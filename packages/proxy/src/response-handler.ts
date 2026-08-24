@@ -1,6 +1,8 @@
 import {
+	BUFFER_SIZES,
 	type CacheFlightCohortSealReceipt,
 	requestEvents,
+	SseFrameBuffer,
 	TIME_CONSTANTS,
 } from "@better-ccflare/core";
 import {
@@ -329,6 +331,383 @@ function logNonStreamingUpstream403(
 		accountId,
 		...telemetry,
 	});
+}
+
+interface RawSseFrame {
+	frame: Uint8Array;
+	delimiter: Uint8Array;
+	remainder: Uint8Array;
+}
+
+function takeRawSseFrame(bytes: Uint8Array): RawSseFrame | null {
+	for (let index = 0; index < bytes.byteLength; index += 1) {
+		let delimiterLength = 0;
+		if (bytes[index] === 10) {
+			if (bytes[index + 1] === 10) delimiterLength = 2;
+			else if (bytes[index + 1] === 13 && bytes[index + 2] === 10)
+				delimiterLength = 3;
+		} else if (bytes[index] === 13 && bytes[index + 1] === 10) {
+			if (bytes[index + 2] === 10) delimiterLength = 3;
+			else if (bytes[index + 2] === 13 && bytes[index + 3] === 10)
+				delimiterLength = 4;
+		}
+		if (delimiterLength > 0) {
+			return {
+				frame: bytes.subarray(0, index),
+				delimiter: bytes.subarray(index, index + delimiterLength),
+				remainder: bytes.subarray(index + delimiterLength),
+			};
+		}
+	}
+	return null;
+}
+
+interface JsonStringNode {
+	kind: "string";
+	value: string;
+	start: number;
+	end: number;
+}
+
+interface JsonObjectNode {
+	kind: "object";
+	properties: Array<{ key: JsonStringNode; value: JsonNode }>;
+}
+
+type JsonNode = JsonStringNode | JsonObjectNode | { kind: "other" };
+
+interface DataSegment {
+	value: string;
+	start: number;
+}
+
+function isJsonWhitespace(char: string): boolean {
+	return char === " " || char === "\t" || char === "\n" || char === "\r";
+}
+
+/** Strict JSON parser retaining token offsets so no payload bytes are reserialized. */
+function parseJsonWithOffsets(source: string): JsonNode | null {
+	let position = 0;
+	const skipWhitespace = (): void => {
+		while (position < source.length && isJsonWhitespace(source[position]))
+			position += 1;
+	};
+	const parseString = (): JsonStringNode | null => {
+		if (source[position] !== '"') return null;
+		const start = position++;
+		while (position < source.length) {
+			const char = source[position++];
+			if (char === '"') {
+				try {
+					return {
+						kind: "string",
+						value: JSON.parse(source.slice(start, position)),
+						start,
+						end: position,
+					};
+				} catch {
+					return null;
+				}
+			}
+			if (char.charCodeAt(0) < 0x20) return null;
+			if (char === "\\") {
+				const escapedCharacter = source[position++];
+				if (!escapedCharacter || !'"\\/bfnrtu'.includes(escapedCharacter)) {
+					return null;
+				}
+				if (escapedCharacter === "u") {
+					const hex = source.slice(position, position + 4);
+					if (!/^[0-9a-fA-F]{4}$/.test(hex)) return null;
+					position += 4;
+				}
+			}
+		}
+		return null;
+	};
+	const parseValue = (): JsonNode | null => {
+		skipWhitespace();
+		if (source[position] === '"') return parseString();
+		if (source[position] === "{") {
+			position += 1;
+			skipWhitespace();
+			const properties: JsonObjectNode["properties"] = [];
+			if (source[position] === "}") {
+				position += 1;
+				return { kind: "object", properties };
+			}
+			while (position < source.length) {
+				skipWhitespace();
+				const key = parseString();
+				if (!key) return null;
+				skipWhitespace();
+				if (source[position++] !== ":") return null;
+				const value = parseValue();
+				if (!value) return null;
+				properties.push({ key, value });
+				skipWhitespace();
+				if (source[position] === "}") {
+					position += 1;
+					return { kind: "object", properties };
+				}
+				if (source[position++] !== ",") return null;
+			}
+			return null;
+		}
+		if (source[position] === "[") {
+			position += 1;
+			skipWhitespace();
+			if (source[position] === "]") {
+				position += 1;
+				return { kind: "other" };
+			}
+			while (position < source.length) {
+				if (!parseValue()) return null;
+				skipWhitespace();
+				if (source[position] === "]") {
+					position += 1;
+					return { kind: "other" };
+				}
+				if (source[position++] !== ",") return null;
+			}
+			return null;
+		}
+		const literal =
+			/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(
+				source.slice(position),
+			);
+		if (!literal) return null;
+		position += literal[0].length;
+		return { kind: "other" };
+	};
+	const value = parseValue();
+	skipWhitespace();
+	return value && position === source.length ? value : null;
+}
+
+function uniqueProperty(object: JsonObjectNode, name: string): JsonNode | null {
+	const matches = object.properties.filter(
+		(property) => property.key.value === name,
+	);
+	return matches.length === 1 ? matches[0].value : null;
+}
+
+function parseSseFrame(frame: string): {
+	event: string | null;
+	data: DataSegment[];
+	ambiguousEvent: boolean;
+} {
+	const events: string[] = [];
+	const data: DataSegment[] = [];
+	let lineStart = 0;
+	while (lineStart <= frame.length) {
+		let lineEnd = lineStart;
+		let colon = -1;
+		while (lineEnd < frame.length && frame[lineEnd] !== "\n") {
+			if (colon === -1 && frame[lineEnd] === ":") colon = lineEnd;
+			lineEnd += 1;
+		}
+		const contentEnd =
+			lineEnd > lineStart && frame[lineEnd - 1] === "\r"
+				? lineEnd - 1
+				: lineEnd;
+		if (colon !== -1 && colon < contentEnd && frame[lineStart] !== ":") {
+			const field = frame.slice(lineStart, colon);
+			const valueStart = frame[colon + 1] === " " ? colon + 2 : colon + 1;
+			const value = frame.slice(valueStart, contentEnd);
+			if (field === "event") events.push(value);
+			if (field === "data") data.push({ value, start: valueStart });
+		}
+		if (lineEnd === frame.length) break;
+		lineStart = lineEnd + 1;
+	}
+	return {
+		event: events.length === 1 ? events[0] : null,
+		data,
+		ambiguousEvent: events.length > 1,
+	};
+}
+
+function rewriteUnknownOpenRouterModelFrame(
+	frame: Uint8Array,
+	attemptedModel: string,
+): {
+	inspected: boolean;
+	replacement: Uint8Array | null;
+	invalidUtf8: boolean;
+} {
+	if (frame[0] === 0xef && frame[1] === 0xbb && frame[2] === 0xbf) {
+		// TextDecoder strips a UTF-8 BOM, making source offsets unsuitable for a
+		// byte-local replacement. Preserve this and all following frames verbatim.
+		return { inspected: true, replacement: null, invalidUtf8: false };
+	}
+	let source: string;
+	try {
+		source = new TextDecoder("utf-8", { fatal: true }).decode(frame);
+	} catch {
+		return { inspected: false, replacement: null, invalidUtf8: true };
+	}
+	const sse = parseSseFrame(source);
+	if (sse.ambiguousEvent) {
+		return { inspected: true, replacement: null, invalidUtf8: false };
+	}
+	if (sse.event !== "message_start") {
+		return { inspected: false, replacement: null, invalidUtf8: false };
+	}
+	const payload = parseJsonWithOffsets(
+		sse.data.map(({ value }) => value).join("\n"),
+	);
+	if (!payload || payload.kind !== "object") {
+		return { inspected: true, replacement: null, invalidUtf8: false };
+	}
+	const type = uniqueProperty(payload, "type");
+	const message = uniqueProperty(payload, "message");
+	if (
+		!type ||
+		type.kind !== "string" ||
+		type.value !== "message_start" ||
+		!message ||
+		message.kind !== "object"
+	) {
+		return { inspected: true, replacement: null, invalidUtf8: false };
+	}
+	const model = uniqueProperty(message, "model");
+	if (!model || model.kind !== "string" || model.value !== "unknown") {
+		return { inspected: true, replacement: null, invalidUtf8: false };
+	}
+	let logicalStart = 0;
+	for (const segment of sse.data) {
+		const logicalEnd = logicalStart + segment.value.length;
+		if (model.start >= logicalStart && model.end <= logicalEnd) {
+			const start = segment.start + model.start - logicalStart;
+			const end = segment.start + model.end - logicalStart;
+			const rawStart = new TextEncoder().encode(
+				source.slice(0, start),
+			).byteLength;
+			const rawEnd = new TextEncoder().encode(source.slice(0, end)).byteLength;
+			const replacement = new TextEncoder().encode(
+				JSON.stringify(attemptedModel),
+			);
+			const rewritten = new Uint8Array(
+				frame.byteLength - (rawEnd - rawStart) + replacement.byteLength,
+			);
+			rewritten.set(frame.subarray(0, rawStart));
+			rewritten.set(replacement, rawStart);
+			rewritten.set(frame.subarray(rawEnd), rawStart + replacement.byteLength);
+			return { inspected: true, replacement: rewritten, invalidUtf8: false };
+		}
+		logicalStart = logicalEnd + 1;
+	}
+	// Replacing a token that crosses an inserted SSE newline is not provably a raw span.
+	return { inspected: true, replacement: null, invalidUtf8: false };
+}
+
+/**
+ * Normalizes OpenRouter's Anthropic-compatible `message_start` placeholder.
+ * attemptedModel is requested transport provenance, not confirmed served identity.
+ */
+const MAX_RETAINED_SSE_FRAGMENTS = 1_024;
+
+function createOpenRouterModelNormalizationStream(
+	upstream: ReadableStream<Uint8Array>,
+	attemptedModel: string,
+): ReadableStream<Uint8Array> {
+	const frames = new SseFrameBuffer({
+		maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+		maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
+	});
+	let rawParts: Uint8Array[] = [];
+	let rawByteLength = 0;
+	let passThrough = false;
+	const drainRawParts = (
+		controller: TransformStreamDefaultController<Uint8Array>,
+	): void => {
+		for (const part of rawParts) controller.enqueue(part);
+		rawParts = [];
+		rawByteLength = 0;
+	};
+
+	return upstream.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			transform(chunk, controller) {
+				if (chunk.byteLength === 0) return;
+				if (passThrough) {
+					controller.enqueue(chunk);
+					return;
+				}
+				rawParts.push(chunk);
+				rawByteLength += chunk.byteLength;
+				if (rawParts.length > MAX_RETAINED_SSE_FRAGMENTS) {
+					passThrough = true;
+					drainRawParts(controller);
+					return;
+				}
+				let parsedFrames: string[];
+				try {
+					parsedFrames = frames.push(chunk);
+				} catch {
+					passThrough = true;
+					drainRawParts(controller);
+					return;
+				}
+				if (parsedFrames.length === 0) return;
+
+				// A complete frame is bounded by SseFrameBuffer. Materialize retained
+				// raw fragments only once here; no-delimiter pushes retain fragments.
+				const rawBlock = new Uint8Array(rawByteLength);
+				let offset = 0;
+				for (const part of rawParts) {
+					rawBlock.set(part, offset);
+					offset += part.byteLength;
+				}
+				rawParts = [];
+				rawByteLength = 0;
+				const rawFrames: RawSseFrame[] = [];
+				let remainder: Uint8Array<ArrayBufferLike> = rawBlock;
+				let rawFrame = takeRawSseFrame(remainder);
+				while (rawFrame) {
+					rawFrames.push(rawFrame);
+					remainder = rawFrame.remainder;
+					rawFrame = takeRawSseFrame(remainder);
+				}
+				if (rawFrames.length !== parsedFrames.length) {
+					passThrough = true;
+					controller.enqueue(rawBlock);
+					return;
+				}
+				for (const frame of rawFrames) {
+					if (passThrough) {
+						controller.enqueue(frame.frame);
+						controller.enqueue(frame.delimiter);
+						continue;
+					}
+					const inspection = rewriteUnknownOpenRouterModelFrame(
+						frame.frame,
+						attemptedModel,
+					);
+					if (inspection.invalidUtf8) passThrough = true;
+					controller.enqueue(inspection.replacement ?? frame.frame);
+					controller.enqueue(frame.delimiter);
+					if (inspection.inspected) passThrough = true;
+				}
+				if (passThrough) {
+					if (remainder.byteLength > 0) controller.enqueue(remainder);
+				} else if (remainder.byteLength > 0) {
+					rawParts = [remainder];
+					rawByteLength = remainder.byteLength;
+				}
+			},
+			flush(controller) {
+				if (!passThrough) {
+					try {
+						frames.flush();
+					} catch {
+						// The retained raw fragments are emitted unchanged below.
+					}
+				}
+				drainRawParts(controller);
+			},
+		}),
+	);
 }
 
 export interface ResponseHandlerOptions {
@@ -739,7 +1118,7 @@ export async function forwardToClient(
 				.includes("text/event-stream") ??
 				false);
 		let streamTerminalState: AnthropicTerminalState | null = null;
-		const responseBody = isAnthropicMessagesSseResponse
+		const terminalRecoveredBody = isAnthropicMessagesSseResponse
 			? createAnthropicTerminalRecoveryStream(semanticallyBoundedBody, {
 					drainAbort,
 					gracePeriodMs: anthropicStreamConfig?.terminalGraceMs,
@@ -790,6 +1169,27 @@ export async function forwardToClient(
 		const anthropicOutcomeTracker = isAnthropicMessagesSseResponse
 			? new AnthropicStreamOutcomeTracker()
 			: null;
+		const normalizedAttemptedModel = attemptedModel?.trim() ?? "";
+		const shouldNormalizeOpenRouterModel =
+			ctx.provider.name === "openrouter" &&
+			method === "POST" &&
+			path === "/v1/messages" &&
+			response.ok &&
+			(response.headers
+				.get("content-type")
+				?.toLowerCase()
+				.includes("text/event-stream") ??
+				false) &&
+			normalizedAttemptedModel.length > 0 &&
+			normalizedAttemptedModel.toLowerCase() !== "unknown";
+		// Normalize after terminal recovery so outcome tracking, the client, and
+		// the usage collector consume the same bytes.
+		const responseBody = shouldNormalizeOpenRouterModel
+			? createOpenRouterModelNormalizationStream(
+					terminalRecoveredBody,
+					normalizedAttemptedModel,
+				)
+			: terminalRecoveredBody;
 
 		const onChunk = (value: Uint8Array): void => {
 			anthropicOutcomeTracker?.push(value);
