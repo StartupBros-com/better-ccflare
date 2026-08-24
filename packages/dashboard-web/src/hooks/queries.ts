@@ -534,6 +534,22 @@ export const useUsageHistory = (account: string, range: string) => {
 	});
 };
 
+/** Closed and active value records for one account or the entire fleet. */
+export const useUsageWindows = (
+	account?: string,
+	windowKey = "seven_day",
+	limit = 20,
+) => {
+	return useQuery({
+		queryKey: queryKeys.usageWindows(account, windowKey, limit),
+		queryFn: () => api.getUsageWindows(account, windowKey, limit),
+		staleTime: 45000,
+		refetchInterval: 60000,
+		refetchIntervalInBackground: false,
+		gcTime: 15 * 60 * 1000,
+	});
+};
+
 /** Fleet-wide (all accounts) usage history, backing the "All accounts" chart. */
 export const useFleetUsageHistory = (range: string, enabled = true) => {
 	return useQuery({

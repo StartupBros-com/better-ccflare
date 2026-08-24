@@ -3,6 +3,7 @@ import {
 	Activity,
 	BarChart3,
 	Bot,
+	CircleDollarSign,
 	FileText,
 	GitBranch,
 	History,
@@ -89,6 +90,11 @@ export function Navigation({
 			{ label: "Requests", icon: Activity, path: "/requests" },
 			{ label: "Accounts", icon: Users, path: "/accounts" },
 			{ label: "Usage History", icon: History, path: "/usage-history" },
+			{
+				label: "Window Value",
+				icon: CircleDollarSign,
+				path: "/window-value",
+			},
 		];
 
 		// Add combos item if feature is enabled
