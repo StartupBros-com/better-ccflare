@@ -2,18 +2,20 @@
   "schemaVersion": 1,
   "phase": "pre-merge",
   "baseline": {
-    "forkParent": "39cc7f6489d42bb5e04bab4c1786ab4a2d96c790",
-    "requiredAncestors": ["f65e5768f842853e60fc1f411eedf5281b0bc52b"],
+    "forkParent": "4db136a13ce3bf1b2d03fdf3174c52640ba17abd",
+    "requiredAncestors": [
+      "f65e5768f842853e60fc1f411eedf5281b0bc52b"
+    ],
     "target": "db894ef34ed140a4ec495253da79824eb811010a",
     "canonicalTag": "refs/tags/v3.5.66",
     "peeledTag": "db894ef34ed140a4ec495253da79824eb811010a",
     "mergeBase": "0ad2f93d9e0c75e7b575006d12433d33a358df50",
     "rawCounts": {
-      "left": 796,
+      "left": 800,
       "right": 116
     },
     "cherryPickCounts": {
-      "left": 796,
+      "left": 800,
       "right": 116
     },
     "versions": {
@@ -230,6 +232,10 @@
         "conflictClass": "content"
       },
       {
+        "path": "packages/dashboard-web/src/components/navigation.tsx",
+        "conflictClass": "content"
+      },
+      {
         "path": "packages/dashboard-web/src/components/overview/pool-usage-shared.tsx",
         "conflictClass": "content"
       },
@@ -427,7 +433,6 @@
       "packages/dashboard-web/src/components/accounts/AccountListItem.tsx",
       "packages/dashboard-web/src/components/accounts/RateLimitProgress.test.tsx",
       "packages/dashboard-web/src/components/combos/CombosTab.tsx",
-      "packages/dashboard-web/src/components/navigation.tsx",
       "packages/dashboard-web/src/lib/query-keys.ts",
       "packages/database/src/__tests__/multi-instance-guard.test.ts",
       "packages/database/src/adapters/bun-sql-adapter.ts",
@@ -5082,6 +5087,41 @@
       "refreshedMainEvidence": []
     },
     {
+      "id": "conflict:packages/dashboard-web/src/components/navigation.tsx",
+      "kind": "conflict",
+      "source": {
+        "path": "packages/dashboard-web/src/components/navigation.tsx",
+        "conflictClass": "content"
+      },
+      "ledgerAnchor": "#sync-conflict-80f22e72e24ab312d63fbb5e",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
       "id": "conflict:packages/dashboard-web/src/components/overview/pool-usage-shared.tsx",
       "kind": "conflict",
       "source": {
@@ -7038,40 +7078,6 @@
         "path": "packages/dashboard-web/src/components/combos/CombosTab.tsx"
       },
       "ledgerAnchor": "#sync-shared-path-b229c4100c7aa7ff323da6a5",
-      "disposition": "pending",
-      "upstreamIntent": "pending",
-      "protectedForkBehavior": "pending",
-      "selectedResolution": "pending",
-      "evidence": {
-        "focusedPacket": {
-          "status": "pending",
-          "references": []
-        },
-        "acceptanceComplete": {
-          "status": "pending",
-          "references": []
-        },
-        "combinedDiff": {
-          "status": "pending",
-          "references": []
-        }
-      },
-      "reviewer": {
-        "status": "pending",
-        "identity": null,
-        "notes": "pending"
-      },
-      "dependencies": [],
-      "rationale": "pending",
-      "refreshedMainEvidence": []
-    },
-    {
-      "id": "shared-path:packages/dashboard-web/src/components/navigation.tsx",
-      "kind": "shared-path",
-      "source": {
-        "path": "packages/dashboard-web/src/components/navigation.tsx"
-      },
-      "ledgerAnchor": "#sync-shared-path-9cf6ca3d4a86569af7f09940",
       "disposition": "pending",
       "upstreamIntent": "pending",
       "protectedForkBehavior": "pending",

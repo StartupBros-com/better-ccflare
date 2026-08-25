@@ -650,6 +650,7 @@ export function renderLedger(inventory: SyncInventory): string {
       "",
     );
   }
+  while (lines.at(-1) === "") lines.pop();
   return `${lines.join("\n")}\n`;
 }
 

@@ -307,6 +307,12 @@ describe("bidirectional expected-set validation", () => {
 });
 
 describe("ledger linkage and machine/human parity", () => {
+  test("renders a diff-clean ledger with exactly one trailing newline", () => {
+    const ledger = renderLedger(validInventory());
+    expect(ledger.endsWith("\n")).toBe(true);
+    expect(ledger.endsWith("\n\n")).toBe(false);
+  });
+
   test("rejects dangling and duplicate explicit anchors", () => {
     const inventory = validInventory();
     const ledger = renderLedger(inventory);
