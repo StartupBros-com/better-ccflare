@@ -29,6 +29,8 @@ jobs:
         run: bun run build:dashboard
 
       - name: Build Windows binary
+        env:
+          CCFLARE_BUILD_PRODUCER: ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'github-release-binary' || '' }}
         run: |
           cd apps/cli
           bun run build:windows-x64

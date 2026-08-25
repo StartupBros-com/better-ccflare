@@ -4,6 +4,7 @@ import {
 	MAX_REQUEST_BODY_BYTES,
 	RequestBodyTooLargeError,
 	requestEvents,
+	resolveBuildProvenance,
 	ServiceUnavailableError,
 	trackClientVersion,
 } from "@better-ccflare/core";
@@ -732,13 +733,25 @@ async function handleProxyCoreImpl(
 	}
 
 	// 0. Silently ignore Claude Code internal endpoints (non-critical, not supported by all providers)
-	if (
-		url.pathname === "/api/event_logging/batch" ||
-		url.pathname === "/api/system/package-manager"
-	) {
+	if (url.pathname === "/api/event_logging/batch") {
 		return new Response(JSON.stringify({ success: true }), {
 			status: 200,
 			headers: { "Content-Type": "application/json" },
+		});
+	}
+
+	// This compatibility endpoint bypasses APIRouter. It is intentionally a
+	// resolver-only subset: no installation inference and no remote lookup.
+	if (url.pathname === "/api/system/package-manager") {
+		const provenance = resolveBuildProvenance();
+		return Response.json({
+			provenance: {
+				identity: provenance.identity,
+				producer: provenance.producer,
+				artifactMode: provenance.artifactMode,
+				proven: provenance.proven,
+				reason: provenance.reason,
+			},
 		});
 	}
 

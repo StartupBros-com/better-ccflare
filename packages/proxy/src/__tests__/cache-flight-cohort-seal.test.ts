@@ -148,6 +148,19 @@ function makeService(
 			git_sha: options.gitSha === undefined ? "deploy-sha-a" : options.gitSha,
 			git_ref: "refs/heads/main",
 			build_date: "2026-08-08T09:59:00.000Z",
+			distribution: {
+				raw: null,
+				schemaVersion: null,
+				identity: null,
+				producer: null,
+				artifactMode: null,
+				updateChannel: null,
+				source_sha: null,
+				source_ref: null,
+				proven: false,
+				actionable: false,
+				reason: "unknown_distribution",
+			},
 		}),
 	});
 }

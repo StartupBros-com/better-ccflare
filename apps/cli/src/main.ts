@@ -40,6 +40,7 @@ import {
 import { Config } from "@better-ccflare/config";
 import {
 	CLAUDE_MODEL_IDS,
+	getGitSha,
 	getVersionSync,
 	installOutboundProxy,
 	isFamilyAliasModel,
@@ -1073,6 +1074,19 @@ export async function resolveFamilyPolicyAliases(
 
 async function main() {
 	const args = process.argv.slice(2);
+	// Used by Docker release verification; emit no decoration or fallback value
+	// before parsing commands or initializing any application services.
+	if (args.includes("--git-sha")) {
+		const gitSha = getGitSha();
+		if (!gitSha) {
+			console.error("Git SHA is unavailable in this binary");
+			fastExit(1);
+			return;
+		}
+		console.log(gitSha);
+		fastExit(0);
+		return;
+	}
 	const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
 	let routingCommand: ManagedRoutingCliCommand | null;
 	try {

@@ -213,6 +213,7 @@ export function createHealthHandler(
 
 		const status = computeHealthStatus(runtimeHealthy, pool);
 
+		const dockerProvenance = readDockerBuildProvenance();
 		const response: HealthResponse = {
 			status,
 			accounts: pool.configured,
@@ -223,7 +224,15 @@ export function createHealthHandler(
 			// overridden by the fork's own --define-based mechanism so a deploy
 			// can still be verified over HTTP (git_sha) without trusting the
 			// pinned binary filename.
-			...readDockerBuildProvenance(),
+			git_ref: dockerProvenance.git_ref,
+			build_date: dockerProvenance.build_date,
+			distribution: {
+				identity: dockerProvenance.distribution.identity,
+				producer: dockerProvenance.distribution.producer,
+				artifactMode: dockerProvenance.distribution.artifactMode,
+				proven: dockerProvenance.distribution.proven,
+				reason: dockerProvenance.distribution.reason,
+			},
 			version: getVersionSync(),
 			git_sha: getGitSha(),
 			pool,

@@ -13,6 +13,8 @@ env:
 
 jobs:
   build-and-push:
+    # workflow_run fires for failed workflows too; never publish their artifacts.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -21,8 +23,22 @@ jobs:
       attestations: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout triggering workflow source
+        if: github.event_name == 'workflow_run'
         uses: actions/checkout@v5
+        with:
+          # The Docker build context must be the completed release workflow's
+          # exact commit, not the default branch at workflow_run execution time.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Checkout dispatch source
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -38,43 +54,102 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from tag or event
-        id: version
+      - name: Set build provenance
+        id: provenance
         env:
-          REF: ${{ github.event.workflow_run.head_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          # For workflow_run events triggered by release workflow
-          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            # Get the head branch which contains the tag name
-            if [[ "$REF" == v* ]]; then
-              VERSION="${REF#v}"
-              echo "version=${VERSION}" >> $GITHUB_OUTPUT
-
-              # Check if this is a pre-release (rc, beta, alpha)
-              if [[ "$VERSION" =~ (rc|beta|alpha) ]]; then
-                echo "is_prerelease=true" >> $GITHUB_OUTPUT
-              else
-                echo "is_prerelease=false" >> $GITHUB_OUTPUT
-              fi
-            else
-              echo "version=latest" >> $GITHUB_OUTPUT
-              echo "is_prerelease=false" >> $GITHUB_OUTPUT
-            fi
-          # For direct tag pushes
-          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
-            echo "version=${VERSION}" >> $GITHUB_OUTPUT
-
-            # Check if this is a pre-release (rc, beta, alpha)
-            if [[ "$VERSION" =~ (rc|beta|alpha) ]]; then
-              echo "is_prerelease=true" >> $GITHUB_OUTPUT
-            else
-              echo "is_prerelease=false" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "version=latest" >> $GITHUB_OUTPUT
-            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          # Only a completed tombii push workflow whose checked-out commit equals
+          # its event SHA can establish mutable distribution provenance. Dispatches
+          # can publish exact-tag images, but their provenance remains unknown.
+          proven="false"
+          version="latest"
+          is_prerelease="false"
+          git_sha="unknown"
+          git_ref="unknown"
+          checkout_sha="unknown"
+          event_sha="unknown"
+          tag_sha="unknown"
+          image_sha="unknown"
+          distribution="unknown"
+          producer="unknown"
+          artifact_mode="unknown"
+          update_channel="unknown"
+          can_publish="false"
+          can_attest="false"
+          numeric_identifier='(0|[1-9][0-9]*)'
+          prerelease_identifier='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          semver_tag_re="^v${numeric_identifier}\\.${numeric_identifier}\\.${numeric_identifier}(-${prerelease_identifier}(\\.${prerelease_identifier})*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"
+          checked_out_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+          if [[ "$checked_out_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            image_sha="$checked_out_sha"
           fi
+
+          valid_workflow_run="false"
+          if [[ "$EVENT_NAME" == "workflow_run" && \
+            "$WORKFLOW_RUN_EVENT" == "push" && \
+            "$WORKFLOW_RUN_CONCLUSION" == "success" && \
+            "$GITHUB_REPOSITORY" == "tombii/better-ccflare" && \
+            "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && \
+            "$checked_out_sha" == "$HEAD_SHA" ]]; then
+            valid_workflow_run="true"
+          fi
+
+          if [[ "$checked_out_sha" =~ ^[0-9a-f]{40}$ && ( "$EVENT_NAME" == "workflow_dispatch" || "$valid_workflow_run" == "true" ) ]]; then
+            release_tags=()
+            release_tag_shas=()
+            while IFS= read -r tag; do
+              [[ "$tag" =~ $semver_tag_re ]] || continue
+              candidate_tag_sha="$(git rev-parse "refs/tags/$tag^{commit}" 2>/dev/null || true)"
+              [[ "$candidate_tag_sha" == "$checked_out_sha" ]] || continue
+              release_tags+=("$tag")
+              release_tag_shas+=("$candidate_tag_sha")
+            done < <(git tag --points-at HEAD 2>/dev/null || true)
+
+            if [[ "${#release_tags[@]}" -eq 1 ]]; then
+              release_tag="${release_tags[0]}"
+              release_tag_sha="${release_tag_shas[0]}"
+              version="${release_tag#v}"
+              if [[ "$version" == *-* ]]; then
+                is_prerelease="true"
+              elif [[ "$version" != *+* ]]; then
+                can_publish="true"
+                if [[ "$valid_workflow_run" == "true" ]]; then
+                  proven="true"
+                  can_attest="true"
+                  git_sha="$checked_out_sha"
+                  git_ref="refs/tags/$release_tag"
+                  checkout_sha="$checked_out_sha"
+                  event_sha="$HEAD_SHA"
+                  tag_sha="$release_tag_sha"
+                  distribution="v1:tombii-ghcr-docker"
+                  producer="tombii"
+                  artifact_mode="docker"
+                  update_channel="ghcr"
+                fi
+              fi
+            fi
+          fi
+          echo "proven=${proven}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${is_prerelease}" >> "$GITHUB_OUTPUT"
+          echo "git_sha=${git_sha}" >> "$GITHUB_OUTPUT"
+          echo "git_ref=${git_ref}" >> "$GITHUB_OUTPUT"
+          echo "checkout_sha=${checkout_sha}" >> "$GITHUB_OUTPUT"
+          echo "event_sha=${event_sha}" >> "$GITHUB_OUTPUT"
+          echo "tag_sha=${tag_sha}" >> "$GITHUB_OUTPUT"
+          echo "image_sha=${image_sha}" >> "$GITHUB_OUTPUT"
+          echo "distribution=${distribution}" >> "$GITHUB_OUTPUT"
+          echo "producer=${producer}" >> "$GITHUB_OUTPUT"
+          echo "artifact_mode=${artifact_mode}" >> "$GITHUB_OUTPUT"
+          echo "update_channel=${update_channel}" >> "$GITHUB_OUTPUT"
+          echo "can_publish=${can_publish}" >> "$GITHUB_OUTPUT"
+          echo "can_attest=${can_attest}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
         id: meta
@@ -83,51 +158,43 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != 'latest' }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.is_prerelease == 'false' && steps.version.outputs.version != 'latest' }}
-            type=semver,pattern={{major}},value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.is_prerelease == 'false' && steps.version.outputs.version != 'latest' }}
-            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
-            type=raw,value=main,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
-            type=sha
-          # Tags: Full version (3.1.0-beta.3), major.minor (3.1 - stable only), major (3 - stable only)
-          # Only add latest/main and major version tags for stable releases (not pre-releases)
-
-      - name: Set build provenance
-        id: provenance
-        env:
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            echo "git_sha=${HEAD_SHA}" >> $GITHUB_OUTPUT
-            echo "git_ref=${HEAD_BRANCH}" >> $GITHUB_OUTPUT
-          else
-            echo "git_sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
-            echo "git_ref=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-          fi
-          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+            # Every exact-tag build gets a full source-SHA tag. Only a proven
+            # stable tombii release may publish version or mutable aliases.
+            type=raw,value=${{ steps.provenance.outputs.version }},enable=${{ steps.provenance.outputs.proven == 'true' && steps.provenance.outputs.is_prerelease == 'false' }}
+            type=raw,value=sha-${{ steps.provenance.outputs.image_sha }},enable=${{ steps.provenance.outputs.can_publish == 'true' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.provenance.outputs.version }},enable=${{ steps.provenance.outputs.proven == 'true' && steps.provenance.outputs.is_prerelease == 'false' }}
+            type=semver,pattern={{major}},value=${{ steps.provenance.outputs.version }},enable=${{ steps.provenance.outputs.proven == 'true' && steps.provenance.outputs.is_prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ steps.provenance.outputs.proven == 'true' && steps.provenance.outputs.is_prerelease == 'false' }}
+            type=raw,value=main,enable=${{ steps.provenance.outputs.proven == 'true' && steps.provenance.outputs.is_prerelease == 'false' }}
 
       - name: Build and push Docker images
+        if: steps.provenance.outputs.can_publish == 'true'
         id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ steps.provenance.outputs.can_publish == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            VERSION=${{ steps.version.outputs.version }}
+            VERSION=${{ steps.provenance.outputs.version }}
+            IMAGE_SHA=${{ steps.provenance.outputs.image_sha }}
             GIT_SHA=${{ steps.provenance.outputs.git_sha }}
             GIT_REF=${{ steps.provenance.outputs.git_ref }}
+            CHECKOUT_SHA=${{ steps.provenance.outputs.checkout_sha }}
+            EVENT_SHA=${{ steps.provenance.outputs.event_sha }}
+            TAG_SHA=${{ steps.provenance.outputs.tag_sha }}
+            DISTRIBUTION=${{ steps.provenance.outputs.distribution }}
+            PRODUCER=${{ steps.provenance.outputs.producer }}
+            ARTIFACT_MODE=${{ steps.provenance.outputs.artifact_mode }}
+            UPDATE_CHANNEL=${{ steps.provenance.outputs.update_channel }}
             BUILD_DATE=${{ steps.provenance.outputs.build_date }}
 
       - name: Generate artifact attestation
-        if: github.event_name != 'pull_request'
+        if: steps.provenance.outputs.proven == 'true' && steps.provenance.outputs.is_prerelease == 'false' && steps.provenance.outputs.can_attest == 'true'
         uses: actions/attest-build-provenance@v1
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}

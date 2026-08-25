@@ -1,4 +1,3 @@
-import { parseHttpError } from "@better-ccflare/errors";
 import {
 	Activity,
 	BarChart3,
@@ -29,11 +28,117 @@ import { ThemeToggle } from "./theme-toggle";
 import { Button } from "./ui/button";
 import { Separator } from "./ui/separator";
 
-// Store update command globally
-let updateCommand: string = "npm install -g better-ccflare@latest";
-let detectedPackageManager: "npm" | "bun" | "unknown" = "npm";
-let isBinaryInstallation: boolean = false;
-let isDockerInstallation: boolean = false;
+export interface UpdateStatusResponse {
+	readonly currentVersion: string;
+	readonly availability: "current" | "available" | "unavailable";
+	readonly latestVersion: string | null;
+	readonly action: {
+		readonly kind: "command" | "url";
+		readonly value: string;
+	} | null;
+	readonly reason: string;
+}
+
+interface UpdateStatusFetchResponse {
+	readonly ok: boolean;
+	readonly status: number;
+	json(): Promise<unknown>;
+}
+
+type UpdateStatusFetcher = (
+	input: string,
+) => PromiseLike<UpdateStatusFetchResponse>;
+
+export async function requestUpdateStatus(
+	fetcher: UpdateStatusFetcher = fetch,
+): Promise<UpdateStatusResponse> {
+	const response = await fetcher("/api/version/check");
+	if (!response.ok) throw new Error(`Update check failed: ${response.status}`);
+	return (await response.json()) as UpdateStatusResponse;
+}
+
+export const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+
+interface UpdateCheckTimer {
+	setInterval(callback: () => void, delay: number): unknown;
+	clearInterval(handle: unknown): void;
+}
+
+export function scheduleUpdateChecks(
+	checkForUpdates: () => void,
+	timer: UpdateCheckTimer = globalThis,
+): () => void {
+	const interval = timer.setInterval(checkForUpdates, UPDATE_CHECK_INTERVAL_MS);
+	return () => timer.clearInterval(interval);
+}
+
+export function UpdateStatusDetails({
+	status,
+	result,
+}: {
+	readonly status:
+		| "idle"
+		| "checking"
+		| "available"
+		| "current"
+		| "unavailable"
+		| "error";
+	readonly result: UpdateStatusResponse | null;
+}) {
+	if (status === "available" && result?.latestVersion) {
+		return (
+			<div className="mt-2 space-y-1">
+				<p className="text-xs text-muted-foreground text-left">
+					{result.currentVersion} → {result.latestVersion}
+				</p>
+				{result.action?.kind === "command" && (
+					<div className="flex items-center gap-1">
+						<code className="text-xs bg-background px-1 py-0.5 rounded font-mono flex-1 truncate">
+							{result.action.value}
+						</code>
+						<CopyButton
+							value={result.action.value}
+							size="sm"
+							variant="ghost"
+							className="h-6 w-6 p-0"
+							title="Copy update command"
+						/>
+					</div>
+				)}
+				{result.action?.kind === "url" && (
+					<a
+						href={result.action.value}
+						className="text-xs text-primary underline"
+					>
+						View release
+					</a>
+				)}
+			</div>
+		);
+	}
+	if (status === "current" && result) {
+		return (
+			<p className="mt-1 text-xs text-muted-foreground text-left">
+				Version {result.currentVersion}
+			</p>
+		);
+	}
+	if (status === "unavailable" && result) {
+		return (
+			<p className="mt-1 text-xs text-muted-foreground text-left">
+				{result.reason}
+			</p>
+		);
+	}
+	if (status === "error") {
+		return (
+			<p className="mt-1 text-xs text-destructive text-left">
+				Update status could not be loaded.
+			</p>
+		);
+	}
+	return null;
+}
 
 interface NavItem {
 	label: string;
@@ -41,19 +146,6 @@ interface NavItem {
 	path: string;
 	badge?: string;
 }
-
-const _navItems: NavItem[] = [
-	{ label: "Overview", icon: LayoutDashboard, path: "/" },
-	{ label: "Analytics", icon: BarChart3, path: "/analytics" },
-	{ label: "Insights", icon: Lightbulb, path: "/insights" },
-	{ label: "Requests", icon: Activity, path: "/requests" },
-	{ label: "Accounts", icon: Users, path: "/accounts" },
-	// { label: "Combos", icon: Zap, path: "/combos" },
-	{ label: "Agents", icon: Bot, path: "/agents" },
-	{ label: "API Keys", icon: Key, path: "/api-keys" },
-	{ label: "Logs", icon: FileText, path: "/logs" },
-	{ label: "Settings", icon: Settings, path: "/settings" },
-];
 
 interface NavigationProps {
 	onLogout?: () => void;
@@ -66,10 +158,11 @@ export function Navigation({
 }: NavigationProps = {}) {
 	const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 	const [updateStatus, setUpdateStatus] = useState<
-		"idle" | "checking" | "available" | "current" | "error"
+		"idle" | "checking" | "available" | "current" | "unavailable" | "error"
 	>("idle");
-	const [latestVersion, setLatestVersion] = useState<string>("");
-	const [updateError, setUpdateError] = useState<string | null>(null);
+	const [updateResult, setUpdateResult] = useState<UpdateStatusResponse | null>(
+		null,
+	);
 	const { data: alertData } = useAlerts();
 	const unacknowledgedCount = alertData?.unacknowledgedCount ?? 0;
 	const location = useLocation();
@@ -113,233 +206,30 @@ export function Navigation({
 		return baseItems;
 	}, [showCombos, unacknowledgedCount]);
 
-	// Cleanup on unmount to prevent memory leaks
-	useEffect(() => {
-		return () => {
-			isMountedRef.current = false;
-		};
-	}, []);
-
-	const detectPackageManager = async (): Promise<{
-		packageManager: "npm" | "bun" | "unknown";
-		isBinary: boolean;
-		isDocker: boolean;
-	}> => {
-		try {
-			// Check if the binary exists in bun's global path
-			try {
-				const response = await fetch("/api/system/package-manager");
-				if (response.ok) {
-					const data = await response.json();
-					isBinaryInstallation = data.isBinary || false;
-					isDockerInstallation = data.isDocker || false;
-					return {
-						packageManager: data.packageManager,
-						isBinary: data.isBinary || false,
-						isDocker: data.isDocker || false,
-					};
-				}
-			} catch {
-				// Fallback to client-side detection
-			}
-
-			// Fallback: check if user agent indicates bun (this is a weak signal)
-			const userAgent = navigator.userAgent;
-			if (userAgent.includes("Bun")) {
-				return { packageManager: "bun", isBinary: false, isDocker: false };
-			}
-
-			// Default to npm as it's more common
-			return { packageManager: "npm", isBinary: false, isDocker: false };
-		} catch (error) {
-			console.error("Error detecting package manager:", error);
-			return { packageManager: "npm", isBinary: false, isDocker: false }; // Default fallback
-		}
-	};
-
-	const getUpdateCommand = (
-		packageManager: "npm" | "bun" | "unknown",
-		isBinary: boolean = false,
-		isDocker: boolean = false,
-	): string => {
-		if (isDocker) {
-			// For Docker installations, provide instructions to pull latest image
-			return "docker pull ghcr.io/tombii/better-ccflare:latest";
-		}
-
-		if (isBinary) {
-			// For binary installations, provide instructions to download from GitHub releases
-			const platform = navigator.platform.toLowerCase();
-			let _arch = "x64";
-
-			// Detect architecture
-			if (platform.includes("arm") || platform.includes("aarch64")) {
-				_arch = "arm64";
-			}
-
-			let _os = "linux";
-			if (platform.includes("win")) {
-				_os = "windows";
-			} else if (platform.includes("mac")) {
-				_os = "darwin";
-			}
-
-			// Return GitHub releases URL instead of a command
-			return "Download latest binary from GitHub releases";
-		}
-
-		switch (packageManager) {
-			case "bun":
-				return "bun install -g better-ccflare@latest";
-			default:
-				return "npm install -g better-ccflare@latest";
-		}
-	};
-
-	/**
-	 * Compare two semantic versions
-	 * @returns true if latest > current (update available), false otherwise
-	 */
-	const compareVersions = (latest: string, current: string): boolean => {
-		const latestParts = latest.split(".").map(Number);
-		const currentParts = current.split(".").map(Number);
-
-		for (
-			let i = 0;
-			i < Math.max(latestParts.length, currentParts.length);
-			i++
-		) {
-			const latestPart = latestParts[i] || 0;
-			const currentPart = currentParts[i] || 0;
-
-			if (latestPart > currentPart) return true;
-			if (latestPart < currentPart) return false;
-		}
-
-		return false; // Versions are equal
-	};
-
-	/**
-	 * Check for available updates from npm registry
-	 * Uses localStorage to cache results and prevent excessive checks (max once per hour)
-	 * This function is called on component mount and then every hour via setInterval
-	 */
-	// biome-ignore lint/correctness/useExhaustiveDependencies: helper functions are stable and don't need to be dependencies
 	const checkForUpdates = useCallback(async () => {
 		if (!isMountedRef.current) return;
-
-		// Check localStorage for last check time to avoid excessive checks
-		const lastCheckTime = localStorage.getItem("updateCheckLastTime");
-		const now = Date.now();
-		const oneHour = 60 * 60 * 1000;
-
-		// Check cache to avoid excessive npm registry requests
-		// Recheck every hour regardless of status to keep version info fresh
-		if (lastCheckTime && now - Number.parseInt(lastCheckTime, 10) < oneHour) {
-			const cachedStatus = localStorage.getItem("updateCheckStatus");
-			const cachedVersion = localStorage.getItem("updateCheckVersion");
-
-			// Remove 'v' prefix from version for comparison
-			const currentVersion = version.replace(/^v/, "");
-
-			if (cachedStatus === "available" && cachedVersion) {
-				// Check if user has updated since cache was created
-				// If cached version <= current version, they've updated, so clear cache
-				if (!compareVersions(cachedVersion, currentVersion)) {
-					localStorage.removeItem("updateCheckStatus");
-					localStorage.removeItem("updateCheckVersion");
-					localStorage.removeItem("updateCheckLastTime");
-					// Fall through to do a fresh check
-				} else {
-					setUpdateStatus("available");
-					setLatestVersion(cachedVersion);
-					return;
-				}
-			}
-
-			if (cachedStatus === "current") {
-				setUpdateStatus("current");
-				return;
-			}
-		}
-
 		setUpdateStatus("checking");
-		setUpdateError(null);
 		try {
-			const [response, packageInfo] = await Promise.all([
-				fetch("/api/version/check"),
-				detectPackageManager(),
-			]);
-
-			if (!response.ok) {
-				throw await parseHttpError(response);
-			}
-
-			const data = await response.json();
-			const latest = data.version;
-
-			// Only update state if component is still mounted
+			const result = await requestUpdateStatus();
 			if (!isMountedRef.current) return;
-
-			setLatestVersion(latest);
-
-			// Remove 'v' prefix from version for comparison
-			const currentVersion = version.replace(/^v/, "");
-
-			// Use semantic version comparison: only show update if latest > current
-			if (compareVersions(latest, currentVersion)) {
-				setUpdateStatus("available");
-				updateCommand = getUpdateCommand(
-					packageInfo.packageManager,
-					packageInfo.isBinary,
-					packageInfo.isDocker,
-				);
-				detectedPackageManager = packageInfo.packageManager;
-				console.log(
-					`🚀 Update available: ${currentVersion} → ${latest}\nDetected package manager: ${packageInfo.packageManager}\nRun: ${updateCommand}`,
-				);
-
-				// Cache "available" status - will recheck after 1 hour for newer versions
-				localStorage.setItem("updateCheckStatus", "available");
-				localStorage.setItem("updateCheckVersion", latest);
-				localStorage.setItem("updateCheckLastTime", now.toString());
-			} else {
-				setUpdateStatus("current");
-				console.log(`✅ You're on the latest version (${currentVersion})`);
-
-				// Cache "current" status - will recheck after 1 hour
-				localStorage.setItem("updateCheckStatus", "current");
-				localStorage.setItem("updateCheckLastTime", now.toString());
-			}
-		} catch (error) {
-			// Only update state if component is still mounted
+			setUpdateResult(result);
+			setUpdateStatus(result.availability);
+		} catch {
 			if (!isMountedRef.current) return;
-
+			setUpdateResult(null);
 			setUpdateStatus("error");
-			setUpdateError(error instanceof Error ? error.message : String(error));
-			console.error("❌ Failed to check for updates:", error);
 		}
 	}, []);
 
-	// Automatic update check: run on mount and every hour
-	// biome-ignore lint/correctness/useExhaustiveDependencies: checkForUpdates is stable via useCallback
 	useEffect(() => {
-		// Check immediately on mount (when dashboard loads)
+		isMountedRef.current = true;
 		checkForUpdates();
-
-		// Set up hourly check
-		const intervalId = setInterval(
-			() => {
-				checkForUpdates();
-			},
-			60 * 60 * 1000,
-		); // 1 hour in milliseconds
-
-		// Cleanup interval on unmount
+		const cancelUpdateChecks = scheduleUpdateChecks(checkForUpdates);
 		return () => {
-			clearInterval(intervalId);
+			isMountedRef.current = false;
+			cancelUpdateChecks();
 		};
-	}, []);
+	}, [checkForUpdates]);
 
 	return (
 		<>
@@ -489,46 +379,15 @@ export function Navigation({
 										{updateStatus === "checking" && "Checking..."}
 										{updateStatus === "available" && "Update Available"}
 										{updateStatus === "current" && "Up to Date"}
+										{updateStatus === "unavailable" && "Updates Unavailable"}
 										{updateStatus === "error" && "Check Failed"}
 									</span>
 								</div>
 							</button>
-							{updateStatus === "available" && (
-								<div className="mt-2 space-y-1">
-									<p className="text-xs text-muted-foreground text-left">
-										{version.replace(/^v/, "")} → {latestVersion}
-									</p>
-									<div className="flex items-center gap-1">
-										<code className="text-xs bg-background px-1 py-0.5 rounded font-mono flex-1 truncate">
-											{updateCommand}
-										</code>
-										<CopyButton
-											value={updateCommand}
-											size="sm"
-											variant="ghost"
-											className="h-6 w-6 p-0"
-											title="Copy update command"
-										/>
-									</div>
-									<p className="text-xs text-muted-foreground text-left">
-										{isDockerInstallation
-											? "Detected: Docker 🐳"
-											: isBinaryInstallation
-												? "Detected: Binary Installation 📦"
-												: `Detected: ${detectedPackageManager} 📦`}
-									</p>
-								</div>
-							)}
-							{updateStatus === "current" && (
-								<p className="mt-1 text-xs text-muted-foreground text-left">
-									Version {version.replace(/^v/, "")}
-								</p>
-							)}
-							{updateStatus === "error" && updateError && (
-								<p className="mt-1 text-xs text-destructive text-left break-words">
-									{updateError}
-								</p>
-							)}
+							<UpdateStatusDetails
+								status={updateStatus}
+								result={updateResult}
+							/>
 						</div>
 
 						<div className="hidden lg:flex items-center justify-between">

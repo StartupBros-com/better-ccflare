@@ -1,9 +1,18 @@
 #!/usr/bin/env bun
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+	readTombiiTaggedBuildEvidence,
+	releaseBuildDefines,
+} from "./build-provenance";
 
-interface Platform {
+export {
+	type ReleaseBuildEvidence,
+	releaseBuildDefines,
+} from "./build-provenance";
+
+export interface Platform {
 	target: string;
 	outfile: string;
 	description: string;
@@ -39,6 +48,40 @@ const platforms: Platform[] = [
 		description: "Windows x86_64",
 	},
 ];
+
+function platformSelectors(value: string): string[] {
+	return value
+		.split(",")
+		.map((selector) => selector.trim())
+		.filter(Boolean);
+}
+
+function matchesPlatform(platform: Platform, selector: string): boolean {
+	return platform.target === selector || platform.outfile === selector;
+}
+
+export function platformsForBuild(
+	onlyPlatforms = process.env.CCFLARE_ONLY_PLATFORMS ?? "",
+	skipPlatforms = process.env.CCFLARE_SKIP_PLATFORMS ?? "",
+): Platform[] {
+	const only = platformSelectors(onlyPlatforms);
+	const skip = platformSelectors(skipPlatforms);
+	const unknown = only.find(
+		(selector) =>
+			!platforms.some((platform) => matchesPlatform(platform, selector)),
+	);
+	if (unknown) {
+		throw new Error(
+			`CCFLARE_ONLY_PLATFORMS contains an unknown platform: ${unknown}`,
+		);
+	}
+	return platforms.filter(
+		(platform) =>
+			(only.length === 0 ||
+				only.some((selector) => matchesPlatform(platform, selector))) &&
+			!skip.some((selector) => matchesPlatform(platform, selector)),
+	);
+}
 
 async function buildWorker() {
 	console.log("🔨 Building workers...");
@@ -163,17 +206,31 @@ async function buildPlatform(platform: Platform) {
 		? `${packageJson.version}+${suffix}`
 		: packageJson.version;
 
-	const buildCmd = [
-		"bun build src/main.ts",
+	const releaseContext =
+		process.env.CCFLARE_BUILD_PRODUCER === "github-release-binary"
+			? "github-release-binary"
+			: undefined;
+	const evidence = readTombiiTaggedBuildEvidence(version, releaseContext);
+	const buildArgs = [
+		"build",
+		"src/main.ts",
 		"--compile",
-		`--outfile dist/${platform.outfile}`,
+		"--outfile",
+		`dist/${platform.outfile}`,
 		`--target=${platform.target}`,
 		"--minify",
-		`--define __BETTER_CCFLARE_VERSION__='"${version}"'`,
-	].join(" ");
+		"--define",
+		`__BETTER_CCFLARE_VERSION__=${JSON.stringify(version)}`,
+		...releaseBuildDefines(evidence, "github-release-binary"),
+	];
+	if (!evidence) {
+		console.warn(
+			"Building without distribution provenance: a binary must match its exact v<version> tag and full SHA before it can publish runtime evidence.",
+		);
+	}
 
 	try {
-		execSync(buildCmd, { stdio: "inherit" });
+		execFileSync("bun", buildArgs, { stdio: "inherit" });
 		console.log(`✅ ${platform.description} build complete\n`);
 	} catch (error) {
 		console.error(`❌ Failed to build for ${platform.description}`);
@@ -190,13 +247,7 @@ async function main() {
 	// Build worker first
 	await buildWorker();
 
-	const skip = (process.env.CCFLARE_SKIP_PLATFORMS ?? "")
-		.split(",")
-		.map((s) => s.trim())
-		.filter(Boolean);
-	const platformsToBuild = platforms.filter(
-		(p) => !skip.includes(p.target) && !skip.includes(p.outfile),
-	);
+	const platformsToBuild = platformsForBuild();
 
 	// Build for selected platforms
 	for (const platform of platformsToBuild) {
@@ -210,7 +261,9 @@ async function main() {
 	}
 }
 
-main().catch((error) => {
-	console.error("Build failed:", error);
-	process.exit(1);
-});
+if (import.meta.main) {
+	main().catch((error) => {
+		console.error("Build failed:", error);
+		process.exit(1);
+	});
+}

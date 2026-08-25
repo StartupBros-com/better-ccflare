@@ -1,4 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
+import { getGitSha, getVersionSync } from "@better-ccflare/core";
 import type { Account, HealthResponse } from "@better-ccflare/types";
 
 mock.module("@better-ccflare/database", () => ({
@@ -84,7 +85,20 @@ describe("health runtime payload", () => {
 		const handler = createHealthHandler(
 			db,
 			config,
-			() => ({ healthy: true, failureCount: 0, recentDrops: 0, queuedJobs: 2 }),
+			() => ({
+				healthy: true,
+				failureCount: 0,
+				recentDrops: 0,
+				queuedJobs: 2,
+				metadataQueuedJobs: 2,
+				payloadQueuedJobs: 0,
+				payloadBytesPending: 0,
+				oldestMetadataAgeMs: 0,
+				oldestPayloadAgeMs: 0,
+				metadataDropped: 0,
+				payloadDropped: 0,
+				payloadDroppedBytes: 0,
+			}),
 			() => ({
 				state: "healthy",
 			}),
@@ -99,10 +113,9 @@ describe("health runtime payload", () => {
 		expect(body.accounts).toBe(3);
 		expect(body.strategy).toBe("session");
 		expect(body.runtime).toBeDefined();
-		expect(body.runtime?.asyncWriter).toEqual({
+		expect(body.runtime?.asyncWriter).toMatchObject({
 			healthy: true,
 			failureCount: 0,
-			recentDrops: 0,
 			queuedJobs: 2,
 		});
 		expect(body.runtime?.usageWorker).toEqual({
@@ -808,14 +821,14 @@ describe("?detail=1 parameter", () => {
 			rate_limited_reason: null,
 			rate_limited_at: null,
 		});
-		expect(body.accounts_detail[1]).toEqual({
+		expect(body.accounts_detail?.[1]).toEqual({
 			name: "acc2",
 			status: "paused",
 			rate_limited_until: null,
 			rate_limited_reason: null,
 			rate_limited_at: null,
 		});
-		expect(body.accounts_detail[2]).toEqual({
+		expect(body.accounts_detail?.[2]).toEqual({
 			name: "acc3",
 			status: "rate_limited",
 			rate_limited_until: expect.any(Number),
@@ -998,6 +1011,12 @@ describe("health build-time provenance", () => {
 		"CCFLARE_GIT_REF",
 		"CCFLARE_BUILD_DATE",
 		"CCFLARE_VERSION",
+		"CCFLARE_DISTRIBUTION",
+		"CCFLARE_PRODUCER",
+		"CCFLARE_ARTIFACT_MODE",
+		"CCFLARE_UPDATE_CHANNEL",
+		"CCFLARE_SOURCE_SHA",
+		"CCFLARE_SOURCE_REF",
 		"BETTER_CCFLARE_VERSION",
 		"npm_package_version",
 	] as const;
@@ -1061,6 +1080,40 @@ describe("health build-time provenance", () => {
 			expect(response.status).toBe(200);
 			expect(body.git_ref).toBe("deploy/test");
 			expect(body.build_date).toBe("2026-08-01T00:00:00Z");
+		} finally {
+			restoreEnv(saved);
+		}
+	});
+
+	it("exposes only validated distribution fields without altering health identity", async () => {
+		const saved = snapshotEnv();
+		process.env.CCFLARE_GIT_SHA = "abcdef1234567890abcdef1234567890abcdef12";
+		process.env.CCFLARE_GIT_REF = "refs/heads/main";
+		process.env.CCFLARE_BUILD_DATE = "2026-08-01T00:00:00Z";
+		process.env.CCFLARE_DISTRIBUTION = "v1:startupbros-managed-source";
+		process.env.CCFLARE_PRODUCER = "startupbros";
+		process.env.CCFLARE_ARTIFACT_MODE = "managed-source";
+		process.env.CCFLARE_SOURCE_SHA = process.env.CCFLARE_GIT_SHA;
+		process.env.CCFLARE_SOURCE_REF = process.env.CCFLARE_GIT_REF;
+		delete process.env.CCFLARE_UPDATE_CHANNEL;
+		try {
+			const response = await createHealthHandler(
+				makeDb(),
+				makeConfig(),
+			)(new URL("http://localhost/health"));
+			const body = (await response.json()) as Record<string, unknown>;
+			expect(body.version).toBe(getVersionSync());
+			expect(body.git_sha).toBe(getGitSha());
+			expect(body.git_ref).toBe("refs/heads/main");
+			expect(body.build_date).toBe("2026-08-01T00:00:00Z");
+			expect(body.distribution).toEqual({
+				identity: "v1:startupbros-managed-source",
+				producer: "startupbros",
+				artifactMode: "managed-source",
+				proven: true,
+				reason: "proven_non_actionable",
+			});
+			expect(JSON.stringify(body)).not.toContain("CCFLARE_SOURCE_SHA");
 		} finally {
 			restoreEnv(saved);
 		}

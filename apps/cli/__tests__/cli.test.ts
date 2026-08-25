@@ -289,6 +289,29 @@ describe("CLI Integration Tests", () => {
 			// Should complete in less than 2 seconds (fast exit)
 			expect(duration).toBeLessThan(2000);
 		});
+
+		it("prints only the embedded git SHA before initialization", async () => {
+			const sha = "abcdef1234567890abcdef1234567890abcdef12";
+			const result = await runCLI(["--git-sha"], {
+				BETTER_CCFLARE_GIT_SHA: sha,
+				BETTER_CCFLARE_DB_PATH: "/proc/better-ccflare-must-not-open/version.db",
+			});
+
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toBe(`${sha}\n`);
+			expect(result.stderr).toBe("");
+		});
+
+		it("fails the git SHA command when the binary has no embedded SHA", async () => {
+			const result = await runCLI(["--git-sha"], {
+				BETTER_CCFLARE_GIT_SHA: "",
+				BETTER_CCFLARE_DB_PATH: "/proc/better-ccflare-must-not-open/version.db",
+			});
+
+			expect(result.exitCode).toBe(1);
+			expect(result.stdout).toBe("");
+			expect(result.stderr).toContain("Git SHA is unavailable");
+		});
 	});
 
 	describe("Help Command", () => {

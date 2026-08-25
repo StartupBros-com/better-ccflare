@@ -134,6 +134,217 @@ validate_deploy_owned_systemd_pin() {
 	' "$input"
 }
 
+preserve_unmanaged_systemd_environment() {
+	if [[ "$#" -ne 1 || ! -f "$1" ]]; then
+		echo "preserve_unmanaged_systemd_environment requires an existing systemd drop-in" >&2
+		return 2
+	fi
+
+	# Preserve unowned assignments from mixed Environment= directives one token at
+	# a time. Keeping their original token spelling retains systemd's quoting and
+	# embedded-space semantics while replacing only the explicit deployment keys.
+	node - "$1" <<'NODE'
+const fs = require("node:fs");
+const input = process.argv[2];
+const managedBegin = "# BEGIN better-ccflare managed deployment";
+const managedEnd = "# END better-ccflare managed deployment";
+const deployOwned = new Set([
+  "CCFLARE_BIN",
+  "CCFLARE_DISTRIBUTION",
+  "CCFLARE_PRODUCER",
+  "CCFLARE_ARTIFACT_MODE",
+  "CCFLARE_GIT_SHA",
+  "CCFLARE_GIT_REF",
+  "CCFLARE_SOURCE_SHA",
+  "CCFLARE_SOURCE_REF",
+  "CCFLARE_UPDATE_CHANNEL",
+  "CCFLARE_VERSION",
+  "CCFLARE_BUILD_DATE",
+  "CCFLARE_CHECKOUT_SHA",
+  "CCFLARE_EVENT_SHA",
+  "CCFLARE_TAG_SHA",
+  "CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES",
+  "CCFLARE_MAX_BODY_ADMISSION_QUEUE",
+  "GUARD_SCRIPT",
+  "GUARD_SOURCE_ID",
+  "GUARD_POLICY_ID",
+  "GUARD_SHA256",
+  "GUARD_POLICY_SHA256",
+  "GUARD_MAX_REQUEST_BODY_BYTES",
+  "GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES",
+  "GUARD_TOTAL_DEADLINE_MS",
+  "GUARD_RETRY_ATTEMPT_HEADROOM_MS",
+  "GUARD_MAX_RECOVERY_SLEEP_MS",
+  "GUARD_MAX_RECOVERY_WAITS",
+  "GUARD_SHUTDOWN_GRACE_MS",
+  "RUNNER_SHA256",
+  "RUNNER_FAILURE_STOP_BUDGET_MS",
+]);
+
+const decodeEscape = (input, index) => {
+  const escape = input[index + 1];
+  if (escape === undefined) throw new Error("invalid escape: trailing backslash");
+  const singleCharacterEscapes = {
+    a: "\x07",
+    b: "\b",
+    f: "\f",
+    n: "\n",
+    r: "\r",
+    t: "\t",
+    v: "\v",
+    "\\": "\\",
+    '"': '"',
+    "'": "'",
+    s: " ",
+  };
+  if (Object.hasOwn(singleCharacterEscapes, escape)) {
+    return { next: index + 2, value: singleCharacterEscapes[escape] };
+  }
+  if (/^[0-7]$/.test(escape)) {
+    const encoded = input.slice(index + 1, index + 4);
+    if (!/^[0-7]{3}$/.test(encoded)) {
+      throw new Error("invalid escape: octal escape requires three digits");
+    }
+    return { next: index + 4, value: String.fromCodePoint(Number.parseInt(encoded, 8)) };
+  }
+
+  const fixedWidthEscape = (width, label) => {
+    const encoded = input.slice(index + 2, index + 2 + width);
+    if (!new RegExp(`^[0-9A-Fa-f]{${width}}$`).test(encoded)) {
+      throw new Error(`invalid escape: \\${label} requires ${width} hexadecimal digits`);
+    }
+    const codePoint = Number.parseInt(encoded, 16);
+    if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+      throw new Error(`invalid escape: \\${label}${encoded} is not a Unicode scalar value`);
+    }
+    return { next: index + 2 + width, value: String.fromCodePoint(codePoint) };
+  };
+  if (escape === "x") return fixedWidthEscape(2, "x");
+  if (escape === "u") return fixedWidthEscape(4, "u");
+  if (escape === "U") return fixedWidthEscape(8, "U");
+  throw new Error(`invalid escape: \\${escape}`);
+};
+
+const splitWords = (input) => {
+  const words = [];
+  let value = "";
+  let rawStart = -1;
+  let quote = null;
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    if (rawStart === -1 && /\s/.test(char)) continue;
+    if (rawStart === -1) rawStart = index;
+    if (char === "\\") {
+      const decoded = decodeEscape(input, index);
+      value += decoded.value;
+      index = decoded.next - 1;
+      continue;
+    }
+    if (quote !== null) {
+      if (char === quote) quote = null;
+      else value += char;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+    } else if (/\s/.test(char)) {
+      words.push({ raw: input.slice(rawStart, index), value });
+      rawStart = -1;
+      value = "";
+    } else {
+      value += char;
+    }
+  }
+  if (quote !== null) throw new Error("unterminated quote");
+  if (rawStart !== -1) words.push({ raw: input.slice(rawStart), value });
+  return words;
+};
+
+let text;
+try {
+  text = fs.readFileSync(input, "utf8");
+  const logicalLines = [];
+  let continued = "";
+  for (const physical of text.split(/\r?\n/)) {
+    if (continued.length > 0 && /^[\t ]*[#;]/.test(physical)) continue;
+    const current = continued + physical;
+    let slashCount = 0;
+    for (let index = current.length - 1; index >= 0 && current[index] === "\\"; index -= 1) {
+      slashCount += 1;
+    }
+    if (slashCount % 2 === 1) {
+      continued = current.slice(0, -1) + " ";
+      continue;
+    }
+    logicalLines.push(current);
+    continued = "";
+  }
+  if (continued.length > 0) logicalLines.push(continued);
+
+  let insideManagedBlock = false;
+  let section = "";
+  // systemd accumulates Environment= assignments in order within [Service]. An
+  // empty directive clears the accumulated list and a repeated name replaces its
+  // earlier value. Keep the final raw token and its directive to retain both
+  // quoting and mixed-directive rendering.
+  const effective = new Map();
+  const preservedDirectives = [];
+  for (const line of logicalLines) {
+    if (line === managedBegin) {
+      insideManagedBlock = true;
+      section = "";
+      continue;
+    }
+    if (line === managedEnd) {
+      insideManagedBlock = false;
+      section = "";
+      continue;
+    }
+    if (!insideManagedBlock) continue;
+    const trimmed = line.trim();
+    const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
+    if (sectionMatch) {
+      section = sectionMatch[1];
+      continue;
+    }
+    if (section !== "Service") continue;
+    const assignment = line.match(/^\s*Environment\s*=(.*)$/);
+    if (!assignment) continue;
+    const tokens = splitWords(assignment[1]);
+    if (
+      assignment[1].trim().length === 0 ||
+      (tokens.length === 1 && tokens[0].value === "")
+    ) {
+      effective.clear();
+      continue;
+    }
+    const directive = [];
+    for (const token of tokens) {
+      const equals = token.value.indexOf("=");
+      if (equals <= 0) continue;
+      const name = token.value.slice(0, equals);
+      if (deployOwned.has(name)) continue;
+      const preserved = { name, raw: token.raw };
+      directive.push(preserved);
+      effective.set(name, preserved);
+    }
+    if (directive.length > 0) preservedDirectives.push(directive);
+  }
+  for (const directive of preservedDirectives) {
+    const finalTokens = directive
+      .filter((token) => effective.get(token.name) === token)
+      .map((token) => token.raw);
+    if (finalTokens.length > 0) {
+      process.stdout.write(`Environment=${finalTokens.join(" ")}\n`);
+    }
+  }
+} catch (error) {
+  console.error("invalid systemd Environment directive: " + error.message);
+  process.exit(2);
+}
+NODE
+}
+
 render_systemd_pin() {
 	if [[ "$#" -ne 8 ]]; then
 		echo "render_systemd_pin requires: input output binary runner guard source-id policy-id guard-policy-script" >&2
@@ -160,10 +371,16 @@ render_systemd_pin() {
 	# three paths to already be real, existing files when this function runs
 	# — true in the real deploy flow, where they are staged before the pin is
 	# rendered.
-	local guard_sha256 guard_policy_sha256 runner_sha256
+	local guard_sha256 guard_policy_sha256 runner_sha256 preserved_environment_lines
 	guard_sha256="$(sha256_file "$guard_script")" || return 2
 	guard_policy_sha256="$(sha256_file "$guard_policy_script")" || return 2
 	runner_sha256="$(sha256_file "$runner")" || return 2
+
+	# Preserve unrelated service environment entries. The renderer owns its
+	# explicit CCFLARE_/GUARD_/RUNNER_ identity and policy keys, but a mixed
+	# Environment= directive must retain each unowned assignment.
+	preserved_environment_lines="$(preserve_unmanaged_systemd_environment "$input")" \
+		|| return "$?"
 
 	{
 		printf '%s\n' "$managed_begin"
@@ -171,7 +388,19 @@ render_systemd_pin() {
 		printf 'StartLimitIntervalSec=%s\n' "$start_limit_interval"
 		printf 'StartLimitBurst=%s\n' "$start_limit_burst"
 		printf '%s\n' "[Service]"
+		if [[ -n "$preserved_environment_lines" ]]; then
+			printf '%s\n' "$preserved_environment_lines"
+		fi
 		printf 'Environment=%s\n' "CCFLARE_BIN=$binary"
+		# A production source deployment is an exact, non-actionable identity.
+		# Keep redundant fields adjacent so stale or conflicting pins fail closed.
+		printf '%s\n' "Environment=CCFLARE_DISTRIBUTION=v1:startupbros-managed-source"
+		printf '%s\n' "Environment=CCFLARE_PRODUCER=startupbros"
+		printf '%s\n' "Environment=CCFLARE_ARTIFACT_MODE=managed-source"
+		printf 'Environment=%s\n' "CCFLARE_GIT_SHA=$source_id"
+		printf '%s\n' "Environment=CCFLARE_GIT_REF=refs/heads/main"
+		printf 'Environment=%s\n' "CCFLARE_SOURCE_SHA=$source_id"
+		printf '%s\n' "Environment=CCFLARE_SOURCE_REF=refs/heads/main"
 		printf 'Environment=%s\n' "GUARD_SCRIPT=$guard_script"
 		printf 'Environment=%s\n' "GUARD_SOURCE_ID=$source_id"
 		printf 'Environment=%s\n' "GUARD_POLICY_ID=$policy_id"
@@ -259,6 +488,7 @@ try {
 const logicalLines = [];
 let continued = "";
 for (const physical of text.split(/\r?\n/)) {
+	if (continued.length > 0 && /^[\t ]*[#;]/.test(physical)) continue;
 	const current = continued + physical;
 	let slashCount = 0;
 	for (let i = current.length - 1; i >= 0 && current[i] === "\\"; i -= 1) {
@@ -273,6 +503,50 @@ for (const physical of text.split(/\r?\n/)) {
 }
 if (continued.length > 0) logicalLines.push(continued);
 
+const decodeEscape = (input, index) => {
+	const escape = input[index + 1];
+	if (escape === undefined) throw new Error("invalid escape: trailing backslash");
+	const singleCharacterEscapes = {
+		a: "\x07",
+		b: "\b",
+		f: "\f",
+		n: "\n",
+		r: "\r",
+		t: "\t",
+		v: "\v",
+		"\\": "\\",
+		'"': '"',
+		"'": "'",
+		s: " ",
+	};
+	if (Object.hasOwn(singleCharacterEscapes, escape)) {
+		return { next: index + 2, value: singleCharacterEscapes[escape] };
+	}
+	if (/^[0-7]$/.test(escape)) {
+		const encoded = input.slice(index + 1, index + 4);
+		if (!/^[0-7]{3}$/.test(encoded)) {
+			throw new Error("invalid escape: octal escape requires three digits");
+		}
+		return { next: index + 4, value: String.fromCodePoint(Number.parseInt(encoded, 8)) };
+	}
+
+	const fixedWidthEscape = (width, label) => {
+		const encoded = input.slice(index + 2, index + 2 + width);
+		if (!new RegExp(`^[0-9A-Fa-f]{${width}}$`).test(encoded)) {
+			throw new Error(`invalid escape: \\${label} requires ${width} hexadecimal digits`);
+		}
+		const codePoint = Number.parseInt(encoded, 16);
+		if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+			throw new Error(`invalid escape: \\${label}${encoded} is not a Unicode scalar value`);
+		}
+		return { next: index + 2 + width, value: String.fromCodePoint(codePoint) };
+	};
+	if (escape === "x") return fixedWidthEscape(2, "x");
+	if (escape === "u") return fixedWidthEscape(4, "u");
+	if (escape === "U") return fixedWidthEscape(8, "U");
+	throw new Error(`invalid escape: \\${escape}`);
+};
+
 const splitWords = (input) => {
 	const words = [];
 	let word = "";
@@ -280,14 +554,16 @@ const splitWords = (input) => {
 	let started = false;
 	for (let i = 0; i < input.length; i += 1) {
 		const char = input[i];
+		if (char === "\\") {
+			const decoded = decodeEscape(input, i);
+			word += decoded.value;
+			i = decoded.next - 1;
+			started = true;
+			continue;
+		}
 		if (quote !== null) {
-			if (char === quote) {
-				quote = null;
-			} else if (char === "\\" && quote === '"' && i + 1 < input.length) {
-				word += input[++i];
-			} else {
-				word += char;
-			}
+			if (char === quote) quote = null;
+			else word += char;
 			started = true;
 			continue;
 		}
@@ -300,9 +576,6 @@ const splitWords = (input) => {
 				word = "";
 				started = false;
 			}
-		} else if (char === "\\" && i + 1 < input.length) {
-			word += input[++i];
-			started = true;
 		} else {
 			word += char;
 			started = true;
@@ -333,11 +606,12 @@ try {
 		if (!assignment) continue;
 		const [, name, raw] = assignment;
 		if (kind === "environment" && name === "Environment") {
-			if (raw.trim().length === 0) {
+			const items = splitWords(raw);
+			if (raw.trim().length === 0 || (items.length === 1 && items[0] === "")) {
 				environment.clear();
 				continue;
 			}
-			for (const item of splitWords(raw)) {
+			for (const item of items) {
 				const equals = item.indexOf("=");
 				if (equals <= 0) continue;
 				const name = item.slice(0, equals);
