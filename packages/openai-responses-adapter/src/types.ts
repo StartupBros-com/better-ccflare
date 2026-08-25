@@ -37,7 +37,7 @@ export type ResponseItem =
 
 export interface ResponseMessageItem {
 	type: "message";
-	role: "user" | "assistant";
+	role: "user" | "assistant" | "developer";
 	id?: string;
 	// OpenAI permits a string shorthand (equivalent to a single input_text
 	// part) in addition to the structured array form.
@@ -177,7 +177,7 @@ export interface ResponsesFunctionTool {
 	type: "function";
 	name: string;
 	description?: string;
-	parameters?: Record<string, unknown>; // JSON Schema
+	parameters?: Record<string, unknown> | null; // JSON Schema
 	strict?: boolean;
 }
 

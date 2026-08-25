@@ -305,6 +305,12 @@ export function translateRequestToAnthropic(
 		const itemType = item.type;
 
 		if (item.type === "message") {
+			const role: unknown = item.role;
+			if (role !== "user" && role !== "assistant" && role !== "developer") {
+				emitWarn("Dropping message with unsupported role");
+				continue;
+			}
+
 			// OpenAI permits content as either a string (shorthand for a single
 			// input_text part) or an array of structured parts; normalize both
 			// into a parts array before validating each part below. Anything
@@ -317,7 +323,7 @@ export function translateRequestToAnthropic(
 				parts = item.content as unknown[];
 			} else {
 				emitWarn(
-					`Dropping message with role "${item.role}" — content is neither a string nor an array, cannot translate`,
+					`Dropping message with role "${role}" — content is neither a string nor an array, cannot translate`,
 				);
 				continue;
 			}
@@ -348,12 +354,12 @@ export function translateRequestToAnthropic(
 			// At most two summary warns for the whole batch, never one per element.
 			if (malformedCount > 0) {
 				emitWarn(
-					`Dropped ${malformedCount} malformed content part(s) in message with role "${item.role}" — not objects`,
+					`Dropped ${malformedCount} malformed content part(s) in message with role "${role}" — not objects`,
 				);
 			}
 			if (rejectedCount > 0) {
 				emitWarn(
-					`Dropped ${rejectedCount} unsupported/invalid content part(s) in message with role "${item.role}"`,
+					`Dropped ${rejectedCount} unsupported/invalid content part(s) in message with role "${role}"`,
 				);
 			}
 			if (malformedCount === 0 && rejectedCount === 0 && content.length === 0) {
@@ -361,7 +367,7 @@ export function translateRequestToAnthropic(
 				// the parts array was empty to begin with) — the two summary warns
 				// above already explain a filtered-to-empty result.
 				emitWarn(
-					`Dropping message with role "${item.role}" — no usable content parts after filtering`,
+					`Dropping message with role "${role}" — no usable content parts after filtering`,
 				);
 			}
 
@@ -373,13 +379,13 @@ export function translateRequestToAnthropic(
 			// developer role is used by Codex CLI for system-level instructions.
 			// Anthropic /v1/messages does not accept this role in the messages array
 			// so we extract the text and merge it into the system prompt instead.
-			if ((item.role as string) === "developer") {
+			if (role === "developer") {
 				for (const c of content) {
 					if (c.type === "text") developerBlocks.push(c.text);
 				}
 				continue;
 			}
-			messages.push({ role: item.role, content });
+			messages.push({ role, content });
 			continue;
 		}
 

@@ -1033,6 +1033,62 @@ describe("Responses request body admission", () => {
 			]);
 		});
 
+		test("drops a hostile non-string message role without throwing", async () => {
+			let forwarded: { messages?: unknown } | undefined;
+			let calls = 0;
+			const proxy: HandleProxyFn = async (proxyRequest) => {
+				calls += 1;
+				forwarded = (await proxyRequest.json()) as typeof forwarded;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: { toString: null, valueOf: null },
+						content: [],
+					},
+					{ type: "message", role: "user", content: "keep me" },
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls).toBe(1);
+			expect(forwarded?.messages).toEqual([
+				{ role: "user", content: [{ type: "text", text: "keep me" }] },
+			]);
+		});
+
+		test("rejects empty string input before proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({ model: "claude-haiku-4-5", input: "" });
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(400);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "input must contain at least one translatable message",
+				},
+			});
+		});
+
 		test("rejects non-array tools with the invalid-request envelope before proxying", async () => {
 			for (const tools of [null, {}, "not-an-array"]) {
 				const [proxy, calls] = countingProxy();

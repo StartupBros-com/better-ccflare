@@ -335,15 +335,13 @@ describe("translateRequestToAnthropic", () => {
 	});
 
 	test("function tool with null parameters keeps required tool choice and normalizes its schema", () => {
-		const req = {
+		const req: ResponsesRequest & { input: ResponseItem[] } = {
 			model: "claude-3-5-sonnet-20241022",
 			input: [],
 			tools: [{ type: "function", name: "simple_tool", parameters: null }],
 			tool_choice: "required",
 		};
-		const result = translateRequestToAnthropic(
-			req as unknown as ResponsesRequest & { input: ResponseItem[] },
-		);
+		const result = translateRequestToAnthropic(req);
 		expect(result.tools).toEqual([
 			{ name: "simple_tool", description: undefined, input_schema: {} },
 		]);
@@ -1174,8 +1172,7 @@ describe("translateRequestToAnthropic", () => {
 			input: [
 				{
 					type: "message",
-					// biome-ignore lint/suspicious/noExplicitAny: exercising the Codex CLI "developer" role, which is outside the user|assistant role type
-					role: "developer" as any,
+					role: "developer",
 					content: "system instr",
 				},
 			],

@@ -375,6 +375,12 @@ export async function handleResponsesRequest(
 	const anthropicBody = translateRequestToAnthropic(
 		body as typeof body & { input: ResponseItem[] },
 	);
+	if (anthropicBody.messages.length === 0) {
+		return openAiRequestError(
+			400,
+			"input must contain at least one translatable message",
+		);
+	}
 
 	// 4b. Preserve an existing valid Claude session envelope. Otherwise bridge
 	// the Responses identity into that envelope with documented precedence.
