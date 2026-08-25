@@ -1,8 +1,8 @@
 ---
-title: Upstream v3.5.66 Product-Fork Synchronization - Plan
+title: Upstream v3.5.67 Product-Fork Synchronization - Plan
 type: chore
 date: 2026-08-24
-topic: upstream-v3-5-66-sync
+topic: upstream-v3-5-67-sync
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
 product_contract_source: ce-plan-bootstrap
@@ -11,12 +11,12 @@ deepened: 2026-08-24
 origin_issue: https://github.com/StartupBros-com/better-ccflare/issues/260
 ---
 
-# Upstream v3.5.66 Product-Fork Synchronization - Plan
+# Upstream v3.5.67 Product-Fork Synchronization - Plan
 
 ## Goal Capsule
 
-- **Objective:** Synchronize tombii/better-ccflare v3.5.66 into the StartupBros product fork without losing fork-only routing, recovery, provider, usage, persistence, observability, or deployment behavior.
-- **Means:** Characterize protected contracts first, harden fork-aware update provenance, then complete one topology-preserving merge of exact upstream commit `db894ef34ed140a4ec495253da79824eb811010a` using a per-conflict semantic ledger and an all-upstream-commit completeness audit.
+- **Objective:** Synchronize tombii/better-ccflare v3.5.67 into the StartupBros product fork without losing fork-only routing, recovery, provider, usage, persistence, observability, or deployment behavior.
+- **Means:** Characterize protected contracts first, harden fork-aware update provenance, then complete one topology-preserving merge of exact upstream commit `ebc904903dc828338cd2d5da707b0d3dd2d0922f` using a per-conflict semantic ledger and an all-upstream-commit completeness audit.
 - **Authority:** Product Requirements govern behavior; Key Technical Decisions govern integration mechanics. The current post-PR #261 baseline is planning evidence, but execution starts by refreshing it against `origin/main`.
 - **Execution profile:** Eight units. U1 and U2 create fork-parent safeguards. U3-U7 are semantic work packets inside one unresolved integration merge, not separate merge-resolution commits. U8 finalizes topology, provenance, documentation, review, and CI evidence.
 - **Stop conditions:** Stop before source changes if issue staleness reveals that main already supersedes or invalidates issue #260; if target tag provenance does not peel to the pinned SHA; if PostgreSQL rehearsal cannot use a disposable loopback database whose name contains `test`; if a resolution would weaken a protected contract without explicit operator approval; or if verification would require scripted Anthropic-backed traffic.
@@ -29,13 +29,13 @@ origin_issue: https://github.com/StartupBros-com/better-ccflare/issues/260
 
 ### Summary
 
-The StartupBros repository remains an intentional product fork, not a mutable mirror of tombii releases. It will ingest the complete pinned v3.5.66 source history while keeping the fork’s stricter routing, response-lifecycle, persistence, provider, and deployment contracts.
+The StartupBros repository remains an intentional product fork, not a mutable mirror of tombii releases. It will ingest the complete pinned v3.5.67 source history while keeping the fork’s stricter routing, response-lifecycle, persistence, provider, and deployment contracts.
 
 The normal dashboard, npm, binary, and Docker update recommendations are unsafe for managed-source fork installations because they point at mutable tombii artifacts. This synchronization therefore includes explicit installation provenance and fail-closed update guidance rather than treating a package update as source synchronization.
 
 ### Problem Frame
 
-The fork and upstream share merge base `0ad2f93d9e0c75e7b575006d12433d33a358df50` (v3.5.55), but both sides changed the same high-coupling runtime paths. At the verified post-PR #261 planning baseline, `origin/main` is `f65e5768f842853e60fc1f411eedf5281b0bc52b`, the upstream target is `db894ef34ed140a4ec495253da79824eb811010a`, the graph contains 790 fork-only and 116 upstream-only commits with zero patch-equivalent commits, and a trial merge reports 59 content conflicts, five add/add conflicts, and one modify/delete conflict. These figures are discovery evidence, not fixed acceptance criteria; execution must recompute them.
+The fork and upstream share merge base `0ad2f93d9e0c75e7b575006d12433d33a358df50` (v3.5.55), but both sides changed the same high-coupling runtime paths. At the refreshed execution baseline, fork parent `8c60a1663a5b973b30d22828cb5205777ab2365a` includes PR #261 and the U1/U2 safeguards, the upstream target is `ebc904903dc828338cd2d5da707b0d3dd2d0922f`, the graph contains 801 fork-only and 120 upstream-only commits with zero patch-equivalent commits, and the regenerated trial merge reports 62 content conflicts, two add/add conflicts, one modify/delete conflict, and 42 clean two-sided shared paths. These figures are machine-validated execution evidence and must be regenerated if either parent changes.
 
 A package-only update would discard reviewed fork behavior. A wholesale “ours” or “theirs” conflict policy would also be unsafe because explicit conflicts and clean shared hunks cross routing precedence, terminal response recovery, stream ownership, Codex Responses translation, dual-dialect migrations, canonical usage windows, and operator controls.
 
@@ -51,7 +51,7 @@ A package-only update would discard reviewed fork behavior. A wholesale “ours�
 ### Key Decisions
 
 - **Keep and minimize the product fork.** (session-settled: user-directed — chosen over retiring the fork or treating it as a mirror: the audit found material fork-only routing, recovery, usage, provider, and deployment value.) Governs R1-R14.
-- **Synchronize the full pinned v3.5.66 source with preserved topology.** (session-settled: user-approved — chosen over package update, selective version bumps, rebase, squash, or tree replacement: the user approved a proper source merge after the audit.) Governs R1-R3, R18.
+- **Synchronize the full pinned v3.5.67 source with preserved topology.** (session-settled: user-approved — chosen over package update, selective version bumps, rebase, squash, or tree replacement: the user approved a proper source merge after the audit.) Governs R1-R3, R18.
 - **Protect the merged issue #251 response-provenance fix as the fork parent.** (session-settled: user-approved — chosen over merging from the pre-fix baseline: PR #261 is a prerequisite because it establishes final-attempt model provenance before stream teeing.) Governs R5.
 - **Harden updater provenance in this synchronization.** (session-settled: user-approved — chosen over leaving the existing npm/tombii fallback in place: a managed-source fork must not recommend replacing itself with unreviewed upstream artifacts.) Governs R13.
 - **Take the work through a CI-green, merge-ready candidate and hermetic provenance rehearsal only.** (session-settled: user-approved — chosen over stopping at source resolution or performing production deployment: the user approved fixture-only rehearsal while reserving the post-merge source gate and all live effects for separate authorization.) Governs R15-R17.
@@ -60,7 +60,7 @@ A package-only update would discard reviewed fork behavior. A wholesale “ours�
 
 **Source and auditability**
 
-- R1. The integration must merge exact peeled upstream commit `db894ef34ed140a4ec495253da79824eb811010a` into the refreshed fork parent as a real two-parent merge commit.
+- R1. The integration must merge exact peeled upstream commit `ebc904903dc828338cd2d5da707b0d3dd2d0922f` into the refreshed fork parent as a real two-parent merge commit.
 - R2. Every textual conflict, rerere application, and clean two-sided shared path must have a machine-readable inventory entry and a linked human ledger disposition recording upstream intent, protected fork behavior, selected resolution, focused evidence, acceptance-complete evidence, and reviewer disposition.
 - R3. Every upstream-only commit in the refreshed `merge-base..target` range must be classified as retained, semantically remapped, intentionally rejected with rationale, or already superseded by refreshed-main evidence; a validator must reject missing, duplicate, or unrecognized commit/path/conflict dispositions so no upstream behavior disappears silently.
 
@@ -76,13 +76,13 @@ A package-only update would discard reviewed fork behavior. A wholesale “ours�
 
 - R9. Every adopted SQLite table, column, index, ALTER, backfill, or runtime query must have equivalent PostgreSQL new-install, upgrade, index, backfill, repository, and retention behavior.
 - R10. Provider observations remain normalized to 0–100 usage. Inactive windows remain historical but cannot bind routing, trigger alerts, open or close a live value window, or affect value calculations.
-- R11. The five xAI/Muse add/add files must use the fork implementation as their behavioral base while importing narrowly verified upstream fixes; compatible accounts must remain fail-closed and may never default to `https://api.openai.com` when endpoint state is missing or invalid.
+- R11. The two xAI add/add paths must use the fork implementation as their behavioral base while importing narrowly verified upstream fixes. The upstream `muse-spark` → `meta` provider-identifier migration must preserve compatible existing accounts through idempotent SQLite and PostgreSQL backfill/rename and repository/API compatibility; compatible accounts must remain fail-closed and may never default to `https://api.openai.com` when endpoint state is missing or invalid.
 - R12. Every adopted persisted control must be traced through configuration/types, database, HTTP/API, CLI, and dashboard serialization; omitted values retain their current disabled behavior.
 
 **Operator and release safety**
 
 - R13. Update guidance must come from one server-authoritative, provenance-first status contract. Trusted artifact provenance includes installation mode (`managed-source`, `package`, `binary`, `docker`, or `unknown`), producer/distribution identity, permitted update channel, source SHA/ref origin, and explicit precedence/conflict rules. `managed-source`, `unknown`, invalid/conflicting metadata, and any artifact without mode plus truthful source SHA must not perform a remote update lookup or emit a mutable update command.
-- R14. A complete source merge must retain truthful v3.5.66 lineage in matching root and CLI manifests while identifying the fork artifact by build/runtime Git SHA and validated artifact provenance; it must not create a tag or perform an independent version bump.
+- R14. A complete source merge must retain truthful v3.5.67 lineage in matching root and CLI manifests while identifying the fork artifact by build/runtime Git SHA and validated artifact provenance; it must not create a tag or perform an independent version bump.
 - R15. A fresh candidate worktree must run `bun run build:cli` before Bun tests, run every affected test file in an isolated Bun process, sweep shared call sites with `grep -a`, and pass lint, typecheck, and format with no unintended diff.
 - R16. No scripted request may reach an Anthropic-backed account. Provider and protocol evidence must use deterministic fixtures, mocks, sanitized databases, or an explicitly force-routed non-Anthropic account if a later authorized canary requires live traffic.
 - R17. Issue #260 does not authorize full deployment, systemd mutation/restart, production database backup/restore, or live production health requests.
@@ -140,13 +140,13 @@ A package-only update would discard reviewed fork behavior. A wholesale “ours�
 - AE9. **Covers R11.** Given a compatible account with blank, malformed, or absent endpoint data, when URL resolution runs, then the account becomes unavailable and no branch resolves to the OpenAI default host.
 - AE10. **Covers R12.** Given upstream controls are absent from persisted configuration, when config, repository, API, CLI, and dashboard state round-trip, then exact-model, combo, and observation behavior remains disabled.
 - AE11. **Covers R13.** Given `managed-source`, `unknown`, failed provenance resolution, a mode/producer/channel conflict, or an artifact without source SHA, when update status is requested, then no registry/release/image lookup occurs and the UI shows fork-safe informational guidance. Only a validated producer/mode/channel/SHA combination may query and show its compatible distribution channel.
-- AE12. **Covers R14.** Given the complete integration contains the v3.5.66 target, when manifests and health provenance are inspected, then root/CLI versions agree on plain `3.5.66` and runtime SHA identifies the fork build without claiming byte identity with upstream.
+- AE12. **Covers R14.** Given the complete integration contains the v3.5.67 target, when manifests and health provenance are inspected, then root/CLI versions agree on plain `3.5.67` and runtime SHA identifies the fork build without claiming byte identity with upstream.
 - AE13. **Covers R15, R18.** Given a fresh worktree, when verification runs, then bootstrap precedes tests, affected files run separately, required final gates pass, and no prohibited/generated/unrelated file enters the diff.
 - AE14. **Covers R16.** Given provider protocol tests, when the suite runs, then every external call is mocked or force-routed to a non-Anthropic account; no scripted request can select `claude` or any other Anthropic-backed account.
 
 ### Success Criteria
 
-- The candidate contains a two-parent merge of exact upstream v3.5.66 source and refreshed fork main.
+- The candidate contains a two-parent merge of exact upstream v3.5.67 source and refreshed fork main.
 - The machine-readable inventory and validator account exactly once for every conflict, recorded rerere result, clean two-sided shared path, and refreshed upstream-only commit; the human ledger links each item to semantic review evidence.
 - Protected routing, response provenance, stream ownership, usage-window, endpoint, and deployment contracts pass focused regressions.
 - SQLite and PostgreSQL parity includes live catalog constraints/indexes, backfills, runtime repository behavior, idempotence, guarded target identities, backup checksums, immutable-source proof, and restored fingerprint equivalence.
@@ -156,7 +156,7 @@ A package-only update would discard reviewed fork behavior. A wholesale “ours�
 
 ### Scope Boundaries
 
-- No moving upstream target beyond `db894ef34ed140a4ec495253da79824eb811010a`; refreshed main changes only the fork parent and resolution inventory.
+- No moving upstream target beyond `ebc904903dc828338cd2d5da707b0d3dd2d0922f`; refreshed main changes only the fork parent and resolution inventory.
 - No retirement of the StartupBros fork and no conversion to an automatically tracking mirror.
 - No package-only, binary-only, Docker-only, rebase, squash, tree-replacement, or selective-release-cherry-pick substitute for the source merge.
 - No independent version bump, prerelease suffix, or new Git tag.
@@ -168,7 +168,7 @@ A package-only update would discard reviewed fork behavior. A wholesale “ours�
 ### Deferred to Follow-Up Work
 
 - Production deployment and guarded live verification after this candidate merges and the operator grants separate authorization.
-- Any new upstream release after v3.5.66.
+- Any new upstream release after v3.5.67.
 - Qwen changes unless R19’s refreshed-path trigger fires.
 
 ### Dependencies / Assumptions
@@ -176,7 +176,7 @@ A package-only update would discard reviewed fork behavior. A wholesale “ours�
 - PR #261 is merged as `f65e5768f842853e60fc1f411eedf5281b0bc52b`; execution verifies its final paths and behavior rather than trusting this planning snapshot.
 - The existing PostgreSQL CI pattern supplies PostgreSQL 16 at `better_ccflare_test`; local rehearsal must use an equivalent loopback/test-named disposable database and sanitized data.
 - `CONCEPTS.md` remains authoritative for canonical usage-window vocabulary and active/inactive semantics.
-- The v3.5.66 annotated tag continues to peel to the pinned target SHA.
+- The v3.5.67 annotated tag continues to peel to the pinned target SHA.
 - If refreshed main changes any assumption, U1 records the delta before resolution begins.
 
 ### Outstanding Questions
@@ -193,7 +193,7 @@ A package-only update would discard reviewed fork behavior. A wholesale “ours�
 
 ### Sources / Research
 
-- GitHub issue #260 and the completed v3.5.66 fork audit in this planning session.
+- GitHub issue #260 and the completed v3.5.67 fork audit in this planning session.
 - `AGENTS.md` — source-sync, testing, migration, worktree, and deployment constraints.
 - `UPSTREAM.md` — product-fork posture and currently stale cherry-pick-only wording.
 - `CONCEPTS.md` — canonical usage windows and active/inactive behavior.
@@ -213,8 +213,8 @@ A package-only update would discard reviewed fork behavior. A wholesale “ours�
 
 ### Key Technical Decisions
 
-- KTD1. **Rebaseline before branching or resolving.** Fetch current refs, run the issue-staleness command from issue creation date `2026-08-24`, verify PR #261 containment, peel the remote v3.5.66 tag, and recompute merge base, left/right and `--cherry-pick` counts, package versions, conflicts, add/add and modify/delete classes, and all clean two-sided paths. If new main work affects scope, stop for the required operator confirmation before code changes. Governs R1-R3, R18.
-- KTD2. **Put safeguards on the fork parent before opening the merge.** Add characterization/upstream-regression tests, a machine-readable inventory plus human-ledger skeleton, its validator, and the self-contained updater provenance hardening as reviewable commits before one `git merge --no-ff --no-commit db894ef…`. Derive commit and conflict sets from Git; define clean shared coverage as every non-conflicting path changed on both sides of the merge base; capture rerere applications separately. The validator rejects missing, duplicate, or unknown rows before resolution can complete. Governs R2, R3, R5, R13, R15.
+- KTD1. **Rebaseline before branching or resolving.** Fetch current refs, run the issue-staleness command from issue creation date `2026-08-24`, verify PR #261 containment, peel the remote v3.5.67 tag, and recompute merge base, left/right and `--cherry-pick` counts, package versions, conflicts, add/add and modify/delete classes, and all clean two-sided paths. If new main work affects scope, stop for the required operator confirmation before code changes. Governs R1-R3, R18.
+- KTD2. **Put safeguards on the fork parent before opening the merge.** Add characterization/upstream-regression tests, a machine-readable inventory plus human-ledger skeleton, its validator, and the self-contained updater provenance hardening as reviewable commits before one `git merge --no-ff --no-commit ebc9049…`. Derive commit and conflict sets from Git; define clean shared coverage as every non-conflicting path changed on both sides of the merge base; capture rerere applications separately. The validator rejects missing, duplicate, or unknown rows before resolution can complete. Governs R2, R3, R5, R13, R15.
 - KTD3. **Resolve by semantic cluster, never file order.** U3-U7 are work packets inside the same unresolved merge; each updates its ledger rows and runs focused tests before the integration commit is finalized. Rerere is a textual accelerator only, and every auto-resolution receives `git diff --cc` review. Governs R2-R12.
 - KTD4. **Hold the routing precedence in R4 as an executable contract.** Bring upstream `force_account_model`, combo, strict-drain, and routing-observation behavior in default-off and prove exact-model refusal before fallback. A forced model or combo cannot override profile, capability, mapping, affinity, capacity, pause, managed-policy, or degraded-replay fences. Governs R4, R6.
 - KTD5. **Treat `attemptedModel` as transport provenance.** Resolve `response-handler.ts` and `proxy-operations.ts` together; preserve the PR #261 scope and terminal recovery → guarded normalization → tee order, with byte equality between collector and client. Governs R5.
@@ -222,7 +222,7 @@ A package-only update would discard reviewed fork behavior. A wholesale “ours�
 - KTD7. **Separate the four stream ownership contracts.** `teeStream` exposes one client-readable stream and collector observation callbacks, not two independently cancellable branches. Adopt upstream cleanup only where client cancellation propagates once through the semantic stream, collector callbacks cannot cancel or stall client delivery, unread retry-response clones are disposed without affecting the live response, and the WeakMap aborts only the transport registered to the selected response. Governs R8.
 - KTD8. **Prove two-dialect migration and restore from executable manifests, not source-text parity.** Maintain an adopted-object manifest covering live SQLite and PostgreSQL types, defaults, nullability, constraints, indexes/predicates, backfill outcomes, repository behavior, retention, and idempotence after clean install and legacy upgrade. A mandatory guarded rehearsal harness applies one loopback/test-name/source-isolation policy to every source, candidate, generated child, and rollback target before any connection or mutation; it records immutable-source, backup checksum, schema/data fingerprint, forward-smoke, and restore-equivalence evidence. The PostgreSQL migration suite must use `DATABASE_URL`, integration suites use `BETTER_CCFLARE_TEST_POSTGRES_URL`, and a must-run signal makes a skipped live block fail. Never claim a reverse migration. Governs R9, R10, R17.
 - KTD9. **Make artifact provenance explicit, conflict-detecting, and lookup-first.** Use one allowlisted distribution identity key, `CCFLARE_DISTRIBUTION`, from which shared provenance derives mode, producer, and permitted channel, together with source SHA/ref origin. Release builders embed their identity; the managed-source systemd pin supplies `startupbros-managed-source`; build/runtime identities may agree or be singly present through their allowed producer path, but any incompatible pair resolves to `unknown`. One server-authoritative update-status service resolves provenance before any network call, suppresses remote lookup for managed-source/unknown, caches external results by validated producer and channel, and feeds both compatibility routes and the dashboard. The current Dockerfile remains a tombii-produced upstream artifact unless a separate fork-controlled image builder proves its own producer/channel/SHA; `docker` alone is never trust. Governs R13, R14.
-- KTD10. **Accept v3.5.66 manifests only as target lineage.** Resolve root and CLI manifests together to the target’s plain `3.5.66` as part of the complete merge, subject to the refreshed contained-tag check. Do not make a standalone bump, suffix, or tag; source SHA and validated distribution provenance distinguish the fork artifact. Governs R14.
+- KTD10. **Accept v3.5.67 manifests only as target lineage.** Resolve root and CLI manifests together to the target’s plain `3.5.67` as part of the complete merge, subject to the refreshed contained-tag check. Do not make a standalone bump, suffix, or tag; source SHA and validated distribution provenance distinguish the fork artifact. Governs R14.
 - KTD11. **Use a mechanically checked bidirectional completeness audit.** Generate the inventory from both parents and the captured rerere record; validate exact-one dispositions and links to the human ledger; map every refreshed upstream-only commit to behavior/tests; compare the final tree and combined diff to both parents; retain or remap every target-only regression; and explain every fork-retained difference. Distinguish `focused-packet-pass` from `acceptance-complete` so dependency-gated units such as U4 cannot close on pre-persistence evidence. Conflict count or Markdown row count alone is not completeness evidence. Governs R2, R3.
 - KTD12. **Separate pre-merge provenance rehearsal from the post-merge source gate.** Before merge, hermetic checkout/pin/runtime fixtures must prove provenance propagation without service, systemd, database, network-release, or health-endpoint effects. After merge, the operator may separately authorize `deploy-ccflare.sh --check`, which proves only canonical-main, clean-tree, and version/source eligibility—not built or runtime provenance. Full deployment, systemd mutation, production DB handling, restart, and live identity verification require a further authorization and a deferred-deployment handoff. Governs R17.
 
@@ -321,7 +321,7 @@ stateDiagram-v2
 ### Assumptions
 
 - The post-PR #261 planning graph is accurate only until U1 refreshes it.
-- The five current add/add paths remain `packages/core/src/xai.ts`, `packages/core/src/xai.test.ts`, `packages/providers/src/providers/muse-spark/provider.ts`, `packages/providers/src/providers/muse-spark/index.ts`, and `packages/providers/src/providers/muse-spark/__tests__/provider.test.ts`; U1 records any delta.
+- The current add/add paths are `packages/core/src/xai.ts` and `packages/core/src/xai.test.ts`. Provider-transition review covers both legacy `packages/providers/src/providers/muse-spark/{provider.ts,index.ts,__tests__/provider.test.ts}` and successor `packages/providers/src/providers/meta/{provider.ts,index.ts,__tests__/provider.test.ts}` paths; U1 records any inventory delta.
 - Static PostgreSQL parity remains necessary but insufficient because it does not prove indexes, data backfills, runtime SQL, ordering, or restore.
 - A broad local `bun test` result may be diagnostic but is not acceptance evidence because mock-module leakage is known; CI’s per-file isolation is authoritative.
 
@@ -357,8 +357,8 @@ U1 establishes the only valid baseline. U2 lands self-contained fork safety befo
 - **Requirements:** R1-R5, R8-R12, R15, R18, R19.
 - **Dependencies:** none.
 - **Files:**
-  - `docs/plans/2026-08-24-issue-260-v3.5.66-resolution-ledger.md` (human review artifact)
-  - `docs/plans/2026-08-24-issue-260-v3.5.66-resolution-inventory.json` (machine-readable execution inventory)
+  - `docs/plans/2026-08-24-issue-260-v3.5.67-resolution-ledger.md` (human review artifact)
+  - `docs/plans/2026-08-24-issue-260-v3.5.67-resolution-inventory.json` (machine-readable execution inventory)
   - `scripts/verify-upstream-sync-ledger.ts` and its focused test (new validator)
   - `packages/proxy/src/__tests__/response-handler-worker-protocol.test.ts`
   - `packages/proxy/src/handlers/__tests__/account-selector.test.ts`
@@ -369,7 +369,7 @@ U1 establishes the only valid baseline. U2 lands self-contained fork safety befo
   - `packages/http-api/src/services/__tests__/usage-window-ledger.test.ts`
 - **Approach:**
   1. Fetch `origin/main` and upstream tags, run `git log origin/main --since='2026-08-24' --oneline --no-merges -- <relevant permitted paths>`, and obtain the repository-required operator confirmation if relevant commits appeared after issue creation (KTD1).
-  2. Verify the final PR #261 merge and tests are contained by refreshed main; verify the remote `v3.5.66^{}` object equals the pinned SHA.
+  2. Verify the final PR #261 merge and tests are contained by refreshed main; verify the remote `v3.5.67^{}` object equals the pinned SHA.
   3. Recompute merge base, raw and patch-equivalent divergence, trial-merge conflict classes, target-only tests, and the complete set of non-conflicting paths changed on both sides of the merge base.
   4. Run `bun run build:cli`, then add missing characterization tests before source resolution. Do not stage generated workers.
   5. Generate the machine inventory from Git evidence; capture rerere applications to a dedicated record during the merge. Link every inventory ID to a human ledger entry with upstream intent, fork contract, resolution, focused tests, acceptance-complete tests, combined-diff review, and disposition.
@@ -446,7 +446,7 @@ U1 establishes the only valid baseline. U2 lands self-contained fork safety befo
   - `packages/load-balancer/src/strategies/`
   - corresponding proxy/load-balancer tests imported or retained from both parents
 - **Approach:**
-  1. Start one `git merge --no-ff --no-commit db894ef34ed140a4ec495253da79824eb811010a`; record every conflict and rerere result before editing (KTD2, KTD3).
+  1. Start one `git merge --no-ff --no-commit ebc904903dc828338cd2d5da707b0d3dd2d0922f`; record every conflict and rerere result before editing (KTD2, KTD3).
   2. Resolve selector, model mapping, route profile, load-balancer, proxy operation, and response handler as one precedence cluster (KTD4).
   3. Bring exact-model control in default-off, allow only the authenticated internal-probe exception, and refuse unsupported physical models before combo/fallback substitution.
   4. Preserve model/family/account hold scope, durations, response headers, finite recovery metadata, and degraded-replay fences.
@@ -544,21 +544,23 @@ U1 establishes the only valid baseline. U2 lands self-contained fork safety befo
   - `packages/database/src/__tests__/managed-routing-postgres.integration.test.ts`
   - `packages/http-api/src/services/usage-window-ledger.ts`
   - `packages/http-api/src/services/__tests__/usage-window-ledger.test.ts`
+  - legacy and successor provider-transition paths: `packages/providers/src/providers/muse-spark/` and `packages/providers/src/providers/meta/`
+  - affected account repository/API compatibility tests
   - `.github/workflows/managed-routing-postgres.yml`
-  - `docs/plans/2026-08-24-issue-260-v3.5.66-database-acceptance.json` (adopted-object and fingerprint manifest)
+  - `docs/plans/2026-08-24-issue-260-v3.5.67-database-acceptance.json` (adopted-object and fingerprint manifest)
   - `scripts/rehearse-upstream-sync-migrations.ts` and its focused safety test (mandatory guarded harness)
 - **Approach:**
   1. Inventory target persistence commits and map each table/column/index/backfill/repository intent before resolving source.
   2. Build sanitized fork-shaped legacy fixtures containing accounts, managed/combo exclusions, device jobs, snapshots, active model-scoped windows, inactive account-wide history, usage windows, and ledger aggregates. Record schema/data fingerprints before any copy or migration.
   3. Maintain an adopted-object acceptance manifest for clean-install and legacy-upgrade catalogs in both dialects: types, defaults, nullability, primary/unique/check/foreign-key constraints, indexes and partial predicates, expected backfill rows, repository operations, and retention outcomes.
-  4. Resolve every change through SQLite `ensureSchema` and upgrade logic plus PostgreSQL `ensureSchemaPg` and upgrade/backfill/index logic (KTD8). Preserve normalized 0–100 values and live `active:false` filtering without broadening raw-history rebuild semantics.
+  4. Adopt the v3.5.67 `muse-spark` → `meta` provider-id migration through SQLite `ensureSchema` and upgrade logic plus PostgreSQL `ensureSchemaPg` and upgrade/backfill/index logic (KTD8). Test existing `muse-spark` account backfill/rename to `meta`, re-running each dialect migration without duplicate or destructive effects, and preserve repository/API compatibility for legacy persisted accounts. Preserve normalized 0–100 values and live `active:false` filtering without broadening raw-history rebuild semantics.
   5. Make live execution explicit: `migrations-pg.test.ts` receives a fresh safe `DATABASE_URL`; integration suites receive `BETTER_CCFLARE_TEST_POSTGRES_URL`; a must-run flag/assertion makes a skipped live block fail and its execution is recorded.
   6. Implement the mandatory rehearsal harness before dump/restore work. It derives per-run source, candidate, generated child, and rollback target identities; requires loopback plus `test` in every database name; rejects malformed/ambiguous URLs, pre-existing destructive targets, and any attempt to select the source as a destructive target before opening a connection.
-  7. Run forward migration twice for idempotence. Rehearse verified backup → separate candidate migration → catalog/repository smoke → clean rollback-target restore → fingerprint/smoke equivalence for both dialects. Record target identities, backup checksums, immutable source fingerprint, candidate acceptance-manifest result, and restored fingerprint.
+  7. Run forward migration twice for idempotence. Rehearse verified backup → separate candidate migration → catalog/repository/API smoke, including legacy `muse-spark` account compatibility after migration → clean rollback-target restore → fingerprint/smoke equivalence for both dialects. Record target identities, backup checksums, immutable source fingerprint, candidate acceptance-manifest result, and restored fingerprint.
 - **Execution note:** Add legacy-fixture and parity assertions before accepting migration source; a static column comparison does not complete this unit.
 - **Test scenarios:**
   - Covers AE6. Live clean-install and legacy-upgrade catalogs in SQLite and PostgreSQL match every adopted-object manifest entry, including types, defaults, nullability, constraints, indexes/predicates, and expected backfills.
-  - Legacy fixtures upgrade twice without duplicate rows, overwritten fork fields, or repeated backfill effects; repository and retention reads/writes produce equivalent results across dialects.
+  - Legacy fixtures upgrade twice without duplicate rows, overwritten fork fields, or repeated backfill effects; existing `muse-spark` accounts become `meta` exactly once and remain readable and writable through repository and API compatibility surfaces in both dialects.
   - The PostgreSQL migration live block is observed as executed under `DATABASE_URL`, not reported green through a skip; integration tests execute separately under `BETTER_CCFLARE_TEST_POSTGRES_URL`.
   - Covers AE8. Inactive weekly/account-wide history stays queryable but cannot bind routing, alerts, ledger closure, or value calculations; upstream reconciliation does not make activity-ambiguous historical rows newly actionable.
   - Unique window anchors and valuation retain their existing idempotent restart/replay behavior; if target changes require a new atomic rollover or raw-activity schema, U6 stops for the documented follow-up decision.
@@ -566,18 +568,17 @@ U1 establishes the only valid baseline. U2 lands self-contained fork safety befo
   - The harness rejects remote hosts, non-test names, malformed/ambiguous URLs, generated child names outside policy, pre-existing destructive targets, and source-as-target selection before any connection or mutation.
 - **Verification:** Live catalog, data, repository, retention, idempotence, active-window, immutable-source, forward-migration, and restore-equivalence evidence passes against sanitized disposable targets only; a skipped PostgreSQL live block or absent guard harness fails U6.
 
-### U7. Compose xAI/Muse add-add paths and trace adopted controls through operator surfaces
+### U7. Compose xAI add/add paths, Meta provider transition, and adopted controls through operator surfaces
 
-- **Goal:** Preserve fork provider safety while integrating narrow upstream provider fixes and complete end-to-end control serialization.
+- **Goal:** Preserve fork provider safety while integrating the two xAI add/add paths, the `muse-spark` → `meta` provider transition, and complete end-to-end control serialization.
 - **Requirements:** R6, R11, R12, R15, R16, R18, R19.
 - **Dependencies:** U3, U6.
 - **Files:**
   - `packages/core/src/model-mappings.ts`
   - `packages/core/src/xai.ts`
   - `packages/core/src/xai.test.ts`
-  - `packages/providers/src/providers/muse-spark/provider.ts`
-  - `packages/providers/src/providers/muse-spark/index.ts`
-  - `packages/providers/src/providers/muse-spark/__tests__/provider.test.ts`
+  - legacy transition paths: `packages/providers/src/providers/muse-spark/provider.ts`, `packages/providers/src/providers/muse-spark/index.ts`, and `packages/providers/src/providers/muse-spark/__tests__/provider.test.ts`
+  - successor paths: `packages/providers/src/providers/meta/provider.ts`, `packages/providers/src/providers/meta/index.ts`, and `packages/providers/src/providers/meta/__tests__/provider.test.ts`
   - `packages/config/src/index.ts`
   - `packages/http-api/src/router.ts`
   - `packages/http-api/src/handlers/__tests__/routing-observations.test.ts`
@@ -585,16 +586,17 @@ U1 establishes the only valid baseline. U2 lands self-contained fork safety befo
   - `packages/dashboard-web/src/components/combos/CombosTab.managed-routing.test.tsx`
   - affected CLI/API/dashboard files identified by U1’s control trace
 - **Approach:**
-  1. Resolve each add/add path from the fork implementation, importing upstream fixes assertion by assertion rather than choosing a whole side.
-  2. Preserve `resolveCompatibleEndpoint` fail-closed semantics across every caller and any account-edit surface touched by the merge.
-  3. Map the upstream modify/delete capacity test onto current profile, selector, managed-routing, and capacity suites instead of reviving an obsolete file.
-  4. Trace every adopted exact-model/combo/observation setting through type, persistence, HTTP, CLI, and dashboard; omitted values remain off.
-  5. If U1 identifies Qwen source changes, perform and record the required local qwen-code comparison before resolution.
+  1. Resolve the two xAI add/add paths from the fork implementation, importing upstream fixes assertion by assertion rather than choosing a whole side.
+  2. Review the `muse-spark` and `meta` provider paths together: adopt the upstream identifier/path rename, retain fork provider behavior, and rely on U6's idempotent dual-dialect existing-account migration rather than orphaning persisted accounts.
+  3. Preserve `resolveCompatibleEndpoint` fail-closed semantics across every caller and any account-edit surface touched by the merge.
+  4. Map the upstream modify/delete capacity test onto current profile, selector, managed-routing, and capacity suites instead of reviving an obsolete file.
+  5. Trace every adopted exact-model/combo/observation setting and the `meta` provider identifier through type, persistence, repository, HTTP/API, CLI, and dashboard; omitted controls remain off and legacy persisted accounts remain compatible.
+  6. If U1 identifies Qwen source changes, perform and record the required local qwen-code comparison before resolution.
 - **Execution note:** Retain fork tests as the base, then add upstream regressions one behavior at a time.
 - **Test scenarios:**
   - Covers AE9. Missing, blank, malformed, and unparsable compatible endpoints fail closed; valid endpoints preserve provider-specific paths; no invalid state reaches OpenAI.
-  - xAI retains fork defaults and imports only verified context/cache-token corrections.
-  - Muse Spark construction, catalog/default mapping, and pricing behavior include the union of verified parent regressions.
+  - xAI add/add paths retain fork defaults and import only verified context/cache-token corrections.
+  - `muse-spark` → `meta` construction, catalog/default mapping, pricing, and account-edit behavior include the union of verified parent regressions; migrated existing accounts remain available through repository and API surfaces after a second migration pass.
   - Covers AE10. Omitted exact-model, combo, and observation controls remain disabled through full serialization.
   - Enabled controls round-trip without widening route eligibility or losing database parity.
   - The obsolete capacity assertion remains covered by current architecture tests.
@@ -602,7 +604,7 @@ U1 establishes the only valid baseline. U2 lands self-contained fork safety befo
 
 ### U8. Finalize topology, version lineage, documentation, completeness review, and merge readiness
 
-- **Goal:** Produce an auditable v3.5.66 integration commit with truthful fork provenance, complete documentation, passing verification, and no production effects.
+- **Goal:** Produce an auditable v3.5.67 integration commit with truthful fork provenance, complete documentation, passing verification, and no production effects.
 - **Requirements:** R1-R3, R13-R19.
 - **Dependencies:** U3, U4, U5, U6, U7.
 - **Files:**
@@ -611,9 +613,9 @@ U1 establishes the only valid baseline. U2 lands self-contained fork safety befo
   - `packages/core/src/version.ts`
   - `packages/dashboard-web/src/lib/version.ts`
   - `UPSTREAM.md`
-  - `docs/plans/2026-08-24-issue-260-v3.5.66-resolution-ledger.md`
-  - `docs/plans/2026-08-24-issue-260-v3.5.66-resolution-inventory.json`
-  - `docs/plans/2026-08-24-issue-260-v3.5.66-database-acceptance.json`
+  - `docs/plans/2026-08-24-issue-260-v3.5.67-resolution-ledger.md`
+  - `docs/plans/2026-08-24-issue-260-v3.5.67-resolution-inventory.json`
+  - `docs/plans/2026-08-24-issue-260-v3.5.67-database-acceptance.json`
   - `.github/workflows/release.yml`
   - `.github/workflows/release-dispatch.yml`
   - `scripts/deploy-ccflare.sh`
@@ -647,9 +649,9 @@ U1 establishes the only valid baseline. U2 lands self-contained fork safety befo
 
 | Gate | Command / evidence | Applies to |
 |---|---|---|
-| Refresh refs | `git fetch origin refs/heads/main && git fetch upstream refs/tags/v3.5.66` | U1 |
+| Refresh refs | `git fetch origin refs/heads/main && git fetch upstream refs/tags/v3.5.67` | U1 |
 | Issue staleness | `git log origin/main --since='2026-08-24' --oneline --no-merges -- <explicit relevant permitted paths>` plus required operator confirmation if relevant commits exist | U1 |
-| Target identity | `git rev-parse 'refs/tags/v3.5.66^{}'` equals `db894ef34ed140a4ec495253da79824eb811010a` | U1 |
+| Target identity | `git rev-parse 'refs/tags/v3.5.67^{}'` equals `ebc904903dc828338cd2d5da707b0d3dd2d0922f` | U1 |
 | Refreshed graph | Record `git merge-base`, left/right counts, `--cherry-pick` counts, manifests, conflicts, and clean shared paths | U1 |
 | Bootstrap | `bun run build:cli` before the first Bun test | U1-U8 |
 | Merge topology | `git show -s --format='%P' <integration-sha>` yields refreshed fork parent then exact target parent | U8 |
@@ -671,7 +673,7 @@ Run each listed file in a separate command/process; do not combine them into one
 | PostgreSQL migration contract | Run `packages/database/src/migrations-pg.test.ts` with a fresh safe `DATABASE_URL` plus the new must-run-live signal; evidence must show the live block executed rather than skipped | U6 |
 | PostgreSQL integration | Run `packages/database/src/__tests__/managed-routing-postgres.integration.test.ts` with a separate safe `BETTER_CCFLARE_TEST_POSTGRES_URL`; record its disposable database identity | U6, U7 |
 | Usage history and ledger | Run usage-history repository, cleanup, and usage-window-ledger files separately | U6 |
-| xAI and Muse | `bun test --timeout 15000 packages/core/src/xai.test.ts` and Muse provider test separately | U7 |
+| xAI and Meta transition | `bun test --timeout 15000 packages/core/src/xai.test.ts`, each `meta` provider test, and legacy-account migration/repository/API compatibility tests separately | U6, U7 |
 | Updater provenance | Run build-provenance/version/health, special proxy route, cache-flight facade, every producer/builder fixture, deploy-pin, aggregate API, and `navigation.test.tsx` separately; assert zero remote calls for every unproven state | U2, U8 |
 
 ### Migration rehearsal gates
@@ -706,7 +708,7 @@ A broad `bun test` may be collected diagnostically but cannot replace the isolat
 Global:
 
 - Every requirement R1-R19 is satisfied, conditionally discharged, or explicitly deferred by its stated trigger.
-- Exact target `db894ef34ed140a4ec495253da79824eb811010a` is one parent of a real two-parent integration commit whose other parent is refreshed fork main.
+- Exact target `ebc904903dc828338cd2d5da707b0d3dd2d0922f` is one parent of a real two-parent integration commit whose other parent is refreshed fork main.
 - The regenerated machine inventory validates exact-one recognized dispositions for every refreshed upstream-only commit, explicit conflict, captured rerere application, and clean two-sided path, with non-dangling links to focused and acceptance-complete human-ledger evidence.
 - Every pre-merge candidate gate in the Verification Contract passes, including observed live PostgreSQL execution, guarded two-dialect rehearsal, database acceptance-manifest validation, immutable-source and restored-fingerprint proofs, hermetic provenance rehearsal, green CI, and focused independent review with no unresolved finding; the post-merge source gate is recorded only if the operator separately authorizes it after merge.
 - Root and CLI manifests truthfully carry target lineage while build/runtime SHA and validated distribution identity, producer, mode, and channel distinguish the artifact; unproven states make no remote lookup.
@@ -722,6 +724,6 @@ Per unit:
 - U3: routing precedence, exact-model refusal, combo/default-off behavior, scoped recovery, and PR #261 recovery → normalization → observation-wrapper order all pass.
 - U4: native Responses stream/non-stream behavior, tools, taxonomy, catalog mapping, context capacity, session privacy, and exactly-once usage are acceptance-complete only after U6 persistence passes.
 - U5: reader locks and unread retry responses are released without affecting the selected response, client cancellation propagates exactly once, collector callbacks cannot cancel or stall delivery, only the registered transport is aborted, and terminal state settles once.
-- U6: live SQLite/PostgreSQL catalogs and data satisfy the adopted-object manifest after clean install and legacy upgrade; live PG execution is observed; guarded targets, checksummed backups, immutable sources, idempotent forward migration, repository/retention behavior, active-window semantics, and restored fingerprint equivalence all pass.
-- U7: xAI/Muse behaviors compose both parents, compatible endpoints remain fail-closed, adopted controls round-trip and remain default-off when omitted, and any triggered Qwen comparison is recorded.
+- U6: live SQLite/PostgreSQL catalogs and data satisfy the adopted-object manifest after clean install and legacy upgrade; live PG execution is observed; guarded targets, checksummed backups, immutable sources, idempotent forward migration, repository/retention behavior, active-window semantics, idempotent `muse-spark` → `meta` existing-account backfill/rename with repository/API compatibility, and restored fingerprint equivalence all pass.
+- U7: xAI add/add and `muse-spark` → `meta` provider-transition behaviors compose both parents, compatible endpoints remain fail-closed, adopted controls and provider identity round-trip while omitted controls remain default-off, and any triggered Qwen comparison is recorded.
 - U8: topology, version lineage, documentation, all-commit and parent-delta completeness, acceptance-complete unit evidence, isolated tests, hermetic provenance, lint, typecheck, format, review, CI, and deferred-deployment handoff are complete; production remains untouched.

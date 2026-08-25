@@ -2,21 +2,21 @@
   "schemaVersion": 1,
   "phase": "pre-merge",
   "baseline": {
-    "forkParent": "4db136a13ce3bf1b2d03fdf3174c52640ba17abd",
+    "forkParent": "8c60a1663a5b973b30d22828cb5205777ab2365a",
     "requiredAncestors": [
       "f65e5768f842853e60fc1f411eedf5281b0bc52b"
     ],
-    "target": "db894ef34ed140a4ec495253da79824eb811010a",
-    "canonicalTag": "refs/tags/v3.5.66",
-    "peeledTag": "db894ef34ed140a4ec495253da79824eb811010a",
+    "target": "ebc904903dc828338cd2d5da707b0d3dd2d0922f",
+    "canonicalTag": "refs/tags/v3.5.67",
+    "peeledTag": "ebc904903dc828338cd2d5da707b0d3dd2d0922f",
     "mergeBase": "0ad2f93d9e0c75e7b575006d12433d33a358df50",
     "rawCounts": {
-      "left": 800,
-      "right": 116
+      "left": 801,
+      "right": 120
     },
     "cherryPickCounts": {
-      "left": 800,
-      "right": 116
+      "left": 801,
+      "right": 120
     },
     "versions": {
       "fork": {
@@ -24,8 +24,8 @@
         "cli": "3.5.55"
       },
       "target": {
-        "root": "3.5.66",
-        "cli": "3.5.66"
+        "root": "3.5.67",
+        "cli": "3.5.67"
       }
     }
   },
@@ -152,7 +152,11 @@
       "94e0ff40d0f590bd4742745b1b35126be80b971f",
       "4a8f2615906cb3c5fa1967edcc47dfecc10c7b5f",
       "17715ca17ad861d7656a743843cdcb5c9cd87d4f",
-      "db894ef34ed140a4ec495253da79824eb811010a"
+      "db894ef34ed140a4ec495253da79824eb811010a",
+      "431eb493eb15ef950d0a11b5a55ae4026cbe91ef",
+      "87d950b32214d16d8bf32cb5249101cb81e21092",
+      "379e178309ae7024bce5d57bb676fe56a4960239",
+      "ebc904903dc828338cd2d5da707b0d3dd2d0922f"
     ],
     "conflicts": [
       {
@@ -256,6 +260,10 @@
         "conflictClass": "content"
       },
       {
+        "path": "packages/database/src/migrations.ts",
+        "conflictClass": "content"
+      },
+      {
         "path": "packages/database/src/repositories/usage-history.repository.ts",
         "conflictClass": "content"
       },
@@ -328,18 +336,6 @@
         "conflictClass": "content"
       },
       {
-        "path": "packages/providers/src/providers/muse-spark/__tests__/provider.test.ts",
-        "conflictClass": "add/add"
-      },
-      {
-        "path": "packages/providers/src/providers/muse-spark/index.ts",
-        "conflictClass": "add/add"
-      },
-      {
-        "path": "packages/providers/src/providers/muse-spark/provider.ts",
-        "conflictClass": "add/add"
-      },
-      {
         "path": "packages/providers/src/providers/openai/provider.ts",
         "conflictClass": "content"
       },
@@ -408,6 +404,10 @@
         "conflictClass": "content"
       },
       {
+        "path": "packages/types/src/account.ts",
+        "conflictClass": "content"
+      },
+      {
         "path": "packages/types/src/constants.ts",
         "conflictClass": "content"
       },
@@ -437,6 +437,7 @@
       "packages/database/src/__tests__/multi-instance-guard.test.ts",
       "packages/database/src/adapters/bun-sql-adapter.ts",
       "packages/database/src/index.ts",
+      "packages/database/src/migrations-pg.ts",
       "packages/database/src/multi-instance-guard.ts",
       "packages/database/src/repositories/__tests__/usage-history.repository.test.ts",
       "packages/database/src/repositories/request.repository.ts",
@@ -451,8 +452,6 @@
       "packages/openai-responses-adapter/src/__tests__/handler.test.ts",
       "packages/openai-responses-adapter/src/stream-translator.ts",
       "packages/providers/src/providers/codex/provider.fidelity.test.ts",
-      "packages/providers/src/providers/muse-spark/__tests__/request-sanitizer.test.ts",
-      "packages/providers/src/providers/muse-spark/request-sanitizer.ts",
       "packages/providers/src/providers/vertex-ai/provider.ts",
       "packages/providers/src/types.ts",
       "packages/providers/src/utils/__tests__/model-mapping.test.ts",
@@ -461,7 +460,6 @@
       "packages/proxy/src/handlers/response-processor.ts",
       "packages/proxy/src/stream-tee.ts",
       "packages/proxy/src/usage-collector.ts",
-      "packages/types/src/account.ts",
       "packages/types/src/alerts.ts",
       "packages/types/src/insights.ts",
       "packages/types/src/strategy.ts"
@@ -1294,6 +1292,40 @@
       "refreshedMainEvidence": []
     },
     {
+      "id": "commit:379e178309ae7024bce5d57bb676fe56a4960239",
+      "kind": "upstream-commit",
+      "source": {
+        "sha": "379e178309ae7024bce5d57bb676fe56a4960239"
+      },
+      "ledgerAnchor": "#sync-commit-7dea3fd7d005992e0496e028",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
       "id": "commit:3b6c984e360b9eee7740dee8d6f0411c3118324a",
       "kind": "upstream-commit",
       "source": {
@@ -1368,6 +1400,40 @@
         "sha": "41f8635ed331eb00e8cd43aecb709169b4da3b4a"
       },
       "ledgerAnchor": "#sync-commit-50647006dfddef97b53fcb88",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "commit:431eb493eb15ef950d0a11b5a55ae4026cbe91ef",
+      "kind": "upstream-commit",
+      "source": {
+        "sha": "431eb493eb15ef950d0a11b5a55ae4026cbe91ef"
+      },
+      "ledgerAnchor": "#sync-commit-fc708ae86de7fdf3e9e0be22",
       "disposition": "pending",
       "upstreamIntent": "pending",
       "protectedForkBehavior": "pending",
@@ -2252,6 +2318,40 @@
         "sha": "8685d04542b287615100c97c5e7b5c44776bd2aa"
       },
       "ledgerAnchor": "#sync-commit-ef689a387c25c642afa4f22e",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "commit:87d950b32214d16d8bf32cb5249101cb81e21092",
+      "kind": "upstream-commit",
+      "source": {
+        "sha": "87d950b32214d16d8bf32cb5249101cb81e21092"
+      },
+      "ledgerAnchor": "#sync-commit-76af15790c31b6651e733708",
       "disposition": "pending",
       "upstreamIntent": "pending",
       "protectedForkBehavior": "pending",
@@ -4048,6 +4148,40 @@
       "refreshedMainEvidence": []
     },
     {
+      "id": "commit:ebc904903dc828338cd2d5da707b0d3dd2d0922f",
+      "kind": "upstream-commit",
+      "source": {
+        "sha": "ebc904903dc828338cd2d5da707b0d3dd2d0922f"
+      },
+      "ledgerAnchor": "#sync-commit-848343c837780221f4dd43fa",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
       "id": "commit:eecc5c4a26b1bf2b2ae110308ec94e0c5a39e871",
       "kind": "upstream-commit",
       "source": {
@@ -5297,6 +5431,41 @@
       "refreshedMainEvidence": []
     },
     {
+      "id": "conflict:packages/database/src/migrations.ts",
+      "kind": "conflict",
+      "source": {
+        "path": "packages/database/src/migrations.ts",
+        "conflictClass": "content"
+      },
+      "ledgerAnchor": "#sync-conflict-503f1d3b248bfe5220ba3b2f",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
       "id": "conflict:packages/database/src/repositories/usage-history.repository.ts",
       "kind": "conflict",
       "source": {
@@ -5927,111 +6096,6 @@
       "refreshedMainEvidence": []
     },
     {
-      "id": "conflict:packages/providers/src/providers/muse-spark/__tests__/provider.test.ts",
-      "kind": "conflict",
-      "source": {
-        "path": "packages/providers/src/providers/muse-spark/__tests__/provider.test.ts",
-        "conflictClass": "add/add"
-      },
-      "ledgerAnchor": "#sync-conflict-43a4c16b65023d2cb1f220a1",
-      "disposition": "pending",
-      "upstreamIntent": "pending",
-      "protectedForkBehavior": "pending",
-      "selectedResolution": "pending",
-      "evidence": {
-        "focusedPacket": {
-          "status": "pending",
-          "references": []
-        },
-        "acceptanceComplete": {
-          "status": "pending",
-          "references": []
-        },
-        "combinedDiff": {
-          "status": "pending",
-          "references": []
-        }
-      },
-      "reviewer": {
-        "status": "pending",
-        "identity": null,
-        "notes": "pending"
-      },
-      "dependencies": [],
-      "rationale": "pending",
-      "refreshedMainEvidence": []
-    },
-    {
-      "id": "conflict:packages/providers/src/providers/muse-spark/index.ts",
-      "kind": "conflict",
-      "source": {
-        "path": "packages/providers/src/providers/muse-spark/index.ts",
-        "conflictClass": "add/add"
-      },
-      "ledgerAnchor": "#sync-conflict-e495310335f604accc5d8af7",
-      "disposition": "pending",
-      "upstreamIntent": "pending",
-      "protectedForkBehavior": "pending",
-      "selectedResolution": "pending",
-      "evidence": {
-        "focusedPacket": {
-          "status": "pending",
-          "references": []
-        },
-        "acceptanceComplete": {
-          "status": "pending",
-          "references": []
-        },
-        "combinedDiff": {
-          "status": "pending",
-          "references": []
-        }
-      },
-      "reviewer": {
-        "status": "pending",
-        "identity": null,
-        "notes": "pending"
-      },
-      "dependencies": [],
-      "rationale": "pending",
-      "refreshedMainEvidence": []
-    },
-    {
-      "id": "conflict:packages/providers/src/providers/muse-spark/provider.ts",
-      "kind": "conflict",
-      "source": {
-        "path": "packages/providers/src/providers/muse-spark/provider.ts",
-        "conflictClass": "add/add"
-      },
-      "ledgerAnchor": "#sync-conflict-6e41814f5c02564afc61d8b4",
-      "disposition": "pending",
-      "upstreamIntent": "pending",
-      "protectedForkBehavior": "pending",
-      "selectedResolution": "pending",
-      "evidence": {
-        "focusedPacket": {
-          "status": "pending",
-          "references": []
-        },
-        "acceptanceComplete": {
-          "status": "pending",
-          "references": []
-        },
-        "combinedDiff": {
-          "status": "pending",
-          "references": []
-        }
-      },
-      "reviewer": {
-        "status": "pending",
-        "identity": null,
-        "notes": "pending"
-      },
-      "dependencies": [],
-      "rationale": "pending",
-      "refreshedMainEvidence": []
-    },
-    {
       "id": "conflict:packages/providers/src/providers/openai/provider.ts",
       "kind": "conflict",
       "source": {
@@ -6599,6 +6663,41 @@
         "conflictClass": "content"
       },
       "ledgerAnchor": "#sync-conflict-78b65cb3f36770d3dbdc63a0",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "conflict:packages/types/src/account.ts",
+      "kind": "conflict",
+      "source": {
+        "path": "packages/types/src/account.ts",
+        "conflictClass": "content"
+      },
+      "ledgerAnchor": "#sync-conflict-2357894efd7223aa1416c6e3",
       "disposition": "pending",
       "upstreamIntent": "pending",
       "protectedForkBehavior": "pending",
@@ -7276,6 +7375,40 @@
       "refreshedMainEvidence": []
     },
     {
+      "id": "shared-path:packages/database/src/migrations-pg.ts",
+      "kind": "shared-path",
+      "source": {
+        "path": "packages/database/src/migrations-pg.ts"
+      },
+      "ledgerAnchor": "#sync-shared-path-2da366aa82679b8d4b6a1d52",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
       "id": "shared-path:packages/database/src/multi-instance-guard.ts",
       "kind": "shared-path",
       "source": {
@@ -7752,74 +7885,6 @@
       "refreshedMainEvidence": []
     },
     {
-      "id": "shared-path:packages/providers/src/providers/muse-spark/__tests__/request-sanitizer.test.ts",
-      "kind": "shared-path",
-      "source": {
-        "path": "packages/providers/src/providers/muse-spark/__tests__/request-sanitizer.test.ts"
-      },
-      "ledgerAnchor": "#sync-shared-path-dd3e76b0d64da9efc6c9b536",
-      "disposition": "pending",
-      "upstreamIntent": "pending",
-      "protectedForkBehavior": "pending",
-      "selectedResolution": "pending",
-      "evidence": {
-        "focusedPacket": {
-          "status": "pending",
-          "references": []
-        },
-        "acceptanceComplete": {
-          "status": "pending",
-          "references": []
-        },
-        "combinedDiff": {
-          "status": "pending",
-          "references": []
-        }
-      },
-      "reviewer": {
-        "status": "pending",
-        "identity": null,
-        "notes": "pending"
-      },
-      "dependencies": [],
-      "rationale": "pending",
-      "refreshedMainEvidence": []
-    },
-    {
-      "id": "shared-path:packages/providers/src/providers/muse-spark/request-sanitizer.ts",
-      "kind": "shared-path",
-      "source": {
-        "path": "packages/providers/src/providers/muse-spark/request-sanitizer.ts"
-      },
-      "ledgerAnchor": "#sync-shared-path-fc6058d20fe8c9b1480ae814",
-      "disposition": "pending",
-      "upstreamIntent": "pending",
-      "protectedForkBehavior": "pending",
-      "selectedResolution": "pending",
-      "evidence": {
-        "focusedPacket": {
-          "status": "pending",
-          "references": []
-        },
-        "acceptanceComplete": {
-          "status": "pending",
-          "references": []
-        },
-        "combinedDiff": {
-          "status": "pending",
-          "references": []
-        }
-      },
-      "reviewer": {
-        "status": "pending",
-        "identity": null,
-        "notes": "pending"
-      },
-      "dependencies": [],
-      "rationale": "pending",
-      "refreshedMainEvidence": []
-    },
-    {
       "id": "shared-path:packages/providers/src/providers/vertex-ai/provider.ts",
       "kind": "shared-path",
       "source": {
@@ -8064,40 +8129,6 @@
         "path": "packages/proxy/src/usage-collector.ts"
       },
       "ledgerAnchor": "#sync-shared-path-fc8cd215aafd6d005e9b952c",
-      "disposition": "pending",
-      "upstreamIntent": "pending",
-      "protectedForkBehavior": "pending",
-      "selectedResolution": "pending",
-      "evidence": {
-        "focusedPacket": {
-          "status": "pending",
-          "references": []
-        },
-        "acceptanceComplete": {
-          "status": "pending",
-          "references": []
-        },
-        "combinedDiff": {
-          "status": "pending",
-          "references": []
-        }
-      },
-      "reviewer": {
-        "status": "pending",
-        "identity": null,
-        "notes": "pending"
-      },
-      "dependencies": [],
-      "rationale": "pending",
-      "refreshedMainEvidence": []
-    },
-    {
-      "id": "shared-path:packages/types/src/account.ts",
-      "kind": "shared-path",
-      "source": {
-        "path": "packages/types/src/account.ts"
-      },
-      "ledgerAnchor": "#sync-shared-path-1d64da537d9427258716d486",
       "disposition": "pending",
       "upstreamIntent": "pending",
       "protectedForkBehavior": "pending",
