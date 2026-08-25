@@ -108,6 +108,37 @@ export interface DatabaseRetryConfig {
 	maxDelayMs?: number;
 }
 
+type DatabaseMaintenanceRequest =
+	| { kind: "optimize"; dbPath: string }
+	| { kind: "vacuum"; dbPath: string; pages: number };
+
+type DatabaseMaintenanceResult =
+	| { ok: true; skipped: boolean }
+	| { ok: true; mode: number }
+	| { ok: false; error: string };
+
+/** Minimal Worker surface used by the SQLite maintenance lane. */
+export interface DatabaseMaintenanceWorker {
+	onmessage: ((event: MessageEvent) => void) | null;
+	onerror: ((event: ErrorEvent) => void) | null;
+	postMessage(message: DatabaseMaintenanceRequest): void;
+	terminate(): void;
+}
+
+/**
+ * Worker plus any resource tied to its construction. Embedded production
+ * workers own a Blob URL that must live for the worker's lifetime and be
+ * revoked exactly once when that worker is discarded.
+ */
+export interface DatabaseMaintenanceWorkerHandle {
+	worker: DatabaseMaintenanceWorker;
+	revokeObjectUrl?: () => void;
+}
+
+/** Injectable seam for deterministic worker lifecycle tests. */
+export type DatabaseMaintenanceWorkerFactory =
+	() => DatabaseMaintenanceWorkerHandle;
+
 /**
  * SQLite's `busy_timeout` PRAGMA takes a signed 32-bit integer. A value
  * above `Number.isInteger`'s (unbounded) range overflows to a non-positive
@@ -345,6 +376,19 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 	private compacting = false;
 	/** Stop function returned by the multi-instance guard's heartbeat loop. */
 	private heartbeatStop: (() => Promise<void>) | null = null;
+	/** Lazily-created worker shared by all queued SQLite maintenance requests. */
+	private maintenanceWorkerHandle: DatabaseMaintenanceWorkerHandle | null =
+		null;
+	/** Factory override used by focused lifecycle tests. */
+	private readonly maintenanceWorkerFactory?: DatabaseMaintenanceWorkerFactory;
+	/** Promise tail that serializes maintenance messages onto the shared worker. */
+	private maintenanceQueueTail: Promise<void> = Promise.resolve();
+	/** Rejects the active round trip when close() or a transport failure wins. */
+	private activeMaintenanceReject: ((reason: Error) => void) | null = null;
+	/** Prevents new worker work once close() begins. */
+	private maintenanceClosed = false;
+	/** Makes close() idempotent, including worker termination and URL revocation. */
+	private closePromise: Promise<void> | null = null;
 	/**
 	 * Hourly `incrementalVacuum()` ticks that bailed because the worker
 	 * couldn't claim the writer slot (SQLITE_BUSY). Bumped on every failure,
@@ -394,7 +438,9 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 		dbPath?: string,
 		dbConfig?: DatabaseConfig,
 		retryConfig?: DatabaseRetryConfig,
+		maintenanceWorkerFactory?: DatabaseMaintenanceWorkerFactory,
 	) {
+		this.maintenanceWorkerFactory = maintenanceWorkerFactory;
 		// Default database configuration optimized for distributed filesystems.
 		// cacheSize kept in sync with the runtime-config default in
 		// packages/config/src/index.ts (256 MiB, negative = KiB): a big enough
@@ -1712,6 +1758,22 @@ OAuth tokens will need to be re-authenticated.
 	}
 
 	async close(): Promise<void> {
+		this.closePromise ??= this.closeOnce();
+		await this.closePromise;
+	}
+
+	private async closeOnce(): Promise<void> {
+		// Reject the active round trip before terminating its worker so callers
+		// cannot hang waiting for an event a terminated Worker will never emit.
+		// Queued requests observe maintenanceClosed and resolve as failures without
+		// posting another message.
+		this.maintenanceClosed = true;
+		this.disposeMaintenanceWorker(
+			this.maintenanceWorkerHandle,
+			new Error("DatabaseOperations closed during maintenance"),
+		);
+		await this.maintenanceQueueTail;
+
 		// Stop the multi-instance heartbeat loop and remove this instance's
 		// row before closing the adapter. Best-effort — errors here are
 		// logged inside the stopper, not rethrown.
@@ -1762,37 +1824,19 @@ OAuth tokens will need to be re-authenticated.
 			return { ok: true, skipped: true, durationMs: 0 };
 		}
 		const start = Date.now();
-		const worker = this.spawnIncrementalVacuumWorker();
-		try {
-			const result = await new Promise<
-				| { ok: true; skipped: boolean }
-				| { ok: true; mode: number }
-				| { ok: false; error: string }
-			>((resolve, reject) => {
-				worker.onmessage = (event: MessageEvent) => resolve(event.data);
-				worker.onerror = (event: ErrorEvent) =>
-					reject(new Error(event.message ?? "optimize worker error"));
-				worker.postMessage({ dbPath: this.resolvedDbPath, kind: "optimize" });
-			});
-			const durationMs = Date.now() - start;
-			if (!result.ok) {
-				return { ok: false, skipped: false, durationMs, error: result.error };
-			}
-			return {
-				ok: true,
-				skipped: "skipped" in result ? result.skipped : false,
-				durationMs,
-			};
-		} catch (err) {
-			return {
-				ok: false,
-				skipped: false,
-				durationMs: Date.now() - start,
-				error: err instanceof Error ? err.message : String(err),
-			};
-		} finally {
-			worker.terminate();
+		const result = await this.enqueueMaintenanceRequest({
+			dbPath: this.resolvedDbPath,
+			kind: "optimize",
+		});
+		const durationMs = Date.now() - start;
+		if (!result.ok) {
+			return { ok: false, skipped: false, durationMs, error: result.error };
 		}
+		return {
+			ok: true,
+			skipped: "skipped" in result ? result.skipped : false,
+			durationMs,
+		};
 	}
 
 	/**
@@ -1998,24 +2042,163 @@ OAuth tokens will need to be re-authenticated.
 	}
 
 	/**
-	 * Spawn the incremental-vacuum worker (shared by `incrementalVacuum()`
-	 * (kind "vacuum") and `optimizeAsync()` (kind "optimize"). Uses the
-	 * embedded base64 bundle when available (production build), falling back
-	 * to the on-disk worker source (tests / fresh worktrees where the inline
-	 * file is an empty placeholder).
+	 * Queue one request onto the single maintenance Worker. Promise chaining is
+	 * deliberate: assigning Worker.onmessage per overlapping call would let the
+	 * newest call steal the older call's response and leave it pending forever.
 	 */
-	private spawnIncrementalVacuumWorker(): Worker {
+	private enqueueMaintenanceRequest(
+		request: DatabaseMaintenanceRequest,
+	): Promise<DatabaseMaintenanceResult> {
+		const result: Promise<DatabaseMaintenanceResult> = this.maintenanceQueueTail
+			.then(() => this.runMaintenanceRequest(request))
+			.catch((error) => {
+				this.disposeMaintenanceWorker(this.maintenanceWorkerHandle);
+				return {
+					ok: false,
+					error: error instanceof Error ? error.message : String(error),
+				};
+			});
+		// Keep the tail fulfilled even if a future implementation accidentally
+		// throws; one failed tick must not poison every later maintenance call.
+		this.maintenanceQueueTail = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	private async runMaintenanceRequest(
+		request: DatabaseMaintenanceRequest,
+	): Promise<DatabaseMaintenanceResult> {
+		if (this.maintenanceClosed) {
+			return { ok: false, error: "DatabaseOperations is closed" };
+		}
+
+		let handle: DatabaseMaintenanceWorkerHandle | null = null;
+		try {
+			handle = this.getMaintenanceWorkerHandle();
+			return await this.roundTripMaintenanceWorker(handle, request);
+		} catch (error) {
+			// A Worker transport error means its execution state is unknown. Drop
+			// that instance and lazily create a clean replacement for the next tick.
+			// Worker-reported database failures are ordinary result messages and do
+			// not pass through this path, so they keep the healthy Worker alive.
+			this.disposeMaintenanceWorker(handle);
+			return {
+				ok: false,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
+	}
+
+	private roundTripMaintenanceWorker(
+		handle: DatabaseMaintenanceWorkerHandle,
+		request: DatabaseMaintenanceRequest,
+	): Promise<DatabaseMaintenanceResult> {
+		const { worker } = handle;
+		return new Promise<DatabaseMaintenanceResult>((resolve, reject) => {
+			let settled = false;
+
+			const cleanup = () => {
+				if (worker.onmessage === onMessage) worker.onmessage = null;
+				if (worker.onerror === onError) worker.onerror = null;
+				if (this.activeMaintenanceReject === rejectActive) {
+					this.activeMaintenanceReject = null;
+				}
+			};
+			const finish = (callback: () => void) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				callback();
+			};
+			const rejectActive = (reason: Error) => finish(() => reject(reason));
+			const onMessage = (event: MessageEvent) =>
+				finish(() => resolve(event.data as DatabaseMaintenanceResult));
+			const onError = (event: ErrorEvent) =>
+				rejectActive(
+					new Error(event.message ?? "database maintenance worker error"),
+				);
+
+			worker.onmessage = onMessage;
+			worker.onerror = onError;
+			this.activeMaintenanceReject = rejectActive;
+			try {
+				worker.postMessage(request);
+			} catch (error) {
+				rejectActive(error instanceof Error ? error : new Error(String(error)));
+			}
+		});
+	}
+
+	private getMaintenanceWorkerHandle(): DatabaseMaintenanceWorkerHandle {
+		if (this.maintenanceWorkerHandle) return this.maintenanceWorkerHandle;
+		const handle = this.maintenanceWorkerFactory
+			? this.maintenanceWorkerFactory()
+			: this.createMaintenanceWorkerHandle();
+		this.maintenanceWorkerHandle = handle;
+		return handle;
+	}
+
+	/**
+	 * Create the reusable incremental-vacuum/optimize Worker. The embedded
+	 * production path retains its Blob URL alongside the Worker so replacement
+	 * and close() can revoke it exactly once. Tests and fresh worktrees use the
+	 * source file fallback and therefore own no Blob URL.
+	 */
+	private createMaintenanceWorkerHandle(): DatabaseMaintenanceWorkerHandle {
 		if (EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE) {
 			const workerCode = Buffer.from(
 				EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE,
 				"base64",
 			).toString("utf8");
 			const blob = new Blob([workerCode], { type: "text/javascript" });
-			return new Worker(URL.createObjectURL(blob), { smol: true });
+			const objectUrl = URL.createObjectURL(blob);
+			try {
+				return {
+					worker: new Worker(objectUrl, {
+						smol: true,
+					}) as DatabaseMaintenanceWorker,
+					revokeObjectUrl: () => URL.revokeObjectURL(objectUrl),
+				};
+			} catch (error) {
+				URL.revokeObjectURL(objectUrl);
+				throw error;
+			}
 		}
-		return new Worker(
-			new URL("./incremental-vacuum-worker.ts", import.meta.url).href,
-		);
+		return {
+			worker: new Worker(
+				new URL("./incremental-vacuum-worker.ts", import.meta.url).href,
+			) as DatabaseMaintenanceWorker,
+		};
+	}
+
+	private disposeMaintenanceWorker(
+		handle: DatabaseMaintenanceWorkerHandle | null,
+		reason = new Error("database maintenance worker discarded"),
+	): void {
+		if (!handle || this.maintenanceWorkerHandle !== handle) return;
+		this.maintenanceWorkerHandle = null;
+
+		const rejectActive = this.activeMaintenanceReject;
+		this.activeMaintenanceReject = null;
+		rejectActive?.(reason);
+		handle.worker.onmessage = null;
+		handle.worker.onerror = null;
+		try {
+			handle.worker.terminate();
+		} catch (error) {
+			console.warn(
+				`[database-maintenance] Worker termination failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		try {
+			handle.revokeObjectUrl?.();
+		} catch (error) {
+			console.warn(
+				`[database-maintenance] Blob URL revocation failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	}
 
 	/**
@@ -2074,41 +2257,32 @@ OAuth tokens will need to be re-authenticated.
 		}
 
 		const dbPath = this.resolvedDbPath;
-		const worker = this.spawnIncrementalVacuumWorker();
-
-		try {
-			const result = await new Promise<
-				{ ok: true; mode: number } | { ok: false; error: string }
-			>((resolve, reject) => {
-				worker.onmessage = (event: MessageEvent) => resolve(event.data);
-				worker.onerror = (event: ErrorEvent) =>
-					reject(new Error(event.message ?? "incremental-vacuum worker error"));
-				worker.postMessage({ dbPath, pages, kind: "vacuum" });
-			});
-			if (result.ok) {
-				this.incVacuumConsecutiveSkips = 0;
+		const result = await this.enqueueMaintenanceRequest({
+			dbPath,
+			pages,
+			kind: "vacuum",
+		});
+		if (result.ok) {
+			this.incVacuumConsecutiveSkips = 0;
+		} else {
+			this.incVacuumConsecutiveSkips += 1;
+			// Single-tick failures are common and noise — sustained skips
+			// across several hourly ticks mean the DB isn't getting any
+			// reclamation, which can let free pages accumulate without
+			// bound. Escalate after 3 consecutive skips (= 3 hours of
+			// missed reclamation). (Greptile #230)
+			if (this.incVacuumConsecutiveSkips >= INC_VAC_SKIP_ESCALATE_AT) {
+				console.warn(
+					`[incrementalVacuum] worker error (${this.incVacuumConsecutiveSkips} consecutive ` +
+						`skips, ≈${this.incVacuumConsecutiveSkips}h of missed reclamation): ` +
+						`${result.error}. ` +
+						`Sustained SQLITE_BUSY suggests writer-slot contention — investigate ` +
+						`whether long-running writers (large DELETEs, manual maintenance) are ` +
+						`overlapping the hourly tick.`,
+				);
 			} else {
-				this.incVacuumConsecutiveSkips += 1;
-				// Single-tick failures are common and noise — sustained skips
-				// across several hourly ticks mean the DB isn't getting any
-				// reclamation, which can let free pages accumulate without
-				// bound. Escalate after 3 consecutive skips (= 3 hours of
-				// missed reclamation). (Greptile #230)
-				if (this.incVacuumConsecutiveSkips >= INC_VAC_SKIP_ESCALATE_AT) {
-					console.warn(
-						`[incrementalVacuum] worker error (${this.incVacuumConsecutiveSkips} consecutive ` +
-							`skips, ≈${this.incVacuumConsecutiveSkips}h of missed reclamation): ` +
-							`${result.error}. ` +
-							`Sustained SQLITE_BUSY suggests writer-slot contention — investigate ` +
-							`whether long-running writers (large DELETEs, manual maintenance) are ` +
-							`overlapping the hourly tick.`,
-					);
-				} else {
-					console.warn(`[incrementalVacuum] worker error: ${result.error}`);
-				}
+				console.warn(`[incrementalVacuum] worker error: ${result.error}`);
 			}
-		} finally {
-			worker.terminate();
 		}
 	}
 

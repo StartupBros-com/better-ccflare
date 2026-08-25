@@ -1066,6 +1066,49 @@ export function formatWalCheckpointLog(
 	};
 }
 
+interface WalCheckpointDatabase {
+	optimizeAsync(): Promise<{
+		ok: boolean;
+		skipped: boolean;
+		error?: string;
+		durationMs?: number;
+	}>;
+	getWalSizeBytes(): Promise<number>;
+}
+
+interface WalCheckpointLogger {
+	debug(message: string): unknown;
+	warn(message: string): unknown;
+	error(message: string): unknown;
+}
+
+/**
+ * Build the scheduler registration as a testable unit. Its callback is async
+ * on purpose: IntervalManager can only enforce maxConcurrent while the real
+ * optimize/checkpoint promise remains in flight.
+ */
+export function createWalCheckpointCleanupConfig(
+	dbOps: WalCheckpointDatabase,
+	log: WalCheckpointLogger,
+) {
+	return {
+		id: "wal-checkpoint",
+		callback: async () => {
+			try {
+				const result = await dbOps.optimizeAsync();
+				const walBytes = result.ok ? await dbOps.getWalSizeBytes() : 0;
+				const { level, message } = formatWalCheckpointLog(result, walBytes);
+				log[level](message);
+			} catch (error) {
+				log.error(`WAL checkpoint error: ${error}`);
+			}
+		},
+		minutes: 1,
+		maxConcurrent: 1,
+		description: "WAL checkpoint to prevent unbounded WAL file growth",
+	};
+}
+
 // Export for programmatic use
 let serverLifecycleOwned = false;
 
@@ -1603,23 +1646,9 @@ export default async function startServer(options?: {
 	// blocks. The old synchronous dbOps.optimize() parked the main thread in
 	// SQLite's busy handler for up to busy_timeout (10s) whenever the hourly
 	// vacuum worker held the write lock, freezing the event loop.
-	const unregisterWalCheckpoint = registerCleanup({
-		id: "wal-checkpoint",
-		callback: () => {
-			dbOps
-				.optimizeAsync()
-				.then(async (result) => {
-					const walBytes = result.ok ? await dbOps.getWalSizeBytes() : 0;
-					const { level, message } = formatWalCheckpointLog(result, walBytes);
-					log[level](message);
-				})
-				.catch((err) => {
-					log.error(`WAL checkpoint error: ${err}`);
-				});
-		},
-		minutes: 1,
-		description: "WAL checkpoint to prevent unbounded WAL file growth",
-	});
+	const unregisterWalCheckpoint = registerCleanup(
+		createWalCheckpointCleanupConfig(dbOps, log),
+	);
 	stopWalCheckpointJob = unregisterWalCheckpoint;
 
 	// Initialize load balancing strategy (will be created after runtime config)
