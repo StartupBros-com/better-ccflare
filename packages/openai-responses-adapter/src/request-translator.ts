@@ -161,12 +161,15 @@ function translateToolChoice(
 // alone lets a truthy non-string value pass through and reach Anthropic,
 // which 400s the whole request on a non-string content field.
 function translateContentItem(c: {
-	type: string;
-	text?: string;
-	refusal?: string;
-	image_url?: string;
-	file_id?: string;
+	type: unknown;
+	text?: unknown;
+	refusal?: unknown;
+	image_url?: unknown;
+	file_id?: unknown;
 }): { ok: true; block: AnthropicContent } | { ok: false; reason: string } {
+	if (typeof c.type !== "string") {
+		return { ok: false, reason: "content type is not a string" };
+	}
 	if (c.type === "input_text" || c.type === "output_text") {
 		if (typeof c.text !== "string") {
 			return { ok: false, reason: `${c.type} has non-string text` };
@@ -329,11 +332,11 @@ export function translateRequestToAnthropic(
 				}
 				const res = translateContentItem(
 					rawC as {
-						type: string;
-						text?: string;
-						refusal?: string;
-						image_url?: string;
-						file_id?: string;
+						type: unknown;
+						text?: unknown;
+						refusal?: unknown;
+						image_url?: unknown;
+						file_id?: unknown;
 					},
 				);
 				if (res.ok) {

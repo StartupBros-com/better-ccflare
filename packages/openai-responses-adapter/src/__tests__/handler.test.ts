@@ -953,6 +953,86 @@ describe("Responses request body admission", () => {
 			expect(calls()).toBe(1);
 		});
 
+		test("accepts the exact content-part limit split across same-role messages", async () => {
+			let forwarded: { messages?: Array<{ content?: unknown[] }> } | undefined;
+			let calls = 0;
+			const proxy: HandleProxyFn = async (proxyRequest) => {
+				calls += 1;
+				forwarded = (await proxyRequest.json()) as typeof forwarded;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: "user",
+						content: [{ type: "input_text", text: "first" }],
+					},
+					{
+						type: "message",
+						role: "user",
+						content: Array.from(
+							{ length: MAX_RESPONSES_CONTENT_PARTS - 1 },
+							() => ({ type: "input_text", text: "x" }),
+						),
+					},
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls).toBe(1);
+			expect(forwarded?.messages).toHaveLength(1);
+			expect(forwarded?.messages?.[0].content).toHaveLength(
+				MAX_RESPONSES_CONTENT_PARTS,
+			);
+		});
+
+		test("drops a hostile non-string content discriminator without throwing", async () => {
+			let forwarded: { messages?: unknown } | undefined;
+			let calls = 0;
+			const proxy: HandleProxyFn = async (proxyRequest) => {
+				calls += 1;
+				forwarded = (await proxyRequest.json()) as typeof forwarded;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: "user",
+						content: [
+							{ type: { toString: null, valueOf: null } },
+							{ type: "input_text", text: "keep me" },
+						],
+					},
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls).toBe(1);
+			expect(forwarded?.messages).toEqual([
+				{ role: "user", content: [{ type: "text", text: "keep me" }] },
+			]);
+		});
+
 		test("rejects non-array tools with the invalid-request envelope before proxying", async () => {
 			for (const tools of [null, {}, "not-an-array"]) {
 				const [proxy, calls] = countingProxy();
@@ -1054,6 +1134,35 @@ describe("Responses request body admission", () => {
 			expect(forwarded?.tool_choice).toEqual({ type: "any" });
 		});
 
+		test("forwards a named choice when its function tool is compatible", async () => {
+			let forwarded: Record<string, unknown> | undefined;
+			const proxy: HandleProxyFn = async (proxyRequest) => {
+				forwarded = (await proxyRequest.json()) as Record<string, unknown>;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: "Hi",
+				tools: [
+					{ type: "web_search_preview" },
+					{ type: "function", name: "lookup" },
+				],
+				tool_choice: { type: "function", name: "lookup" },
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(forwarded?.tools).toEqual([{ name: "lookup", input_schema: {} }]);
+			expect(forwarded?.tool_choice).toEqual({ type: "tool", name: "lookup" });
+		});
+
 		test("rejects malformed function tools before proxying", async () => {
 			for (const tool of [
 				{ type: "function", name: "" },
@@ -1101,6 +1210,36 @@ describe("Responses request body admission", () => {
 			);
 			expect(response.status).toBe(200);
 			expect(calls()).toBe(1);
+		});
+
+		test("rejects required or named tool choices with no compatible function tool", async () => {
+			for (const toolChoice of [
+				"required",
+				{ type: "function", name: "lookup" },
+			]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({
+					model: "claude-haiku-4-5",
+					input: "Hi",
+					tools: [{ type: "web_search_preview" }],
+					tool_choice: toolChoice,
+				});
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+				expect(response.status).toBe(400);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: "tool_choice requires a compatible function tool",
+					},
+				});
+			}
 		});
 
 		test("rejects more than the tool limit without proxying", async () => {

@@ -105,6 +105,47 @@ function hasMalformedFunctionTool(tools: unknown[]): boolean {
 	});
 }
 
+function hasCompatibleFunctionTool(
+	tools: unknown[] | undefined,
+	name?: string,
+): boolean {
+	return (
+		tools?.some((rawTool) => {
+			if (
+				rawTool === null ||
+				typeof rawTool !== "object" ||
+				Array.isArray(rawTool)
+			) {
+				return false;
+			}
+			const tool = rawTool as Record<string, unknown>;
+			return (
+				tool.type === "function" && (name === undefined || tool.name === name)
+			);
+		}) ?? false
+	);
+}
+
+function hasUnsatisfiedToolChoice(
+	tools: unknown[] | undefined,
+	toolChoice: unknown,
+): boolean {
+	if (toolChoice === "required") return !hasCompatibleFunctionTool(tools);
+	if (
+		toolChoice === null ||
+		typeof toolChoice !== "object" ||
+		Array.isArray(toolChoice)
+	) {
+		return false;
+	}
+	const choice = toolChoice as Record<string, unknown>;
+	if (choice.type !== "function") return false;
+	return (
+		typeof choice.name !== "string" ||
+		!hasCompatibleFunctionTool(tools, choice.name)
+	);
+}
+
 async function decompressWithRuntimeStream(
 	encodedBody: ArrayBuffer,
 	format: "gzip" | "deflate",
@@ -314,6 +355,12 @@ export async function handleResponsesRequest(
 	}
 	if (body.tools && hasMalformedFunctionTool(body.tools)) {
 		return openAiRequestError(400, "Invalid function tool definition");
+	}
+	if (hasUnsatisfiedToolChoice(body.tools, body.tool_choice)) {
+		return openAiRequestError(
+			400,
+			"tool_choice requires a compatible function tool",
+		);
 	}
 
 	// `previous_response_id` is intentionally ignored. Codex only sends this
