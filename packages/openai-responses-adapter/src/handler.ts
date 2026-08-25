@@ -51,6 +51,7 @@ function oversizedContentItemType(
 	input: unknown,
 ): "message" | "agent_message" | undefined {
 	if (!Array.isArray(input)) return undefined;
+	let totalContentParts = 0;
 	for (const rawItem of input) {
 		if (
 			rawItem === null ||
@@ -60,21 +61,24 @@ function oversizedContentItemType(
 			continue;
 		}
 		const item = rawItem as Record<string, unknown>;
-		if (
-			(item.type === "message" || item.type === "agent_message") &&
-			Array.isArray(item.content) &&
-			item.content.length > MAX_RESPONSES_CONTENT_PARTS
-		) {
-			return item.type;
+		if (item.type !== "message" && item.type !== "agent_message") continue;
+		if (Array.isArray(item.content)) {
+			totalContentParts += item.content.length;
+		} else if (item.type === "message" && typeof item.content === "string") {
+			totalContentParts += 1;
 		}
+		if (totalContentParts > MAX_RESPONSES_CONTENT_PARTS) return item.type;
 	}
 	return undefined;
 }
 
-function hasNonObjectToolEntry(tools: unknown[]): boolean {
+function hasInvalidToolEntry(tools: unknown[]): boolean {
 	return tools.some(
 		(rawTool) =>
-			rawTool === null || typeof rawTool !== "object" || Array.isArray(rawTool),
+			rawTool === null ||
+			typeof rawTool !== "object" ||
+			Array.isArray(rawTool) ||
+			typeof (rawTool as Record<string, unknown>).type !== "string",
 	);
 }
 
@@ -305,7 +309,7 @@ export async function handleResponsesRequest(
 	if (body.tools && body.tools.length > MAX_RESPONSES_TOOLS) {
 		return openAiRequestError(413, "Too many tools");
 	}
-	if (body.tools && hasNonObjectToolEntry(body.tools)) {
+	if (body.tools && hasInvalidToolEntry(body.tools)) {
 		return openAiRequestError(400, "Invalid tool definition");
 	}
 	if (body.tools && hasMalformedFunctionTool(body.tools)) {

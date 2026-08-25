@@ -883,6 +883,51 @@ describe("Responses request body admission", () => {
 			}
 		});
 
+		test("rejects an aggregate content-part overflow without proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const firstItemParts = Math.floor(MAX_RESPONSES_CONTENT_PARTS / 2);
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: "user",
+						content: Array.from({ length: firstItemParts }, () => ({
+							type: "input_text",
+							text: "x",
+						})),
+					},
+					{
+						type: "agent_message",
+						author: "planner",
+						recipient: "coder",
+						content: Array.from(
+							{
+								length: MAX_RESPONSES_CONTENT_PARTS - firstItemParts + 1,
+							},
+							() => ({ type: "input_text", text: "x" }),
+						),
+					},
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(413);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "Too many agent_message content parts",
+				},
+			});
+		});
+
 		test("accepts exactly the message content-part limit", async () => {
 			const [proxy, calls] = countingProxy();
 			const req = request({
@@ -955,6 +1000,31 @@ describe("Responses request body admission", () => {
 					},
 				});
 			}
+		});
+
+		test("rejects a non-string tool discriminator without proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: "Hi",
+				tools: [{ type: { toString: null, valueOf: null } }],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(400);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "Invalid tool definition",
+				},
+			});
 		});
 
 		test("forwards a null-parameter function tool with required choice", async () => {
