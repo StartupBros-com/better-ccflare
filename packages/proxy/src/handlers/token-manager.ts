@@ -1244,7 +1244,7 @@ export async function getValidAccessToken(
 		account.provider === "claude-console-api" ||
 		account.provider === "anthropic-compatible" ||
 		account.provider === "minimax" ||
-		account.provider === "muse-spark"
+		account.provider === "meta"
 	) {
 		if (account.api_key) {
 			return account.api_key;

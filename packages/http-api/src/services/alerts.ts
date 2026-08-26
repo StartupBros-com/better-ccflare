@@ -27,6 +27,7 @@ import type {
 import {
 	type AnomalyRequestRow,
 	buildAnomalyInsightsResponse,
+	GROUP_KEY_SEPARATOR,
 	sanitizeProjectForDisplay,
 } from "./anomaly-insights";
 import { computeUsagePrediction } from "./usage-prediction";
@@ -166,6 +167,7 @@ export function getAlertsConfig(config: Config): AlertsConfigPayload {
 		usageWindowValueDropThreshold: getUsageWindowValueDropThreshold(config),
 		anomalyEnabled: config.getAlertAnomalyEnabled(),
 		anomalyIntervalMinutes: config.getAlertAnomalyIntervalMinutes(),
+		anomalyBaselineWindowMinutes: config.getAlertAnomalyBaselineWindowMinutes(),
 		loopMinRequests: config.getAlertAnomalyLoopMinRequests(),
 		cooldownMinutes: config.getAlertCooldownMinutes(),
 		webhookUrl: config.getAlertWebhookUrl(),
@@ -194,6 +196,9 @@ export function setAlertsConfig(
 	}
 	config.setAlertAnomalyEnabled(payload.anomalyEnabled);
 	config.setAlertAnomalyIntervalMinutes(payload.anomalyIntervalMinutes);
+	config.setAlertAnomalyBaselineWindowMinutes(
+		payload.anomalyBaselineWindowMinutes,
+	);
 	config.setAlertAnomalyLoopMinRequests(payload.loopMinRequests);
 	config.setAlertCooldownMinutes(payload.cooldownMinutes);
 }
@@ -210,6 +215,29 @@ export function buildThresholdAlertId(
 ): string {
 	const bucketMs = Math.max(1, cooldownMinutes) * 60 * 1000;
 	return `${type}:${scope}:${Math.floor(timestamp / bucketMs)}`;
+}
+
+/**
+ * Encodes a possibly-null raw value for use inside a cooldown scope key,
+ * distinguishing "no value" from a real value that happens to equal the
+ * display fallback ("Unknown"). `event.account`/`event.model` on anomaly
+ * events are already normalized (null -> "Unknown") for display purposes,
+ * so a scope built directly from those two fields cannot tell an account
+ * literally named "Unknown" apart from a request with no account at all —
+ * this must be built from the raw (pre-normalization) field instead.
+ *
+ * `model` is attacker-controlled (taken verbatim from the inbound request's
+ * JSON `model` field, with no charset restriction — unlike account names,
+ * which are validated against patterns.accountName), so no fixed sentinel
+ * string is safe: a client could always send a model value equal to
+ * whatever sentinel was chosen. Instead, length-prefix the value
+ * (`${length}:${value}`) and use a length of 0 for null. Two distinct
+ * inputs can never produce the same encoding this way, regardless of what
+ * characters either one contains — the length prefix is unambiguous.
+ */
+function encodeScopePart(raw: string | null): string {
+	if (raw === null) return "0:";
+	return `${raw.length}:${raw}`;
 }
 
 export function buildRunawayLoopAlertId(
@@ -1026,8 +1054,31 @@ export class AlertService {
 	async evaluateAnomalies(): Promise<void> {
 		const config = getAlertsConfig(this.config);
 		if (!config.anomalyEnabled) return;
-		const since = Date.now() - config.anomalyIntervalMinutes * 60 * 1000;
-		const rows = (
+		const baselineWindowMinutes = config.anomalyBaselineWindowMinutes;
+		const intervalMinutes = config.anomalyIntervalMinutes;
+		// Query one wider window spanning both the baseline history and the
+		// scoring interval, then partition client-side below into two
+		// GENUINELY DISJOINT sets: rows strictly before scoringSince feed the
+		// baseline, rows at/after scoringSince are what gets scored. This
+		// keeps the DB hit to a single query instead of two, while still
+		// upholding the leave-one-out contract documented on
+		// detectTokenOutliers (issue #410) — a scored row must never also be
+		// a member of its own baseline population.
+		//
+		// The query window must be ADDITIVE (baselineWindowMinutes +
+		// intervalMinutes), not Math.max(...). Math.max collapses to just
+		// intervalMinutes whenever baselineWindowMinutes <= intervalMinutes
+		// (a valid config — nothing prevents anomalyBaselineWindowMinutes
+		// from being set lower than anomalyIntervalMinutes), which would
+		// fetch ONLY the scoring interval's worth of history. Every fetched
+		// row would then have timestamp >= scoringSince, so baselineRows
+		// would come up empty and every anomaly would silently go
+		// undetected. The additive formula guarantees the fetch always
+		// extends a full baselineWindowMinutes further back than
+		// scoringSince, regardless of how intervalMinutes compares to it.
+		const scoringSince = Date.now() - intervalMinutes * 60 * 1000;
+		const baselineSince = scoringSince - baselineWindowMinutes * 60 * 1000;
+		const allRows = (
 			await this.db.query<AnomalySqlRow>(
 				`
 				SELECT
@@ -1047,13 +1098,19 @@ export class AlertService {
 				WHERE r.timestamp >= ?
 				ORDER BY r.timestamp ASC
 			`,
-				[since],
+				[baselineSince],
 			)
 		).map(toAnomalyRow);
-		if (rows.length === 0) return;
+		if (allRows.length === 0) return;
+		// Partition by timestamp so the two sets never share a row: baseline is
+		// strictly OLDER history (up to a full baselineWindowMinutes wide),
+		// scoring is the recent slice.
+		const baselineRows = allRows.filter((row) => row.timestamp < scoringSince);
+		const scoringRows = allRows.filter((row) => row.timestamp >= scoringSince);
+		if (scoringRows.length === 0) return;
 		const modelIds = [
 			...new Set(
-				rows
+				scoringRows
 					.map((row) => row.model)
 					.filter((model): model is string => model != null && model !== ""),
 			),
@@ -1065,10 +1122,12 @@ export class AlertService {
 			modelIds.map((modelId, index) => [modelId, rateList[index]]),
 		);
 		const response = buildAnomalyInsightsResponse({
-			rows,
+			baselineRows,
+			scoringRows,
 			rates,
 			options: {
-				range: `${config.anomalyIntervalMinutes}m`,
+				range: `${intervalMinutes}m`,
+				baselineWindowMinutes,
 				truncated: false,
 				loopMinRequests: config.loopMinRequests,
 			},
@@ -1081,7 +1140,7 @@ export class AlertService {
 			alerts.push({
 				id: buildThresholdAlertId(
 					"anomaly_token_outlier",
-					event.requestId,
+					`${encodeScopePart(event.accountRaw)}${GROUP_KEY_SEPARATOR}${encodeScopePart(event.modelRaw)}`,
 					event.timestamp,
 					config.cooldownMinutes,
 				),
@@ -1089,7 +1148,7 @@ export class AlertService {
 				type: "anomaly_token_outlier",
 				severity: "warning",
 				title: "Token usage anomaly detected",
-				message: `Request ${event.requestId} used ${event.value.toLocaleString()} tokens (${event.zScore.toFixed(1)}σ above baseline).`,
+				message: `Request ${event.requestId} used ${event.value.toLocaleString()} tokens (${(event.value / event.approxBaselineMedian).toFixed(1)}x the account/model baseline of ~${Math.round(event.approxBaselineMedian).toLocaleString()}; anomaly score ${event.zScore.toFixed(1)}).`,
 				value: event.value,
 				threshold: null,
 				account: event.account,
@@ -1106,7 +1165,7 @@ export class AlertService {
 			alerts.push({
 				id: buildThresholdAlertId(
 					"anomaly_output_blowup",
-					event.requestId,
+					`${encodeScopePart(event.accountRaw)}${GROUP_KEY_SEPARATOR}${encodeScopePart(event.modelRaw)}`,
 					event.timestamp,
 					config.cooldownMinutes,
 				),
@@ -1114,7 +1173,7 @@ export class AlertService {
 				type: "anomaly_output_blowup",
 				severity: "warning",
 				title: "Output token blowup detected",
-				message: `Request ${event.requestId} returned ${event.value.toLocaleString()} output tokens (${event.zScore.toFixed(1)}σ above baseline).`,
+				message: `Request ${event.requestId} returned ${event.value.toLocaleString()} output tokens (${(event.value / event.approxBaselineMedian).toFixed(1)}x the account/model baseline of ~${Math.round(event.approxBaselineMedian).toLocaleString()} output tokens; anomaly score ${event.zScore.toFixed(1)}).`,
 				value: event.value,
 				threshold: null,
 				account: event.account,

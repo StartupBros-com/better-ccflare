@@ -593,8 +593,11 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 			partition.unavailableDimensions,
 		);
 		const sealUnavailable = JSON.stringify(receipt.unavailableDimensions);
+		// PostgreSQL cannot infer a bare bind parameter's type in `? IS NULL`.
+		// COALESCE with the typed column preserves the cross-dialect null-safe
+		// comparison while giving each nullable bind an explicit type context.
 		const nullableEquals = (column: string) =>
-			`((${column} IS NULL AND ? IS NULL) OR ${column} = ?)`;
+			`((${column} IS NULL AND COALESCE(?, ${column}) IS NULL) OR ${column} = ?)`;
 
 		return [
 			{

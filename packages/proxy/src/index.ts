@@ -101,7 +101,14 @@ export type {
 	CodexModelEntry,
 	CodexModelListing,
 } from "./codex-model-catalog";
-export { getCodexModels } from "./codex-model-catalog";
+export {
+	getCodexModels,
+	lowestTierCodexModel,
+} from "./codex-model-catalog";
+export {
+	recordCodexUsageSnapshot,
+	resetCodexUsageHistoryThrottle,
+} from "./codex-usage-history";
 export { readCodexWebSocketPercent } from "./codex-websocket-contract";
 export {
 	type DegradedOwnerDirectiveInput,
@@ -141,6 +148,14 @@ export {
 	restorePendingRotations,
 } from "./handlers/pending-rotation-registry";
 export { createPendingRotationWal } from "./handlers/pending-rotation-wal";
+export {
+	clearRoutingObservations,
+	getRoutingObservations,
+	type RoutingObservation,
+	type RoutingObservationAccount,
+	recordRoutingObservation,
+	recordSelectedOrder,
+} from "./handlers/routing-observations";
 export {
 	runIntegrityCheckOnDemand,
 	startFullIntegrityCheckBackground,

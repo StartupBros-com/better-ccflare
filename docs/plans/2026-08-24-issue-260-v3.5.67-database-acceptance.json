@@ -1,0 +1,119 @@
+{
+  "schemaVersion": 2,
+  "manifestRevision": "v3.5.67-u6-final-database-contract-v2",
+  "purpose": "Executable acceptance inventory for sanitized, guarded U6 fresh-schema, legacy-upgrade, two-pass idempotence, and forward-and-restore rehearsal. This manifest never authorizes a production connection, provider traffic, or a reverse migration.",
+  "fixtureContract": {
+    "sanitizedOnly": true,
+    "requiredRows": [
+      "colliding canonical meta and legacy muse-spark accounts sharing the same logical account tuple",
+      "colliding combo slots that exercise survivor-owned and lowest-logical-slot-id keeper rules",
+      "colliding usage windows that exercise survivor-owned keeper and settled-state merge rules",
+      "requests, usage snapshots, usage windows, combo membership exclusions, and device setup jobs referencing discarded account ids",
+      "managed combo enrollment rules, family assignment, and membership exclusions",
+      "one active model-scoped usage window and one inactive account-wide historical usage window",
+      "same-timestamp active and inactive usage snapshots, with the later append inactive"
+    ],
+    "normalization": "usage utilization remains within 0 through 100",
+    "sourceImmutability": "fingerprint the pre-migration legacy source before its backup/dump and require the same fingerprint after candidate migration",
+    "sqliteBackupSemantics": "runMigrations' built-in SQLite backup is best-effort: a backup error is warned and migration proceeds. This rehearsal independently creates and verifies an immutable source copy before candidate mutation, so this acceptance run is externally backup-protected but the production migration itself is not backup-gated.",
+    "idempotence": "run every candidate migration twice; the second pass creates no duplicate rows and changes no adopted schema or data outcome",
+    "safety": "Exact test-only identities, disposable loopback PostgreSQL targets, immutable source backups/dumps, generated child schemas, and distinct rollback restores are required."
+  },
+  "dialects": {
+    "sqlite": {
+      "usageSnapshots": {
+        "columns": [
+          "append_order INTEGER PRIMARY KEY AUTOINCREMENT",
+          "account_id TEXT NOT NULL",
+          "timestamp INTEGER NOT NULL",
+          "window_key TEXT NOT NULL",
+          "utilization REAL NOT NULL",
+          "resets_at INTEGER",
+          "active INTEGER NOT NULL DEFAULT 1"
+        ],
+        "indexes": [
+          "idx_usage_snapshots_append_order implicit PRIMARY KEY uniqueness",
+          "idx_usage_snapshots_acct_win_time(account_id, window_key, timestamp DESC)",
+          "idx_usage_snapshots_acct_win_time_append_order(account_id, window_key, timestamp DESC, append_order DESC)",
+          "idx_usage_snapshots_ts(timestamp)"
+        ]
+      }
+    },
+    "postgres": {
+      "usageSnapshots": {
+        "columns": [
+          "append_order BIGINT NOT NULL DEFAULT nextval('usage_snapshots_append_order_seq')",
+          "account_id TEXT NOT NULL",
+          "timestamp BIGINT NOT NULL",
+          "window_key TEXT NOT NULL",
+          "utilization DOUBLE PRECISION NOT NULL",
+          "resets_at BIGINT",
+          "active INTEGER NOT NULL DEFAULT 1"
+        ],
+        "generator": "usage_snapshots_append_order_seq nextval is the atomic database-generated append-order allocator",
+        "indexes": [
+          "idx_usage_snapshots_append_order UNIQUE(append_order)",
+          "idx_usage_snapshots_acct_win_time(account_id, window_key, timestamp DESC)",
+          "idx_usage_snapshots_acct_win_time_append_order(account_id, window_key, timestamp DESC, append_order DESC)",
+          "idx_usage_snapshots_ts(timestamp)"
+        ]
+      }
+    }
+  },
+  "legacyUpgradeAssertions": [
+    {
+      "id": "legacy-snapshot-shape",
+      "assertion": "The seeded upgrade source genuinely has usage_snapshots without active or append_order; migration backfills active to 1 and allocates unique durable append_order values before post-migration inserts."
+    },
+    {
+      "id": "append-order-contract",
+      "assertion": "Fresh and upgraded SQLite schemas use INTEGER PRIMARY KEY AUTOINCREMENT. Fresh and upgraded PostgreSQL schemas use BIGINT NOT NULL DEFAULT atomic nextval from usage_snapshots_append_order_seq plus idx_usage_snapshots_append_order uniqueness. The durable account/window/timestamp/append_order lookup index exists in both dialects."
+    },
+    {
+      "id": "alias-collapse-and-state",
+      "assertion": "meta and muse-spark collisions collapse to one canonical meta account exactly once. Survivor selection is deterministic: latest last_used, then latest refresh_token_issued_at, then latest created_at, then lowest logical account id. Freshest credential fields come from one deterministic row; API keys and nullable state use the same logical-id-safe ordering."
+    },
+    {
+      "id": "colliding-combo-slots",
+      "assertion": "Colliding combo slots retain a survivor-owned keeper when present; otherwise the lowest logical slot id wins. In both cases enabled wins and the lowest numeric priority wins before discarded account ids are repointed."
+    },
+    {
+      "id": "colliding-usage-windows",
+      "assertion": "Colliding usage windows retain a survivor-owned keeper when present; the latest and most-complete closed row supplies settled fields, while earliest start, maximum utilization, and earliest 100% observation are preserved across aliases."
+    },
+    {
+      "id": "dependent-repoints",
+      "assertion": "combo_slots, requests, usage_snapshots, usage_windows, combo_membership_exclusions, and device_setup_jobs that reference discarded ids are repointed before deletion; exclusion collisions preserve the survivor-owned row."
+    },
+    {
+      "id": "two-pass-idempotence",
+      "assertion": "Both migration passes preserve canonical meta state, adopted catalog and rows, revision singleton/triggers, managed routing rows, and indexes without duplicate outcomes."
+    }
+  ],
+  "repositoryAndRetentionAssertions": [
+    {
+      "id": "inactive-latest",
+      "assertion": "A newest inactive marker makes getLatestSnapshot return null. Active chart series omit inactive rows, while unfiltered getRawSnapshots retains complete history."
+    },
+    {
+      "id": "same-timestamp-append-order",
+      "assertion": "For equal timestamps, getLatestSnapshot selects the later database-generated append_order rather than a physical storage location."
+    },
+    {
+      "id": "retention",
+      "assertion": "Retention deletes only eligible old raw snapshots by durable append_order and preserves the current snapshot."
+    },
+    {
+      "id": "managed-routing",
+      "assertion": "Managed enrollment rules, exclusions, assignments, slots, and routing revision reads round-trip; a policy mutation advances the revision."
+    }
+  ],
+  "rollbackFingerprints": {
+    "algorithm": "catalog plus sanitized fixture/adopted rows plus repository and retention smoke outputs",
+    "source": "capture with legacy-schema queries before backup/dump; these queries never reference active or append_order",
+    "artifact": "checksum every SQLite backup and PostgreSQL dump before restore",
+    "candidate": "fresh and upgraded catalogs plus post-migration data/repository fingerprints after two passes must satisfy this manifest",
+    "rollback": "restore the immutable pre-migration fixture backup or dump into a distinct clean target; its legacy-source fingerprint must equal the original source fingerprint",
+    "forbidden": "No production connection, production data, provider request, reverse meta-to-muse-spark migration, or reverse-schema migration is a rollback strategy."
+  }
+}

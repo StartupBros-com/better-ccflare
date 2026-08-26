@@ -22,6 +22,7 @@ import {
 	CODEX_CACHE_KEY_PREFIX_SHARD_PERCENT_ENV,
 	CODEX_CACHE_KEY_SESSION_PERCENT_ENV,
 	CODEX_DEFAULT_ENDPOINT,
+	CODEX_PING_MODEL,
 	CODEX_PROMPT_CACHE_KEY_ENV,
 	CODEX_VERSION,
 	CodexProvider,
@@ -50,6 +51,20 @@ const eventLine = (name: string, data: unknown) => [
 	`data: ${typeof data === "string" ? data : JSON.stringify(data)}`,
 	"",
 ];
+
+async function waitForAbort(
+	signal: AbortSignal,
+	timeoutMs: number,
+): Promise<void> {
+	const start = Date.now();
+	while (!signal.aborted) {
+		if (Date.now() - start > timeoutMs) {
+			throw new Error("drain transport did not abort within expected time");
+		}
+		await Bun.sleep(5);
+	}
+}
+
 const readTraceRecords = (dir: string): Array<Record<string, unknown>> => {
 	const file = readdirSync(dir).find((f) => f.endsWith(".jsonl"));
 	if (!file) return [];
@@ -972,9 +987,9 @@ describe("CodexProvider stream liveness", () => {
 		const provider = new CodexProvider({
 			streamHeartbeatIntervalMs: 20,
 			streamRawSilenceTimeoutMs: 200,
+			streamDrainDeadlineMs: 100,
 		});
 		let upstreamController: ReadableStreamDefaultController<Uint8Array>;
-		let upstreamCancelReason: unknown;
 		const upstream = new ReadableStream<Uint8Array>({
 			start(controller) {
 				upstreamController = controller;
@@ -989,17 +1004,14 @@ describe("CodexProvider stream liveness", () => {
 					),
 				);
 			},
-			cancel(reason) {
-				upstreamCancelReason = reason;
-			},
 		});
-		const transformed = await provider.processResponse(
-			new Response(upstream, {
-				status: 200,
-				headers: { "content-type": "text/event-stream" },
-			}),
-			null,
-		);
+		const upstreamResponse = new Response(upstream, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const drainAbort = new AbortController();
+		registerResponseDrainTransport(upstreamResponse, drainAbort);
+		const transformed = await provider.processResponse(upstreamResponse, null);
 		const reader = transformed.body?.getReader();
 		if (!reader) throw new Error("transformed response has no body");
 		const decoder = new TextDecoder();
@@ -1041,28 +1053,27 @@ describe("CodexProvider stream liveness", () => {
 		}
 		expect(terminalBody).toContain("event: message_stop");
 		expect(terminalBody).not.toContain("event: ping");
-		expect(upstreamCancelReason).toBeDefined();
+		await waitForAbort(drainAbort.signal, 1000);
 	});
 
 	it("terminates raw upstream silence after synthetic heartbeats", async () => {
 		const provider = new CodexProvider({
 			streamHeartbeatIntervalMs: 15,
 			streamRawSilenceTimeoutMs: 70,
+			streamDrainDeadlineMs: 100,
 		});
-		let upstreamCancelReason: unknown;
 		const upstream = new ReadableStream<Uint8Array>({
-			cancel(reason) {
-				upstreamCancelReason = reason;
+			pull() {
 				return new Promise<void>(() => {});
 			},
 		});
-		const transformed = await provider.processResponse(
-			new Response(upstream, {
-				status: 200,
-				headers: { "content-type": "text/event-stream" },
-			}),
-			null,
-		);
+		const upstreamResponse = new Response(upstream, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const drainAbort = new AbortController();
+		registerResponseDrainTransport(upstreamResponse, drainAbort);
+		const transformed = await provider.processResponse(upstreamResponse, null);
 
 		const body = await Promise.race([
 			transformed.text(),
@@ -1070,20 +1081,20 @@ describe("CodexProvider stream liveness", () => {
 				throw new Error("timed-out Codex stream did not terminate");
 			}),
 		]);
-		expect(upstreamCancelReason).toBeInstanceOf(Error);
 		expect(body).toContain("event: error");
 		expect(body).toContain(
 			"Codex upstream timed out while waiting for response data.",
 		);
 		expect(body).not.toContain("rawSilenceTimeoutMs");
+		await waitForAbort(drainAbort.signal, 1000);
 	});
 
-	it("does not await a hanging upstream cancellation after a terminal event", async () => {
+	it("does not await a hanging upstream drain after a terminal event", async () => {
 		const provider = new CodexProvider({
 			streamHeartbeatIntervalMs: 100,
 			streamRawSilenceTimeoutMs: 500,
+			streamDrainDeadlineMs: 100,
 		});
-		let cancelCalls = 0;
 		const upstream = new ReadableStream<Uint8Array>({
 			start(controller) {
 				controller.enqueue(
@@ -1101,18 +1112,17 @@ describe("CodexProvider stream liveness", () => {
 					),
 				);
 			},
-			cancel() {
-				cancelCalls++;
+			pull() {
 				return new Promise<void>(() => {});
 			},
 		});
-		const transformed = await provider.processResponse(
-			new Response(upstream, {
-				status: 200,
-				headers: { "content-type": "text/event-stream" },
-			}),
-			null,
-		);
+		const upstreamResponse = new Response(upstream, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const drainAbort = new AbortController();
+		registerResponseDrainTransport(upstreamResponse, drainAbort);
+		const transformed = await provider.processResponse(upstreamResponse, null);
 		const body = await Promise.race([
 			transformed.text(),
 			Bun.sleep(300).then(() => {
@@ -1120,7 +1130,8 @@ describe("CodexProvider stream liveness", () => {
 			}),
 		]);
 		expect(body).toContain("event: message_stop");
-		expect(cancelCalls).toBe(1);
+		expect(drainAbort.signal.aborted).toBe(false);
+		await waitForAbort(drainAbort.signal, 1000);
 	});
 });
 
@@ -2883,9 +2894,9 @@ describe("CodexProvider.processResponse", () => {
 		const provider = new CodexProvider({
 			streamHeartbeatIntervalMs: 20,
 			streamRawSilenceTimeoutMs: 200,
+			streamDrainDeadlineMs: 150,
 		});
 		let upstreamController: ReadableStreamDefaultController<Uint8Array>;
-		let upstreamCancelReason: unknown;
 		const upstream = new ReadableStream<Uint8Array>({
 			start(controller) {
 				upstreamController = controller;
@@ -2898,16 +2909,18 @@ describe("CodexProvider.processResponse", () => {
 					),
 				);
 			},
-			cancel(reason) {
-				upstreamCancelReason = reason;
-			},
 		});
+		const upstreamResponse = new Response(upstream, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const drainAbort = new AbortController();
+		registerResponseDrainTransport(upstreamResponse, drainAbort);
 		const transformed = await provider.processResponse(
-			new Response(upstream, {
-				status: 200,
-				headers: { "content-type": "text/event-stream" },
-			}),
+			upstreamResponse,
 			null,
+			undefined,
+			{ hosted: true },
 		);
 		const reader = transformed.body?.getReader();
 		if (!reader) throw new Error("transformed response has no body");
@@ -2948,7 +2961,7 @@ describe("CodexProvider.processResponse", () => {
 		}
 		expect(terminalBody).toContain("event: message_stop");
 		expect(terminalBody).not.toContain("event: ping");
-		expect(upstreamCancelReason).toBeDefined();
+		await waitForAbort(drainAbort.signal, 1000);
 	});
 
 	it("keeps a committed Codex stream alive during post-output silence", async () => {
@@ -3047,24 +3060,21 @@ describe("CodexProvider.processResponse", () => {
 		const provider = new CodexProvider({
 			streamHeartbeatIntervalMs: 15,
 			streamRawSilenceTimeoutMs: 300,
+			streamDrainDeadlineMs: 100,
 		});
 		let upstreamController: ReadableStreamDefaultController<Uint8Array>;
-		let upstreamCancelReason: unknown;
 		const upstream = new ReadableStream<Uint8Array>({
 			start(controller) {
 				upstreamController = controller;
 			},
-			cancel(reason) {
-				upstreamCancelReason = reason;
-			},
 		});
-		const transformed = await provider.processResponse(
-			new Response(upstream, {
-				status: 200,
-				headers: { "content-type": "text/event-stream" },
-			}),
-			null,
-		);
+		const upstreamResponse = new Response(upstream, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const drainAbort = new AbortController();
+		registerResponseDrainTransport(upstreamResponse, drainAbort);
+		const transformed = await provider.processResponse(upstreamResponse, null);
 
 		// The first heartbeat fills the downstream queue. Let the next heartbeat
 		// become due without pulling, then settle the retained upstream read.
@@ -3098,15 +3108,16 @@ describe("CodexProvider.processResponse", () => {
 		expect(body.match(/event: ping\n/g) ?? []).toHaveLength(1);
 		expect(body).toContain("event: message_start");
 		expect(body).toContain("event: message_stop");
-		expect(upstreamCancelReason).toBeDefined();
+		await waitForAbort(drainAbort.signal, 1000);
 	});
 
-	it("closes a terminal stream without awaiting upstream cancellation", async () => {
+	it("closes a terminal stream without awaiting a hanging upstream drain", async () => {
 		const provider = new CodexProvider({
 			streamHeartbeatIntervalMs: 100,
 			streamRawSilenceTimeoutMs: 500,
+			streamDrainDeadlineMs: 150,
 		});
-		let cancelCalls = 0;
+		let readCalls = 0;
 		const upstream = new ReadableStream<Uint8Array>({
 			start(controller) {
 				controller.enqueue(
@@ -3122,52 +3133,86 @@ describe("CodexProvider.processResponse", () => {
 					),
 				);
 			},
-			cancel() {
-				cancelCalls++;
+			pull() {
+				readCalls++;
+				if (readCalls === 1) return;
 				return new Promise<void>(() => {});
 			},
 		});
-		const transformed = await provider.processResponse(
-			new Response(upstream, {
-				status: 200,
-				headers: { "content-type": "text/event-stream" },
-			}),
-			null,
-		);
+		const upstreamResponse = new Response(upstream, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const drainAbort = new AbortController();
+		registerResponseDrainTransport(upstreamResponse, drainAbort);
+		const transformed = await provider.processResponse(upstreamResponse, null);
 
 		const body = await Promise.race([
 			transformed.text(),
-			Bun.sleep(300).then(() => {
+			Bun.sleep(500).then(() => {
 				throw new Error("terminal Codex stream did not reach EOF");
 			}),
 		]);
 		expect(body).toContain("event: message_stop");
-		expect(cancelCalls).toBe(1);
+		await waitForAbort(drainAbort.signal, 1000);
+	});
+
+	it("prefers exact-response transport ownership over an explicit controller", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 15,
+			streamRawSilenceTimeoutMs: 70,
+			streamDrainDeadlineMs: 100,
+		});
+		const upstream = new ReadableStream<Uint8Array>({
+			pull() {
+				return new Promise<void>(() => {});
+			},
+		});
+		const upstreamResponse = new Response(upstream, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const registeredDrainAbort = new AbortController();
+		const explicitDrainAbort = new AbortController();
+		registerResponseDrainTransport(upstreamResponse, registeredDrainAbort);
+
+		const transformed = await provider.processResponse(
+			upstreamResponse,
+			null,
+			undefined,
+			explicitDrainAbort,
+		);
+		await Promise.race([
+			transformed.text(),
+			Bun.sleep(300).then(() => {
+				throw new Error("timed-out Codex stream did not reach EOF");
+			}),
+		]);
+		await waitForAbort(registeredDrainAbort.signal, 1000);
+		expect(explicitDrainAbort.signal.aborted).toBe(false);
 	});
 
 	it("terminates raw-upstream silence after synthetic keepalive output", async () => {
 		const provider = new CodexProvider({
 			streamHeartbeatIntervalMs: 15,
 			streamRawSilenceTimeoutMs: 70,
+			streamDrainDeadlineMs: 150,
 		});
-		let upstreamCancelReason: unknown;
 		const upstream = new ReadableStream<Uint8Array>({
-			cancel(reason) {
-				upstreamCancelReason = reason;
+			pull() {
 				return new Promise<void>(() => {});
 			},
 		});
-		const transformed = await provider.processResponse(
-			new Response(upstream, {
-				status: 200,
-				headers: { "content-type": "text/event-stream" },
-			}),
-			null,
-		);
+		const upstreamResponse = new Response(upstream, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const drainAbort = new AbortController();
+		registerResponseDrainTransport(upstreamResponse, drainAbort);
+		const transformed = await provider.processResponse(upstreamResponse, null);
 		// Do not consume downstream until after the hard deadline. Upstream
-		// cancellation must not wait for capacity to emit the terminal error.
+		// cleanup must not wait for capacity to emit the terminal error.
 		await Bun.sleep(90);
-		expect(upstreamCancelReason).toBeInstanceOf(Error);
 		const body = await Promise.race([
 			transformed.text(),
 			Bun.sleep(300).then(() => {
@@ -3183,6 +3228,7 @@ describe("CodexProvider.processResponse", () => {
 		expect(body).not.toContain("rawSilenceTimeoutMs");
 		expect(body).not.toContain("upstream_stream_read_error");
 		expect(body).not.toContain("abrupt_stream_eof");
+		await waitForAbort(drainAbort.signal, 1000);
 	});
 
 	it("does not prematurely close an in-flight function-call block when reasoning completes", async () => {
@@ -6367,11 +6413,10 @@ describe("CodexProvider.processResponse", () => {
 		}
 	});
 
-	it("cancels the upstream stream and traces downstream cancellation", async () => {
-		const provider = new CodexProvider();
+	it("aborts exact upstream transport and traces downstream cancellation", async () => {
+		const provider = new CodexProvider({ streamDrainDeadlineMs: 50 });
 		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
 		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
-		let cancelled = false;
 		try {
 			const upstream = new ReadableStream<Uint8Array>({
 				start(controller) {
@@ -6386,24 +6431,26 @@ describe("CodexProvider.processResponse", () => {
 						),
 					);
 				},
-				cancel() {
-					cancelled = true;
+			});
+			const upstreamResponse = new Response(upstream, {
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-id": "logical-cancel",
+					"x-better-ccflare-attempt-id": "attempt-cancel",
 				},
 			});
+			const transportAbort = new AbortController();
+			let abortCalls = 0;
+			transportAbort.signal.addEventListener("abort", () => abortCalls++);
+			registerResponseDrainTransport(upstreamResponse, transportAbort);
 			const transformed = await provider.processResponse(
-				new Response(upstream, {
-					headers: {
-						"content-type": "text/event-stream",
-						"x-better-ccflare-request-id": "logical-cancel",
-						"x-better-ccflare-attempt-id": "attempt-cancel",
-					},
-				}),
+				upstreamResponse,
 				null,
 			);
 			const reader = transformed.body?.getReader();
 			await reader?.cancel("client disconnected");
-			await Bun.sleep(10);
-			expect(cancelled).toBe(true);
+			expect(transportAbort.signal.aborted).toBe(true);
+			expect(abortCalls).toBe(1);
 			const record = readTraceRecords(traceDir).find(
 				(candidate) => candidate.phase === "response",
 			);
@@ -7118,9 +7165,8 @@ describe("CodexProvider SSE frame bounds", () => {
 	});
 
 	it("closes the open content block before an error when a single frame exceeds the per-frame cap", async () => {
-		const provider = new CodexProvider();
+		const provider = new CodexProvider({ streamDrainDeadlineMs: 100 });
 		const encoder = new TextEncoder();
-		let cancelReason: unknown;
 		const upstreamBody = new ReadableStream<Uint8Array>({
 			start(controller) {
 				// First chunk: opens a text content block, fully processed on its own.
@@ -7160,11 +7206,8 @@ describe("CodexProvider SSE frame bounds", () => {
 					),
 				);
 				// Deliberately left open: a real upstream connection just idles
-				// after the cap trip. The reader must be actively cancelled by
-				// the consumer rather than relying on EOF that never arrives.
-			},
-			cancel(reason) {
-				cancelReason = reason ?? "cancelled";
+				// after the cap trip. Bounded drain cleanup must abort the exact
+				// transport rather than relying on EOF that never arrives.
 			},
 		});
 
@@ -7172,6 +7215,8 @@ describe("CodexProvider SSE frame bounds", () => {
 			status: 200,
 			headers: { "content-type": "text/event-stream" },
 		});
+		const drainAbort = new AbortController();
+		registerResponseDrainTransport(response, drainAbort);
 
 		const transformed = await provider.processResponse(response, null);
 		const body = await transformed.text();
@@ -7187,9 +7232,7 @@ describe("CodexProvider SSE frame bounds", () => {
 		expect(startPos).toBeGreaterThanOrEqual(0);
 		expect(stopPos).toBeGreaterThan(startPos);
 		expect(errorPos).toBeGreaterThan(stopPos);
-		// The upstream source is always cancelled on a cap trip, never left
-		// dangling for the caller to clean up.
-		expect(cancelReason).toBeDefined();
+		await waitForAbort(drainAbort.signal, 1000);
 	});
 
 	// AE1: this is the exact real-world scenario that motivated raising the
@@ -7243,9 +7286,8 @@ describe("CodexProvider SSE frame bounds", () => {
 	});
 
 	it("closes the open content block before an error when an unterminated tail exceeds the buffer cap", async () => {
-		const provider = new CodexProvider();
+		const provider = new CodexProvider({ streamDrainDeadlineMs: 100 });
 		const encoder = new TextEncoder();
-		let cancelReason: unknown;
 		const upstreamBody = new ReadableStream<Uint8Array>({
 			start(controller) {
 				controller.enqueue(
@@ -7271,11 +7313,8 @@ describe("CodexProvider SSE frame bounds", () => {
 					BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES + 1024,
 				)}`;
 				controller.enqueue(encoder.encode(runaway));
-				// Deliberately left open: see the frame-cap test above for why
-				// closing here would make cancellation a spec-mandated no-op.
-			},
-			cancel(reason) {
-				cancelReason = reason ?? "cancelled";
+				// Deliberately left open: bounded drain cleanup must abort the
+				// exact transport rather than relying on EOF that never arrives.
 			},
 		});
 
@@ -7283,6 +7322,8 @@ describe("CodexProvider SSE frame bounds", () => {
 			status: 200,
 			headers: { "content-type": "text/event-stream" },
 		});
+		const drainAbort = new AbortController();
+		registerResponseDrainTransport(response, drainAbort);
 
 		const transformed = await provider.processResponse(response, null);
 		const body = await transformed.text();
@@ -7298,11 +7339,11 @@ describe("CodexProvider SSE frame bounds", () => {
 		expect(startPos).toBeGreaterThanOrEqual(0);
 		expect(stopPos).toBeGreaterThan(startPos);
 		expect(errorPos).toBeGreaterThan(stopPos);
-		expect(cancelReason).toBeDefined();
+		await waitForAbort(drainAbort.signal, 1000);
 	});
 
 	it("trips the aggregate tool-args cap when five parallel calls each stay under the per-call cap but exceed it together", async () => {
-		const provider = new CodexProvider();
+		const provider = new CodexProvider({ streamDrainDeadlineMs: 100 });
 		const perCallArgBytes = 15_000;
 		expect(perCallArgBytes).toBeLessThan(
 			BUFFER_SIZES.TOOL_ARGUMENTS_PER_CALL_MAX_BYTES,
@@ -7338,15 +7379,11 @@ describe("CodexProvider SSE frame bounds", () => {
 		}
 
 		const encoder = new TextEncoder();
-		let cancelReason: unknown;
 		const upstreamBody = new ReadableStream<Uint8Array>({
 			start(controller) {
 				controller.enqueue(encoder.encode(sseBody(lines)));
-				// Deliberately left open: see the frame-cap test above for why
-				// closing here would make cancellation a spec-mandated no-op.
-			},
-			cancel(reason) {
-				cancelReason = reason ?? "cancelled";
+				// Deliberately left open: bounded drain cleanup must abort the
+				// exact transport rather than relying on EOF that never arrives.
 			},
 		});
 
@@ -7354,6 +7391,8 @@ describe("CodexProvider SSE frame bounds", () => {
 			status: 200,
 			headers: { "content-type": "text/event-stream" },
 		});
+		const drainAbort = new AbortController();
+		registerResponseDrainTransport(response, drainAbort);
 
 		const transformed = await provider.processResponse(response, null);
 		const body = await transformed.text();
@@ -7364,14 +7403,14 @@ describe("CodexProvider SSE frame bounds", () => {
 		expect(body).toContain("Aggregate tool call arguments totaled");
 		expect(countEventOccurrences(body, "error")).toBe(1);
 		expect(body).not.toContain("event: message_delta");
-		expect(cancelReason).toBeDefined();
+		await waitForAbort(drainAbort.signal, 1000);
 	});
 
 	// AE2: a single tool call's own arguments alone exceed the per-call cap,
 	// even though the frame ceiling is 4MiB and this call's individual delta
 	// frames are nowhere near it.
 	it("trips the per-call tool-args cap when a single call's own arguments alone exceed it", async () => {
-		const provider = new CodexProvider();
+		const provider = new CodexProvider({ streamDrainDeadlineMs: 100 });
 
 		// Each individual delta frame stays well under the per-frame SSE cap
 		// (now 4MiB); only their accumulated total for this one call exceeds
@@ -7407,15 +7446,11 @@ describe("CodexProvider SSE frame bounds", () => {
 		}
 
 		const encoder = new TextEncoder();
-		let cancelReason: unknown;
 		const upstreamBody = new ReadableStream<Uint8Array>({
 			start(controller) {
 				controller.enqueue(encoder.encode(sseBody(lines)));
-				// Deliberately left open: see the frame-cap test above for why
-				// closing here would make cancellation a spec-mandated no-op.
-			},
-			cancel(reason) {
-				cancelReason = reason ?? "cancelled";
+				// Deliberately left open: bounded drain cleanup must abort the
+				// exact transport rather than relying on EOF that never arrives.
 			},
 		});
 
@@ -7423,6 +7458,8 @@ describe("CodexProvider SSE frame bounds", () => {
 			status: 200,
 			headers: { "content-type": "text/event-stream" },
 		});
+		const drainAbort = new AbortController();
+		registerResponseDrainTransport(response, drainAbort);
 
 		const transformed = await provider.processResponse(response, null);
 		const body = await transformed.text();
@@ -7433,7 +7470,7 @@ describe("CodexProvider SSE frame bounds", () => {
 		expect(body).toContain("Tool call arguments for output_index 0 totaled");
 		expect(body).not.toContain("Aggregate tool call arguments");
 		expect(countEventOccurrences(body, "error")).toBe(1);
-		expect(cancelReason).toBeDefined();
+		await waitForAbort(drainAbort.signal, 1000);
 	});
 
 	it("emits message_start before an error that arrives as the literal first SSE event", async () => {
@@ -7602,6 +7639,57 @@ describe("CodexProvider upstream error code classification", () => {
 });
 
 describe("CodexProvider.transformRequestBody", () => {
+	it("keeps an explicit account mapping ahead of a native Responses model", async () => {
+		const provider = new CodexProvider();
+		const account = {
+			model_mappings: JSON.stringify({ sonnet: "gpt-5.3-codex" }),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-7-sonnet",
+				max_tokens: 10,
+				messages: [{ role: "user", content: "hello" }],
+				__better_ccflare_codex_passthrough: { model: "gpt-5.4-mini" },
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = (await transformed.json()) as Record<string, unknown>;
+
+		expect(body.model).toBe("gpt-5.3-codex");
+		expect(body).not.toHaveProperty("__better_ccflare_codex_passthrough");
+	});
+
+	it("uses a native Responses model ahead of an advisory family default", async () => {
+		setDerivedProviderModelDefaults("codex", "native-model-account", {
+			fable: "gpt-5.6-sol",
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+			haiku: "gpt-5.6-luna",
+		});
+		const provider = new CodexProvider();
+		const account = {
+			id: "native-model-account",
+		} as Parameters<typeof provider.transformRequestBody>[1];
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-7-sonnet",
+				max_tokens: 10,
+				messages: [{ role: "user", content: "hello" }],
+				__better_ccflare_codex_passthrough: { model: "gpt-5.4-mini" },
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = (await transformed.json()) as Record<string, unknown>;
+
+		expect(body.model).toBe("gpt-5.4-mini");
+	});
+
 	it("returns a synthetic Anthropic count_tokens response", async () => {
 		const provider = new CodexProvider();
 		const url = provider.buildUrl("/v1/messages/count_tokens", "");
@@ -9868,7 +9956,7 @@ describe("fetchCodexUsageOnDemand", () => {
 		expect(body.stream).toBe(true);
 		expect(body.store).toBe(false);
 		expect(body.max_output_tokens).toBe(1);
-		expect(body.reasoning?.effort).toBe("minimal");
+		expect(body.reasoning?.effort).toBe("low");
 		expect(body.input).toHaveLength(1);
 		expect(body.input[0].role).toBe("user");
 
@@ -9894,6 +9982,30 @@ describe("fetchCodexUsageOnDemand", () => {
 			"1775000000",
 		);
 		expect(recorded?.init.signal?.aborted).toBe(true);
+	});
+
+	it("uses the account-selected model and falls back on blank input", async () => {
+		globalThis.fetch = makeMockFetch(
+			new Response("event: ignored\n\n", { status: 200 }),
+		) as unknown as typeof fetch;
+
+		await fetchCodexUsageOnDemand(
+			"test-token",
+			"https://example.test/codex/responses",
+			"gpt-5.4-mini",
+		);
+		expect(JSON.parse(recorded?.init.body as string).model).toBe(
+			"gpt-5.4-mini",
+		);
+
+		await fetchCodexUsageOnDemand(
+			"test-token",
+			"https://example.test/codex/responses",
+			"   ",
+		);
+		expect(JSON.parse(recorded?.init.body as string).model).toBe(
+			CODEX_PING_MODEL,
+		);
 	});
 
 	it("omits max_output_tokens for default subscription usage refreshes", async () => {

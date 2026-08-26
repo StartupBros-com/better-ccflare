@@ -84,6 +84,7 @@ describe("AccountAddForm provider contracts", () => {
 			"onCompleteAccount",
 			"onAddZaiAccount",
 			"onAddMinimaxAccount",
+			"onAddMetaAccount",
 			"onAddAnthropicCompatibleAccount",
 			"onAddNanoGPTAccount",
 			"onAddOpenAIAccount",

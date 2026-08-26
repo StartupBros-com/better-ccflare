@@ -1,4 +1,9 @@
-import { beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import {
+	clearAllProbeBackoff,
+	PROBE_BACKOFF_PENALTY_THRESHOLD_MS,
+	setProbeBackoff,
+} from "@better-ccflare/core";
 import { LeastUsedStrategy } from "@better-ccflare/load-balancer";
 import type {
 	Account,
@@ -79,9 +84,14 @@ describe("LeastUsedStrategy", () => {
 	let strategy: LeastUsedStrategy;
 
 	beforeEach(() => {
+		clearAllProbeBackoff();
 		store = new MockStore();
 		strategy = new LeastUsedStrategy();
 		strategy.initialize(store);
+	});
+
+	afterEach(() => {
+		clearAllProbeBackoff();
 	});
 
 	it("returns [] when all accounts are unavailable", async () => {
@@ -103,6 +113,50 @@ describe("LeastUsedStrategy", () => {
 		];
 		const ordered = await strategy.select(accounts, meta);
 		expect(ordered.map((a) => a.id)).toEqual(["p0", "p1", "p2"]);
+	});
+
+	it("deprioritizes a long probe backoff within one routing tier", async () => {
+		store.setUtil("backed-off", 0);
+		store.setUtil("healthy", 90);
+		setProbeBackoff(
+			"backed-off",
+			Date.now() + PROBE_BACKOFF_PENALTY_THRESHOLD_MS,
+		);
+		const accounts = [
+			makeAccount({ id: "backed-off", priority: 0 }),
+			makeAccount({ id: "healthy", priority: 0 }),
+		];
+		const requestMeta = {
+			...meta,
+			routingCandidates: undefined,
+			routingCandidateCatalog: undefined,
+		} as RequestMeta;
+
+		const ordered = await strategy.select(accounts, requestMeta);
+
+		expect(ordered.map((a) => a.id)).toEqual(["healthy", "backed-off"]);
+		expect(strategy.peek(accounts)).toBe("healthy");
+	});
+
+	it("keeps structural priority ahead of probe backoff", async () => {
+		setProbeBackoff(
+			"priority-0",
+			Date.now() + PROBE_BACKOFF_PENALTY_THRESHOLD_MS,
+		);
+		const accounts = [
+			makeAccount({ id: "priority-1", priority: 1 }),
+			makeAccount({ id: "priority-0", priority: 0 }),
+		];
+		const requestMeta = {
+			...meta,
+			routingCandidates: undefined,
+			routingCandidateCatalog: undefined,
+		} as RequestMeta;
+
+		const ordered = await strategy.select(accounts, requestMeta);
+
+		expect(ordered.map((a) => a.id)).toEqual(["priority-0", "priority-1"]);
+		expect(strategy.peek(accounts)).toBe("priority-0");
 	});
 
 	it("breaks priority ties by utilization ASC", async () => {

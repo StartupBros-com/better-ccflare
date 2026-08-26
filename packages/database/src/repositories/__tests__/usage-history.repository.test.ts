@@ -35,6 +35,176 @@ describe("usage_snapshots schema", () => {
 		expect(row?.name).toBe("idx_usage_snapshots_ts");
 		db.close();
 	});
+
+	it("defaults fresh and upgraded snapshot rows to active", () => {
+		const fresh = makeDb();
+		try {
+			const freshColumn = fresh
+				.prepare("PRAGMA table_info(usage_snapshots)")
+				.all()
+				.find((column: { name: string }) => column.name === "active") as
+				| { notnull: number; dflt_value: string | null }
+				| undefined;
+			expect(freshColumn).toEqual(
+				expect.objectContaining({ notnull: 1, dflt_value: "1" }),
+			);
+		} finally {
+			fresh.close();
+		}
+
+		const upgraded = new Database(":memory:");
+		try {
+			upgraded.run(`
+				CREATE TABLE usage_snapshots (
+					account_id TEXT NOT NULL,
+					timestamp INTEGER NOT NULL,
+					window_key TEXT NOT NULL,
+					utilization REAL NOT NULL,
+					resets_at INTEGER
+				)
+			`);
+			upgraded
+				.prepare(
+					`INSERT INTO usage_snapshots
+						(account_id, timestamp, window_key, utilization, resets_at)
+					 VALUES (?, ?, ?, ?, ?)`,
+				)
+				.run("legacy-account", 1_000, "seven_day", 12, null);
+
+			runMigrations(upgraded);
+			const legacy = upgraded
+				.prepare("SELECT active FROM usage_snapshots WHERE account_id = ?")
+				.get("legacy-account") as { active: number };
+			expect(legacy.active).toBe(1);
+		} finally {
+			upgraded.close();
+		}
+	});
+
+	it("generates and backfills durable append order without relying on rowid", () => {
+		const fresh = makeDb();
+		try {
+			const appendOrder = fresh
+				.prepare("PRAGMA table_info(usage_snapshots)")
+				.all()
+				.find((column: { name: string }) => column.name === "append_order") as
+				| { pk: number }
+				| undefined;
+			expect(appendOrder).toEqual(expect.objectContaining({ pk: 1 }));
+			fresh
+				.prepare(
+					`INSERT INTO usage_snapshots
+						(account_id, timestamp, window_key, utilization)
+					 VALUES (?, ?, ?, ?), (?, ?, ?, ?)`,
+				)
+				.run("fresh", 1_000, "seven_day", 10, "fresh", 1_000, "seven_day", 20);
+			expect(
+				fresh
+					.prepare(
+						"SELECT append_order FROM usage_snapshots ORDER BY append_order",
+					)
+					.all(),
+			).toEqual([{ append_order: 1 }, { append_order: 2 }]);
+			expect(() =>
+				fresh
+					.prepare(
+						`INSERT INTO usage_snapshots
+							(append_order, account_id, timestamp, window_key, utilization)
+						 VALUES (?, ?, ?, ?, ?)`,
+					)
+					.run(1, "fresh", 1_000, "seven_day", 30),
+			).toThrow();
+		} finally {
+			fresh.close();
+		}
+
+		const upgraded = new Database(":memory:");
+		try {
+			upgraded.run(`
+				CREATE TABLE usage_snapshots (
+					account_id TEXT NOT NULL,
+					timestamp INTEGER NOT NULL,
+					window_key TEXT NOT NULL,
+					utilization REAL NOT NULL,
+					resets_at INTEGER,
+					active INTEGER NOT NULL DEFAULT 1
+				)
+			`);
+			upgraded
+				.prepare(
+					`INSERT INTO usage_snapshots (account_id, timestamp, window_key, utilization)
+					 VALUES (?, ?, ?, ?), (?, ?, ?, ?)`,
+				)
+				.run(
+					"legacy",
+					1_000,
+					"seven_day",
+					10,
+					"legacy",
+					1_000,
+					"seven_day",
+					20,
+				);
+
+			runMigrations(upgraded);
+			expect(
+				upgraded
+					.prepare(
+						"SELECT append_order FROM usage_snapshots ORDER BY append_order",
+					)
+					.all(),
+			).toEqual([{ append_order: 1 }, { append_order: 2 }]);
+			upgraded
+				.prepare(
+					`INSERT INTO usage_snapshots (account_id, timestamp, window_key, utilization)
+					 VALUES (?, ?, ?, ?)`,
+				)
+				.run("legacy", 1_000, "seven_day", 30);
+			expect(
+				upgraded
+					.prepare(
+						"SELECT append_order FROM usage_snapshots ORDER BY append_order",
+					)
+					.all(),
+			).toEqual([
+				{ append_order: 1 },
+				{ append_order: 2 },
+				{ append_order: 3 },
+			]);
+			// A second migration is a no-op, and AUTOINCREMENT does not reuse a
+			// deleted key after the legacy-table rebuild.
+			expect(() => runMigrations(upgraded)).not.toThrow();
+			upgraded
+				.prepare("DELETE FROM usage_snapshots WHERE append_order = ?")
+				.run(3);
+			upgraded
+				.prepare(
+					`INSERT INTO usage_snapshots (account_id, timestamp, window_key, utilization)
+					 VALUES (?, ?, ?, ?)`,
+				)
+				.run("legacy", 1_000, "seven_day", 40);
+			expect(
+				upgraded
+					.prepare(
+						"SELECT append_order FROM usage_snapshots ORDER BY append_order",
+					)
+					.all(),
+			).toEqual([
+				{ append_order: 1 },
+				{ append_order: 2 },
+				{ append_order: 4 },
+			]);
+			expect(
+				upgraded
+					.prepare(
+						"SELECT COUNT(*) AS count FROM usage_snapshots WHERE append_order IS NULL",
+					)
+					.get(),
+			).toEqual({ count: 0 });
+		} finally {
+			upgraded.close();
+		}
+	});
 });
 
 function makeRepo(db: Database): UsageHistoryRepository {
@@ -91,6 +261,15 @@ describe("UsageHistoryRepository", () => {
 		const fiveH = rows.find((r) => r.windowKey === "five_hour");
 		expect(fiveH?.utilization).toBe(10);
 		expect(fiveH?.resetsAt).toBe(new Date("2026-07-05T12:00:00Z").getTime());
+		// recordSnapshot emits one multi-row INSERT; the database supplies one
+		// distinct append key per value tuple without repository-side allocation.
+		expect(
+			db
+				.prepare(
+					"SELECT append_order FROM usage_snapshots ORDER BY append_order ASC",
+				)
+				.all(),
+		).toEqual([{ append_order: 1 }, { append_order: 2 }]);
 		db.close();
 	});
 
@@ -249,6 +428,241 @@ describe("UsageHistoryRepository", () => {
 			until: 2500,
 		});
 		expect(rows.map((r) => r.timestamp)).toEqual([2000]);
+		db.close();
+	});
+
+	it("getLatestSnapshot returns the newest row for the window", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{ seven_day: { utilization: 11, resets_at: null } },
+			1000,
+		);
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{ seven_day: { utilization: 22, resets_at: "2026-07-12T00:00:00Z" } },
+			3000,
+		);
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{ seven_day: { utilization: 15, resets_at: null } },
+			2000,
+		);
+		const latest = await repo.getLatestSnapshot("acc1", "seven_day");
+		expect(latest?.timestamp).toBe(3000);
+		expect(latest?.utilization).toBe(22);
+		expect(latest?.resetsAt).toBe(new Date("2026-07-12T00:00:00Z").getTime());
+		db.close();
+	});
+
+	it("treats a newest inactive snapshot as no live durable value while retaining raw history", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		await repo.recordSnapshot(
+			"acc1",
+			[
+				{
+					windowKey: "seven_day",
+					utilization: 20,
+					resetsAtMs: null,
+					scope: "account",
+					modelFamily: null,
+					active: true,
+				},
+			],
+			1_000,
+		);
+		await repo.recordSnapshot(
+			"acc1",
+			[
+				{
+					windowKey: "seven_day",
+					utilization: 80,
+					resetsAtMs: null,
+					scope: "account",
+					modelFamily: null,
+					active: false,
+				},
+			],
+			2_000,
+		);
+
+		expect(await repo.getLatestSnapshot("acc1", "seven_day")).toBeNull();
+		expect(
+			(await repo.getSeries({ accountId: "acc1", windowKey: "seven_day" })).map(
+				(row) => row.utilization,
+			),
+		).toEqual([20]);
+		expect(
+			(await repo.getRawSnapshots("acc1", "seven_day")).map(
+				(row) => row.utilization,
+			),
+		).toEqual([20, 80]);
+		db.close();
+	});
+
+	it("uses the later durable append order when snapshots share a timestamp", async () => {
+		const db = makeDb();
+		try {
+			const repo = makeRepo(db);
+			await repo.recordSnapshot(
+				"acc1",
+				[
+					{
+						windowKey: "seven_day",
+						utilization: 20,
+						resetsAtMs: null,
+						scope: "account",
+						modelFamily: null,
+						active: true,
+					},
+				],
+				1_000,
+			);
+			await repo.recordSnapshot(
+				"acc1",
+				[
+					{
+						windowKey: "seven_day",
+						utilization: 80,
+						resetsAtMs: null,
+						scope: "account",
+						modelFamily: null,
+						active: true,
+					},
+				],
+				1_000,
+			);
+
+			const appended = db
+				.prepare(
+					"SELECT append_order FROM usage_snapshots ORDER BY append_order ASC",
+				)
+				.all() as Array<{ append_order: number }>;
+			expect(appended).toEqual([{ append_order: 1 }, { append_order: 2 }]);
+			// The key remains logical data even if SQLite rewrites its storage layout.
+			db.exec("VACUUM");
+
+			expect(
+				(await repo.getLatestSnapshot("acc1", "seven_day"))?.utilization,
+			).toBe(80);
+			expect(
+				(
+					await repo.getSeries({
+						accountId: "acc1",
+						windowKey: "seven_day",
+					})
+				).map((row) => row.utilization),
+			).toEqual([20, 80]);
+			expect(
+				(await repo.getRawSnapshots("acc1", "seven_day")).map(
+					(row) => row.utilization,
+				),
+			).toEqual([20, 80]);
+			expect(
+				(
+					await repo.getFleetUsageHistory({
+						accountIds: ["acc1"],
+						windowKey: "seven_day",
+					})
+				).rows.map((row) => row.utilization),
+			).toEqual([20, 80]);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("uses PostgreSQL append_order as the latest-snapshot append tie-break", async () => {
+		let latestSql = "";
+		const pgAdapter = {
+			isSQLite: false,
+			query: async <R>(sql: string): Promise<R[]> => {
+				latestSql = sql;
+				return [
+					{
+						account_id: "acc1",
+						timestamp: 1_000,
+						window_key: "seven_day",
+						utilization: 80,
+						resets_at: null,
+						active: 1,
+					},
+				] as R[];
+			},
+		} as unknown as BunSqlAdapter;
+		const repo = new UsageHistoryRepository(pgAdapter);
+
+		expect(
+			(await repo.getLatestSnapshot("acc1", "seven_day"))?.utilization,
+		).toBe(80);
+		expect(latestSql).toContain("ORDER BY timestamp DESC, append_order DESC");
+		expect(latestSql).not.toContain("ctid");
+	});
+
+	it("uses append_order rather than physical row locations for PostgreSQL cleanup", async () => {
+		let cleanupSql = "";
+		const pgAdapter = {
+			isSQLite: false,
+			runWithChanges: async (sql: string): Promise<number> => {
+				cleanupSql = sql;
+				return 0;
+			},
+		} as unknown as BunSqlAdapter;
+		const repo = new UsageHistoryRepository(pgAdapter);
+
+		expect(await repo.deleteOlderThan(1_000)).toBe(0);
+		expect(cleanupSql).toContain(
+			"DELETE FROM usage_snapshots WHERE append_order IN",
+		);
+		expect(cleanupSql).not.toContain("ctid");
+		expect(cleanupSql).not.toContain("rowid");
+	});
+
+	it("getLatestSnapshot isolates windows and accounts", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{
+				five_hour: { utilization: 90, resets_at: null },
+				seven_day: { utilization: 40, resets_at: null },
+			},
+			1000,
+		);
+		await writeSnapshot(
+			repo,
+			"acc2",
+			{ seven_day: { utilization: 77, resets_at: null } },
+			5000,
+		);
+		expect(
+			(await repo.getLatestSnapshot("acc1", "seven_day"))?.utilization,
+		).toBe(40);
+		expect(
+			(await repo.getLatestSnapshot("acc1", "five_hour"))?.utilization,
+		).toBe(90);
+		expect(
+			(await repo.getLatestSnapshot("acc2", "seven_day"))?.utilization,
+		).toBe(77);
+		db.close();
+	});
+
+	it("getLatestSnapshot returns null when the window was never recorded", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{ five_hour: { utilization: 5, resets_at: null } },
+			1000,
+		);
+		expect(await repo.getLatestSnapshot("acc1", "seven_day")).toBeNull();
+		expect(await repo.getLatestSnapshot("missing", "five_hour")).toBeNull();
 		db.close();
 	});
 
@@ -420,6 +834,33 @@ describe("DatabaseOperations usage-history facade", () => {
 			});
 			expect(rows.map((r) => r.timestamp)).toEqual([2000]);
 			expect(rows[0].windowKey).toBe("five_hour");
+		} finally {
+			await dbOps.dispose();
+		}
+	});
+
+	it("getLatestUsageSnapshot returns the newest weekly row, or null", async () => {
+		const dbOps = new DatabaseOperations(":memory:", { walMode: false });
+		try {
+			expect(
+				await dbOps.getLatestUsageSnapshot("acc1", "seven_day"),
+			).toBeNull();
+			await writeDbSnapshot(
+				dbOps,
+				"acc1",
+				{ seven_day: { utilization: 12, resets_at: null } },
+				1000,
+			);
+			await writeDbSnapshot(
+				dbOps,
+				"acc1",
+				{ seven_day: { utilization: 34, resets_at: null } },
+				2000,
+			);
+			const latest = await dbOps.getLatestUsageSnapshot("acc1", "seven_day");
+			expect(latest?.utilization).toBe(34);
+			expect(latest?.timestamp).toBe(2000);
+			expect(latest?.windowKey).toBe("seven_day");
 		} finally {
 			await dbOps.dispose();
 		}

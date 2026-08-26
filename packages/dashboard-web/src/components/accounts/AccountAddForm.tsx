@@ -112,7 +112,7 @@ interface AccountAddFormProps {
 		apiKey: string;
 		priority: number;
 	}) => Promise<AccountCreationIdentity>;
-	onAddMuseSparkAccount: (params: {
+	onAddMetaAccount: (params: {
 		name: string;
 		apiKey: string;
 		priority: number;
@@ -198,7 +198,7 @@ export function AccountAddForm({
 	onCompleteAccount,
 	onAddZaiAccount,
 	onAddMinimaxAccount,
-	onAddMuseSparkAccount,
+	onAddMetaAccount,
 	onAddAnthropicCompatibleAccount,
 	onAddNanoGPTAccount,
 	onAddOpenAIAccount,
@@ -224,7 +224,7 @@ export function AccountAddForm({
 			| "console"
 			| "zai"
 			| "minimax"
-			| "muse-spark"
+			| "meta"
 			| "anthropic-compatible"
 			| "openai-compatible"
 			| "nanogpt"
@@ -425,7 +425,7 @@ export function AccountAddForm({
 			const apiKeyErrors: Partial<Record<AccountSetupMode, string>> = {
 				zai: "API key is required for z.ai accounts",
 				minimax: "API key is required for Minimax accounts",
-				"muse-spark": "API key is required for Muse Spark accounts",
+				meta: "API key is required for Meta Model API accounts",
 				nanogpt: "API key is required for NanoGPT accounts",
 				"anthropic-compatible":
 					"API key is required for Anthropic-compatible accounts",
@@ -752,16 +752,13 @@ export function AccountAddForm({
 			return;
 		}
 
-		if (newAccount.mode === "muse-spark") {
+		if (newAccount.mode === "meta") {
 			if (!newAccount.apiKey) {
-				onError("API key is required for Muse Spark accounts");
+				onError("API key is required for Meta Model API accounts");
 				return;
 			}
-			// Build model mappings object
 			const modelMappings = buildAccountModelMappings(newAccount);
-
-			// For Muse Spark accounts, we don't need OAuth flow and use default tier
-			const identity = await onAddMuseSparkAccount({
+			const identity = await onAddMetaAccount({
 				name: newAccount.name,
 				apiKey: newAccount.apiKey,
 				priority: newAccount.priority,
@@ -769,7 +766,6 @@ export function AccountAddForm({
 				modelMappings:
 					Object.keys(modelMappings).length > 0 ? modelMappings : undefined,
 			});
-			// Reset form and signal success
 			await completeCreatedAccount(identity);
 			return;
 		}
@@ -1095,7 +1091,7 @@ export function AccountAddForm({
 										| "console"
 										| "zai"
 										| "minimax"
-										| "muse-spark"
+										| "meta"
 										| "anthropic-compatible"
 										| "openai-compatible"
 										| "bedrock"
@@ -1125,9 +1121,7 @@ export function AccountAddForm({
 									<SelectItem value="bedrock">AWS Bedrock</SelectItem>
 									<SelectItem value="zai">z.ai (API Key)</SelectItem>
 									<SelectItem value="minimax">Minimax (API Key)</SelectItem>
-									<SelectItem value="muse-spark">
-										Meta Model API (Muse Spark)
-									</SelectItem>
+									<SelectItem value="meta">Meta Model API (API Key)</SelectItem>
 									<SelectItem value="nanogpt">NanoGPT (API Key)</SelectItem>
 									<SelectItem value="anthropic-compatible">
 										Anthropic-Compatible (API Key)
@@ -2134,10 +2128,10 @@ export function AccountAddForm({
 								</div>
 							</>
 						)}
-						{newAccount.mode === "muse-spark" && (
+						{newAccount.mode === "meta" && (
 							<>
 								<div className="space-y-2">
-									<Label htmlFor="apiKey">Muse Spark API Key</Label>
+									<Label htmlFor="apiKey">Meta Model API Key</Label>
 									<Input
 										id="apiKey"
 										type="password"
@@ -2148,7 +2142,7 @@ export function AccountAddForm({
 												apiKey: (e.target as HTMLInputElement).value,
 											})
 										}
-										placeholder="Enter your Meta Model API (Muse Spark) key"
+										placeholder="Enter your Meta Model API key"
 									/>
 								</div>
 								<div className="space-y-2">
@@ -2171,16 +2165,16 @@ export function AccountAddForm({
 								<div className="space-y-2">
 									<Label>Model Mappings (Optional)</Label>
 									<p className="text-xs text-muted-foreground mb-2">
-										Map Anthropic model names to provider-specific models. Leave
-										empty to default to muse-spark-1.2.
+										Map Anthropic model names to Meta models. Leave empty to
+										default to muse-spark-1.2.
 									</p>
 									<div className="space-y-2 pl-4">
 										<div>
-											<Label htmlFor="museSparkFableModel" className="text-sm">
+											<Label htmlFor="metaFableModel" className="text-sm">
 												Fable Model
 											</Label>
 											<Input
-												id="museSparkFableModel"
+												id="metaFableModel"
 												value={newAccount.fableModel}
 												onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
 													setNewAccount({

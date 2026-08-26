@@ -58,8 +58,8 @@ import { AnthropicCompatibleProvider } from "./providers/anthropic-compatible/pr
 import { BedrockProvider } from "./providers/bedrock/provider";
 import { CodexProvider } from "./providers/codex/provider";
 import { KiloProvider } from "./providers/kilo/provider";
+import { MetaProvider } from "./providers/meta/provider";
 import { MinimaxProvider } from "./providers/minimax/provider";
-import { MuseSparkProvider } from "./providers/muse-spark/provider";
 import { NanoGPTProvider } from "./providers/nanogpt/provider";
 import { OllamaCloudProvider } from "./providers/ollama/ollama-cloud-provider";
 import { OllamaProvider } from "./providers/ollama/provider";
@@ -80,7 +80,7 @@ registry.registerProvider(new KiloProvider());
 registry.registerProvider(new OpenRouterProvider());
 registry.registerProvider(new QwenProvider());
 registry.registerProvider(new MinimaxProvider());
-registry.registerProvider(new MuseSparkProvider());
+registry.registerProvider(new MetaProvider());
 registry.registerProvider(new NanoGPTProvider());
 registry.registerProvider(new ZaiProvider());
 registry.registerProvider(new VertexAIProvider());

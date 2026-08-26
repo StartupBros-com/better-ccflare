@@ -206,7 +206,7 @@ const ROUTING_REVISION_API_KEY_PROVIDERS = [
 	"openrouter",
 	"alibaba-coding-plan",
 	"ollama-cloud",
-	"muse-spark",
+	"meta",
 ] as const;
 
 /**
@@ -721,20 +721,30 @@ export function ensureSchema(db: Database): void {
 	`);
 
 	// Create usage_snapshots table: time series of per-account usage-window
-	// utilization (0–100) captured on each /oauth/usage poll. Append-only, no
-	// surrogate key; queried and pruned by (account_id, window_key, timestamp).
+	// utilization (0–100) captured on each /oauth/usage poll. append_order is a
+	// durable, database-generated key for same-timestamp writes; unlike rowid it
+	// remains the logical append order after VACUUM or a storage rewrite.
 	db.run(`
 		CREATE TABLE IF NOT EXISTS usage_snapshots (
+			append_order INTEGER PRIMARY KEY AUTOINCREMENT,
 			account_id TEXT NOT NULL,
 			timestamp INTEGER NOT NULL,
 			window_key TEXT NOT NULL,
 			utilization REAL NOT NULL,
-			resets_at INTEGER
+			resets_at INTEGER,
+			active INTEGER NOT NULL DEFAULT 1
 		)
 	`);
 	db.run(
 		`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_acct_win_time ON usage_snapshots(account_id, window_key, timestamp DESC)`,
 	);
+	// Existing databases do not gain append_order until runMigrations() rebuilds
+	// the table below, so avoid creating an index that references it here.
+	if (tableHasColumn(db, "usage_snapshots", "append_order")) {
+		db.run(
+			`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_acct_win_time_append_order ON usage_snapshots(account_id, window_key, timestamp DESC, append_order DESC)`,
+		);
+	}
 	// Secondary index on timestamp alone so retention pruning
 	// (`DELETE ... WHERE timestamp < ?`) uses an index instead of full-scanning —
 	// the composite index above can't serve it because timestamp isn't leading.
@@ -864,18 +874,24 @@ export function ensureSchema(db: Database): void {
  *   3. Most recent `created_at` (newer row wins on ties — mirror of the
  *      intuition that the newer row represents the operator's "current"
  *      intent for that account name).
- *   4. Smallest `rowid` (final tiebreak; monotone insert order — gives the
- *      older insert a deterministic stable choice when all three timestamps
- *      above are NULL).
+ *   4. Lexicographically smallest logical account `id` (final tiebreak,
+ *      stable across SQLite and PostgreSQL when all three timestamps tie).
  *
  * For each tuple group the non-survivor rows are deleted only after their
  * state has been merged into the survivor and every dependent row
  * (`combo_slots.account_id`, `requests.account_used`,
- * `usage_snapshots.account_id`, `combo_membership_exclusions.account_id`,
- * `device_setup_jobs.account_id`) has been repointed at the survivor's id.
- * `combo_membership_exclusions` has a real `ON DELETE CASCADE` FK to
- * `accounts` (like `combo_slots`), so an unrepointed row there is silently
- * destroyed by the DELETE; it also has a UNIQUE(family, combo_id,
+ * `usage_snapshots.account_id`, `usage_windows.account_id`,
+ * `combo_membership_exclusions.account_id`, `device_setup_jobs.account_id`)
+ * has been repointed at the survivor's id. `combo_slots` is unique on
+ * `(combo_id, account_id, model)`: colliding slots merge before repointing,
+ * preserving any enabled state and the lowest numeric priority; a
+ * survivor-owned slot stays the keeper, otherwise the lowest logical slot id
+ * does. `usage_windows` is unique on `(account_id, window_key, resets_at)`:
+ * colliding logical windows keep a survivor-owned row when available and merge
+ * their lifecycle state before repointing. `combo_membership_exclusions` has a
+ * real `ON DELETE
+ * CASCADE` FK to `accounts` (like `combo_slots`), so an unrepointed row there
+ * is silently destroyed by the DELETE; it also has a UNIQUE(family, combo_id,
  * account_id) index, so colliding discarded rows are dropped rather than
  * repointed (see the collision handling below). `device_setup_jobs` has no
  * FK, so a missed repoint doesn't cascade-delete anything but still leaves
@@ -901,13 +917,19 @@ export function ensureSchema(db: Database): void {
  * wraps it in `db.transaction(() => { ... })`).
  */
 function collapseAccountDuplicatesPreservingState(db: Database): void {
-	// Find every tuple (name, provider, COALESCE(custom_endpoint,'')) that
-	// currently has more than one row. For each, pick the survivor and merge.
+	// Collapse on the canonical provider key, not the literal stored value: a
+	// legacy muse-spark row and a meta row become one logical account when the
+	// provider alias migration runs. Keeping the canonical expression in every
+	// scope below ensures the established survivor and state-merge policy applies
+	// to that cross-provider collision as well as ordinary exact duplicates.
+	const canonicalProvider =
+		"CASE WHEN provider = 'muse-spark' THEN 'meta' ELSE provider END";
 	const dupGroups = db
 		.prepare(
-			`SELECT name, provider, COALESCE(custom_endpoint, '') AS ep
+			`SELECT name, ${canonicalProvider} AS provider,
+			        COALESCE(custom_endpoint, '') AS ep
 			 FROM accounts
-			 GROUP BY name, provider, COALESCE(custom_endpoint, '')
+			 GROUP BY name, ${canonicalProvider}, COALESCE(custom_endpoint, '')
 			 HAVING COUNT(*) > 1`,
 		)
 		.all() as Array<{ name: string; provider: string; ep: string }>;
@@ -917,21 +939,21 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 	}
 
 	const pickSurvivor = db.prepare(
-		`SELECT rowid AS survivor_rowid, id AS survivor_id
+		`SELECT id AS survivor_id
 		 FROM accounts
-		 WHERE name = ? AND provider = ? AND COALESCE(custom_endpoint, '') = ?
+		 WHERE name = ? AND ${canonicalProvider} = ? AND COALESCE(custom_endpoint, '') = ?
 		 ORDER BY
 		   COALESCE(last_used, 0) DESC,
 		   COALESCE(refresh_token_issued_at, 0) DESC,
 		   created_at DESC,
-		   rowid ASC
+		   id ASC
 		 LIMIT 1`,
 	);
 
 	const findDiscardedIds = db.prepare(
 		`SELECT id FROM accounts
-		 WHERE name = ? AND provider = ? AND COALESCE(custom_endpoint, '') = ?
-		   AND rowid != ?`,
+		 WHERE name = ? AND ${canonicalProvider} = ? AND COALESCE(custom_endpoint, '') = ?
+		   AND id != ?`,
 	);
 
 	// Merged freshest-credentials lookup. The "best" credentials come from a
@@ -947,39 +969,39 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 		   (SELECT refresh_token FROM accounts
 		    WHERE rowid = (
 		      SELECT rowid FROM accounts
-		      WHERE name = ? AND provider = ? AND COALESCE(custom_endpoint, '') = ?
+		      WHERE name = ? AND ${canonicalProvider} = ? AND COALESCE(custom_endpoint, '') = ?
 		        AND refresh_token IS NOT NULL AND refresh_token != ''
-		      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, rowid ASC
+		      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, id ASC
 		      LIMIT 1
 		    )) AS merged_refresh_token,
 		   (SELECT access_token FROM accounts
 		    WHERE rowid = (
 		      SELECT rowid FROM accounts
-		      WHERE name = ? AND provider = ? AND COALESCE(custom_endpoint, '') = ?
+		      WHERE name = ? AND ${canonicalProvider} = ? AND COALESCE(custom_endpoint, '') = ?
 		        AND refresh_token IS NOT NULL AND refresh_token != ''
-		      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, rowid ASC
+		      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, id ASC
 		      LIMIT 1
 		    )) AS merged_access_token,
 		   (SELECT expires_at FROM accounts
 		    WHERE rowid = (
 		      SELECT rowid FROM accounts
-		      WHERE name = ? AND provider = ? AND COALESCE(custom_endpoint, '') = ?
+		      WHERE name = ? AND ${canonicalProvider} = ? AND COALESCE(custom_endpoint, '') = ?
 		        AND refresh_token IS NOT NULL AND refresh_token != ''
-		      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, rowid ASC
+		      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, id ASC
 		      LIMIT 1
 		    )) AS merged_expires_at,
 		   (SELECT refresh_token_issued_at FROM accounts
 		    WHERE rowid = (
 		      SELECT rowid FROM accounts
-		      WHERE name = ? AND provider = ? AND COALESCE(custom_endpoint, '') = ?
+		      WHERE name = ? AND ${canonicalProvider} = ? AND COALESCE(custom_endpoint, '') = ?
 		        AND refresh_token IS NOT NULL AND refresh_token != ''
-		      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, rowid ASC
+		      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, id ASC
 		      LIMIT 1
 		    )) AS merged_refresh_token_issued_at,
 		   (SELECT api_key FROM accounts
-		    WHERE name = ? AND provider = ? AND COALESCE(custom_endpoint, '') = ?
+		    WHERE name = ? AND ${canonicalProvider} = ? AND COALESCE(custom_endpoint, '') = ?
 		      AND api_key IS NOT NULL AND api_key != ''
-		    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, created_at DESC, rowid ASC
+		    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, created_at DESC, id ASC
 		    LIMIT 1) AS merged_api_key`,
 	);
 
@@ -1013,14 +1035,14 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 	// 42 positional `?`s, most of them the same (name, provider, endpoint)
 	// triple repeated per column. Adding columns to that was a silent-corruption
 	// hazard — one misplaced argument shifts every subsequent binding.
-	const groupScope = `WHERE name = $name AND provider = $provider
+	const groupScope = `WHERE name = $name AND ${canonicalProvider} = $provider
 		                      AND COALESCE(custom_endpoint, '') = $ep`;
 	// Freshest non-NULL value of a column across the duplicate group, using the
 	// same ordering that picks the credential set: newest refresh token first,
-	// then newest row.
+	// then newest creation time, then the smallest logical account id.
 	const freshest = (col: string) =>
 		`(SELECT ${col} FROM accounts ${groupScope} AND ${col} IS NOT NULL
-		    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, created_at DESC, rowid ASC
+		    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, created_at DESC, id ASC
 		    LIMIT 1)`;
 	const agg = (fn: "MAX" | "MIN" | "SUM", col: string, dflt = "0") =>
 		`(SELECT ${fn}(COALESCE(${col}, ${dflt})) FROM accounts ${groupScope})`;
@@ -1058,20 +1080,201 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 		   model_fallbacks = COALESCE(model_fallbacks, ${freshest("model_fallbacks")}),
 		   cross_region_mode = COALESCE(cross_region_mode, ${freshest("cross_region_mode")}),
 		   billing_type = COALESCE(billing_type, ${freshest("billing_type")})
-		 WHERE rowid = $rowid`,
+		 WHERE id = $survivor_id`,
 	);
+
+	const mergeCollidingSlots = (
+		survivorId: string,
+		discardedIds: string[],
+	): { merged: number; repointed: number } => {
+		const accountIds = [survivorId, ...discardedIds];
+		const placeholders = accountIds.map(() => "?").join(",");
+		const slots = db
+			.prepare(
+				`SELECT id, combo_id, account_id, model, priority, enabled
+				 FROM combo_slots WHERE account_id IN (${placeholders})
+				 ORDER BY combo_id ASC, model ASC, id ASC`,
+			)
+			.all(...accountIds) as Array<{
+			id: string;
+			combo_id: string;
+			account_id: string;
+			model: string;
+			priority: number;
+			enabled: number;
+		}>;
+		const groups = new Map<string, typeof slots>();
+		for (const slot of slots) {
+			const key = JSON.stringify([slot.combo_id, slot.model]);
+			const group = groups.get(key) ?? [];
+			group.push(slot);
+			groups.set(key, group);
+		}
+
+		let merged = 0;
+		let repointed = 0;
+		for (const group of groups.values()) {
+			if (group.length < 2) continue;
+			const keeper =
+				group.find((slot) => slot.account_id === survivorId) ?? group[0];
+			if (!keeper) continue;
+			const duplicates = group.filter((slot) => slot.id !== keeper.id);
+			const mergedPriority = Math.min(...group.map((slot) => slot.priority));
+			const mergedEnabled = Math.max(...group.map((slot) => slot.enabled));
+			if (duplicates.length > 0) {
+				const duplicatePlaceholders = duplicates.map(() => "?").join(",");
+				db.prepare(
+					`DELETE FROM combo_slots WHERE id IN (${duplicatePlaceholders})`,
+				).run(...duplicates.map((slot) => slot.id));
+				merged += duplicates.length;
+			}
+			db.prepare(
+				`UPDATE combo_slots
+				 SET account_id = ?, priority = ?, enabled = ?
+				 WHERE id = ?`,
+			).run(survivorId, mergedPriority, mergedEnabled, keeper.id);
+			repointed++;
+		}
+		return { merged, repointed };
+	};
+
+	type UsageWindowMergeRow = {
+		id: string;
+		account_id: string;
+		window_key: string;
+		started_at: number;
+		resets_at: number;
+		closed_at: number | null;
+		grant_type: string;
+		peak_utilization: number;
+		first_100_at: number | null;
+		value_usd: number | null;
+		input_tokens: number | null;
+		cache_read_input_tokens: number | null;
+		cache_creation_input_tokens: number | null;
+		output_tokens: number | null;
+		request_count: number | null;
+		model_breakdown: string | null;
+		unpriced_tokens: number | null;
+		projection_version: string | null;
+	};
+
+	const settledCompleteness = (row: UsageWindowMergeRow): number =>
+		[
+			row.value_usd,
+			row.input_tokens,
+			row.cache_read_input_tokens,
+			row.cache_creation_input_tokens,
+			row.output_tokens,
+			row.request_count,
+			row.model_breakdown,
+			row.unpriced_tokens,
+			row.projection_version,
+		].filter((value) => value !== null).length;
+
+	const mergeCollidingUsageWindows = (
+		survivorId: string,
+		discardedIds: string[],
+	): { merged: number; repointed: number } => {
+		const accountIds = [survivorId, ...discardedIds];
+		const placeholders = accountIds.map(() => "?").join(",");
+		const windows = db
+			.prepare(
+				`SELECT id, account_id, window_key, started_at, resets_at,
+				        closed_at, grant_type, peak_utilization, first_100_at,
+				        value_usd, input_tokens, cache_read_input_tokens,
+				        cache_creation_input_tokens, output_tokens, request_count,
+				        model_breakdown, unpriced_tokens, projection_version
+				 FROM usage_windows WHERE account_id IN (${placeholders})
+				 ORDER BY window_key ASC, resets_at ASC, id ASC`,
+			)
+			.all(...accountIds) as UsageWindowMergeRow[];
+		const groups = new Map<string, UsageWindowMergeRow[]>();
+		for (const window of windows) {
+			const key = JSON.stringify([window.window_key, window.resets_at]);
+			const group = groups.get(key) ?? [];
+			group.push(window);
+			groups.set(key, group);
+		}
+
+		let merged = 0;
+		let repointed = 0;
+		for (const group of groups.values()) {
+			if (group.length < 2) continue;
+			const keeper =
+				group.find((window) => window.account_id === survivorId) ?? group[0];
+			if (!keeper) continue;
+			const settledSource = group
+				.filter((window) => window.closed_at !== null)
+				.sort(
+					(left, right) =>
+						Number(right.closed_at) - Number(left.closed_at) ||
+						settledCompleteness(right) - settledCompleteness(left) ||
+						left.id.localeCompare(right.id),
+				)[0];
+			const source = settledSource ?? keeper;
+			const duplicates = group.filter((window) => window.id !== keeper.id);
+			const startedAt = Math.min(...group.map((window) => window.started_at));
+			const peakUtilization = Math.max(
+				...group.map((window) => window.peak_utilization),
+			);
+			const first100At =
+				group
+					.map((window) => window.first_100_at)
+					.filter((value): value is number => value !== null)
+					.sort((left, right) => left - right)[0] ?? null;
+			if (duplicates.length > 0) {
+				const duplicatePlaceholders = duplicates.map(() => "?").join(",");
+				db.prepare(
+					`DELETE FROM usage_windows WHERE id IN (${duplicatePlaceholders})`,
+				).run(...duplicates.map((window) => window.id));
+				merged += duplicates.length;
+			}
+			db.prepare(
+				`UPDATE usage_windows SET
+				   account_id = ?, started_at = ?, closed_at = ?, grant_type = ?,
+				   peak_utilization = ?, first_100_at = ?, value_usd = ?,
+				   input_tokens = ?, cache_read_input_tokens = ?,
+				   cache_creation_input_tokens = ?, output_tokens = ?,
+				   request_count = ?, model_breakdown = ?, unpriced_tokens = ?,
+				   projection_version = ?
+				 WHERE id = ?`,
+			).run(
+				survivorId,
+				startedAt,
+				source.closed_at,
+				source.grant_type,
+				peakUtilization,
+				first100At,
+				source.value_usd,
+				source.input_tokens,
+				source.cache_read_input_tokens,
+				source.cache_creation_input_tokens,
+				source.output_tokens,
+				source.request_count,
+				source.model_breakdown,
+				source.unpriced_tokens,
+				source.projection_version,
+				keeper.id,
+			);
+			repointed++;
+		}
+		return { merged, repointed };
+	};
 
 	let totalDeleted = 0;
 	let totalRepointedSlots = 0;
+	let totalMergedCollidingSlots = 0;
 	let totalRepointedRequests = 0;
 	let totalRepointedSnapshots = 0;
+	let totalRepointedWindows = 0;
+	let totalMergedCollidingWindows = 0;
 	let totalRepointedExclusions = 0;
 	let totalDroppedCollidingExclusions = 0;
 	let totalRepointedDeviceSetupJobs = 0;
 
 	for (const grp of dupGroups) {
 		const survivor = pickSurvivor.get(grp.name, grp.provider, grp.ep) as {
-			survivor_rowid: number;
 			survivor_id: string;
 		};
 		if (!survivor) {
@@ -1082,7 +1285,7 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 			grp.name,
 			grp.provider,
 			grp.ep,
-			survivor.survivor_rowid,
+			survivor.survivor_id,
 		) as Array<{ id: string }>;
 		const discardedIds = discardedRows.map((r) => r.id);
 
@@ -1113,7 +1316,7 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 		// The merge UPDATE has 12 aggregate subqueries × 3 group-key params each
 		// (= 36 placeholders), plus 5 credential pre-fills (refresh_token,
 		// access_token, expires_at, refresh_token_issued_at, api_key) and the
-		// final WHERE rowid = ?. Total 42 placeholders. Bindings are
+		// final WHERE id = ?. Total 42 placeholders. Bindings are
 		// positional; the order below mirrors the `?` positions in the SQL.
 		mergeSurvivor.run({
 			$refresh_token: merged.merged_refresh_token,
@@ -1124,10 +1327,17 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 			$name: grp.name,
 			$provider: grp.provider,
 			$ep: grp.ep,
-			$rowid: survivor.survivor_rowid,
+			$survivor_id: survivor.survivor_id,
 		});
 
 		if (discardedIds.length > 0) {
+			// `combo_slots` is unique on (combo_id, account_id, model), so a
+			// direct repoint can collide when aliases own the same logical slot.
+			// Merge those collisions first, then repoint the remaining slots.
+			const mergedSlots = mergeCollidingSlots(
+				survivor.survivor_id,
+				discardedIds,
+			);
 			const placeholders = discardedIds.map(() => "?").join(",");
 			const repointSlots = db
 				.prepare(
@@ -1142,6 +1352,18 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 			const repointSnapshots = db
 				.prepare(
 					`UPDATE usage_snapshots SET account_id = ? WHERE account_id IN (${placeholders})`,
+				)
+				.run(survivor.survivor_id, ...discardedIds);
+			// usage_windows is unique on (account_id, window_key, resets_at), so
+			// aliases can own rows that collide only after canonicalization. Merge
+			// those logical windows first, then repoint the non-colliding history.
+			const mergedWindows = mergeCollidingUsageWindows(
+				survivor.survivor_id,
+				discardedIds,
+			);
+			const repointWindows = db
+				.prepare(
+					`UPDATE usage_windows SET account_id = ? WHERE account_id IN (${placeholders})`,
 				)
 				.run(survivor.survivor_id, ...discardedIds);
 
@@ -1198,9 +1420,14 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 				.run(...discardedIds).changes;
 
 			totalDeleted += deleted;
-			totalRepointedSlots += Number(repointSlots.changes ?? 0);
+			totalMergedCollidingSlots += mergedSlots.merged;
+			totalRepointedSlots +=
+				Number(repointSlots.changes ?? 0) + mergedSlots.repointed;
 			totalRepointedRequests += Number(repointRequests.changes ?? 0);
 			totalRepointedSnapshots += Number(repointSnapshots.changes ?? 0);
+			totalMergedCollidingWindows += mergedWindows.merged;
+			totalRepointedWindows +=
+				Number(repointWindows.changes ?? 0) + mergedWindows.repointed;
 			totalDroppedCollidingExclusions += Number(
 				dropCollidingExclusions.changes ?? 0,
 			);
@@ -1216,10 +1443,13 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 			`Collapsed ${totalDeleted} duplicate account row(s) across ${dupGroups.length} ` +
 				`(name, provider, COALESCE(custom_endpoint,'')) tuple group(s) before creating ` +
 				`UNIQUE index. Each group kept the row with the freshest credentials (most ` +
-				`recent last_used → refresh_token_issued_at → created_at → smallest rowid) ` +
+				`recent last_used → refresh_token_issued_at → created_at → smallest account id) ` +
 				`and merged request counts / priority / paused state from the rest. ` +
-				`Repointed ${totalRepointedSlots} combo slot(s), ${totalRepointedRequests} ` +
+				`Merged ${totalMergedCollidingSlots} colliding combo slot(s) and repointed ` +
+				`${totalRepointedSlots} combo slot(s), ${totalRepointedRequests} ` +
 				`request-history row(s), ${totalRepointedSnapshots} usage-snapshot row(s), ` +
+				`merged ${totalMergedCollidingWindows} colliding usage-window row(s) and ` +
+				`repointed ${totalRepointedWindows} usage-window row(s), ` +
 				`and ${totalRepointedExclusions} combo-membership-exclusion row(s) ` +
 				`(dropped ${totalDroppedCollidingExclusions} colliding duplicate exclusion(s)), ` +
 				`and repointed ${totalRepointedDeviceSetupJobs} device-setup-job row(s), ` +
@@ -1318,6 +1548,16 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		"cache_flight_recorder_partitions",
 		"last_verified_at",
 	);
+	const usageSnapshotsHasActive = tableHasColumn(
+		db,
+		"usage_snapshots",
+		"active",
+	);
+	const usageSnapshotsHasAppendOrder = tableHasColumn(
+		db,
+		"usage_snapshots",
+		"append_order",
+	);
 
 	const refreshTokenCol = accountsInfo.find(
 		(col) => col.name === "refresh_token",
@@ -1335,7 +1575,8 @@ export function runMigrations(db: Database, dbPath?: string): void {
 	const willMutate =
 		(refreshTokenCol && refreshTokenCol.notnull === 1) ||
 		finalAccountsColumnNames.includes("account_tier") ||
-		finalOAuthColumnNames.includes("tier");
+		finalOAuthColumnNames.includes("tier") ||
+		!usageSnapshotsHasAppendOrder;
 
 	// Create backup before *destructive* schema modifications only.
 	if (willMutate && dbPath && dbPath !== "") {
@@ -1409,6 +1650,54 @@ export function runMigrations(db: Database, dbPath?: string): void {
 
 	// Wrap database operations in a transaction for atomicity
 	const migrationTx = db.transaction(() => {
+		if (!usageSnapshotsHasActive) {
+			db.prepare(
+				"ALTER TABLE usage_snapshots ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+			).run();
+			log.info("Added active liveness column to usage snapshots");
+		}
+		if (!usageSnapshotsHasAppendOrder) {
+			// SQLite cannot add an INTEGER PRIMARY KEY through ALTER TABLE. Rebuild
+			// inside the existing migration transaction after taking the normal
+			// destructive-migration backup. Copying in legacy rowid order is the only
+			// available historical append order; from this point the AUTOINCREMENT
+			// key persists independently of SQLite's mutable physical rowid.
+			db.prepare(`
+				CREATE TABLE usage_snapshots_new (
+					append_order INTEGER PRIMARY KEY AUTOINCREMENT,
+					account_id TEXT NOT NULL,
+					timestamp INTEGER NOT NULL,
+					window_key TEXT NOT NULL,
+					utilization REAL NOT NULL,
+					resets_at INTEGER,
+					active INTEGER NOT NULL DEFAULT 1
+				)
+			`).run();
+			db.prepare(`
+				INSERT INTO usage_snapshots_new
+					(account_id, timestamp, window_key, utilization, resets_at, active)
+				SELECT account_id, timestamp, window_key, utilization, resets_at,
+					COALESCE(active, 1)
+				FROM usage_snapshots
+				ORDER BY rowid ASC
+			`).run();
+			db.prepare("DROP TABLE usage_snapshots").run();
+			db.prepare(
+				"ALTER TABLE usage_snapshots_new RENAME TO usage_snapshots",
+			).run();
+			db.prepare(
+				`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_acct_win_time
+				 ON usage_snapshots(account_id, window_key, timestamp DESC)`,
+			).run();
+			db.prepare(
+				`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_acct_win_time_append_order
+				 ON usage_snapshots(account_id, window_key, timestamp DESC, append_order DESC)`,
+			).run();
+			db.prepare(
+				`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_ts ON usage_snapshots(timestamp)`,
+			).run();
+			log.info("Added durable append order to usage snapshots");
+		}
 		if (!comboFamilyAssignmentColumnNames.includes("membership_mode")) {
 			db.prepare(
 				`ALTER TABLE combo_family_assignments
@@ -1750,8 +2039,9 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		// row. Collapse existing duplicates per tuple BEFORE creating the
 		// index, but **without destroying account state**: keep the row most
 		// likely to still hold working credentials, merge the others' state
-		// into it, and repoint every dependent row (combo_slots, requests,
-		// usage_snapshots) at the surviving id. An earlier implementation
+		// into it, and repoint every operational dependent row (combo slots,
+		// requests, usage snapshots/windows, routing exclusions, and setup jobs)
+		// at the surviving id. An earlier implementation
 		// kept the arbitrary minimum-rowid row and DELETED the rest; that
 		// silently dropped live OAuth refresh tokens, cascade-removed combo
 		// slots, and orphaned request history rows whose `account_used`
@@ -2265,6 +2555,24 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		// Account columns can be added or rebuilt above. Reinstall the dynamic
 		// account trigger only after the final table shape is in place.
 		ensureRoutingPolicyRevisionSchema(db);
+
+		// A canonical provider update can collide with the already-installed unique
+		// index when legacy muse-spark and meta rows share a name and endpoint.
+		// Collapse those canonical groups first, then update the remaining singleton
+		// aliases. This deliberately follows trigger installation so the provider
+		// transition advances the routing-policy revision; errors propagate and roll
+		// back the transaction rather than leaving an unusable legacy row behind.
+		collapseAccountDuplicatesPreservingState(db);
+		const updateCount = db
+			.prepare(
+				`UPDATE accounts SET provider = 'meta' WHERE provider = 'muse-spark'`,
+			)
+			.run().changes;
+		if (updateCount > 0) {
+			log.info(
+				`Updated ${updateCount} accounts from 'muse-spark' to 'meta' provider`,
+			);
+		}
 	});
 
 	// Execute the migration transaction

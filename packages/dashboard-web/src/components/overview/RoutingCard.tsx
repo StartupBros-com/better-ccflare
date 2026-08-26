@@ -1,5 +1,10 @@
 import { StrategyName } from "@better-ccflare/core";
-import { useSetStrategy, useStrategy } from "../../hooks/queries";
+import {
+	useModelCapacityRouting,
+	useSetModelCapacityRouting,
+	useSetStrategy,
+	useStrategy,
+} from "../../hooks/queries";
 import { Badge } from "../ui/badge";
 import {
 	Card,
@@ -16,19 +21,22 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "../ui/select";
+import { Switch } from "../ui/switch";
 
 // Only session-class strategies are offered from the dashboard. Per-request
 // spreading strategies (least-used, session-affinity) can trip Claude's
 // anti-abuse systems and get accounts banned, so they remain deliberately
-// hidden even though StrategyName defines them. The drain variant preserves
-// client/lane affinity and is exposed as an explicit opt-in. Values come from
-// the shared StrategyName enum (not hardcoded strings) so this list cannot
-// drift from the authoritative enum in @better-ccflare/core.
+// hidden even though StrategyName defines them. Values come from the shared
+// StrategyName enum so this list cannot drift from the authoritative values.
 const STRATEGY_OPTIONS: ReadonlyArray<{ label: string; value: string }> = [
 	{ label: "Session", value: StrategyName.Session },
 	{
-		label: "Session drain soonest (opt-in)",
+		label: "Session — drain soonest",
 		value: StrategyName.SessionDrainSoonest,
+	},
+	{
+		label: "Session — drain soonest (strict)",
+		value: StrategyName.SessionDrainSoonestStrict,
 	},
 ];
 
@@ -39,9 +47,9 @@ export interface StrategySelectItem {
 }
 
 /**
- * Build the strategy Select's item list. The dashboard offers the safe
- * session-class options above, but the server's effective strategy
- * (getStrategy()) can be any of the StrategyName values — settable via
+ * Build the strategy Select's item list. The dashboard only offers the
+ * session-class strategies above, but the server's effective strategy
+ * (getStrategy()) can be any StrategyName value — settable via
  * LB_STRATEGY, an older config file, or a hand-edited one. An out-of-list
  * value used to leave the Select's trigger blank with no indication it was
  * active, and selecting a listed option would silently overwrite it
@@ -69,6 +77,10 @@ export interface RoutingCardViewProps {
 	onStrategyChange: (strategy: string) => void;
 	strategyDisabled: boolean;
 	strategySource: "env" | "file" | "default";
+	capacityMode: "off" | "exhausted";
+	capacitySource: "env" | "file" | "default";
+	onCapacityChange: (mode: "off" | "exhausted") => void;
+	capacityDisabled: boolean;
 }
 
 /**
@@ -81,8 +93,13 @@ export function RoutingCardView({
 	onStrategyChange,
 	strategyDisabled,
 	strategySource,
+	capacityMode,
+	capacitySource,
+	onCapacityChange,
+	capacityDisabled,
 }: RoutingCardViewProps) {
 	const strategyEnvLocked = strategySource === "env";
+	const capacityEnvLocked = capacitySource === "env";
 	const strategyItems = getStrategySelectItems(strategy);
 
 	return (
@@ -110,10 +127,17 @@ export function RoutingCardView({
 						</div>
 						<div className="text-sm text-muted-foreground">
 							<span className="font-medium">Session</span> keeps each client on
-							one account for the session duration. Weekly-window capacity is
-							handled separately by this fork's hard-capacity routing, which
-							excludes accounts whose model lane is exhausted rather than
-							reordering the pool by reset time.
+							one account for the session duration.{" "}
+							<span className="font-medium">Session — drain soonest</span> is
+							sticky: its affinity owner is never preempted; weekly-reset
+							ranking only orders fresh selection and failover.{" "}
+							<span className="font-medium">
+								Session — drain soonest (strict)
+							</span>{" "}
+							orders candidates within each authorized routing class by earliest
+							future weekly reset; an active session only breaks ties, while
+							explicit owner-retention and route-circuit decisions remain
+							authoritative.
 						</div>
 						<Select
 							disabled={strategyDisabled || strategyEnvLocked}
@@ -136,23 +160,42 @@ export function RoutingCardView({
 							</SelectContent>
 						</Select>
 						<div className="text-xs text-muted-foreground">
-							⚠️ The opt-in drain variant preserves client/lane stickiness and
-							only changes fresh-session or failover ordering when a future
-							weekly reset is known. Per-request spreading strategies can
-							trigger Claude's anti-abuse systems and risk account bans, so they
-							are not offered here.
+							⚠️ Only session-class strategies are shown. Strategies that spread
+							individual requests across accounts can trigger Claude's
+							anti-abuse systems and risk account bans.
 						</div>
 					</div>
 
-					<div className="space-y-1">
-						<Label>Model-scoped capacity routing</Label>
-						<div className="text-sm text-muted-foreground">
-							Always on. Accounts whose per-model weekly cap is exhausted are
-							skipped, so clients get a fast model_pool_exhausted response
-							instead of failover retries that are guaranteed to fail. This fork
-							has no on/off toggle for it — unlike upstream, capacity routing is
-							part of the routing pipeline itself.
+					<div className="flex items-center justify-between gap-3">
+						<div className="space-y-1">
+							<div className="flex items-center gap-2">
+								<Label htmlFor="routing-capacity">
+									Model-scoped capacity routing
+								</Label>
+								{capacityEnvLocked && (
+									<Badge
+										variant="outline"
+										title="Set by the MODEL_SCOPED_CAPACITY_ROUTING environment variable; change the env var to edit this."
+									>
+										env-locked
+									</Badge>
+								)}
+							</div>
+							<div className="text-sm text-muted-foreground">
+								Exhausted per-model accounts are skipped; remaining eligible
+								accounts can still handle the request. A retryable 503
+								model_pool_exhausted occurs only if capacity filtering leaves no
+								eligible account instead of guaranteed-failure retries.
+							</div>
 						</div>
+						<Switch
+							id="routing-capacity"
+							disabled={capacityDisabled || capacityEnvLocked}
+							checked={capacityMode === "exhausted"}
+							onCheckedChange={(checked) =>
+								onCapacityChange(checked ? "exhausted" : "off")
+							}
+						/>
 					</div>
 				</div>
 			</CardContent>
@@ -163,6 +206,9 @@ export function RoutingCardView({
 export function RoutingCard() {
 	const { data: strategyData, isLoading: strategyLoading } = useStrategy();
 	const setStrategy = useSetStrategy();
+	const { data: capacity, isLoading: capacityLoading } =
+		useModelCapacityRouting();
+	const setCapacity = useSetModelCapacityRouting();
 
 	return (
 		<RoutingCardView
@@ -170,6 +216,10 @@ export function RoutingCard() {
 			strategySource={strategyData?.strategySource ?? "default"}
 			onStrategyChange={(value) => setStrategy.mutate(value)}
 			strategyDisabled={strategyLoading || setStrategy.isPending}
+			capacityMode={capacity?.mode ?? "off"}
+			capacitySource={capacity?.source ?? "default"}
+			onCapacityChange={(mode) => setCapacity.mutate(mode)}
+			capacityDisabled={capacityLoading || setCapacity.isPending}
 		/>
 	);
 }

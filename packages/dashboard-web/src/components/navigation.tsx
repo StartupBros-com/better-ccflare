@@ -149,13 +149,9 @@ interface NavItem {
 
 interface NavigationProps {
 	onLogout?: () => void;
-	showCombos?: boolean;
 }
 
-export function Navigation({
-	onLogout,
-	showCombos = false,
-}: NavigationProps = {}) {
+export function Navigation({ onLogout }: NavigationProps = {}) {
 	const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 	const [updateStatus, setUpdateStatus] = useState<
 		"idle" | "checking" | "available" | "current" | "unavailable" | "error"
@@ -168,7 +164,7 @@ export function Navigation({
 	const location = useLocation();
 	const isMountedRef = useRef(true);
 
-	// Build nav items dynamically based on feature flags
+	// Build nav items with the current alert badge
 	const navItems: NavItem[] = useMemo(() => {
 		const baseItems: NavItem[] = [
 			{ label: "Overview", icon: LayoutDashboard, path: "/" },
@@ -190,10 +186,7 @@ export function Navigation({
 			},
 		];
 
-		// Add combos item if feature is enabled
-		if (showCombos) {
-			baseItems.push({ label: "Combos", icon: Zap, path: "/combos" });
-		}
+		baseItems.push({ label: "Combos", icon: Zap, path: "/combos" });
 
 		// Add remaining items
 		baseItems.push(
@@ -204,7 +197,7 @@ export function Navigation({
 		);
 
 		return baseItems;
-	}, [showCombos, unacknowledgedCount]);
+	}, [unacknowledgedCount]);
 
 	const checkForUpdates = useCallback(async () => {
 		if (!isMountedRef.current) return;

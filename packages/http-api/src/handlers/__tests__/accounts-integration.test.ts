@@ -8,7 +8,7 @@ import { deriveComboRouteClass } from "@better-ccflare/providers/request-capabil
 import {
 	createAccountResumeHandler,
 	createAccountsListHandler,
-	createMuseSparkAccountAddHandler,
+	createMetaAccountAddHandler,
 	createOpenAIAccountAddHandler,
 } from "../accounts";
 
@@ -1299,7 +1299,7 @@ describe("Accounts Handler - OAuth control-plane hotfix (U8)", () => {
  * U1 — Canonical static-key persistence in HTTP account creation (R1, R16, R17).
  *
  * These tests exercise the REAL createOpenAIAccountAddHandler and
- * createMuseSparkAccountAddHandler against a real DatabaseOperations instance
+ * createMetaAccountAddHandler against a real DatabaseOperations instance
  * backed by a temp SQLite file, so a regression in the INSERT row shape
  * actually fails these tests. No network traffic; credential columns only.
  *
@@ -1491,23 +1491,23 @@ describe("Accounts Handler - U1 static-key row-shape parity", () => {
 		);
 	});
 
-	it("creating a non-compatible API-key account through its own handler is unaffected (KTD2 — Muse Spark still canonical)", async () => {
-		const response = await createMuseSparkAccountAddHandler(dbOps)(
+	it("creating a canonical Meta API-key account persists provider=meta and the static credential shape", async () => {
+		const response = await createMetaAccountAddHandler(dbOps)(
 			makeAddRequest({
-				name: "muse-spark-u1",
-				apiKey: "ms-key-abcdef",
+				name: "meta-u1",
+				apiKey: "meta-key-abcdef",
 				priority: 7,
 			}),
 		);
 
 		expect(response.ok).toBe(true);
-		const payload = (await response.json()) as { account: { id: string } };
+		const payload = (await response.json()) as {
+			account: { id: string; provider: string };
+		};
 		const row = await fetchCredentialRow(payload.account.id);
 
-		// Muse Spark is the precedent canonical static-key shape: key in
-		// api_key only, refresh_token and access_token NULL, expires_at kept
-		// as the 1-year expiry. This must not regress as a side effect of U1.
-		expect(row.api_key).toBe("ms-key-abcdef");
+		expect(payload.account.provider).toBe("meta");
+		expect(row.api_key).toBe("meta-key-abcdef");
 		expect(row.refresh_token).toBeNull();
 		expect(row.access_token).toBeNull();
 		expect(row.expires_at).not.toBeNull();

@@ -8,6 +8,7 @@ import {
 	NETWORK,
 	STRATEGIES,
 	type StrategyName,
+	setForceAccountModel as setForceAccountModelFlag,
 	TIME_CONSTANTS,
 	validateNumber,
 	validateString,
@@ -330,6 +331,118 @@ export function createConfigHandlers(
 			config.setUsageThrottlingFiveHourEnabled(body.fiveHourEnabled);
 			config.setUsageThrottlingWeeklyEnabled(body.weeklyEnabled);
 			return new Response(null, { status: 204 });
+		},
+
+		getModelCapacityRouting: (): Response => {
+			return jsonResponse({
+				mode: config.getModelScopedCapacityRouting(),
+				source: config.getModelScopedCapacityRoutingSource(),
+			});
+		},
+
+		setModelCapacityRouting: async (req: Request): Promise<Response> => {
+			const body = await req.json();
+			if (body.mode !== "off" && body.mode !== "exhausted") {
+				return errorResponse(
+					BadRequest(
+						"Invalid model capacity routing payload: expected 'mode' to be 'off' or 'exhausted'",
+					),
+				);
+			}
+			config.setModelScopedCapacityRouting(body.mode);
+			// Report the post-set EFFECTIVE mode/source: a MODEL_SCOPED_CAPACITY_ROUTING
+			// env var still overrides the file we just wrote, so `effective` may differ
+			// from the requested `mode`. The dashboard uses this to warn that the write
+			// was ineffective while env-locked.
+			return jsonResponse({
+				success: true,
+				mode: body.mode,
+				source: config.getModelScopedCapacityRoutingSource(),
+				effective: config.getModelScopedCapacityRouting(),
+			});
+		},
+
+		getCombosEnabled: (): Response => {
+			return jsonResponse({
+				enabled: config.getCombosEnabled(),
+				source: config.getCombosEnabledSource(),
+			});
+		},
+
+		setCombosEnabled: async (req: Request): Promise<Response> => {
+			const body = await req.json();
+			if (typeof body.enabled !== "boolean") {
+				return errorResponse(
+					BadRequest(
+						"Invalid combos payload: expected 'enabled' to be a boolean",
+					),
+				);
+			}
+			config.setCombosEnabled(body.enabled);
+			// Same shape as setModelCapacityRouting: report the post-set EFFECTIVE
+			// value, so the dashboard shows what the server confirmed rather than
+			// what it asked for.
+			return jsonResponse({
+				success: true,
+				enabled: body.enabled,
+				source: config.getCombosEnabledSource(),
+				effective: config.getCombosEnabled(),
+			});
+		},
+
+		getComboSessionFallback: (): Response => {
+			return jsonResponse({
+				enabled: config.getComboSessionFallback(),
+				source: config.getComboSessionFallbackSource(),
+			});
+		},
+
+		getForceAccountModel: (): Response => {
+			return jsonResponse({
+				enabled: config.getForceAccountModel(),
+				source: config.getForceAccountModelSource(),
+			});
+		},
+
+		setForceAccountModel: async (req: Request): Promise<Response> => {
+			const body = await req.json();
+			if (typeof body.enabled !== "boolean") {
+				return errorResponse(
+					BadRequest(
+						"Invalid force account model payload: expected 'enabled' to be a boolean",
+					),
+				);
+			}
+			config.setForceAccountModel(body.enabled);
+			// Push the effective value into the core mirror the model-rewriting
+			// code reads (core and providers cannot depend on config), so the
+			// switch takes effect without a restart. The effective value, not the
+			// requested one: the mirror must never claim more than the config does.
+			setForceAccountModelFlag(config.getForceAccountModel());
+			return jsonResponse({
+				success: true,
+				enabled: body.enabled,
+				source: config.getForceAccountModelSource(),
+				effective: config.getForceAccountModel(),
+			});
+		},
+
+		setComboSessionFallback: async (req: Request): Promise<Response> => {
+			const body = await req.json();
+			if (typeof body.enabled !== "boolean") {
+				return errorResponse(
+					BadRequest(
+						"Invalid combo session fallback payload: expected 'enabled' to be a boolean",
+					),
+				);
+			}
+			config.setComboSessionFallback(body.enabled);
+			return jsonResponse({
+				success: true,
+				enabled: body.enabled,
+				source: config.getComboSessionFallbackSource(),
+				effective: config.getComboSessionFallback(),
+			});
 		},
 	};
 }

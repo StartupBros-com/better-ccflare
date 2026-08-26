@@ -194,25 +194,26 @@ describe("XaiProvider", () => {
 				body: JSON.stringify(sessionBody),
 			});
 
-		delete process.env[XAI_CACHE_NATIVE_ENV];
-		const off = await provider.transformRequestBody(makeReq(), account());
-		expect(off.headers.get(XAI_CONV_ID_HEADER)).toBeNull();
+		try {
+			delete process.env[XAI_CACHE_NATIVE_ENV];
+			const off = await provider.transformRequestBody(makeReq(), account());
+			expect(off.headers.get(XAI_CONV_ID_HEADER)).toBeNull();
 
-		process.env[XAI_CACHE_NATIVE_ENV] = "1";
-		const on = await provider.transformRequestBody(makeReq(), account());
-		const header = on.headers.get(XAI_CONV_ID_HEADER);
-		expect(header).toMatch(/^ccflare-xai-[0-9a-f]{48}$/);
+			process.env[XAI_CACHE_NATIVE_ENV] = "1";
+			const on = await provider.transformRequestBody(makeReq(), account());
+			const header = on.headers.get(XAI_CONV_ID_HEADER);
+			expect(header).toMatch(/^ccflare-xai-[0-9a-f]{48}$/);
 
-		const custom = await provider.transformRequestBody(
-			makeReq(),
-			account({ custom_endpoint: "https://proxy.example.com/v1" }),
-		);
-		expect(custom.headers.get(XAI_CONV_ID_HEADER)).toBeNull();
-
-		if (original === undefined) delete process.env[XAI_CACHE_NATIVE_ENV];
-		else process.env[XAI_CACHE_NATIVE_ENV] = original;
+			const custom = await provider.transformRequestBody(
+				makeReq(),
+				account({ custom_endpoint: "https://proxy.example.com/v1" }),
+			);
+			expect(custom.headers.get(XAI_CONV_ID_HEADER)).toBeNull();
+		} finally {
+			if (original === undefined) delete process.env[XAI_CACHE_NATIVE_ENV];
+			else process.env[XAI_CACHE_NATIVE_ENV] = original;
+		}
 	});
-
 	it("refreshes xAI OAuth tokens with the Grok client id", async () => {
 		const provider = new XaiProvider();
 		const fetchMock = mock(

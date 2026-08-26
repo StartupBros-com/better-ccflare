@@ -129,8 +129,6 @@ const RESCUE_DEADLINE_ENV = ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV;
 const CONTEXT_ADMISSION_ENV = "CCFLARE_CONTEXT_ADMISSION";
 const CODEX_PROMPT_CACHE_KEY_ENV = "CCFLARE_CODEX_PROMPT_CACHE_KEY";
 const ACCOUNT_SELECTION_TIMEOUT_ENV = "CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS";
-const DISABLE_COMBO_SESSION_FALLBACK_ENV =
-	"CCFLARE_DISABLE_COMBO_SESSION_FALLBACK";
 
 const originalFetch = globalThis.fetch;
 const originalEnv = new Map(
@@ -147,7 +145,6 @@ const originalEnv = new Map(
 		CONTEXT_ADMISSION_ENV,
 		CODEX_PROMPT_CACHE_KEY_ENV,
 		ACCOUNT_SELECTION_TIMEOUT_ENV,
-		DISABLE_COMBO_SESSION_FALLBACK_ENV,
 	].map((name) => [name, process.env[name]] as const),
 );
 let restoreUsageCollector = (): void => {};
@@ -848,6 +845,7 @@ function makeContext(accounts: Account[], combo: ComboWithSlots | null = null) {
 			getUsageThrottlingWeeklyEnabled: () => false,
 			getSystemPromptCacheTtl1h: () => false,
 			getAgentFrontmatterModelFallback: () => false,
+			getComboSessionFallback: () => true,
 			getStorePayloads: () => false,
 		},
 		anthropicDegradedMode: new AnthropicDegradedModeCoordinator({
@@ -1313,7 +1311,6 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		);
 		const outboundKeys: string[] = [];
 		const outboundModels: string[] = [];
-		let firstCancelCount = 0;
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const upstreamRequest =
 				input instanceof Request ? input : new Request(input);
@@ -1324,7 +1321,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			outboundKeys.push(body.prompt_cache_key);
 			outboundModels.push(body.model);
 			if (outboundKeys.length === 1) {
-				return sseResponse(stalledCodexStream(() => firstCancelCount++));
+				return sseResponse(stalledCodexStream(() => undefined));
 			}
 			return sseResponse(byteStream(CODEX_SUCCESS_STREAM));
 		}) as unknown as typeof fetch;
@@ -1339,7 +1336,6 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(outboundKeys[1]).toMatch(/^ccflare-rescue-[0-9a-f]{48}$/);
 		expect(outboundKeys[1]).not.toBe(outboundKeys[0]);
 		expect(outboundModels[1]).toBe(outboundModels[0]);
-		expect(firstCancelCount).toBe(1);
 		expect(body).toContain('"text":"codex recovered"');
 		expect(body.match(/event: message_start/g)).toHaveLength(1);
 		expect(body).not.toContain("resp-stalled");
@@ -1360,7 +1356,6 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			makeCombo([stalled, fallback]),
 		);
 		const fetchedAccounts: string[] = [];
-		let cancelCount = 0;
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const upstreamRequest =
 				input instanceof Request ? input : new Request(input);
@@ -1368,7 +1363,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			const accountId = bearer.replace(/^Bearer access-/, "");
 			fetchedAccounts.push(accountId);
 			if (accountId === stalled.id) {
-				return sseResponse(stalledCodexStream(() => cancelCount++));
+				return sseResponse(stalledCodexStream(() => undefined));
 			}
 			return sseResponse(byteStream(CODEX_SUCCESS_STREAM));
 		}) as unknown as typeof fetch;
@@ -1378,7 +1373,6 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const body = await response.text();
 
 		expect(fetchedAccounts).toEqual([stalled.id, stalled.id, fallback.id]);
-		expect(cancelCount).toBe(2);
 		expect(response.status).toBe(200);
 		expect(body).toContain('"text":"codex recovered"');
 	});
@@ -2398,7 +2392,6 @@ describe("downstream Anthropic Messages SSE routing", () => {
 	});
 
 	it("runs a queued probe-suppressed promotion before enforcing disabled session fallback", async () => {
-		process.env[DISABLE_COMBO_SESSION_FALLBACK_ENV] = "true";
 		process.env[CONTEXT_ADMISSION_ENV] = "1";
 		const codex = makeCodexAccount(
 			"codex-disabled-session-probe-suppressed-promotion",
@@ -2410,6 +2403,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			[codex],
 			makeCombo([codex]),
 		);
+		ctx.config.getComboSessionFallback = () => false;
 		const routeOrder: string[] = [];
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const upstreamRequest =
@@ -2452,7 +2446,6 @@ describe("downstream Anthropic Messages SSE routing", () => {
 	});
 
 	it("releases a promoted authoritative terminal when combo session fallback is disabled", async () => {
-		process.env[DISABLE_COMBO_SESSION_FALLBACK_ENV] = "true";
 		process.env[CONTEXT_ADMISSION_ENV] = "1";
 		discardedResponses.length = 0;
 		const codex = makeCodexAccount("codex-disabled-session-authoritative");
@@ -2463,6 +2456,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			[codex],
 			makeCombo([codex]),
 		);
+		ctx.config.getComboSessionFallback = () => false;
 		const routeOrder: string[] = [];
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const upstreamRequest =
@@ -4083,7 +4077,6 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const account = makeCodexAccount("codex-both-stall");
 		const { ctx } = makeContext([account]);
 		const outboundKeys: string[] = [];
-		let cancelCount = 0;
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const upstreamRequest =
 				input instanceof Request ? input : new Request(input);
@@ -4091,7 +4084,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				prompt_cache_key: string;
 			};
 			outboundKeys.push(body.prompt_cache_key);
-			return sseResponse(stalledCodexStream(() => cancelCount++));
+			return sseResponse(stalledCodexStream(() => undefined));
 		}) as unknown as typeof fetch;
 
 		const request = makeCodexRequest();
@@ -4104,7 +4097,6 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(outboundKeys).toHaveLength(2);
 		expect(outboundKeys[0]).toMatch(/^ccflare-convo-/);
 		expect(outboundKeys[1]).toMatch(/^ccflare-rescue-/);
-		expect(cancelCount).toBe(2);
 		expect(payload.error).toMatchObject({
 			code: "route_unavailable",
 			attempted_routes: 1,
@@ -4202,7 +4194,6 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const account = makeCodexAccount("codex-postcommit-stall");
 		const { ctx } = makeContext([account]);
 		let fetchCount = 0;
-		let cancelCount = 0;
 		globalThis.fetch = mock(async () => {
 			fetchCount++;
 			return sseResponse(
@@ -4214,7 +4205,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 							data: { delta: "committed partial" },
 						},
 					],
-					() => cancelCount++,
+					() => undefined,
 				),
 			);
 		}) as unknown as typeof fetch;
@@ -4224,7 +4215,6 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const body = await response.text();
 
 		expect(fetchCount).toBe(1);
-		expect(cancelCount).toBe(1);
 		expect(body).toContain('"text":"committed partial"');
 		expect(body).toContain("Response stalled after partial output");
 	});

@@ -16,6 +16,9 @@ const { getProvider, registerProvider } = await import(
 	"@better-ccflare/providers"
 );
 const usageCollectorModule = await import("../usage-collector");
+const { clearRoutingObservations, getRoutingObservations } = await import(
+	"../handlers/routing-observations"
+);
 const { handleProxy } = await import("../proxy");
 
 function makeAccount(id: string): Account {
@@ -119,6 +122,7 @@ const cachedUsageAccountIds = new Set<string>();
 afterEach(() => {
 	restoreUsageCollector();
 	restoreUsageCollector = (): void => {};
+	clearRoutingObservations();
 	for (const accountId of cachedUsageAccountIds) usageCache.delete(accountId);
 	cachedUsageAccountIds.clear();
 	globalThis.fetch = originalFetch;
@@ -213,6 +217,7 @@ function makeContext(
 			getUsageThrottlingWeeklyEnabled: () => false,
 			getSystemPromptCacheTtl1h: () => false,
 			getAgentFrontmatterModelFallback: () => false,
+			getComboSessionFallback: () => true,
 			getStorePayloads: () => false,
 		},
 		provider: {
@@ -307,6 +312,48 @@ function expectSanitizedComboTerminalHeaders(
 	});
 }
 
+describe("routing observations", () => {
+	it("records the ordinary selected account order", async () => {
+		installUsageCollector();
+		const first = makeAccount("ordinary-first");
+		const second = makeAccount("ordinary-second");
+		const unusedCombo: ComboWithSlots = {
+			id: "unused-combo",
+			name: "Unused combo",
+			description: null,
+			enabled: false,
+			created_at: 0,
+			updated_at: 0,
+			slots: [],
+		};
+		const ctx = makeContext([first, second], unusedCombo, () => [
+			second,
+			first,
+		]);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) => {
+			const policy = makeRoutingPolicy(unusedCombo, family);
+			policy.assignment.enabled = false;
+			return policy;
+		});
+		globalThis.fetch = mock(
+			async () =>
+				new Response('{"type":"message","content":[]}', {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		) as unknown as typeof fetch;
+
+		const request = makeProxyRequest("claude-opus-4-5", false);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(getRoutingObservations().opus?.order).toEqual([
+			{ id: second.id, name: second.name },
+			{ id: first.id, name: first.name },
+		]);
+	});
+});
+
 describe("combo fallback disabled terminal persistence", () => {
 	it("sanitizes request headers when no combo slot is available", async () => {
 		const previousFallbackSetting =
@@ -334,6 +381,7 @@ describe("combo fallback disabled terminal persistence", () => {
 			],
 		};
 		const ctx = makeContext([unavailable], combo, (accounts) => accounts);
+		ctx.config.getComboSessionFallback = () => false;
 		const upstreamFetch = mock(async () => {
 			throw new Error("unavailable combo must not reach upstream");
 		});
@@ -383,6 +431,7 @@ describe("combo fallback disabled terminal persistence", () => {
 			],
 		};
 		const ctx = makeContext([account], combo, (accounts) => accounts);
+		ctx.config.getComboSessionFallback = () => false;
 		let fetchCount = 0;
 		globalThis.fetch = mock(async () => {
 			fetchCount++;
@@ -475,6 +524,7 @@ describe("post-combo normal fallback", () => {
 				getUsageThrottlingWeeklyEnabled: () => false,
 				getSystemPromptCacheTtl1h: () => false,
 				getAgentFrontmatterModelFallback: () => false,
+				getComboSessionFallback: () => true,
 				getStorePayloads: () => false,
 			},
 			provider: {
@@ -529,6 +579,9 @@ describe("post-combo normal fallback", () => {
 		]);
 		expect(getComboRoutingPolicy).toHaveBeenCalledTimes(1);
 		expect(strategySelect).toHaveBeenCalledTimes(2);
+		expect(getRoutingObservations().opus?.order).toEqual([
+			{ id: normalAccount.id, name: normalAccount.name },
+		]);
 		expect(
 			(handleStart.mock.calls[0]?.[0] as { failoverAttempts: number })
 				.failoverAttempts,

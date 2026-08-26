@@ -379,10 +379,11 @@ describe("CLI Integration Tests", () => {
 				"codex",
 				"xai",
 				"ollama",
-				"muse-spark",
+				"meta",
 			]) {
 				expect(result.stdout).toContain(mode);
 			}
+			expect(result.stdout).not.toContain("muse-spark:");
 		});
 
 		it("should exit quickly for help command", async () => {

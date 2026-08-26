@@ -173,6 +173,29 @@ export interface StorageInfoResponse {
 	null_account_rows_24h: number;
 }
 
+/** One account in a routing observation's order. */
+export interface RoutingObservationAccount {
+	id: string;
+	name: string;
+}
+
+/**
+ * The proxy's last-observed account order for one model family -- display-only
+ * telemetry recorded from the real request path (see
+ * packages/proxy/src/handlers/routing-observations.ts), never a simulation.
+ */
+export interface RoutingObservation {
+	family: string;
+	order: RoutingObservationAccount[];
+	model: string;
+	observedAtMs: number;
+}
+
+/** Response from `GET /api/routing/observations`. */
+export interface RoutingObservationsResponse {
+	observations: Record<string, RoutingObservation>;
+}
+
 /**
  * Response from `POST /api/storage/integrity/check`.
  *
@@ -743,7 +766,7 @@ class API extends HttpClient {
 		}
 	}
 
-	async addMuseSparkAccount(data: {
+	async addMetaAccount(data: {
 		name: string;
 		apiKey: string;
 		priority: number;
@@ -751,7 +774,7 @@ class API extends HttpClient {
 		modelMappings?: { [key: string]: string };
 	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
-		const url = "/api/accounts/muse-spark";
+		const url = "/api/accounts/meta";
 
 		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 
@@ -1632,6 +1655,53 @@ class API extends HttpClient {
 			if (error instanceof HttpError) {
 				throw new Error(error.message);
 			}
+			throw error;
+		}
+	}
+
+	async getModelCapacityRouting(): Promise<{
+		mode: "off" | "exhausted";
+		source: "env" | "file" | "default";
+	}> {
+		const startTime = Date.now();
+		const url = "/api/config/model-capacity-routing";
+
+		this.logger.debug(`→ GET ${url}`);
+
+		try {
+			const response = await this.get<{
+				mode: "off" | "exhausted";
+				source: "env" | "file" | "default";
+			}>(url);
+			const duration = Date.now() - startTime;
+			this.logger.debug(`← GET ${url} - 200 (${duration}ms)`);
+			return response;
+		} catch (error) {
+			const duration = Date.now() - startTime;
+			this.logger.error(`✗ GET ${url} - ERROR (${duration}ms)`, {
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
+			throw error;
+		}
+	}
+
+	async setModelCapacityRouting(mode: "off" | "exhausted"): Promise<void> {
+		const startTime = Date.now();
+		const url = "/api/config/model-capacity-routing";
+
+		this.logger.debug(`→ POST ${url}`, { mode });
+
+		try {
+			await this.post(url, { mode });
+			const duration = Date.now() - startTime;
+			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
+		} catch (error) {
+			const duration = Date.now() - startTime;
+			this.logger.error(`✗ POST ${url} - ERROR (${duration}ms)`, {
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
 			throw error;
 		}
 	}
@@ -2626,6 +2696,24 @@ class API extends HttpClient {
 		}
 	}
 
+	async getRoutingObservations(): Promise<RoutingObservationsResponse> {
+		const startTime = Date.now();
+		const url = "/api/routing/observations";
+		this.logger.debug(`→ GET ${url}`);
+		try {
+			const response = await this.get<RoutingObservationsResponse>(url);
+			const duration = Date.now() - startTime;
+			this.logger.debug(`← GET ${url} - 200 (${duration}ms)`);
+			return response;
+		} catch (error) {
+			const duration = Date.now() - startTime;
+			this.logger.error(`✗ GET ${url} - ERROR (${duration}ms)`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			throw error;
+		}
+	}
+
 	async triggerIntegrityCheck(
 		kind: "quick" | "full",
 	): Promise<IntegrityCheckResponse> {
@@ -2646,29 +2734,6 @@ class API extends HttpClient {
 		}
 	}
 
-	async getFeatures(): Promise<{ showCombos: boolean }> {
-		const startTime = Date.now();
-		const url = "/api/features";
-
-		this.logger.debug(`→ GET ${url}`);
-
-		try {
-			const response = await this.get<{
-				success: boolean;
-				data: { showCombos: boolean };
-			}>(url);
-			const duration = Date.now() - startTime;
-			this.logger.debug(`← GET ${url} - 200 (${duration}ms)`);
-			return response.data;
-		} catch (error) {
-			const duration = Date.now() - startTime;
-			this.logger.error(`✗ GET ${url} - ERROR (${duration}ms)`, {
-				error: error instanceof Error ? error.message : String(error),
-				stack: error instanceof Error ? error.stack : undefined,
-			});
-			throw error;
-		}
-	}
 	async getAlerts(limit = 100): Promise<{
 		alerts: import("@better-ccflare/types").AlertEvent[];
 		unacknowledgedCount: number;

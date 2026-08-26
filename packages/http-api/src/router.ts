@@ -36,8 +36,8 @@ import {
 	createAwsProfilesListHandler,
 	createBedrockAccountAddHandler,
 	createKiloAccountAddHandler,
+	createMetaAccountAddHandler,
 	createMinimaxAccountAddHandler,
-	createMuseSparkAccountAddHandler,
 	createNanoGPTAccountAddHandler,
 	createOllamaAccountAddHandler,
 	createOllamaCloudAccountAddHandler,
@@ -97,7 +97,6 @@ import {
 	createHeapStatsHandler,
 	createRssHandler,
 } from "./handlers/debug";
-import { createFeaturesHandler } from "./handlers/features";
 import { createHealthHandler } from "./handlers/health";
 import {
 	createAnomalyInsightsHandler,
@@ -132,6 +131,7 @@ import {
 	createRequestsSummaryHandler,
 } from "./handlers/requests";
 import { createRequestsStreamHandler } from "./handlers/requests-stream";
+import { createRoutingObservationsHandler } from "./handlers/routing-observations";
 import { createSessionAccountHandler } from "./handlers/sessions";
 import { createStatsHandler, createStatsResetHandler } from "./handlers/stats";
 import {
@@ -237,7 +237,7 @@ export class APIRouter {
 		const nanogptAccountAddHandler = createNanoGPTAccountAddHandler(dbOps);
 		const anthropicCompatibleAccountAddHandler =
 			createAnthropicCompatibleAccountAddHandler(dbOps);
-		const museSparkAccountAddHandler = createMuseSparkAccountAddHandler(dbOps);
+		const metaAccountAddHandler = createMetaAccountAddHandler(dbOps);
 		const ollamaAccountAddHandler = createOllamaAccountAddHandler(dbOps);
 		const openaiAccountAddHandler = createOpenAIAccountAddHandler(dbOps);
 		const _accountRemoveHandler = createAccountRemoveHandler(dbOps);
@@ -291,7 +291,6 @@ export class APIRouter {
 		const cleanupHandler = createCleanupHandler(dbOps, config);
 		const systemInfoHandler = createSystemInfoHandler();
 		const versionCheckHandler = createVersionCheckHandler();
-		const featuresHandler = createFeaturesHandler();
 
 		// Debug/profiling handlers
 		const heapStatsHandler = createHeapStatsHandler();
@@ -341,8 +340,10 @@ export class APIRouter {
 		this.handlers.set("POST:/api/accounts/anthropic-compatible", (req) =>
 			anthropicCompatibleAccountAddHandler(req),
 		);
+		// Keep the legacy route as an ingress alias only; both paths persist the
+		// canonical `meta` provider identity through the same handler.
 		this.handlers.set("POST:/api/accounts/muse-spark", (req) =>
-			museSparkAccountAddHandler(req),
+			metaAccountAddHandler(req),
 		);
 		this.handlers.set("POST:/api/accounts/ollama", (req) =>
 			ollamaAccountAddHandler(req),
@@ -355,6 +356,9 @@ export class APIRouter {
 		this.handlers.set("POST:/api/accounts/openai-compatible", (req) =>
 			openaiAccountAddHandler(req),
 		);
+		this.handlers.set("POST:/api/accounts/meta", (req) =>
+			metaAccountAddHandler(req),
+		);
 
 		// Token health handlers
 		const tokenHealthHandler = createTokenHealthHandler(dbOps);
@@ -364,6 +368,13 @@ export class APIRouter {
 		this.handlers.set(
 			"GET:/api/token-health/reauth-needed",
 			reauthNeededHandler,
+		);
+
+		// Last-observed routing order per model family (display-only telemetry
+		// from the proxy's own account selection -- see routing-observations.ts).
+		const routingObservationsHandler = createRoutingObservationsHandler();
+		this.handlers.set("GET:/api/routing/observations", () =>
+			routingObservationsHandler(),
 		);
 
 		this.handlers.set("POST:/api/oauth/init", (req) => oauthInitHandler(req));
@@ -472,10 +483,33 @@ export class APIRouter {
 		this.handlers.set("POST:/api/config/usage-throttling", (req) =>
 			configHandlers.setUsageThrottling(req),
 		);
+		this.handlers.set("GET:/api/config/model-capacity-routing", () =>
+			configHandlers.getModelCapacityRouting(),
+		);
+		this.handlers.set("POST:/api/config/model-capacity-routing", (req) =>
+			configHandlers.setModelCapacityRouting(req),
+		);
+		this.handlers.set("GET:/api/config/combos-enabled", () =>
+			configHandlers.getCombosEnabled(),
+		);
+		this.handlers.set("POST:/api/config/combos-enabled", (req) =>
+			configHandlers.setCombosEnabled(req),
+		);
+		this.handlers.set("GET:/api/config/combo-session-fallback", () =>
+			configHandlers.getComboSessionFallback(),
+		);
+		this.handlers.set("POST:/api/config/combo-session-fallback", (req) =>
+			configHandlers.setComboSessionFallback(req),
+		);
+		this.handlers.set("GET:/api/config/force-account-model", () =>
+			configHandlers.getForceAccountModel(),
+		);
+		this.handlers.set("POST:/api/config/force-account-model", (req) =>
+			configHandlers.setForceAccountModel(req),
+		);
 		this.handlers.set("POST:/api/maintenance/cleanup", () => cleanupHandler());
 		this.handlers.set("GET:/api/system/info", () => systemInfoHandler());
 		this.handlers.set("GET:/api/version/check", () => versionCheckHandler());
-		this.handlers.set("GET:/api/features", () => featuresHandler());
 		this.handlers.set("GET:/api/logs/stream", (req) => logsStreamHandler(req));
 		this.handlers.set("GET:/api/logs/history", () => logsHistoryHandler());
 		this.handlers.set("GET:/api/analytics", (_req, url) => {

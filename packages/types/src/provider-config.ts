@@ -19,7 +19,7 @@ export const PROVIDER_NAMES = {
 	XAI: "xai",
 	OLLAMA: "ollama",
 	OLLAMA_CLOUD: "ollama-cloud",
-	MUSE_SPARK: "muse-spark",
+	META: "meta",
 } as const;
 
 export type ProviderName = (typeof PROVIDER_NAMES)[keyof typeof PROVIDER_NAMES];
@@ -152,7 +152,7 @@ export const PROVIDER_CONFIG: Record<ProviderName, ProviderConfig> = {
 		supportsOAuth: false,
 		defaultEndpoint: "https://ollama.com",
 	},
-	[PROVIDER_NAMES.MUSE_SPARK]: {
+	[PROVIDER_NAMES.META]: {
 		requiresSessionTracking: false, // Meta Model API is pay-as-you-go, no session windows
 		supportsUsageTracking: false, // Quota is reported per-response via x-ratelimit-* headers, not a polling API
 		supportsOAuth: false, // Meta Model API uses a bearer API key

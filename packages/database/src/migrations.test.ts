@@ -1939,3 +1939,149 @@ describe("PostgreSQL migration parity — attribution source columns", () => {
 		);
 	});
 });
+
+describe("Muse Spark provider migration", () => {
+	it("state-preservingly collapses alias collisions, repoints dependents, and remains idempotent", () => {
+		const db = new Database(":memory:");
+		try {
+			ensureSchema(db);
+			// Reproduce an already-upgraded database: the existing composite index
+			// permits this pair because the legacy and canonical provider strings
+			// are distinct until this migration canonicalizes them.
+			runMigrations(db);
+			db.prepare(
+				`INSERT INTO accounts (
+					id, name, provider, custom_endpoint, refresh_token, access_token,
+					refresh_token_issued_at, created_at, last_used, request_count,
+					total_requests, priority
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"legacy-muse",
+				"shared-account",
+				"muse-spark",
+				"https://meta.example.test",
+				"fresh-refresh-token",
+				"fresh-access-token",
+				20,
+				2,
+				20,
+				2,
+				2,
+				1,
+			);
+			db.prepare(
+				`INSERT INTO accounts (
+					id, name, provider, custom_endpoint, refresh_token, access_token,
+					refresh_token_issued_at, created_at, last_used, request_count,
+					total_requests, priority, paused
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"already-meta",
+				"shared-account",
+				"meta",
+				"https://meta.example.test",
+				"stale-refresh-token",
+				"stale-access-token",
+				10,
+				1,
+				10,
+				3,
+				3,
+				7,
+				1,
+			);
+			db.prepare(
+				"INSERT INTO accounts (id, name, provider, created_at) VALUES (?, ?, ?, ?)",
+			).run("legacy-solo", "legacy-solo", "muse-spark", 1);
+			db.prepare(
+				"INSERT INTO combos (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+			).run("combo-1", "combo-1", 1, 1);
+			db.prepare(
+				"INSERT INTO combo_slots (id, combo_id, account_id, model, priority) VALUES (?, ?, ?, ?, ?)",
+			).run("slot-meta", "combo-1", "already-meta", "model", 1);
+			db.prepare(
+				"INSERT INTO requests (id, timestamp, method, path, account_used) VALUES (?, ?, ?, ?, ?)",
+			).run("request-meta", 1, "POST", "/v1/messages", "already-meta");
+			db.prepare(
+				"INSERT INTO usage_snapshots (account_id, timestamp, window_key, utilization) VALUES (?, ?, ?, ?)",
+			).run("already-meta", 1, "five_hour", 10);
+			db.prepare(
+				"INSERT INTO combo_membership_exclusions (id, family, combo_id, account_id, created_at) VALUES (?, ?, ?, ?, ?)",
+			).run("exclusion-survivor", "fable", "combo-1", "legacy-muse", 1);
+			db.prepare(
+				"INSERT INTO combo_membership_exclusions (id, family, combo_id, account_id, created_at) VALUES (?, ?, ?, ?, ?)",
+			).run("exclusion-collision", "fable", "combo-1", "already-meta", 1);
+			db.prepare(
+				`INSERT INTO device_setup_jobs (
+					id, idempotency_key, request_fingerprint, provider, account_id,
+					status, created_at, updated_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"device-job-meta",
+				"device-key-meta",
+				"device-fingerprint-meta",
+				"qwen",
+				"already-meta",
+				"awaiting_authorization",
+				1,
+				1,
+			);
+
+			runMigrations(db);
+
+			expect(
+				db
+					.prepare(
+						`SELECT id, provider, refresh_token, access_token, request_count,
+						 total_requests, priority, paused
+						 FROM accounts WHERE name = ?`,
+					)
+					.all("shared-account"),
+			).toEqual([
+				{
+					id: "legacy-muse",
+					provider: "meta",
+					refresh_token: "fresh-refresh-token",
+					access_token: "fresh-access-token",
+					request_count: 5,
+					total_requests: 5,
+					priority: 7,
+					paused: 1,
+				},
+			]);
+			expect(
+				db
+					.prepare("SELECT provider FROM accounts WHERE id = ?")
+					.get("legacy-solo"),
+			).toEqual({ provider: "meta" });
+			for (const [table, column] of [
+				["combo_slots", "account_id"],
+				["requests", "account_used"],
+				["usage_snapshots", "account_id"],
+				["device_setup_jobs", "account_id"],
+			] as const) {
+				expect(
+					db.prepare(`SELECT ${column} AS account_id FROM ${table}`).get(),
+				).toEqual({ account_id: "legacy-muse" });
+			}
+			expect(
+				db
+					.prepare(
+						"SELECT id, account_id FROM combo_membership_exclusions ORDER BY id",
+					)
+					.all(),
+			).toEqual([{ id: "exclusion-survivor", account_id: "legacy-muse" }]);
+
+			expect(() => runMigrations(db)).not.toThrow();
+			expect(
+				db
+					.prepare(
+						"SELECT COUNT(*) AS count FROM accounts WHERE provider = 'meta'",
+					)
+					.get(),
+			).toEqual({ count: 2 });
+		} finally {
+			db.close();
+		}
+	});
+});

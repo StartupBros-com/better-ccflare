@@ -7,6 +7,7 @@ import {
 import type { Account } from "@better-ccflare/types";
 import {
 	extractAuthFailureReason,
+	getValidAccessToken,
 	isDefinitiveAuthFailure,
 	refreshAccessTokenSafe,
 } from "../token-manager";
@@ -77,6 +78,21 @@ function makeContext(refreshError: Error) {
 		setRequiresReauth,
 	};
 }
+
+describe("getValidAccessToken API-key providers", () => {
+	it("returns the canonical Meta provider API key without OAuth refresh", async () => {
+		const account = makeAccount("meta-api-key");
+		account.provider = "meta";
+		account.api_key = "meta-test-key";
+		account.refresh_token = null;
+		account.access_token = null;
+		account.expires_at = null;
+
+		await expect(getValidAccessToken(account, {} as never)).resolves.toBe(
+			"meta-test-key",
+		);
+	});
+});
 
 describe("extractAuthFailureReason / isDefinitiveAuthFailure", () => {
 	it("classifies a realistic invalid_grant message (code preserved mid-message)", () => {

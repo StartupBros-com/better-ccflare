@@ -60,6 +60,10 @@ export function createAlertsConfigSetHandler(context: APIContext) {
 				anomalyIntervalMinutes: Number(
 					body.anomalyIntervalMinutes ?? current.anomalyIntervalMinutes,
 				),
+				anomalyBaselineWindowMinutes: Number(
+					body.anomalyBaselineWindowMinutes ??
+						current.anomalyBaselineWindowMinutes,
+				),
 				loopMinRequests: Number(
 					body.loopMinRequests ?? current.loopMinRequests,
 				),

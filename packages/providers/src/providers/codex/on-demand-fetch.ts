@@ -29,20 +29,25 @@ export interface CodexUsageRefreshFetchResult {
  * Send a minimal Codex `/responses` request whose only purpose is to elicit
  * the `x-codex-*` rate-limit/usage headers that the upstream attaches to
  * every response. The request body is intentionally tiny (a single character
- * input with `reasoning.effort = "minimal"`), and the response is aborted and
- * its body cancelled as soon as headers are captured. The subscription API
- * rejects `max_output_tokens`; custom API-compatible endpoints retain the
- * legacy one-token cap.
+ * input at the lowest reasoning effort the models accept), and the response is
+ * aborted and its body cancelled as soon as headers are captured. The
+ * subscription API rejects `max_output_tokens`; custom API-compatible endpoints
+ * retain the legacy one-token cap.
  *
  * The ChatGPT backend DOES expose a free usage-introspection endpoint
  * (`wham/usage`, see api-usage.ts's `fetchCodexUsageData`), used to poll
  * subscription accounts without spending quota. This quota-consuming ping
  * remains in use for custom OpenAI-compatible endpoints (which have no
  * wham/usage equivalent) and as a fallback when the free endpoint fails.
+ *
+ * `model` exists because a wrong model name is rejected before quota accounting,
+ * producing no usage headers. Callers with an account model listing should pass
+ * its weakest accepted model; callers without one fall back to CODEX_PING_MODEL.
  */
 export async function fetchCodexUsageOnDemand(
 	accessToken: string,
 	endpoint: string = CODEX_DEFAULT_ENDPOINT,
+	model: string = CODEX_PING_MODEL,
 ): Promise<CodexUsageRefreshFetchResult> {
 	if (!accessToken || accessToken.trim() === "") {
 		throw new Error(
@@ -55,7 +60,8 @@ export async function fetchCodexUsageOnDemand(
 	const resolvedEndpoint = resolveCodexEndpoint(endpoint);
 
 	const requestBody: Record<string, unknown> = {
-		model: CODEX_PING_MODEL,
+		// Blank input is the same missing-model failure as a stale model name.
+		model: model.trim() || CODEX_PING_MODEL,
 		input: [
 			{
 				role: "user",
@@ -64,7 +70,9 @@ export async function fetchCodexUsageOnDemand(
 		],
 		stream: true,
 		store: false,
-		reasoning: { effort: "minimal" },
+		// "minimal" is rejected by current models; "low" is accepted across the
+		// measured catalog and is the cheapest portable probe effort.
+		reasoning: { effort: "low" },
 		instructions: "ping",
 	};
 	if (!isCodexSubscriptionEndpoint(resolvedEndpoint)) {

@@ -185,6 +185,15 @@ describe("upstream sync inventory structural validation", () => {
     expect(() => validateFixture(validInventory())).not.toThrow();
   });
 
+  test("renders the release from the canonical tag", () => {
+    const inventory = validInventory();
+    inventory.baseline.canonicalTag = "refs/tags/v3.5.67";
+
+    expect(renderLedger(inventory)).toStartWith(
+      "# Issue #260 — v3.5.67 Resolution Ledger",
+    );
+  });
+
   test("rejects unknown schema versions, phases, kinds, and dispositions", () => {
     for (const mutate of [
       (value: SyncInventory) => (value.schemaVersion = 2),

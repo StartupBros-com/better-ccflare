@@ -1,7 +1,6 @@
 import type { Account } from "@better-ccflare/types";
 import { getEndpointUrl } from "./model-mappings";
 
-const XAI_DEFAULT_ENDPOINT = "https://api.x.ai/v1";
 const OFFICIAL_XAI_HOSTS = new Set(["api.x.ai"]);
 
 /**
@@ -43,26 +42,26 @@ export function resolveXaiContextWindow(
 
 /**
  * Resolve whether an account targets official xAI infrastructure.
- * Invalid custom endpoints fall back to the official default, matching
- * XaiProvider.buildUrl behavior.
+ * Invalid custom endpoints are not official, even though XaiProvider.buildUrl
+ * falls them back to the official default for transport safety.
  */
 export function isOfficialXaiEndpoint(account?: Account | null): boolean {
 	if (account && account.provider !== "xai") return false;
-
-	let endpoint = XAI_DEFAULT_ENDPOINT;
-	try {
-		endpoint = account?.custom_endpoint
-			? (getEndpointUrl(account) ?? XAI_DEFAULT_ENDPOINT)
-			: XAI_DEFAULT_ENDPOINT;
-	} catch {
-		endpoint = XAI_DEFAULT_ENDPOINT;
+	if (account?.custom_endpoint) {
+		let endpoint: string | null;
+		try {
+			endpoint = getEndpointUrl(account);
+		} catch {
+			return false;
+		}
+		if (!endpoint) return false;
+		try {
+			return OFFICIAL_XAI_HOSTS.has(new URL(endpoint).hostname.toLowerCase());
+		} catch {
+			return false;
+		}
 	}
-
-	try {
-		return OFFICIAL_XAI_HOSTS.has(new URL(endpoint).hostname.toLowerCase());
-	} catch {
-		return false;
-	}
+	return true;
 }
 
 export type XaiCacheOutcome = "hit" | "miss" | "unknown" | "fail_closed";

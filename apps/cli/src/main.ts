@@ -77,7 +77,7 @@ export const ACCOUNT_MODES = [
 	"codex",
 	"xai",
 	"ollama",
-	"muse-spark",
+	"meta",
 ] as const;
 
 type AccountMode = (typeof ACCOUNT_MODES)[number];
@@ -102,7 +102,7 @@ const ACCOUNT_MODE_DESCRIPTIONS: Record<AccountMode, string> = {
 	codex: "Codex (OpenAI OAuth) provider",
 	xai: "xAI/Grok provider (imports local Grok CLI OAuth credentials)",
 	ollama: "Ollama local provider (no API key required)",
-	"muse-spark": "Muse Spark provider (API key)",
+	meta: "Meta Model API provider (API key)",
 };
 
 /**

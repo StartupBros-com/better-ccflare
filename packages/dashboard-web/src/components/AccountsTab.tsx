@@ -54,7 +54,7 @@ type AccountCreationClient = Pick<
 	| "addBedrockAccount"
 	| "addZaiAccount"
 	| "addMinimaxAccount"
-	| "addMuseSparkAccount"
+	| "addMetaAccount"
 	| "addNanoGPTAccount"
 	| "addAlibabaCodingPlanAccount"
 	| "addKiloAccount"
@@ -129,11 +129,9 @@ export function createAccountCreationCallbacks(
 				afterCreate,
 				onError,
 			),
-		onAddMuseSparkAccount: (
-			params: Parameters<typeof client.addMuseSparkAccount>[0],
-		) =>
+		onAddMetaAccount: (params: Parameters<typeof client.addMetaAccount>[0]) =>
 			immutableAccountIdentity(
-				() => client.addMuseSparkAccount(params),
+				() => client.addMetaAccount(params),
 				afterCreate,
 				onError,
 			),
@@ -398,14 +396,14 @@ export function AccountsTab() {
 		return accountCreationCallbacks.onAddMinimaxAccount(params);
 	};
 
-	const handleAddMuseSparkAccount = async (params: {
+	const handleAddMetaAccount = async (params: {
 		name: string;
 		apiKey: string;
 		priority: number;
 		customEndpoint?: string;
 		modelMappings?: { [key: string]: string };
 	}) => {
-		return accountCreationCallbacks.onAddMuseSparkAccount(params);
+		return accountCreationCallbacks.onAddMetaAccount(params);
 	};
 
 	const handleAddNanoGPTAccount = async (params: {
@@ -555,8 +553,13 @@ export function AccountsTab() {
 
 	const handleRefreshUsage = async (account: Account) => {
 		try {
-			await refreshUsage.mutateAsync(account.id);
-			setActionError(null);
+			// The endpoint answers 200 even when the refresh failed (`success:
+			// false` plus a reason), so discarding the body makes a failed refresh
+			// indistinguishable from a successful one — the button just appears to
+			// do nothing. Surface the reason while retaining the managed-routing
+			// invalidation performed by the mutation hook.
+			const result = await refreshUsage.mutateAsync(account.id);
+			setActionError(result.success ? null : result.message);
 		} catch (err) {
 			setActionError(formatError(err));
 		}
@@ -736,7 +739,6 @@ export function AccountsTab() {
 							onAddBedrockAccount={handleAddBedrockAccount}
 							onAddZaiAccount={handleAddZaiAccount}
 							onAddMinimaxAccount={handleAddMinimaxAccount}
-							onAddMuseSparkAccount={handleAddMuseSparkAccount}
 							onAddNanoGPTAccount={handleAddNanoGPTAccount}
 							onAddAlibabaCodingPlanAccount={handleAddAlibabaCodingPlanAccount}
 							onAddKiloAccount={handleAddKiloAccount}
@@ -747,6 +749,7 @@ export function AccountsTab() {
 							onAddOpenAIAccount={handleAddOpenAIAccount}
 							onAddOllamaAccount={handleAddOllamaAccount}
 							onAddOllamaCloudAccount={handleAddOllamaCloudAccount}
+							onAddMetaAccount={handleAddMetaAccount}
 							onCancel={() => {
 								setAdding(false);
 								setActionError(null);

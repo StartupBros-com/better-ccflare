@@ -187,6 +187,7 @@ describe("account routing draft and selection", () => {
 				routeClass: "api-key",
 				billingType: "api",
 			},
+			meta: { provider: "meta", routeClass: "api-key", billingType: "api" },
 			"anthropic-compatible": {
 				provider: "anthropic-compatible",
 				routeClass: "api-key",

@@ -1,18 +1,26 @@
 import {
 	authFailureEvents,
 	CLAUDE_MODEL_IDS,
+	clearProbeBackoff,
 	getClientVersion,
 	getOAuthErrorCode,
 	normalizeProviderUsageWindows,
 	OAuthRefreshTokenError,
 	PAUSE_REASON_NEEDS_REAUTH,
+	PROBE_BACKOFF_PENALTY_THRESHOLD_MS,
 	registerHeartbeat,
 	requestEvents,
+	setProbeBackoff,
 } from "@better-ccflare/core";
 import type { BunSqlAdapter } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import { fetchUsageData, getProvider } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
+import {
+	AUTO_REFRESH_PROMPTS,
+	claimAutoRefreshPrompt,
+	releaseAutoRefreshPrompt,
+} from "./auto-refresh-prompt-pool";
 import { TOKEN_SAFETY_WINDOW_MS } from "./constants";
 import { getValidAccessToken, INTERNAL_PROBE_SECRET_HEADER } from "./handlers";
 import {
@@ -56,6 +64,23 @@ export class AutoRefreshScheduler {
 	// self-recover automatically instead of getting stuck in API ERROR (#262).
 	private lastFailureProbeAt: Map<string, number> = new Map();
 	private readonly FAILURE_PROBE_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+	// Escalating backoff for probe failures that deliberately do not count toward
+	// FAILURE_THRESHOLD. Without this, a persistent overload or no-response loop
+	// retries every minute and can exhaust the shared 24-hour prompt pool.
+	private readonly UNCOUNTED_FAILURE_BACKOFF_MS: readonly number[] = [
+		60 * 1000,
+		5 * 60 * 1000,
+		10 * 60 * 1000,
+		30 * 60 * 1000,
+		60 * 60 * 1000,
+		6 * 60 * 60 * 1000,
+		12 * 60 * 60 * 1000,
+	];
+	private uncountedProbeFailures: Map<string, { at: number; streak: number }> =
+		new Map();
+	// The release time already reported for an exhausted prompt pool. Comparing
+	// against it turns the per-minute retry into one warning per dry-pool episode.
+	private promptPoolExhaustedReportedFor: number | null = null;
 
 	constructor(db: BunSqlAdapter, proxyContext: ProxyContext) {
 		this.db = db;
@@ -96,6 +121,26 @@ export class AutoRefreshScheduler {
 		this.lastRefreshResetTime.clear();
 		this.consecutiveFailures.clear();
 		this.lastFailureProbeAt.clear();
+		for (const accountId of this.uncountedProbeFailures.keys()) {
+			clearProbeBackoff(accountId);
+		}
+		this.uncountedProbeFailures.clear();
+		this.promptPoolExhaustedReportedFor = null;
+	}
+
+	/** Report a dry prompt pool once per episode rather than once per minute. */
+	private notePromptPoolExhausted(retryAt: number, accountName: string): void {
+		const at = new Date(retryAt).toISOString();
+		if (this.promptPoolExhaustedReportedFor === retryAt) {
+			log.debug(
+				`Auto-refresh still holding off on ${accountName} until ${at} — every probe prompt is on cooldown`,
+			);
+			return;
+		}
+		this.promptPoolExhaustedReportedFor = retryAt;
+		log.warn(
+			`Auto-refresh is sending nothing for ${accountName}: all ${AUTO_REFRESH_PROMPTS.length} probe prompts are inside their 24h cooldown, which takes ${AUTO_REFRESH_PROMPTS.length} refreshes in a day and should not happen. The first prompt frees up at ${at}.`,
+		);
 	}
 
 	/**
@@ -272,8 +317,20 @@ export class AutoRefreshScheduler {
 		auto_pause_on_overage_enabled: number;
 		pause_reason: string | null;
 	}): Promise<boolean> {
+		// Hoisted so the catch path can return an unsent prompt to the pool.
+		let claimIndex: number | null = null;
+		let probeSent = false;
+
 		try {
-			log.info(`Sending auto-refresh message to account: ${accountRow.name}`);
+			const claim = claimAutoRefreshPrompt();
+			if (!claim.ok) {
+				this.notePromptPoolExhausted(claim.retryAt, accountRow.name);
+				return false;
+			}
+			claimIndex = claim.index;
+			log.info(
+				`Sending auto-refresh message to account: ${accountRow.name} (prompt #${claim.index})`,
+			);
 
 			// Record the probe timestamp for failure_threshold accounts so the
 			// cooldown in shouldRefreshAccount suppresses re-probes for the next
@@ -287,6 +344,7 @@ export class AutoRefreshScheduler {
 				log.error(
 					`No provider found for ${accountRow.provider} (account: ${accountRow.name})`,
 				);
+				releaseAutoRefreshPrompt(claim.index);
 				return false;
 			}
 
@@ -352,18 +410,6 @@ export class AutoRefreshScheduler {
 				statusCode: 0, // Will be updated later
 				agentUsed: null,
 			});
-
-			// Prepare dummy message request
-			const dummyMessages = [
-				"Write a hello world program in Python",
-				"What is 2+2?",
-				"Tell me a programmer joke",
-				"What is the capital of France?",
-				"Explain recursion in one sentence",
-			];
-
-			const randomMessage =
-				dummyMessages[Math.floor(Math.random() * dummyMessages.length)];
 
 			// Send request through proxy with special header to force specific account usage
 			// This ensures proper request handling and analytics while using the correct account
@@ -435,7 +481,7 @@ export class AutoRefreshScheduler {
 						messages: [
 							{
 								role: "user",
-								content: randomMessage,
+								content: claim.prompt,
 							},
 						],
 					};
@@ -451,6 +497,9 @@ export class AutoRefreshScheduler {
 					// handleProxy consumes it at ingress before metadata or forwarding.
 					const authorizedHeaders = new Headers(headers);
 					stampInternalAutoRefreshAuth(authorizedHeaders);
+					// Past this line the text may already be on the wire, so the
+					// prompt stays claimed however the request ends.
+					probeSent = true;
 					response = await fetch(endpoint, {
 						method: "POST",
 						headers: authorizedHeaders,
@@ -488,6 +537,7 @@ export class AutoRefreshScheduler {
 				log.error(
 					`Failed to send auto-refresh message to ${accountRow.name} with any model: ${errorMsg}`,
 				);
+				this.recordUncountedProbeFailure(accountRow.id, accountRow.name);
 				return false;
 			}
 
@@ -530,6 +580,8 @@ export class AutoRefreshScheduler {
 				log.info(
 					`Auto-refresh message sent successfully for account: ${accountRow.name}`,
 				);
+				this.uncountedProbeFailures.delete(accountRow.id);
+				clearProbeBackoff(accountRow.id);
 
 				// Log the response for debugging
 				let responseText = "";
@@ -691,6 +743,7 @@ export class AutoRefreshScheduler {
 				log.warn(
 					`Auto-refresh probe for ${accountRow.name} received 529 (overloaded/throttled) — not counting toward the ${this.FAILURE_THRESHOLD}-failure pause threshold`,
 				);
+				this.recordUncountedProbeFailure(accountRow.id, accountRow.name);
 				return false;
 			}
 
@@ -720,6 +773,10 @@ export class AutoRefreshScheduler {
 				log.error(
 					`Error sending auto-refresh message to account ${accountRow.name}: Unknown error (possibly undefined or null)`,
 				);
+			}
+
+			if (!probeSent && claimIndex !== null) {
+				releaseAutoRefreshPrompt(claimIndex);
 			}
 
 			// Track consecutive failures for this account (for exceptions too)
@@ -1293,6 +1350,16 @@ export class AutoRefreshScheduler {
 					);
 				}
 			}
+
+			for (const accountId of this.uncountedProbeFailures.keys()) {
+				if (!activeAccountIdSet.has(accountId)) {
+					this.uncountedProbeFailures.delete(accountId);
+					clearProbeBackoff(accountId);
+					log.debug(
+						`Removed uncounted-failure cooldown tracking for account ${accountId} (no longer exists or auto-refresh disabled)`,
+					);
+				}
+			}
 		} catch (error) {
 			if (error instanceof Error) {
 				const errorMessage = `Error cleaning up tracking map: ${error.name}: ${error.message}`;
@@ -1357,6 +1424,34 @@ export class AutoRefreshScheduler {
 		}
 	}
 
+	/** How long an account waits after its nth consecutive uncounted failure. */
+	private uncountedFailureCooldownMs(streak: number): number {
+		const ladder = this.UNCOUNTED_FAILURE_BACKOFF_MS;
+		const rung = Math.min(Math.max(streak, 1), ladder.length) - 1;
+		return ladder[rung];
+	}
+
+	/** Advance an account one rung up the uncounted-failure ladder. */
+	private recordUncountedProbeFailure(
+		accountId: string,
+		accountName: string,
+	): void {
+		const streak =
+			(this.uncountedProbeFailures.get(accountId)?.streak ?? 0) + 1;
+		const at = Date.now();
+		this.uncountedProbeFailures.set(accountId, { at, streak });
+
+		const cooldown = this.uncountedFailureCooldownMs(streak);
+		const penalized = cooldown >= PROBE_BACKOFF_PENALTY_THRESHOLD_MS;
+		if (penalized) {
+			setProbeBackoff(accountId, at + cooldown);
+		}
+
+		log.debug(
+			`Uncounted probe failure #${streak} for account ${accountName} — next probe held off for ${cooldown / 60000}m${penalized ? ", and deprioritized in the queue until then" : ""}`,
+		);
+	}
+
 	/**
 	 * Determine if an account should be refreshed based on its reset time and tracking state
 	 * @param account - The account to check
@@ -1378,6 +1473,17 @@ export class AutoRefreshScheduler {
 		},
 		now: number,
 	): boolean {
+		const uncounted = this.uncountedProbeFailures.get(account.id);
+		if (uncounted) {
+			const cooldown = this.uncountedFailureCooldownMs(uncounted.streak);
+			if (now - uncounted.at < cooldown) {
+				log.debug(
+					`Skipping probe for account ${account.name} — ${uncounted.streak} uncounted failure(s) in a row, last one ${Math.round((now - uncounted.at) / 1000)}s ago, backoff ${cooldown / 1000}s`,
+				);
+				return false;
+			}
+		}
+
 		// Throttle re-probes of failure_threshold-paused accounts to once per
 		// cooldown — avoids burning quota on a dead endpoint every 60s (#199)
 		// while still letting it recover automatically (#262).

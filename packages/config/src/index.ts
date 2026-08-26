@@ -31,6 +31,14 @@ import { resolveConfigPath } from "./paths";
 
 const log = new Logger("Config");
 
+export type ModelScopedCapacityRoutingMode = "off" | "exhausted";
+
+function isValidModelScopedCapacityRoutingMode(
+	value: unknown,
+): value is ModelScopedCapacityRoutingMode {
+	return value === "off" || value === "exhausted";
+}
+
 /**
  * This credential is intentionally env-only: it is absent from ConfigData,
  * config files, health output, and every generic config enumeration surface.
@@ -881,6 +889,9 @@ export interface ConfigData {
 	system_prompt_cache_ttl_1h?: boolean;
 	usage_throttling_five_hour_enabled?: boolean;
 	usage_throttling_weekly_enabled?: boolean;
+	codex_five_hour_window_enabled?: boolean;
+	model_scoped_capacity_routing?: ModelScopedCapacityRoutingMode;
+	force_account_model?: boolean;
 	agent_frontmatter_model_fallback?: boolean;
 	model_catalog_oauth_refresh_enabled?: boolean;
 	implicit_fallback_mode?: string;
@@ -906,9 +917,12 @@ export interface ConfigData {
 	alert_usage_window_threshold_percent?: number;
 	alert_anomaly_enabled?: boolean;
 	alert_anomaly_interval_minutes?: number;
+	alert_anomaly_baseline_window_minutes?: number;
 	alert_anomaly_loop_min_requests?: number;
 	alert_cooldown_minutes?: number;
 	alert_webhook_url?: string;
+	combos_enabled?: boolean;
+	combo_session_fallback?: boolean;
 	outbound_proxy?: string;
 	// Local-control secret: shared between the CLI and the server process it
 	// controls, used to authorize a small set of idempotent CLI->server
@@ -1623,6 +1637,22 @@ export class Config extends EventEmitter {
 		return false;
 	}
 
+	getCodexFiveHourWindowEnabled(): boolean {
+		const fromEnv = parseEnabledEnvFlag(
+			process.env.CODEX_FIVE_HOUR_WINDOW_ENABLED,
+		);
+		if (fromEnv !== undefined) {
+			return fromEnv;
+		}
+		const fromFile = this.data.codex_five_hour_window_enabled;
+		if (typeof fromFile === "boolean") return fromFile;
+		return false;
+	}
+
+	setCodexFiveHourWindowEnabled(value: boolean): void {
+		this.set("codex_five_hour_window_enabled", value);
+	}
+
 	/**
 	 * Whether an agent's frontmatter `model` field should be used as a
 	 * substitution fallback when no explicit DB preference is configured for
@@ -1723,6 +1753,64 @@ export class Config extends EventEmitter {
 		this.set("usage_throttling_weekly_enabled", value);
 	}
 
+	getCombosEnabled(): boolean {
+		return typeof this.data.combos_enabled === "boolean"
+			? this.data.combos_enabled
+			: false;
+	}
+
+	getCombosEnabledSource(): "file" | "default" {
+		return typeof this.data.combos_enabled === "boolean" ? "file" : "default";
+	}
+
+	setCombosEnabled(value: boolean): void {
+		this.set("combos_enabled", value);
+	}
+
+	getComboSessionFallback(): boolean {
+		return typeof this.data.combo_session_fallback === "boolean"
+			? this.data.combo_session_fallback
+			: false;
+	}
+
+	getComboSessionFallbackSource(): "file" | "default" {
+		return typeof this.data.combo_session_fallback === "boolean"
+			? "file"
+			: "default";
+	}
+
+	setComboSessionFallback(value: boolean): void {
+		this.set("combo_session_fallback", value);
+	}
+
+	/**
+	 * Migrate one-time boot inputs from the retired combo environment settings.
+	 * Persisted values always win so dashboard choices cannot be overwritten by a
+	 * later restart with stale environment state.
+	 */
+	adoptLegacyRoutingSettings(hasCombos: boolean): string[] {
+		const notes: string[] = [];
+		if (hasCombos && this.getCombosEnabledSource() === "default") {
+			this.setCombosEnabled(true);
+			notes.push(
+				"combos enabled: this install already has combos, so the routing it was already doing is kept. Turn it off in the dashboard Combos tab",
+			);
+		}
+
+		if (this.getComboSessionFallbackSource() === "default") {
+			const legacyValue = process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK;
+			if (legacyValue !== undefined && legacyValue !== "") {
+				this.setComboSessionFallback(!/^(1|true|yes|on)$/i.test(legacyValue));
+			} else if (hasCombos) {
+				this.setComboSessionFallback(true);
+				notes.push(
+					"combo session fallback enabled: existing combos retain their historical SessionStrategy fallback. Turn it off in the dashboard Combos tab",
+				);
+			}
+		}
+		return notes;
+	}
+
 	/**
 	 * Shared env > file > default precedence resolver: a valid environment
 	 * value wins ("env"), else a valid config-file value ("file"), else
@@ -1760,6 +1848,58 @@ export class Config extends EventEmitter {
 			isValidStrategy,
 			DEFAULT_STRATEGY,
 		);
+	}
+
+	private resolveModelScopedCapacityRouting(): {
+		value: ModelScopedCapacityRoutingMode;
+		source: "env" | "file" | "default";
+	} {
+		return this.resolveEnvFileSetting(
+			process.env.MODEL_SCOPED_CAPACITY_ROUTING,
+			this.data.model_scoped_capacity_routing,
+			isValidModelScopedCapacityRoutingMode,
+			"off",
+		);
+	}
+
+	getModelScopedCapacityRouting(): ModelScopedCapacityRoutingMode {
+		return this.resolveModelScopedCapacityRouting().value;
+	}
+
+	getModelScopedCapacityRoutingSource(): "env" | "file" | "default" {
+		return this.resolveModelScopedCapacityRouting().source;
+	}
+
+	setModelScopedCapacityRouting(mode: ModelScopedCapacityRoutingMode): void {
+		if (!isValidModelScopedCapacityRoutingMode(mode)) {
+			throw new ValidationError(
+				`Invalid model_scoped_capacity_routing mode: ${mode}`,
+				"model_scoped_capacity_routing",
+			);
+		}
+		this.set("model_scoped_capacity_routing", mode);
+	}
+
+	private resolveFlag(
+		fileValue: boolean | undefined,
+		defaultValue: boolean,
+	): { value: boolean; source: "file" | "default" } {
+		if (typeof fileValue === "boolean") {
+			return { value: fileValue, source: "file" };
+		}
+		return { value: defaultValue, source: "default" };
+	}
+
+	getForceAccountModel(): boolean {
+		return this.resolveFlag(this.data.force_account_model, false).value;
+	}
+
+	getForceAccountModelSource(): "file" | "default" {
+		return this.resolveFlag(this.data.force_account_model, false).source;
+	}
+
+	setForceAccountModel(value: boolean): void {
+		this.set("force_account_model", value);
 	}
 
 	getHealthDetailEnabled(): boolean {
@@ -1964,6 +2104,24 @@ export class Config extends EventEmitter {
 		this.set("alert_anomaly_interval_minutes", this.clamp(value, 5, 1440));
 	}
 
+	getAlertAnomalyBaselineWindowMinutes(): number {
+		const fromEnv = process.env.ALERT_ANOMALY_BASELINE_WINDOW_MINUTES;
+		if (fromEnv) {
+			const n = Number.parseInt(fromEnv, 10);
+			if (!Number.isNaN(n)) return this.clamp(n, 60, 43200);
+		}
+		const fromFile = this.data.alert_anomaly_baseline_window_minutes;
+		if (typeof fromFile === "number") return this.clamp(fromFile, 60, 43200);
+		return 1440;
+	}
+
+	setAlertAnomalyBaselineWindowMinutes(value: number): void {
+		this.set(
+			"alert_anomaly_baseline_window_minutes",
+			this.clamp(value, 60, 43200),
+		);
+	}
+
 	getAlertAnomalyLoopMinRequests(): number {
 		const fromEnv = process.env.ALERT_ANOMALY_LOOP_MIN_REQUESTS;
 		if (fromEnv) {
@@ -2046,6 +2204,11 @@ export class Config extends EventEmitter {
 			usage_throttling_five_hour_enabled:
 				this.getUsageThrottlingFiveHourEnabled(),
 			usage_throttling_weekly_enabled: this.getUsageThrottlingWeeklyEnabled(),
+			codex_five_hour_window_enabled: this.getCodexFiveHourWindowEnabled(),
+			model_scoped_capacity_routing: this.getModelScopedCapacityRouting(),
+			force_account_model: this.getForceAccountModel(),
+			combos_enabled: this.getCombosEnabled(),
+			combo_session_fallback: this.getComboSessionFallback(),
 			agent_frontmatter_model_fallback: this.getAgentFrontmatterModelFallback(),
 			model_catalog_oauth_refresh_enabled:
 				this.getModelCatalogOAuthRefreshEnabled(),
@@ -2075,6 +2238,8 @@ export class Config extends EventEmitter {
 				this.getAlertUsageWindowThresholdPercent(),
 			alert_anomaly_enabled: this.getAlertAnomalyEnabled(),
 			alert_anomaly_interval_minutes: this.getAlertAnomalyIntervalMinutes(),
+			alert_anomaly_baseline_window_minutes:
+				this.getAlertAnomalyBaselineWindowMinutes(),
 			alert_anomaly_loop_min_requests: this.getAlertAnomalyLoopMinRequests(),
 			alert_cooldown_minutes: this.getAlertCooldownMinutes(),
 			alert_webhook_url: this.getAlertWebhookUrl(),

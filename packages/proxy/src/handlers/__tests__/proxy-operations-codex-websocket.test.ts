@@ -1517,7 +1517,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(websocketAttempt).toHaveBeenCalledTimes(1);
 		expect(httpCalls).toBe(0);
 		expect(postWriteCategories).toEqual(["semantic_stall"]);
-		expect(upstreamCancels).toBe(1);
+		expect(upstreamCancels).toBe(0);
 		expect(elapsedMs).toBeGreaterThanOrEqual(140);
 		expect(receipt.stickyHttp).toBe(true);
 		expect(response?.status).toBe(504);
@@ -1686,6 +1686,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		const routeAbort = new AbortController();
 		const postWriteCategories: string[] = [];
 		let upstreamCancels = 0;
+		let webSocketSignal: AbortSignal | undefined;
 		const receipt = makeReceipt((category) =>
 			postWriteCategories.push(category),
 		);
@@ -1693,6 +1694,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			codexWebSocketTransport,
 			"tryRequest",
 		).mockImplementation(async (input) => {
+			webSocketSignal = input.signal;
 			input.onFrameWritten?.(receipt);
 			const encoder = new TextEncoder();
 			return {
@@ -1749,7 +1751,8 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(websocketAttempt).toHaveBeenCalledTimes(1);
 		expect(httpCalls).toBe(0);
 		expect(postWriteCategories).toEqual([]);
-		expect(upstreamCancels).toBe(1);
+		expect(webSocketSignal?.aborted).toBe(true);
+		expect(upstreamCancels).toBe(0);
 		expect(receipt.stickyHttp).toBe(false);
 		expect(thrown).toBeInstanceOf(Error);
 		expect((thrown as Error).name).toBe("AnthropicPreCommitAbortedError");
@@ -1820,7 +1823,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(websocketAttempt).toHaveBeenCalledTimes(1);
 		expect(httpCalls).toBe(0);
 		expect(postWriteCategories).toEqual(["semantic_stall"]);
-		expect(upstreamCancels).toBe(1);
+		expect(upstreamCancels).toBe(0);
 		expect(receipt.stickyHttp).toBe(true);
 		expect(response?.status).toBe(504);
 		expect(await response?.json()).toMatchObject({
@@ -1839,6 +1842,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 
 		const postWriteCategories: string[] = [];
 		let upstreamCancels = 0;
+		let webSocketSignal: AbortSignal | undefined;
 		const receipt = makeReceipt((category) =>
 			postWriteCategories.push(category),
 		);
@@ -1868,6 +1872,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			codexWebSocketTransport,
 			"tryRequest",
 		).mockImplementation(async (input) => {
+			webSocketSignal = input.signal;
 			input.onFrameWritten?.(receipt);
 			return { response: structurallyStarted, receipt };
 		});
@@ -1886,7 +1891,8 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(websocketAttempt).toHaveBeenCalledTimes(1);
 		expect(httpCalls).toBe(0);
 		expect(postWriteCategories).toEqual(["semantic_stall"]);
-		expect(upstreamCancels).toBe(1);
+		expect(webSocketSignal?.aborted).toBe(true);
+		expect(upstreamCancels).toBe(0);
 		expect(elapsedMs).toBeGreaterThanOrEqual(140);
 		expect(receipt.stickyHttp).toBe(true);
 		expect(response?.status).toBe(504);
@@ -1991,11 +1997,13 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		let postWriteMarks = 0;
 		let upstreamCancels = 0;
 		let progressEventsSent = 0;
+		let webSocketSignal: AbortSignal | undefined;
 		const receipt = makeReceipt(() => postWriteMarks++);
 		const websocketAttempt = spyOn(
 			codexWebSocketTransport,
 			"tryRequest",
 		).mockImplementation(async (input) => {
+			webSocketSignal = input.signal;
 			input.onFrameWritten?.(receipt);
 			const encoder = new TextEncoder();
 			let progressTimer: ReturnType<typeof setInterval> | undefined;
@@ -2048,7 +2056,8 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(httpCalls).toBe(0);
 		expect(postWriteMarks).toBe(1);
 		expect(receipt.stickyHttp).toBe(true);
-		expect(upstreamCancels).toBe(1);
+		expect(webSocketSignal?.aborted).toBe(true);
+		expect(upstreamCancels).toBe(0);
 		expect(progressEventsSent).toBeGreaterThanOrEqual(2);
 		expect(elapsedMs).toBeGreaterThanOrEqual(1_450);
 		expect(response?.status).toBe(504);

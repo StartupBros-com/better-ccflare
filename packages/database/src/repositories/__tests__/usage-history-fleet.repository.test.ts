@@ -206,6 +206,31 @@ describe("UsageHistoryRepository.getFleetUsageHistory", () => {
 		db.close();
 	});
 
+	it("excludes inactive samples from live fleet charts and value calculations", async () => {
+		const db = makeDb();
+		const repo = new UsageHistoryRepository(new BunSqlAdapter(db));
+		await repo.recordSnapshot(
+			"acc1",
+			[
+				canonicalWindow("five_hour", 10),
+				{
+					...canonicalWindow("seven_day", 90),
+					active: false,
+				},
+			],
+			1_000,
+		);
+
+		const result = await repo.getFleetUsageHistory({
+			accountIds: ["acc1"],
+		});
+		expect(
+			result.rows.map((row) => `${row.windowKey}:${row.utilization}`),
+		).toEqual(["five_hour:10"]);
+		expect(result.returnedPointCount).toBe(1);
+		db.close();
+	});
+
 	it("keeps window and time filters sargable on the composite index", async () => {
 		const db = makeDb();
 		const { adapter, observations } = countingAdapter(db);

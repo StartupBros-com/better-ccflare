@@ -6,6 +6,8 @@ export {
 	ForceRouteUnavailableError,
 	getComboSlotInfo,
 	getRoutingCapacityContext,
+	isComboSessionFallbackDisabled,
+	isForceAccountModelEnabled,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
 	setComboSlotInfo,
@@ -54,6 +56,14 @@ export {
 	PhysicalAttemptBudgetExceededError,
 	RoutingAttemptLedger,
 } from "./routing-attempt-ledger";
+export {
+	clearRoutingObservations,
+	getRoutingObservations,
+	type RoutingObservation,
+	type RoutingObservationAccount,
+	recordRoutingObservation,
+	recordSelectedOrder,
+} from "./routing-observations";
 export {
 	createModelPoolExhaustedResponse,
 	createRoutingTerminalResponse,

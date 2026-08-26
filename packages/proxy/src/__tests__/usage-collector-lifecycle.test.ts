@@ -115,6 +115,8 @@ interface TestRequestState {
 	chunksBytes: number;
 	usagePayloadSeq?: number;
 	usage: {
+		inputTokensPresent?: boolean;
+		cacheReadInputTokensPresent?: boolean;
 		iterations?: unknown[];
 		iterationsSeq?: number;
 		fallbackIterationSeen?: boolean;
@@ -3652,6 +3654,58 @@ describe("UsageCollector request lifecycle", () => {
 		expect(markedIncomplete).toEqual([
 			{ id: "cfr_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", dropped: true },
 		]);
+	});
+
+	it.each([
+		{
+			label: "with usage",
+			response: {
+				model: FABLE_MODEL,
+				usage: {
+					input_tokens: 19,
+					output_tokens: 7,
+					input_tokens_details: { cached_tokens: 11 },
+				},
+			},
+			expected: {
+				inputTokens: 8,
+				inputTokensPresent: true,
+				cacheReadInputTokens: 11,
+				cacheReadInputTokensPresent: true,
+				outputTokens: 7,
+			},
+		},
+		{
+			label: "without usage",
+			response: { model: FABLE_MODEL },
+			expected: {
+				inputTokens: 0,
+				cacheReadInputTokens: undefined,
+				outputTokens: 0,
+			},
+		},
+	])("records response.failed terminal usage $label without treating it as an Anthropic event", ({
+		label,
+		response,
+		expected,
+	}) => {
+		const { collector } = harness();
+		const requestId = `responses-failed-${label}`;
+		collector.handleStart(makeStartMessage(requestId));
+		collector.handleChunk(
+			requestId,
+			new TextEncoder().encode(
+				`event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response })}\n\n`,
+			),
+		);
+
+		const state = testable(collector).requests.get(requestId);
+		expect(state?.usage).toMatchObject(expected);
+		if (label === "without usage") {
+			expect(state?.usage.inputTokensPresent).toBeUndefined();
+			expect(state?.usage.cacheReadInputTokensPresent).toBeUndefined();
+		}
+		expect(state?.usage.model).toBe(FABLE_MODEL);
 	});
 
 	it("treats explicit cache tokens from a generic usage event as present", async () => {

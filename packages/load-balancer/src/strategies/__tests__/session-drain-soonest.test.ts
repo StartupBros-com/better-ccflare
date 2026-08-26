@@ -368,4 +368,91 @@ describe("SessionDrainSoonestStrategy", () => {
 		);
 		expect(ordered[0]?.id).toBe("no-reset");
 	});
+
+	describe("codex upstream window reset ends the session", () => {
+		// Fork stickiness is explicit per client/lane rather than inferred from
+		// the newest account.session_start. A crossed Codex window releases that
+		// ordinary owner so drain ranking can run, while an open window keeps it.
+		it("releases drain ranking once the reported window has reset", async () => {
+			const now = Date.now();
+			const requestMeta = meta("codex-window-client");
+			const rolledOver = makeAccount({
+				id: "codex-rolled",
+				name: "codex-rolled",
+				provider: "codex",
+				session_start: now - 60 * 60 * 1000,
+				session_request_count: 40,
+				rate_limit_reset: now + 60 * 60 * 1000,
+			});
+			const drainsSooner = makeAccount({
+				id: "codex-drains-sooner",
+				name: "codex-drains-sooner",
+				provider: "codex",
+			});
+			store.weeklyResets.set("codex-drains-sooner", now + 30 * 60 * 1000);
+			store.weeklyResets.set("codex-rolled", now + 5 * 24 * 60 * 60 * 1000);
+			await strategy.select([rolledOver], requestMeta);
+			rolledOver.rate_limit_reset = now - 2000;
+
+			const result = await strategy.select(
+				[rolledOver, drainsSooner],
+				requestMeta,
+			);
+
+			expect(result[0]).toBe(drainsSooner);
+			expect(strategy.peek([rolledOver, drainsSooner])).toBe(
+				"codex-drains-sooner",
+			);
+		});
+
+		it("resets a rolled-over affinity owner when it is the only candidate", async () => {
+			const now = Date.now();
+			const sessionStart = now - 60 * 60 * 1000;
+			const requestMeta = meta("codex-only-client");
+			const account = makeAccount({
+				id: "codex-only",
+				name: "codex-only",
+				provider: "codex",
+				session_start: sessionStart,
+				session_request_count: 40,
+				rate_limit_reset: now + 60 * 60 * 1000,
+			});
+			await strategy.select([account], requestMeta);
+			account.rate_limit_reset = now - 2000;
+
+			const result = await strategy.select([account], requestMeta);
+
+			expect(result[0]).toBe(account);
+			expect(store.resetCalls).toContain(account.id);
+			expect(account.session_start).toBeGreaterThan(sessionStart);
+			expect(account.session_request_count).toBe(0);
+		});
+
+		it("keeps the affinity owner while the reported window is still open", async () => {
+			const now = Date.now();
+			const sessionStart = now - 60 * 60 * 1000;
+			const requestMeta = meta("codex-window-client");
+			const active = makeAccount({
+				id: "codex-open",
+				name: "codex-open",
+				provider: "codex",
+				session_start: sessionStart,
+				session_request_count: 40,
+				rate_limit_reset: now + 60 * 60 * 1000,
+			});
+			const drainsSooner = makeAccount({
+				id: "codex-drains-sooner",
+				name: "codex-drains-sooner",
+				provider: "codex",
+			});
+			store.weeklyResets.set("codex-drains-sooner", now + 30 * 60 * 1000);
+			await strategy.select([active], requestMeta);
+
+			const result = await strategy.select([active, drainsSooner], requestMeta);
+
+			expect(result[0]).toBe(active);
+			expect(store.resetCalls).not.toContain(active.id);
+			expect(active.session_start).toBe(sessionStart);
+		});
+	});
 });

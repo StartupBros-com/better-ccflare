@@ -158,9 +158,20 @@ function scheduleEnsureRetry(accountId: string, now: number): void {
 	});
 }
 
-function readCache(accountId: string): CodexModelListing | null {
+/**
+ * Return only first-hand evidence for an account. Shared provider listings are
+ * useful advisory defaults but must never exclude a model for another account.
+ */
+export function getKnownCodexModels(
+	accountId: string,
+): CodexModelListing | null {
 	const own = lastGood.get(accountId)?.listing;
-	if (own) return { ...own, source: "cached" };
+	return own ? { ...own, source: "cached" } : null;
+}
+
+function readCache(accountId: string): CodexModelListing | null {
+	const own = getKnownCodexModels(accountId);
+	if (own) return own;
 	// Nothing of this account's own: fall back to whatever another account of
 	// the same provider read, labelled so nobody mistakes it for this one's.
 	if (providerWide) {
@@ -354,6 +365,20 @@ export function deriveFamilyDefaults(
 		sonnet: at(1),
 		haiku: at(2),
 	};
+}
+
+/**
+ * The weakest model of a listing, or null when there is no listing to read.
+ *
+ * `normalize` sorts by the provider's own priority, so the tail is the lowest
+ * tier the plan can call. Usage probes prefer it because their response body is
+ * discarded and quota headers describe the subscription rather than the model.
+ */
+export function lowestTierCodexModel(
+	listing: CodexModelListing | null | undefined,
+): string | null {
+	const models = listing?.models ?? [];
+	return models.length > 0 ? models[models.length - 1].id : null;
 }
 
 /**

@@ -309,6 +309,11 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		return clientId !== null ? `client:${clientId}` : null;
 	}
 
+	/** Strategy variants may suppress ordinary stickiness without disabling route circuits. */
+	protected selectionAffinityKey(meta: RequestMeta): string | null {
+		return this.affinityKey(meta);
+	}
+
 	/** The minimum tier in a set, or null for an empty input. */
 	private minimumConfiguredTier(tiers: Iterable<number>): number | null {
 		let min: number | null = null;
@@ -737,6 +742,15 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		return this.rankByLeastUsed(candidates, now, meta);
 	}
 
+	/** Strategy variants may invalidate an ordinary sticky owner. */
+	protected canRetainAffinityOwner(
+		_candidate: StrategyCandidate,
+		_now: number,
+		_meta: RequestMeta,
+	): boolean {
+		return true;
+	}
+
 	/**
 	 * Rank available accounts least-used AND mark the chosen primary as
 	 * recently-picked, so concurrent picks within RECENT_PICK_WINDOW_MS spread
@@ -847,7 +861,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		const now = this.now();
 		this.gcStaleRouteFailureStates(now);
 		this.routeCircuitSelections.delete(meta);
-		const affinityKey = this.affinityKey(meta);
+		const affinityKey = this.selectionAffinityKey(meta);
+		const routeCircuitKey = this.affinityKey(meta);
 		const configuredCandidates = zipStrategyCandidates(accounts, meta);
 		const candidates = filterHardExcludedCandidates(configuredCandidates, meta);
 
@@ -1034,7 +1049,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		let available = otherwiseAvailable;
 		let forcedPriorityProbe: StrategyCandidate | null = null;
 		let forcedPriorityFallbacks: StrategyCandidate[] = [];
-		if (affinityKey !== null) {
+		if (routeCircuitKey !== null) {
 			this.routeCircuitSelections.set(meta, {
 				candidateIds: [
 					...new Set(
@@ -1046,13 +1061,17 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			});
 			const closedCandidates = otherwiseAvailable.filter(
 				(candidate) =>
-					this.routeFailureState(affinityKey, candidate.routing.candidateId) ===
-					undefined,
+					this.routeFailureState(
+						routeCircuitKey,
+						candidate.routing.candidateId,
+					) === undefined,
 			);
 			const circuitCandidates = otherwiseAvailable.filter(
 				(candidate) =>
-					this.routeFailureState(affinityKey, candidate.routing.candidateId) !==
-					undefined,
+					this.routeFailureState(
+						routeCircuitKey,
+						candidate.routing.candidateId,
+					) !== undefined,
 			);
 			const rankedClosedCandidates = this.rankByLeastUsed(
 				closedCandidates,
@@ -1060,7 +1079,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 				meta,
 			);
 			const bestClosedCandidate = rankedClosedCandidates[0];
-			const mapping = this.affinity.get(affinityKey);
+			const mapping =
+				affinityKey === null ? undefined : this.affinity.get(affinityKey);
 			const activeMapping =
 				mapping && now - mapping.assignedAt < this.affinityTtlMs
 					? mapping
@@ -1078,7 +1098,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			if (bestClosedCandidate && !upgradeSuppressed) {
 				forcedPriorityProbe = this.acquireHalfOpenProbe(
 					circuitCandidates,
-					affinityKey,
+					routeCircuitKey,
 					now,
 					false,
 					(candidate) =>
@@ -1102,7 +1122,12 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			// probe before its ordinary backoff boundary.
 			const allOpenProbe =
 				closedCandidates.length === 0
-					? this.acquireHalfOpenProbe(circuitCandidates, affinityKey, now, true)
+					? this.acquireHalfOpenProbe(
+							circuitCandidates,
+							routeCircuitKey,
+							now,
+							true,
+						)
 					: null;
 			// If every route is circuit-open and no probe can be leased, preserve
 			// the strategy's existing [] no-route contract. The proxy returns its
@@ -1151,6 +1176,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 				if (
 					mapped &&
 					best &&
+					this.canRetainAffinityOwner(mapped, now, meta) &&
 					isSameStrategyCandidateClass(mapped, best, meta)
 				) {
 					// STICKY hit: keep the client on its account (prompt-cache reuse).

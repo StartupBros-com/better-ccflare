@@ -623,8 +623,10 @@ function stableJson(value: unknown): string {
 }
 
 export function renderLedger(inventory: SyncInventory): string {
+  const release = inventory.baseline.canonicalTag.split("/").at(-1);
+  if (!release) fail("canonical tag must identify a release");
   const lines = [
-    "# Issue #260 — v3.5.66 Resolution Ledger",
+    `# Issue #260 — ${release} Resolution Ledger`,
     "",
     "> Generated review skeleton. Edit the machine inventory first, then regenerate this ledger explicitly.",
     "> `check` never rewrites either file.",

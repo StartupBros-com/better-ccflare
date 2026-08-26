@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { registerResponseDrainTransport } from "../../utils/stream-drain";
 import { CodexProvider } from "./provider";
 
 const eventLine = (name: string, data: unknown) => [
@@ -26,6 +27,7 @@ const eventLine = (name: string, data: unknown) => [
  */
 function makeSpiedTwoEventUpstream() {
 	const encoder = new TextEncoder();
+	const transportAbort = new AbortController();
 	const frame1 = encoder.encode(
 		`${eventLine("response.created", { response: { id: "resp_1", model: "gpt-5.4" } }).join("\n")}\n`,
 	);
@@ -40,6 +42,11 @@ function makeSpiedTwoEventUpstream() {
 			// than one committed event queued up, not upstream pacing.
 			controller.enqueue(frame1);
 			controller.enqueue(frame2);
+			transportAbort.signal.addEventListener(
+				"abort",
+				() => controller.error(transportAbort.signal.reason),
+				{ once: true },
+			);
 			// Deliberately never close(): a real Codex connection stays open
 			// until the server sends a terminal event or the socket drops.
 			// Closing here would let the transform's end-of-stream cleanup
@@ -76,9 +83,11 @@ function makeSpiedTwoEventUpstream() {
 			"x-better-ccflare-attempt-id": "attempt-abandonment",
 		},
 	});
+	registerResponseDrainTransport(response, transportAbort);
 
 	return {
 		response,
+		transportAbort,
 		getReleaseLockCalls: () => releaseLockCalls,
 		getCancelCalls: () => cancelCalls,
 	};
@@ -87,7 +96,7 @@ function makeSpiedTwoEventUpstream() {
 describe("CodexProvider stream abandonment", () => {
 	it(
 		"documents that an abandoned transformed stream (never read, never cancelled) " +
-			"leaks the upstream reader: releaseLock/cancel are never called",
+			"leaks the upstream reader and leaves its exact transport active",
 		async () => {
 			const provider = new CodexProvider();
 			const upstream = makeSpiedTwoEventUpstream();
@@ -113,12 +122,13 @@ describe("CodexProvider stream abandonment", () => {
 			// it is the only regression guard for this invariant.
 			expect(upstream.getReleaseLockCalls()).toBe(0);
 			expect(upstream.getCancelCalls()).toBe(0);
+			expect(upstream.transportAbort.signal.aborted).toBe(false);
 		},
 	);
 
 	it(
-		"confirms the held reader is a real leak, not a timing artifact: reading the " +
-			"transformed body to completion DOES release the upstream reader",
+		"confirms the held reader is a real leak, not a timing artifact: consuming then " +
+			"cancelling the transformed body aborts its transport and releases the reader",
 		async () => {
 			const provider = new CodexProvider();
 			const upstream = makeSpiedTwoEventUpstream();
@@ -150,7 +160,10 @@ describe("CodexProvider stream abandonment", () => {
 
 			await reader.cancel();
 
-			expect(upstream.getCancelCalls()).toBeGreaterThan(0);
+			expect(upstream.transportAbort.signal.aborted).toBe(true);
+			expect(upstream.getCancelCalls()).toBe(0);
+			await Bun.sleep(10);
+			expect(upstream.getReleaseLockCalls()).toBeGreaterThan(0);
 		},
 	);
 
@@ -175,11 +188,12 @@ describe("CodexProvider stream abandonment", () => {
 			// early return).
 			await transformed.body?.cancel("abandoned by caller");
 
-			expect(upstream.getCancelCalls()).toBeGreaterThan(0);
+			expect(upstream.transportAbort.signal.aborted).toBe(true);
+			expect(upstream.getCancelCalls()).toBe(0);
 
 			// releaseLock() happens inside processEvents()'s own finally block,
-			// a separate background task that only observes the cancellation
-			// once its pending upstreamReader.read() settles. Give it a tick.
+			// a separate background task that observes the transport abort once
+			// its pending upstreamReader.read() rejects. Give it a tick.
 			await Bun.sleep(10);
 			expect(upstream.getReleaseLockCalls()).toBeGreaterThan(0);
 		},

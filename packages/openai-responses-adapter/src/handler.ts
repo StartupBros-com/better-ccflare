@@ -21,6 +21,46 @@ import type { HandleProxyFn, ResponseItem, ResponsesRequest } from "./types";
 
 const log = new Logger("openai-responses-adapter");
 
+const TERMINAL_RESPONSE_EVENT_TYPES = new Set([
+	"response.completed",
+	"response.incomplete",
+	"response.failed",
+]);
+
+function extractTerminalNativeResponse(
+	sseText: string,
+): Record<string, unknown> | null {
+	const rawEvents = sseText.split("\n\n");
+	for (let i = rawEvents.length - 1; i >= 0; i--) {
+		const rawEvent = rawEvents[i];
+		if (!rawEvent.trim()) continue;
+
+		let eventType = "";
+		let dataStr = "";
+		for (const line of rawEvent.split("\n")) {
+			if (line.startsWith("event:")) {
+				eventType = line.slice("event:".length).trim();
+			} else if (line.startsWith("data:")) {
+				dataStr = line.slice("data:".length).trim();
+			}
+		}
+		if (!dataStr) continue;
+		try {
+			const data = JSON.parse(dataStr) as {
+				type?: string;
+				response?: Record<string, unknown>;
+			};
+			const type = data.type ?? eventType;
+			if (type && TERMINAL_RESPONSE_EVENT_TYPES.has(type) && data.response) {
+				return data.response;
+			}
+		} catch {
+			// Malformed events are not terminal evidence; keep scanning backwards.
+		}
+	}
+	return null;
+}
+
 const SESSION_UUID_RE =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RESPONSES_SESSION_ID_DOMAIN =
@@ -269,6 +309,30 @@ export async function handleResponsesRequest(
 		}
 	}
 
+	// Preserve Codex-only fields on the translated payload. This must happen
+	// before bounded serialization so the Codex provider receives them through
+	// the synthetic /v1/messages request.
+	const codexPassthrough: Record<string, unknown> = {};
+	if (body.model !== undefined) codexPassthrough.model = body.model;
+	if (body.reasoning !== undefined) codexPassthrough.reasoning = body.reasoning;
+	if (body.tools !== undefined) codexPassthrough.tools = body.tools;
+	if (body.parallel_tool_calls !== undefined)
+		codexPassthrough.parallel_tool_calls = body.parallel_tool_calls;
+	if (body.store !== undefined) codexPassthrough.store = body.store;
+	const additionalToolsItems = Array.isArray(body.input)
+		? body.input.filter((item) => item.type === "additional_tools")
+		: [];
+	if (additionalToolsItems.length > 0) {
+		codexPassthrough.additional_tools = additionalToolsItems;
+	}
+	if (Object.keys(codexPassthrough).length > 0) {
+		(
+			anthropicBody as typeof anthropicBody & {
+				__better_ccflare_codex_passthrough?: Record<string, unknown>;
+			}
+		).__better_ccflare_codex_passthrough = codexPassthrough;
+	}
+
 	// 5. Keep translated request serialization within the same canonical budget.
 	// The shared serializer proves the serialized body fits before materializing it.
 	let syntheticBody: string;
@@ -427,6 +491,42 @@ export async function handleResponsesRequest(
 		return new Response(JSON.stringify(errorBody), {
 			status: anthropicResp.status,
 			headers: responseHeaders,
+		});
+	}
+
+	// Codex custom tools emit native Responses frames. Do not route those frames
+	// through the Anthropic translator: streaming callers require raw SSE and
+	// non-stream callers require the terminal response object.
+	const responseFormat = anthropicResp.headers.get(
+		"x-better-ccflare-codex-response-format",
+	);
+	if (responseFormat === "responses-api") {
+		if (body.stream) {
+			const headers = new Headers(anthropicResp.headers);
+			headers.delete("x-better-ccflare-codex-response-format");
+			return new Response(anthropicResp.body, {
+				status: anthropicResp.status,
+				headers,
+			});
+		}
+		const nativeResponse = extractTerminalNativeResponse(
+			await anthropicResp.text(),
+		);
+		if (!nativeResponse) {
+			return new Response(
+				JSON.stringify({
+					error: {
+						message: "Failed to parse upstream response",
+						type: "api_error",
+						code: "api_error",
+					},
+				}),
+				{ status: 502, headers: { "Content-Type": "application/json" } },
+			);
+		}
+		return new Response(JSON.stringify(nativeResponse), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
 		});
 	}
 

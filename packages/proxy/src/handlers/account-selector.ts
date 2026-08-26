@@ -1,10 +1,14 @@
-import type { ImplicitFallbackPolicyConfig } from "@better-ccflare/config";
+import type {
+	ImplicitFallbackPolicyConfig,
+	ModelScopedCapacityRoutingMode,
+} from "@better-ccflare/config";
 import {
 	getConfiguredModelMapping,
 	getModelFamily,
 	getModelList,
 	isAccountAvailable,
 	isOfficialXaiEndpoint,
+	providerAcceptsClientModel,
 	resolveEffectiveComboMembership,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
@@ -41,6 +45,7 @@ import type {
 	AnthropicDegradedRouteInspection,
 	AnthropicReplayRisk,
 } from "../anthropic-degraded-mode";
+import { getKnownCodexModels } from "../codex-model-catalog";
 import { evaluateServerToolReplayEligibility } from "../server-tool-replay-eligibility";
 import {
 	ServerToolRoutingError,
@@ -51,7 +56,7 @@ import {
 	emitPoolFloorEvent,
 	poolFloorApproachingThreshold,
 } from "./pool-floor-event";
-import type { ProxyContext } from "./proxy-types";
+import { isInternalProbe, type ProxyContext } from "./proxy-types";
 import { boundedRoutingSelectionCount } from "./routing-selection-diagnostics";
 import {
 	evaluateHardCapacity,
@@ -60,6 +65,23 @@ import {
 } from "./usage-throttling";
 
 const log = new Logger("AccountSelector");
+
+export function isForceAccountModelEnabled(ctx: ProxyContext): boolean {
+	return ctx.config?.getForceAccountModel?.() ?? false;
+}
+
+function isClaudeModelId(model: string): boolean {
+	return getModelFamily(model) !== null;
+}
+
+function accountServesModel(account: Account, model: string): boolean {
+	const known =
+		account.provider === "codex" ? getKnownCodexModels(account.id) : null;
+	if (known) return known.models.some((entry) => entry.id === model);
+	return (
+		providerAcceptsClientModel(account.provider) === isClaudeModelId(model)
+	);
+}
 
 const PRESSURE_RANK = {
 	cold: 0,
@@ -593,10 +615,10 @@ export function getXaiConvId(meta: RequestMeta): string | null {
 // Deliberately kept even though our fork replaced upstream's model-capacity.ts
 // module wholesale (see account-selector's hard-capacity system below): this
 // one flag is an unrelated, additive combo-isolation safety valve with no
-// equivalent in our fork's control plane, and is exercised by tests below.
-function isComboSessionFallbackDisabled(): boolean {
-	const value = process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK;
-	return /^(1|true|yes|on)$/i.test(value ?? "");
+// equivalent in our fork's hard-capacity system. The legacy environment value
+// is adopted into config once at boot; request-time routing has one authority.
+export function isComboSessionFallbackDisabled(ctx: ProxyContext): boolean {
+	return ctx.config?.getComboSessionFallback?.() === false;
 }
 
 /**
@@ -742,16 +764,40 @@ interface CandidateCapacityEvaluation {
 	readonly quotaPressure: AccountQuotaPressure | null;
 }
 
+type CapacityRouteIntent = "ordinary" | "capability" | "combo" | "force";
+
+interface CandidateCapacityEvaluationOptions {
+	readonly modelScopedCapacityRouting: ModelScopedCapacityRoutingMode;
+	readonly routeIntent: CapacityRouteIntent;
+	readonly syntheticProbe: boolean;
+}
+
+function getModelScopedCapacityRoutingMode(
+	ctx: ProxyContext,
+): ModelScopedCapacityRoutingMode {
+	return ctx.config?.getModelScopedCapacityRouting?.() ?? "off";
+}
+
+function enforcesModelScopedCapacity(
+	options: CandidateCapacityEvaluationOptions,
+): boolean {
+	return (
+		options.modelScopedCapacityRouting === "exhausted" ||
+		options.routeIntent === "force"
+	);
+}
+
 function evaluateCandidateCapacity(
 	account: Account,
 	model: string,
 	betaSignature: string,
 	now: number,
-	syntheticProbe: boolean,
+	options: CandidateCapacityEvaluationOptions,
 ): CandidateCapacityEvaluation {
 	const snapshot = usageCache.getSnapshot(account.id);
 	const blockers: RoutingCapacityBlocker[] = [];
 	let quotaPressure: AccountQuotaPressure | null = null;
+	const enforceModelScopedCapacity = enforcesModelScopedCapacity(options);
 
 	if (snapshot) {
 		const hardCapacity = evaluateHardCapacity(snapshot.data, {
@@ -760,7 +806,14 @@ function evaluateCandidateCapacity(
 			provider: account.provider,
 			now,
 		});
-		blockers.push(...hardCapacity.exclusions.map(snapshotBlocker));
+		blockers.push(
+			...hardCapacity.exclusions
+				.filter(
+					(exclusion) =>
+						exclusion.scope === "account" || enforceModelScopedCapacity,
+				)
+				.map(snapshotBlocker),
+		);
 
 		const pressure = getWeeklyQuotaPressure(snapshot.data, {
 			requestModel: model,
@@ -788,7 +841,7 @@ function evaluateCandidateCapacity(
 		}
 	}
 
-	if (!syntheticProbe) {
+	if (!options.syntheticProbe && enforceModelScopedCapacity) {
 		const reactive = getReactiveModelCapacityBlocker(
 			account.id,
 			model,
@@ -813,7 +866,7 @@ function resolveCapacityDeferredRoutes(
 	requestedModel: string,
 	betaSignature: string,
 	now: number,
-	syntheticProbe: boolean,
+	capacityOptions: CandidateCapacityEvaluationOptions,
 ): {
 	readonly routes: readonly {
 		readonly model: string;
@@ -863,7 +916,7 @@ function resolveCapacityDeferredRoutes(
 			candidateModel,
 			betaSignature,
 			now,
-			syntheticProbe,
+			capacityOptions,
 		);
 		if (evaluation.blockers.length === 0) {
 			const route = { model: candidateModel, fallbackRank, familyOccurrence };
@@ -961,7 +1014,7 @@ function prepareNormalRoutingMetadata(
 	ctx: ProxyContext,
 	accounts: Account[],
 	effectiveModel: string | null,
-	syntheticProbe: boolean,
+	capacityOptions: CandidateCapacityEvaluationOptions,
 	priorServerToolCatalog: readonly RoutingCandidateMetadata[] = [],
 ): Account[] {
 	meta.affinityLaneKey = deriveAffinityLaneKey(meta, effectiveModel);
@@ -999,7 +1052,7 @@ function prepareNormalRoutingMetadata(
 					effectiveModel,
 					beta,
 					now,
-					syntheticProbe,
+					capacityOptions,
 				);
 				candidate.quotaPressure = evaluation.quotaPressure;
 				if (evaluation.quotaPressure) {
@@ -1056,7 +1109,7 @@ function prepareNormalRoutingMetadata(
 			effectiveModel,
 			beta,
 			now,
-			syntheticProbe,
+			capacityOptions,
 		);
 		if (evaluation.blockers.length > 0) {
 			excludedIds.add(account.id);
@@ -1074,7 +1127,7 @@ function prepareNormalRoutingMetadata(
 							effectiveModel,
 							beta,
 							now,
-							syntheticProbe,
+							capacityOptions,
 						);
 			for (const blocked of fallback.blocked) {
 				exclusions.push(
@@ -1124,7 +1177,7 @@ function finalizeNormalServerToolRoutingMetadata(
 	ctx: ProxyContext,
 	orderedAccounts: readonly Account[],
 	effectiveModel: string | null,
-	syntheticProbe: boolean,
+	capacityOptions: CandidateCapacityEvaluationOptions,
 ): Account[] {
 	const baseCatalog = meta.routingCandidateCatalog ?? [];
 	const normalCatalog = baseCatalog.filter(
@@ -1164,7 +1217,7 @@ function finalizeNormalServerToolRoutingMetadata(
 				effectiveModel,
 				beta,
 				now,
-				syntheticProbe,
+				capacityOptions,
 			);
 			candidate.quotaPressure = evaluation.quotaPressure;
 			if (evaluation.quotaPressure) {
@@ -1185,7 +1238,7 @@ function finalizeNormalServerToolRoutingMetadata(
 							effectiveModel,
 							beta,
 							now,
-							syntheticProbe,
+							capacityOptions,
 						);
 				for (const blocked of fallback.blocked) {
 					exclusions.push(
@@ -1719,8 +1772,15 @@ export async function getOrderedAccounts(
 	degradedOwner?: DegradedOwnerSelectionContext,
 	priorServerToolCatalog: readonly RoutingCandidateMetadata[] = [],
 	preselectionFilter?: (accounts: Account[]) => Account[],
+	modelScopedCapacityRouting = getModelScopedCapacityRoutingMode(ctx),
 ): Promise<Account[]> {
 	try {
+		const capacityOptions: CandidateCapacityEvaluationOptions = {
+			modelScopedCapacityRouting,
+			routeIntent:
+				meta.routeProfileSelection === "capability" ? "capability" : "ordinary",
+			syntheticProbe,
+		};
 		const loadedAccounts =
 			preloadedAccounts ?? (await ctx.dbOps.getAllAccounts());
 		const preselectedAccounts = preselectionFilter
@@ -1744,7 +1804,7 @@ export async function getOrderedAccounts(
 			ctx,
 			structuralAccounts,
 			effectiveModel,
-			syntheticProbe,
+			capacityOptions,
 			priorServerToolCatalog,
 		);
 		try {
@@ -1760,15 +1820,22 @@ export async function getOrderedAccounts(
 			// the final phase below republishes authoritative exclusions.
 			if (meta.serverToolRequirements) meta.hardExcludedAccountIds = null;
 		}
-		// Return all accounts - the provider will be determined dynamically per account.
-		const strategyOrdered = await ctx.strategy.select(eligibleAccounts, meta);
+		// A strategy may return stale cached objects or otherwise ignore its input.
+		// Treat it as an ordering policy, never as authority to escape the candidate
+		// set established by exclusions, route intent, and exact-model admission.
+		const eligibleAccountIds = new Set(
+			eligibleAccounts.map((account) => account.id),
+		);
+		const strategyOrdered = (
+			await ctx.strategy.select(eligibleAccounts, meta)
+		).filter((account) => eligibleAccountIds.has(account.id));
 		const ordered = meta.serverToolRequirements
 			? finalizeNormalServerToolRoutingMetadata(
 					meta,
 					ctx,
 					strategyOrdered,
 					effectiveModel,
-					syntheticProbe,
+					capacityOptions,
 				)
 			: strategyOrdered.filter(
 					(account) => !meta.hardExcludedAccountIds?.has(account.id),
@@ -1858,6 +1925,7 @@ async function selectAccountsForRequestInternal(
 	meta.comboSlotIndex = null;
 	const effectiveModel =
 		model ?? resolveEffectiveModel(meta.appliedModel, meta.originalModel);
+	const modelScopedCapacityRouting = getModelScopedCapacityRoutingMode(ctx);
 	meta.affinityLaneKey = deriveAffinityLaneKey(meta, effectiveModel);
 	meta.hardExcludedAccountIds = null;
 	meta.quotaPressureByAccountId = null;
@@ -1903,6 +1971,14 @@ async function selectAccountsForRequestInternal(
 			);
 			if (!forcedAccount) {
 				throw new ForceRouteUnavailableError(forcedAccountId, "not_found");
+			}
+			if (
+				effectiveModel &&
+				isForceAccountModelEnabled(ctx) &&
+				!isInternalProbe(meta.headers, ctx) &&
+				!accountServesModel(forcedAccount, effectiveModel)
+			) {
+				return [];
 			}
 			if (!isAccountEligibleForRouteIntent(forcedAccount, meta, ctx)) {
 				throw new ForceRouteUnavailableError(
@@ -2027,7 +2103,11 @@ async function selectAccountsForRequestInternal(
 						effectiveModel,
 						canonicalizeBetaSignature(meta.headers?.get("anthropic-beta")),
 						now,
-						options.syntheticProbe === true,
+						{
+							modelScopedCapacityRouting,
+							routeIntent: "force",
+							syntheticProbe: options.syntheticProbe === true,
+						},
 					);
 					meta.quotaPressureByAccountId = evaluation.quotaPressure
 						? new Map([[forcedAccount.id, evaluation.quotaPressure]])
@@ -2142,6 +2222,7 @@ async function selectAccountsForRequestInternal(
 						matchesCapabilityRouteProfile(account, meta) &&
 						!isProviderExcludedForRequest(account, excludedProviders),
 				),
+			modelScopedCapacityRouting,
 		);
 		// A custom strategy is allowed to return stale/unavailable candidates;
 		// dynamic profiles must not let those candidates turn into a passthrough
@@ -2186,6 +2267,8 @@ async function selectAccountsForRequestInternal(
 	if (
 		effectiveModel &&
 		!options.skipCombo &&
+		(ctx.config?.getCombosEnabled?.() ?? true) &&
+		!(isForceAccountModelEnabled(ctx) && !isInternalProbe(meta.headers, ctx)) &&
 		meta.routeProfileSelection !== "capability"
 	) {
 		const family = getModelFamily(effectiveModel);
@@ -2306,6 +2389,11 @@ async function selectAccountsForRequestInternal(
 
 					// Effective members are structural candidates. The resolver owns
 					// manual/managed precedence and its order is the stable ordinal.
+					const capacityOptions: CandidateCapacityEvaluationOptions = {
+						modelScopedCapacityRouting,
+						routeIntent: "combo",
+						syntheticProbe: options.syntheticProbe === true,
+					};
 					for (const [ordinal, member] of resolution.members.entries()) {
 						const account = accountMap.get(member.account_id);
 						if (!account) {
@@ -2361,7 +2449,7 @@ async function selectAccountsForRequestInternal(
 							member.logical_model,
 							beta,
 							now,
-							options.syntheticProbe === true,
+							capacityOptions,
 						);
 						routing.quotaPressure = evaluation.quotaPressure;
 						if (evaluation.blockers.length > 0) {
@@ -2555,7 +2643,7 @@ async function selectAccountsForRequestInternal(
 					}
 
 					// All effective candidates unavailable — fall back to normal routing.
-					if (isComboSessionFallbackDisabled()) {
+					if (isComboSessionFallbackDisabled(ctx)) {
 						setComboSlotInfo(meta, { comboName: combo.name, slots: [] });
 						meta.comboName = combo.name;
 						log.warn(
@@ -2600,7 +2688,19 @@ async function selectAccountsForRequestInternal(
 		preloadedAccounts,
 		options.degradedOwner,
 		priorServerToolCatalog,
-		(accounts) => applyNormalImplicitFallbackPolicy(applyExclusions(accounts)),
+		(accounts) => {
+			const eligible = applyNormalImplicitFallbackPolicy(
+				applyExclusions(accounts),
+			);
+			return effectiveModel &&
+				isForceAccountModelEnabled(ctx) &&
+				!isInternalProbe(meta.headers, ctx)
+				? eligible.filter((account) =>
+						accountServesModel(account, effectiveModel),
+					)
+				: eligible;
+		},
+		modelScopedCapacityRouting,
 	);
 }
 

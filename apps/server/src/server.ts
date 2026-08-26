@@ -19,6 +19,7 @@ import {
 	NETWORK,
 	registerCleanup,
 	registerDisposable,
+	setForceAccountModel,
 	setPricingLogger,
 	shutdown,
 	TIME_CONSTANTS,
@@ -48,6 +49,7 @@ import { Logger, setConsoleLogging } from "@better-ccflare/logger";
 import { handleResponsesRequest } from "@better-ccflare/openai-responses-adapter";
 import {
 	CODEX_DEFAULT_ENDPOINT,
+	CODEX_PING_MODEL,
 	extractWeeklyResetTime,
 	fetchCodexUsageData,
 	fetchCodexUsageOnDemand,
@@ -88,10 +90,12 @@ import {
 	handleProxy,
 	initModelCatalogRefresh,
 	initProxy,
+	lowestTierCodexModel,
 	ModelRouteSessionRegistry,
 	markAccountTokensFresh,
 	type ProxyContext,
 	parseModelRouteProfiles,
+	recordCodexUsageSnapshot,
 	refreshModelCatalog,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
@@ -147,10 +151,13 @@ export function buildStrategy(
 		case StrategyName.SessionDrainSoonest:
 			return new SessionDrainSoonestStrategy(
 				sessionDurationMs,
-				undefined,
-				undefined,
-				undefined,
-				undefined,
+				"sticky",
+				routingTransitions,
+			);
+		case StrategyName.SessionDrainSoonestStrict:
+			return new SessionDrainSoonestStrategy(
+				sessionDurationMs,
+				"strict",
 				routingTransitions,
 			);
 		default:
@@ -623,6 +630,38 @@ async function cleanupCacheFlightRecorderRetention(
 		}
 	} catch (err) {
 		log.error(`Cache flight recorder retention error: ${err}`);
+	}
+}
+
+/**
+ * Adopt, once, what the combo environment variables used to decide.
+ *
+ * The switches for combo routing and its session fallback now live in the
+ * dashboard and are read from the config file only — an environment variable
+ * that could override them would force the UI to draw a control that accepts a
+ * click and does nothing. So the old variables are read here, at boot, written
+ * into the file, and never consulted again.
+ *
+ * The same pass covers an install that has combos but never set the variable:
+ * it was routing through them, and an upgrade must not stop that in silence.
+ *
+ * Failure is not fatal: the settings stay at their defaults and the operator
+ * can set them in the dashboard, which is the whole point of moving them there.
+ */
+async function adoptLegacyRoutingSettings(
+	config: Config,
+	dbOps: DatabaseOperations,
+) {
+	const log = new Logger("Startup");
+	try {
+		const combos = await dbOps.listCombos();
+		for (const note of config.adoptLegacyRoutingSettings(combos.length > 0)) {
+			log.info(note);
+		}
+	} catch (err) {
+		log.warn(
+			`Could not adopt the legacy combo settings: ${err instanceof Error ? err.message : String(err)}`,
+		);
 	}
 }
 
@@ -1165,6 +1204,10 @@ export default async function startServer(options?: {
 			config.getProviderModelDefaultOverrides(),
 		),
 	);
+	// The code that renames models lives in core and providers, neither of
+	// which may depend on config; mirror the setting there before anything can
+	// route. The config POST handler mirrors it again after a write.
+	setForceAccountModel(config.getForceAccountModel());
 	installOutboundProxy(() => config.getOutboundProxy());
 	const outboundProxyUrl = config.getOutboundProxy();
 	if (outboundProxyUrl) {
@@ -1216,6 +1259,10 @@ export default async function startServer(options?: {
 
 	DatabaseFactory.initialize(undefined, runtime);
 	const dbOps = await DatabaseFactory.getInstanceAsync();
+
+	// Before anything can route: adopt the combo behaviour this install was
+	// already running, so upgrading is never a silent routing change.
+	await adoptLegacyRoutingSettings(config, dbOps);
 
 	// One-time migration: promote pre-existing DBs from auto_vacuum=NONE to
 	// INCREMENTAL. Fresh DBs created since ensureSchema() started issuing
@@ -1924,9 +1971,34 @@ export default async function startServer(options?: {
 
 		const endpoint = account.custom_endpoint ?? CODEX_DEFAULT_ENDPOINT;
 
+		// Ping with a model this account can actually address, and with the
+		// cheapest one of those. A hardcoded name goes stale silently and fatally:
+		// the subscription endpoint rejects an unknown model before it accounts for
+		// quota, so the 400 carries no `x-codex-*` headers and the refresh fails
+		// with nothing to show. The account's own listing already answers the
+		// "which models exist" half for the family mapping — reuse it, and take the
+		// tail rather than the head, because the reply is discarded as soon as the
+		// headers arrive and the headers describe the subscription, not the model.
+		// `CODEX_PING_MODEL` is only reached when that listing has never been
+		// readable.
+		let pingModel = CODEX_PING_MODEL;
+		try {
+			pingModel =
+				lowestTierCodexModel(await getCodexModels(accountId, proxyContext)) ??
+				CODEX_PING_MODEL;
+		} catch (error) {
+			log.debug(
+				`Codex usage refresh: could not resolve the model list for ${account.name}, pinging ${pingModel}: ${error}`,
+			);
+		}
+
 		let fetchResult: Awaited<ReturnType<typeof fetchCodexUsageOnDemand>>;
 		try {
-			fetchResult = await fetchCodexUsageOnDemand(accessToken, endpoint);
+			fetchResult = await fetchCodexUsageOnDemand(
+				accessToken,
+				endpoint,
+				pingModel,
+			);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			log.error(
@@ -1961,19 +2033,33 @@ export default async function startServer(options?: {
 		}
 
 		if (!fetchResult.data) {
+			// Naming the model matters here: this is the shape a rejected model
+			// takes, and without it the message says nothing actionable.
 			return {
 				success: false,
-				message: `Codex returned no usage headers (status ${fetchResult.response.status}) for '${account.name}'`,
+				message: `Codex returned no usage headers (status ${fetchResult.response.status}) for '${account.name}' when pinging model '${pingModel}'`,
 			};
 		}
 
 		usageCache.set(accountId, fetchResult.data);
 
+		// Persist alongside the cache: this on-demand read costs quota, so it must
+		// outlive the 10-minute cache. `force` skips the traffic throttle — the
+		// operator asked for this read explicitly.
+		await recordCodexUsageSnapshot(
+			dbOps,
+			accountId,
+			account.name,
+			fetchResult.data as unknown as Record<string, unknown>,
+			Date.now(),
+			true,
+		);
+
 		const fiveHour = fetchResult.data.five_hour?.utilization ?? 0;
 		const sevenDay = fetchResult.data.seven_day?.utilization ?? 0;
 		const isRateLimited = fetchResult.response.status === 429;
 		log.info(
-			`Codex usage refreshed for '${account.name}': 5h=${fiveHour}%, 7d=${sevenDay}%${
+			`Codex usage refreshed for '${account.name}' via ${pingModel}: 5h=${fiveHour}%, 7d=${sevenDay}%${
 				isRateLimited ? " (rate-limited)" : ""
 			}`,
 		);

@@ -443,6 +443,9 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 			// zero/negative (PG treats 0 as "disabled"), or too-large override is
 			// silently clamped rather than trusted, since an unbounded value here
 			// reopens the exact connection-leak bug this timeout exists to close.
+			// PG_CLIENT_QUERY_TIMEOUT_MS itself is configurable via
+			// BETTER_CCFLARE_DB_CLIENT_TIMEOUT (default 8000ms), so raising that
+			// env var also raises this clamp's ceiling (#412).
 			const requestedPgStatementTimeout = Number(
 				process.env.BETTER_CCFLARE_DB_STATEMENT_TIMEOUT,
 			);
@@ -1113,6 +1116,10 @@ OAuth tokens will need to be re-authenticated.
 		pointBudget?: number;
 	}) {
 		return this.usageHistory.getFleetUsageHistory(opts);
+	}
+
+	async getLatestUsageSnapshot(accountId: string, windowKey: string) {
+		return this.usageHistory.getLatestSnapshot(accountId, windowKey);
 	}
 
 	async pruneUsageSnapshots(cutoffTs: number): Promise<number> {

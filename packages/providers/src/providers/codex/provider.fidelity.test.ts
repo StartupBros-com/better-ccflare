@@ -253,6 +253,89 @@ describe("Codex transform, disable_parallel_tool_use mapping", () => {
 		});
 		expect(body.parallel_tool_calls).toBeUndefined();
 	});
+
+	test("preserves an explicit Responses API false value", async () => {
+		const body = await transform({
+			...base,
+			__better_ccflare_codex_passthrough: {
+				parallel_tool_calls: false,
+			},
+		});
+		expect(body.parallel_tool_calls).toBe(false);
+	});
+});
+
+describe("Codex transform, store field", () => {
+	const base = {
+		model: "claude-opus-4-8",
+		max_tokens: 10,
+		messages: [{ role: "user", content: "hi" }],
+	};
+
+	test("defaults to explicit false for ordinary requests", async () => {
+		const body = await transform(base);
+		expect(body.store).toBe(false);
+	});
+
+	test("honors an explicit Responses API true value", async () => {
+		const body = await transform({
+			...base,
+			__better_ccflare_codex_passthrough: { store: true },
+		});
+		expect(body.store).toBe(true);
+	});
+
+	test("keeps explicit account mapping authoritative over a native Responses model", async () => {
+		const provider = new CodexProvider();
+		const request = makeRequest({
+			...base,
+			model: "claude-fable-5",
+			__better_ccflare_codex_passthrough: {
+				model: "gpt-5.6-sol",
+			},
+		});
+		const account = {
+			model_mappings: JSON.stringify({ fable: "gpt-5.4-mini" }),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = (await transformed.json()) as CodexBody;
+
+		expect(body.model).toBe("gpt-5.4-mini");
+	});
+
+	test("lets a native Responses model refine a Claude-family default without an account mapping", async () => {
+		const body = await transform({
+			...base,
+			model: "claude-fable-5",
+			__better_ccflare_codex_passthrough: {
+				model: "gpt-5.6-sol",
+			},
+		});
+
+		expect(body.model).toBe("gpt-5.6-sol");
+	});
+});
+
+describe("Codex transform, tools field", () => {
+	test("omits tools entirely for tool-less requests", async () => {
+		const body = await transform({
+			model: "claude-opus-4-8",
+			max_tokens: 10,
+			messages: [{ role: "user", content: "hi" }],
+		});
+		expect(body.tools).toBeUndefined();
+	});
+
+	test("maps Anthropic tools when present", async () => {
+		const body = await transform({
+			model: "claude-opus-4-8",
+			max_tokens: 10,
+			messages: [{ role: "user", content: "hi" }],
+			tools: [{ name: "Read", input_schema: { type: "object" } }],
+		});
+		expect(body.tools).toHaveLength(1);
+	});
 });
 
 describe("Codex transform, Skill nudge in mixed parallel final turns", () => {

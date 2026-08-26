@@ -30,6 +30,7 @@ export type ResponseItem =
 	| LocalShellCallItem
 	| LocalShellCallOutputItem
 	| AgentMessageItem
+	| AdditionalToolsItem
 	| ReasoningItem
 	| CompactionItem
 	| CompactionSummaryItem
@@ -142,6 +143,16 @@ export interface AgentMessageItem {
 	author: string;
 	recipient: string;
 	content: AgentMessageContent[];
+}
+
+/**
+ * Codex-private tool declarations preserved separately by the adapter handler.
+ * They are not translated into Anthropic message content.
+ */
+export interface AdditionalToolsItem {
+	type: "additional_tools";
+	tools: unknown[];
+	[key: string]: unknown;
 }
 
 // These three are intentionally modeled (rather than left for the generic

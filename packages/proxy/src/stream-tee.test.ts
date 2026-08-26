@@ -96,6 +96,49 @@ describe("teeStream", () => {
 		);
 	});
 
+	it("keeps the client stream healthy when onChunk throws", async () => {
+		const chunks = [textChunk("first"), textChunk("second")];
+		const { stream } = makeTrackedUpstream(chunks);
+		let onChunkCalls = 0;
+		let onCloseCalls = 0;
+		let onErrorCalls = 0;
+
+		const received = await readAll(
+			teeStream(stream, {
+				onChunk() {
+					onChunkCalls++;
+					if (onChunkCalls === 1) throw new Error("analytics failed");
+				},
+				onClose() {
+					onCloseCalls++;
+				},
+				onError() {
+					onErrorCalls++;
+				},
+			}),
+		);
+
+		expect(new TextDecoder().decode(combineChunks(received))).toBe(
+			"firstsecond",
+		);
+		expect(onChunkCalls).toBe(2);
+		expect(onCloseCalls).toBe(1);
+		expect(onErrorCalls).toBe(0);
+	});
+
+	it("releases the upstream lock after cancellation, even when upstream cancellation fails", async () => {
+		const upstream = new ReadableStream<Uint8Array>({
+			cancel() {
+				return Promise.reject(new Error("upstream cancellation failed"));
+			},
+		});
+		const reader = teeStream(upstream).getReader();
+
+		await expect(reader.cancel("client disconnected")).resolves.toBeUndefined();
+
+		expect(() => upstream.getReader()).not.toThrow();
+	});
+
 	it("respects maxBytes when buffering, while still passing all bytes through", async () => {
 		const chunks = [textChunk("12345"), textChunk("67890"), textChunk("abcde")];
 		const { stream } = makeTrackedUpstream(chunks);

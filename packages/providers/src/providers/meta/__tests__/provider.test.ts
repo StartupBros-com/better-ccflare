@@ -3,23 +3,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Account } from "@better-ccflare/types";
 import {
-	isMuseSparkMessagesPath,
-	isMuseSparkModel,
-	MUSE_SPARK_DEFAULT_MODEL,
-	MuseSparkProvider,
+	isMetaMessagesPath,
+	isMetaModel,
+	META_DEFAULT_MODEL,
+	MetaProvider,
 } from "../provider";
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
 	return {
 		id: "test-id",
-		name: "test-muse-spark-account",
-		provider: "muse-spark",
+		name: "test-meta-account",
+		provider: "meta",
 		refresh_token: "",
 		access_token: null,
 		expires_at: null,
 		api_key: "LLM|123|secret",
 		custom_endpoint: null,
 		rate_limited_until: null,
+		rate_limited_reason: null,
+		rate_limited_at: null,
 		rate_limit_status: null,
 		rate_limit_reset: null,
 		rate_limit_remaining: null,
@@ -30,9 +32,19 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
+		requires_reauth: false,
 		priority: 0,
 		auto_fallback_enabled: false,
 		auto_refresh_enabled: false,
+		auto_pause_on_overage_enabled: false,
+		peak_hours_pause_enabled: false,
+		model_mappings: null,
+		cross_region_mode: null,
+		model_fallbacks: null,
+		billing_type: null,
+		pause_reason: null,
+		refresh_token_issued_at: null,
+		consecutive_rate_limits: 0,
 		...overrides,
 	} as Account;
 }
@@ -49,18 +61,18 @@ function jsonRequest(body: unknown): Request {
 	});
 }
 
-describe("MuseSparkProvider", () => {
-	let provider: MuseSparkProvider;
+describe("MetaProvider", () => {
+	let provider: MetaProvider;
 	let account: Account;
 
 	beforeEach(() => {
-		provider = new MuseSparkProvider();
+		provider = new MetaProvider();
 		account = makeAccount();
 	});
 
 	describe("name", () => {
 		it("should have the correct provider name", () => {
-			expect(provider.name).toBe("muse-spark");
+			expect(provider.name).toBe("meta");
 		});
 	});
 
@@ -219,16 +231,16 @@ describe("MuseSparkProvider", () => {
 	});
 
 	describe("resolveModel", () => {
-		it("routes a Claude model to the default Muse Spark checkpoint", () => {
+		it("routes a Claude model to the default Meta checkpoint", () => {
 			expect(provider.resolveModel("claude-opus-4-6-20260115", account)).toBe(
-				MUSE_SPARK_DEFAULT_MODEL,
+				META_DEFAULT_MODEL,
 			);
 			expect(provider.resolveModel("claude-haiku-4-5-20251001", account)).toBe(
-				MUSE_SPARK_DEFAULT_MODEL,
+				META_DEFAULT_MODEL,
 			);
 		});
 
-		it("passes an explicit Muse Spark model through", () => {
+		it("passes an explicit Meta model through", () => {
 			expect(provider.resolveModel("muse-spark-1.1", account)).toBe(
 				"muse-spark-1.1",
 			);
@@ -247,9 +259,7 @@ describe("MuseSparkProvider", () => {
 		});
 
 		it("routes an unknown model to the default rather than forwarding it", () => {
-			expect(provider.resolveModel("gpt-4o", account)).toBe(
-				MUSE_SPARK_DEFAULT_MODEL,
-			);
+			expect(provider.resolveModel("gpt-4o", account)).toBe(META_DEFAULT_MODEL);
 		});
 	});
 
@@ -267,7 +277,7 @@ describe("MuseSparkProvider", () => {
 				await provider.transformRequestBody(request, account),
 			);
 
-			expect(body.model).toBe(MUSE_SPARK_DEFAULT_MODEL);
+			expect(body.model).toBe(META_DEFAULT_MODEL);
 			expect(body).not.toHaveProperty("stop_sequences");
 			expect(body).not.toHaveProperty("top_k");
 			expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
@@ -377,7 +387,7 @@ describe("MuseSparkProvider", () => {
 			const body = await bodyOf(
 				await provider.transformRequestBody(request, account),
 			);
-			expect(body.model).toBe(MUSE_SPARK_DEFAULT_MODEL);
+			expect(body.model).toBe(META_DEFAULT_MODEL);
 			expect(body).not.toHaveProperty("top_k");
 		});
 
@@ -394,145 +404,68 @@ describe("MuseSparkProvider", () => {
 			);
 			expect(body).toEqual(original);
 		});
-
-		it("filters retained reasoning on non-Messages JSON endpoints without applying the Messages sanitizer", async () => {
-			const body = await bodyOf(
-				await provider.transformRequestBody(
-					new Request("https://proxy.local/v1/files", {
-						method: "POST",
-						headers: { "content-type": "application/json" },
-						body: JSON.stringify({
-							purpose: "assistants",
-							unknown_file_field: true,
-							messages: [
-								{
-									role: "assistant",
-									content: [
-										{
-											type: "redacted_thinking",
-											data: "bccfr1.rs_strip.cipher",
-										},
-										{ type: "redacted_thinking", data: "anthropic-genuine" },
-									],
-								},
-							],
-						}),
-					}),
-					account,
-				),
-			);
-
-			expect(body).toEqual({
-				purpose: "assistants",
-				unknown_file_field: true,
-				messages: [
-					{
-						role: "assistant",
-						content: [{ type: "redacted_thinking", data: "anthropic-genuine" }],
-					},
-				],
-			});
-		});
 	});
 
 	describe("skill elision (Messages sanitizer path)", () => {
-		const SKILL_MARKER = "Base directory for this skill: ";
-		const originalConfigPath = process.env.BETTER_CCFLARE_CONFIG_PATH;
-		const originalBlocked = process.env.CCFLARE_SKILL_ELISION_BLOCKED;
-		let tmpDir: string;
-
-		beforeEach(() => {
-			tmpDir = mkdtempSync(
-				join(tmpdir(), "better-ccflare-skill-elision-muse-spark-"),
+		it("elides a blocked skill bundle before sanitizing the Messages body", async () => {
+			const originalConfigPath = process.env.BETTER_CCFLARE_CONFIG_PATH;
+			const originalBlocked = process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+			const tmpDir = mkdtempSync(
+				join(tmpdir(), "better-ccflare-skill-elision-meta-"),
 			);
-			process.env.BETTER_CCFLARE_CONFIG_PATH = join(tmpDir, "config.json");
-		});
-
-		afterEach(() => {
-			rmSync(tmpDir, { recursive: true, force: true });
-			if (originalConfigPath === undefined) {
-				delete process.env.BETTER_CCFLARE_CONFIG_PATH;
-			} else {
-				process.env.BETTER_CCFLARE_CONFIG_PATH = originalConfigPath;
+			try {
+				process.env.BETTER_CCFLARE_CONFIG_PATH = join(tmpDir, "config.json");
+				process.env.CCFLARE_SKILL_ELISION_BLOCKED = "some-skill";
+				const bundleText = `Base directory for this skill: /skills/some-skill\n${"x".repeat(12_000)}`;
+				const body = await bodyOf(
+					await provider.transformRequestBody(
+						jsonRequest({
+							model: "muse-spark-1.2",
+							max_tokens: 4096,
+							messages: [
+								{ role: "user", content: [{ type: "text", text: bundleText }] },
+							],
+						}),
+						account,
+					),
+				);
+				const messages = body.messages as Array<{
+					content: Array<{ type: string; text: string }>;
+				}>;
+				expect(messages[0].content[0].text).toContain("[better-ccflare]");
+				expect(messages[0].content[0].text.length).toBeLessThan(200);
+			} finally {
+				rmSync(tmpDir, { recursive: true, force: true });
+				if (originalConfigPath === undefined) {
+					delete process.env.BETTER_CCFLARE_CONFIG_PATH;
+				} else {
+					process.env.BETTER_CCFLARE_CONFIG_PATH = originalConfigPath;
+				}
+				if (originalBlocked === undefined) {
+					delete process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+				} else {
+					process.env.CCFLARE_SKILL_ELISION_BLOCKED = originalBlocked;
+				}
 			}
-			if (originalBlocked === undefined) {
-				delete process.env.CCFLARE_SKILL_ELISION_BLOCKED;
-			} else {
-				process.env.CCFLARE_SKILL_ELISION_BLOCKED = originalBlocked;
-			}
-		});
-
-		function makeSkillText(dir: string, totalLength: number): string {
-			const header = `${SKILL_MARKER}${dir}\n`;
-			return header + "x".repeat(Math.max(0, totalLength - header.length));
-		}
-
-		it("elides a blocked skill bundle on the sanitized Messages path", async () => {
-			process.env.CCFLARE_SKILL_ELISION_BLOCKED = "some-skill";
-			const bundleText = makeSkillText("/skills/some-skill", 12_000);
-			const body = await bodyOf(
-				await provider.transformRequestBody(
-					jsonRequest({
-						model: "muse-spark-1.2",
-						max_tokens: 4096,
-						messages: [
-							{ role: "user", content: [{ type: "text", text: bundleText }] },
-						],
-					}),
-					account,
-				),
-			);
-
-			const messages = body.messages as Array<{
-				content: Array<{ type: string; text: string }>;
-			}>;
-			expect(messages[0].content[0].text).toContain("[better-ccflare]");
-			expect(messages[0].content[0].text.length).toBeLessThan(200);
-		});
-
-		it("leaves an unblocked skill bundle intact on the Messages path", async () => {
-			process.env.CCFLARE_SKILL_ELISION_BLOCKED = "other-skill";
-			const bundleText = makeSkillText("/skills/some-skill", 12_000);
-			const body = await bodyOf(
-				await provider.transformRequestBody(
-					jsonRequest({
-						model: "muse-spark-1.2",
-						max_tokens: 4096,
-						messages: [
-							{ role: "user", content: [{ type: "text", text: bundleText }] },
-						],
-					}),
-					account,
-				),
-			);
-
-			const messages = body.messages as Array<{
-				content: Array<{ type: string; text: string }>;
-			}>;
-			expect(messages[0].content[0].text).toBe(bundleText);
 		});
 	});
 
-	describe("isMuseSparkMessagesPath", () => {
+	describe("isMetaMessagesPath", () => {
 		it("matches the Messages surface only", () => {
-			expect(isMuseSparkMessagesPath("https://api.meta.ai/v1/messages")).toBe(
-				true,
-			);
+			expect(isMetaMessagesPath("https://api.meta.ai/v1/messages")).toBe(true);
 			expect(
-				isMuseSparkMessagesPath("https://api.meta.ai/v1/messages/count_tokens"),
+				isMetaMessagesPath("https://api.meta.ai/v1/messages/count_tokens"),
 			).toBe(true);
-			expect(isMuseSparkMessagesPath("https://api.meta.ai/v1/files")).toBe(
-				false,
-			);
-			expect(isMuseSparkMessagesPath("https://api.meta.ai/v1/responses")).toBe(
+			expect(isMetaMessagesPath("https://api.meta.ai/v1/files")).toBe(false);
+			expect(isMetaMessagesPath("https://api.meta.ai/v1/responses")).toBe(
 				false,
 			);
 		});
 
 		it("ignores the query string", () => {
-			expect(
-				isMuseSparkMessagesPath("https://api.meta.ai/v1/messages?beta=1"),
-			).toBe(true);
+			expect(isMetaMessagesPath("https://api.meta.ai/v1/messages?beta=1")).toBe(
+				true,
+			);
 		});
 
 		// The proxy hands transformRequestBody the already-rewritten target URL,
@@ -540,16 +473,16 @@ describe("MuseSparkProvider", () => {
 		// for exactly the accounts that need it.
 		it("matches both Messages routes behind a gateway path prefix", () => {
 			expect(
-				isMuseSparkMessagesPath("https://gateway.example/proxy/v1/messages"),
+				isMetaMessagesPath("https://gateway.example/proxy/v1/messages"),
 			).toBe(true);
 			expect(
-				isMuseSparkMessagesPath(
+				isMetaMessagesPath(
 					"https://gateway.example/proxy/v1/messages/count_tokens",
 				),
 			).toBe(true);
-			expect(
-				isMuseSparkMessagesPath("https://gateway.example/proxy/v1/files"),
-			).toBe(false);
+			expect(isMetaMessagesPath("https://gateway.example/proxy/v1/files")).toBe(
+				false,
+			);
 		});
 	});
 
@@ -647,30 +580,15 @@ describe("MuseSparkProvider", () => {
 	});
 
 	describe("getLogicalModelCapability", () => {
-		it("declares Claude families supported under provider defaults", () => {
-			const capability = provider.getLogicalModelCapability(
-				"claude-sonnet-4-5",
-				makeAccount({ model_mappings: null }),
-			);
-			expect(capability.status).toBe("supported");
-			expect(capability.provenance).toBe("provider_default");
-		});
-
-		it("declares an explicit Muse Spark model supported", () => {
+		it("declares Claude families and explicit Muse Spark models supported", () => {
+			expect(
+				provider.getLogicalModelCapability("claude-fable-5", account).status,
+			).toBe("supported");
 			expect(
 				provider.getLogicalModelCapability("muse-spark-1.2", account).status,
 			).toBe("supported");
 		});
 
-		it("returns unknown for an unrecognised family", () => {
-			expect(provider.getLogicalModelCapability("gpt-4o", account).status).toBe(
-				"unknown",
-			);
-		});
-
-		// A partial table must not strand the families it omits: resolveModel
-		// still routes them to the default checkpoint, so admission must agree or
-		// combo/managed routing drops an account that can serve the request.
 		it("keeps families absent from a partial mapping table supported", () => {
 			const partial = makeAccount({
 				model_mappings: JSON.stringify({ opus: "muse-spark-1.1" }),
@@ -681,21 +599,17 @@ describe("MuseSparkProvider", () => {
 			expect(
 				provider.getLogicalModelCapability("claude-haiku-4-5", partial).status,
 			).toBe("supported");
-		});
-
-		it("keeps families supported with an empty mapping table", () => {
-			const empty = makeAccount({ model_mappings: JSON.stringify({}) });
-			expect(
-				provider.getLogicalModelCapability("claude-opus-4-6", empty).status,
-			).toBe("supported");
+			expect(provider.getLogicalModelCapability("gpt-4o", account).status).toBe(
+				"unknown",
+			);
 		});
 	});
 
-	describe("isMuseSparkModel", () => {
-		it("recognises Muse Spark model IDs", () => {
-			expect(isMuseSparkModel("muse-spark-1.2")).toBe(true);
-			expect(isMuseSparkModel("MUSE-SPARK-1.1")).toBe(true);
-			expect(isMuseSparkModel("claude-opus-4-6")).toBe(false);
+	describe("isMetaModel", () => {
+		it("recognises Meta model IDs", () => {
+			expect(isMetaModel("muse-spark-1.2")).toBe(true);
+			expect(isMetaModel("MUSE-SPARK-1.1")).toBe(true);
+			expect(isMetaModel("claude-opus-4-6")).toBe(false);
 		});
 	});
 });

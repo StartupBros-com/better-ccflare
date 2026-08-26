@@ -3,16 +3,16 @@ import type { Account } from "@better-ccflare/types";
 import { getAccountsList } from "../account";
 
 /**
- * A Muse Spark account holds a static API key: no OAuth access token and no
+ * A Meta account holds a static API key: no OAuth access token and no
  * expiry. Classification derived from those two fields alone reported a working
  * account as an expired `console` account, misleading operators and anything
  * consuming `account list --json`.
  */
-function museSparkAccount(overrides: Partial<Account> = {}): Account {
+function metaAccount(overrides: Partial<Account> = {}): Account {
 	return {
-		id: "muse-1",
+		id: "meta-1",
 		name: "meta",
-		provider: "muse-spark",
+		provider: "meta",
 		api_key: "LLM|123|secret",
 		access_token: null,
 		refresh_token: null,
@@ -35,17 +35,17 @@ function museSparkAccount(overrides: Partial<Account> = {}): Account {
 	} as Account;
 }
 
-describe("getAccountsList Muse Spark classification", () => {
-	it("reports the mode as muse-spark, not console", async () => {
-		const dbOps = { getAllAccounts: async () => [museSparkAccount()] };
+describe("getAccountsList Meta classification", () => {
+	it("reports the mode as meta, not console", async () => {
+		const dbOps = { getAllAccounts: async () => [metaAccount()] };
 
 		const result = await getAccountsList(dbOps as never);
 
-		expect(result[0]?.mode).toBe("muse-spark");
+		expect(result[0]?.mode).toBe("meta");
 	});
 
 	it("does not report a static API-key account as expired", async () => {
-		const dbOps = { getAllAccounts: async () => [museSparkAccount()] };
+		const dbOps = { getAllAccounts: async () => [metaAccount()] };
 
 		const result = await getAccountsList(dbOps as never);
 
@@ -53,7 +53,7 @@ describe("getAccountsList Muse Spark classification", () => {
 	});
 
 	it("still reports a genuinely expired OAuth account as expired", async () => {
-		const expiredOAuth = museSparkAccount({
+		const expiredOAuth = metaAccount({
 			id: "oauth-1",
 			provider: "anthropic",
 			api_key: null,

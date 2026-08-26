@@ -611,6 +611,64 @@ function extractUsageFromData(
 			// Even if no usage info, we still set the timestamp for duration calculation
 		}
 
+		// Codex Responses-API passthrough streams (declared custom tools bypass
+		// the Anthropic transform) carry usage only on the terminal response.*
+		// event, nested under response.usage with OpenAI's cache-inclusive
+		// input_tokens. Normalize to Anthropic's additive semantics so input
+		// excludes cache reads instead of double-counting them.
+		const isResponsesTerminal =
+			parsed.type === "response.completed" ||
+			parsed.type === "response.incomplete" ||
+			parsed.type === "response.failed" ||
+			eventType === "response.completed" ||
+			eventType === "response.incomplete" ||
+			eventType === "response.failed";
+		if (isResponsesTerminal && parsed.response) {
+			state.lastTokenTimestamp = Date.now();
+			if (parsed.response.model && !state.usage.model) {
+				state.usage.model = parsed.response.model;
+			}
+			const usage = parsed.response.usage;
+			if (usage) {
+				const cachedTokens =
+					typeof usage.input_tokens_details?.cached_tokens === "number"
+						? usage.input_tokens_details.cached_tokens
+						: 0;
+				if (typeof usage.input_tokens === "number") {
+					state.usage.inputTokens = Math.max(
+						0,
+						usage.input_tokens - cachedTokens,
+					);
+					state.usage.inputTokensPresent = true;
+				}
+				if (typeof usage.input_tokens_details?.cached_tokens === "number") {
+					state.usage.cacheReadInputTokens =
+						usage.input_tokens_details.cached_tokens;
+					state.usage.cacheReadInputTokensPresent = true;
+				}
+				if (
+					typeof usage.input_tokens_details?.cache_creation_input_tokens ===
+					"number"
+				) {
+					state.usage.cacheCreationInputTokens =
+						usage.input_tokens_details.cache_creation_input_tokens;
+				}
+				if (typeof usage.output_tokens === "number") {
+					state.providerFinalOutputTokens = usage.output_tokens;
+					state.usage.outputTokens = usage.output_tokens;
+				}
+			}
+			// A Responses terminal without usage still represents a completed
+			// accounting lifecycle. Keep explicit zeroes distinct from nonterminal
+			// events, which must remain absent until the provider reports usage.
+			state.usage.inputTokens ??= 0;
+			state.usage.outputTokens ??= 0;
+			if (!usage && !("cacheReadInputTokens" in state.usage)) {
+				state.usage.cacheReadInputTokens = undefined;
+			}
+			return;
+		}
+
 		// Note: tiktoken-based outputTokensComputed was removed (see refactor notes).
 		// The provider's authoritative token counts are used instead.
 

@@ -10,6 +10,8 @@ import {
 	clearCodexModelCacheForTests,
 	ensureCodexModelDefaults,
 	getCodexModels,
+	getKnownCodexModels,
+	lowestTierCodexModel,
 } from "../codex-model-catalog";
 import type { ProxyContext } from "../handlers/proxy-types";
 
@@ -240,6 +242,18 @@ describe("getCodexModels", () => {
 		]);
 	});
 
+	it("does not present a shared catalog as first-hand account knowledge", async () => {
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify(LIVE_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			})) as typeof globalThis.fetch;
+		await getCodexModels("acc-codex", makeCtx(makeAccount()));
+
+		expect(getKnownCodexModels("acc-codex")?.source).toBe("cached");
+		expect(getKnownCodexModels("acc-blind")).toBeNull();
+	});
+
 	// A 200 carrying nothing usable is not an answer. Recording it would mark the
 	// account as resolved and stop every later attempt, freezing it with no
 	// defaults because of one odd response.
@@ -296,6 +310,55 @@ describe("getCodexModels", () => {
 
 	it("returns nothing for an account that does not exist", async () => {
 		expect(await getCodexModels("ghost", makeCtx(null))).toBeNull();
+	});
+});
+
+describe("lowestTierCodexModel", () => {
+	it("names the weakest visible model in provider priority order", async () => {
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify(LIVE_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			})) as typeof globalThis.fetch;
+
+		const listing = await getCodexModels("acc-codex", makeCtx(makeAccount()));
+
+		expect(lowestTierCodexModel(listing)).toBe("gpt-5.4-mini");
+		expect(lowestTierCodexModel(listing)).not.toBe("gpt-5.6-sol");
+	});
+
+	it("returns the only model when a plan lists one", () => {
+		expect(
+			lowestTierCodexModel({
+				accountId: "acc-codex",
+				models: [
+					{
+						id: "gpt-5.6-sol",
+						displayName: "GPT-5.6-Sol",
+						description: null,
+						contextWindow: null,
+						maxContextWindow: null,
+						effectiveContextPercent: null,
+						supersededBy: null,
+					},
+				],
+				fetchedAt: 0,
+				source: "live",
+			}),
+		).toBe("gpt-5.6-sol");
+	});
+
+	it("returns null when there is no listing to read", () => {
+		expect(lowestTierCodexModel(null)).toBeNull();
+		expect(lowestTierCodexModel(undefined)).toBeNull();
+		expect(
+			lowestTierCodexModel({
+				accountId: "acc-codex",
+				models: [],
+				fetchedAt: 0,
+				source: "live",
+			}),
+		).toBeNull();
 	});
 });
 
