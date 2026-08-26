@@ -3734,11 +3734,6 @@ describe("proxyWithAccount — 401 failover", () => {
 		ctx.provider = provider;
 		const pauseAccountIfActive = mock(async () => true);
 		const updateAccountTokensIfRefreshTokenMatches = mock(async () => true);
-		Object.assign(ctx.dbOps as object, {
-			getAccount: mock(async () => null),
-			pauseAccountIfActive,
-			updateAccountTokensIfRefreshTokenMatches,
-		});
 		const account = makeAccount({
 			id: "budgeted-stale-token-account",
 			provider: "claude-oauth",
@@ -3746,6 +3741,11 @@ describe("proxyWithAccount — 401 failover", () => {
 			access_token: "stale-access-token",
 			expires_at: Date.now() + 60 * 60 * 1000,
 			refresh_token: "refresh-token",
+		});
+		Object.assign(ctx.dbOps as object, {
+			getAccount: mock(async () => account),
+			pauseAccountIfActive,
+			updateAccountTokensIfRefreshTokenMatches,
 		});
 		const ledger = new RoutingAttemptLedger();
 		for (let attempt = 1; attempt < MAX_REQUEST_PHYSICAL_ATTEMPTS; attempt++) {

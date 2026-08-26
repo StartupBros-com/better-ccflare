@@ -6121,11 +6121,18 @@ export async function proxyWithAccount(
 								"overload_529",
 								currentTransportModel ?? undefined,
 							);
-							const retrySource = new Request(retrySourceRequest.url, {
+							const retrySourceInit: RequestInit & { duplex?: "half" } = {
 								method: retrySourceRequest.method,
 								headers: retryHeaders,
-								body: await retrySourceRequest.clone().arrayBuffer(),
-							});
+							};
+							if (currentReplayBody) {
+								retrySourceInit.body = new Uint8Array(currentReplayBody);
+								retrySourceInit.duplex = "half";
+							}
+							const retrySource = new Request(
+								retrySourceRequest.url,
+								retrySourceInit,
+							);
 							let retryTransformed = await transformWithCurrentAttemptPlan(
 								attemptPlan,
 								retrySource,
