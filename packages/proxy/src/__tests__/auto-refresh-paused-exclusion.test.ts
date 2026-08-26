@@ -44,7 +44,34 @@ async function makeScheduler(sqliteDb: Database) {
 	const proxyContext = {
 		runtime: { port: 8080, clientId: "test-client" },
 		refreshInFlight: new Map(),
-		dbOps: { pauseAccountIfActive: mock(async () => false) },
+		dbOps: {
+			getAccount: async (accountId: string) =>
+				adapter.get("SELECT * FROM accounts WHERE id = ?", [accountId]),
+			pauseAccountIfActive: mock(async () => false),
+			updateAccountTokensIfRefreshTokenMatches: async (
+				accountId: string,
+				expectedRefreshToken: string,
+				accessToken: string,
+				expiresAt: number,
+				refreshToken: string | undefined,
+				expectedCreatedAt: number | undefined,
+			) => {
+				const changes = await adapter.runWithChanges(
+					`UPDATE accounts
+					 SET access_token = ?, expires_at = ?, refresh_token = COALESCE(?, refresh_token)
+					 WHERE id = ? AND refresh_token = ? AND created_at = ?`,
+					[
+						accessToken,
+						expiresAt,
+						refreshToken,
+						accountId,
+						expectedRefreshToken,
+						expectedCreatedAt,
+					],
+				);
+				return changes === 1;
+			},
+		},
 	};
 	const { AutoRefreshScheduler } = await import("../auto-refresh-scheduler");
 	return new AutoRefreshScheduler(

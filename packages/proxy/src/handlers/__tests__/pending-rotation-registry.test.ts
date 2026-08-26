@@ -2,10 +2,13 @@ import { beforeEach, describe, expect, it, mock } from "bun:test";
 import {
 	clearAllPendingRotationsForTests,
 	clearPendingRotation,
+	clearPendingRotationForDeletedAccount,
+	configurePendingRotationPersistence,
 	flushPendingRotation,
 	getPendingRotation,
 	type PendingRotationDbOps,
 	recordPendingRotation,
+	restorePendingRotations,
 } from "../pending-rotation-registry";
 
 function makeDbOps(overrides: Partial<PendingRotationDbOps> = {}) {
@@ -18,6 +21,138 @@ function makeDbOps(overrides: Partial<PendingRotationDbOps> = {}) {
 
 beforeEach(() => {
 	clearAllPendingRotationsForTests();
+	configurePendingRotationPersistence(null);
+});
+
+function restoredRotation(overrides: Record<string, unknown> = {}) {
+	return {
+		accessToken: "restored-access",
+		expiresAt: 12345,
+		refreshToken: "restored-refresh",
+		attemptedRefreshToken: "consumed-refresh",
+		recordedAt: 100,
+		...overrides,
+	};
+}
+
+describe("restorePendingRotations", () => {
+	it("upgrades a legacy WAL entry to the current durable account generation before exposing it", async () => {
+		let saveCompleted = false;
+		const save = mock(async () => {
+			expect(getPendingRotation("legacy-account")).toBeUndefined();
+			saveCompleted = true;
+		});
+		configurePendingRotationPersistence({
+			save,
+			load: mock(async () => [
+				{ accountId: "legacy-account", rotation: restoredRotation() },
+			]),
+			remove: mock(async () => {}),
+		});
+
+		await expect(
+			restorePendingRotations(async () => ({ created_at: 2468 })),
+		).resolves.toBe(1);
+
+		expect(saveCompleted).toBe(true);
+		expect(save).toHaveBeenCalledWith(
+			"legacy-account",
+			expect.objectContaining({ createdAt: 2468 }),
+		);
+		expect(getPendingRotation("legacy-account")).toEqual(
+			expect.objectContaining({ createdAt: 2468 }),
+		);
+	});
+
+	it("durably removes an orphaned legacy WAL entry instead of exposing it", async () => {
+		const remove = mock(async () => {});
+		const save = mock(async () => {});
+		configurePendingRotationPersistence({
+			save,
+			load: mock(async () => [
+				{ accountId: "orphaned-account", rotation: restoredRotation() },
+			]),
+			remove,
+		});
+
+		await expect(restorePendingRotations(async () => null)).resolves.toBe(0);
+
+		expect(remove).toHaveBeenCalledWith("orphaned-account");
+		expect(save).not.toHaveBeenCalled();
+		expect(getPendingRotation("orphaned-account")).toBeUndefined();
+	});
+
+	it("preserves a modern WAL entry without resolving or rewriting it", async () => {
+		const resolver = mock(async () => ({ created_at: 999 }));
+		const save = mock(async () => {});
+		const remove = mock(async () => {});
+		configurePendingRotationPersistence({
+			save,
+			load: mock(async () => [
+				{
+					accountId: "modern-account",
+					rotation: restoredRotation({ createdAt: 101 }),
+				},
+			]),
+			remove,
+		});
+
+		await expect(restorePendingRotations(resolver)).resolves.toBe(1);
+
+		expect(resolver).not.toHaveBeenCalled();
+		expect(save).not.toHaveBeenCalled();
+		expect(remove).not.toHaveBeenCalled();
+		expect(getPendingRotation("modern-account")?.createdAt).toBe(101);
+	});
+
+	it("keeps the legacy ID-only restore behavior when no generation resolver is supplied", async () => {
+		const save = mock(async () => {});
+		configurePendingRotationPersistence({
+			save,
+			load: mock(async () => [
+				{ accountId: "legacy-api-account", rotation: restoredRotation() },
+			]),
+			remove: mock(async () => {}),
+		});
+
+		await expect(restorePendingRotations()).resolves.toBe(1);
+
+		expect(save).not.toHaveBeenCalled();
+		expect(getPendingRotation("legacy-api-account")?.createdAt).toBeUndefined();
+	});
+});
+
+describe("clearPendingRotationForDeletedAccount", () => {
+	it("removes both modern and legacy rotations through the persistence queue", async () => {
+		const removed: string[] = [];
+		configurePendingRotationPersistence({
+			save: mock(async () => {}),
+			load: mock(async () => []),
+			remove: mock(async (accountId: string) => {
+				removed.push(accountId);
+			}),
+		});
+		await recordPendingRotation("modern-deleted", {
+			accessToken: "access-modern",
+			expiresAt: 1,
+			attemptedRefreshToken: "refresh-modern",
+			createdAt: 101,
+		});
+		await recordPendingRotation("legacy-deleted", {
+			accessToken: "access-legacy",
+			expiresAt: 1,
+			attemptedRefreshToken: "refresh-legacy",
+		});
+
+		clearPendingRotationForDeletedAccount("modern-deleted");
+		clearPendingRotationForDeletedAccount("legacy-deleted");
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(removed).toEqual(["modern-deleted", "legacy-deleted"]);
+		expect(getPendingRotation("modern-deleted")).toBeUndefined();
+		expect(getPendingRotation("legacy-deleted")).toBeUndefined();
+	});
 });
 
 describe("recordPendingRotation / getPendingRotation", () => {
@@ -62,6 +197,29 @@ describe("recordPendingRotation / getPendingRotation", () => {
 		// only ever consumed in-memory.
 		expect(entry?.attemptedRefreshToken).toBe("old-1");
 	});
+
+	it("forwards the recorded account generation when flushing a rotation", async () => {
+		const dbOps = makeDbOps();
+		recordPendingRotation("acc-generation", {
+			accessToken: "access-1",
+			expiresAt: 12345,
+			refreshToken: "refresh-1",
+			attemptedRefreshToken: "old-refresh-1",
+			createdAt: 101,
+		});
+
+		await expect(flushPendingRotation("acc-generation", dbOps)).resolves.toBe(
+			"persisted",
+		);
+		expect(dbOps.updateAccountTokensIfRefreshTokenMatches).toHaveBeenCalledWith(
+			"acc-generation",
+			"old-refresh-1",
+			"access-1",
+			12345,
+			"refresh-1",
+			101,
+		);
+	});
 });
 
 describe("recordPendingRotation — anchor compression across chained rotations (round-3 final review, C1)", () => {
@@ -71,16 +229,19 @@ describe("recordPendingRotation — anchor compression across chained rotations 
 			expiresAt: 2,
 			refreshToken: "RT2",
 			attemptedRefreshToken: "RT1",
+			createdAt: 101,
 		});
 		recordPendingRotation("acc-1", {
 			accessToken: "access-3",
 			expiresAt: 3,
 			refreshToken: "RT3",
 			attemptedRefreshToken: "RT2",
+			createdAt: 101,
 		});
 
 		const entry = getPendingRotation("acc-1");
 		expect(entry?.attemptedRefreshToken).toBe("RT1");
+		expect(entry?.createdAt).toBe(101);
 		expect(entry?.refreshToken).toBe("RT3");
 		expect(entry?.accessToken).toBe("access-3");
 		expect(entry?.expiresAt).toBe(3);
@@ -97,6 +258,41 @@ describe("recordPendingRotation — anchor compression across chained rotations 
 			"access-3",
 			3,
 			"RT3",
+			101,
+		);
+	});
+
+	it("resets the anchor for a same-ID replacement generation", async () => {
+		recordPendingRotation("acc-1", {
+			accessToken: "access-old",
+			expiresAt: 1,
+			refreshToken: "RT-old-next",
+			attemptedRefreshToken: "RT-old",
+			createdAt: 101,
+		});
+		recordPendingRotation("acc-1", {
+			accessToken: "access-new",
+			expiresAt: 2,
+			refreshToken: "RT-new-next",
+			attemptedRefreshToken: "RT-new",
+			createdAt: 202,
+		});
+
+		const entry = getPendingRotation("acc-1");
+		expect(entry?.attemptedRefreshToken).toBe("RT-new");
+		expect(entry?.createdAt).toBe(202);
+
+		const dbOps = makeDbOps();
+		await expect(flushPendingRotation("acc-1", dbOps)).resolves.toBe(
+			"persisted",
+		);
+		expect(dbOps.updateAccountTokensIfRefreshTokenMatches).toHaveBeenCalledWith(
+			"acc-1",
+			"RT-new",
+			"access-new",
+			2,
+			"RT-new-next",
+			202,
 		);
 	});
 });
@@ -203,6 +399,30 @@ describe("flushPendingRotation — rebases the survivor's anchor after a concurr
 	});
 });
 
+describe("generation-bound pending rotation ownership", () => {
+	it("leaves a replacement generation entry untouched when an older generation inspects, clears, or flushes it", async () => {
+		const dbOps = makeDbOps();
+		recordPendingRotation("same-id", {
+			accessToken: "replacement-access",
+			expiresAt: 999,
+			refreshToken: "replacement-refresh",
+			attemptedRefreshToken: "replacement-old-refresh",
+			createdAt: 202,
+		});
+
+		expect(getPendingRotation("same-id", 101)).toBeUndefined();
+		clearPendingRotation("same-id", 101);
+		expect(await flushPendingRotation("same-id", dbOps, 101)).toBe("none");
+		expect(
+			dbOps.updateAccountTokensIfRefreshTokenMatches,
+		).not.toHaveBeenCalled();
+		expect(getPendingRotation("same-id")?.createdAt).toBe(202);
+		expect(getPendingRotation("same-id")?.accessToken).toBe(
+			"replacement-access",
+		);
+	});
+});
+
 describe("clearPendingRotation", () => {
 	it("removes the entry for the given account", () => {
 		recordPendingRotation("acc-1", {
@@ -268,6 +488,7 @@ describe("flushPendingRotation", () => {
 			expiresAt: 999,
 			refreshToken: "refresh-new",
 			attemptedRefreshToken: "",
+			createdAt: 101,
 		});
 
 		const outcome = await flushPendingRotation("acc-1", dbOps);
@@ -278,6 +499,7 @@ describe("flushPendingRotation", () => {
 			"access-1",
 			999,
 			"refresh-new",
+			101,
 		);
 		expect(
 			dbOps.updateAccountTokensIfRefreshTokenMatches,

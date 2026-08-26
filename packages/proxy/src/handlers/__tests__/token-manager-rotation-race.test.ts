@@ -10,7 +10,10 @@ import {
 	getPendingRotation,
 	recordPendingRotation,
 } from "../pending-rotation-registry";
-import { refreshAccessTokenSafe } from "../token-manager";
+import {
+	refreshAccessTokenSafe,
+	setRefreshInFlightForAccount,
+} from "../token-manager";
 
 beforeEach(() => {
 	clearAllPendingRotationsForTests();
@@ -82,7 +85,15 @@ function makeContext(opts: {
 		ctx: {
 			provider: { name: "fake-refresh-provider", refreshToken },
 			dbOps: {
-				getAccount: mock(async () => opts.dbAccount ?? null),
+				getAccount: mock(
+					async () =>
+						opts.dbAccount ??
+						makeAccount("current-generation-row", {
+							access_token: null,
+							expires_at: null,
+							refresh_token: "",
+						}),
+				),
 				setRequiresReauth,
 				updateAccountTokens: mock(async () => {}),
 				updateAccountTokensIfRefreshTokenMatches: mock(async () => true),
@@ -366,6 +377,7 @@ describe("refreshAccessTokenSafe — benign race on invalid_grant", () => {
 		expect(ctx.dbOps.flagRequiresReauthIfTokenMatches).toHaveBeenCalledWith(
 			"race-catch-flag-1",
 			"RT1-dead",
+			1,
 		);
 		expect(events).toHaveLength(1);
 	});
@@ -401,6 +413,7 @@ describe("refreshAccessTokenSafe — benign race on invalid_grant", () => {
 		expect(ctx.dbOps.flagRequiresReauthIfTokenMatches).toHaveBeenCalledWith(
 			"flag-cas-fail-1",
 			"RT1-dead",
+			1,
 		);
 		expect(events).toHaveLength(0);
 	});
@@ -468,6 +481,7 @@ describe("refreshAccessTokenSafe — benign race on invalid_grant", () => {
 		expect(ctx.dbOps.flagRequiresReauthIfTokenMatches).toHaveBeenCalledWith(
 			"flag-cas-rejects-1",
 			"RT1-dead",
+			1,
 		);
 		expect(events).toHaveLength(0);
 	});
@@ -510,6 +524,7 @@ describe("refreshAccessTokenSafe — persist-in-promise and identity-safe cleanu
 			"brand-new",
 			expect.any(Number),
 			"RT2",
+			1,
 		);
 		// The lossy asyncWriter queue must never be used for the token write.
 		expect(queuedJobs).toHaveLength(0);
@@ -540,6 +555,7 @@ describe("refreshAccessTokenSafe — persist-in-promise and identity-safe cleanu
 			"brand-new",
 			expect.any(Number),
 			undefined,
+			1,
 		);
 	});
 
@@ -611,7 +627,7 @@ describe("refreshAccessTokenSafe — join in-flight before backoff", () => {
 		const inFlightPromise = joinedRefresh().then(
 			(result: { accessToken: string }) => result.accessToken,
 		);
-		ctx.refreshInFlight.set(account.id, inFlightPromise);
+		setRefreshInFlightForAccount(ctx as never, account, inFlightPromise);
 
 		// Still well within the backoff window — a fresh caller with no
 		// in-flight entry would be blocked here; this caller must instead join
@@ -655,6 +671,7 @@ describe("refreshAccessTokenSafe — accounts with no refresh token to CAS again
 			"brand-new",
 			expect.any(Number),
 			undefined,
+			1,
 		);
 		expect(ctx.dbOps.updateAccountTokens).not.toHaveBeenCalled();
 		expect(
@@ -964,7 +981,7 @@ describe("refreshAccessTokenSafe — adopts authoritative DB credentials when th
 		});
 		let call = 0;
 		ctx.dbOps.getAccount = mock(async () =>
-			call++ === 0 ? preRefreshDb : manualReauthDb,
+			call++ < 2 ? preRefreshDb : manualReauthDb,
 		);
 		ctx.dbOps.updateAccountTokensIfRefreshTokenMatches = mock(
 			async () => false,
@@ -1017,7 +1034,7 @@ describe("refreshAccessTokenSafe — adopts authoritative DB credentials when th
 		});
 		let call = 0;
 		ctx.dbOps.getAccount = mock(async () =>
-			call++ === 0 ? preRefreshDb : expiredManualReauthDb,
+			call++ < 2 ? preRefreshDb : expiredManualReauthDb,
 		);
 		ctx.dbOps.updateAccountTokensIfRefreshTokenMatches = mock(
 			async () => false,
@@ -1034,7 +1051,7 @@ describe("refreshAccessTokenSafe — adopts authoritative DB credentials when th
 		expect(account.access_token).toBe("manual-access-expired");
 	});
 
-	it("falls back to the losing in-memory update when the post-persist re-read fails", async () => {
+	it("fails closed when post-persist generation verification cannot read the row", async () => {
 		const accountId = "adopt-authoritative-readfail-1";
 		const account = makeAccount(accountId, {
 			refresh_token: "RT1",
@@ -1062,13 +1079,11 @@ describe("refreshAccessTokenSafe — adopts authoritative DB credentials when th
 			async () => false,
 		);
 
-		const token = await refreshAccessTokenSafe(account as never, ctx as never);
-
-		expect(token).toBe("new-access-from-provider");
-		// Re-read failed — falls back to the pre-existing behavior of
-		// installing the (losing) result values in-memory.
-		expect(account.refresh_token).toBe("RT2-losing");
-		expect(account.access_token).toBe("new-access-from-provider");
+		await expect(
+			refreshAccessTokenSafe(account as never, ctx as never),
+		).rejects.toThrow("Failed to refresh access token");
+		expect(account.refresh_token).toBe("RT1");
+		expect(account.access_token).toBe("stale-access");
 	});
 });
 
@@ -1112,6 +1127,7 @@ describe("refreshAccessTokenSafe — serves the newest pending entry recorded du
 					expiresAt: Date.now() + 3_600_000,
 					refreshToken: "RT3",
 					attemptedRefreshToken: "RT2",
+					createdAt: 1,
 				});
 				return true;
 			},
@@ -1122,5 +1138,295 @@ describe("refreshAccessTokenSafe — serves the newest pending entry recorded du
 		expect(token).toBe("access-2");
 		expect(refreshToken).not.toHaveBeenCalled();
 		expect(getPendingRotation(accountId)?.accessToken).toBe("access-2");
+	});
+});
+
+describe("refreshAccessTokenSafe — account-generation fence", () => {
+	it("does not clear a replacement generation's pending rotation after A persists", async () => {
+		const account = makeAccount("generation-pending-owner", {
+			created_at: 100,
+			refresh_token: "refresh-a",
+		});
+		recordPendingRotation(account.id, {
+			accessToken: "pending-access-b",
+			expiresAt: Date.now() + 3_600_000,
+			refreshToken: "refresh-b-next",
+			attemptedRefreshToken: "refresh-b",
+			createdAt: 200,
+		});
+		const { ctx } = makeContext({
+			dbAccount: account,
+			refreshResult: {
+				accessToken: "fresh-access-a",
+				expiresAt: Date.now() + 3_600_000,
+				refreshToken: "refresh-a-next",
+			},
+		});
+
+		await expect(
+			refreshAccessTokenSafe(account as never, ctx as never),
+		).resolves.toBe("fresh-access-a");
+		expect(getPendingRotation(account.id)?.createdAt).toBe(200);
+		expect(getPendingRotation(account.id)?.accessToken).toBe(
+			"pending-access-b",
+		);
+	});
+
+	it("does not clear B's pending rotation when B replaces A during A's persist CAS", async () => {
+		const account = makeAccount("generation-pending-during-cas", {
+			created_at: 100,
+			refresh_token: "refresh-a",
+		});
+		const replacement = makeAccount(account.id, {
+			created_at: 200,
+			refresh_token: "refresh-b",
+			access_token: "access-b",
+			expires_at: Date.now() + 3_600_000,
+		});
+		const { ctx } = makeContext({
+			dbAccount: account,
+			refreshResult: {
+				accessToken: "fresh-access-a",
+				expiresAt: Date.now() + 3_600_000,
+				refreshToken: "refresh-a-next",
+			},
+		});
+		let current = account;
+		ctx.dbOps.getAccount = mock(async () => current);
+		ctx.dbOps.updateAccountTokensIfRefreshTokenMatches = mock(async () => {
+			current = replacement;
+			await recordPendingRotation(account.id, {
+				accessToken: "pending-access-b",
+				expiresAt: Date.now() + 3_600_000,
+				refreshToken: "refresh-b-next",
+				attemptedRefreshToken: "refresh-b",
+				createdAt: replacement.created_at,
+			});
+			return true;
+		});
+
+		await expect(
+			refreshAccessTokenSafe(account as never, ctx as never),
+		).rejects.toThrow("generation is no longer current");
+		expect(getPendingRotation(account.id)?.createdAt).toBe(200);
+		expect(getPendingRotation(account.id)?.accessToken).toBe(
+			"pending-access-b",
+		);
+	});
+
+	it("does not adopt a same-ID replacement row before refreshing", async () => {
+		const account = makeAccount("generation-pre-adopt", {
+			created_at: 100,
+			access_token: "access-from-generation-a",
+			refresh_token: "refresh-from-generation-a",
+			expires_at: 1,
+		});
+		const replacement = makeAccount("generation-pre-adopt", {
+			created_at: 200,
+			access_token: "access-from-generation-b",
+			refresh_token: "refresh-from-generation-b",
+			expires_at: Date.now() + 3_600_000,
+		});
+		const { ctx, refreshToken } = makeContext({ dbAccount: replacement });
+
+		await expect(
+			refreshAccessTokenSafe(account as never, ctx as never),
+		).rejects.toThrow("generation is no longer current");
+		expect(refreshToken).not.toHaveBeenCalled();
+		expect(account.access_token).toBe("access-from-generation-a");
+		expect(account.refresh_token).toBe("refresh-from-generation-a");
+	});
+
+	it("does not return a generation A in-flight token after replacement B is current", async () => {
+		const account = makeAccount("generation-stale-join", { created_at: 100 });
+		const replacement = makeAccount("generation-stale-join", {
+			created_at: 200,
+			access_token: "access-from-generation-b",
+			refresh_token: "refresh-from-generation-b",
+			expires_at: Date.now() + 3_600_000,
+		});
+		const { ctx, refreshToken } = makeContext({ dbAccount: replacement });
+		setRefreshInFlightForAccount(
+			ctx as never,
+			account,
+			Promise.resolve("access-from-generation-a"),
+		);
+
+		await expect(
+			refreshAccessTokenSafe(account as never, ctx as never),
+		).rejects.toThrow("generation is no longer current");
+		expect(refreshToken).not.toHaveBeenCalled();
+	});
+
+	it("does not let generation B join generation A's tracked in-flight promise", async () => {
+		const accountA = makeAccount("generation-inflight", { created_at: 100 });
+		const accountB = makeAccount("generation-inflight", {
+			created_at: 200,
+			access_token: "expired-generation-b",
+			refresh_token: "refresh-generation-b",
+			expires_at: 1,
+		});
+		const dbB = makeAccount("generation-inflight", {
+			created_at: 200,
+			access_token: "expired-generation-b",
+			refresh_token: "refresh-generation-b",
+			expires_at: 1,
+		});
+		const { ctx, refreshToken } = makeContext({
+			dbAccount: dbB,
+			refreshResult: {
+				accessToken: "access-from-generation-b",
+				expiresAt: Date.now() + 3_600_000,
+			},
+		});
+		const generationAPromise = Promise.resolve("access-from-generation-a");
+		setRefreshInFlightForAccount(ctx as never, accountA, generationAPromise);
+
+		const token = await refreshAccessTokenSafe(accountB as never, ctx as never);
+
+		expect(token).toBe("access-from-generation-b");
+		expect(refreshToken).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not adopt replacement credentials after a lost persist CAS", async () => {
+		const account = makeAccount("generation-lost-cas", {
+			created_at: 100,
+			access_token: "access-from-generation-a",
+			refresh_token: "refresh-from-generation-a",
+			expires_at: 1,
+		});
+		const current = makeAccount("generation-lost-cas", {
+			created_at: 100,
+			access_token: "access-from-generation-a",
+			refresh_token: "refresh-from-generation-a",
+			expires_at: 1,
+		});
+		const replacement = makeAccount("generation-lost-cas", {
+			created_at: 200,
+			access_token: "access-from-generation-b",
+			refresh_token: "refresh-from-generation-b",
+			expires_at: Date.now() + 3_600_000,
+		});
+		const { ctx } = makeContext({
+			refreshResult: {
+				accessToken: "access-losing-a",
+				expiresAt: Date.now() + 3_600_000,
+				refreshToken: "refresh-losing-a",
+			},
+		});
+		let reads = 0;
+		ctx.dbOps.getAccount = mock(async () =>
+			reads++ < 2 ? current : replacement,
+		);
+		ctx.dbOps.updateAccountTokensIfRefreshTokenMatches = mock(
+			async () => false,
+		);
+
+		await expect(
+			refreshAccessTokenSafe(account as never, ctx as never),
+		).rejects.toThrow("generation is no longer current");
+		expect(account.access_token).toBe("access-from-generation-a");
+		expect(account.refresh_token).toBe("refresh-from-generation-a");
+
+		// The stale generation's successful provider result must not seed the
+		// ID-keyed backoff maps: B is immediately allowed to refresh normally.
+		const replacementContext = makeContext({
+			dbAccount: replacement,
+			refreshResult: {
+				accessToken: "fresh-access-from-generation-b",
+				expiresAt: Date.now() + 3_600_000,
+			},
+		});
+		await expect(
+			refreshAccessTokenSafe(
+				replacement as never,
+				replacementContext.ctx as never,
+			),
+		).resolves.toBe("fresh-access-from-generation-b");
+		expect(replacementContext.refreshToken).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not let a stale generation consume the current generation's refresh backoff", async () => {
+		const accountId = "generation-backoff-owner";
+		const accountB = makeAccount(accountId, {
+			created_at: 200,
+			access_token: "expired-access-b",
+			refresh_token: "refresh-b",
+			expires_at: 1,
+		});
+		const accountA = makeAccount(accountId, {
+			created_at: 100,
+			access_token: "expired-access-a",
+			refresh_token: "refresh-a",
+			expires_at: 1,
+		});
+		const { ctx, refreshToken } = makeContext({
+			dbAccount: accountB,
+			refreshError: new Error("upstream timeout"),
+		});
+		let current = accountB;
+		ctx.dbOps.getAccount = mock(async () => current);
+
+		// B owns this ID and has a transient failure, which seeds its normal
+		// backoff. The restored durable row becomes valid before stale A arrives
+		// solely to make the old tenth-hit recovery path observable.
+		await expect(
+			refreshAccessTokenSafe(accountB as never, ctx as never),
+		).rejects.toThrow("Failed to refresh access token");
+		current = makeAccount(accountId, {
+			created_at: 200,
+			access_token: "current-access-b",
+			refresh_token: "refresh-b",
+			expires_at: Date.now() + 3_600_000,
+		});
+
+		// The old ID-only backoff path would increment B's counter here. On the
+		// tenth call it would read B's valid credentials and return them to A.
+		for (let attempt = 0; attempt < 10; attempt += 1) {
+			await expect(
+				refreshAccessTokenSafe(accountA as never, ctx as never),
+			).rejects.toThrow("generation is no longer current");
+		}
+
+		// B still observes its original backoff instead of having it consumed by A.
+		await expect(
+			refreshAccessTokenSafe(accountB as never, ctx as never),
+		).rejects.toThrow("backoff period");
+		expect(refreshToken).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not adopt or quarantine a replacement after definitive auth failure", async () => {
+		const account = makeAccount("generation-invalid-grant", {
+			created_at: 100,
+			access_token: "access-from-generation-a",
+			refresh_token: "refresh-from-generation-a",
+			expires_at: 1,
+		});
+		const current = makeAccount("generation-invalid-grant", {
+			created_at: 100,
+			access_token: "access-from-generation-a",
+			refresh_token: "refresh-from-generation-a",
+			expires_at: 1,
+		});
+		const replacement = makeAccount("generation-invalid-grant", {
+			created_at: 200,
+			access_token: "access-from-generation-b",
+			refresh_token: "refresh-from-generation-b",
+			expires_at: Date.now() + 3_600_000,
+		});
+		const { ctx } = makeContext({
+			refreshError: new OAuthRefreshTokenError("invalid_grant", "rejected"),
+		});
+		let reads = 0;
+		ctx.dbOps.getAccount = mock(async () =>
+			reads++ === 0 ? current : replacement,
+		);
+
+		await expect(
+			refreshAccessTokenSafe(account as never, ctx as never),
+		).rejects.toThrow("generation is no longer current");
+		expect(ctx.dbOps.flagRequiresReauthIfTokenMatches).not.toHaveBeenCalled();
+		expect(account.access_token).toBe("access-from-generation-a");
+		expect(account.refresh_token).toBe("refresh-from-generation-a");
 	});
 });

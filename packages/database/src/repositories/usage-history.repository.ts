@@ -100,6 +100,7 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 		accountId: string,
 		windows: CanonicalUsageWindow[],
 		now: number,
+		expectedCreatedAt?: number,
 	): Promise<void> {
 		// Build one value tuple per window, then insert them all in a SINGLE
 		// statement. A multi-row INSERT is atomic (all-or-nothing) on both SQLite
@@ -121,9 +122,29 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 		const rows = Array.from({ length: count }, () => "(?, ?, ?, ?, ?, ?)").join(
 			", ",
 		);
+		if (expectedCreatedAt === undefined) {
+			await this.run(
+				`INSERT INTO usage_snapshots (account_id, timestamp, window_key, utilization, resets_at, active)
+				 VALUES ${rows}`,
+				params,
+			);
+			return;
+		}
+
+		// A CTE makes the generation guard one statement across SQLite and
+		// PostgreSQL. Either every canonical window is inserted for the exact
+		// account row, or the SELECT produces zero rows after a same-ID replacement.
+		params.push(accountId, expectedCreatedAt);
 		await this.run(
-			`INSERT INTO usage_snapshots (account_id, timestamp, window_key, utilization, resets_at, active)
-			 VALUES ${rows}`,
+			`WITH snapshot_rows (account_id, timestamp, window_key, utilization, resets_at, active) AS (
+				VALUES ${rows}
+			)
+			INSERT INTO usage_snapshots (account_id, timestamp, window_key, utilization, resets_at, active)
+			SELECT account_id, timestamp, window_key, utilization, resets_at, active
+			FROM snapshot_rows
+			WHERE EXISTS (
+				SELECT 1 FROM accounts WHERE id = ? AND created_at = ?
+			)`,
 			params,
 		);
 	}

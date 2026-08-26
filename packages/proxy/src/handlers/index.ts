@@ -89,17 +89,22 @@ export {
 export {
 	type CodexUsageRefreshOutcome,
 	clearAccountRefreshCache,
+	clearAutoRefreshTrackingForAccount,
 	extractAuthFailureReason,
 	getValidAccessToken,
 	isDefinitiveAuthFailure,
 	markAccountTokensFresh,
 	pauseAccountForReauthIfInvalidGrant,
 	refreshCodexUsageForAccount,
+	registerAutoRefreshTrackingClearer,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
 	registerRefreshClearer,
 	restartUsagePollingForAccount,
+	unregisterAutoRefreshTrackingClearer,
 	unregisterCodexUsageRefresher,
+	unregisterPollingRestarter,
+	unregisterRefreshClearer,
 } from "./token-manager";
 export {
 	type BindingConstraint,

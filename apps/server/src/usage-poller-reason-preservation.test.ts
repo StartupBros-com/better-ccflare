@@ -1,7 +1,11 @@
-import { describe, expect, it } from "bun:test";
-import type { TokenRefreshResult } from "@better-ccflare/providers";
+import { describe, expect, it, spyOn } from "bun:test";
+import { type TokenRefreshResult, usageCache } from "@better-ccflare/providers";
 import type { Account, RateLimitReason } from "@better-ccflare/types";
-import { refreshPollingAccessToken } from "./server";
+import {
+	refreshPollingAccessToken,
+	startUsagePollingWithRefresh,
+} from "./server";
+import { UsagePollingLifecycle } from "./usage-polling-lifecycle";
 
 /**
  * R25 (OAuth control-plane hotfix, U8 pro-gate): refreshPollingAccessToken
@@ -104,6 +108,88 @@ function makeNeverCalledPauseSpies() {
 }
 
 describe("refreshPollingAccessToken (R25: no temporary resume/restore)", () => {
+	it("fails closed without adopting credentials when its snapshot row was deleted", async () => {
+		const account = makeAccount({
+			access_token: "access-from-generation-a",
+			refresh_token: "refresh-from-generation-a",
+		});
+		const dbOps = {
+			getAccount: async (_id: string) => null,
+			...makeNeverCalledPauseSpies(),
+		};
+		const proxyContext = {
+			dbOps,
+			refreshInFlight: new Map<string, Promise<string>>(),
+		} as unknown as Parameters<typeof refreshPollingAccessToken>[1];
+
+		await expect(
+			refreshPollingAccessToken(account, proxyContext),
+		).rejects.toThrow("generation is no longer current");
+		expect(account.access_token).toBe("access-from-generation-a");
+		expect(account.refresh_token).toBe("refresh-from-generation-a");
+	});
+
+	it("fails closed without adopting replacement credentials for the same account ID", async () => {
+		const account = makeAccount({
+			created_at: 100,
+			access_token: "access-from-generation-a",
+			refresh_token: "refresh-from-generation-a",
+		});
+		const replacement = makeAccount({
+			created_at: 200,
+			access_token: "access-from-generation-b",
+			refresh_token: "refresh-from-generation-b",
+		});
+		const dbOps = {
+			getAccount: async (_id: string) => replacement,
+			...makeNeverCalledPauseSpies(),
+		};
+		const proxyContext = {
+			dbOps,
+			refreshInFlight: new Map<string, Promise<string>>(),
+		} as unknown as Parameters<typeof refreshPollingAccessToken>[1];
+
+		await expect(
+			refreshPollingAccessToken(account, proxyContext),
+		).rejects.toThrow("generation is no longer current");
+		expect(account.access_token).toBe("access-from-generation-a");
+		expect(account.refresh_token).toBe("refresh-from-generation-a");
+	});
+
+	it("fails closed when the row is replaced while getValidAccessToken awaits", async () => {
+		const account = makeAccount({
+			created_at: 100,
+			access_token: "access-from-generation-a",
+			refresh_token: "refresh-from-generation-a",
+		});
+		const current = makeAccount({
+			created_at: 100,
+			access_token: "access-from-generation-a",
+			refresh_token: "refresh-from-generation-a",
+		});
+		const replacement = makeAccount({
+			created_at: 200,
+			access_token: "access-from-generation-b",
+			refresh_token: "refresh-from-generation-b",
+		});
+		let reads = 0;
+		const dbOps = {
+			getAccount: async (_id: string) =>
+				reads++ === 0 ? current : replacement,
+			...makeNeverCalledPauseSpies(),
+		};
+		const proxyContext = {
+			dbOps,
+			refreshInFlight: new Map<string, Promise<string>>(),
+		} as unknown as Parameters<typeof refreshPollingAccessToken>[1];
+
+		await expect(
+			refreshPollingAccessToken(account, proxyContext),
+		).rejects.toThrow("generation is no longer current");
+		expect(account.access_token).toBe("access-from-generation-a");
+		expect(account.refresh_token).toBe("refresh-from-generation-a");
+	});
+
 	it("leaves a terminally-paused account's pause state completely untouched (fast path, no refresh needed)", async () => {
 		const account = makeAccount({
 			paused: true,
@@ -124,7 +210,7 @@ describe("refreshPollingAccessToken (R25: no temporary resume/restore)", () => {
 		const token = await refreshPollingAccessToken(account, proxyContext);
 
 		expect(token).toBe("at-fixture-valid");
-		expect(calls).toEqual(["getAccount"]);
+		expect(calls).toEqual(["getAccount", "getAccount"]);
 		expect(account.paused).toBe(true);
 		expect(account.pause_reason).toBe("oauth_invalid_grant");
 	});
@@ -146,7 +232,7 @@ describe("refreshPollingAccessToken (R25: no temporary resume/restore)", () => {
 		const token = await refreshPollingAccessToken(account, proxyContext);
 
 		expect(token).toBe("at-fixture-valid");
-		expect(calls).toEqual(["getAccount"]);
+		expect(calls).toEqual(["getAccount", "getAccount"]);
 		expect(account.paused).toBe(false);
 	});
 });
@@ -179,6 +265,7 @@ describe("refreshPollingAccessToken (R25: no temporary resume/restore)", () => {
  * modeling the production persistence contract.
  */
 function makeRotationProxyContext(state: {
+	created_at: number;
 	paused: boolean;
 	pause_reason: string | null;
 	refresh_token: string;
@@ -237,6 +324,97 @@ function makeRotationProxyContext(state: {
 	return { proxyContext, calls, state };
 }
 
+describe("startUsagePollingWithRefresh lease ownership", () => {
+	it("does not retain retry state after a failed start loses its durable generation", async () => {
+		const account = makeAccount({ created_at: 100 });
+		let durableAccount: Account | null = account;
+		const scheduledRetries: Array<{ callback: () => void; delayMs: number }> =
+			[];
+		const lifecycle = new UsagePollingLifecycle<number>({
+			schedule: (callback, delayMs) => {
+				scheduledRetries.push({ callback, delayMs });
+				return scheduledRetries.length;
+			},
+			cancel: () => {},
+		});
+		const startPolling = spyOn(usageCache, "startPolling").mockImplementation(
+			() => {
+				durableAccount = makeAccount({ created_at: 200 });
+				throw new Error("usage cache registration failed");
+			},
+		);
+		const proxyContext = {
+			dbOps: {
+				getAccount: async (_id: string) => durableAccount,
+			},
+		} as unknown as Parameters<typeof startUsagePollingWithRefresh>[1];
+
+		try {
+			startUsagePollingWithRefresh(
+				account,
+				proxyContext,
+				{} as never,
+				{} as never,
+				lifecycle,
+			);
+			for (let i = 0; i < 4; i++) await Promise.resolve();
+
+			expect(startPolling).toHaveBeenCalledTimes(1);
+			expect(scheduledRetries).toEqual([]);
+		} finally {
+			startPolling.mockRestore();
+		}
+	});
+
+	it("passes the refresh lease generation to alert and ledger snapshot writes", async () => {
+		const account = makeAccount({ created_at: 100 });
+		let snapshotCallback:
+			| ((payload: { accountId: string; windows: never[] }) => void)
+			| undefined;
+		const alertCalls: unknown[][] = [];
+		const ledgerCalls: unknown[][] = [];
+		const startPolling = spyOn(usageCache, "startPolling").mockImplementation(
+			(...args) => {
+				snapshotCallback = args[7] as typeof snapshotCallback;
+			},
+		);
+		const lifecycle = new UsagePollingLifecycle<number>({
+			schedule: () => 1,
+			cancel: () => {},
+		});
+		try {
+			startUsagePollingWithRefresh(
+				account,
+				{
+					dbOps: {
+						getAccount: async () => account,
+						recordUsageSnapshot: async () => {},
+					},
+				} as never,
+				{
+					evaluateUsageSnapshot: async (...args: unknown[]) => {
+						alertCalls.push(args);
+					},
+				} as never,
+				{
+					observeSnapshot: async (...args: unknown[]) => {
+						ledgerCalls.push(args);
+					},
+				} as never,
+				lifecycle,
+			);
+			for (let i = 0; i < 4; i++) await Promise.resolve();
+			expect(snapshotCallback).toBeDefined();
+			snapshotCallback?.({ accountId: account.id, windows: [] });
+			for (let i = 0; i < 20; i++) await Promise.resolve();
+			expect(alertCalls[0]?.[4]).toBe(account.created_at);
+			expect(ledgerCalls[0]?.[3]).toBe(account.created_at);
+		} finally {
+			startPolling.mockRestore();
+		}
+	});
+});
+
 describe("refreshPollingAccessToken (R25: rotation no longer defeats the pause)", () => {
 	it("leaves a manually-paused account paused even when the refresh rotates the refresh token", async () => {
 		const account = makeAccount({
@@ -251,6 +429,7 @@ describe("refreshPollingAccessToken (R25: rotation no longer defeats the pause)"
 			provider: "fixture-rotating-provider",
 		});
 		const { proxyContext, calls, state } = makeRotationProxyContext({
+			created_at: account.created_at,
 			paused: true,
 			pause_reason: "manual",
 			refresh_token: "rt-old",
@@ -273,7 +452,10 @@ describe("refreshPollingAccessToken (R25: rotation no longer defeats the pause)"
 			"getAccount",
 			"getAccount",
 			"provider.refreshToken",
+			"getAccount",
 			"updateAccountTokensIfRefreshTokenMatches",
+			"getAccount",
+			"getAccount",
 		]);
 	});
 });

@@ -19,7 +19,10 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { Config } from "@better-ccflare/config";
-import { normalizeProviderUsageWindows } from "@better-ccflare/core";
+import {
+	alertEvents,
+	normalizeProviderUsageWindows,
+} from "@better-ccflare/core";
 import { BunSqlAdapter, ensureSchema } from "@better-ccflare/database";
 import type { AlertEvent } from "@better-ccflare/types";
 import { AlertService } from "../alerts";
@@ -45,6 +48,7 @@ function makeConfig(
 			overrides.usageWindowThresholdPercent ?? 90,
 		getAlertAnomalyEnabled: () => false,
 		getAlertAnomalyIntervalMinutes: () => 15,
+		getAlertAnomalyBaselineWindowMinutes: () => 60,
 		getAlertAnomalyLoopMinRequests: () => 25,
 		getAlertCooldownMinutes: () => overrides.cooldownMinutes ?? 60,
 		getAlertWebhookUrl: () => "",
@@ -710,5 +714,96 @@ describe("AlertService usage-window alerts", () => {
 			(a) => a.type === "usage_window_threshold",
 		);
 		expect(alerts).toHaveLength(1);
+	});
+
+	it("does not persist or emit an exhaustion alert after its history await loses the account generation", async () => {
+		const accountId = "generation-alert-account";
+		const generationA = 100;
+		const generationB = 200;
+		const now = 1_800_000_000_000;
+		const resetsAtMs = now + 60 * 60 * 1000;
+		sqlite.run("INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)", [
+			accountId,
+			"generation A",
+			generationA,
+		]);
+		seedSnapshot(sqlite, {
+			accountId,
+			timestamp: now - 60 * 60 * 1000,
+			windowKey: "five_hour",
+			utilization: 50,
+			resetsAt: resetsAtMs,
+		});
+		seedSnapshot(sqlite, {
+			accountId,
+			timestamp: now - 30 * 60 * 1000,
+			windowKey: "five_hour",
+			utilization: 65,
+			resetsAt: resetsAtMs,
+		});
+		let replaced = false;
+		class ReplaceAfterHistoryQueryAdapter extends BunSqlAdapter {
+			async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
+				const rows = await super.query<T>(sql, params);
+				if (!replaced && sql.includes("FROM usage_snapshots")) {
+					replaced = true;
+					sqlite.run("DELETE FROM accounts WHERE id = ?", [accountId]);
+					sqlite.run(
+						"INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)",
+						[accountId, "generation B", generationB],
+					);
+				}
+				return rows;
+			}
+		}
+		service = new AlertService(
+			new ReplaceAfterHistoryQueryAdapter(sqlite),
+			makeConfig({ usageWindowThresholdPercent: 99 }),
+		);
+		const events: unknown[] = [];
+		const listener = (event: unknown) => events.push(event);
+		alertEvents.on("event", listener);
+		try {
+			await service.evaluateUsageSnapshot(
+				accountId,
+				"generation A",
+				anthropicWindows({
+					five_hour: {
+						utilization: 80,
+						resets_at: new Date(resetsAtMs).toISOString(),
+					},
+				}),
+				now,
+				generationA,
+			);
+		} finally {
+			alertEvents.off("event", listener);
+		}
+		expect(replaced).toBe(true);
+		expect(await service.listAlerts()).toHaveLength(0);
+		expect(events).toHaveLength(0);
+	});
+
+	it("does not persist a threshold alert when the replacement generation already exists", async () => {
+		const accountId = "generation-threshold-account";
+		sqlite.run("INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)", [
+			accountId,
+			"generation B",
+			200,
+		]);
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		await service.evaluateUsageSnapshot(
+			accountId,
+			"generation A",
+			anthropicWindows({
+				five_hour: {
+					utilization: 95,
+					resets_at: new Date(1_800_000_000_000 + FIVE_HOURS_MS).toISOString(),
+				},
+			}),
+			1_800_000_000_000,
+			100,
+		);
+		expect(await service.listAlerts()).toHaveLength(0);
 	});
 });

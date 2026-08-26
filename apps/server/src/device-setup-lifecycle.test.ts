@@ -10,6 +10,7 @@ mock.module("@better-ccflare/database", () => ({
 }));
 
 class MockHttpApiService {}
+const restorePendingRotations = mock(async () => 0);
 
 mock.module("@better-ccflare/http-api", () => ({
 	AlertService: MockHttpApiService,
@@ -27,6 +28,7 @@ mock.module("@better-ccflare/openai-responses-adapter", () => ({
 }));
 mock.module("@better-ccflare/providers", () => ({
 	CODEX_DEFAULT_ENDPOINT: "https://example.invalid",
+	CODEX_PING_MODEL: "test-model",
 	fetchCodexUsageData: async () => null,
 	fetchCodexUsageOnDemand: async () => null,
 	extractWeeklyResetTime: () => null,
@@ -81,23 +83,32 @@ mock.module("@better-ccflare/proxy", () => {
 		handleProxy: async () => new Response(),
 		initModelCatalogRefresh: () => () => {},
 		initProxy: () => {},
+		lowestTierCodexModel: () => null,
 		markAccountTokensFresh: () => {},
 		ModelRouteSessionRegistry: class {},
 		parseModelRouteProfiles: () => [],
+		recordCodexUsageSnapshot: async () => {},
 		refreshModelCatalog: async () => ({ success: true }),
+		registerAutoRefreshTrackingClearer: () => {},
 		registerCodexUsageRefresher: () => {},
 		registerPollingRestarter: () => {},
 		registerRefreshClearer: () => {},
-		restorePendingRotations: async () => {},
+		restorePendingRotations,
 		startGlobalTokenHealthChecks: () => {},
 		startIntegrityScheduler: () => () => {},
 		stopGlobalTokenHealthChecks: () => {},
+		unregisterAutoRefreshTrackingClearer: () => {},
 		unregisterCodexUsageRefresher: () => {},
+		unregisterPollingRestarter: () => {},
+		unregisterRefreshClearer: () => {},
 	};
 });
 
-const { DEVICE_SETUP_RECOVERY_INTERVAL_MS, startDeviceSetupRecoveryLifecycle } =
-	await import("./server");
+const {
+	DEVICE_SETUP_RECOVERY_INTERVAL_MS,
+	restorePendingRotationsBeforeRuntimeRefresh,
+	startDeviceSetupRecoveryLifecycle,
+} = await import("./server");
 
 function deferred() {
 	let resolve!: () => void;
@@ -106,6 +117,25 @@ function deferred() {
 	});
 	return { promise, resolve };
 }
+
+describe("pending rotation startup restore", () => {
+	it("supplies the durable account resolver before runtime refresh can start", async () => {
+		const getAccount = mock(async (accountId: string) =>
+			accountId === "legacy-account" ? { created_at: 2468 } : null,
+		);
+		restorePendingRotations.mockImplementationOnce(async (resolver) => {
+			expect(await resolver("legacy-account")).toEqual({ created_at: 2468 });
+			expect(await resolver("missing-account")).toBeNull();
+			return 1;
+		});
+
+		await expect(
+			restorePendingRotationsBeforeRuntimeRefresh({ getAccount } as never),
+		).resolves.toBe(1);
+		expect(getAccount).toHaveBeenCalledWith("legacy-account");
+		expect(getAccount).toHaveBeenCalledWith("missing-account");
+	});
+});
 
 describe("device setup recovery lifecycle", () => {
 	it("runs one bounded startup tick before scheduling periodic recovery", async () => {

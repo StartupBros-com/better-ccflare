@@ -28,10 +28,35 @@ import {
 	getPendingRotation,
 	recordPendingRotation,
 } from "./handlers/pending-rotation-registry";
+import {
+	getRefreshInFlightForAccount,
+	setRefreshInFlightForAccount,
+} from "./handlers/token-manager";
 import { stampInternalAutoRefreshAuth } from "./internal-probe-auth";
 import type { ProxyContext } from "./proxy";
 
 const log = new Logger("AutoRefreshScheduler");
+
+class StaleProactiveGenerationError extends Error {
+	constructor(accountId: string) {
+		super(
+			`Account ${accountId} generation is no longer current; refusing stale proactive credential work`,
+		);
+	}
+}
+
+/** Bun.SQL returns PostgreSQL BIGINT columns as strings, unlike SQLite. */
+function normalizeRawAccountCreatedAt<
+	T extends { created_at: number | string },
+>(row: T): Omit<T, "created_at"> & { created_at: number } {
+	return { ...row, created_at: Number(row.created_at) };
+}
+
+function normalizeRawCreatedAt(
+	createdAt: number | string | null | undefined,
+): number | null {
+	return createdAt == null ? null : Number(createdAt);
+}
 
 function isZaiPeakHour(ts = Date.now()): boolean {
 	const d = new Date(ts);
@@ -78,6 +103,10 @@ export class AutoRefreshScheduler {
 	];
 	private uncountedProbeFailures: Map<string, { at: number; streak: number }> =
 		new Map();
+	// Per-active-account identity tokens fence work that was already awaiting a
+	// probe response when the row was deleted or replaced. Unlike numeric
+	// tombstones, deletion removes the token and cannot retain unbounded IDs.
+	private accountTokens: Map<string, object> = new Map();
 	// The release time already reported for an exhausted prompt pool. Comparing
 	// against it turns the per-minute retry into one warning per dry-pool episode.
 	private promptPoolExhaustedReportedFor: number | null = null;
@@ -125,6 +154,7 @@ export class AutoRefreshScheduler {
 			clearProbeBackoff(accountId);
 		}
 		this.uncountedProbeFailures.clear();
+		this.accountTokens.clear();
 		this.promptPoolExhaustedReportedFor = null;
 	}
 
@@ -177,22 +207,24 @@ export class AutoRefreshScheduler {
 			await this.checkPeakHoursPause();
 
 			// Get all accounts with auto-refresh enabled that have reset windows OR need immediate refresh
-			const accounts = await this.db.query<{
-				id: string;
-				name: string;
-				provider: string;
-				refresh_token: string | null;
-				access_token: string | null;
-				expires_at: number | null;
-				rate_limit_reset: number | null;
-				custom_endpoint: string | null;
-				paused: number;
-				auto_pause_on_overage_enabled: number;
-				pause_reason: string | null;
-			}>(
-				`
+			const accounts = (
+				await this.db.query<{
+					id: string;
+					created_at: number | string;
+					name: string;
+					provider: string;
+					refresh_token: string | null;
+					access_token: string | null;
+					expires_at: number | null;
+					rate_limit_reset: number | null;
+					custom_endpoint: string | null;
+					paused: number;
+					auto_pause_on_overage_enabled: number;
+					pause_reason: string | null;
+				}>(
+					`
 				SELECT
-					id, name, provider, refresh_token, access_token,
+					id, created_at, name, provider, refresh_token, access_token,
 					expires_at, rate_limit_reset, custom_endpoint,
 					COALESCE(paused, 0) as paused,
 					COALESCE(auto_pause_on_overage_enabled, 0) as auto_pause_on_overage_enabled,
@@ -231,8 +263,9 @@ export class AutoRefreshScheduler {
 						OR pause_reason = 'failure_threshold'
 					)
 			`,
-				[now, now, now],
-			);
+					[now, now, now],
+				)
+			).map(normalizeRawAccountCreatedAt);
 
 			log.debug(
 				`Auto-refresh check found ${accounts.length} account(s) to consider`,
@@ -300,6 +333,26 @@ export class AutoRefreshScheduler {
 		}
 	}
 
+	/** Check that this probe still owns the exact durable account row. */
+	private async isCurrentProbeGeneration(
+		accountRow: { id: string; created_at?: number | null },
+		token: object,
+	): Promise<boolean> {
+		if (this.accountTokens.get(accountRow.id) !== token) return false;
+		// Direct unit callers historically supplied no row identity. Production rows
+		// always include created_at from checkAndRefresh; only those rows can start a
+		// provider probe, and must be checked against the durable current row.
+		if (accountRow.created_at == null) return true;
+		const current = await this.db.get<{ created_at: number | string | null }>(
+			"SELECT created_at FROM accounts WHERE id = ?",
+			[accountRow.id],
+		);
+		return (
+			this.accountTokens.get(accountRow.id) === token &&
+			normalizeRawCreatedAt(current?.created_at) === accountRow.created_at
+		);
+	}
+
 	/**
 	 * Send a dummy message to refresh the usage window for an account
 	 * @returns true if the refresh was successful, false otherwise
@@ -316,7 +369,37 @@ export class AutoRefreshScheduler {
 		paused: number;
 		auto_pause_on_overage_enabled: number;
 		pause_reason: string | null;
+		created_at?: number | null;
 	}): Promise<boolean> {
+		const existingToken = this.accountTokens.get(accountRow.id);
+		let token: object;
+		let createdToken = false;
+		if (existingToken) {
+			token = existingToken;
+		} else {
+			// Do not recreate tracking after deletion cleanup just to reject a stale
+			// scheduler row. The durable row check must happen before this row gets a
+			// new token; the second check below closes the delete-after-read race.
+			if (accountRow.created_at != null) {
+				const current = await this.db.get<{
+					created_at: number | string | null;
+				}>("SELECT created_at FROM accounts WHERE id = ?", [accountRow.id]);
+				if (
+					normalizeRawCreatedAt(current?.created_at) !== accountRow.created_at
+				)
+					return false;
+			}
+			token = {};
+			createdToken = true;
+			this.accountTokens.set(accountRow.id, token);
+		}
+		const isCurrent = () => this.isCurrentProbeGeneration(accountRow, token);
+		if (!(await isCurrent())) {
+			if (createdToken && this.accountTokens.get(accountRow.id) === token) {
+				this.accountTokens.delete(accountRow.id);
+			}
+			return false;
+		}
 		// Hoisted so the catch path can return an unsent prompt to the pool.
 		let claimIndex: number | null = null;
 		let probeSent = false;
@@ -369,7 +452,7 @@ export class AutoRefreshScheduler {
 				request_count: 0,
 				total_requests: 0,
 				last_used: null,
-				created_at: 0,
+				created_at: accountRow.created_at ?? 0,
 				rate_limited_until: null,
 				rate_limited_reason: null,
 				rate_limited_at: null,
@@ -497,8 +580,12 @@ export class AutoRefreshScheduler {
 					// handleProxy consumes it at ingress before metadata or forwarding.
 					const authorizedHeaders = new Headers(headers);
 					stampInternalAutoRefreshAuth(authorizedHeaders);
-					// Past this line the text may already be on the wire, so the
-					// prompt stays claimed however the request ends.
+					// A stale lease must return the unused prompt before it becomes sent.
+					if (!(await isCurrent())) {
+						return false;
+					}
+					// Past this line the text may already be on the wire, so the prompt
+					// stays claimed however the request ends.
 					probeSent = true;
 					response = await fetch(endpoint, {
 						method: "POST",
@@ -506,6 +593,9 @@ export class AutoRefreshScheduler {
 						body: JSON.stringify(requestBody),
 						signal: AbortSignal.timeout(30000),
 					});
+					if (!(await isCurrent())) {
+						return false;
+					}
 
 					log.debug(
 						`Auto-refresh response status: ${response.status} ${response.statusText}`,
@@ -533,6 +623,9 @@ export class AutoRefreshScheduler {
 
 			// If we couldn't get any successful response
 			if (!response) {
+				if (!(await isCurrent())) {
+					return false;
+				}
 				const errorMsg = lastError?.message || "All models failed";
 				log.error(
 					`Failed to send auto-refresh message to ${accountRow.name} with any model: ${errorMsg}`,
@@ -543,6 +636,9 @@ export class AutoRefreshScheduler {
 
 			// Handle authentication errors specifically
 			if (response.status === 401) {
+				if (!(await isCurrent())) {
+					return false;
+				}
 				log.error(
 					`❌ AUTHENTICATION FAILED: Account "${accountRow.name}" needs manual reauthentication`,
 				);
@@ -562,9 +658,10 @@ export class AutoRefreshScheduler {
 
 				// Mark account as needing attention in database (disable auto-refresh to prevent repeated failures)
 				await this.db.run(
-					`UPDATE accounts SET auto_refresh_enabled = 0 WHERE id = ?`,
-					[accountRow.id],
+					`UPDATE accounts SET auto_refresh_enabled = 0 WHERE id = ? AND created_at = ?`,
+					[accountRow.id, accountRow.created_at],
 				);
+				if (!(await isCurrent())) return false;
 
 				log.error(
 					`🚫 Auto-refresh has been DISABLED for account "${accountRow.name}" until reauthentication is completed`,
@@ -577,6 +674,9 @@ export class AutoRefreshScheduler {
 			}
 
 			if (response.ok) {
+				if (!(await isCurrent())) {
+					return false;
+				}
 				log.info(
 					`Auto-refresh message sent successfully for account: ${accountRow.name}`,
 				);
@@ -587,11 +687,15 @@ export class AutoRefreshScheduler {
 				let responseText = "";
 				try {
 					responseText = await response.text();
+					if (!(await isCurrent())) {
+						return false;
+					}
 					log.info(
 						`Auto-refresh response for ${accountRow.name}: ${responseText}`,
 					);
 				} catch (e) {
 					log.warn(`Could not read response body for ${accountRow.name}: ${e}`);
+					if (!(await isCurrent())) return false;
 				}
 
 				// Use the provider's parseRateLimit method to get unified rate limit info
@@ -600,9 +704,12 @@ export class AutoRefreshScheduler {
 				// Update rate limit fields from unified headers
 				if (rateLimitInfo.resetTime) {
 					await this.db.run(
-						"UPDATE accounts SET rate_limit_reset = ?, rate_limited_until = NULL WHERE id = ?",
-						[rateLimitInfo.resetTime, accountRow.id],
+						"UPDATE accounts SET rate_limit_reset = ?, rate_limited_until = NULL WHERE id = ? AND created_at = ?",
+						[rateLimitInfo.resetTime, accountRow.id, accountRow.created_at],
 					);
+					if (!(await isCurrent())) {
+						return false;
+					}
 
 					// Update our tracking with the NEW rate_limit_reset from the API
 					this.lastRefreshResetTime.set(accountRow.id, rateLimitInfo.resetTime);
@@ -617,9 +724,12 @@ export class AutoRefreshScheduler {
 					// Even if no reset time is provided, clear rate_limited_until as the refresh was successful
 					// Also make sure to clear any existing rate_limited_until value to ensure the account is not stuck
 					await this.db.run(
-						"UPDATE accounts SET rate_limited_until = NULL WHERE id = ?",
-						[accountRow.id],
+						"UPDATE accounts SET rate_limited_until = NULL WHERE id = ? AND created_at = ?",
+						[accountRow.id, accountRow.created_at],
 					);
+					if (!(await isCurrent())) {
+						return false;
+					}
 					log.info(
 						`Cleared rate_limited_until for ${accountRow.name} as account has been refreshed (no new reset time)`,
 					);
@@ -627,9 +737,12 @@ export class AutoRefreshScheduler {
 
 				if (rateLimitInfo.statusHeader) {
 					await this.db.run(
-						"UPDATE accounts SET rate_limit_status = ? WHERE id = ?",
-						[rateLimitInfo.statusHeader, accountRow.id],
+						"UPDATE accounts SET rate_limit_status = ? WHERE id = ? AND created_at = ?",
+						[rateLimitInfo.statusHeader, accountRow.id, accountRow.created_at],
 					);
+					if (!(await isCurrent())) {
+						return false;
+					}
 					log.info(
 						`Updated rate_limit_status for ${accountRow.name} to ${rateLimitInfo.statusHeader}`,
 					);
@@ -637,9 +750,12 @@ export class AutoRefreshScheduler {
 
 				if (rateLimitInfo.remaining !== undefined) {
 					await this.db.run(
-						"UPDATE accounts SET rate_limit_remaining = ? WHERE id = ?",
-						[rateLimitInfo.remaining, accountRow.id],
+						"UPDATE accounts SET rate_limit_remaining = ? WHERE id = ? AND created_at = ?",
+						[rateLimitInfo.remaining, accountRow.id, accountRow.created_at],
 					);
+					if (!(await isCurrent())) {
+						return false;
+					}
 					log.info(
 						`Updated rate_limit_remaining for ${accountRow.name} to ${rateLimitInfo.remaining}`,
 					);
@@ -658,9 +774,12 @@ export class AutoRefreshScheduler {
 						`Auto-resuming account '${accountRow.name}' — failure_threshold cleared after successful probe`,
 					);
 					await this.db.run(
-						"UPDATE accounts SET paused = 0, pause_reason = NULL WHERE id = ?",
-						[accountRow.id],
+						"UPDATE accounts SET paused = 0, pause_reason = NULL WHERE id = ? AND created_at = ?",
+						[accountRow.id, accountRow.created_at],
 					);
+					if (!(await isCurrent())) {
+						return false;
+					}
 					this.lastFailureProbeAt.delete(accountRow.id);
 				} else if (
 					accountRow.auto_pause_on_overage_enabled === 1 &&
@@ -671,9 +790,10 @@ export class AutoRefreshScheduler {
 						`Auto-resuming account '${accountRow.name}' after window reset (auto-pause-on-overage enabled)`,
 					);
 					await this.db.run(
-						"UPDATE accounts SET paused = 0, pause_reason = NULL WHERE id = ?",
-						[accountRow.id],
+						"UPDATE accounts SET paused = 0, pause_reason = NULL WHERE id = ? AND created_at = ?",
+						[accountRow.id, accountRow.created_at],
 					);
+					if (!(await isCurrent())) return false;
 				}
 
 				if (accountRow.provider === "anthropic") {
@@ -683,23 +803,27 @@ export class AutoRefreshScheduler {
 						account,
 						this.proxyContext,
 					);
+					if (!(await isCurrent())) return false;
 					if (accessToken) {
 						const { data: usageData } = await fetchUsageData(accessToken);
+						if (!(await isCurrent())) return false;
 						if (usageData) {
 							log.info(
 								`Fetched usage data for ${accountRow.name}: 5h=${usageData.five_hour?.utilization ?? "?"}%, 7d=${usageData.seven_day?.utilization ?? "?"}%`,
 							);
-							this.proxyContext.dbOps
-								.recordUsageSnapshot(
+							try {
+								await this.proxyContext.dbOps.recordUsageSnapshot(
 									accountRow.id,
 									normalizeProviderUsageWindows(usageData, accountRow.provider),
 									Date.now(),
-								)
-								.catch((err) =>
-									log.warn(
-										`Failed to record usage snapshot for ${accountRow.name}: ${err}`,
-									),
+									accountRow.created_at ?? undefined,
 								);
+							} catch (err) {
+								log.warn(
+									`Failed to record usage snapshot for ${accountRow.name}: ${err}`,
+								);
+							}
+							if (!(await isCurrent())) return false;
 						} else {
 							log.warn(
 								`Failed to fetch usage data for ${accountRow.name} after auto-refresh`,
@@ -730,6 +854,7 @@ export class AutoRefreshScheduler {
 			} catch {
 				// Ignore error reading body
 			}
+			if (!(await isCurrent())) return false;
 
 			// A 529 (overloaded_error) is a deliberate throttle/overload signal —
 			// either better-ccflare's own usage-throttling (should no longer reach
@@ -740,6 +865,9 @@ export class AutoRefreshScheduler {
 			// previously auto-paused a healthy-but-throttled account the instant
 			// its usage window reset and the scheduler re-probed it.
 			if (response.status === 529) {
+				if (!(await isCurrent())) {
+					return false;
+				}
 				log.warn(
 					`Auto-refresh probe for ${accountRow.name} received 529 (overloaded/throttled) — not counting toward the ${this.FAILURE_THRESHOLD}-failure pause threshold`,
 				);
@@ -748,10 +876,15 @@ export class AutoRefreshScheduler {
 			}
 
 			// Track consecutive failures for this account (for non-401 errors too)
+			if (!(await isCurrent())) {
+				return false;
+			}
 			await this.recordRefreshFailure(
 				accountRow.id,
 				accountRow.name,
 				"(non-401 error)",
+				isCurrent,
+				accountRow.created_at,
 			);
 
 			return false;
@@ -775,18 +908,23 @@ export class AutoRefreshScheduler {
 				);
 			}
 
-			if (!probeSent && claimIndex !== null) {
-				releaseAutoRefreshPrompt(claimIndex);
-			}
-
 			// Track consecutive failures for this account (for exceptions too)
+			if (!(await isCurrent())) {
+				return false;
+			}
 			await this.recordRefreshFailure(
 				accountRow.id,
 				accountRow.name,
 				"(exception)",
+				isCurrent,
+				accountRow.created_at,
 			);
 
 			return false;
+		} finally {
+			if (!probeSent && claimIndex !== null) {
+				releaseAutoRefreshPrompt(claimIndex);
+			}
 		}
 	}
 
@@ -799,7 +937,10 @@ export class AutoRefreshScheduler {
 		accountId: string,
 		accountName: string,
 		context: string,
+		isCurrent: () => Promise<boolean> = async () => true,
+		createdAt?: number | null,
 	): Promise<void> {
+		if (!(await isCurrent())) return;
 		const currentFailures = this.consecutiveFailures.get(accountId) || 0;
 		const newFailures = currentFailures + 1;
 		this.consecutiveFailures.set(accountId, newFailures);
@@ -810,13 +951,18 @@ export class AutoRefreshScheduler {
 
 		if (newFailures >= this.FAILURE_THRESHOLD) {
 			try {
-				// Guarded on the account still being active so this generic
-				// failure_threshold reason never overwrites a more specific reason
-				// (e.g. oauth_invalid_grant) already set by the token-refresh chokepoint.
+				// The row predicate protects a same-ID replacement while the UPDATE is
+				// in flight; the second lease check below prevents that old completion
+				// from deleting failure state that belongs to the replacement.
+				if (!(await isCurrent())) return;
+				const rowIdentityClause =
+					createdAt == null ? "" : " AND created_at = ?";
 				const changes = await this.db.runWithChanges(
-					`UPDATE accounts SET paused = 1, pause_reason = 'failure_threshold' WHERE id = ? AND COALESCE(paused, 0) = 0`,
-					[accountId],
+					`UPDATE accounts SET paused = 1, pause_reason = 'failure_threshold'
+					 WHERE id = ?${rowIdentityClause} AND COALESCE(paused, 0) = 0`,
+					createdAt == null ? [accountId] : [accountId, createdAt],
 				);
+				if (!(await isCurrent())) return;
 				// Clear the counter regardless so subsequent scheduler cycles don't fire
 				// redundant DB writes and log entries — the account is paused either way.
 				this.consecutiveFailures.delete(accountId);
@@ -846,17 +992,19 @@ export class AutoRefreshScheduler {
 		const now = Date.now();
 		const expiryThreshold = now + TOKEN_SAFETY_WINDOW_MS;
 
-		const accounts = await this.db.query<{
-			id: string;
-			name: string;
-			provider: string;
-			refresh_token: string;
-			access_token: string | null;
-			expires_at: number | null;
-			custom_endpoint: string | null;
-		}>(
-			`
-			SELECT id, name, provider, refresh_token, access_token, expires_at, custom_endpoint
+		const accounts = (
+			await this.db.query<{
+				id: string;
+				name: string;
+				provider: string;
+				refresh_token: string;
+				access_token: string | null;
+				expires_at: number | null;
+				custom_endpoint: string | null;
+				created_at: number | string;
+			}>(
+				`
+			SELECT id, name, provider, refresh_token, access_token, expires_at, custom_endpoint, created_at
 			FROM accounts
 			WHERE
 				provider IN ('qwen', 'xai')
@@ -872,8 +1020,9 @@ export class AutoRefreshScheduler {
 					OR expires_at <= ?
 				)
 		`,
-			[expiryThreshold],
-		);
+				[expiryThreshold],
+			)
+		).map(normalizeRawAccountCreatedAt);
 
 		if (accounts.length === 0) return;
 
@@ -891,7 +1040,11 @@ export class AutoRefreshScheduler {
 			// itself or by whatever superseded it) — refreshing with it now
 			// would replay an already-consumed token. Skip this row for this
 			// cycle either way; the next cycle re-reads it fresh.
-			const flush = await flushPendingRotation(row.id, this.proxyContext.dbOps);
+			const flush = await flushPendingRotation(
+				row.id,
+				this.proxyContext.dbOps,
+				row.created_at,
+			);
 			if (flush !== "none") {
 				log.warn(
 					`Skipping proactive ${row.provider} refresh for ${row.name} this cycle: row snapshot predates a pending-rotation flush (${flush})`,
@@ -900,7 +1053,7 @@ export class AutoRefreshScheduler {
 			}
 
 			// Skip if a refresh is already in-flight for this account (deduplication)
-			if (this.proxyContext.refreshInFlight.has(row.id)) {
+			if (getRefreshInFlightForAccount(this.proxyContext, row)) {
 				log.debug(
 					`Skipping proactive ${row.provider} refresh for ${row.name} — refresh already in-flight`,
 				);
@@ -929,7 +1082,7 @@ export class AutoRefreshScheduler {
 					request_count: 0,
 					total_requests: 0,
 					last_used: null,
-					created_at: 0,
+					created_at: row.created_at,
 					rate_limited_until: null,
 					rate_limited_reason: null,
 					rate_limited_at: null,
@@ -959,6 +1112,10 @@ export class AutoRefreshScheduler {
 				const refreshPromise = provider
 					.refreshToken(account, this.proxyContext.runtime.clientId)
 					.then(async (result) => {
+						// The provider exchange may complete after this same ID was
+						// deleted/recreated. Do not persist, queue, or return A's
+						// credentials into B.
+						await this.requireCurrentProactiveGeneration(row);
 						const newRefreshToken = result.refreshToken ?? row.refresh_token;
 						// CAS: only persist if the row still holds the refresh token this
 						// attempt used — a rotation that landed underneath (manual re-auth,
@@ -976,21 +1133,25 @@ export class AutoRefreshScheduler {
 									result.accessToken,
 									result.expiresAt,
 									newRefreshToken,
+									row.created_at,
 								);
 						} catch (persistError) {
 							// The provider already committed the rotation. Durably record it
 							// before resolving any joiner so a process crash cannot lose the
 							// only copy of the new refresh token.
+							await this.requireCurrentProactiveGeneration(row);
 							await recordPendingRotation(row.id, {
 								accessToken: result.accessToken,
 								expiresAt: result.expiresAt,
 								refreshToken: newRefreshToken,
 								attemptedRefreshToken: row.refresh_token,
+								createdAt: row.created_at,
 							});
 							log.error(
 								`Failed to persist refreshed ${row.provider} token for ${row.name} — rotation queued for re-persist`,
 								persistError,
 							);
+							await this.requireCurrentProactiveGeneration(row);
 							return result.accessToken;
 						}
 						if (!persisted) {
@@ -999,6 +1160,7 @@ export class AutoRefreshScheduler {
 						log.info(
 							`${row.provider} token refreshed for ${row.name}, expires at ${new Date(result.expiresAt).toISOString()}`,
 						);
+						await this.requireCurrentProactiveGeneration(row);
 						return result.accessToken;
 					})
 					.finally(() => {
@@ -1012,7 +1174,7 @@ export class AutoRefreshScheduler {
 						}
 					});
 
-				this.proxyContext.refreshInFlight.set(row.id, refreshPromise);
+				setRefreshInFlightForAccount(this.proxyContext, row, refreshPromise);
 				await refreshPromise;
 			} catch (error) {
 				log.error(
@@ -1027,6 +1189,7 @@ export class AutoRefreshScheduler {
 					name: row.name,
 					provider: row.provider,
 					refresh_token: row.refresh_token,
+					created_at: row.created_at,
 				});
 			}
 		}
@@ -1042,17 +1205,19 @@ export class AutoRefreshScheduler {
 		const now = Date.now();
 		const expiryThreshold = now + TOKEN_SAFETY_WINDOW_MS;
 
-		const accounts = await this.db.query<{
-			id: string;
-			name: string;
-			provider: string;
-			refresh_token: string;
-			access_token: string | null;
-			expires_at: number | null;
-			custom_endpoint: string | null;
-		}>(
-			`
-			SELECT id, name, provider, refresh_token, access_token, expires_at, custom_endpoint
+		const accounts = (
+			await this.db.query<{
+				id: string;
+				name: string;
+				provider: string;
+				refresh_token: string;
+				access_token: string | null;
+				expires_at: number | null;
+				custom_endpoint: string | null;
+				created_at: number | string;
+			}>(
+				`
+			SELECT id, name, provider, refresh_token, access_token, expires_at, custom_endpoint, created_at
 			FROM accounts
 			WHERE
 				provider = 'codex'
@@ -1068,8 +1233,9 @@ export class AutoRefreshScheduler {
 					OR expires_at <= ?
 				)
 		`,
-			[expiryThreshold],
-		);
+				[expiryThreshold],
+			)
+		).map(normalizeRawAccountCreatedAt);
 
 		if (accounts.length === 0) return;
 
@@ -1088,7 +1254,11 @@ export class AutoRefreshScheduler {
 			// would replay an already-consumed token, and on Codex specifically
 			// reuse-detection can invalidate the whole token family. Skip this
 			// row for this cycle either way; the next cycle re-reads it fresh.
-			const flush = await flushPendingRotation(row.id, this.proxyContext.dbOps);
+			const flush = await flushPendingRotation(
+				row.id,
+				this.proxyContext.dbOps,
+				row.created_at,
+			);
 			if (flush !== "none") {
 				log.warn(
 					`Skipping proactive Codex refresh for ${row.name} this cycle: row snapshot predates a pending-rotation flush (${flush})`,
@@ -1097,7 +1267,7 @@ export class AutoRefreshScheduler {
 			}
 
 			// Skip if a refresh is already in-flight for this account (deduplication)
-			if (this.proxyContext.refreshInFlight.has(row.id)) {
+			if (getRefreshInFlightForAccount(this.proxyContext, row)) {
 				log.debug(
 					`Skipping proactive Codex refresh for ${row.name} — refresh already in-flight`,
 				);
@@ -1124,7 +1294,7 @@ export class AutoRefreshScheduler {
 					request_count: 0,
 					total_requests: 0,
 					last_used: null,
-					created_at: 0,
+					created_at: row.created_at,
 					rate_limited_until: null,
 					rate_limited_reason: null,
 					rate_limited_at: null,
@@ -1154,6 +1324,10 @@ export class AutoRefreshScheduler {
 				const refreshPromise = provider
 					.refreshToken(account, this.proxyContext.runtime.clientId)
 					.then(async (result) => {
+						// The provider exchange may complete after this same ID was
+						// deleted/recreated. Do not persist, queue, or return A's
+						// credentials into B.
+						await this.requireCurrentProactiveGeneration(row);
 						const newRefreshToken = result.refreshToken ?? row.refresh_token;
 						// CAS: only persist if the row still holds the refresh token this
 						// attempt used — a rotation that landed underneath (manual re-auth,
@@ -1171,18 +1345,22 @@ export class AutoRefreshScheduler {
 									result.accessToken,
 									result.expiresAt,
 									newRefreshToken,
+									row.created_at,
 								);
 						} catch (persistError) {
+							await this.requireCurrentProactiveGeneration(row);
 							await recordPendingRotation(row.id, {
 								accessToken: result.accessToken,
 								expiresAt: result.expiresAt,
 								refreshToken: newRefreshToken,
 								attemptedRefreshToken: row.refresh_token,
+								createdAt: row.created_at,
 							});
 							log.error(
 								`Failed to persist refreshed Codex token for ${row.name} — rotation queued for re-persist`,
 								persistError,
 							);
+							await this.requireCurrentProactiveGeneration(row);
 							return result.accessToken;
 						}
 						if (!persisted) {
@@ -1191,6 +1369,7 @@ export class AutoRefreshScheduler {
 						log.info(
 							`Codex token refreshed for ${row.name}, expires at ${new Date(result.expiresAt).toISOString()}`,
 						);
+						await this.requireCurrentProactiveGeneration(row);
 						return result.accessToken;
 					})
 					.finally(() => {
@@ -1204,7 +1383,7 @@ export class AutoRefreshScheduler {
 						}
 					});
 
-				this.proxyContext.refreshInFlight.set(row.id, refreshPromise);
+				setRefreshInFlightForAccount(this.proxyContext, row, refreshPromise);
 				await refreshPromise;
 			} catch (error) {
 				log.error(
@@ -1219,8 +1398,20 @@ export class AutoRefreshScheduler {
 					name: row.name,
 					provider: row.provider,
 					refresh_token: row.refresh_token,
+					created_at: row.created_at,
 				});
 			}
+		}
+	}
+
+	/** Verify the durable row still belongs to this proactive refresh attempt. */
+	private async requireCurrentProactiveGeneration(row: {
+		id: string;
+		created_at: number;
+	}): Promise<void> {
+		const account = await this.proxyContext.dbOps.getAccount(row.id);
+		if (!account || account.created_at !== row.created_at) {
+			throw new StaleProactiveGenerationError(row.id);
 		}
 	}
 
@@ -1233,10 +1424,14 @@ export class AutoRefreshScheduler {
 		id: string;
 		name: string;
 		provider: string;
+		created_at: number;
 	}): Promise<string> {
 		const account = await this.proxyContext.dbOps.getAccount(row.id);
+		if (account?.created_at !== row.created_at) {
+			throw new StaleProactiveGenerationError(row.id);
+		}
 		if (
-			account?.access_token &&
+			account.access_token &&
 			typeof account.expires_at === "number" &&
 			account.expires_at - Date.now() > TOKEN_SAFETY_WINDOW_MS
 		) {
@@ -1256,7 +1451,13 @@ export class AutoRefreshScheduler {
 	 */
 	private async flagIfDefinitiveAuthFailure(
 		error: unknown,
-		row: { id: string; name: string; provider: string; refresh_token: string },
+		row: {
+			id: string;
+			name: string;
+			provider: string;
+			refresh_token: string;
+			created_at: number;
+		},
 	): Promise<void> {
 		const reason =
 			error instanceof OAuthRefreshTokenError
@@ -1264,7 +1465,23 @@ export class AutoRefreshScheduler {
 				: getOAuthErrorCode(error);
 		if (!reason) return;
 
-		if (getPendingRotation(row.id)) {
+		try {
+			await this.requireCurrentProactiveGeneration(row);
+		} catch (generationError) {
+			if (generationError instanceof StaleProactiveGenerationError) {
+				log.warn(
+					`Skipping requires_reauth for ${row.name}: its proactive refresh generation is stale`,
+				);
+				return;
+			}
+			log.warn(
+				`Could not verify account generation before quarantining ${row.name} — leaving requires_reauth unset`,
+				generationError,
+			);
+			return;
+		}
+
+		if (getPendingRotation(row.id, row.created_at)) {
 			log.warn(
 				`Skipping requires_reauth for ${row.name}: a successful rotation is awaiting persist (replayed a consumed token)`,
 			);
@@ -1276,6 +1493,7 @@ export class AutoRefreshScheduler {
 			flagged = await this.proxyContext.dbOps.flagRequiresReauthIfTokenMatches(
 				row.id,
 				row.refresh_token,
+				row.created_at,
 			);
 		} catch (writeError) {
 			log.warn(
@@ -1299,6 +1517,22 @@ export class AutoRefreshScheduler {
 			provider: row.provider,
 			reason,
 		});
+	}
+
+	/**
+	 * Remove all tracking state for a single account. Used when an account is
+	 * deleted so its entries don't linger until the next `cleanupTracking()`
+	 * sweep (up to 60s later) or server shutdown.
+	 */
+	clearAccountTracking(accountId: string): void {
+		// Retire first so an in-flight probe cannot repopulate any state after the
+		// deletion/replacement cleanup has completed.
+		this.accountTokens.delete(accountId);
+		this.lastRefreshResetTime.delete(accountId);
+		this.consecutiveFailures.delete(accountId);
+		this.lastFailureProbeAt.delete(accountId);
+		this.uncountedProbeFailures.delete(accountId);
+		clearProbeBackoff(accountId);
 	}
 
 	/**
@@ -1359,6 +1593,11 @@ export class AutoRefreshScheduler {
 						`Removed uncounted-failure cooldown tracking for account ${accountId} (no longer exists or auto-refresh disabled)`,
 					);
 				}
+			}
+
+			for (const accountId of this.accountTokens.keys()) {
+				if (!activeAccountIdSet.has(accountId))
+					this.accountTokens.delete(accountId);
 			}
 		} catch (error) {
 			if (error instanceof Error) {

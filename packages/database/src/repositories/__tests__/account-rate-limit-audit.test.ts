@@ -258,6 +258,75 @@ describe("AccountRepository - clearRateLimitState", () => {
 			consecutive_rate_limits: 0,
 		});
 	});
+
+	it("does not clear a same-ID replacement when the expected creation differs", async () => {
+		const accountId = "acc-replacement-rate-limit";
+		const originalCreatedAt = 1_000;
+		const replacementCreatedAt = 2_000;
+		db.run(
+			`INSERT INTO accounts (id, name, created_at, rate_limited_until, rate_limited_reason, session_start, session_request_count)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			[
+				accountId,
+				"replacement",
+				replacementCreatedAt,
+				Date.now() + 60_000,
+				"upstream_429_with_reset",
+				7_000,
+				9,
+			],
+		);
+
+		const changes = await repo.clearRateLimitState(
+			accountId,
+			originalCreatedAt,
+		);
+		const row = db
+			.query<
+				{
+					rate_limited_until: number | null;
+					rate_limited_reason: string | null;
+					session_start: number | null;
+					session_request_count: number;
+				},
+				[string]
+			>(
+				`SELECT rate_limited_until, rate_limited_reason, session_start, session_request_count
+				 FROM accounts WHERE id = ?`,
+			)
+			.get(accountId);
+
+		expect(changes).toBe(0);
+		expect(row).toEqual({
+			rate_limited_until: expect.any(Number),
+			rate_limited_reason: "upstream_429_with_reset",
+			session_start: 7_000,
+			session_request_count: 9,
+		});
+	});
+
+	it("does not reset a same-ID replacement session when the expected creation differs", async () => {
+		const accountId = "acc-replacement-session";
+		const originalCreatedAt = 1_000;
+		const replacementCreatedAt = 2_000;
+		db.run(
+			`INSERT INTO accounts (id, name, created_at, session_start, session_request_count)
+			 VALUES (?, ?, ?, ?, ?)`,
+			[accountId, "replacement", replacementCreatedAt, 7_000, 9],
+		);
+
+		await repo.resetSession(accountId, 8_000, originalCreatedAt);
+		const row = db
+			.query<
+				{ session_start: number | null; session_request_count: number },
+				[string]
+			>(
+				"SELECT session_start, session_request_count FROM accounts WHERE id = ?",
+			)
+			.get(accountId);
+
+		expect(row).toEqual({ session_start: 7_000, session_request_count: 9 });
+	});
 });
 
 describe("AccountRepository - markAccountRateLimited MAX-style clamp under concurrent writers", () => {

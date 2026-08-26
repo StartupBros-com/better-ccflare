@@ -1,68 +1,76 @@
 import { sseResponse } from "@better-ccflare/http-common";
-import { Logger, logBus } from "@better-ccflare/logger";
+import { logBus } from "@better-ccflare/logger";
 import type { LogEvent } from "@better-ccflare/types";
-
-const log = new Logger("LogsHandler");
 
 /**
  * Create a logs stream handler using Server-Sent Events
  */
 export function createLogsStreamHandler() {
 	return (req: Request): Response => {
-		// Use TransformStream for better Bun compatibility
-		const { readable, writable } = new TransformStream();
-		const writer = writable.getWriter();
-		const encoder = new TextEncoder();
-		let closed = false;
-		let handleLogEvent: ((event: LogEvent) => Promise<void>) | null = null;
+		if (req.signal.aborted) {
+			return sseResponse(
+				new ReadableStream({
+					start(controller) {
+						controller.close();
+					},
+				}),
+			);
+		}
 
-		// Send initial connection message
-		(async () => {
-			try {
-				const initialData = `data: ${JSON.stringify({ connected: true })}\n\n`;
-				await writer.write(encoder.encode(initialData));
-			} catch (e) {
-				log.error("Error sending initial message:", e);
+		let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+		let handleLogEvent: ((event: LogEvent) => void) | null = null;
+		let cleanedUp = false;
+		const handleAbort = () => cleanup();
+
+		const cleanup = () => {
+			if (cleanedUp) return;
+			cleanedUp = true;
+
+			if (handleLogEvent) {
+				logBus.off("log", handleLogEvent);
+				handleLogEvent = null;
 			}
-		})();
-
-		// Listen for log events
-		handleLogEvent = async (event: LogEvent) => {
-			if (closed) return;
-
+			req.signal.removeEventListener("abort", handleAbort);
 			try {
-				const data = `data: ${JSON.stringify(event)}\n\n`;
-				await writer.write(encoder.encode(data));
-			} catch (_error) {
-				// Stream closed
-				closed = true;
-				if (handleLogEvent) {
-					logBus.off("log", handleLogEvent);
-					handleLogEvent = null;
-				}
-				try {
-					await writer.close();
-				} catch {}
+				controller?.close();
+			} catch {
+				// The consumer may already have cancelled the stream.
 			}
 		};
 
-		// Subscribe to log events
-		logBus.on("log", handleLogEvent);
+		req.signal.addEventListener("abort", handleAbort);
 
-		// Clean up on abort signal
-		req.signal?.addEventListener("abort", () => {
-			if (!closed) {
-				closed = true;
-				if (handleLogEvent) {
-					logBus.off("log", handleLogEvent);
-					handleLogEvent = null;
-				}
+		const stream = new ReadableStream<Uint8Array>({
+			start(streamController) {
+				controller = streamController;
+				const encoder = new TextEncoder();
+
+				handleLogEvent = (event: LogEvent) => {
+					if (cleanedUp) return;
+					try {
+						streamController.enqueue(
+							encoder.encode(`data: ${JSON.stringify(event)}\n\n`),
+						);
+					} catch {
+						cleanup();
+					}
+				};
+
 				try {
-					writer.close();
-				} catch {}
-			}
+					streamController.enqueue(
+						encoder.encode(`data: ${JSON.stringify({ connected: true })}\n\n`),
+					);
+				} catch {
+					cleanup();
+					return;
+				}
+				logBus.on("log", handleLogEvent);
+			},
+			cancel() {
+				cleanup();
+			},
 		});
 
-		return sseResponse(readable);
+		return sseResponse(stream);
 	};
 }

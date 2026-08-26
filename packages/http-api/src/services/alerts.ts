@@ -657,6 +657,7 @@ export class AlertService {
 		accountName: string,
 		windows: CanonicalUsageWindow[],
 		timestamp: number,
+		expectedCreatedAt?: number,
 	): Promise<void> {
 		if (windows.length === 0) return;
 		const config = getAlertsConfig(this.config);
@@ -681,7 +682,12 @@ export class AlertService {
 				timestamp,
 			);
 			if (thresholdAlert) {
-				await this.persistUsageWindowAlert(thresholdAlert, config.webhookUrl);
+				await this.persistUsageWindowAlert(
+					thresholdAlert,
+					config.webhookUrl,
+					accountId,
+					expectedCreatedAt,
+				);
 			}
 			// Projection is best-effort per window: a history lookup failing for
 			// one window must not cancel evaluation of the remaining windows.
@@ -698,6 +704,8 @@ export class AlertService {
 					await this.persistUsageWindowAlert(
 						exhaustionAlert,
 						config.webhookUrl,
+						accountId,
+						expectedCreatedAt,
 					);
 				}
 			} catch (error) {
@@ -711,6 +719,8 @@ export class AlertService {
 	private async persistUsageWindowAlert(
 		alert: AlertEvent,
 		webhookUrl: string,
+		accountId: string,
+		expectedCreatedAt?: number,
 	): Promise<void> {
 		// Jitter <2s can move the minute bucket by exactly one when the reset
 		// instant sits near a half-minute boundary — treat an alert already
@@ -723,7 +733,13 @@ export class AlertService {
 		const neighborIds = m
 			? [`${m[1]}:${Number(m[2]) - 1}`, `${m[1]}:${Number(m[2]) + 1}`]
 			: [];
-		await this.persistAndEmit(alert, webhookUrl, neighborIds);
+		await this.persistAndEmit(
+			alert,
+			webhookUrl,
+			neighborIds,
+			accountId,
+			expectedCreatedAt,
+		);
 	}
 
 	private buildUsageWindowThresholdAlert(
@@ -893,6 +909,7 @@ export class AlertService {
 	async evaluateClosedWindow(
 		window: UsageWindow,
 		accountName: string,
+		expectedCreatedAt?: number,
 	): Promise<void> {
 		if (window.valueUsd == null) return;
 		const config = getAlertsConfig(this.config);
@@ -943,7 +960,13 @@ export class AlertService {
 			requestId: null,
 			acknowledged: false,
 		};
-		await this.persistAndEmit(alert, config.webhookUrl);
+		await this.persistAndEmit(
+			alert,
+			config.webhookUrl,
+			[],
+			window.accountId,
+			expectedCreatedAt,
+		);
 	}
 
 	async listAlerts(limit = 100): Promise<AlertEvent[]> {
@@ -1237,6 +1260,8 @@ export class AlertService {
 		alert: AlertEvent,
 		webhookUrl: string,
 		suppressIfExistingIds: string[] = [],
+		accountId?: string,
+		expectedCreatedAt?: number,
 	): Promise<void> {
 		try {
 			// INSERT OR IGNORE is SQLite-only; PostgreSQL uses ON CONFLICT DO NOTHING.
@@ -1253,13 +1278,22 @@ export class AlertService {
 			// inside the INSERT ... SELECT statement so it evaluates under the
 			// same snapshot as the insert instead of a separate, raceable
 			// pre-check.
-			const suppressClause =
-				suppressIfExistingIds.length > 0
-					? `WHERE NOT EXISTS (SELECT 1 FROM alerts WHERE id IN (${suppressIfExistingIds.map(() => "?").join(", ")}))`
-					: "";
+			const hasGenerationFence =
+				accountId !== undefined && expectedCreatedAt !== undefined;
+			const conditions: string[] = [];
+			if (hasGenerationFence) {
+				conditions.push(
+					"EXISTS (SELECT 1 FROM accounts WHERE id = ? AND created_at = ?)",
+				);
+			}
+			if (suppressIfExistingIds.length > 0) {
+				conditions.push(
+					`NOT EXISTS (SELECT 1 FROM alerts WHERE id IN (${suppressIfExistingIds.map(() => "?").join(", ")}))`,
+				);
+			}
 			const valuesSource =
-				suppressIfExistingIds.length > 0
-					? `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? ${suppressClause}`
+				conditions.length > 0
+					? `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${conditions.join(" AND ")}`
 					: "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 			const inserted = await this.db.runWithChanges(
 				`
@@ -1283,6 +1317,7 @@ export class AlertService {
 					alert.project,
 					alert.requestId,
 					alert.acknowledged ? 1 : 0,
+					...(hasGenerationFence ? [accountId, expectedCreatedAt] : []),
 					...suppressIfExistingIds,
 				],
 			);

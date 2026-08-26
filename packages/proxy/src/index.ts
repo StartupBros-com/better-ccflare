@@ -121,6 +121,7 @@ export {
 	checkAllAccountsHealth,
 	checkRefreshTokenHealth,
 	clearAccountRefreshCache,
+	clearAutoRefreshTrackingForAccount,
 	createGuardCorrelationVerifier,
 	createUsageThrottledResponse,
 	formatTokenHealthReport,
@@ -133,6 +134,7 @@ export {
 	isRefreshTokenLikelyExpired,
 	markAccountTokensFresh,
 	refreshCodexUsageForAccount,
+	registerAutoRefreshTrackingClearer,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
 	registerRefreshClearer,
@@ -141,9 +143,13 @@ export {
 	stopGlobalTokenHealthChecks,
 	type TokenHealthReport,
 	type TokenHealthStatus,
+	unregisterAutoRefreshTrackingClearer,
 	unregisterCodexUsageRefresher,
+	unregisterPollingRestarter,
+	unregisterRefreshClearer,
 } from "./handlers";
 export {
+	clearPendingRotationForDeletedAccount,
 	configurePendingRotationPersistence,
 	restorePendingRotations,
 } from "./handlers/pending-rotation-registry";

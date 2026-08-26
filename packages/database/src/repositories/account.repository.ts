@@ -127,11 +127,16 @@ export class AccountRepository extends BaseRepository<Account> {
 		accessToken: string,
 		expiresAt: number,
 		refreshToken?: string,
+		expectedCreatedAt?: number,
 	): Promise<boolean> {
 		const now = Date.now();
+		const generationClause =
+			expectedCreatedAt === undefined ? "" : " AND created_at = ?";
+		const generationParams =
+			expectedCreatedAt === undefined ? [] : [expectedCreatedAt];
 		if (refreshToken) {
 			const changes = await this.runWithChanges(
-				`UPDATE accounts SET access_token = ?, expires_at = ?, refresh_token = ?, refresh_token_issued_at = ?, requires_reauth = 0 WHERE id = ? AND refresh_token = ?`,
+				`UPDATE accounts SET access_token = ?, expires_at = ?, refresh_token = ?, refresh_token_issued_at = ?, requires_reauth = 0 WHERE id = ? AND refresh_token = ?${generationClause}`,
 				[
 					accessToken,
 					expiresAt,
@@ -139,13 +144,20 @@ export class AccountRepository extends BaseRepository<Account> {
 					now,
 					accountId,
 					expectedRefreshToken,
+					...generationParams,
 				],
 			);
 			return changes > 0;
 		}
 		const changes = await this.runWithChanges(
-			`UPDATE accounts SET access_token = ?, expires_at = ?, requires_reauth = 0 WHERE id = ? AND refresh_token = ?`,
-			[accessToken, expiresAt, accountId, expectedRefreshToken],
+			`UPDATE accounts SET access_token = ?, expires_at = ?, requires_reauth = 0 WHERE id = ? AND refresh_token = ?${generationClause}`,
+			[
+				accessToken,
+				expiresAt,
+				accountId,
+				expectedRefreshToken,
+				...generationParams,
+			],
 		);
 		return changes > 0;
 	}
@@ -155,18 +167,30 @@ export class AccountRepository extends BaseRepository<Account> {
 		accessToken: string,
 		expiresAt: number,
 		refreshToken?: string,
+		expectedCreatedAt?: number,
 	): Promise<boolean> {
 		const now = Date.now();
+		const generationClause =
+			expectedCreatedAt === undefined ? "" : " AND created_at = ?";
+		const generationParams =
+			expectedCreatedAt === undefined ? [] : [expectedCreatedAt];
 		if (refreshToken) {
 			const changes = await this.runWithChanges(
-				`UPDATE accounts SET access_token = ?, expires_at = ?, refresh_token = ?, refresh_token_issued_at = ?, requires_reauth = 0 WHERE id = ? AND (refresh_token IS NULL OR refresh_token = '')`,
-				[accessToken, expiresAt, refreshToken, now, accountId],
+				`UPDATE accounts SET access_token = ?, expires_at = ?, refresh_token = ?, refresh_token_issued_at = ?, requires_reauth = 0 WHERE id = ? AND (refresh_token IS NULL OR refresh_token = '')${generationClause}`,
+				[
+					accessToken,
+					expiresAt,
+					refreshToken,
+					now,
+					accountId,
+					...generationParams,
+				],
 			);
 			return changes > 0;
 		}
 		const changes = await this.runWithChanges(
-			`UPDATE accounts SET access_token = ?, expires_at = ?, requires_reauth = 0 WHERE id = ? AND (refresh_token IS NULL OR refresh_token = '')`,
-			[accessToken, expiresAt, accountId],
+			`UPDATE accounts SET access_token = ?, expires_at = ?, requires_reauth = 0 WHERE id = ? AND (refresh_token IS NULL OR refresh_token = '')${generationClause}`,
+			[accessToken, expiresAt, accountId, ...generationParams],
 		);
 		return changes > 0;
 	}
@@ -174,10 +198,15 @@ export class AccountRepository extends BaseRepository<Account> {
 	async flagRequiresReauthIfTokenMatches(
 		accountId: string,
 		expectedRefreshToken: string,
+		expectedCreatedAt?: number,
 	): Promise<boolean> {
+		const generationClause =
+			expectedCreatedAt === undefined ? "" : " AND created_at = ?";
 		const changes = await this.runWithChanges(
-			`UPDATE accounts SET requires_reauth = 1 WHERE id = ? AND refresh_token = ?`,
-			[accountId, expectedRefreshToken],
+			`UPDATE accounts SET requires_reauth = 1 WHERE id = ? AND refresh_token = ?${generationClause}`,
+			expectedCreatedAt === undefined
+				? [accountId, expectedRefreshToken]
+				: [accountId, expectedRefreshToken, expectedCreatedAt],
 		);
 		return changes > 0;
 	}
@@ -332,7 +361,16 @@ export class AccountRepository extends BaseRepository<Account> {
 		);
 	}
 
-	async clearRateLimitState(accountId: string): Promise<number> {
+	async clearRateLimitState(
+		accountId: string,
+		expectedCreatedAt?: number,
+	): Promise<number> {
+		const generationClause =
+			expectedCreatedAt === undefined ? "" : " AND created_at = ?";
+		const params =
+			expectedCreatedAt === undefined
+				? [accountId]
+				: [accountId, expectedCreatedAt];
 		return this.runWithChanges(
 			`UPDATE accounts
 			 SET
@@ -343,8 +381,8 @@ export class AccountRepository extends BaseRepository<Account> {
 			 	rate_limit_status = NULL,
 				rate_limit_remaining = NULL,
 				consecutive_rate_limits = 0
-			 WHERE id = ?`,
-			[accountId],
+			 WHERE id = ?${generationClause}`,
+			params,
 		);
 	}
 
@@ -382,24 +420,29 @@ export class AccountRepository extends BaseRepository<Account> {
 		accountId: string,
 		reason: string,
 		expectedRefreshToken?: string | null,
+		expectedCreatedAt?: number,
 	): Promise<boolean> {
+		const generationClause =
+			expectedCreatedAt === undefined ? "" : " AND created_at = ?";
+		const generationParams =
+			expectedCreatedAt === undefined ? [] : [expectedCreatedAt];
 		if (expectedRefreshToken !== undefined) {
 			if (expectedRefreshToken === null) {
 				const changes = await this.runWithChanges(
-					`UPDATE accounts SET paused = 1, pause_reason = ? WHERE id = ? AND COALESCE(paused, 0) = 0 AND refresh_token IS NULL`,
-					[reason, accountId],
+					`UPDATE accounts SET paused = 1, pause_reason = ? WHERE id = ? AND COALESCE(paused, 0) = 0 AND refresh_token IS NULL${generationClause}`,
+					[reason, accountId, ...generationParams],
 				);
 				return changes > 0;
 			}
 			const changes = await this.runWithChanges(
-				`UPDATE accounts SET paused = 1, pause_reason = ? WHERE id = ? AND COALESCE(paused, 0) = 0 AND refresh_token = ?`,
-				[reason, accountId, expectedRefreshToken],
+				`UPDATE accounts SET paused = 1, pause_reason = ? WHERE id = ? AND COALESCE(paused, 0) = 0 AND refresh_token = ?${generationClause}`,
+				[reason, accountId, expectedRefreshToken, ...generationParams],
 			);
 			return changes > 0;
 		}
 		const changes = await this.runWithChanges(
-			`UPDATE accounts SET paused = 1, pause_reason = ? WHERE id = ? AND COALESCE(paused, 0) = 0`,
-			[reason, accountId],
+			`UPDATE accounts SET paused = 1, pause_reason = ? WHERE id = ? AND COALESCE(paused, 0) = 0${generationClause}`,
+			[reason, accountId, ...generationParams],
 		);
 		return changes > 0;
 	}
@@ -460,10 +503,20 @@ export class AccountRepository extends BaseRepository<Account> {
 		return { resumed: false, pauseReason: row?.pause_reason ?? null };
 	}
 
-	async resetSession(accountId: string, timestamp: number): Promise<void> {
+	async resetSession(
+		accountId: string,
+		timestamp: number,
+		expectedCreatedAt?: number,
+	): Promise<void> {
+		const generationClause =
+			expectedCreatedAt === undefined ? "" : " AND created_at = ?";
+		const params =
+			expectedCreatedAt === undefined
+				? [timestamp, accountId]
+				: [timestamp, accountId, expectedCreatedAt];
 		await this.run(
-			`UPDATE accounts SET session_start = ?, session_request_count = 0 WHERE id = ?`,
-			[timestamp, accountId],
+			`UPDATE accounts SET session_start = ?, session_request_count = 0 WHERE id = ?${generationClause}`,
+			params,
 		);
 	}
 

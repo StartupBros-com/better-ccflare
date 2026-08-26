@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,6 +14,7 @@ import type { Config } from "@better-ccflare/config";
 import { DatabaseOperations } from "@better-ccflare/database";
 import { deriveComboRouteClass } from "@better-ccflare/providers/request-capabilities";
 import {
+	createAccountPauseHandler,
 	createAccountResumeHandler,
 	createAccountsListHandler,
 	createMetaAccountAddHandler,
@@ -37,6 +46,10 @@ const mockUsageCache = {
 	delete: (accountId: string) => {
 		mockUsageCache.cache.delete(accountId);
 	},
+
+	stopPolling: mock((accountId: string) => {
+		mockUsageCache.polling.delete(accountId);
+	}),
 
 	refreshNow: async (_accountId: string) => true,
 
@@ -75,16 +88,15 @@ const mockLog = {
 	error: () => {},
 };
 
-const mockClearAccountRefreshCache = (_accountId: string) => {
-	// Mock implementation
-};
+const mockClearAccountRefreshCache = mock((_accountId: string) => {});
+
+const mockClearAutoRefreshTrackingForAccount = mock((_accountId: string) => {});
 
 const mockCliCommands = {
 	removeAccount: () => ({ success: true, message: "Account removed" }),
 	pauseAccount: () => ({ success: true, message: "Account paused" }),
 	resumeAccount: () => ({ success: true, message: "Account resumed" }),
 };
-
 const mockDbOps = {
 	getDatabase: () => mockDatabase,
 	updateAccountPriority: () => {},
@@ -480,32 +492,54 @@ describe("Accounts Handler - Dashboard Usage Data Integration", () => {
 	});
 
 	describe("Account Management Integration", () => {
-		it("should clear usage cache when Anthropic account is removed", async () => {
+		it("stops polling and clears refresh lifecycle state only after successful removal", async () => {
 			const removeHandler = createMockAccountRemoveHandler();
-
-			// Setup: Account exists in database
 			mockQuery.get = () => ({ id: "test-account-id" });
-
-			// Mock successful removal
 			mockCliCommands.removeAccount = () => ({
 				success: true,
 				message: "Account removed",
 			});
+			mockUsageCache.stopPolling.mockClear();
+			mockClearAccountRefreshCache.mockClear();
+			mockClearAutoRefreshTrackingForAccount.mockClear();
 
-			// Track usageCache.delete calls
-			const deleteSpy = spyOn(mockUsageCache, "delete");
+			const response = await removeHandler(
+				{ json: async () => ({ confirm: "test-account-name" }) } as Request,
+				"test-account-name",
+			);
 
-			// Mock request body with confirmation
-			const mockRequest = {
-				json: async () => ({ confirm: "test-account-name" }),
-			} as Request;
-
-			// Execute the handler
-			const response = await removeHandler(mockRequest, "test-account-name");
-
-			// Verify usage cache was cleared for the removed account
-			expect(deleteSpy).toHaveBeenCalledWith("test-account-id");
+			expect(mockUsageCache.stopPolling).toHaveBeenCalledWith(
+				"test-account-id",
+			);
+			expect(mockClearAccountRefreshCache).toHaveBeenCalledWith(
+				"test-account-id",
+			);
+			expect(mockClearAutoRefreshTrackingForAccount).toHaveBeenCalledWith(
+				"test-account-id",
+			);
 			expect(response.ok).toBe(true);
+		});
+
+		it("does not stop polling or clear lifecycle state when removal fails", async () => {
+			const removeHandler = createMockAccountRemoveHandler();
+			mockQuery.get = () => ({ id: "test-account-id" });
+			mockCliCommands.removeAccount = () => ({
+				success: false,
+				message: "Account not found",
+			});
+			mockUsageCache.stopPolling.mockClear();
+			mockClearAccountRefreshCache.mockClear();
+			mockClearAutoRefreshTrackingForAccount.mockClear();
+
+			const response = await removeHandler(
+				{ json: async () => ({ confirm: "test-account-name" }) } as Request,
+				"test-account-name",
+			);
+
+			expect(response.ok).toBe(false);
+			expect(mockUsageCache.stopPolling).not.toHaveBeenCalled();
+			expect(mockClearAccountRefreshCache).not.toHaveBeenCalled();
+			expect(mockClearAutoRefreshTrackingForAccount).not.toHaveBeenCalled();
 		});
 
 		it("should clear usage cache when Anthropic account tokens are reloaded", async () => {
@@ -517,14 +551,19 @@ describe("Accounts Handler - Dashboard Usage Data Integration", () => {
 				provider: "anthropic",
 			});
 
-			// Track usageCache.delete calls
+			// Track usageCache.delete calls and reset deletion-only lifecycle mocks.
 			const deleteSpy = spyOn(mockUsageCache, "delete");
+			mockUsageCache.stopPolling.mockClear();
+			mockClearAutoRefreshTrackingForAccount.mockClear();
 
 			// Execute the handler
 			const response = await reloadHandler({} as Request, "test-account-id");
 
-			// Verify usage cache was cleared
+			// Reload intentionally clears the refresh and usage caches, but it must not
+			// tear down deletion-only polling or auto-refresh tracking state.
 			expect(deleteSpy).toHaveBeenCalledWith("test-account-id");
+			expect(mockUsageCache.stopPolling).not.toHaveBeenCalled();
+			expect(mockClearAutoRefreshTrackingForAccount).not.toHaveBeenCalled();
 			expect(response.ok).toBe(true);
 		});
 
@@ -1072,7 +1111,9 @@ function createMockAccountRemoveHandler() {
 			const account = mockQuery.get(accountName);
 
 			if (account) {
-				mockUsageCache.delete(account.id);
+				mockUsageCache.stopPolling(account.id);
+				mockClearAccountRefreshCache(account.id);
+				mockClearAutoRefreshTrackingForAccount(account.id);
 			}
 
 			return mockJsonResponse({
@@ -1222,11 +1263,33 @@ describe("Accounts Handler - OAuth control-plane hotfix (U8)", () => {
 		expect(byId.get("acct-active")).toBeNull();
 	});
 
-	it("R23: manual-pause resume works unchanged", async () => {
+	it("R23: manual pause does not perform deletion-only lifecycle cleanup", async () => {
+		await insertAccount("acct-pause", { paused: false });
+		mockUsageCache.stopPolling.mockClear();
+		mockClearAutoRefreshTrackingForAccount.mockClear();
+
+		const response = await createAccountPauseHandler(dbOps)(
+			new Request("http://localhost/api/accounts/acct-pause/pause", {
+				method: "POST",
+			}),
+			"acct-pause",
+		);
+
+		expect(response.status).toBe(200);
+		expect(mockUsageCache.stopPolling).not.toHaveBeenCalled();
+		expect(mockClearAutoRefreshTrackingForAccount).not.toHaveBeenCalled();
+		const row = await getRow("acct-pause");
+		expect(row.paused).toBe(1);
+		expect(row.pause_reason).toBe("manual");
+	});
+
+	it("R23: manual-pause resume works unchanged without deletion-only lifecycle cleanup", async () => {
 		await insertAccount("acct-manual-2", {
 			paused: true,
 			pauseReason: "manual",
 		});
+		mockUsageCache.stopPolling.mockClear();
+		mockClearAutoRefreshTrackingForAccount.mockClear();
 
 		const response = await createAccountResumeHandler(dbOps)(
 			new Request("http://localhost/api/accounts/acct-manual-2/resume", {
@@ -1238,6 +1301,8 @@ describe("Accounts Handler - OAuth control-plane hotfix (U8)", () => {
 
 		expect(response.status).toBe(200);
 		expect(payload.success).toBe(true);
+		expect(mockUsageCache.stopPolling).not.toHaveBeenCalled();
+		expect(mockClearAutoRefreshTrackingForAccount).not.toHaveBeenCalled();
 		const row = await getRow("acct-manual-2");
 		expect(row.paused).toBe(0);
 		expect(row.pause_reason).toBeNull();

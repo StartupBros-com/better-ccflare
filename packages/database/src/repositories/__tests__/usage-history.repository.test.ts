@@ -273,6 +273,44 @@ describe("UsageHistoryRepository", () => {
 		db.close();
 	});
 
+	it("rejects every window from a stale same-ID account generation", async () => {
+		const db = makeDb();
+		try {
+			const repo = makeRepo(db);
+			const accountId = "replaced-account";
+			const originalCreatedAt = 1_000;
+			const replacementCreatedAt = 2_000;
+			db.run("INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)", [
+				accountId,
+				"original",
+				originalCreatedAt,
+			]);
+			db.run("DELETE FROM accounts WHERE id = ?", [accountId]);
+			db.run("INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)", [
+				accountId,
+				"replacement",
+				replacementCreatedAt,
+			]);
+			const windows = canonicalWindows({
+				five_hour: { utilization: 10, resets_at: "2026-07-05T12:00:00Z" },
+				seven_day: { utilization: 20, resets_at: "2026-07-12T12:00:00Z" },
+			});
+
+			await repo.recordSnapshot(accountId, windows, 3_000, originalCreatedAt);
+			expect(await repo.getSeries({ accountId })).toEqual([]);
+
+			await repo.recordSnapshot(
+				accountId,
+				windows,
+				4_000,
+				replacementCreatedAt,
+			);
+			expect(await repo.getSeries({ accountId })).toHaveLength(2);
+		} finally {
+			db.close();
+		}
+	});
+
 	it("records limits[]-only payload (session/weekly_all/weekly_scoped, no flat windows)", async () => {
 		const db = makeDb();
 		const repo = makeRepo(db);

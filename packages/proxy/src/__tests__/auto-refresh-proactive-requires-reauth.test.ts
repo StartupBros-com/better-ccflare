@@ -14,14 +14,19 @@ interface ProactiveRow {
 	access_token: string | null;
 	expires_at: number | null;
 	custom_endpoint: string | null;
+	created_at?: number | string;
 }
 
 function makeDb(queryRows: ProactiveRow[]) {
+	const rows = queryRows.map((row) => ({
+		...row,
+		created_at: row.created_at ?? 101,
+	}));
 	const runCalls: Array<[string, unknown[]]> = [];
 	const queries: string[] = [];
-	const flagCalls: Array<[string, string]> = [];
+	const flagCalls: Array<[string, string, number]> = [];
 	const persistCalls: Array<
-		[string, string, string, number, string | undefined]
+		[string, string, string, number, string | undefined, number]
 	> = [];
 	const db = {
 		run: mock(async (sql: string, params: unknown[]) => {
@@ -29,18 +34,27 @@ function makeDb(queryRows: ProactiveRow[]) {
 		}),
 		query: mock(async (sql: string) => {
 			queries.push(sql);
-			return queryRows;
+			return rows;
 		}),
 	};
 	const dbOps = {
-		getAccount: mock(async (): Promise<Record<string, unknown> | null> => null),
+		getAccount: mock(
+			async (accountId: string): Promise<Record<string, unknown> | null> => {
+				const row = rows.find((candidate) => candidate.id === accountId);
+				return row ? { ...row, created_at: Number(row.created_at) } : null;
+			},
+		),
 		// flagIfDefinitiveAuthFailure persists requires_reauth via this CAS
 		// helper — return true so the write reports as "landed" (matches the
 		// real UPDATE ... WHERE refresh_token = ? matching the row's current
 		// token in these fixtures).
 		flagRequiresReauthIfTokenMatches: mock(
-			async (accountId: string, expectedRefreshToken: string) => {
-				flagCalls.push([accountId, expectedRefreshToken]);
+			async (
+				accountId: string,
+				expectedRefreshToken: string,
+				expectedCreatedAt: number,
+			) => {
+				flagCalls.push([accountId, expectedRefreshToken, expectedCreatedAt]);
 				return true;
 			},
 		),
@@ -54,7 +68,8 @@ function makeDb(queryRows: ProactiveRow[]) {
 				expectedRefreshToken: string,
 				accessToken: string,
 				expiresAt: number,
-				refreshToken?: string,
+				refreshToken: string | undefined,
+				expectedCreatedAt: number,
 			) => {
 				persistCalls.push([
 					accountId,
@@ -62,6 +77,7 @@ function makeDb(queryRows: ProactiveRow[]) {
 					accessToken,
 					expiresAt,
 					refreshToken,
+					expectedCreatedAt,
 				]);
 				return true;
 			},
@@ -100,6 +116,7 @@ describe("AutoRefreshScheduler proactive refresh — requires_reauth guard", () 
 		const sql = queries.find((q) => q.includes("'qwen', 'xai'"));
 		expect(sql).toBeDefined();
 		expect(sql).toContain("COALESCE(requires_reauth, 0) = 0");
+		expect(sql).toContain("created_at");
 	});
 
 	it("excludes flagged accounts from the Codex eligibility query", async () => {
@@ -111,6 +128,7 @@ describe("AutoRefreshScheduler proactive refresh — requires_reauth guard", () 
 		const sql = queries.find((q) => q.includes("provider = 'codex'"));
 		expect(sql).toBeDefined();
 		expect(sql).toContain("COALESCE(requires_reauth, 0) = 0");
+		expect(sql).toContain("created_at");
 	});
 });
 
@@ -137,6 +155,7 @@ describe("AutoRefreshScheduler proactive refresh — CAS loser adoption", () => 
 			dbOps.getAccount = mock(async () => {
 				await authoritativeReadGate;
 				return {
+					created_at: 101,
 					access_token: "authoritative-access",
 					expires_at: Date.now() + 3_600_000,
 				};
@@ -171,6 +190,16 @@ describe("AutoRefreshScheduler proactive refresh — CAS loser adoption", () => 
 			releaseAuthoritativeRead?.();
 			expect(await joined).toBe("authoritative-access");
 			await run;
+			expect(
+				dbOps.updateAccountTokensIfRefreshTokenMatches,
+			).toHaveBeenCalledWith(
+				id,
+				"rt-old",
+				"losing-access",
+				expect.any(Number),
+				"losing-refresh",
+				101,
+			);
 		});
 	}
 
@@ -189,6 +218,7 @@ describe("AutoRefreshScheduler proactive refresh — CAS loser adoption", () => 
 		]);
 		dbOps.updateAccountTokensIfRefreshTokenMatches = mock(async () => false);
 		dbOps.getAccount = mock(async () => ({
+			created_at: 101,
 			access_token: "expired-authoritative-access",
 			expires_at: Date.now() - 1,
 		}));
@@ -208,6 +238,87 @@ describe("AutoRefreshScheduler proactive refresh — CAS loser adoption", () => 
 		await scheduler.checkAndRefreshCodexTokens();
 		expect(dbOps.getAccount).toHaveBeenCalledWith(id);
 	});
+});
+
+describe("AutoRefreshScheduler proactive refresh — PostgreSQL generation rows", () => {
+	for (const provider of ["qwen", "xai", "codex"] as const) {
+		it(`persists ${provider} refreshes selected from a BIGINT-string generation`, async () => {
+			const id = `${provider}-bigint-generation`;
+			const { db, dbOps, persistCalls } = makeDb([
+				{
+					id,
+					name: id,
+					provider,
+					refresh_token: "rt-old",
+					access_token: "at-old",
+					expires_at: 1,
+					custom_endpoint: null,
+					created_at: "101",
+				},
+			]);
+			global.fetch = mock(
+				async () =>
+					new Response(
+						JSON.stringify({
+							access_token: "refreshed-access",
+							refresh_token: "refreshed-refresh",
+							expires_in: 3600,
+						}),
+						{ status: 200, headers: { "content-type": "application/json" } },
+					),
+			) as unknown as typeof fetch;
+
+			const scheduler = makeScheduler(db, dbOps);
+			await (provider === "codex"
+				? scheduler.checkAndRefreshCodexTokens()
+				: scheduler.checkAndRefreshOpenAICompatibleOAuthTokens());
+
+			expect(persistCalls).toHaveLength(1);
+			expect(persistCalls[0]?.[5]).toBe(101);
+		});
+	}
+});
+
+describe("AutoRefreshScheduler proactive refresh — generation fence", () => {
+	for (const provider of ["qwen", "xai", "codex"] as const) {
+		it(`does not quarantine replacement generation B when ${provider} fails after A was selected`, async () => {
+			const id = `${provider}-stale-generation`;
+			const { db, dbOps, flagCalls, persistCalls } = makeDb([
+				{
+					id,
+					name: id,
+					provider,
+					refresh_token: "refresh-a",
+					access_token: "access-a",
+					expires_at: 1,
+					custom_endpoint: null,
+					created_at: 101,
+				},
+			]);
+			dbOps.getAccount = mock(async () => ({
+				id,
+				created_at: 202,
+				refresh_token: "refresh-b",
+				access_token: "access-b",
+				expires_at: Date.now() + 3_600_000,
+			}));
+			global.fetch = mock(
+				async () =>
+					new Response(JSON.stringify({ error: "invalid_grant" }), {
+						status: 400,
+						headers: { "content-type": "application/json" },
+					}),
+			) as unknown as typeof fetch;
+
+			const scheduler = makeScheduler(db, dbOps);
+			await (provider === "codex"
+				? scheduler.checkAndRefreshCodexTokens()
+				: scheduler.checkAndRefreshOpenAICompatibleOAuthTokens());
+
+			expect(flagCalls).toHaveLength(0);
+			expect(persistCalls).toHaveLength(0);
+		});
+	}
 });
 
 describe("AutoRefreshScheduler proactive refresh — definitive auth failure", () => {
@@ -239,7 +350,7 @@ describe("AutoRefreshScheduler proactive refresh — definitive auth failure", (
 		const scheduler = makeScheduler(db, dbOps);
 		await scheduler.checkAndRefreshOpenAICompatibleOAuthTokens();
 
-		expect(flagCalls).toEqual([["xai-dead", "rt"]]);
+		expect(flagCalls).toEqual([["xai-dead", "rt", 101]]);
 		expect(emitted).toHaveLength(1);
 		expect(emitted[0]).toMatchObject({
 			accountId: "xai-dead",
@@ -273,7 +384,7 @@ describe("AutoRefreshScheduler proactive refresh — definitive auth failure", (
 		const scheduler = makeScheduler(db, dbOps);
 		await scheduler.checkAndRefreshCodexTokens();
 
-		expect(flagCalls).toEqual([["codex-dead", "rt"]]);
+		expect(flagCalls).toEqual([["codex-dead", "rt", 101]]);
 		expect(emitted).toHaveLength(1);
 		expect(emitted[0]?.reason).toBe("refresh_token_reused");
 	});

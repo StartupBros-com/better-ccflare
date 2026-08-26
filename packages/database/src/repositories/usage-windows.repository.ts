@@ -203,30 +203,67 @@ export class UsageWindowsRepository extends BaseRepository<UsageWindow> {
 	 * natural key so a losing insert (its generated id discarded) still
 	 * returns the surviving row.
 	 */
-	async openWindow(input: OpenWindowInput): Promise<UsageWindow> {
+	async openWindow(input: OpenWindowInput): Promise<UsageWindow>;
+	async openWindow(
+		input: OpenWindowInput,
+		expectedCreatedAt: number,
+	): Promise<UsageWindow | null>;
+	async openWindow(
+		input: OpenWindowInput,
+		expectedCreatedAt?: number,
+	): Promise<UsageWindow | null> {
 		const accountId = requireNonEmpty(input.accountId, "accountId");
 		const windowKey = requireNonEmpty(input.windowKey, "windowKey");
 		const startedAt = requireTimestamp(input.startedAt, "startedAt");
 		const resetsAt = requireTimestamp(input.resetsAt, "resetsAt");
 		const grantType = requireGrantType(input.grantType);
 		const id = randomUUID();
+		if (expectedCreatedAt === undefined) {
+			await this.run(
+				`INSERT INTO usage_windows (
+					id, account_id, window_key, started_at, resets_at, closed_at,
+					grant_type, peak_utilization
+				 ) VALUES (?, ?, ?, ?, ?, NULL, ?, 0)
+				 ON CONFLICT (account_id, window_key, resets_at) DO NOTHING`,
+				[id, accountId, windowKey, startedAt, resetsAt, grantType],
+			);
+			const row = await this.get<UsageWindowRow>(
+				`SELECT ${WINDOW_COLUMNS} FROM usage_windows
+				 WHERE account_id = ? AND window_key = ? AND resets_at = ?`,
+				[accountId, windowKey, resetsAt],
+			);
+			if (!row) throw new Error("Failed to open or load usage window");
+			return toUsageWindow(row);
+		}
+
 		await this.run(
 			`INSERT INTO usage_windows (
 				id, account_id, window_key, started_at, resets_at, closed_at,
 				grant_type, peak_utilization
-			 ) VALUES (?, ?, ?, ?, ?, NULL, ?, 0)
-			 ON CONFLICT (account_id, window_key, resets_at) DO NOTHING`,
-			[id, accountId, windowKey, startedAt, resetsAt, grantType],
+			 ) SELECT ?, ?, ?, ?, ?, NULL, ?, 0
+			 WHERE EXISTS (
+				SELECT 1 FROM accounts WHERE id = ? AND created_at = ?
+			 ) ON CONFLICT (account_id, window_key, resets_at) DO NOTHING`,
+			[
+				id,
+				accountId,
+				windowKey,
+				startedAt,
+				resetsAt,
+				grantType,
+				accountId,
+				expectedCreatedAt,
+			],
 		);
 		const row = await this.get<UsageWindowRow>(
 			`SELECT ${WINDOW_COLUMNS} FROM usage_windows
-			 WHERE account_id = ? AND window_key = ? AND resets_at = ?`,
-			[accountId, windowKey, resetsAt],
+			 WHERE account_id = ? AND window_key = ? AND resets_at = ?
+			   AND EXISTS (
+					SELECT 1 FROM accounts WHERE id = ? AND created_at = ?
+			   )`,
+			[accountId, windowKey, resetsAt, accountId, expectedCreatedAt],
 		);
-		if (!row) {
-			throw new Error("Failed to open or load usage window");
-		}
-		return toUsageWindow(row);
+		return row ? toUsageWindow(row) : null;
 	}
 
 	/**
@@ -239,18 +276,33 @@ export class UsageWindowsRepository extends BaseRepository<UsageWindow> {
 		id: string,
 		utilization: number,
 		timestampMs: number,
+		expectedCreatedAt?: number,
 	): Promise<void> {
 		requireNonEmpty(id, "id");
 		if (!Number.isFinite(utilization)) {
 			throw new TypeError("utilization must be a finite number");
 		}
 		requireTimestamp(timestampMs, "timestampMs");
+		const generationClause =
+			expectedCreatedAt === undefined
+				? ""
+				: ` AND EXISTS (
+					SELECT 1 FROM accounts
+					WHERE id = usage_windows.account_id AND created_at = ?
+				)`;
 		await this.run(
 			`UPDATE usage_windows
 			 SET peak_utilization = CASE WHEN ? > peak_utilization THEN ? ELSE peak_utilization END,
 			     first_100_at = CASE WHEN first_100_at IS NULL AND ? >= 100 THEN ? ELSE first_100_at END
-			 WHERE id = ?`,
-			[utilization, utilization, utilization, timestampMs, id],
+			 WHERE id = ?${generationClause}`,
+			[
+				utilization,
+				utilization,
+				utilization,
+				timestampMs,
+				id,
+				...(expectedCreatedAt === undefined ? [] : [expectedCreatedAt]),
+			],
 		);
 	}
 
@@ -260,20 +312,31 @@ export class UsageWindowsRepository extends BaseRepository<UsageWindow> {
 	 * silently overwrite an already-settled row with stale aggregates.
 	 * Returns false (no-op) if the window was already closed.
 	 */
-	async closeWindow(id: string, input: CloseWindowInput): Promise<boolean> {
+	async closeWindow(
+		id: string,
+		input: CloseWindowInput,
+		expectedCreatedAt?: number,
+	): Promise<boolean> {
 		requireNonEmpty(id, "id");
 		const closedAt = requireTimestamp(input.closedAt, "closedAt");
 		const modelBreakdownJson =
 			input.modelBreakdown == null
 				? null
 				: JSON.stringify(input.modelBreakdown);
+		const generationClause =
+			expectedCreatedAt === undefined
+				? ""
+				: ` AND EXISTS (
+					SELECT 1 FROM accounts
+					WHERE id = usage_windows.account_id AND created_at = ?
+				)`;
 		const changes = await this.runWithChanges(
 			`UPDATE usage_windows
 			 SET closed_at = ?, value_usd = ?, input_tokens = ?,
 			     cache_read_input_tokens = ?, cache_creation_input_tokens = ?,
 			     output_tokens = ?, request_count = ?, model_breakdown = ?,
 			     unpriced_tokens = ?, projection_version = ?
-			 WHERE id = ? AND closed_at IS NULL`,
+			 WHERE id = ? AND closed_at IS NULL${generationClause}`,
 			[
 				closedAt,
 				input.valueUsd,
@@ -286,6 +349,7 @@ export class UsageWindowsRepository extends BaseRepository<UsageWindow> {
 				input.unpricedTokens,
 				input.projectionVersion,
 				id,
+				...(expectedCreatedAt === undefined ? [] : [expectedCreatedAt]),
 			],
 		);
 		return changes === 1;

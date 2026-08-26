@@ -30,6 +30,59 @@ import {
 const log = new Logger("TokenManager");
 const freshlyLoadedAccounts = new WeakSet<Account>();
 
+// The public map intentionally remains Map<id, Promise<string>> for existing
+// contexts. Promise identity is a suitable private side-channel for the row
+// generation which owns it: the metadata disappears when the promise does and
+// cannot be forged by an account ID alone.
+const refreshInFlightGenerations = new WeakMap<Promise<string>, number>();
+
+/** Register an in-flight refresh with the generation that initiated it. */
+export function setRefreshInFlightForAccount(
+	ctx: Pick<ProxyContext, "refreshInFlight">,
+	account: Pick<Account, "id" | "created_at">,
+	promise: Promise<string>,
+): void {
+	refreshInFlightGenerations.set(promise, account.created_at);
+	ctx.refreshInFlight.set(account.id, promise);
+}
+
+/** Return only an in-flight refresh owned by this exact account generation. */
+export function getRefreshInFlightForAccount(
+	ctx: Pick<ProxyContext, "refreshInFlight">,
+	account: Pick<Account, "id" | "created_at">,
+): Promise<string> | undefined {
+	const promise = ctx.refreshInFlight.get(account.id);
+	return promise &&
+		refreshInFlightGenerations.get(promise) === account.created_at
+		? promise
+		: undefined;
+}
+
+class StaleAccountGenerationError extends Error {
+	constructor(account: Pick<Account, "id">) {
+		super(
+			`Account ${account.id} generation is no longer current; refusing stale credential work`,
+		);
+	}
+}
+
+function staleAccountGenerationError(
+	account: Pick<Account, "id">,
+): StaleAccountGenerationError {
+	return new StaleAccountGenerationError(account);
+}
+
+async function requireCurrentAccountGeneration(
+	account: Pick<Account, "id" | "created_at">,
+	ctx: Pick<ProxyContext, "dbOps">,
+): Promise<Account> {
+	const current = await ctx.dbOps.getAccount(account.id);
+	if (!current || current.created_at !== account.created_at) {
+		throw staleAccountGenerationError(account);
+	}
+	return current;
+}
+
 /** Mark an account whose credentials were just re-read by a polling caller. */
 export function markAccountTokensFresh(account: Account): void {
 	freshlyLoadedAccounts.add(account);
@@ -262,6 +315,7 @@ interface ReauthPauser {
 		accountId: string,
 		reason: string,
 		expectedRefreshToken?: string | null,
+		expectedCreatedAt?: number,
 	): Promise<boolean>;
 }
 
@@ -280,7 +334,9 @@ interface ReauthPauser {
  * still responsible for preventing another send in the same request.
  */
 export async function pauseAccountForUpstreamAuthFailure(
-	account: Pick<Account, "id" | "name" | "provider" | "refresh_token">,
+	account: Pick<Account, "id" | "name" | "provider" | "refresh_token"> & {
+		created_at?: number;
+	},
 	dbOps: ReauthPauser,
 	/** Explicit credential identity used by the failed request, when known. */
 	expectedRefreshToken?: string | null,
@@ -308,11 +364,19 @@ export async function pauseAccountForUpstreamAuthFailure(
 				: undefined
 			: refreshTokenForFailure;
 	try {
-		const paused = await dbOps.pauseAccountIfActive(
-			account.id,
-			reason,
-			expectedTokenForCas,
-		);
+		const paused =
+			account.created_at === undefined
+				? await dbOps.pauseAccountIfActive(
+						account.id,
+						reason,
+						expectedTokenForCas,
+					)
+				: await dbOps.pauseAccountIfActive(
+						account.id,
+						reason,
+						expectedTokenForCas,
+						account.created_at,
+					);
 		if (paused) {
 			log.error(
 				`Account "${account.name}" PAUSED — upstream authentication failed (401; ${reason}). Repair the credential before resuming it.`,
@@ -363,6 +427,7 @@ export async function pauseAccountForReauthIfInvalidGrant(
 		name: string;
 		provider: string;
 		refresh_token: string | null;
+		created_at?: number;
 	},
 	dbOps: ReauthPauser,
 	/** Refresh-token snapshot captured before the provider call. */
@@ -388,11 +453,19 @@ export async function pauseAccountForReauthIfInvalidGrant(
 			expectedRefreshToken === undefined
 				? account.refresh_token
 				: expectedRefreshToken;
-		const paused = await dbOps.pauseAccountIfActive(
-			account.id,
-			PAUSE_REASON_NEEDS_REAUTH,
-			refreshTokenForCas?.trim() ? refreshTokenForCas : undefined,
-		);
+		const paused =
+			account.created_at === undefined
+				? await dbOps.pauseAccountIfActive(
+						account.id,
+						PAUSE_REASON_NEEDS_REAUTH,
+						refreshTokenForCas?.trim() ? refreshTokenForCas : undefined,
+					)
+				: await dbOps.pauseAccountIfActive(
+						account.id,
+						PAUSE_REASON_NEEDS_REAUTH,
+						refreshTokenForCas?.trim() ? refreshTokenForCas : undefined,
+						account.created_at,
+					);
 		if (paused) {
 			log.error(
 				`Account "${account.name}" PAUSED — OAuth refresh token rejected (needs re-authentication). Reauthenticate the account; it will auto-resume on success.`,
@@ -543,25 +616,37 @@ async function adoptDbTokensIfFresher(
 	account: Account,
 	ctx: ProxyContext,
 ): Promise<string | null> {
-	const pendingRotation = getPendingRotation(account.id);
-	const flush = await (async () => {
+	// Generation-bound callers may only inspect or flush their own entry. An
+	// ID-reused replacement's outbox entry must remain available to B while A's
+	// stale request finishes.
+	const currentAccount = await requireCurrentAccountGeneration(account, ctx);
+	const pendingRotation = getPendingRotation(account.id, account.created_at);
+	if (pendingRotation) {
 		const { flushPendingRotation } = await import(
 			"./pending-rotation-registry"
 		);
-		return flushPendingRotation(account.id, ctx.dbOps);
-	})();
-	const effectivePending = getPendingRotation(account.id) ?? pendingRotation;
-	if (effectivePending && (flush === "failed" || flush === "persisted")) {
-		account.access_token = effectivePending.accessToken;
-		account.expires_at = effectivePending.expiresAt;
-		if (effectivePending.refreshToken)
-			account.refresh_token = effectivePending.refreshToken;
-		if (effectivePending.expiresAt - Date.now() > TOKEN_SAFETY_WINDOW_MS) {
-			return account.access_token;
+		const flush = await flushPendingRotation(
+			account.id,
+			ctx.dbOps,
+			account.created_at,
+		);
+		const effectivePending =
+			getPendingRotation(account.id, account.created_at) ?? pendingRotation;
+		await requireCurrentAccountGeneration(account, ctx);
+		if (effectivePending && (flush === "failed" || flush === "persisted")) {
+			account.access_token = effectivePending.accessToken;
+			account.expires_at = effectivePending.expiresAt;
+			if (effectivePending.refreshToken)
+				account.refresh_token = effectivePending.refreshToken;
+			if (effectivePending.expiresAt - Date.now() > TOKEN_SAFETY_WINDOW_MS) {
+				return account.access_token;
+			}
 		}
 	}
-	const dbAccount = await ctx.dbOps.getAccount(account.id);
-	if (!dbAccount) return null;
+
+	const dbAccount = pendingRotation
+		? await requireCurrentAccountGeneration(account, ctx)
+		: currentAccount;
 	const dbTokenValid =
 		typeof dbAccount.access_token === "string" &&
 		typeof dbAccount.expires_at === "number" &&
@@ -614,8 +699,14 @@ export async function refreshAccessTokenSafe(
 	// scheduler registers its own in-flight promise into this same map;
 	// a request-triggered caller must join that refresh, not bounce off a
 	// stale backoff record for the account).
-	const inFlight = ctx.refreshInFlight.get(account.id);
-	if (inFlight) return inFlight;
+	const inFlight = getRefreshInFlightForAccount(ctx, account);
+	if (inFlight) {
+		// A compatible promise still may have outlived its row. Verify the durable
+		// generation before returning a shared credential to this caller.
+		await requireCurrentAccountGeneration(account, ctx);
+		const currentInFlight = getRefreshInFlightForAccount(ctx, account);
+		if (currentInFlight) return currentInFlight;
+	}
 
 	// Proactively clean expired entries before checking
 	cleanupExpiredFailures();
@@ -623,6 +714,9 @@ export async function refreshAccessTokenSafe(
 	// Check for recent refresh failures and implement backoff
 	const lastFailure = refreshFailures.get(account.id);
 	if (lastFailure && Date.now() - lastFailure < TOKEN_REFRESH_BACKOFF_MS) {
+		// Both maps are keyed only by ID. Verify ownership before consuming B's
+		// backoff state or returning its availability result to stale generation A.
+		await requireCurrentAccountGeneration(account, ctx);
 		// Increment backoff counter
 		const currentCount = backoffCounters.get(account.id) || 0;
 		const newCount = currentCount + 1;
@@ -641,7 +735,7 @@ export async function refreshAccessTokenSafe(
 			try {
 				// Reload account from database
 				const dbAccount = await ctx.dbOps.getAccount(account.id);
-				if (dbAccount) {
+				if (dbAccount?.created_at === account.created_at) {
 					// Check if DB has a valid token that we don't have in memory
 					const accessTokenFromDb = dbAccount.access_token;
 					const expiresAtFromDb = dbAccount.expires_at;
@@ -707,15 +801,15 @@ export async function refreshAccessTokenSafe(
 	// scheduler builds one from a loop-start SELECT). Re-read the row and adopt
 	// fresher credentials before initiating a refresh — refreshing with an
 	// already-rotated refresh token produces a false-definitive invalid_grant.
-	if (!ctx.refreshInFlight.has(account.id)) {
+	if (!getRefreshInFlightForAccount(ctx, account)) {
 		const adopted = await adoptDbTokensIfFresher(account, ctx);
 		if (adopted) return adopted;
 	}
 
-	// Check if a refresh is already in progress for this account.
+	// Check if a refresh is already in progress for this exact generation.
 	// NOTE: no await may sit between this check and refreshInFlight.set() —
 	// microtask atomicity is what deduplicates concurrent callers.
-	if (!ctx.refreshInFlight.has(account.id)) {
+	if (!getRefreshInFlightForAccount(ctx, account)) {
 		// Get the provider for this account
 		const provider = getProvider(account.provider) || ctx.provider;
 
@@ -728,6 +822,9 @@ export async function refreshAccessTokenSafe(
 		const refreshPromise = provider
 			.refreshToken(account, ctx.runtime.clientId)
 			.then(async (result: TokenRefreshResult) => {
+				// The provider call may have awaited through a delete/recreate. Do not
+				// persist, queue, or return credentials after that generation boundary.
+				await requireCurrentAccountGeneration(account, ctx);
 				// (finding 1) Persist INSIDE the shared promise so refreshInFlight
 				// stays installed until the write commits, and never via the
 				// lossy asyncWriter queue (a queued write's failure was
@@ -756,6 +853,7 @@ export async function refreshAccessTokenSafe(
 								result.accessToken,
 								result.expiresAt,
 								result.refreshToken,
+								account.created_at,
 							);
 					} else {
 						// (round-3 item 4) Null-safe CAS: an account that refreshed
@@ -767,50 +865,45 @@ export async function refreshAccessTokenSafe(
 							result.accessToken,
 							result.expiresAt,
 							result.refreshToken,
+							account.created_at,
 						);
 					}
 					if (persisted) {
-						clearPendingRotation(account.id);
+						clearPendingRotation(account.id, account.created_at);
 					} else {
 						log.warn(
 							`Skipped persisting refreshed tokens for ${account.name}: refresh token changed underneath (superseded by a newer rotation or manual re-auth) — adopting the authoritative DB credentials instead`,
 						);
-						try {
-							const dbAccount = await ctx.dbOps.getAccount(account.id);
-							if (dbAccount) {
-								account.access_token = dbAccount.access_token;
-								account.expires_at = dbAccount.expires_at;
-								if (dbAccount.refresh_token) {
-									account.refresh_token = dbAccount.refresh_token;
-									account.refresh_token_issued_at =
-										dbAccount.refresh_token_issued_at;
-								}
-								adoptAuthoritative = true;
-								// The winning writer (manual re-auth or a newer rotation)
-								// may have revoked the losing token's session family —
-								// serve the adopted access token instead when it is
-								// itself servable, so the caller isn't handed a token
-								// that fails auth despite valid credentials sitting in
-								// memory.
-								const adoptedTokenIsServable =
-									typeof dbAccount.access_token === "string" &&
-									typeof dbAccount.expires_at === "number" &&
-									dbAccount.expires_at - Date.now() > TOKEN_SAFETY_WINDOW_MS;
-								if (adoptedTokenIsServable && dbAccount.access_token) {
-									resolveWithToken = dbAccount.access_token;
-								}
-								log.warn(
-									`Persist CAS lost for ${account.name} — serving the ${adoptedTokenIsServable ? "adopted authoritative" : "just-minted (losing)"} access token`,
-								);
-							}
-						} catch (readError) {
-							log.warn(
-								`Failed to re-read account ${account.name} after a lost persist CAS — falling back to the in-memory update`,
-								readError,
-							);
+						const dbAccount = await requireCurrentAccountGeneration(
+							account,
+							ctx,
+						);
+						account.access_token = dbAccount.access_token;
+						account.expires_at = dbAccount.expires_at;
+						if (dbAccount.refresh_token) {
+							account.refresh_token = dbAccount.refresh_token;
+							account.refresh_token_issued_at =
+								dbAccount.refresh_token_issued_at;
 						}
+						adoptAuthoritative = true;
+						// The winning writer (manual re-auth or a newer rotation)
+						// may have revoked the losing token's session family — serve the
+						// adopted access token only after the durable generation check.
+						const adoptedTokenIsServable =
+							typeof dbAccount.access_token === "string" &&
+							typeof dbAccount.expires_at === "number" &&
+							dbAccount.expires_at - Date.now() > TOKEN_SAFETY_WINDOW_MS;
+						if (adoptedTokenIsServable && dbAccount.access_token) {
+							resolveWithToken = dbAccount.access_token;
+						}
+						log.warn(
+							`Persist CAS lost for ${account.name} — serving the ${adoptedTokenIsServable ? "adopted authoritative" : "just-minted (losing)"} access token`,
+						);
 					}
 				} catch (persistError) {
+					if (persistError instanceof StaleAccountGenerationError) {
+						throw persistError;
+					}
 					// (round-3 item 1) A rotation the provider has already
 					// committed must never be silently dropped: the DB still
 					// holds the consumed token, and a later stale consumer would
@@ -818,17 +911,26 @@ export async function refreshAccessTokenSafe(
 					// account. Record it so every subsequent touchpoint retries
 					// the persist, serves the rotated credentials, and
 					// suppresses flagging meanwhile.
+					// The failed persistence write may have awaited through a same-ID
+					// replacement, so fence ownership again before touching the
+					// ID-keyed outbox.
+					await requireCurrentAccountGeneration(account, ctx);
 					await recordPendingRotation(account.id, {
 						accessToken: result.accessToken,
 						expiresAt: result.expiresAt,
 						refreshToken: result.refreshToken,
 						attemptedRefreshToken: attemptedRefreshToken ?? "",
+						createdAt: account.created_at,
 					});
 					log.error(
 						`Failed to persist refreshed tokens for ${account.name} — rotation queued for re-persist`,
 						persistError,
 					);
 				}
+
+				// Every branch above awaited either persistence or outbox I/O. Verify
+				// once more before exposing a token or mutating this stale snapshot.
+				await requireCurrentAccountGeneration(account, ctx);
 
 				// Update the live in-memory account object immediately
 				// This prevents subsequent requests from seeing stale token data
@@ -857,7 +959,40 @@ export async function refreshAccessTokenSafe(
 				return resolveWithToken;
 			})
 			.catch(async (error) => {
-				// Record the failure timestamp for backoff
+				// A successful refresh may discover replacement only after its last
+				// awaited CAS/outbox step. It must escape unchanged rather than be
+				// counted, wrapped, or mistaken for a provider failure below.
+				if (error instanceof StaleAccountGenerationError) throw error;
+
+				// Provider failures are ID-keyed in the legacy backoff maps, so prove
+				// this request still owns the durable row before changing any state or
+				// attempting a quarantine. An operational read failure is not evidence
+				// of replacement: preserve the provider failure shape without mutating
+				// potentially replacement-owned ID-only state.
+				try {
+					await requireCurrentAccountGeneration(account, ctx);
+				} catch (generationError) {
+					if (generationError instanceof StaleAccountGenerationError) {
+						throw generationError;
+					}
+					const originalError =
+						error instanceof Error
+							? error.message
+							: formatOAuthErrorMessage(error) || String(error);
+					log.warn(
+						`Could not verify account ${account.name} generation after token refresh failure — leaving ID-keyed backoff and quarantine state untouched`,
+						generationError,
+					);
+					throw wrapTokenRefreshFailure(
+						account.id,
+						getOAuthErrorMessage(account, originalError),
+						attemptedRefreshToken,
+						Boolean(getOAuthErrorCode(error)),
+					);
+				}
+
+				// Record the failure timestamp for backoff only after the durable
+				// generation fence established that this account is still current.
 				refreshFailures.set(account.id, Date.now());
 				// Enforce size limit after adding a new entry
 				enforceMaxSize();
@@ -880,7 +1015,7 @@ export async function refreshAccessTokenSafe(
 					// (round-3 item 1) A pending unpersisted rotation means WE
 					// rotated successfully moments ago — this failure is a
 					// replay of the consumed token, not a dead account.
-					if (getPendingRotation(account.id)) {
+					if (getPendingRotation(account.id, account.created_at)) {
 						log.warn(
 							`Skipping requires_reauth for ${account.name}: a successful rotation is awaiting persist (replayed a consumed token)`,
 						);
@@ -899,6 +1034,13 @@ export async function refreshAccessTokenSafe(
 					let dbReadFailed = false;
 					try {
 						dbAccount = await ctx.dbOps.getAccount(account.id);
+						if (dbAccount?.created_at !== account.created_at) {
+							dbAccount = null;
+							dbReadFailed = true;
+							log.warn(
+								`Account ${account.name} generation changed after ${authFailureReason}; refusing stale recovery or quarantine`,
+							);
+						}
 					} catch (readError) {
 						dbReadFailed = true;
 						log.warn(
@@ -961,6 +1103,7 @@ export async function refreshAccessTokenSafe(
 									ctx.dbOps,
 									account.id,
 									attemptedRefreshToken,
+									account.created_at,
 								)) || quarantined;
 						} catch (flagError) {
 							log.warn(
@@ -976,6 +1119,7 @@ export async function refreshAccessTokenSafe(
 									account.id,
 									PAUSE_REASON_NEEDS_REAUTH,
 									attemptedRefreshToken,
+									account.created_at,
 								)) || quarantined;
 						} catch (pauseError) {
 							log.warn(
@@ -1016,11 +1160,11 @@ export async function refreshAccessTokenSafe(
 					ctx.refreshInFlight.delete(account.id);
 				}
 			});
-		ctx.refreshInFlight.set(account.id, refreshPromise);
+		setRefreshInFlightForAccount(ctx, account, refreshPromise);
 	}
 
 	// Return the existing or new refresh promise
-	const promise = ctx.refreshInFlight.get(account.id);
+	const promise = getRefreshInFlightForAccount(ctx, account);
 	if (!promise) {
 		throw new ServiceUnavailableError(
 			`${ERROR_MESSAGES.REFRESH_NOT_FOUND} ${account.id}`,
@@ -1031,6 +1175,10 @@ export async function refreshAccessTokenSafe(
 
 // Global registry for account refresh clearing functions
 const refreshClearers: Map<string, (accountId: string) => void> = new Map();
+
+// Global registry for auto-refresh-scheduler tracking clearing functions
+const autoRefreshTrackingClearers: Map<string, (accountId: string) => void> =
+	new Map();
 
 // Global registry for usage polling restart functions
 const pollingRestarters: Map<string, (accountId: string) => Promise<boolean>> =
@@ -1062,6 +1210,13 @@ export function registerPollingRestarter(
 	restarter: (accountId: string) => Promise<boolean>,
 ): void {
 	pollingRestarters.set(serverId, restarter);
+}
+
+/**
+ * Unregister a previously registered polling restarter.
+ */
+export function unregisterPollingRestarter(serverId: string): void {
+	pollingRestarters.delete(serverId);
 }
 
 /**
@@ -1183,6 +1338,13 @@ export function registerRefreshClearer(
 }
 
 /**
+ * Unregister a previously registered refresh clearer.
+ */
+export function unregisterRefreshClearer(serverId: string): void {
+	refreshClearers.delete(serverId);
+}
+
+/**
  * Clear refresh cache for an account across all registered servers
  */
 export function clearAccountRefreshCache(accountId: string): void {
@@ -1202,6 +1364,46 @@ export function clearAccountRefreshCache(accountId: string): void {
 		} catch (error) {
 			log.error(
 				`Failed to clear refresh cache for account ${accountId} on server ${serverId}:`,
+				error,
+			);
+		}
+	}
+}
+
+/**
+ * Register a function to clear auto-refresh-scheduler tracking state for a
+ * specific account. Used by the server to expose its scheduler's per-account
+ * cleanup so account removal doesn't have to wait for the scheduler's next
+ * periodic sweep.
+ */
+export function registerAutoRefreshTrackingClearer(
+	serverId: string,
+	clearer: (accountId: string) => void,
+): void {
+	autoRefreshTrackingClearers.set(serverId, clearer);
+}
+
+/**
+ * Unregister a previously registered auto-refresh tracking clearer.
+ */
+export function unregisterAutoRefreshTrackingClearer(serverId: string): void {
+	autoRefreshTrackingClearers.delete(serverId);
+}
+
+/**
+ * Clear auto-refresh-scheduler tracking state for an account across all
+ * registered servers.
+ */
+export function clearAutoRefreshTrackingForAccount(accountId: string): void {
+	for (const [serverId, clearer] of autoRefreshTrackingClearers) {
+		try {
+			clearer(accountId);
+			log.info(
+				`Cleared auto-refresh tracking for account ${accountId} on ${serverId}`,
+			);
+		} catch (error) {
+			log.error(
+				`Failed to clear auto-refresh tracking for account ${accountId} on ${serverId}:`,
 				error,
 			);
 		}

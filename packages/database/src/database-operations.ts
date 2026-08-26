@@ -944,16 +944,26 @@ OAuth tokens will need to be re-authenticated.
 		accessToken: string,
 		expiresAt: number,
 		refreshToken?: string,
+		expectedCreatedAt?: number,
 	): Promise<boolean> {
 		return withDatabaseRetry(
 			() =>
-				this.accounts.updateTokensIfRefreshTokenMatches(
-					accountId,
-					expectedRefreshToken,
-					accessToken,
-					expiresAt,
-					refreshToken,
-				),
+				expectedCreatedAt === undefined
+					? this.accounts.updateTokensIfRefreshTokenMatches(
+							accountId,
+							expectedRefreshToken,
+							accessToken,
+							expiresAt,
+							refreshToken,
+						)
+					: this.accounts.updateTokensIfRefreshTokenMatches(
+							accountId,
+							expectedRefreshToken,
+							accessToken,
+							expiresAt,
+							refreshToken,
+							expectedCreatedAt,
+						),
 			this.retryConfig,
 			"updateAccountTokensIfRefreshTokenMatches",
 		);
@@ -964,15 +974,24 @@ OAuth tokens will need to be re-authenticated.
 		accessToken: string,
 		expiresAt: number,
 		refreshToken?: string,
+		expectedCreatedAt?: number,
 	): Promise<boolean> {
 		return withDatabaseRetry(
 			() =>
-				this.accounts.updateTokensIfRefreshTokenAbsent(
-					accountId,
-					accessToken,
-					expiresAt,
-					refreshToken,
-				),
+				expectedCreatedAt === undefined
+					? this.accounts.updateTokensIfRefreshTokenAbsent(
+							accountId,
+							accessToken,
+							expiresAt,
+							refreshToken,
+						)
+					: this.accounts.updateTokensIfRefreshTokenAbsent(
+							accountId,
+							accessToken,
+							expiresAt,
+							refreshToken,
+							expectedCreatedAt,
+						),
 			this.retryConfig,
 			"updateAccountTokensIfRefreshTokenAbsent",
 		);
@@ -981,13 +1000,20 @@ OAuth tokens will need to be re-authenticated.
 	async flagAccountRequiresReauthIfTokenMatches(
 		accountId: string,
 		expectedRefreshToken: string,
+		expectedCreatedAt?: number,
 	): Promise<boolean> {
 		return withDatabaseRetry(
 			() =>
-				this.accounts.flagRequiresReauthIfTokenMatches(
-					accountId,
-					expectedRefreshToken,
-				),
+				expectedCreatedAt === undefined
+					? this.accounts.flagRequiresReauthIfTokenMatches(
+							accountId,
+							expectedRefreshToken,
+						)
+					: this.accounts.flagRequiresReauthIfTokenMatches(
+							accountId,
+							expectedRefreshToken,
+							expectedCreatedAt,
+						),
 			this.retryConfig,
 			"flagAccountRequiresReauthIfTokenMatches",
 		);
@@ -997,10 +1023,12 @@ OAuth tokens will need to be re-authenticated.
 	async flagRequiresReauthIfTokenMatches(
 		accountId: string,
 		expectedRefreshToken: string,
+		expectedCreatedAt?: number,
 	): Promise<boolean> {
 		return this.flagAccountRequiresReauthIfTokenMatches(
 			accountId,
 			expectedRefreshToken,
+			expectedCreatedAt,
 		);
 	}
 
@@ -1089,8 +1117,14 @@ OAuth tokens will need to be re-authenticated.
 		accountId: string,
 		usage: import("@better-ccflare/types").CanonicalUsageWindow[],
 		now: number,
+		expectedCreatedAt?: number,
 	): Promise<void> {
-		await this.usageHistory.recordSnapshot(accountId, usage, now);
+		await this.usageHistory.recordSnapshot(
+			accountId,
+			usage,
+			now,
+			expectedCreatedAt,
+		);
 	}
 
 	async getUsageHistory(opts: {
@@ -1138,23 +1172,40 @@ OAuth tokens will need to be re-authenticated.
 		return this.usageWindows.getOpenWindow(accountId, windowKey);
 	}
 
-	async openUsageWindow(input: OpenWindowInput): Promise<UsageWindow> {
-		return this.usageWindows.openWindow(input);
+	async openUsageWindow(input: OpenWindowInput): Promise<UsageWindow>;
+	async openUsageWindow(
+		input: OpenWindowInput,
+		expectedCreatedAt: number,
+	): Promise<UsageWindow | null>;
+	async openUsageWindow(
+		input: OpenWindowInput,
+		expectedCreatedAt?: number,
+	): Promise<UsageWindow | null> {
+		return expectedCreatedAt === undefined
+			? this.usageWindows.openWindow(input)
+			: this.usageWindows.openWindow(input, expectedCreatedAt);
 	}
 
 	async recordUsageWindowUtilization(
 		id: string,
 		utilization: number,
 		timestampMs: number,
+		expectedCreatedAt?: number,
 	): Promise<void> {
-		await this.usageWindows.recordUtilization(id, utilization, timestampMs);
+		await this.usageWindows.recordUtilization(
+			id,
+			utilization,
+			timestampMs,
+			expectedCreatedAt,
+		);
 	}
 
 	async closeUsageWindow(
 		id: string,
 		input: CloseWindowInput,
+		expectedCreatedAt?: number,
 	): Promise<boolean> {
-		return this.usageWindows.closeWindow(id, input);
+		return this.usageWindows.closeWindow(id, input, expectedCreatedAt);
 	}
 
 	async listUsageWindows(
@@ -1221,11 +1272,17 @@ OAuth tokens will need to be re-authenticated.
 		return this.cacheFlightRecorder.expireTombstonesOlderThan(now);
 	}
 
-	async forceResetAccountRateLimit(accountId: string): Promise<boolean> {
+	async forceResetAccountRateLimit(
+		accountId: string,
+		expectedCreatedAt?: number,
+	): Promise<boolean> {
 		return withDatabaseRetry(
 			async () => {
-				const changes = await this.accounts.clearRateLimitState(accountId);
-				return changes >= 0;
+				const changes = await this.accounts.clearRateLimitState(
+					accountId,
+					expectedCreatedAt,
+				);
+				return expectedCreatedAt === undefined ? changes >= 0 : changes > 0;
 			},
 			this.retryConfig,
 			"forceResetAccountRateLimit",
@@ -1245,8 +1302,16 @@ OAuth tokens will need to be re-authenticated.
 		accountId: string,
 		reason: string,
 		expectedRefreshToken?: string | null,
+		expectedCreatedAt?: number,
 	): Promise<boolean> {
-		return this.accounts.pauseIfActive(accountId, reason, expectedRefreshToken);
+		return expectedCreatedAt === undefined
+			? this.accounts.pauseIfActive(accountId, reason, expectedRefreshToken)
+			: this.accounts.pauseIfActive(
+					accountId,
+					reason,
+					expectedRefreshToken,
+					expectedCreatedAt,
+				);
 	}
 
 	/**
@@ -1285,8 +1350,9 @@ OAuth tokens will need to be re-authenticated.
 	async resetAccountSession(
 		accountId: string,
 		timestamp: number,
+		expectedCreatedAt?: number,
 	): Promise<void> {
-		await this.accounts.resetSession(accountId, timestamp);
+		await this.accounts.resetSession(accountId, timestamp, expectedCreatedAt);
 	}
 
 	async setAccountBillingType(
