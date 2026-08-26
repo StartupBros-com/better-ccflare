@@ -108,6 +108,7 @@ import {
 import { createLogsStreamHandler } from "./handlers/logs";
 import { createLogsHistoryHandler } from "./handlers/logs-history";
 import { createCleanupHandler } from "./handlers/maintenance";
+import { getSharedModelProvenanceHandler } from "./handlers/model-provenance";
 import {
 	createModelsHandler,
 	createModelsRefreshHandler,
@@ -245,6 +246,7 @@ export class APIRouter {
 			dbOps.getAdapter(),
 		);
 		const requestsDetailHandler = createRequestsDetailHandler(dbOps);
+		const modelProvenanceHandler = getSharedModelProvenanceHandler();
 		const configHandlers = createConfigHandlers(
 			config,
 			this.context.runtime,
@@ -425,6 +427,9 @@ export class APIRouter {
 		});
 		this.handlers.set("GET:/api/requests/stream", (req) =>
 			requestsStreamHandler(req),
+		);
+		this.handlers.set("GET:/api/routing/model-provenance", (_req, url) =>
+			modelProvenanceHandler.handle(url.searchParams.get("agentId")),
 		);
 		this.handlers.set("GET:/api/config", () => configHandlers.getConfig());
 		this.handlers.set("GET:/api/config/provider-model-defaults", () =>
