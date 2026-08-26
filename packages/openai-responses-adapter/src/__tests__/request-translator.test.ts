@@ -1187,6 +1187,29 @@ describe("translateRequestToAnthropic", () => {
 		]);
 	});
 
+	test("system and developer messages after conversation content are rejected instead of hoisted", () => {
+		for (const conversationRole of ["user", "assistant"] as const) {
+			for (const instructionRole of ["system", "developer"] as const) {
+				const req: ResponsesRequest = {
+					model: "claude-3-5-sonnet-20241022",
+					input: [
+						{
+							type: "message",
+							role: conversationRole,
+							content: "conversation content",
+						},
+						{ type: "message", role: instructionRole, content: "late policy" },
+						{ type: "message", role: "user", content: "next user" },
+					],
+				};
+
+				expect(() => translateRequestToAnthropic(req)).toThrow(
+					`${instructionRole} message must appear before conversation content`,
+				);
+			}
+		}
+	});
+
 	test("developer message with string content → merged into system, no messages entry", () => {
 		const req: ResponsesRequest = {
 			model: "claude-3-5-sonnet-20241022",
@@ -1201,6 +1224,32 @@ describe("translateRequestToAnthropic", () => {
 		const result = translateRequestToAnthropic(req);
 		expect(result.messages).toHaveLength(0);
 		expect(result.system).toContain("system instr");
+	});
+
+	test("system message with image content is rejected instead of silently dropping policy", () => {
+		for (const image of [
+			{
+				type: "input_image" as const,
+				image_url: "https://example.com/policy.png",
+			},
+			{ type: "input_image" as const, file_id: "file_policy" },
+		]) {
+			const req: ResponsesRequest = {
+				model: "claude-3-5-sonnet-20241022",
+				input: [
+					{
+						type: "message",
+						role: "system",
+						content: [image],
+					},
+					{ type: "message", role: "user", content: "hello" },
+				],
+			};
+
+			expect(() => translateRequestToAnthropic(req)).toThrow(
+				"system message content must be text-only",
+			);
+		}
 	});
 
 	// --- Findings #1 / #4: malformed-content warn batching + empty-content drop ---

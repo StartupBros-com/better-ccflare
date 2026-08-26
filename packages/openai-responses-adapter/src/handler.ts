@@ -19,7 +19,10 @@ import {
 	MAX_RESPONSES_INPUT_ITEMS,
 	MAX_RESPONSES_TOOLS,
 } from "./request-limits";
-import { translateRequestToAnthropic } from "./request-translator";
+import {
+	InvalidInstructionError,
+	translateRequestToAnthropic,
+} from "./request-translator";
 import { translateAnthropicResponseToResponses } from "./response-translator";
 import { translateAnthropicStreamToResponses } from "./stream-translator";
 import type { HandleProxyFn, ResponseItem, ResponsesRequest } from "./types";
@@ -372,9 +375,17 @@ export async function handleResponsesRequest(
 	const responseId = `resp_${crypto.randomBytes(12).toString("hex")}`;
 
 	// 4. Translate to Anthropic format
-	const anthropicBody = translateRequestToAnthropic(
-		body as typeof body & { input: ResponseItem[] },
-	);
+	let anthropicBody: ReturnType<typeof translateRequestToAnthropic>;
+	try {
+		anthropicBody = translateRequestToAnthropic(
+			body as typeof body & { input: ResponseItem[] },
+		);
+	} catch (error) {
+		if (error instanceof InvalidInstructionError) {
+			return openAiRequestError(400, error.message);
+		}
+		throw error;
+	}
 	if (anthropicBody.messages.length === 0) {
 		return openAiRequestError(
 			400,

@@ -1069,6 +1069,72 @@ describe("Responses request body admission", () => {
 			]);
 		});
 
+		test("rejects non-text system content before proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: "system",
+						content: [
+							{
+								type: "input_image",
+								image_url: "https://example.com/policy.png",
+							},
+						],
+					},
+					{ type: "message", role: "user", content: "hello" },
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+
+			expect(response.status).toBe(400);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "system message content must be text-only",
+				},
+			});
+		});
+
+		test("rejects a system message after conversation content before proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{ type: "message", role: "user", content: "first user" },
+					{ type: "message", role: "system", content: "late policy" },
+					{ type: "message", role: "user", content: "second user" },
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+
+			expect(response.status).toBe(400);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "system message must appear before conversation content",
+				},
+			});
+		});
+
 		test("drops a hostile non-string message role without throwing", async () => {
 			let forwarded: { messages?: unknown } | undefined;
 			let calls = 0;

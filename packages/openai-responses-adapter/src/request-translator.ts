@@ -16,6 +16,13 @@ import type {
 
 const logger = new Logger("openai-responses-adapter");
 
+export class InvalidInstructionError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "InvalidInstructionError";
+	}
+}
+
 // Map OpenAI model names to Claude family aliases so per-account model_mappings
 // (opus/sonnet/haiku) resolve correctly when Codex CLI requests reach the proxy.
 // Rules based on OpenAI naming conventions:
@@ -336,20 +343,26 @@ export function translateRequestToAnthropic(
 			const content: AnthropicContent[] = [];
 			let malformedCount = 0;
 			let rejectedCount = 0;
+			let hasImageInstructionContent = false;
 			for (const rawC of parts) {
 				if (rawC === null || typeof rawC !== "object" || Array.isArray(rawC)) {
 					malformedCount++;
 					continue;
 				}
-				const res = translateContentItem(
-					rawC as {
-						type: unknown;
-						text?: unknown;
-						refusal?: unknown;
-						image_url?: unknown;
-						file_id?: unknown;
-					},
-				);
+				const contentItem = rawC as {
+					type: unknown;
+					text?: unknown;
+					refusal?: unknown;
+					image_url?: unknown;
+					file_id?: unknown;
+				};
+				if (
+					(role === "system" || role === "developer") &&
+					contentItem.type === "input_image"
+				) {
+					hasImageInstructionContent = true;
+				}
+				const res = translateContentItem(contentItem);
 				if (res.ok) {
 					content.push(res.block);
 				} else {
@@ -383,10 +396,26 @@ export function translateRequestToAnthropic(
 
 			// system and developer roles carry request instructions. Anthropic
 			// /v1/messages accepts them only through the top-level system field, so
-			// preserve their input order while extracting their text blocks.
+			// preserve their input order while extracting text. Fail closed when
+			// translation cannot preserve either their content or their position.
 			if (role === "system" || role === "developer") {
+				if (messages.length > 0) {
+					throw new InvalidInstructionError(
+						`${role} message must appear before conversation content`,
+					);
+				}
+				if (hasImageInstructionContent) {
+					throw new InvalidInstructionError(
+						`${role} message content must be text-only`,
+					);
+				}
 				for (const c of content) {
-					if (c.type === "text") instructionBlocks.push(c.text);
+					if (c.type !== "text") {
+						throw new InvalidInstructionError(
+							`${role} message content must be text-only`,
+						);
+					}
+					instructionBlocks.push(c.text);
 				}
 				continue;
 			}
