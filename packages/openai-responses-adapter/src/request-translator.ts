@@ -269,7 +269,7 @@ export function translateRequestToAnthropic(
 	req: ResponsesRequest & { input: ResponseItem[] },
 ): AnthropicRequest {
 	const messages: AnthropicMessage[] = [];
-	const developerBlocks: string[] = [];
+	const instructionBlocks: string[] = [];
 	// Request-scoped: pairing (function_call <-> function_call_output etc.)
 	// must survive sanitization, so the mapper and side-specific consumption
 	// tracking are built once per request, never globally.
@@ -306,7 +306,12 @@ export function translateRequestToAnthropic(
 
 		if (item.type === "message") {
 			const role: unknown = item.role;
-			if (role !== "user" && role !== "assistant" && role !== "developer") {
+			if (
+				role !== "user" &&
+				role !== "assistant" &&
+				role !== "developer" &&
+				role !== "system"
+			) {
 				emitWarn("Dropping message with unsupported role");
 				continue;
 			}
@@ -376,12 +381,12 @@ export function translateRequestToAnthropic(
 				continue;
 			}
 
-			// developer role is used by Codex CLI for system-level instructions.
-			// Anthropic /v1/messages does not accept this role in the messages array
-			// so we extract the text and merge it into the system prompt instead.
-			if (role === "developer") {
+			// system and developer roles carry request instructions. Anthropic
+			// /v1/messages accepts them only through the top-level system field, so
+			// preserve their input order while extracting their text blocks.
+			if (role === "system" || role === "developer") {
 				for (const c of content) {
-					if (c.type === "text") developerBlocks.push(c.text);
+					if (c.type === "text") instructionBlocks.push(c.text);
 				}
 				continue;
 			}
@@ -643,10 +648,10 @@ export function translateRequestToAnthropic(
 		max_tokens: req.max_output_tokens ?? 4096,
 	};
 
-	// Merge developer-role blocks and req.instructions into system prompt.
+	// Merge message-role instruction blocks and req.instructions into system prompt.
 	const systemParts: string[] = [];
-	if (developerBlocks.length > 0)
-		systemParts.push(developerBlocks.join("\n\n"));
+	if (instructionBlocks.length > 0)
+		systemParts.push(instructionBlocks.join("\n\n"));
 	if (req.instructions !== undefined) systemParts.push(req.instructions);
 	if (systemParts.length > 0) result.system = systemParts.join("\n\n");
 

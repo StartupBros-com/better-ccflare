@@ -1033,6 +1033,42 @@ describe("Responses request body admission", () => {
 			]);
 		});
 
+		test("preserves system policy and developer instructions before user input", async () => {
+			let forwarded: { messages?: unknown; system?: unknown } | undefined;
+			let calls = 0;
+			const proxy: HandleProxyFn = async (proxyRequest) => {
+				calls += 1;
+				forwarded = (await proxyRequest.json()) as typeof forwarded;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{ type: "message", role: "system", content: "system first" },
+					{ type: "message", role: "developer", content: "developer second" },
+					{ type: "message", role: "system", content: "system third" },
+					{ type: "message", role: "user", content: "hello" },
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls).toBe(1);
+			expect(forwarded?.system).toBe(
+				"system first\n\ndeveloper second\n\nsystem third",
+			);
+			expect(forwarded?.messages).toEqual([
+				{ role: "user", content: [{ type: "text", text: "hello" }] },
+			]);
+		});
+
 		test("drops a hostile non-string message role without throwing", async () => {
 			let forwarded: { messages?: unknown } | undefined;
 			let calls = 0;

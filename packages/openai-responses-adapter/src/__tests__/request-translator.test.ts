@@ -1166,6 +1166,27 @@ describe("translateRequestToAnthropic", () => {
 		expect(warnings).toHaveLength(0);
 	});
 
+	test("system and developer message text preserves input order in the Anthropic system prompt", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{ type: "message", role: "system", content: "system first" },
+				{ type: "message", role: "developer", content: "developer second" },
+				{ type: "message", role: "system", content: "system third" },
+				{ type: "message", role: "user", content: "hello" },
+			],
+		};
+		const result = translateRequestToAnthropic(
+			req as ResponsesRequest & { input: ResponseItem[] },
+		);
+		expect(result.system).toBe(
+			"system first\n\ndeveloper second\n\nsystem third",
+		);
+		expect(result.messages).toEqual([
+			{ role: "user", content: [{ type: "text", text: "hello" }] },
+		]);
+	});
+
 	test("developer message with string content → merged into system, no messages entry", () => {
 		const req: ResponsesRequest = {
 			model: "claude-3-5-sonnet-20241022",
