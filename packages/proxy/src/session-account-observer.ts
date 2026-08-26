@@ -28,6 +28,8 @@ interface SessionAccountEntry {
 	accountId: string | null;
 	/** Model-route profile provenance, or null for an ordinary account route. */
 	routeProfileId: string | null;
+	/** Models associated with the same successful physical route, when observed. */
+	models: SessionModelObservation | null;
 	/** Observation (completion) time — drives TTL expiry and eviction recency. */
 	recordedAt: number;
 	/**
@@ -49,11 +51,22 @@ interface SessionAccountEntry {
 	version: number;
 }
 
+export interface SessionModelObservation {
+	/** Client/request model before ccflare policy rewrites, when available. */
+	requestedModel: string | null;
+	/** Model after ccflare policy rewrites, before provider transport mapping. */
+	appliedModel: string | null;
+	/** Concrete model sent to the successful upstream provider. */
+	upstreamModel: string;
+}
+
 /** The account observation stored atomically for one live Claude Code session. */
 export interface SessionAccountObservation {
 	accountId: string;
 	/** Internal profile slug, or null when ordinary account selection served it. */
 	routeProfileId: string | null;
+	/** Same-attempt model provenance; absent for legacy/test callers. */
+	models?: SessionModelObservation;
 }
 
 export interface SessionAccountObserverOptions {
@@ -99,6 +112,7 @@ export class SessionAccountObserver {
 		accountId: string,
 		version: number = this.now(),
 		routeProfileId: string | null = null,
+		models: SessionModelObservation | null = null,
 	): void {
 		if (!sessionId || !accountId) return;
 		const existing = this.map.get(sessionId);
@@ -110,6 +124,7 @@ export class SessionAccountObserver {
 		this.map.set(sessionId, {
 			accountId,
 			routeProfileId,
+			models,
 			recordedAt: this.now(),
 			version,
 		});
@@ -141,6 +156,7 @@ export class SessionAccountObserver {
 		return {
 			accountId: entry.accountId,
 			routeProfileId: entry.routeProfileId,
+			...(entry.models ? { models: entry.models } : {}),
 		};
 	}
 
@@ -165,6 +181,7 @@ export class SessionAccountObserver {
 		this.map.set(sessionId, {
 			accountId: null,
 			routeProfileId: null,
+			models: null,
 			recordedAt: this.now(),
 			version,
 		});
@@ -227,8 +244,9 @@ export function recordServedAccount(
 	accountId: string,
 	version?: number,
 	routeProfileId: string | null = null,
+	models: SessionModelObservation | null = null,
 ): void {
-	observer.record(sessionId, accountId, version, routeProfileId);
+	observer.record(sessionId, accountId, version, routeProfileId, models);
 }
 
 /** Look up the account id that last served `sessionId`, if still live. */

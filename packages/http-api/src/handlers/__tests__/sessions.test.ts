@@ -82,6 +82,9 @@ type SessionAccountBody = {
 			rateLimitReset: number | null;
 			usageThrottledUntil: number | null;
 			usageThrottledWindows: string[];
+			requestedModel: string | null;
+			appliedModel: string | null;
+			upstreamModel: string | null;
 		};
 	};
 };
@@ -107,7 +110,11 @@ describe("createSessionAccountHandler", () => {
 				resets_at: new Date(now + 6 * 86400_000).toISOString(),
 			},
 		});
-		recordServedAccount(SESSION, ACCOUNT_ID);
+		recordServedAccount(SESSION, ACCOUNT_ID, Date.now(), null, {
+			requestedModel: "claude-opus-5",
+			appliedModel: "claude-opus-5",
+			upstreamModel: "gpt-5.6-sol",
+		});
 		const account = makeAccount({ id: ACCOUNT_ID, name: "healthy-acct" });
 
 		const handler = createSessionAccountHandler(
@@ -130,6 +137,11 @@ describe("createSessionAccountHandler", () => {
 		expect(body.data.account?.usageResetMs).toBeGreaterThan(now);
 		expect(body.data.account?.paused).toBe(false);
 		expect(body.data.account?.rateLimitStatus).toBe("OK");
+		expect(body.data.account).toMatchObject({
+			requestedModel: "claude-opus-5",
+			appliedModel: "claude-opus-5",
+			upstreamModel: "gpt-5.6-sol",
+		});
 		// Anthropic exposes BOTH its 5h and 7d limits independently.
 		const w = body.data.account?.windows ?? [];
 		expect(w.map((x) => x.window).sort()).toEqual(["five_hour", "seven_day"]);

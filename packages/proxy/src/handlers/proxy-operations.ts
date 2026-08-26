@@ -5645,6 +5645,14 @@ export async function proxyWithAccount(
 								observedSessionId,
 								account.id,
 								requestMeta.timestamp,
+								requestMeta.routeProfileId ?? null,
+								currentTransportModel
+									? {
+											requestedModel: requestMeta.originalModel ?? null,
+											appliedModel: attemptAppliedModel ?? null,
+											upstreamModel: currentTransportModel,
+										}
+									: null,
 							);
 						}
 						return withSanitizedProxyHeaders(rawResponse);
