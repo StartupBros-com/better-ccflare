@@ -73,10 +73,11 @@ describe("parseModelRouteProfiles", () => {
 		expect(parseModelRouteProfiles("   ")).toEqual([]);
 	});
 
-	it("preserves existing profile shapes when optional bounded fields are absent", () => {
+	it("preserves existing profile shapes when optional bounded fields and client context hints are absent", () => {
 		expect(profile()).toEqual({
 			id: "pro-primary-sol",
 			publicModelId: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}pro-primary-sol`,
+			discoveryModelId: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}pro-primary-sol`,
 			displayName: "GPT-5.6 Sol · pro-primary",
 			description: "Pinned high-reasoning route",
 			accountId: "df44bdf6-d646-45aa-b3d1-1b2b2cdbf774",
@@ -85,6 +86,70 @@ describe("parseModelRouteProfiles", () => {
 			expectedProvider: "codex",
 			expectedPhysicalModel: "gpt-5.6-sol",
 		});
+	});
+
+	it("parses a one-million-token client context hint without changing its legacy picker id", () => {
+		const [configured] = parseModelRouteProfiles(
+			JSON.stringify([
+				{
+					id: "pro-primary-sol",
+					displayName: "GPT-5.6 Sol · pro-primary",
+					accountId: "df44bdf6-d646-45aa-b3d1-1b2b2cdbf774",
+					logicalModel: "claude-opus-5",
+					clientContextWindowHint: "1m",
+				},
+			]),
+		);
+
+		expect(configured).toMatchObject({
+			publicModelId: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}pro-primary-sol`,
+			discoveryModelId: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}pro-primary-sol[1m]`,
+			clientContextWindowHint: "1m",
+		});
+	});
+
+	it("accepts only the supported client context hint value and types", () => {
+		const exactProfile = {
+			id: "hinted-route",
+			displayName: "Hinted route",
+			accountId: "account",
+			logicalModel: "claude-fable-5",
+		};
+
+		for (const clientContextWindowHint of [
+			"",
+			"1M",
+			"2m",
+			"1m ",
+			1_000_000,
+			true,
+			null,
+			{},
+		] as const) {
+			expect(() =>
+				parseModelRouteProfiles(
+					JSON.stringify([{ ...exactProfile, clientContextWindowHint }]),
+				),
+			).toThrow("CCFLARE_MODEL_ROUTE_PROFILES_JSON");
+		}
+	});
+
+	it("rejects client context hints combined with bounded route limits", () => {
+		expect(() =>
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "hinted-bounded-route",
+						displayName: "Hinted bounded route",
+						accountId: "account",
+						logicalModel: "claude-fable-5",
+						clientContextWindowHint: "1m",
+						contextWindow: 24_000,
+						maxOutputTokens: 4_000,
+					},
+				]),
+			),
+		).toThrow("CCFLARE_MODEL_ROUTE_PROFILES_JSON");
 	});
 
 	it("parses bounded exclusive settings on an exact-account profile", () => {
@@ -341,6 +406,51 @@ describe("ModelRouteSessionRegistry", () => {
 			generation: null,
 		});
 		expect(registry.size).toBe(0);
+	});
+
+	it("accepts legacy and hinted picker ids as one profile while discovering only the hint", () => {
+		const [configured] = parseModelRouteProfiles(
+			JSON.stringify([
+				{
+					id: "pro-primary-sol",
+					displayName: "GPT-5.6 Sol · pro-primary",
+					accountId: "df44bdf6-d646-45aa-b3d1-1b2b2cdbf774",
+					logicalModel: "claude-opus-5",
+					clientContextWindowHint: "1m",
+				},
+			]),
+		);
+		if (!configured) throw new Error("Expected the hinted route to parse");
+		const registry = new ModelRouteSessionRegistry([configured]);
+
+		for (const requestModel of [
+			configured.publicModelId,
+			configured.discoveryModelId,
+		]) {
+			expect(
+				resolveRequest(registry, {
+					callerIdentity: null,
+					requestModel,
+					sessionId: null,
+					isSubagent: false,
+				}),
+			).toEqual({
+				kind: "route",
+				source: "explicit",
+				profile: configured,
+				generation: null,
+			});
+		}
+
+		expect(registry.hasPublicModelId(`${configured.publicModelId}[2m]`)).toBe(
+			false,
+		);
+		expect(registry.getDiscoveryModels()).toEqual([
+			{
+				id: configured.discoveryModelId,
+				display_name: configured.displayName,
+			},
+		]);
 	});
 
 	it("binds an explicit route and inherits it for child-agent model overrides", () => {
