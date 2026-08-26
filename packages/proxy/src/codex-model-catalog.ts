@@ -1,6 +1,7 @@
 import { Logger } from "@better-ccflare/logger";
 import {
 	CODEX_VERSION,
+	clearDerivedAccountModelDefaults,
 	hasDerivedProviderModelDefaults,
 	setDerivedAccountModelDefaults,
 	setDerivedProviderModelDefaults,
@@ -92,6 +93,24 @@ interface CachedAccountCatalog {
 const lastGood = new Map<string, CachedAccountCatalog>();
 
 /**
+ * Per-account deletion generation. A request captures this before any await;
+ * clearing increments it so a pre-delete completion may answer its own caller
+ * but cannot repopulate state for a same-ID replacement.
+ */
+const invalidationGenerationByAccount = new Map<string, number>();
+
+function invalidationGenerationFor(accountId: string): number {
+	return invalidationGenerationByAccount.get(accountId) ?? 0;
+}
+
+function isCurrentInvalidationGeneration(
+	accountId: string,
+	generation: number,
+): boolean {
+	return invalidationGenerationFor(accountId) === generation;
+}
+
+/**
  * The last listing any account of this provider managed to read.
  *
  * Two of three measured accounts answer HTTP 401 on the models endpoint while
@@ -132,10 +151,30 @@ let publishedProviderCatalogGeneration = 0;
  */
 export function clearCodexModelCacheForTests(): void {
 	lastGood.clear();
+	invalidationGenerationByAccount.clear();
 	providerWide = null;
 	ensureRetryByAccount.clear();
 	ensureInFlight.clear();
 	publishedProviderCatalogGeneration = 0;
+}
+
+/**
+ * Retire every account-local catalog projection after deletion.
+ *
+ * Provider-wide evidence is intentionally advisory and may have come from a
+ * different account, so it survives. The generation fence prevents a request
+ * which started before this clear from restoring any exact or provider-wide
+ * evidence after a same-ID account replacement.
+ */
+export function clearCodexModelCacheForAccount(accountId: string): void {
+	invalidationGenerationByAccount.set(
+		accountId,
+		invalidationGenerationFor(accountId) + 1,
+	);
+	lastGood.delete(accountId);
+	ensureRetryByAccount.delete(accountId);
+	ensureInFlight.delete(accountId);
+	clearDerivedAccountModelDefaults("codex", accountId);
 }
 
 function scheduleEnsureRetry(accountId: string, now: number): void {
@@ -302,6 +341,7 @@ export function ensureCodexModelDefaults(
 	now: () => number = Date.now,
 ): Promise<void> {
 	if (account?.provider !== "codex") return Promise.resolve();
+	const invalidationGeneration = invalidationGenerationFor(account.id);
 	if (hasDerivedProviderModelDefaults("codex", account.id)) {
 		ensureRetryByAccount.delete(account.id);
 		return Promise.resolve();
@@ -321,11 +361,15 @@ export function ensureCodexModelDefaults(
 				ensureRetryByAccount.delete(account.id);
 				return;
 			}
-			scheduleEnsureRetry(account.id, now());
+			if (isCurrentInvalidationGeneration(account.id, invalidationGeneration)) {
+				scheduleEnsureRetry(account.id, now());
+			}
 		} catch (err) {
 			// Never blocks the request: without a map the family falls through and
 			// the provider gets to say what it thinks, which the record then learns.
-			scheduleEnsureRetry(account.id, now());
+			if (isCurrentInvalidationGeneration(account.id, invalidationGeneration)) {
+				scheduleEnsureRetry(account.id, now());
+			}
 			log.debug(`Could not load the model list for ${account.name}: ${err}`);
 		}
 	})().finally(() => {
@@ -390,6 +434,7 @@ export async function getCodexModels(
 	accountId: string,
 	ctx: ProxyContext,
 ): Promise<CodexModelListing | null> {
+	const invalidationGeneration = invalidationGenerationFor(accountId);
 	const account = await ctx.dbOps.getAccount(accountId);
 	if (!account || account.provider !== "codex") return null;
 	const fetchGeneration = ++nextCatalogFetchGeneration;
@@ -410,26 +455,31 @@ export async function getCodexModels(
 		};
 		const families = deriveFamilyDefaults(models);
 		const publishedAccountGeneration = lastGood.get(accountId)?.generation;
-		if (
-			publishedAccountGeneration === undefined ||
-			fetchGeneration > publishedAccountGeneration
-		) {
-			// This account's exact evidence advances independently of the shared
-			// frontier, so a late response from another account still remains useful.
-			lastGood.set(accountId, { listing, generation: fetchGeneration });
-			setDerivedAccountModelDefaults("codex", accountId, families);
-		}
-		if (fetchGeneration > publishedProviderCatalogGeneration) {
-			providerWide = listing;
-			setDerivedProviderModelDefaults("codex", accountId, families);
-			publishedProviderCatalogGeneration = fetchGeneration;
+		if (isCurrentInvalidationGeneration(accountId, invalidationGeneration)) {
+			if (
+				publishedAccountGeneration === undefined ||
+				fetchGeneration > publishedAccountGeneration
+			) {
+				// This account's exact evidence advances independently of the shared
+				// frontier, so a late response from another account still remains useful.
+				lastGood.set(accountId, { listing, generation: fetchGeneration });
+				setDerivedAccountModelDefaults("codex", accountId, families);
+			}
+			if (fetchGeneration > publishedProviderCatalogGeneration) {
+				providerWide = listing;
+				setDerivedProviderModelDefaults("codex", accountId, families);
+				publishedProviderCatalogGeneration = fetchGeneration;
+			}
 		}
 		return listing;
 	} catch (error) {
 		const cached = readCache(accountId);
 		// The cached listing is still this account's own answer, just an older
 		// one — far better than a map compiled months ago.
-		if (cached?.source === "cached") {
+		if (
+			cached?.source === "cached" &&
+			isCurrentInvalidationGeneration(accountId, invalidationGeneration)
+		) {
 			setDerivedAccountModelDefaults(
 				"codex",
 				accountId,

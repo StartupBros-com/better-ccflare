@@ -42,6 +42,7 @@ import {
 import {
 	clearAccountRefreshCache,
 	clearAutoRefreshTrackingForAccount,
+	clearCodexModelCacheForAccount,
 	clearPendingRotationForDeletedAccount,
 	getBindingConstraint,
 	getUsageThrottleStatus,
@@ -1085,6 +1086,11 @@ export function createAccountRemoveHandler(dbOps: DatabaseOperations) {
 			// lingers until the scheduler's next periodic cleanup sweep (up to
 			// 60s later) or server shutdown.
 			clearAutoRefreshTrackingForAccount(accountId);
+
+			// Retire catalog evidence and any in-flight discovery for this exact id.
+			// A same-ID replacement must fetch its own model list rather than inherit
+			// state published by the deleted account's pending request.
+			clearCodexModelCacheForAccount(accountId);
 
 			// Deletion is the only lifecycle transition that proves no live account
 			// can still own this rotation. Reload and re-auth must retain it.

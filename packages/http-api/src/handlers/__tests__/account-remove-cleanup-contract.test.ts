@@ -13,12 +13,14 @@ const deleteUsageCache = spyOn(usageCache, "delete").mockImplementation(
 );
 const clearAccountRefreshCache = mock(() => {});
 const clearAutoRefreshTrackingForAccount = mock(() => {});
+const clearCodexModelCacheForAccount = mock(() => {});
 const clearPendingRotationForDeletedAccount = mock(() => {});
 
 mock.module("@better-ccflare/cli-commands", () => ({ removeAccountById }));
 mock.module("@better-ccflare/proxy", () => ({
 	clearAccountRefreshCache,
 	clearAutoRefreshTrackingForAccount,
+	clearCodexModelCacheForAccount,
 	clearPendingRotationForDeletedAccount,
 	getBindingConstraint: () => undefined,
 	getUsageThrottleStatus: () => undefined,
@@ -52,6 +54,7 @@ afterEach(() => {
 	deleteUsageCache.mockClear();
 	clearAccountRefreshCache.mockClear();
 	clearAutoRefreshTrackingForAccount.mockClear();
+	clearCodexModelCacheForAccount.mockClear();
 	clearPendingRotationForDeletedAccount.mockClear();
 });
 
@@ -69,6 +72,9 @@ describe("createAccountRemoveHandler cleanup contract", () => {
 		clearAutoRefreshTrackingForAccount.mockImplementationOnce(() =>
 			callOrder.push("clearAutoRefreshTracking"),
 		);
+		clearCodexModelCacheForAccount.mockImplementationOnce(() =>
+			callOrder.push("clearCodexModelCatalog"),
+		);
 		clearPendingRotationForDeletedAccount.mockImplementationOnce(() =>
 			callOrder.push("clearPendingRotation"),
 		);
@@ -83,6 +89,7 @@ describe("createAccountRemoveHandler cleanup contract", () => {
 			"stopPolling",
 			"clearRefreshCache",
 			"clearAutoRefreshTracking",
+			"clearCodexModelCatalog",
 			"clearPendingRotation",
 		]);
 
@@ -100,6 +107,7 @@ describe("createAccountRemoveHandler cleanup contract", () => {
 		expect(clearAutoRefreshTrackingForAccount).toHaveBeenCalledWith(
 			"account-1",
 		);
+		expect(clearCodexModelCacheForAccount).toHaveBeenCalledWith("account-1");
 		expect(clearPendingRotationForDeletedAccount).toHaveBeenCalledWith(
 			"account-1",
 		);
@@ -122,6 +130,7 @@ describe("createAccountRemoveHandler cleanup contract", () => {
 		expect(deleteUsageCache).toHaveBeenCalledWith("account-1");
 		expect(stopPolling).not.toHaveBeenCalled();
 		expect(clearAutoRefreshTrackingForAccount).not.toHaveBeenCalled();
+		expect(clearCodexModelCacheForAccount).not.toHaveBeenCalled();
 		expect(clearPendingRotationForDeletedAccount).not.toHaveBeenCalled();
 	});
 
@@ -151,6 +160,7 @@ describe("createAccountRemoveHandler cleanup contract", () => {
 		expect(stopPolling).not.toHaveBeenCalled();
 		expect(clearAccountRefreshCache).not.toHaveBeenCalled();
 		expect(clearAutoRefreshTrackingForAccount).not.toHaveBeenCalled();
+		expect(clearCodexModelCacheForAccount).not.toHaveBeenCalled();
 		expect(clearPendingRotationForDeletedAccount).not.toHaveBeenCalled();
 	});
 });
