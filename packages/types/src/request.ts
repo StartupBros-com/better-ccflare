@@ -181,21 +181,6 @@ export interface Request {
 	streamTerminalState?: ReportedStreamTerminalState;
 }
 
-/**
- * Latest completed route observed for one live agent/session in this process.
- * This is deliberately ephemeral: the request ledger remains the durable source
- * for historical attribution, while statusline consumers need only the current
- * upstream model without scanning the global request list.
- */
-export interface ModelProvenanceResponse {
-	agentId: string;
-	requestedModel: string | null;
-	appliedModel: string | null;
-	upstreamModel: string;
-	account: string | null;
-	timestamp: string;
-}
-
 // API response type
 export interface RequestResponse {
 	id: string;

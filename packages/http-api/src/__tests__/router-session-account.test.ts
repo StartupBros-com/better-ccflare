@@ -104,18 +104,26 @@ describe("APIRouter — GET /api/sessions/:sessionId/account (#318)", () => {
 			["r1", 1000, "POST", "/v1/messages", "acc-1", "session-abc"],
 		);
 
-		recordServedAccount("session-abc", "acc-1");
+		recordServedAccount("session-abc", "acc-1", Date.now(), null, {
+			requestedModel: "claude-opus-5",
+			appliedModel: "claude-opus-5",
+			upstreamModel: "gpt-5.6-sol",
+		});
 		const url = new URL("http://localhost/api/sessions/session-abc/account");
 		const req = new Request(url);
 		const res = await router.handleRequest(url, req);
 		expect(res?.status).toBe(200);
 		const body = (await res?.json()) as {
 			success: boolean;
-			data: { status: string; account?: { id: string } };
+			data: {
+				status: string;
+				account?: { id: string; upstreamModel: string | null };
+			};
 		};
 		expect(body.success).toBe(true);
 		expect(body.data.status).toBe("known");
 		expect(body.data.account?.id).toBe("acc-1");
+		expect(body.data.account?.upstreamModel).toBe("gpt-5.6-sol");
 	});
 
 	it("does not match a POST to the same path (falls through to 404)", async () => {
