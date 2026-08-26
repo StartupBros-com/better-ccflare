@@ -552,6 +552,11 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(getServedAccountObservation(sessionId)).toEqual({
 			accountId: ROUTE_ACCOUNT_ID,
 			routeProfileId: "pro-primary-sol",
+			models: {
+				requestedModel: PROFILE_MODEL,
+				appliedModel: LOGICAL_MODEL,
+				upstreamModel: LOGICAL_MODEL,
+			},
 		});
 		clearSession(sessionId);
 	});

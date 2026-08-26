@@ -72,6 +72,10 @@ interface SessionAccountData {
 		usageThrottledUntil: number | null;
 		/** Names of the windows driving the throttle, if any. */
 		usageThrottledWindows: string[];
+		/** Model names from the same successful physical route. */
+		requestedModel: string | null;
+		appliedModel: string | null;
+		upstreamModel: string | null;
 	};
 }
 
@@ -298,6 +302,9 @@ export function createSessionAccountHandler(
 				rateLimitReset: account.rate_limit_reset ?? null,
 				usageThrottledUntil,
 				usageThrottledWindows,
+				requestedModel: observation.models?.requestedModel ?? null,
+				appliedModel: observation.models?.appliedModel ?? null,
+				upstreamModel: observation.models?.upstreamModel ?? null,
 			},
 		};
 

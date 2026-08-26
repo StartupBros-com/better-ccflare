@@ -833,6 +833,13 @@ export async function forwardToClient(
 				account.id,
 				timestamp,
 				routingMeta?.routeProfileId ?? null,
+				attemptedModel
+					? {
+							requestedModel: originalModel ?? null,
+							appliedModel: appliedModel ?? null,
+							upstreamModel: attemptedModel,
+						}
+					: null,
 			);
 		} else {
 			clearSession(servedSessionId, timestamp);

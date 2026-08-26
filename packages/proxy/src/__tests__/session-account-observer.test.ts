@@ -42,10 +42,19 @@ describe("SessionAccountObserver", () => {
 
 	it("stores profile provenance atomically and clears it on a newer ordinary record", () => {
 		const obs = new SessionAccountObserver();
-		obs.record("session-a", "profile-account", 10, "pro-primary-sol");
+		obs.record("session-a", "profile-account", 10, "pro-primary-sol", {
+			requestedModel: "claude-opus-5",
+			appliedModel: "claude-opus-5",
+			upstreamModel: "gpt-5.6-sol",
+		});
 		expect(obs.getObservation("session-a")).toEqual({
 			accountId: "profile-account",
 			routeProfileId: "pro-primary-sol",
+			models: {
+				requestedModel: "claude-opus-5",
+				appliedModel: "claude-opus-5",
+				upstreamModel: "gpt-5.6-sol",
+			},
 		});
 
 		obs.record("session-a", "ordinary-account", 20);
@@ -54,9 +63,13 @@ describe("SessionAccountObserver", () => {
 			routeProfileId: null,
 		});
 
-		// A late completion from the older profile request cannot restore either
-		// its account or its provenance over the newer ordinary observation.
-		obs.record("session-a", "stale-profile-account", 15, "stale-profile");
+		// A late completion from the older profile request cannot restore its
+		// account, route profile, or model provenance over the newer observation.
+		obs.record("session-a", "stale-profile-account", 15, "stale-profile", {
+			requestedModel: "stale-request",
+			appliedModel: "stale-applied",
+			upstreamModel: "stale-upstream",
+		});
 		expect(obs.getObservation("session-a")).toEqual({
 			accountId: "ordinary-account",
 			routeProfileId: null,
