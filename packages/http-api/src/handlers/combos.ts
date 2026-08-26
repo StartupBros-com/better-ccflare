@@ -1,3 +1,4 @@
+import { providerAcceptsClientModel } from "@better-ccflare/core";
 import type { ComboResolverDependencies } from "@better-ccflare/core/managed-routing";
 import {
 	getAllowedModelsMessage,
@@ -44,6 +45,23 @@ import {
 	toEffectiveRoutingView,
 } from "../services/account-routing-operations";
 import { errorResponse } from "../utils/http-error";
+
+/**
+ * A slot without a model (passthrough) only makes sense on a provider whose
+ * upstream natively accepts Claude model ids: the model the client asked for
+ * arrives intact and is understood on the other side.
+ *
+ * On any other provider, passthrough would hand a Claude name to an upstream
+ * that does not know it, and translation would fall to the embedded default
+ * map — the path that produced `400 gpt-5.3-codex ... ChatGPT account`.
+ *
+ * The list moved to core so that "force account model", which needs the same
+ * answer when deciding whether an account can serve a Claude id untranslated,
+ * cannot drift from it.
+ */
+function _allowsClientModel(provider: string | null | undefined): boolean {
+	return providerAcceptsClientModel(provider);
+}
 
 /**
  * GET /api/combos — List all combos with slot counts (lightweight)

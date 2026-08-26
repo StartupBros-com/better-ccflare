@@ -476,6 +476,13 @@ PIN_RENDERED=""
 
 for expected_line in \
 	"Environment=CCFLARE_BIN=${DEST_BIN}" \
+	"Environment=CCFLARE_DISTRIBUTION=v1:startupbros-managed-source" \
+	"Environment=CCFLARE_PRODUCER=startupbros" \
+	"Environment=CCFLARE_ARTIFACT_MODE=managed-source" \
+	"Environment=CCFLARE_GIT_SHA=${HEAD_SHA}" \
+	"Environment=CCFLARE_GIT_REF=refs/heads/main" \
+	"Environment=CCFLARE_SOURCE_SHA=${HEAD_SHA}" \
+	"Environment=CCFLARE_SOURCE_REF=refs/heads/main" \
 	"Environment=GUARD_SCRIPT=${GUARD_SCRIPT}" \
 	"Environment=GUARD_SOURCE_ID=${GUARD_SOURCE_ID}" \
 	"Environment=GUARD_POLICY_ID=${GUARD_POLICY_ID}" \

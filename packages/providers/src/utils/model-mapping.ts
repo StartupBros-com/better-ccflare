@@ -144,13 +144,26 @@ export async function transformRequestBodyModel<T extends TransformRequestBody>(
 
 	try {
 		const rawParsedBody: T = JSON.parse(new TextDecoder().decode(bytes));
+		// The Responses adapter's Codex carrier belongs solely to Codex. A later
+		// provider failover must not forward private adapter metadata upstream.
+		const {
+			__better_ccflare_codex_passthrough: _codexPassthrough,
+			...withoutCodexPassthrough
+		} = rawParsedBody as T & {
+			__better_ccflare_codex_passthrough?: unknown;
+		};
+		const carrierStripped =
+			"__better_ccflare_codex_passthrough" in rawParsedBody;
+		const carrierSafeBody = carrierStripped
+			? (withoutCodexPassthrough as T)
+			: rawParsedBody;
 		const parsedBody: T = providerName
 			? applySkillElision(
 					providerName,
-					rawParsedBody,
+					carrierSafeBody,
 					resolveSkillElisionBlockedSkills(),
 				)
-			: rawParsedBody;
+			: carrierSafeBody;
 		const bodyChangedByElision = parsedBody !== rawParsedBody;
 		const { body, strippedCount } = stripCodexReasoningRetention(parsedBody);
 		let modelChanged = false;

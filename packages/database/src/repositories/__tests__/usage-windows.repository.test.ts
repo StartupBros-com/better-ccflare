@@ -359,45 +359,55 @@ describe("UsageWindowsRepository", () => {
 // ---------------------------------------------------------------------------
 // Facade smoke test: exercise the usage-windows methods through a real
 // in-memory DatabaseOperations, mirroring the usage-history facade tests.
+// DatabaseOperations treats DATABASE_URL as authoritative, even with an
+// explicit :memory: path, so this SQLite-only smoke test cannot run live.
 // ---------------------------------------------------------------------------
 
+const databaseOperationsUsesPostgres = Boolean(
+	process.env.DATABASE_URL?.startsWith("postgres://") ||
+		process.env.DATABASE_URL?.startsWith("postgresql://"),
+);
+
 describe("DatabaseOperations usage-windows facade", () => {
-	it("round-trips open / recordUtilization / close through the facade", async () => {
-		const dbOps = new DatabaseOperations(":memory:", { walMode: false });
-		try {
-			const window = await dbOps.openUsageWindow({
-				accountId: "acc1",
-				windowKey: "five_hour",
-				startedAt: 1000,
-				resetsAt: 6000,
-				grantType: "natural",
-			});
-			await dbOps.recordUsageWindowUtilization(window.id, 100, 2000);
-			const open = await dbOps.getOpenUsageWindow("acc1", "five_hour");
-			expect(open?.peakUtilization).toBe(100);
-			expect(open?.first100At).toBe(2000);
+	it.skipIf(databaseOperationsUsesPostgres)(
+		"round-trips open / recordUtilization / close through the facade",
+		async () => {
+			const dbOps = new DatabaseOperations(":memory:", { walMode: false });
+			try {
+				const window = await dbOps.openUsageWindow({
+					accountId: "acc1",
+					windowKey: "five_hour",
+					startedAt: 1000,
+					resetsAt: 6000,
+					grantType: "natural",
+				});
+				await dbOps.recordUsageWindowUtilization(window.id, 100, 2000);
+				const open = await dbOps.getOpenUsageWindow("acc1", "five_hour");
+				expect(open?.peakUtilization).toBe(100);
+				expect(open?.first100At).toBe(2000);
 
-			const closed = await dbOps.closeUsageWindow(window.id, {
-				closedAt: 6000,
-				valueUsd: 3.5,
-				inputTokens: null,
-				cacheReadInputTokens: null,
-				cacheCreationInputTokens: null,
-				outputTokens: null,
-				requestCount: null,
-				modelBreakdown: null,
-				unpricedTokens: null,
-				projectionVersion: null,
-			});
-			expect(closed).toBe(true);
+				const closed = await dbOps.closeUsageWindow(window.id, {
+					closedAt: 6000,
+					valueUsd: 3.5,
+					inputTokens: null,
+					cacheReadInputTokens: null,
+					cacheCreationInputTokens: null,
+					outputTokens: null,
+					requestCount: null,
+					modelBreakdown: null,
+					unpricedTokens: null,
+					projectionVersion: null,
+				});
+				expect(closed).toBe(true);
 
-			const rows = await dbOps.listUsageWindows({ accountId: "acc1" });
-			expect(rows).toHaveLength(1);
-			expect(rows[0].valueUsd).toBe(3.5);
-		} finally {
-			await dbOps.dispose();
-		}
-	});
+				const rows = await dbOps.listUsageWindows({ accountId: "acc1" });
+				expect(rows).toHaveLength(1);
+				expect(rows[0].valueUsd).toBe(3.5);
+			} finally {
+				await dbOps.dispose();
+			}
+		},
+	);
 });
 
 // ---------------------------------------------------------------------------
@@ -509,5 +519,231 @@ describe.skipIf(!livePgAvailable)(
 				await adapter.close();
 			}
 		});
+
+		it("enforces expectedCreatedAt after a same-id account generation replacement", async () => {
+			const { SQL } = await import("bun");
+			const { randomUUID } = await import("node:crypto");
+			const { ensureSchemaPg, runMigrationsPg } = await import(
+				"../../migrations-pg"
+			);
+
+			// biome-ignore lint/style/noNonNullAssertion: guarded by describe.skipIf(!livePgAvailable)
+			const databaseUrl = process.env.DATABASE_URL!;
+			const sqlClient = new SQL({ url: databaseUrl });
+			const adapter = new BunSqlAdapter(sqlClient, false);
+			const accountId = `usage-windows-generation-fence-${randomUUID()}`;
+			const generationA = 100;
+			const generationB = 200;
+			const closeInput = {
+				closedAt: 7_000,
+				valueUsd: 1,
+				inputTokens: 1,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0,
+				outputTokens: 0,
+				requestCount: 1,
+				modelBreakdown: null,
+				unpricedTokens: 0,
+				projectionVersion: "v1",
+			};
+
+			try {
+				await ensureSchemaPg(adapter);
+				await runMigrationsPg(adapter);
+				const repo = new UsageWindowsRepository(adapter);
+				await adapter.run(
+					"INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)",
+					[accountId, "generation A", generationA],
+				);
+				const generationAWindow = await repo.openWindow(
+					{
+						accountId,
+						windowKey: "seven_day",
+						startedAt: 1_000,
+						resetsAt: 7_000,
+						grantType: "natural",
+					},
+					generationA,
+				);
+				expect(generationAWindow?.accountId).toBe(accountId);
+
+				// PostgreSQL cascades the old window when generation A is deleted.
+				// Open a B-owned row so stale A update/close attempts exercise their
+				// generation predicates rather than merely targeting a deleted row.
+				await adapter.run("DELETE FROM accounts WHERE id = ?", [accountId]);
+				await adapter.run(
+					"INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)",
+					[accountId, "generation B", generationB],
+				);
+
+				expect(
+					await repo.openWindow(
+						{
+							accountId,
+							windowKey: "seven_day",
+							startedAt: 7_000,
+							resetsAt: 14_000,
+							grantType: "natural",
+						},
+						generationA,
+					),
+				).toBeNull();
+				const generationBWindow = await repo.openWindow(
+					{
+						accountId,
+						windowKey: "seven_day",
+						startedAt: 7_000,
+						resetsAt: 14_000,
+						grantType: "natural",
+					},
+					generationB,
+				);
+				if (!generationBWindow) {
+					throw new Error("Generation B failed to open its usage window");
+				}
+
+				await repo.recordUtilization(
+					generationBWindow.id,
+					90,
+					2_000,
+					generationA,
+				);
+				expect(
+					(await repo.getOpenWindow(accountId, "seven_day"))?.peakUtilization,
+				).toBe(0);
+				expect(
+					await repo.closeWindow(generationBWindow.id, closeInput, generationA),
+				).toBe(false);
+				expect(
+					(await repo.getOpenWindow(accountId, "seven_day"))?.closedAt,
+				).toBeNull();
+
+				await repo.recordUtilization(
+					generationBWindow.id,
+					90,
+					2_000,
+					generationB,
+				);
+				expect(
+					(await repo.getOpenWindow(accountId, "seven_day"))?.peakUtilization,
+				).toBe(90);
+				expect(
+					await repo.closeWindow(generationBWindow.id, closeInput, generationB),
+				).toBe(true);
+			} finally {
+				try {
+					await adapter.run("DELETE FROM usage_windows WHERE account_id = ?", [
+						accountId,
+					]);
+				} finally {
+					try {
+						await adapter.run("DELETE FROM accounts WHERE id = ?", [accountId]);
+					} finally {
+						await adapter.close();
+					}
+				}
+			}
+		});
 	},
 );
+
+describe("UsageWindowsRepository generation fences", () => {
+	it("rejects stale-generation opens, utilization, and closes while permitting the replacement generation", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		const accountId = "generation-fence-account";
+		const generationA = 100;
+		const generationB = 200;
+		db.run("INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)", [
+			accountId,
+			"generation A",
+			generationA,
+		]);
+		const existing = await repo.openWindow({
+			accountId,
+			windowKey: "seven_day",
+			startedAt: 1_000,
+			resetsAt: 7_000,
+			grantType: "natural",
+		});
+
+		db.run("DELETE FROM accounts WHERE id = ?", [accountId]);
+		db.run("INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)", [
+			accountId,
+			"generation B",
+			generationB,
+		]);
+
+		const staleOpen = await repo.openWindow(
+			{
+				accountId,
+				windowKey: "seven_day",
+				startedAt: 7_000,
+				resetsAt: 14_000,
+				grantType: "natural",
+			},
+			generationA,
+		);
+		expect(staleOpen).toBeNull();
+		await repo.recordUtilization(existing.id, 90, 2_000, generationA);
+		expect(
+			(await repo.getOpenWindow(accountId, "seven_day"))?.peakUtilization,
+		).toBe(0);
+		expect(
+			await repo.closeWindow(
+				existing.id,
+				{
+					closedAt: 7_000,
+					valueUsd: 1,
+					inputTokens: 1,
+					cacheReadInputTokens: 0,
+					cacheCreationInputTokens: 0,
+					outputTokens: 0,
+					requestCount: 1,
+					modelBreakdown: null,
+					unpricedTokens: 0,
+					projectionVersion: "v1",
+				},
+				generationA,
+			),
+		).toBe(false);
+		expect(
+			(await repo.getOpenWindow(accountId, "seven_day"))?.closedAt,
+		).toBeNull();
+
+		await repo.recordUtilization(existing.id, 90, 2_000, generationB);
+		expect(
+			(await repo.getOpenWindow(accountId, "seven_day"))?.peakUtilization,
+		).toBe(90);
+		expect(
+			await repo.closeWindow(
+				existing.id,
+				{
+					closedAt: 7_000,
+					valueUsd: 1,
+					inputTokens: 1,
+					cacheReadInputTokens: 0,
+					cacheCreationInputTokens: 0,
+					outputTokens: 0,
+					requestCount: 1,
+					modelBreakdown: null,
+					unpricedTokens: 0,
+					projectionVersion: "v1",
+				},
+				generationB,
+			),
+		).toBe(true);
+		const replacementOpen = await repo.openWindow(
+			{
+				accountId,
+				windowKey: "seven_day",
+				startedAt: 7_000,
+				resetsAt: 14_000,
+				grantType: "natural",
+			},
+			generationB,
+		);
+		expect(replacementOpen?.accountId).toBe(accountId);
+		db.close();
+	});
+});

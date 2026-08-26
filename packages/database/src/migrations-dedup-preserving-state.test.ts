@@ -19,7 +19,7 @@ import { ensureSchema, runMigrations } from "../src/migrations";
  * What this test file proves:
  *   (1) Survivor selection picks the row most likely to still hold working
  *       credentials: most-recent last_used → most-recent
- *       refresh_token_issued_at → most-recent created_at → smallest rowid.
+ *       refresh_token_issued_at → most-recent created_at → smallest logical id.
  *   (2) The merged survivor holds the freshest OAuth credentials (refresh +
  *       access + expires_at) from any row in the group, not the survivor's
  *       own (which could be stale).
@@ -184,20 +184,21 @@ describe("Database Migrations — non-destructive account dedup", () => {
 		expect(survivors[0]?.id).toBe("alpha-2");
 	});
 
-	it("breaks full-ties (all timestamps NULL) by smallest rowid", () => {
+	it("breaks full timestamp ties by smallest logical account id", () => {
 		setupFullSchemaForDedupTest(db);
 
-		// Same created_at across both rows; no last_used; no
-		// refresh_token_issued_at. Final tiebreak: smallest rowid wins.
+		// Both physical insertion order and PostgreSQL ctid are deliberately
+		// irrelevant: SQLite and PostgreSQL must choose the same logical account
+		// under a complete timestamp tie.
 		const sameCreatedAt = 1000;
 		db.prepare(
 			`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, custom_endpoint)
 			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		).run("alpha-1", "alpha", "anthropic", "r1", "a1", sameCreatedAt, null);
+		).run("alpha-z", "alpha", "anthropic", "r-z", "a-z", sameCreatedAt, null);
 		db.prepare(
 			`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, custom_endpoint)
 			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		).run("alpha-2", "alpha", "anthropic", "r2", "a2", sameCreatedAt, null);
+		).run("alpha-a", "alpha", "anthropic", "r-a", "a-a", sameCreatedAt, null);
 
 		runMigrations(db);
 
@@ -205,8 +206,7 @@ describe("Database Migrations — non-destructive account dedup", () => {
 			.prepare(`SELECT id FROM accounts WHERE name = 'alpha'`)
 			.all() as Array<{ id: string }>;
 		expect(survivors).toHaveLength(1);
-		// First INSERT got the smallest rowid.
-		expect(survivors[0]?.id).toBe("alpha-1");
+		expect(survivors[0]?.id).toBe("alpha-a");
 	});
 
 	it("preserves the freshest OAuth credentials (refresh+access+expires) from any duplicate", () => {
@@ -529,6 +529,248 @@ describe("Database Migrations — non-destructive account dedup", () => {
 			.prepare(`SELECT id FROM accounts WHERE id = 'alpha-2'`)
 			.all() as Array<{ id: string }>;
 		expect(remaining).toHaveLength(0);
+	});
+
+	it("merges colliding slots and usage windows before alias account repointing", () => {
+		db.exec("PRAGMA foreign_keys = ON");
+		setupFullSchemaForDedupTest(db);
+
+		const now = Date.now();
+		const insertAccount = db.prepare(
+			`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		);
+		// The meta row survives. The two muse-spark rows belong to its same
+		// canonical provider group and are discarded during alias migration.
+		insertAccount.run(
+			"meta-survivor",
+			"alias-collision",
+			"meta",
+			"r-meta",
+			"a-meta",
+			now - 3_000,
+			now,
+			now - 3_000,
+			null,
+		);
+		insertAccount.run(
+			"muse-a",
+			"alias-collision",
+			"muse-spark",
+			"r-a",
+			"a-a",
+			now - 2_000,
+			now - 1_000,
+			now - 2_000,
+			null,
+		);
+		insertAccount.run(
+			"muse-b",
+			"alias-collision",
+			"muse-spark",
+			"r-b",
+			"a-b",
+			now - 1_000,
+			now - 2_000,
+			now - 1_000,
+			null,
+		);
+
+		for (const comboId of ["combo-1", "combo-2"]) {
+			db.prepare(
+				`INSERT INTO combos (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+			).run(comboId, comboId, now, now);
+		}
+		const insertSlot = db.prepare(
+			`INSERT INTO combo_slots (id, combo_id, account_id, model, priority, enabled)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+		);
+		// The survivor already owns this logical slot, so it keeps its id while
+		// priority/enabled merge from every colliding duplicate.
+		insertSlot.run(
+			"survivor-slot",
+			"combo-1",
+			"meta-survivor",
+			"model-a",
+			9,
+			0,
+		);
+		insertSlot.run("discarded-slot", "combo-1", "muse-a", "model-a", 1, 1);
+		// No survivor-owned slot exists for combo-2/model-b. The lowest stable
+		// logical slot id must become the keeper, not an insertion/physical row.
+		insertSlot.run("slot-a", "combo-2", "muse-a", "model-b", 4, 0);
+		insertSlot.run("slot-z", "combo-2", "muse-b", "model-b", 2, 1);
+		// A non-colliding slot must survive unchanged except for account repointing.
+		insertSlot.run("unique-slot", "combo-1", "muse-b", "model-c", 7, 0);
+
+		const resetsAt = now + 10_000;
+		const insertWindow = db.prepare(
+			`INSERT INTO usage_windows (
+				id, account_id, window_key, started_at, resets_at, closed_at,
+				grant_type, peak_utilization, first_100_at, value_usd,
+				input_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+				output_tokens, request_count, model_breakdown, unpriced_tokens,
+				projection_version
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		);
+		// The survivor-owned row keeps its logical id, but the later closed row
+		// contributes the settled aggregates while minima/maxima preserve the
+		// strongest lifecycle evidence across both aliases.
+		insertWindow.run(
+			"survivor-window",
+			"meta-survivor",
+			"seven_day",
+			now - 5_000,
+			resetsAt,
+			null,
+			"first_observed",
+			20,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+		);
+		insertWindow.run(
+			"discarded-window",
+			"muse-a",
+			"seven_day",
+			now - 6_000,
+			resetsAt,
+			now,
+			"natural",
+			100,
+			now - 1_000,
+			42.5,
+			1_000,
+			200,
+			50,
+			300,
+			7,
+			'{"model-a":7}',
+			11,
+			"fixture-v1",
+		);
+		insertWindow.run(
+			"unique-window",
+			"muse-b",
+			"five_hour",
+			now - 4_000,
+			resetsAt + 1,
+			null,
+			"first_observed",
+			33,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+		);
+
+		expect(() => runMigrations(db)).not.toThrow();
+
+		const slots = db
+			.prepare(
+				`SELECT id, combo_id, account_id, model, priority, enabled
+				 FROM combo_slots ORDER BY combo_id, model`,
+			)
+			.all() as Array<{
+			id: string;
+			combo_id: string;
+			account_id: string;
+			model: string;
+			priority: number;
+			enabled: number;
+		}>;
+		expect(slots).toEqual([
+			{
+				id: "survivor-slot",
+				combo_id: "combo-1",
+				account_id: "meta-survivor",
+				model: "model-a",
+				priority: 1,
+				enabled: 1,
+			},
+			{
+				id: "unique-slot",
+				combo_id: "combo-1",
+				account_id: "meta-survivor",
+				model: "model-c",
+				priority: 7,
+				enabled: 0,
+			},
+			{
+				id: "slot-a",
+				combo_id: "combo-2",
+				account_id: "meta-survivor",
+				model: "model-b",
+				priority: 2,
+				enabled: 1,
+			},
+		]);
+
+		const windows = db
+			.prepare(
+				`SELECT id, account_id, window_key, started_at, resets_at, closed_at,
+				        grant_type, peak_utilization, first_100_at, value_usd,
+				        input_tokens, cache_read_input_tokens,
+				        cache_creation_input_tokens, output_tokens, request_count,
+				        model_breakdown, unpriced_tokens, projection_version
+				 FROM usage_windows ORDER BY id`,
+			)
+			.all();
+		expect(windows).toEqual([
+			{
+				id: "survivor-window",
+				account_id: "meta-survivor",
+				window_key: "seven_day",
+				started_at: now - 6_000,
+				resets_at: resetsAt,
+				closed_at: now,
+				grant_type: "natural",
+				peak_utilization: 100,
+				first_100_at: now - 1_000,
+				value_usd: 42.5,
+				input_tokens: 1_000,
+				cache_read_input_tokens: 200,
+				cache_creation_input_tokens: 50,
+				output_tokens: 300,
+				request_count: 7,
+				model_breakdown: '{"model-a":7}',
+				unpriced_tokens: 11,
+				projection_version: "fixture-v1",
+			},
+			{
+				id: "unique-window",
+				account_id: "meta-survivor",
+				window_key: "five_hour",
+				started_at: now - 4_000,
+				resets_at: resetsAt + 1,
+				closed_at: null,
+				grant_type: "first_observed",
+				peak_utilization: 33,
+				first_100_at: null,
+				value_usd: null,
+				input_tokens: null,
+				cache_read_input_tokens: null,
+				cache_creation_input_tokens: null,
+				output_tokens: null,
+				request_count: null,
+				model_breakdown: null,
+				unpriced_tokens: null,
+				projection_version: null,
+			},
+		]);
 	});
 
 	it("repoints requests.account_used from discarded ids to the survivor id", () => {

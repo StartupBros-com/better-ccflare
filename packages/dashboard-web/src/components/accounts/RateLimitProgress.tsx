@@ -1,6 +1,7 @@
 import { computeWindowStartMs, registerUIRefresh } from "@better-ccflare/core";
 import type { AnthropicUsageData, FullUsageData } from "@better-ccflare/types";
 import { useEffect, useState } from "react";
+import { formatRelativeReset } from "../../lib/pool-usage";
 import { cn, formatShortDuration } from "../../lib/utils";
 import {
 	isAnthropicPeakHour,
@@ -158,9 +159,16 @@ export function RateLimitProgress({
 		return unregisterInterval;
 	}, []);
 
+	// Codex has no usage-polling endpoint, so gaps in its data are routine (the
+	// weekly percentage arrives only piggybacked on real traffic). The weekly bar
+	// is its only quota bar and must stay on screen through those gaps, saying
+	// "Data unavailable" instead of vanishing — a missing bar reads as "no limit".
+	const isCodex = provider === "codex";
+
 	// Allow null resetIso for providers that show usage data (like NanoGPT in PayG mode)
 	// but still render null if there's no resetIso and no usage data to show
-	if (!resetIso && !usageData && !usageRateLimitedUntil) return null;
+	if (!isCodex && !resetIso && !usageData && !usageRateLimitedUntil)
+		return null;
 
 	// Show explicit rate-limited state when the Anthropic usage API returned 429
 	// and we have no cached data to show.
@@ -422,17 +430,27 @@ export function RateLimitProgress({
 	} else if (hasAnthropicStyleData && showWeekly) {
 		// Anthropic usage data - show 5-hour, weekly, and any per-model weekly
 		// tier (opus, sonnet, and future tiers such as Fable) generically.
-		usages.push(
-			...collectAnthropicUsageRows(usageData as unknown as AnthropicUsageData, {
+		const rows = collectAnthropicUsageRows(
+			usageData as unknown as AnthropicUsageData,
+			{
 				utilization: usageUtilization ?? null,
 				resetTime: resetIso,
-			}),
+			},
+		);
+		// Codex: drop the 5-hour row entirely. Its percentage is either absent or
+		// borrowed from the time-elapsed fallback, so the bar showed how much of
+		// the window had passed as if it were consumption. The weekly window is
+		// what actually limits a Codex account, and it is the only bar kept here.
+		usages.push(
+			...(isCodex ? rows.filter((row) => row.window !== "five_hour") : rows),
 		);
 	} else if (
 		providerShowsWeeklyUsage(provider) &&
 		usageUtilization !== null &&
 		usageUtilization !== undefined &&
-		usageWindow
+		usageWindow &&
+		// Never let the 5-hour window back in for Codex through this fallback.
+		!(isCodex && usageWindow === "five_hour")
 	) {
 		// Fallback: show only the most restrictive window
 		usages.push({
@@ -440,6 +458,13 @@ export function RateLimitProgress({
 			window: usageWindow,
 			resetTime: resetIso,
 		});
+	} else if (isCodex) {
+		// Back door closed: the time-based bar below is hardcoded to a 5-hour
+		// window, so without this branch removing the Codex 5h row above would just
+		// bring it back through here whenever data is missing. Show the weekly
+		// window as unavailable instead — the render path already prints "N/A" and
+		// "Data unavailable" for a null utilization.
+		usages.push({ utilization: null, window: "seven_day", resetTime: null });
 	} else {
 		// Use time-based percentage for non-Anthropic or when no usage data is available
 		const percentage = Math.min(
@@ -476,6 +501,23 @@ export function RateLimitProgress({
 	const isAnthropicPeak = provider === "anthropic" && isAnthropicPeakHour(now);
 	const throttledWindowSet = new Set(usageThrottledWindows);
 
+	// The throttle notice normally rides along inside the throttled window's row.
+	// Codex no longer renders a 5-hour row, and throttling on that window still
+	// delays real requests — so surface any throttled window that has no row of
+	// its own as a standalone line. Without this, dropping the bar would also
+	// silently drop the warning.
+	const renderedWindows = new Set(
+		usages
+			.map((usage) => usage.window)
+			.filter((window): window is string => window != null),
+	);
+	// Scoped to Codex on purpose: it is the only provider here that deliberately
+	// suppresses a window's row, so it is the only one that can orphan a notice.
+	const hasOrphanThrottledWindow =
+		isCodex &&
+		usageThrottledUntil != null &&
+		usageThrottledWindows.some((window) => !renderedWindows.has(window));
+
 	return (
 		<div className={cn("space-y-3", className)}>
 			{provider === "zai" && (
@@ -509,6 +551,24 @@ export function RateLimitProgress({
 						{isAnthropicPeak
 							? "Peak hours (5–11am PT, weekdays)"
 							: "Off-peak hours"}
+					</span>
+				</div>
+			)}
+			{hasOrphanThrottledWindow && usageThrottledUntil != null && (
+				<div className="flex items-center justify-between">
+					<span className="text-xs text-amber-600 dark:text-amber-400">
+						Usage throttling enabled; requests are being delayed
+					</span>
+					<span className="text-xs text-amber-600 dark:text-amber-400">
+						{(() => {
+							const throttledLabel = formatThrottledUntil(
+								usageThrottledUntil,
+								now,
+							);
+							return throttledLabel.startsWith("Less than")
+								? throttledLabel
+								: `Until ${throttledLabel}`;
+						})()}
 					</span>
 				</div>
 			)}
@@ -722,6 +782,13 @@ export function RateLimitProgress({
 													minute: "2-digit",
 												},
 											)} (local)`}
+									{(() => {
+										const relativeReset = formatRelativeReset(
+											new Date(usage.resetTime).getTime(),
+											now,
+										);
+										return relativeReset != null ? ` · ${relativeReset}` : "";
+									})()}
 								</span>
 							</div>
 						)}

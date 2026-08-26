@@ -154,6 +154,15 @@ function makeCtx(
 	} as unknown as ProxyContext;
 }
 
+function makeExhaustedCapacityCtx(
+	opts: Parameters<typeof makeCtx>[0] = {},
+): ProxyContext {
+	return {
+		...makeCtx(opts),
+		config: { getModelScopedCapacityRouting: () => "exhausted" },
+	} as ProxyContext;
+}
+
 function makeProfileOnlyRegistry(
 	accountId: string,
 	options: { exclusive?: boolean; includeCapabilityProfile?: boolean } = {},
@@ -2342,7 +2351,7 @@ describe("selectAccountsForRequest — combo routing", () => {
 				},
 			],
 		});
-		const ctx = makeCtx({
+		const ctx = makeExhaustedCapacityCtx({
 			accounts: [unavailable, fallback],
 			routingPolicy: policy,
 		});
@@ -2634,7 +2643,8 @@ describe("selectAccountsForRequest — combo routing", () => {
 	});
 
 	it("does not fall back to SessionStrategy when all combo slots are unavailable and combo fallback is disabled", async () => {
-		process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK = "true";
+		// Set through the config, not the environment: the variable is adopted
+		// into the config once at boot and no longer decides at request time.
 		const rateLimitedAcc = makeAccount({
 			id: "acc-1",
 			rate_limited_until: Date.now() + 3_600_000,
@@ -2661,6 +2671,7 @@ describe("selectAccountsForRequest — combo routing", () => {
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
+			config: { getComboSessionFallback: () => false },
 		} as unknown as ProxyContext;
 
 		const meta = makeRequestMeta();
@@ -3113,7 +3124,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 		cacheUsage(preferred.id, weeklyScoped("Fable"));
 
 		const strategy = mock((_accounts: Account[]) => [preferred, fallback]);
-		const ctx = makeCtx({ accounts: [preferred, fallback] });
+		const ctx = makeExhaustedCapacityCtx({ accounts: [preferred, fallback] });
 		ctx.strategy.select = strategy;
 		const fableMeta = makeRequestMeta({ clientSessionId: "conversation-1" });
 
@@ -3172,7 +3183,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 			}),
 		});
 		cacheUsage(account.id, weeklyScoped("Fable"));
-		const ctx = makeCtx({ accounts: [account] });
+		const ctx = makeExhaustedCapacityCtx({ accounts: [account] });
 		const meta = makeRequestMeta();
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
@@ -3214,7 +3225,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 		cacheUsage(exhausted.id, weeklyScoped("Fable"));
 		cacheUsage(paused.id, weeklyScoped("Fable"));
 		const meta = makeRequestMeta();
-		const ctx = makeCtx({ accounts: [exhausted, paused] });
+		const ctx = makeExhaustedCapacityCtx({ accounts: [exhausted, paused] });
 		ctx.strategy.select = mock((accounts: Account[]) =>
 			accounts.filter((account) => !account.paused),
 		);
@@ -3248,7 +3259,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 
 		const result = await selectAccountsForRequest(
 			meta,
-			makeCtx({ accounts: [account] }),
+			makeExhaustedCapacityCtx({ accounts: [account] }),
 			"claude-fable-5",
 		);
 
@@ -3279,7 +3290,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 
 		const result = await selectAccountsForRequest(
 			meta,
-			makeCtx({ accounts: [account] }),
+			makeExhaustedCapacityCtx({ accounts: [account] }),
 			"claude-fable-5",
 		);
 
@@ -3317,7 +3328,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 
 		const result = await selectAccountsForRequest(
 			meta,
-			makeCtx({ accounts: [account] }),
+			makeExhaustedCapacityCtx({ accounts: [account] }),
 			"claude-fable-5",
 		);
 
@@ -3353,7 +3364,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 		});
 		cacheUsage(account.id, weeklyScoped("Fable"));
 		const meta = makeRequestMeta();
-		const ctx = makeCtx({ accounts: [account] });
+		const ctx = makeExhaustedCapacityCtx({ accounts: [account] });
 
 		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
 			[],
@@ -3402,7 +3413,9 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 			}),
 		});
 		cacheUsage(allowedBlocked.id, weeklyScoped("Fable"));
-		const ctx = makeCtx({ accounts: [excludedHealthy, allowedBlocked] });
+		const ctx = makeExhaustedCapacityCtx({
+			accounts: [excludedHealthy, allowedBlocked],
+		});
 		const meta = makeRequestMeta({
 			headers: new Headers({
 				"x-better-ccflare-exclude-providers": "anthropic-oauth",
@@ -3436,7 +3449,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 
 		const result = await selectAccountsForRequest(
 			meta,
-			makeCtx({ accounts: [account] }),
+			makeExhaustedCapacityCtx({ accounts: [account] }),
 			"claude-fable-5",
 		);
 
@@ -3574,7 +3587,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 			Date.now() + 60_000,
 		);
 		cachedUsageAccountIds.add(preferred.id);
-		const ctx = makeCtx({ accounts: [preferred, fallback] });
+		const ctx = makeExhaustedCapacityCtx({ accounts: [preferred, fallback] });
 		const fableMeta = makeRequestMeta({
 			headers: new Headers({
 				"anthropic-beta": "CONTEXT-1M, beta-b",
@@ -3662,7 +3675,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 			Date.now() + 60_000,
 		);
 		cachedUsageAccountIds.add(preferred.id);
-		const ctx = makeCtx({ accounts: [preferred, fallback] });
+		const ctx = makeExhaustedCapacityCtx({ accounts: [preferred, fallback] });
 		const fableMeta = makeRequestMeta();
 
 		const fable = await selectAccountsForRequest(
@@ -4001,7 +4014,7 @@ describe("selectAccountsForRequest — atomic combo capacity", () => {
 				enabled: true,
 			},
 		]);
-		const ctx = makeCtx({
+		const ctx = makeExhaustedCapacityCtx({
 			accounts: [preferred, fallback],
 			activeCombo: combo,
 		});
@@ -4367,7 +4380,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 					},
 				],
 			});
-			const ctx = makeCtx({ accounts: [account] });
+			const ctx = makeExhaustedCapacityCtx({ accounts: [account] });
 			const meta = serverToolMeta();
 
 			const result = await selectAccountsForRequest(
@@ -4624,7 +4637,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 				}),
 			});
 			cacheUsage(account.id, blockedFableCapacity());
-			const ctx = makeCtx({ accounts: [account] });
+			const ctx = makeExhaustedCapacityCtx({ accounts: [account] });
 			const { resumeAccount } = useSessionStrategy(ctx);
 			const meta = serverToolMeta();
 
@@ -5118,7 +5131,6 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 	});
 
 	it("fails capability-empty combo selection locally when session fallback is disabled", async () => {
-		process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK = "1";
 		const providerName = "u4-combo-no-session-fallback";
 		installCapabilityProvider({
 			name: providerName,
@@ -5143,6 +5155,9 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			},
 		]);
 		const ctx = makeCtx({ accounts: [incapable], activeCombo: combo });
+		ctx.config = {
+			getComboSessionFallback: () => false,
+		} as ProxyContext["config"];
 		const meta = serverToolMeta();
 
 		try {

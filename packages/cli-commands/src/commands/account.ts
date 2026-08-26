@@ -42,6 +42,7 @@ export interface AddAccountOptionsWithAdapter {
 		| "console"
 		| "zai"
 		| "minimax"
+		| "deepseek"
 		| "anthropic-compatible"
 		| "openai-compatible"
 		| "nanogpt"
@@ -55,7 +56,7 @@ export interface AddAccountOptionsWithAdapter {
 		| "xai"
 		| "ollama"
 		| "ollama-cloud"
-		| "muse-spark";
+		| "meta";
 	priority?: number;
 	customEndpoint?: string;
 	modelMappings?: { [key: string]: string | string[] };
@@ -92,6 +93,7 @@ export interface AccountListItemWithMode extends AccountListItem {
 		| "console"
 		| "zai"
 		| "minimax"
+		| "deepseek"
 		| "anthropic-compatible"
 		| "openai-compatible"
 		| "nanogpt"
@@ -105,7 +107,7 @@ export interface AccountListItemWithMode extends AccountListItem {
 		| "xai"
 		| "ollama"
 		| "ollama-cloud"
-		| "muse-spark";
+		| "meta";
 }
 
 /**
@@ -182,6 +184,50 @@ async function createMinimaxAccount(
 		],
 	);
 	return toCreatedAccountIdentity({ id: accountId, name, provider: "minimax" });
+}
+
+const DEEPSEEK_ENDPOINT = "https://api.deepseek.com/anthropic";
+
+/** Create a DeepSeek account with its fixed Anthropic-compatible endpoint. */
+async function createDeepseekAccount(
+	dbOps: DatabaseOperations,
+	name: string,
+	apiKey: string,
+	priority: number,
+	modelMappings?: { [key: string]: string | string[] } | null,
+): Promise<CreatedAccountIdentity> {
+	const accountId = crypto.randomUUID();
+	const now = Date.now();
+	const validatedApiKey = validateApiKey(apiKey, "DeepSeek API key");
+	const validatedPriority = validatePriority(priority, "priority");
+	let validatedModelMappings: string | null = null;
+	if (modelMappings && Object.keys(modelMappings).length > 0) {
+		validatedModelMappings = JSON.stringify(
+			validateAndSanitizeModelMappings(modelMappings),
+		);
+	}
+
+	await dbOps.getAdapter().run(
+		`INSERT INTO accounts (
+			id, name, provider, api_key, refresh_token, access_token,
+			expires_at, created_at, request_count, total_requests, priority, custom_endpoint, model_mappings
+		) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, 0, 0, ?, ?, ?)`,
+		[
+			accountId,
+			name,
+			"deepseek",
+			validatedApiKey,
+			now,
+			validatedPriority,
+			DEEPSEEK_ENDPOINT,
+			validatedModelMappings,
+		],
+	);
+	return toCreatedAccountIdentity({
+		id: accountId,
+		name,
+		provider: "deepseek",
+	});
 }
 
 /**
@@ -1312,8 +1358,8 @@ export async function addAccount(
 				value: "ollama-cloud",
 			},
 			{
-				label: "Meta Model API (Muse Spark)",
-				value: "muse-spark",
+				label: "Meta Model API (API key)",
+				value: "meta",
 			},
 		]));
 
@@ -1528,6 +1574,23 @@ export async function addAccount(
 		);
 		console.log(`\nAccount '${name}' added successfully!`);
 		console.log("Type: Minimax (API key)");
+		return createdAccount;
+	} else if (mode === "deepseek") {
+		const apiKey = await adapter.input("\nEnter your DeepSeek API key: ");
+		const finalModelMappings = await promptModelMappings(
+			adapter,
+			modelMappings,
+		);
+		const createdAccount = await createDeepseekAccount(
+			dbOps,
+			name,
+			apiKey,
+			providedPriority || 0,
+			finalModelMappings,
+		);
+		console.log(`\nAccount '${name}' added successfully!`);
+		console.log("Type: DeepSeek (API key)");
+		console.log(`Endpoint: ${DEEPSEEK_ENDPOINT}`);
 		return createdAccount;
 	} else if (mode === "nanogpt") {
 		// Handle NanoGPT accounts with API keys
@@ -1842,29 +1905,26 @@ export async function addAccount(
 		console.log("Type: Ollama Cloud");
 		console.log(`Endpoint: https://ollama.com/api/chat`);
 		return createdAccount;
-	} else if (mode === "muse-spark") {
-		// Handle Meta Model API (Muse Spark) accounts with API keys
-		const apiKey = await adapter.input(
-			"\nEnter your Meta Model API (Muse Spark) API key: ",
-		);
+	} else if (mode === "meta") {
+		const apiKey = await adapter.input("\nEnter your Meta Model API key: ");
 
-		// Get custom endpoint (optional; defaults to the Muse Spark API)
+		if (!apiKey) {
+			throw new Error("API key is required for Meta Model API");
+		}
+
 		const endpoint =
 			customEndpoint ||
 			(await adapter.input(
 				"\nEnter API endpoint URL (press Enter for default https://api.meta.ai): ",
 			)) ||
-			"https://api.meta.ai";
+			undefined;
 
-		// Get priority
 		const priority =
 			providedPriority ??
 			(await adapter.input(
 				"\nEnter priority (0 = highest, lower number = higher priority, default 0): ",
 			));
 
-		// Get model mappings (optional — muse-spark already routes every model
-		// to muse-spark-1.2 by default, so custom mappings are never required)
 		const finalModelMappings = await promptModelMappings(
 			adapter,
 			modelMappings,
@@ -1880,11 +1940,11 @@ export async function addAccount(
 			endpoint,
 			finalModelMappings,
 			undefined,
-			"muse-spark",
+			"meta",
 		);
 		console.log(`\nAccount '${name}' added successfully!`);
-		console.log("Type: Meta Model API (Muse Spark) (API key)");
-		console.log(`Endpoint: ${endpoint}`);
+		console.log("Type: Meta Model API");
+		console.log(`Endpoint: ${endpoint || "https://api.meta.ai"}`);
 		return createdAccount;
 	} else {
 		return completeAnthropicOAuthAccount(
@@ -1949,12 +2009,13 @@ export async function getAccountsList(
 				if (
 					account.provider === "zai" ||
 					account.provider === "minimax" ||
-					account.provider === "muse-spark" ||
+					account.provider === "deepseek" ||
 					account.provider === "anthropic-compatible" ||
 					account.provider === "bedrock" ||
 					account.provider === "openrouter" ||
 					account.provider === "codex" ||
-					account.provider === "xai"
+					account.provider === "xai" ||
+					account.provider === "meta"
 				) {
 					return account.provider;
 				}

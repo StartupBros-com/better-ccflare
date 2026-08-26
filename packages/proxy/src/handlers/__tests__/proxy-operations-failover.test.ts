@@ -3361,8 +3361,13 @@ describe("proxyWithAccount: Codex 529 rate-limited failover does not hang on aba
 		);
 		let releaseLockCalls = 0;
 		let cancelCalls = 0;
+		let transportAbortCalls = 0;
+		let streamController:
+			| ReadableStreamDefaultController<Uint8Array>
+			| undefined;
 		const stream = new ReadableStream<Uint8Array>({
 			start(controller) {
+				streamController = controller;
 				controller.enqueue(frame1);
 				// Deliberately never close().
 			},
@@ -3390,15 +3395,30 @@ describe("proxyWithAccount: Codex 529 rate-limited failover does not hang on aba
 		});
 		return {
 			response,
+			bindTransportSignal(signal: AbortSignal) {
+				const abort = () => {
+					transportAbortCalls++;
+					streamController?.error(signal.reason);
+				};
+				signal.addEventListener("abort", abort, { once: true });
+				if (signal.aborted) abort();
+			},
 			getReleaseLockCalls: () => releaseLockCalls,
 			getCancelCalls: () => cancelCalls,
+			getTransportAbortCalls: () => transportAbortCalls,
 		};
 	}
 
 	it("resolves null within 2s instead of hanging on discardUnusedResponse, and " +
-		"eventually cancels or releases the abandoned upstream reader", async () => {
+		"eventually aborts the transport and releases the abandoned upstream reader", async () => {
 		const upstream = makeLiveNeverClosingCodexUpstream(529);
-		globalThis.fetch = mock(async () => upstream.response);
+		globalThis.fetch = mock(async (input) => {
+			if (!(input instanceof Request)) {
+				throw new Error("expected fetch to receive the transport Request");
+			}
+			upstream.bindTransportSignal(input.signal);
+			return upstream.response;
+		});
 
 		const bodyBuffer = new TextEncoder().encode(
 			JSON.stringify({
@@ -3442,11 +3462,11 @@ describe("proxyWithAccount: Codex 529 rate-limited failover does not hang on aba
 		expect(outcome).toBeNull();
 
 		// Give the transform's background processEvents() task a tick to
-		// observe the cancellation and run its own cleanup.
+		// observe the exact fetch transport abort and run its own cleanup.
 		await Bun.sleep(20);
-		expect(
-			upstream.getCancelCalls() > 0 || upstream.getReleaseLockCalls() > 0,
-		).toBe(true);
+		expect(upstream.getTransportAbortCalls()).toBe(1);
+		expect(upstream.getCancelCalls()).toBe(0);
+		expect(upstream.getReleaseLockCalls()).toBeGreaterThan(0);
 	}, 3000);
 });
 
@@ -3483,23 +3503,119 @@ describe("proxyWithAccount: Codex 529 in-place retry drain is bounded by a timeo
 		const frame1 = encoder.encode(
 			`event: response.created\ndata: ${JSON.stringify({ response: { id: "resp_drain_hang", model: "gpt-5.4" } })}\n\n`,
 		);
+		let releaseLockCalls = 0;
+		let cancelCalls = 0;
+		let transportAbortCalls = 0;
+		let streamController:
+			| ReadableStreamDefaultController<Uint8Array>
+			| undefined;
 		const stream = new ReadableStream<Uint8Array>({
 			start(controller) {
+				streamController = controller;
 				controller.enqueue(frame1);
 				// Deliberately never close().
 			},
 		});
-		return new Response(stream, {
+		const originalGetReader = stream.getReader.bind(stream);
+		// biome-ignore lint/suspicious/noExplicitAny: test-only monkeypatch of a built-in
+		(stream as any).getReader = (...args: unknown[]) => {
+			// biome-ignore lint/suspicious/noExplicitAny: forwarding getReader() args
+			const reader = (originalGetReader as any)(...args);
+			const originalReleaseLock = reader.releaseLock.bind(reader);
+			const originalCancel = reader.cancel.bind(reader);
+			reader.releaseLock = (...args: unknown[]) => {
+				releaseLockCalls++;
+				return originalReleaseLock(...args);
+			};
+			reader.cancel = (...args: unknown[]) => {
+				cancelCalls++;
+				return originalCancel(...args);
+			};
+			return reader;
+		};
+		const response = new Response(stream, {
 			status,
 			headers: { "content-type": "text/event-stream" },
 		});
+		return {
+			response,
+			bindTransportSignal(signal: AbortSignal) {
+				const abort = () => {
+					transportAbortCalls++;
+					streamController?.error(signal.reason);
+				};
+				signal.addEventListener("abort", abort, { once: true });
+				if (signal.aborted) abort();
+			},
+			getReleaseLockCalls: () => releaseLockCalls,
+			getCancelCalls: () => cancelCalls,
+			getTransportAbortCalls: () => transportAbortCalls,
+		};
 	}
+
+	function makeCompletedCodexUpstream() {
+		return new Response(
+			`event: response.completed\ndata: ${JSON.stringify({ response: { id: "resp_drain_success", status: "completed", usage: { input_tokens: 1, output_tokens: 1 } } })}\n\n`,
+			{
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			},
+		);
+	}
+
+	it("aborts the exact superseded transport and releases its reader after the drain deadline", async () => {
+		const firstUpstream = makeLiveNeverClosingCodexUpstream(529);
+		let callCount = 0;
+		globalThis.fetch = mock(async (input) => {
+			if (!(input instanceof Request)) {
+				throw new Error("expected fetch to receive the transport Request");
+			}
+			callCount++;
+			if (callCount > 1) return makeCompletedCodexUpstream();
+			firstUpstream.bindTransportSignal(input.signal);
+			return firstUpstream.response;
+		});
+
+		const bodyBuffer = new TextEncoder().encode(
+			JSON.stringify({
+				model: "claude-sonnet-4-5",
+				messages: [{ role: "user", content: "hello" }],
+				max_tokens: 10,
+				stream: true,
+			}),
+		).buffer;
+
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			makeAccount({
+				provider: "codex",
+				api_key: "test-key",
+				access_token: null,
+				refresh_token: "",
+			}),
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			makeProxyContext(),
+		).catch((error) => {
+			const message = error instanceof Error ? error.message : String(error);
+			if (message.includes("UsageCollector not initialized")) return null;
+			throw error;
+		});
+
+		expect(result === null || result.status === 200).toBe(true);
+		expect(callCount).toBe(2);
+		expect(firstUpstream.getTransportAbortCalls()).toBe(1);
+		expect(firstUpstream.getReleaseLockCalls()).toBeGreaterThan(0);
+	});
 
 	it("proceeds to the in-place retry instead of hanging when the superseded 529 body never closes", async () => {
 		let callCount = 0;
 		globalThis.fetch = mock(async () => {
 			callCount++;
-			return makeLiveNeverClosingCodexUpstream(529);
+			return makeLiveNeverClosingCodexUpstream(529).response;
 		});
 
 		const bodyBuffer = new TextEncoder().encode(
@@ -3618,11 +3734,6 @@ describe("proxyWithAccount — 401 failover", () => {
 		ctx.provider = provider;
 		const pauseAccountIfActive = mock(async () => true);
 		const updateAccountTokensIfRefreshTokenMatches = mock(async () => true);
-		Object.assign(ctx.dbOps as object, {
-			getAccount: mock(async () => null),
-			pauseAccountIfActive,
-			updateAccountTokensIfRefreshTokenMatches,
-		});
 		const account = makeAccount({
 			id: "budgeted-stale-token-account",
 			provider: "claude-oauth",
@@ -3630,6 +3741,11 @@ describe("proxyWithAccount — 401 failover", () => {
 			access_token: "stale-access-token",
 			expires_at: Date.now() + 60 * 60 * 1000,
 			refresh_token: "refresh-token",
+		});
+		Object.assign(ctx.dbOps as object, {
+			getAccount: mock(async () => account),
+			pauseAccountIfActive,
+			updateAccountTokensIfRefreshTokenMatches,
 		});
 		const ledger = new RoutingAttemptLedger();
 		for (let attempt = 1; attempt < MAX_REQUEST_PHYSICAL_ATTEMPTS; attempt++) {

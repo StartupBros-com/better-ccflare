@@ -6,6 +6,8 @@ export {
 	ForceRouteUnavailableError,
 	getComboSlotInfo,
 	getRoutingCapacityContext,
+	isComboSessionFallbackDisabled,
+	isForceAccountModelEnabled,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
 	setComboSlotInfo,
@@ -22,6 +24,14 @@ export {
 	type GuardCorrelationVerifier,
 	verifyGuardCorrelationEnvelope,
 } from "./guard-correlation-auth";
+export {
+	clearPendingRotation,
+	flushPendingRotation,
+	getPendingRotation,
+	type PendingRotation,
+	type PendingRotationDbOps,
+	recordPendingRotation,
+} from "./pending-rotation-registry";
 export {
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
@@ -55,6 +65,14 @@ export {
 	RoutingAttemptLedger,
 } from "./routing-attempt-ledger";
 export {
+	clearRoutingObservations,
+	getRoutingObservations,
+	type RoutingObservation,
+	type RoutingObservationAccount,
+	recordRoutingObservation,
+	recordSelectedOrder,
+} from "./routing-observations";
+export {
 	createModelPoolExhaustedResponse,
 	createRoutingTerminalResponse,
 	filterRequestCompatibleAccounts,
@@ -79,17 +97,22 @@ export {
 export {
 	type CodexUsageRefreshOutcome,
 	clearAccountRefreshCache,
+	clearAutoRefreshTrackingForAccount,
 	extractAuthFailureReason,
 	getValidAccessToken,
 	isDefinitiveAuthFailure,
 	markAccountTokensFresh,
 	pauseAccountForReauthIfInvalidGrant,
 	refreshCodexUsageForAccount,
+	registerAutoRefreshTrackingClearer,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
 	registerRefreshClearer,
 	restartUsagePollingForAccount,
+	unregisterAutoRefreshTrackingClearer,
 	unregisterCodexUsageRefresher,
+	unregisterPollingRestarter,
+	unregisterRefreshClearer,
 } from "./token-manager";
 export {
 	type BindingConstraint,

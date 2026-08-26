@@ -393,6 +393,7 @@ export interface AccountListItem {
 		| "console"
 		| "zai"
 		| "minimax"
+		| "deepseek"
 		| "anthropic-compatible"
 		| "openai-compatible"
 		| "nanogpt"
@@ -406,7 +407,7 @@ export interface AccountListItem {
 		| "xai"
 		| "ollama"
 		| "ollama-cloud"
-		| "muse-spark";
+		| "meta";
 	priority: number;
 	autoFallbackEnabled: boolean;
 	autoRefreshEnabled: boolean;
@@ -422,12 +423,13 @@ export interface AddAccountOptions {
 		| "console"
 		| "zai"
 		| "minimax"
+		| "deepseek"
 		| "anthropic-compatible"
 		| "openai-compatible"
 		| "bedrock"
 		| "openrouter"
 		| "xai"
-		| "muse-spark";
+		| "meta";
 	priority?: number;
 	customEndpoint?: string;
 }

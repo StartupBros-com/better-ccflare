@@ -162,6 +162,7 @@ function makeContext(accounts: Account[], combo: ComboWithSlots): ProxyContext {
 			getUsageThrottlingWeeklyEnabled: () => false,
 			getSystemPromptCacheTtl1h: () => false,
 			getAgentFrontmatterModelFallback: () => false,
+			getModelScopedCapacityRouting: () => "exhausted",
 			getStorePayloads: () => false,
 		},
 		provider: {

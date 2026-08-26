@@ -26,7 +26,7 @@ export function getHelpText(): string {
 Usage: better-ccflare <command> [options]
 
 Commands:
-  add <name> [--mode <claude-oauth|console|codex|qwen|xai|zai|minimax|anthropic-compatible|openai-compatible|nanogpt|kilo|openrouter|ollama|ollama-cloud|muse-spark>] [--priority <number>] [--modelMappings <JSON>] [--api-url <loopback-url>]
+  add <name> [--mode <claude-oauth|console|codex|qwen|xai|zai|minimax|anthropic-compatible|openai-compatible|nanogpt|kilo|openrouter|ollama|ollama-cloud|meta>] [--priority <number>] [--modelMappings <JSON>] [--api-url <loopback-url>]
     Add a new account using OAuth or API key
     --mode: Account type (optional, will prompt if not provided)
       claude-oauth: Claude CLI OAuth account (OAuth)
@@ -43,7 +43,7 @@ Commands:
       openrouter: OpenRouter provider (API key)
       ollama: Ollama local provider (v0.14.0+, no API key required)
       ollama-cloud: Ollama Cloud provider (ollama.com, API key required)
-      muse-spark: Meta Model API / Muse Spark provider (API key)
+      meta: Meta Model API provider (API key)
     --priority: Account priority (0-100, default 0, lower numbers = higher priority)
     --modelMappings: Model mappings as JSON string (e.g., '{"opus":"my-opus-model","sonnet":"my-sonnet-model"}')
     --api-url: Optional loopback live-server target for post-create routing review

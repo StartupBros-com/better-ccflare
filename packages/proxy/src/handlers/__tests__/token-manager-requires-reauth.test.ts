@@ -7,6 +7,7 @@ import {
 import type { Account } from "@better-ccflare/types";
 import {
 	extractAuthFailureReason,
+	getValidAccessToken,
 	isDefinitiveAuthFailure,
 	refreshAccessTokenSafe,
 } from "../token-manager";
@@ -50,7 +51,7 @@ function makeAccount(id: string, name = "test-account"): Account {
 	};
 }
 
-function makeContext(refreshError: Error) {
+function makeContext(refreshError: Error, currentAccount: Account) {
 	const queuedJobs: Array<() => Promise<void>> = [];
 	const setRequiresReauth = mock(async () => {});
 	return {
@@ -62,7 +63,9 @@ function makeContext(refreshError: Error) {
 				}),
 			},
 			dbOps: {
-				getAccount: mock(async () => null),
+				getAccount: mock(async (accountId: string) =>
+					accountId === currentAccount.id ? currentAccount : null,
+				),
 				setRequiresReauth,
 				updateAccountTokensIfRefreshTokenMatches: mock(async () => true),
 				flagRequiresReauthIfTokenMatches: mock(async () => true),
@@ -77,6 +80,21 @@ function makeContext(refreshError: Error) {
 		setRequiresReauth,
 	};
 }
+
+describe("getValidAccessToken API-key providers", () => {
+	it("returns the canonical Meta provider API key without OAuth refresh", async () => {
+		const account = makeAccount("meta-api-key");
+		account.provider = "meta";
+		account.api_key = "meta-test-key";
+		account.refresh_token = null;
+		account.access_token = null;
+		account.expires_at = null;
+
+		await expect(getValidAccessToken(account, {} as never)).resolves.toBe(
+			"meta-test-key",
+		);
+	});
+});
 
 describe("extractAuthFailureReason / isDefinitiveAuthFailure", () => {
 	it("classifies a realistic invalid_grant message (code preserved mid-message)", () => {
@@ -143,22 +161,25 @@ describe("extractAuthFailureReason / isDefinitiveAuthFailure", () => {
 
 describe("refreshAccessTokenSafe requires_reauth detection", () => {
 	it("flags requires_reauth via the direct CAS write for a realistic invalid_grant refresh error and propagates it", async () => {
+		const account = makeAccount("invalid-grant");
 		const { ctx } = makeContext(
 			new OAuthRefreshTokenError(
 				"invalid-grant",
 				"Failed to refresh token for account test-account: invalid_grant: Refresh token is invalid or has been revoked.",
 			),
+			account,
 		);
 		const emitted: AuthFailureEvt[] = [];
 		authFailureEvents.once("event", (event) => emitted.push(event));
 
-		await expect(
-			refreshAccessTokenSafe(makeAccount("invalid-grant"), ctx as never),
-		).rejects.toThrow("Failed to refresh access token");
+		await expect(refreshAccessTokenSafe(account, ctx as never)).rejects.toThrow(
+			"Failed to refresh access token",
+		);
 
 		expect(ctx.dbOps.flagRequiresReauthIfTokenMatches).toHaveBeenCalledWith(
 			"invalid-grant",
 			"refresh-token",
+			1,
 		);
 		expect(emitted).toHaveLength(1);
 		expect(emitted[0]).toMatchObject({
@@ -171,15 +192,17 @@ describe("refreshAccessTokenSafe requires_reauth detection", () => {
 	});
 
 	it("does not flag network or upstream failures", async () => {
+		const account = makeAccount("network-error");
 		const { ctx, queuedJobs, setRequiresReauth } = makeContext(
 			new Error(
 				"Failed to refresh token for account test-account: upstream 503 timeout",
 			),
+			account,
 		);
 
-		await expect(
-			refreshAccessTokenSafe(makeAccount("network-error"), ctx as never),
-		).rejects.toThrow("Failed to refresh access token");
+		await expect(refreshAccessTokenSafe(account, ctx as never)).rejects.toThrow(
+			"Failed to refresh access token",
+		);
 
 		expect(queuedJobs).toHaveLength(0);
 		expect(setRequiresReauth).not.toHaveBeenCalled();
@@ -187,18 +210,17 @@ describe("refreshAccessTokenSafe requires_reauth detection", () => {
 	});
 
 	it("ignores invalid_grant in the account name when the provider error is harmless", async () => {
+		const account = makeAccount("name-false-positive", "test_invalid_grant");
 		const { ctx, queuedJobs, setRequiresReauth } = makeContext(
 			new Error(
 				"Failed to refresh token for account test_invalid_grant: temporary upstream failure",
 			),
+			account,
 		);
 
-		await expect(
-			refreshAccessTokenSafe(
-				makeAccount("name-false-positive", "test_invalid_grant"),
-				ctx as never,
-			),
-		).rejects.toThrow("Failed to refresh access token");
+		await expect(refreshAccessTokenSafe(account, ctx as never)).rejects.toThrow(
+			"Failed to refresh access token",
+		);
 
 		expect(queuedJobs).toHaveLength(0);
 		expect(setRequiresReauth).not.toHaveBeenCalled();

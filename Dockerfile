@@ -20,6 +20,7 @@ WORKDIR /app
 # TARGETARCH is automatically set by Docker buildx (amd64 or arm64)
 ARG TARGETARCH
 ARG VERSION
+ARG IMAGE_SHA=unknown
 
 # Determine correct architecture and download binary
 RUN echo "=== Binary Download Information ===" && \
@@ -47,8 +48,18 @@ RUN echo "=== Binary Download Information ===" && \
     chmod +x /usr/local/bin/better-ccflare && \
     echo "Binary downloaded successfully" && \
     file /usr/local/bin/better-ccflare && \
-    # Verify the binary can execute (basic sanity check)
-    /usr/local/bin/better-ccflare --version || (echo "Binary verification failed - exec format error"; exit 1) && \
+    # Versioned downloads must prove that the fetched tombii release is the
+    # requested release, while latest/manual builds intentionally stay unproven.
+    if [ "${VERSION}" = "latest" ]; then \
+      /usr/local/bin/better-ccflare --version || (echo "Binary verification failed - exec format error"; exit 1); \
+    else \
+      expected_version="better-ccflare v${VERSION}"; \
+      [ "${IMAGE_SHA}" != "unknown" ] && printf '%s\n' "${IMAGE_SHA}" | grep -Eq '^[0-9a-f]{40}$' || (echo "Versioned download requires a full checked-out release SHA"; exit 1); \
+      reported_version="$(/usr/local/bin/better-ccflare --version)" || (echo "Binary verification failed - exec format error"; exit 1); \
+      [ "${reported_version}" = "${expected_version}" ] || (echo "Downloaded binary version ${reported_version} does not match ${expected_version}"; exit 1); \
+      reported_sha="$(/usr/local/bin/better-ccflare --git-sha)" || (echo "Binary SHA verification failed"; exit 1); \
+      [ "${reported_sha}" = "${IMAGE_SHA}" ] || (echo "Downloaded binary SHA ${reported_sha} does not match ${IMAGE_SHA}"; exit 1); \
+    fi && \
     echo "==================================="
 
 # Create a non-root user to run the application
@@ -59,6 +70,13 @@ RUN useradd -r -u 1000 -m -s /bin/bash ccflare && \
 # Build provenance for the /health endpoint (packages/http-api/src/handlers/health.ts)
 ARG GIT_SHA=unknown
 ARG GIT_REF=unknown
+ARG CHECKOUT_SHA=unknown
+ARG EVENT_SHA=unknown
+ARG TAG_SHA=unknown
+ARG DISTRIBUTION=unknown
+ARG PRODUCER=unknown
+ARG ARTIFACT_MODE=unknown
+ARG UPDATE_CHANNEL=unknown
 ARG BUILD_DATE=unknown
 
 # Set environment variables
@@ -69,7 +87,18 @@ ENV BETTER_CCFLARE_LOG_DIR=/app/logs
 ENV CCFLARE_VERSION=${VERSION}
 ENV CCFLARE_GIT_SHA=${GIT_SHA}
 ENV CCFLARE_GIT_REF=${GIT_REF}
+# These duplicate immutable args let the runtime reject a stale or conflicting
+# provenance tuple rather than inferring identity from the Docker environment.
+ENV CCFLARE_SOURCE_SHA=${GIT_SHA}
+ENV CCFLARE_SOURCE_REF=${GIT_REF}
+ENV CCFLARE_CHECKOUT_SHA=${CHECKOUT_SHA}
+ENV CCFLARE_EVENT_SHA=${EVENT_SHA}
+ENV CCFLARE_TAG_SHA=${TAG_SHA}
 ENV CCFLARE_BUILD_DATE=${BUILD_DATE}
+ENV CCFLARE_DISTRIBUTION=${DISTRIBUTION}
+ENV CCFLARE_PRODUCER=${PRODUCER}
+ENV CCFLARE_ARTIFACT_MODE=${ARTIFACT_MODE}
+ENV CCFLARE_UPDATE_CHANNEL=${UPDATE_CHANNEL}
 
 # Create logs directory with proper permissions
 RUN mkdir -p /app/logs /data && chown -R ccflare:ccflare /app/logs /data

@@ -70,6 +70,7 @@ export class UsageWindowLedger {
 		accountId: string,
 		windows: readonly CanonicalUsageWindow[],
 		timestampMs: number,
+		expectedCreatedAt?: number,
 	): Promise<void> {
 		for (const window of windows) {
 			if (window.windowKey !== LEDGER_WINDOW_KEY) continue;
@@ -101,6 +102,7 @@ export class UsageWindowLedger {
 					window.resetsAtMs,
 					window.utilization,
 					timestampMs,
+					expectedCreatedAt,
 				);
 			} catch (error) {
 				log.warn(
@@ -125,6 +127,7 @@ export class UsageWindowLedger {
 		resetsAtMs: number,
 		utilization: number,
 		timestampMs: number,
+		expectedCreatedAt?: number,
 	): Promise<void> {
 		const open = await this.dbOps.getOpenUsageWindow(
 			accountId,
@@ -137,6 +140,7 @@ export class UsageWindowLedger {
 					open.id,
 					utilization,
 					timestampMs,
+					expectedCreatedAt,
 				);
 				return;
 			}
@@ -152,7 +156,7 @@ export class UsageWindowLedger {
 				anchorStart > open.startedAt && anchorStart < timestampMs
 					? anchorStart
 					: timestampMs;
-			await this.closeAndValue(open, timestampMs, boundary);
+			await this.closeAndValue(open, timestampMs, boundary, expectedCreatedAt);
 
 			// The old window still had days of runway left when a new cluster
 			// showed up -> the provider granted an early/bonus reset. If the old
@@ -163,17 +167,23 @@ export class UsageWindowLedger {
 					? "early_reset"
 					: "natural";
 
-			const next = await this.dbOps.openUsageWindow({
+			const nextInput: Parameters<DatabaseOperations["openUsageWindow"]>[0] = {
 				accountId,
 				windowKey: LEDGER_WINDOW_KEY,
 				startedAt: boundary,
 				resetsAt: resetsAtMs,
 				grantType,
-			});
+			};
+			const next =
+				expectedCreatedAt === undefined
+					? await this.dbOps.openUsageWindow(nextInput)
+					: await this.dbOps.openUsageWindow(nextInput, expectedCreatedAt);
+			if (!next) return;
 			await this.dbOps.recordUsageWindowUtilization(
 				next.id,
 				utilization,
 				timestampMs,
+				expectedCreatedAt,
 			);
 			return;
 		}
@@ -185,17 +195,23 @@ export class UsageWindowLedger {
 		// instant it was first seen.
 		const naturalStart = resetsAtMs - SEVEN_DAYS_MS;
 		const startedAt = Math.min(naturalStart, timestampMs);
-		const next = await this.dbOps.openUsageWindow({
+		const nextInput = {
 			accountId,
 			windowKey: LEDGER_WINDOW_KEY,
 			startedAt,
 			resetsAt: resetsAtMs,
-			grantType: "first_observed",
-		});
+			grantType: "first_observed" as const,
+		};
+		const next =
+			expectedCreatedAt === undefined
+				? await this.dbOps.openUsageWindow(nextInput)
+				: await this.dbOps.openUsageWindow(nextInput, expectedCreatedAt);
+		if (!next) return;
 		await this.dbOps.recordUsageWindowUtilization(
 			next.id,
 			utilization,
 			timestampMs,
+			expectedCreatedAt,
 		);
 	}
 
@@ -222,6 +238,7 @@ export class UsageWindowLedger {
 		window: UsageWindow,
 		closedAtMs: number,
 		newStartedAtMs?: number,
+		expectedCreatedAt?: number,
 	): Promise<boolean> {
 		const upperBoundMs = newStartedAtMs ?? closedAtMs;
 		const aggregates = await this.dbOps.aggregateTokensByModel(
@@ -242,7 +259,11 @@ export class UsageWindowLedger {
 			unpricedTokens: valuation.unpricedTokens,
 			projectionVersion: VALUE_PRICING_VERSION,
 		};
-		const closed = await this.dbOps.closeUsageWindow(window.id, closeInput);
+		const closed = await this.dbOps.closeUsageWindow(
+			window.id,
+			closeInput,
+			expectedCreatedAt,
+		);
 		if (closed && this.alertService) {
 			// Isolation, not detachment: awaited so the guarantee ("an alert
 			// failure must never break the ledger") is deterministic and
@@ -250,7 +271,7 @@ export class UsageWindowLedger {
 			// than an un-awaited promise this class can't otherwise observe.
 			try {
 				const closedWindow: UsageWindow = { ...window, ...closeInput };
-				await this.notifyClosedWindow(closedWindow);
+				await this.notifyClosedWindow(closedWindow, expectedCreatedAt);
 			} catch (error) {
 				log.warn(
 					`usage_window_value_drop evaluation failed for account ${window.accountId} window ${window.id}: ${error}`,
@@ -267,12 +288,16 @@ export class UsageWindowLedger {
 	 * projected) and hands the closed window to AlertService for the
 	 * usage_window_value_drop evaluation.
 	 */
-	private async notifyClosedWindow(closedWindow: UsageWindow): Promise<void> {
+	private async notifyClosedWindow(
+		closedWindow: UsageWindow,
+		expectedCreatedAt?: number,
+	): Promise<void> {
 		if (!this.alertService) return;
 		const account = await this.dbOps.getAccount(closedWindow.accountId);
 		await this.alertService.evaluateClosedWindow(
 			closedWindow,
 			account?.name ?? closedWindow.accountId,
+			expectedCreatedAt,
 		);
 	}
 }

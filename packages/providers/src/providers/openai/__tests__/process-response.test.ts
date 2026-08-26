@@ -132,6 +132,46 @@ describe("processResponse – JSON (application/json)", () => {
 		expect(body.content[0]).toMatchObject({ type: "text", text: "Hello" });
 	});
 
+	it("drains the discarded original JSON branch instead of cancelling it", async () => {
+		const provider = makeProvider();
+		const upstream = openaiJsonResponse({
+			id: "chatcmpl-drain",
+			model: "gpt-4o",
+			choices: [
+				{
+					message: { role: "assistant", content: "Hello" },
+					finish_reason: "stop",
+				},
+			],
+			usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+		});
+		if (!upstream.body) throw new Error("expected upstream body");
+		const body = upstream.body;
+		const originalCancel = body.cancel.bind(body);
+		const originalGetReader = body.getReader.bind(body);
+		let cancelCalls = 0;
+		let getReaderCalls = 0;
+		Object.defineProperty(body, "cancel", {
+			configurable: true,
+			value: (...args: Parameters<typeof body.cancel>) => {
+				cancelCalls += 1;
+				return originalCancel(...args);
+			},
+		});
+		Object.defineProperty(body, "getReader", {
+			configurable: true,
+			value: () => {
+				getReaderCalls += 1;
+				return originalGetReader();
+			},
+		});
+
+		await provider.processResponse(upstream, makeAccount());
+
+		expect(cancelCalls).toBe(0);
+		expect(getReaderCalls).toBe(1);
+	});
+
 	it("tool call response converts to Anthropic tool_use shape", async () => {
 		const provider = makeProvider();
 		const account = makeAccount();
@@ -619,5 +659,26 @@ describe("extractUsageInfo", () => {
 
 		const info = await provider.extractUsageInfo(upstream);
 		expect(info).toBeNull();
+	});
+
+	it("does not create an unread clone for streaming responses", async () => {
+		const provider = makeProvider();
+		const upstream = new Response(null, {
+			headers: { "content-type": "text/event-stream" },
+		});
+		const originalClone = upstream.clone.bind(upstream);
+		let cloneCalls = 0;
+		Object.defineProperty(upstream, "clone", {
+			configurable: true,
+			value: () => {
+				cloneCalls += 1;
+				return originalClone();
+			},
+		});
+
+		const info = await provider.extractUsageInfo(upstream);
+
+		expect(info).toBeNull();
+		expect(cloneCalls).toBe(0);
 	});
 });

@@ -19,6 +19,7 @@ import {
 	NETWORK,
 	registerCleanup,
 	registerDisposable,
+	setForceAccountModel,
 	setPricingLogger,
 	shutdown,
 	TIME_CONSTANTS,
@@ -48,6 +49,7 @@ import { Logger, setConsoleLogging } from "@better-ccflare/logger";
 import { handleResponsesRequest } from "@better-ccflare/openai-responses-adapter";
 import {
 	CODEX_DEFAULT_ENDPOINT,
+	CODEX_PING_MODEL,
 	extractWeeklyResetTime,
 	fetchCodexUsageData,
 	fetchCodexUsageOnDemand,
@@ -83,16 +85,20 @@ import {
 	forceCloseCircuit,
 	getCodexModels,
 	getModelCatalog,
+	getOpenAICompatibleModels,
 	getUsageCollectorHealth,
 	getValidAccessToken,
 	handleProxy,
 	initModelCatalogRefresh,
 	initProxy,
+	lowestTierCodexModel,
 	ModelRouteSessionRegistry,
 	markAccountTokensFresh,
 	type ProxyContext,
 	parseModelRouteProfiles,
+	recordCodexUsageSnapshot,
 	refreshModelCatalog,
+	registerAutoRefreshTrackingClearer,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
 	registerRefreshClearer,
@@ -100,7 +106,10 @@ import {
 	startGlobalTokenHealthChecks,
 	startIntegrityScheduler,
 	stopGlobalTokenHealthChecks,
+	unregisterAutoRefreshTrackingClearer,
 	unregisterCodexUsageRefresher,
+	unregisterPollingRestarter,
+	unregisterRefreshClearer,
 } from "@better-ccflare/proxy";
 import { validatePathOrThrow } from "@better-ccflare/security";
 import {
@@ -116,6 +125,12 @@ import {
 	BodyAdmissionController,
 	withBodyAdmission,
 } from "./body-admission";
+import {
+	createUsagePollingTrackingClearer,
+	isCurrentUsagePollingAccount,
+	UsagePollingLifecycle,
+	unregisterServerLifecycleCallbacks,
+} from "./usage-polling-lifecycle";
 
 /**
  * Build a load-balancing strategy from its enum name. Add new strategies here
@@ -147,10 +162,13 @@ export function buildStrategy(
 		case StrategyName.SessionDrainSoonest:
 			return new SessionDrainSoonestStrategy(
 				sessionDurationMs,
-				undefined,
-				undefined,
-				undefined,
-				undefined,
+				"sticky",
+				routingTransitions,
+			);
+		case StrategyName.SessionDrainSoonestStrict:
+			return new SessionDrainSoonestStrategy(
+				sessionDurationMs,
+				"strict",
 				routingTransitions,
 			);
 		default:
@@ -499,11 +517,10 @@ let stopIntegritySchedulerJob: (() => void) | null = null;
 let stopModelCatalogRefreshJob: (() => void) | null = null;
 let stopDeviceSetupRecoveryJob: (() => Promise<void>) | null = null;
 let autoRefreshScheduler: AutoRefreshScheduler | null = null;
+let usagePollingLifecycle: UsagePollingLifecycle<NodeJS.Timeout> | null = null;
 let cacheFlightCohortSealService: CohortSealService | null = null;
 let cacheKeepaliveScheduler: CacheKeepaliveScheduler | null = null;
 let memoryMonitorInterval: Timer | null = null;
-// Track usage polling retry timeouts for cleanup
-const usagePollingRetryTimeouts = new Map<string, NodeJS.Timeout>();
 
 export const DEVICE_SETUP_RECOVERY_INTERVAL_MS = 30_000;
 
@@ -624,6 +641,50 @@ async function cleanupCacheFlightRecorderRetention(
 	} catch (err) {
 		log.error(`Cache flight recorder retention error: ${err}`);
 	}
+}
+
+/**
+ * Adopt, once, what the combo environment variables used to decide.
+ *
+ * The switches for combo routing and its session fallback now live in the
+ * dashboard and are read from the config file only — an environment variable
+ * that could override them would force the UI to draw a control that accepts a
+ * click and does nothing. So the old variables are read here, at boot, written
+ * into the file, and never consulted again.
+ *
+ * The same pass covers an install that has combos but never set the variable:
+ * it was routing through them, and an upgrade must not stop that in silence.
+ *
+ * Failure is not fatal: the settings stay at their defaults and the operator
+ * can set them in the dashboard, which is the whole point of moving them there.
+ */
+async function adoptLegacyRoutingSettings(
+	config: Config,
+	dbOps: DatabaseOperations,
+) {
+	const log = new Logger("Startup");
+	try {
+		const combos = await dbOps.listCombos();
+		for (const note of config.adoptLegacyRoutingSettings(combos.length > 0)) {
+			log.info(note);
+		}
+	} catch (err) {
+		log.warn(
+			`Could not adopt the legacy combo settings: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+}
+
+/**
+ * Restore the pending-rotation WAL only after account lookups exist, but before
+ * any proxy context or scheduler can begin credential refresh work.
+ */
+export async function restorePendingRotationsBeforeRuntimeRefresh(
+	dbOps: Pick<DatabaseOperations, "getAccount">,
+): Promise<number> {
+	return restorePendingRotations(async (accountId) =>
+		dbOps.getAccount(accountId),
+	);
 }
 
 // Startup maintenance (one-shot): cleanup only (compaction available via API endpoint)
@@ -750,28 +811,40 @@ export async function refreshPollingAccessToken(
 ): Promise<string> {
 	// Reload the current token state from the database first to avoid using
 	// stale tokens after re-authentication (or any other writer) updated them
-	// since this account object was last touched.
+	// since this account object was last touched. An ID match is insufficient:
+	// deletion/recreation can reuse the ID while changing the credential owner.
 	const currentAccount = await proxyContext.dbOps.getAccount(account.id);
-	if (currentAccount) {
-		account.access_token = currentAccount.access_token;
-		account.refresh_token = currentAccount.refresh_token;
-		account.expires_at = currentAccount.expires_at;
-		markAccountTokensFresh(account);
+	if (!currentAccount || currentAccount.created_at !== account.created_at) {
+		throw new Error(
+			`Account ${account.id} generation is no longer current; refusing stale polling refresh`,
+		);
 	}
+	account.access_token = currentAccount.access_token;
+	account.refresh_token = currentAccount.refresh_token;
+	account.expires_at = currentAccount.expires_at;
+	markAccountTokensFresh(account);
 
 	const accessToken = await getValidAccessToken(account, proxyContext);
+	// getValidAccessToken can await a provider refresh or join an existing shared
+	// refresh. Re-read before returning so generation A cannot hand A or B's
+	// credential to a poller after a same-ID replacement became current.
+	const refreshedAccount = await proxyContext.dbOps.getAccount(account.id);
+	if (!refreshedAccount || refreshedAccount.created_at !== account.created_at) {
+		throw new Error(
+			`Account ${account.id} generation is no longer current; refusing stale polling refresh`,
+		);
+	}
 	// The caller that started the refresh is mutated by getValidAccessToken. A
-	// concurrent caller can instead join an in-flight refresh owned by a different
-	// Account snapshot, so adopt the persisted winner only when this snapshot did
-	// not receive the returned access token itself.
-	if (account.access_token !== accessToken) {
-		const refreshedAccount = await proxyContext.dbOps.getAccount(account.id);
-		if (refreshedAccount?.access_token === accessToken) {
-			account.access_token = refreshedAccount.access_token;
-			account.refresh_token = refreshedAccount.refresh_token;
-			account.expires_at = refreshedAccount.expires_at;
-			markAccountTokensFresh(account);
-		}
+	// joiner instead adopts only the persisted token it was handed, after the
+	// generation fence above verified the row still belongs to this snapshot.
+	if (
+		account.access_token !== accessToken &&
+		refreshedAccount.access_token === accessToken
+	) {
+		account.access_token = refreshedAccount.access_token;
+		account.refresh_token = refreshedAccount.refresh_token;
+		account.expires_at = refreshedAccount.expires_at;
+		markAccountTokensFresh(account);
 	}
 	return accessToken;
 }
@@ -782,20 +855,39 @@ export async function refreshPollingAccessToken(
  * to MAX_RETRY_ATTEMPTS on failure; a permanently-failing account simply
  * stops polling rather than crashing the server.
  */
-function startUsagePollingWithRefresh(
+export function startUsagePollingWithRefresh(
 	account: Account,
 	proxyContext: ProxyContext,
 	alertService: AlertService,
 	usageWindowLedger: UsageWindowLedger,
+	lifecycle: UsagePollingLifecycle<NodeJS.Timeout>,
 	startupDelayMs: number = 0,
 	intervalMs: number = 90000,
 ) {
 	const logger = new Logger("UsagePolling");
 	const MAX_RETRY_ATTEMPTS = 10;
 	let retryCount = 0;
+	const lease = lifecycle.replace(account.id, account.created_at);
+
+	const isCurrent = async (): Promise<boolean> => {
+		if (!lifecycle.isCurrent(lease)) return false;
+		const matchesDurableRow = await isCurrentUsagePollingAccount(
+			lease,
+			(accountId) => proxyContext.dbOps.getAccount(accountId),
+		);
+		if (!matchesDurableRow) {
+			// This callback may belong to an already-replaced registration. Retire
+			// only its exact lease and do not call usageCache.stopPolling(), whose
+			// account-ID-only API could tear down the replacement's provider loop.
+			lifecycle.retireLease(lease);
+			return false;
+		}
+		return lifecycle.isCurrent(lease);
+	};
 
 	// Initial polling with token refresh
 	const pollWithRefresh = async () => {
+		if (!(await isCurrent())) return;
 		try {
 			// Create a token provider function that gets a fresh token each time.
 			// For codex it also re-checks endpoint eligibility from the DB on
@@ -803,10 +895,24 @@ function startUsagePollingWithRefresh(
 			// loop polling the subscription backend (pro-gate P1) — the throw
 			// fails this fetch and stopPolling ends the loop cleanly.
 			const tokenProvider = async () => {
+				if (!(await isCurrent())) {
+					throw new Error(
+						`Usage polling lease retired for account ${account.name}; polling stopped`,
+					);
+				}
 				if (account.provider === "codex") {
 					const fresh = await proxyContext.dbOps.getAccount(account.id);
-					if (fresh && !accountSupportsRefreshBackedUsagePolling(fresh)) {
+					if (!fresh || fresh.created_at !== account.created_at) {
+						// Do not stop by account ID here. This stale provider callback
+						// can run after a same-ID replacement has started polling.
+						lifecycle.retireLease(lease);
+						throw new Error(
+							`Codex usage polling lease for ${account.name} is stale; polling stopped`,
+						);
+					}
+					if (!accountSupportsRefreshBackedUsagePolling(fresh)) {
 						usageCache.stopPolling(account.id);
+						lifecycle.retireLease(lease);
 						throw new Error(
 							`Codex account ${account.name} no longer targets the subscription backend; usage polling stopped`,
 						);
@@ -823,98 +929,112 @@ function startUsagePollingWithRefresh(
 				intervalMs,
 				undefined, // customEndpoint
 				(accountId) => {
-					// Usage window has rolled over — reset session tracking so the
-					// dashboard reflects the new window without waiting for the next request.
-					proxyContext.dbOps
-						.resetAccountSession(accountId, Date.now())
-						.catch((err) =>
+					// UsageCache can emit after stopPolling. Re-check this registration's
+					// durable lease before a stale event resets a replacement row.
+					void (async () => {
+						if (accountId !== account.id || !(await isCurrent())) return;
+						try {
+							await proxyContext.dbOps.resetAccountSession(
+								accountId,
+								Date.now(),
+								lease.createdAt,
+							);
+						} catch (err) {
 							logger.warn(
 								`Failed to reset session for account ${accountId} on window reset: ${err}`,
-							),
-						);
+							);
+						}
+					})();
 				},
 				(accountId) => {
-					// Usage API shows available capacity (<100%). If rate_limited_until is
-					// set in the future (seat-reassignment case), clear it now rather than
-					// waiting for the natural expiry timer — the polling loop has confirmed
-					// the seat is available again.
-					proxyContext.dbOps
-						.getAccount(accountId)
-						.then((acc) => {
+					void (async () => {
+						if (accountId !== account.id || !(await isCurrent())) return;
+						try {
+							// Usage API shows available capacity (<100%). If rate_limited_until is
+							// set in the future (seat-reassignment case), clear it now rather than
+							// waiting for the natural expiry timer — the polling loop has confirmed
+							// the seat is available again.
+							const currentAccount =
+								await proxyContext.dbOps.getAccount(accountId);
 							if (
-								acc?.rate_limited_until &&
-								Number(acc.rate_limited_until) > Date.now()
-							) {
-								return proxyContext.dbOps
-									.forceResetAccountRateLimit(accountId)
-									.then(() => {
-										logger.info(
-											`Cleared stale rate_limited_until for account ${acc.name} (${accountId}): usage polling shows available capacity (seat reassignment or early reset)`,
-										);
-									});
-							}
-						})
-						.catch((err) =>
+								currentAccount?.created_at !== lease.createdAt ||
+								!(await isCurrent()) ||
+								!currentAccount.rate_limited_until ||
+								Number(currentAccount.rate_limited_until) <= Date.now()
+							)
+								return;
+							await proxyContext.dbOps.forceResetAccountRateLimit(
+								accountId,
+								lease.createdAt,
+							);
+							logger.info(
+								`Cleared stale rate_limited_until for account ${currentAccount.name} (${accountId}): usage polling shows available capacity (seat reassignment or early reset)`,
+							);
+						} catch (err) {
 							logger.warn(
 								`Failed to check/clear rate_limited_until for account ${accountId} on capacity restore: ${err}`,
-							),
-						);
+							);
+						}
+					})();
 				},
 				(payload) => {
-					const { accountId, windows } = payload;
-					const now = Date.now();
-					proxyContext.dbOps
-						.recordUsageSnapshot(accountId, windows, now)
-						.catch((err) =>
-							logger.warn(
-								`Failed to record usage snapshot for account ${accountId}: ${err}`,
-							),
-						);
-					// Usage-window threshold / exhaustion-projection alerts
-					// (OnWatch). Independent of recordUsageSnapshot above — must not
-					// depend on that insert's timing (see the comment in
-					// AlertService.buildUsageWindowExhaustionAlert), and a failure
-					// here is best-effort telemetry, never fatal to polling.
-					// Resolve the CURRENT name at dispatch — the closure-captured
-					// name goes stale on rename (pro-gate round-2 finding).
-					proxyContext.dbOps
-						.getAccount(accountId)
-						.then((acc) =>
-							alertService.evaluateUsageSnapshot(
+					void (async () => {
+						if (payload.accountId !== account.id || !(await isCurrent()))
+							return;
+						const { accountId, windows } = payload;
+						const now = Date.now();
+						try {
+							await proxyContext.dbOps.recordUsageSnapshot(
 								accountId,
-								acc?.name ?? account.name,
 								windows,
 								now,
-							),
-						)
-						.catch((err) =>
+								lease.createdAt,
+							);
+						} catch (err) {
+							logger.warn(
+								`Failed to record usage snapshot for account ${accountId}: ${err}`,
+							);
+						}
+						if (!(await isCurrent())) return;
+
+						try {
+							const currentAccount =
+								await proxyContext.dbOps.getAccount(accountId);
+							if (!(await isCurrent())) return;
+							await alertService.evaluateUsageSnapshot(
+								accountId,
+								currentAccount?.name ?? account.name,
+								windows,
+								now,
+								lease.createdAt,
+							);
+						} catch (err) {
 							logger.warn(
 								`Failed to evaluate usage-window alerts for account ${accountId}: ${err}`,
-							),
-						);
-					// Window Value Ledger (issue #252). Independent of the alert
-					// evaluation above. observeSnapshot is internally resilient
-					// per-window (see its implementation), but this .catch() is
-					// kept anyway for defense-in-depth, matching every other
-					// fire-and-forget call in this callback.
-					usageWindowLedger
-						.observeSnapshot(accountId, windows, now)
-						.catch((err) =>
+							);
+						}
+						if (!(await isCurrent())) return;
+
+						try {
+							await usageWindowLedger.observeSnapshot(
+								accountId,
+								windows,
+								now,
+								lease.createdAt,
+							);
+						} catch (err) {
 							logger.warn(
 								`Usage window ledger failed for account ${accountId}: ${err}`,
-							),
-						);
+							);
+						}
+					})();
 				},
 			);
 
-			// Reset retry count on success
+			// Reset retry count on success. A retry callback clears only its own
+			// lease-owned timer before invoking this function, so it cannot erase
+			// a newer account generation's timer.
 			retryCount = 0;
-			// Clear any tracked timeout since we succeeded
-			const existingTimeout = usagePollingRetryTimeouts.get(account.id);
-			if (existingTimeout) {
-				clearTimeout(existingTimeout);
-				usagePollingRetryTimeouts.delete(account.id);
-			}
 		} catch (error) {
 			logger.error(
 				`Error starting usage polling for account ${account.name}:`,
@@ -967,14 +1087,8 @@ function startUsagePollingWithRefresh(
 				}
 			}
 
-			// Clear any existing retry timeout before scheduling a new one
-			const existingTimeout = usagePollingRetryTimeouts.get(account.id);
-			if (existingTimeout) {
-				clearTimeout(existingTimeout);
-				usagePollingRetryTimeouts.delete(account.id);
-			}
-
 			// Check if we've exceeded max retry attempts
+			if (!(await isCurrent())) return;
 			retryCount++;
 			if (retryCount >= MAX_RETRY_ATTEMPTS) {
 				logger.error(
@@ -994,24 +1108,24 @@ function startUsagePollingWithRefresh(
 				`Scheduling retry ${retryCount}/${MAX_RETRY_ATTEMPTS} for account ${account.name} in ${Math.round(delayMs / 1000 / 60)} minutes`,
 			);
 
-			const timeoutId = setTimeout(() => {
+			lifecycle.scheduleRetry(lease, delayMs, () => {
 				logger.info(
 					`Retrying usage polling for account ${account.name} (attempt ${retryCount}/${MAX_RETRY_ATTEMPTS})`,
 				);
-				usagePollingRetryTimeouts.delete(account.id);
-				pollWithRefresh();
-			}, delayMs);
-
-			// Track the timeout for cleanup
-			usagePollingRetryTimeouts.set(account.id, timeoutId);
+				void pollWithRefresh();
+			});
 		}
 	};
 
-	// Start the polling (with optional startup delay to stagger multiple accounts)
+	// Start the polling (with optional startup delay to stagger multiple accounts).
+	// The lifecycle owns the stagger timer too, so account deletion/restart/shutdown
+	// retires it before its callback can start work for a replacement row.
 	if (startupDelayMs > 0) {
-		setTimeout(() => pollWithRefresh(), startupDelayMs);
+		lifecycle.scheduleStagger(lease, startupDelayMs, () => {
+			void pollWithRefresh();
+		});
 	} else {
-		pollWithRefresh();
+		void pollWithRefresh();
 	}
 }
 
@@ -1165,6 +1279,10 @@ export default async function startServer(options?: {
 			config.getProviderModelDefaultOverrides(),
 		),
 	);
+	// The code that renames models lives in core and providers, neither of
+	// which may depend on config; mirror the setting there before anything can
+	// route. The config POST handler mirrors it again after a write.
+	setForceAccountModel(config.getForceAccountModel());
 	installOutboundProxy(() => config.getOutboundProxy());
 	const outboundProxyUrl = config.getOutboundProxy();
 	if (outboundProxyUrl) {
@@ -1205,17 +1323,23 @@ export default async function startServer(options?: {
 	// Keep provider-committed rotations outside the primary DB: this WAL must
 	// remain writable when the DB outage that caused the token CAS failure is
 	// still active. One encrypted, atomically-replaced file per account avoids
-	// cross-account writer races and restores before any scheduler can refresh.
+	// cross-account writer races.
 	configurePendingRotationPersistence(
 		createPendingRotationWal({
 			directory: join(dirname(resolveConfigPath()), "pending-rotations"),
 			secret: localControlSecret,
 		}),
 	);
-	await restorePendingRotations();
 
 	DatabaseFactory.initialize(undefined, runtime);
 	const dbOps = await DatabaseFactory.getInstanceAsync();
+	// Upgrade legacy WAL ownership before any proxy context, polling loop, or
+	// scheduler can refresh: every later production caller is generation-bound.
+	await restorePendingRotationsBeforeRuntimeRefresh(dbOps);
+
+	// Before anything can route: adopt the combo behaviour this install was
+	// already running, so upgrading is never a silent routing change.
+	await adoptLegacyRoutingSettings(config, dbOps);
 
 	// One-time migration: promote pre-existing DBs from auto_vacuum=NONE to
 	// INCREMENTAL. Fresh DBs created since ensureSchema() started issuing
@@ -1501,6 +1625,10 @@ export default async function startServer(options?: {
 					return getCodexModels(accountId, modelCatalogProxyContext);
 				},
 				get: () => getModelCatalog(),
+				openaiCompatibleModels: async (accountId: string) => {
+					if (!modelCatalogProxyContext) return null;
+					return getOpenAICompatibleModels(accountId, modelCatalogProxyContext);
+				},
 				refresh: async () => {
 					if (!modelCatalogProxyContext) {
 						return {
@@ -1715,6 +1843,15 @@ export default async function startServer(options?: {
 	};
 	modelCatalogProxyContext = proxyContext;
 
+	// This concrete owner is captured by account-removal callbacks below. Do not
+	// read the module-level variable from those callbacks: a later server start
+	// must never make an old callback retire the new server's timers.
+	const pollingLifecycle = new UsagePollingLifecycle<NodeJS.Timeout>({
+		schedule: (callback, delayMs) => setTimeout(callback, delayMs),
+		cancel: (timer) => clearTimeout(timer),
+	});
+	usagePollingLifecycle = pollingLifecycle;
+
 	// Register this server's refresh clearing capability
 	const serverId = `server-${runtime.port}`;
 	// Track at module scope so handleGracefulShutdown can unregister cleanly.
@@ -1727,6 +1864,10 @@ export default async function startServer(options?: {
 
 	// Register this server's usage polling restart capability
 	registerPollingRestarter(serverId, async (accountId: string) => {
+		// Retire before stopping the provider loop: an old retry/stagger callback
+		// must not observe this restart and mutate its replacement's timer state.
+		pollingLifecycle.retire(accountId);
+		usageCache.stopPolling(accountId);
 		const account = await dbOps.getAccount(accountId);
 		if (!account) {
 			log.warn(
@@ -1759,6 +1900,7 @@ export default async function startServer(options?: {
 			proxyContext,
 			alertService,
 			usageWindowLedger,
+			pollingLifecycle,
 			0,
 			config.getUsagePollIntervalMs(),
 		);
@@ -1924,9 +2066,34 @@ export default async function startServer(options?: {
 
 		const endpoint = account.custom_endpoint ?? CODEX_DEFAULT_ENDPOINT;
 
+		// Ping with a model this account can actually address, and with the
+		// cheapest one of those. A hardcoded name goes stale silently and fatally:
+		// the subscription endpoint rejects an unknown model before it accounts for
+		// quota, so the 400 carries no `x-codex-*` headers and the refresh fails
+		// with nothing to show. The account's own listing already answers the
+		// "which models exist" half for the family mapping — reuse it, and take the
+		// tail rather than the head, because the reply is discarded as soon as the
+		// headers arrive and the headers describe the subscription, not the model.
+		// `CODEX_PING_MODEL` is only reached when that listing has never been
+		// readable.
+		let pingModel = CODEX_PING_MODEL;
+		try {
+			pingModel =
+				lowestTierCodexModel(await getCodexModels(accountId, proxyContext)) ??
+				CODEX_PING_MODEL;
+		} catch (error) {
+			log.debug(
+				`Codex usage refresh: could not resolve the model list for ${account.name}, pinging ${pingModel}: ${error}`,
+			);
+		}
+
 		let fetchResult: Awaited<ReturnType<typeof fetchCodexUsageOnDemand>>;
 		try {
-			fetchResult = await fetchCodexUsageOnDemand(accessToken, endpoint);
+			fetchResult = await fetchCodexUsageOnDemand(
+				accessToken,
+				endpoint,
+				pingModel,
+			);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			log.error(
@@ -1961,19 +2128,33 @@ export default async function startServer(options?: {
 		}
 
 		if (!fetchResult.data) {
+			// Naming the model matters here: this is the shape a rejected model
+			// takes, and without it the message says nothing actionable.
 			return {
 				success: false,
-				message: `Codex returned no usage headers (status ${fetchResult.response.status}) for '${account.name}'`,
+				message: `Codex returned no usage headers (status ${fetchResult.response.status}) for '${account.name}' when pinging model '${pingModel}'`,
 			};
 		}
 
 		usageCache.set(accountId, fetchResult.data);
 
+		// Persist alongside the cache: this on-demand read costs quota, so it must
+		// outlive the 10-minute cache. `force` skips the traffic throttle — the
+		// operator asked for this read explicitly.
+		await recordCodexUsageSnapshot(
+			dbOps,
+			accountId,
+			account.name,
+			fetchResult.data as unknown as Record<string, unknown>,
+			Date.now(),
+			true,
+		);
+
 		const fiveHour = fetchResult.data.five_hour?.utilization ?? 0;
 		const sevenDay = fetchResult.data.seven_day?.utilization ?? 0;
 		const isRateLimited = fetchResult.response.status === 429;
 		log.info(
-			`Codex usage refreshed for '${account.name}': 5h=${fiveHour}%, 7d=${sevenDay}%${
+			`Codex usage refreshed for '${account.name}' via ${pingModel}: 5h=${fiveHour}%, 7d=${sevenDay}%${
 				isRateLimited ? " (rate-limited)" : ""
 			}`,
 		);
@@ -1992,9 +2173,16 @@ export default async function startServer(options?: {
 		};
 	});
 
-	// Initialize auto-refresh scheduler (now that proxyContext is available)
-	autoRefreshScheduler = new AutoRefreshScheduler(db, proxyContext);
-	autoRefreshScheduler.start();
+	// Initialize auto-refresh scheduler (now that proxyContext is available).
+	// Capture this concrete scheduler and polling owner in the deletion callback;
+	// consulting mutable module state here could clear a later server instance.
+	const scheduler = new AutoRefreshScheduler(db, proxyContext);
+	autoRefreshScheduler = scheduler;
+	scheduler.start();
+	registerAutoRefreshTrackingClearer(
+		serverId,
+		createUsagePollingTrackingClearer(pollingLifecycle, scheduler),
+	);
 
 	// Initialize cache keepalive scheduler
 	cacheKeepaliveScheduler = new CacheKeepaliveScheduler(proxyContext, config);
@@ -2378,6 +2566,7 @@ Available endpoints:
 					proxyContext,
 					alertService,
 					usageWindowLedger,
+					pollingLifecycle,
 					startupDelayMs,
 					config.getUsagePollIntervalMs(),
 				);
@@ -2820,6 +3009,20 @@ async function handleGracefulShutdown(signal: string) {
 	watchdog.unref();
 
 	try {
+		// Unregister all server-keyed callbacks before retiring any owner. A caller
+		// racing shutdown must find no callback rather than a null/stale scheduler.
+		if (registeredServerId) {
+			unregisterServerLifecycleCallbacks(registeredServerId, {
+				unregisterCodexUsageRefresher,
+				unregisterPollingRestarter,
+				unregisterRefreshClearer,
+				unregisterAutoRefreshTrackingClearer,
+			});
+			registeredServerId = null;
+		}
+		usagePollingLifecycle?.retireAll();
+		usagePollingLifecycle = null;
+
 		// Stop scheduler triggers first so they don't add load while draining.
 		// Device setup additionally drains its database-owning work before shared
 		// resources can be disposed below.
@@ -2878,27 +3081,9 @@ async function handleGracefulShutdown(signal: string) {
 		// Stop token health monitoring
 		stopGlobalTokenHealthChecks();
 
-		// Unregister this server's Codex on-demand usage refresher so the
-		// module-level registry doesn't keep a stale callback after restart.
-		// Mirrors the cleanup pattern used by the schedulers above.
-		if (registeredServerId) {
-			unregisterCodexUsageRefresher(registeredServerId);
-			registeredServerId = null;
-		}
+		// Server-keyed callbacks were unregistered before stopping owners above.
 
-		// Clear all pending usage polling retry timeouts
-		if (usagePollingRetryTimeouts.size > 0) {
-			console.log(
-				`Clearing ${usagePollingRetryTimeouts.size} pending usage polling retry timeout(s)...`,
-			);
-			for (const [
-				_accountId,
-				timeoutId,
-			] of usagePollingRetryTimeouts.entries()) {
-				clearTimeout(timeoutId);
-			}
-			usagePollingRetryTimeouts.clear();
-		}
+		// The polling lifecycle retired retry and stagger timers before shutdown.
 
 		// Drain in-flight requests before tearing down shared resources.
 		// stop() without arguments stops accepting new connections while

@@ -96,6 +96,49 @@ describe("teeStream", () => {
 		);
 	});
 
+	it("keeps the client stream healthy when onChunk throws", async () => {
+		const chunks = [textChunk("first"), textChunk("second")];
+		const { stream } = makeTrackedUpstream(chunks);
+		let onChunkCalls = 0;
+		let onCloseCalls = 0;
+		let onErrorCalls = 0;
+
+		const received = await readAll(
+			teeStream(stream, {
+				onChunk() {
+					onChunkCalls++;
+					if (onChunkCalls === 1) throw new Error("analytics failed");
+				},
+				onClose() {
+					onCloseCalls++;
+				},
+				onError() {
+					onErrorCalls++;
+				},
+			}),
+		);
+
+		expect(new TextDecoder().decode(combineChunks(received))).toBe(
+			"firstsecond",
+		);
+		expect(onChunkCalls).toBe(2);
+		expect(onCloseCalls).toBe(1);
+		expect(onErrorCalls).toBe(0);
+	});
+
+	it("releases the upstream lock after cancellation, even when upstream cancellation fails", async () => {
+		const upstream = new ReadableStream<Uint8Array>({
+			cancel() {
+				return Promise.reject(new Error("upstream cancellation failed"));
+			},
+		});
+		const reader = teeStream(upstream).getReader();
+
+		await expect(reader.cancel("client disconnected")).resolves.toBeUndefined();
+
+		expect(() => upstream.getReader()).not.toThrow();
+	});
+
 	it("respects maxBytes when buffering, while still passing all bytes through", async () => {
 		const chunks = [textChunk("12345"), textChunk("67890"), textChunk("abcde")];
 		const { stream } = makeTrackedUpstream(chunks);
@@ -153,22 +196,37 @@ describe("teeStream", () => {
 		expect(tracked.wasExhausted()).toBe(false);
 	});
 
-	it("swallows drain errors instead of throwing during cancel teardown", async () => {
+	it("reports cancellation without closing the collector lifecycle", async () => {
+		const tracked = makeTrackedUpstream([textChunk("chunk1")]);
+		let closeCallCount = 0;
+		let cancelledReason: unknown;
+		const reader = teeStream(tracked.stream, {
+			onClose: () => {
+				closeCallCount++;
+			},
+			onCancel: (reason) => {
+				cancelledReason = reason;
+			},
+		}).getReader();
+
+		await reader.cancel("client disconnected");
+
+		expect(cancelledReason).toBe("client disconnected");
+		expect(closeCallCount).toBe(0);
+		expect(tracked.wasCancelCalled()).toBe(true);
+	});
+
+	it("swallows upstream cancellation errors during teardown", async () => {
 		const erroringStream = new ReadableStream<Uint8Array>({
-			pull(controller) {
-				controller.error(new Error("boom during drain"));
+			cancel() {
+				return Promise.reject(new Error("upstream cancellation failed"));
 			},
 		});
 
-		const out = teeStream(erroringStream);
-		const reader = out.getReader();
+		const reader = teeStream(erroringStream).getReader();
 
 		// Must not reject / throw — cancel() during teardown should not
-		// propagate drain failures.
+		// propagate upstream cancellation failures.
 		await expect(reader.cancel("client disconnected")).resolves.toBeUndefined();
-
-		// Let any fire-and-forget drain promise settle without an
-		// unhandled rejection surfacing.
-		await new Promise((resolve) => setTimeout(resolve, 10));
 	});
 });

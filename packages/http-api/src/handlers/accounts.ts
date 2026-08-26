@@ -34,13 +34,17 @@ import {
 	getRepresentativeUtilization,
 	getRepresentativeUtilizationForProvider,
 	getRepresentativeWindow,
-	MUSE_SPARK_DEFAULT_ENDPOINT,
+	META_DEFAULT_ENDPOINT,
 	parseCodexUsageHeaders,
 	type UsageData,
 	usageCache,
 } from "@better-ccflare/providers";
 import {
 	clearAccountRefreshCache,
+	clearAutoRefreshTrackingForAccount,
+	clearCodexModelCacheForAccount,
+	clearOpenAICompatibleModelCacheForAccount,
+	clearPendingRotationForDeletedAccount,
 	getBindingConstraint,
 	getUsageThrottleStatus,
 	refreshCodexUsageForAccount,
@@ -48,6 +52,7 @@ import {
 } from "@better-ccflare/proxy";
 import type {
 	Account,
+	AnthropicUsageData,
 	FullUsageData,
 	LoadBalancingStrategy,
 	RateLimitReason,
@@ -97,26 +102,65 @@ function toRateLimitReason(v: string | null): RateLimitReason | null {
 		: null;
 }
 
-function normalizeCodexUsageData(usage: UsageData): UsageData | null {
-	// Codex payloads carry the flat windows; default to empty windows if a
+/** A window we know nothing about: unknown percentage, unknown reset. */
+const UNKNOWN_WINDOW = { utilization: null, resets_at: null } as const;
+
+function hasWindowInfo(window: {
+	utilization: number | null;
+	resets_at: string | null;
+}): boolean {
+	return window.utilization !== null || window.resets_at !== null;
+}
+
+/**
+ * Input shape accepted by the normalizer. Looser than the provider's `UsageData`
+ * on purpose: the snapshot fallback feeds it windows whose utilization is
+ * already unknown, and `UsageWindow.utilization` in the providers package is a
+ * plain `number`.
+ */
+type CodexUsageInput = {
+	five_hour?: { utilization: number | null; resets_at: string | null } | null;
+	seven_day?: { utilization: number | null; resets_at: string | null } | null;
+	plan_type?: string | null;
+	credits_balance?: number | null;
+	code_review_used_percent?: number | null;
+	code_review_resets_at?: string | null;
+};
+
+/**
+ * Returns the display shape (`AnthropicUsageData`, whose windows are nullable),
+ * not the provider shape — an unknown window is `utilization: null` here.
+ */
+function normalizeCodexUsageData(
+	usage: CodexUsageInput,
+): AnthropicUsageData | null {
+	// Codex payloads carry the flat windows; default to unknown windows if a
 	// limits-only shape ever reaches here (five_hour/seven_day are now optional).
+	//
+	// An absent window is UNKNOWN, not zero. Reporting 0% made the dashboard draw
+	// a confident "nothing used" bar and made the Overview pool average count the
+	// account as an idle contributor. null renders as "N/A / Data unavailable"
+	// and lands the account in the honest excluded/no_usage_data bucket
+	// (pool-usage.ts extractFiveHour -> pct null).
 	let five_hour = usage.five_hour
 		? { ...usage.five_hour }
-		: { utilization: 0, resets_at: null };
+		: { ...UNKNOWN_WINDOW };
 	let seven_day = usage.seven_day
 		? { ...usage.seven_day }
-		: { utilization: 0, resets_at: null };
+		: { ...UNKNOWN_WINDOW };
+	// A reset already in the past means the window rolled over; how much has been
+	// used since is unknown, so drop the stale percentage rather than claim zero.
 	if (
 		five_hour.resets_at &&
 		new Date(five_hour.resets_at).getTime() <= Date.now()
 	) {
-		five_hour = { utilization: 0, resets_at: null };
+		five_hour = { ...UNKNOWN_WINDOW };
 	}
 	if (
 		seven_day.resets_at &&
 		new Date(seven_day.resets_at).getTime() <= Date.now()
 	) {
-		seven_day = { utilization: 0, resets_at: null };
+		seven_day = { ...UNKNOWN_WINDOW };
 	}
 	// Spread the source first so polling-only extras (plan_type,
 	// credits_balance, code_review_used_percent/_resets_at from the free
@@ -125,29 +169,42 @@ function normalizeCodexUsageData(usage: UsageData): UsageData | null {
 	// report live utilization with reset_at 0/absent (e.g. an unstarted
 	// window), and polled snapshots carrying extras or non-zero utilization
 	// must not be discarded in favor of stale header replays (pro-gate P2).
-	const hasWindowReset =
-		five_hour.resets_at !== null || seven_day.resets_at !== null;
 	const hasPollingExtras =
 		usage.plan_type !== undefined ||
 		usage.credits_balance !== undefined ||
 		usage.code_review_used_percent !== undefined;
-	const hasLiveUtilization =
-		five_hour.utilization > 0 || seven_day.utilization > 0;
-	return hasWindowReset || hasPollingExtras || hasLiveUtilization
+	return hasWindowInfo(five_hour) ||
+		hasWindowInfo(seven_day) ||
+		hasPollingExtras
 		? { ...usage, five_hour, seven_day }
 		: null;
 }
 
+/**
+ * Best available Codex usage, in descending order of freshness:
+ *   1. the in-memory cache (10-minute TTL, empty after a restart)
+ *   2. headers reparsed from recently stored request payloads (pruned after
+ *      DATA_RETENTION_DAYS, default 1 day, and unreadable when payload
+ *      encryption is on)
+ *   3. the last usage_snapshots row for the weekly window (90-day retention)
+ *
+ * Step 3 exists because Codex has no usage-polling endpoint: without it the
+ * weekly percentage — the window that actually limits the account — is gone
+ * after a restart or a quiet day, and the card shows an empty bar.
+ */
 async function getCachedOrPersistedCodexUsage(
-	db: ReturnType<DatabaseOperations["getAdapter"]>,
+	dbOps: DatabaseOperations,
 	accountId: string,
 	accountName: string,
 	cacheData: FullUsageData | null,
 ): Promise<FullUsageData | null> {
+	const db = dbOps.getAdapter();
 	if (cacheData) {
-		const normalizedCache = normalizeCodexUsageData(cacheData as UsageData);
+		const normalizedCache = normalizeCodexUsageData(
+			cacheData as CodexUsageInput,
+		);
 		if (normalizedCache) {
-			return normalizedCache as FullUsageData;
+			return normalizedCache;
 		}
 	}
 	const rows = await db.query<{ json: string; timestamp: number | null }>(
@@ -183,15 +240,50 @@ async function getCachedOrPersistedCodexUsage(
 			const normalizedUsage = normalizeCodexUsageData(usage);
 			if (!normalizedUsage) continue;
 
-			usageCache.set(accountId, normalizedUsage);
+			// The cache's window type still declares `utilization: number`, while a
+			// normalized window may legitimately be unknown (null). Storing it is
+			// intended: every reader re-normalizes, and null renders as N/A.
+			usageCache.set(accountId, normalizedUsage as AnyUsageData);
 			log.debug(`Recovered Codex usage from stored payload for ${accountName}`);
-			return normalizedUsage as FullUsageData;
+			return normalizedUsage;
 		} catch (error) {
 			log.warn(
 				`Failed to recover Codex usage from stored payload for ${accountName}:`,
 				error instanceof Error ? error.message : String(error),
 			);
 		}
+	}
+
+	// Last resort: the durable weekly snapshot. Deliberately NOT written back to
+	// usageCache — the cache stands for "fresh enough to serve as current", and a
+	// snapshot can be days old. The card shows the percentage without an age
+	// label (product decision), so it must at least not shadow fresher data on the
+	// next request.
+	try {
+		const snapshot = await dbOps.getLatestUsageSnapshot(accountId, "seven_day");
+		if (snapshot) {
+			const normalizedSnapshot = normalizeCodexUsageData({
+				five_hour: { ...UNKNOWN_WINDOW },
+				seven_day: {
+					utilization: snapshot.utilization,
+					resets_at:
+						snapshot.resetsAt == null
+							? null
+							: new Date(snapshot.resetsAt).toISOString(),
+				},
+			});
+			if (normalizedSnapshot) {
+				log.debug(
+					`Recovered Codex weekly usage from history for ${accountName}`,
+				);
+				return normalizedSnapshot;
+			}
+		}
+	} catch (error) {
+		log.warn(
+			`Failed to read Codex usage history for ${accountName}:`,
+			error instanceof Error ? error.message : String(error),
+		);
 	}
 
 	return null;
@@ -357,7 +449,7 @@ export function createAccountsListHandler(
 					cachedUsageData as FullUsageData | null;
 				if (account.provider === "codex") {
 					usageData = await getCachedOrPersistedCodexUsage(
-						db,
+						dbOps,
 						account.id,
 						account.name,
 						usageData,
@@ -980,10 +1072,35 @@ export function createAccountRemoveHandler(dbOps: DatabaseOperations) {
 				return errorResponse(NotFound(result.message));
 			}
 
-			// Clear usage cache for removed account to prevent memory leaks.
-			// The cache is keyed by id, and we already have the id from the
-			// URL — no extra lookup needed.
+			// Stop usage polling and clear all cached state for the removed
+			// account to prevent memory leaks. `delete()` only clears the cache
+			// entry — `stopPolling()` also clears the timer and tracking maps,
+			// otherwise the poll loop keeps rescheduling itself forever.
+			usageCache.stopPolling(accountId);
+
+			// Also clear token-manager state (in-flight refresh, failure/backoff
+			// counters) for the removed account — otherwise it lingers until the
+			// 5-minute TTL sweep or the 1000-entry cap evicts it.
+			clearAccountRefreshCache(accountId);
+
+			// And clear auto-refresh-scheduler tracking state — otherwise it
+			// lingers until the scheduler's next periodic cleanup sweep (up to
+			// 60s later) or server shutdown.
+			clearAutoRefreshTrackingForAccount(accountId);
+
+			// Retire catalog evidence and any in-flight discovery for this exact id.
+			// A same-ID replacement must fetch its own model list rather than inherit
+			// state published by the deleted account's pending request.
+			clearCodexModelCacheForAccount(accountId);
+			clearOpenAICompatibleModelCacheForAccount(accountId);
+
+			// Clear provider usage and account-scoped depletion evidence only after
+			// deletion succeeds; reload/reauth must retain both owners.
 			usageCache.delete(accountId);
+
+			// Deletion is the only lifecycle transition that proves no live account
+			// can still own this rotation. Reload and re-auth must retain it.
+			clearPendingRotationForDeletedAccount(accountId);
 
 			return jsonResponse({
 				success: true,
@@ -1810,6 +1927,125 @@ export function createMinimaxAccountAddHandler(dbOps: DatabaseOperations) {
 	};
 }
 
+/** Create a DeepSeek API-key account at the provider's fixed endpoint. */
+export function createDeepseekAccountAddHandler(dbOps: DatabaseOperations) {
+	return async (req: Request): Promise<Response> => {
+		try {
+			const body = await req.json();
+			const name = validateString(body.name, "name", {
+				required: true,
+				minLength: 1,
+				maxLength: 100,
+				pattern: patterns.accountName,
+				patternErrorMessage:
+					"can only contain letters, numbers, spaces, hyphens, underscores, and dots",
+				transform: sanitizers.trim,
+			});
+			if (!name) return errorResponse(BadRequest("Account name is required"));
+
+			const apiKey = validateString(body.apiKey, "apiKey", {
+				required: true,
+				minLength: 1,
+				transform: sanitizers.trim,
+			});
+			if (!apiKey) return errorResponse(BadRequest("API key is required"));
+
+			const priority =
+				validateNumber(body.priority, "priority", {
+					min: 0,
+					max: 100,
+					integer: true,
+				}) || 0;
+			let modelMappings: string | null = null;
+			if (body.modelMappings !== undefined) {
+				if (
+					!body.modelMappings ||
+					typeof body.modelMappings !== "object" ||
+					Array.isArray(body.modelMappings)
+				) {
+					return errorResponse(BadRequest("Model mappings must be an object"));
+				}
+				const validated = validateAndSanitizeModelMappings(body.modelMappings);
+				if (!validated) {
+					return errorResponse(BadRequest("Invalid model mappings"));
+				}
+				if (Object.keys(validated).length > 0) {
+					modelMappings = JSON.stringify(validated);
+				}
+			}
+
+			const accountId = crypto.randomUUID();
+			const now = Date.now();
+			const endpoint = "https://api.deepseek.com/anthropic";
+			const db = dbOps.getAdapter();
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"deepseek",
+				endpoint,
+			);
+			if (conflict) return conflict;
+
+			await db.run(
+				`INSERT INTO accounts (
+					id, name, provider, api_key, refresh_token, access_token,
+					expires_at, created_at, request_count, total_requests, priority, custom_endpoint, model_mappings
+				) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)`,
+				[
+					accountId,
+					name,
+					"deepseek",
+					apiKey,
+					now,
+					0,
+					0,
+					priority,
+					endpoint,
+					modelMappings,
+				],
+			);
+
+			return accountCreatedResponse(accountId, {
+				message: `DeepSeek account '${name}' added successfully`,
+				account: {
+					id: accountId,
+					name,
+					provider: "deepseek",
+					requestCount: 0,
+					totalRequests: 0,
+					lastUsed: null,
+					created: new Date(now).toISOString(),
+					paused: false,
+					priority,
+					tokenStatus: "valid" as const,
+					tokenExpiresAt: new Date(
+						now + 365 * 24 * 60 * 60 * 1000,
+					).toISOString(),
+					rateLimitStatus: "OK",
+					rateLimitReset: null,
+					rateLimitRemaining: null,
+					rateLimitedUntil: null,
+					sessionInfo: "No active session",
+					hasRefreshToken: false,
+				},
+			});
+		} catch (error) {
+			log.error("DeepSeek account creation error:", error);
+			if (error instanceof ValidationError) {
+				return errorResponse(BadRequest(error.message));
+			}
+			if (isUniqueConstraintError(error)) {
+				return errorResponse(BadRequest("Account name is already taken"));
+			}
+			return errorResponse(
+				error instanceof Error
+					? error
+					: new Error("Failed to create DeepSeek account"),
+			);
+		}
+	};
+}
+
 /**
  * Create a NanoGPT account add handler
  */
@@ -2171,9 +2407,9 @@ export function createAnthropicCompatibleAccountAddHandler(
 }
 
 /**
- * Create a Muse Spark (Meta Model API) account add handler
+ * Create a Meta (Meta Model API) account add handler
  */
-export function createMuseSparkAccountAddHandler(dbOps: DatabaseOperations) {
+export function createMetaAccountAddHandler(dbOps: DatabaseOperations) {
 	return async (req: Request): Promise<Response> => {
 		let name: string | undefined;
 		try {
@@ -2212,7 +2448,7 @@ export function createMuseSparkAccountAddHandler(dbOps: DatabaseOperations) {
 					integer: true,
 				}) || 0;
 
-			// Validate custom endpoint (optional for Muse Spark; falls back to
+			// Validate custom endpoint (optional for Meta; falls back to
 			// Meta's default Model API host when not supplied)
 			const customEndpoint = validateString(
 				body.customEndpoint || null,
@@ -2232,7 +2468,7 @@ export function createMuseSparkAccountAddHandler(dbOps: DatabaseOperations) {
 				},
 			);
 
-			const endpoint = customEndpoint || MUSE_SPARK_DEFAULT_ENDPOINT;
+			const endpoint = customEndpoint || META_DEFAULT_ENDPOINT;
 
 			// Validate and sanitize model mappings (optional)
 			let modelMappings = null;
@@ -2243,7 +2479,7 @@ export function createMuseSparkAccountAddHandler(dbOps: DatabaseOperations) {
 				modelMappings = JSON.stringify(validatedMappings);
 			}
 
-			// Create Muse Spark account directly in database
+			// Create Meta account directly in database
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
 			const db = dbOps.getAdapter();
@@ -2251,7 +2487,7 @@ export function createMuseSparkAccountAddHandler(dbOps: DatabaseOperations) {
 			const conflict = await assertAccountNameAvailable(
 				dbOps,
 				name,
-				"muse-spark",
+				"meta",
 				endpoint,
 			);
 			if (conflict) return conflict;
@@ -2264,7 +2500,7 @@ export function createMuseSparkAccountAddHandler(dbOps: DatabaseOperations) {
 				[
 					accountId,
 					name,
-					"muse-spark",
+					"meta",
 					apiKey,
 					// API-key providers store the credential in api_key only. Mirroring
 					// it into refresh_token/access_token is the legacy shape that
@@ -2283,7 +2519,7 @@ export function createMuseSparkAccountAddHandler(dbOps: DatabaseOperations) {
 			);
 
 			log.info(
-				`Successfully added Muse Spark account: ${name} (Priority ${priority})`,
+				`Successfully added Meta account: ${name} (Priority ${priority})`,
 			);
 
 			// Get the created account for response
@@ -2314,7 +2550,7 @@ export function createMuseSparkAccountAddHandler(dbOps: DatabaseOperations) {
 			}
 
 			return accountCreatedResponse(accountId, {
-				message: `Muse Spark account '${name}' added successfully`,
+				message: `Meta account '${name}' added successfully`,
 				account: {
 					id: account.id,
 					name: account.name,
@@ -2338,7 +2574,7 @@ export function createMuseSparkAccountAddHandler(dbOps: DatabaseOperations) {
 				},
 			});
 		} catch (error) {
-			log.error("Muse Spark account creation error:", error);
+			log.error("Meta account creation error:", error);
 			if (error instanceof ValidationError) {
 				return errorResponse(BadRequest(error.message));
 			}
@@ -2350,7 +2586,7 @@ export function createMuseSparkAccountAddHandler(dbOps: DatabaseOperations) {
 			return errorResponse(
 				error instanceof Error
 					? error
-					: new Error("Failed to create Muse Spark account"),
+					: new Error("Failed to create Meta account"),
 			);
 		}
 	};
@@ -3013,13 +3249,23 @@ export function createAccountCustomEndpointUpdateHandler(
 				},
 			);
 
-			// Update account custom endpoint
-			await dbOps
-				.getAdapter()
-				.run("UPDATE accounts SET custom_endpoint = ? WHERE id = ?", [
-					customEndpoint || null,
-					accountId,
-				]);
+			const adapter = dbOps.getAdapter();
+			const account = await adapter.get<{
+				provider: string;
+			}>("SELECT provider FROM accounts WHERE id = ?", [accountId]);
+
+			// A conditional write makes a no-op observable without treating SQLite's
+			// matched-row count as an endpoint mutation.
+			const changed = await adapter.runWithChanges(
+				"UPDATE accounts SET custom_endpoint = ? WHERE id = ? AND custom_endpoint IS DISTINCT FROM ?",
+				[customEndpoint || null, accountId, customEndpoint || null],
+			);
+
+			if (changed > 0 && account?.provider === "openai-compatible") {
+				// The prior endpoint's models are not evidence for the newly selected
+				// endpoint. This also fences any discovery request started before it.
+				clearOpenAICompatibleModelCacheForAccount(accountId);
+			}
 
 			log.info(`Updated custom endpoint for account ${accountId}`);
 

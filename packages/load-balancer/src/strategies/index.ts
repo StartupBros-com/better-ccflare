@@ -1,4 +1,9 @@
-import { isAccountAvailable, TIME_CONSTANTS } from "@better-ccflare/core";
+import {
+	compareAccountPreference,
+	isAccountAvailable,
+	preemptsOnPreference,
+	TIME_CONSTANTS,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type {
 	Account,
@@ -14,18 +19,22 @@ import { isPeekAvailable } from "./peek-availability";
 import {
 	commitStrategyCandidateOrder,
 	compareRoutingMetadata,
-	compareStrategyCandidates,
+	compareSessionStrategyCandidates,
 	filterHardExcludedCandidates,
 	isSameStrategyCandidateClass,
 	zipStrategyCandidates,
 } from "./routing-metadata";
+import { codexWindowHasReset } from "./session-window-reset";
 
 export { LeastUsedStrategy } from "./least-used";
 export {
 	RoutingTransitionRecorder,
 	SessionAffinityStrategy,
 } from "./session-affinity";
-export { SessionDrainSoonestStrategy } from "./session-drain-soonest";
+export {
+	type SessionDrainSoonestMode,
+	SessionDrainSoonestStrategy,
+} from "./session-drain-soonest";
 
 export class SessionStrategy implements LoadBalancingStrategy {
 	private sessionDurationMs: number;
@@ -55,10 +64,13 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		// This helps Anthropic accounts better utilize their usage windows
 		// Usage windows: Anthropic accounts with proactive rate limit headers (usage-based accounts)
 		// No usage windows: Other account types or Anthropic console keys without usage windows
+		// Codex has 5h/7d usage windows too, but reports them through the
+		// x-codex-* response headers — see codexWindowHasReset.
 		const rateLimitWindowReset =
-			account.provider === PROVIDER_NAMES.ANTHROPIC && // Explicit provider check for Anthropic usage windows
-			account.rate_limit_reset &&
-			account.rate_limit_reset < now - 1000; // 1 second buffer for clock skew protection
+			(account.provider === PROVIDER_NAMES.ANTHROPIC && // Explicit provider check for Anthropic usage windows
+				account.rate_limit_reset &&
+				account.rate_limit_reset < now - 1000) || // 1 second buffer for clock skew protection
+			codexWindowHasReset(account, now);
 
 		if (fixedDurationExpired || rateLimitWindowReset) {
 			// Reset session
@@ -109,6 +121,15 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			return false;
 		}
 
+		// A Codex session whose upstream window already reset is not a live
+		// session, even with time left on the local 5h clock: continuing it
+		// re-pins traffic to the account that just rolled over instead of
+		// re-selecting with the fresh capacity in view. Anthropic is
+		// unaffected — see codexWindowHasReset for why it is Codex-only.
+		if (codexWindowHasReset(account, now)) {
+			return false;
+		}
+
 		// For Anthropic providers: check if session is active (within duration window)
 		return (
 			!!account.session_start &&
@@ -139,7 +160,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		if (fallbackTriggered) {
 			const sorted = accounts
 				.filter((a) => isAvailable(a))
-				.sort((a, b) => a.priority - b.priority);
+				.sort((a, b) => compareAccountPreference(a, b));
 			return sorted[0]?.id ?? null;
 		}
 
@@ -162,9 +183,9 @@ export class SessionStrategy implements LoadBalancingStrategy {
 					(a) =>
 						a.id !== activeAccount.id &&
 						isAvailable(a) &&
-						a.priority < activeAccount.priority,
+						preemptsOnPreference(a, activeAccount),
 				)
-				.sort((a, b) => a.priority - b.priority)[0];
+				.sort((a, b) => compareAccountPreference(a, b))[0];
 
 			if (!higherPriorityAccount) {
 				return activeAccount.id;
@@ -174,7 +195,8 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		const available = accounts
 			.filter((a) => isAvailable(a))
 			.sort((a, b) => {
-				if (a.priority !== b.priority) return a.priority - b.priority;
+				const preference = compareAccountPreference(a, b);
+				if (preference !== 0) return preference;
 				const utilA =
 					this.store?.getAccountUtilization?.(a.id, a.provider) ?? 0;
 				const utilB =
@@ -285,7 +307,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			// priority inversion when other accounts rank higher.
 			const ordered = candidates
 				.filter((candidate) => getCachedAvailability(candidate.account))
-				.sort((a, b) => compareStrategyCandidates(a, b, meta));
+				.sort((a, b) => compareSessionStrategyCandidates(a, b, meta));
 			return commitStrategyCandidateOrder(ordered, meta);
 		}
 
@@ -322,7 +344,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			const bestAvailable = candidates
 				.filter((candidate) => getCachedAvailability(candidate.account))
 				.sort((a, b) => {
-					const routingOrder = compareStrategyCandidates(a, b, meta);
+					const routingOrder = compareSessionStrategyCandidates(a, b, meta);
 					if (routingOrder !== 0) return routingOrder;
 					const utilA =
 						this.store?.getAccountUtilization?.(
@@ -338,12 +360,17 @@ export class SessionStrategy implements LoadBalancingStrategy {
 				})[0];
 			const activeCandidate = candidates
 				.filter((candidate) => candidate.account.id === activeAccount.id)
-				.sort((a, b) => compareStrategyCandidates(a, b, meta))[0];
+				.sort((a, b) => compareSessionStrategyCandidates(a, b, meta))[0];
 
 			if (
 				bestAvailable &&
 				activeCandidate &&
-				!isSameStrategyCandidateClass(activeCandidate, bestAvailable, meta)
+				(!isSameStrategyCandidateClass(activeCandidate, bestAvailable, meta) ||
+					compareSessionStrategyCandidates(
+						activeCandidate,
+						bestAvailable,
+						meta,
+					) > 0)
 			) {
 				this.log.info(
 					`Skipping session on account ${activeAccount.name} (candidate: ${activeCandidate.routing.candidateId}) — candidate ${bestAvailable.routing.candidateId} is in a better routing class`,
@@ -366,7 +393,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 								activeCandidate.routing.candidateId &&
 							getCachedAvailability(candidate.account),
 					)
-					.sort((a, b) => compareStrategyCandidates(a, b, meta));
+					.sort((a, b) => compareSessionStrategyCandidates(a, b, meta));
 				return commitStrategyCandidateOrder([activeCandidate, ...others], meta);
 			}
 		}
@@ -378,7 +405,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		const available = candidates
 			.filter((candidate) => getCachedAvailability(candidate.account))
 			.sort((a, b) => {
-				const routingOrder = compareStrategyCandidates(a, b, meta);
+				const routingOrder = compareSessionStrategyCandidates(a, b, meta);
 				if (routingOrder !== 0) return routingOrder;
 				// Treat null as 0: an account with no usage data is assumed fresh
 				// (maximum remaining capacity). This prevents newly-added accounts
@@ -447,7 +474,10 @@ export class SessionStrategy implements LoadBalancingStrategy {
 
 		if (resetAccounts.length === 0) return [];
 
-		// Sort by priority (lower number = higher priority)
-		return resetAccounts.sort((a, b) => compareRoutingMetadata(a, b, meta));
+		// Long probe backoff loses precedence before priority and quota pressure.
+		return resetAccounts.sort((a, b) => {
+			const preference = compareAccountPreference(a, b);
+			return preference !== 0 ? preference : compareRoutingMetadata(a, b, meta);
+		});
 	}
 }

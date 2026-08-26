@@ -462,17 +462,26 @@ function processEvent(
 		);
 		return;
 	}
+
+	// Codex provider emits Anthropic `ping` events as keepalives during
+	// long-running requests.  Forward as an SSE comment so the reverse
+	// proxy's idle timeout does not kill the connection.
+	if (eventType === "ping") {
+		controller.enqueue(encoder.encode(": keepalive\n\n"));
+		return;
+	}
 }
 
 /**
  * Parse and process a single already-delimited SSE frame (the text between
  * two blank-line delimiters, with the delimiters themselves stripped).
  *
- * Only JSON.parse failures are swallowed here (malformed upstream payload):
- * any StreamResourceLimitError raised by processEvent (e.g. a tool-argument
- * or translated-output-total cap trip) is intentionally left to propagate to
- * the caller, which routes it through the terminal error/cancellation path
- * instead of being logged and ignored.
+ * Malformed JSON and ordinary per-frame processing failures are logged and
+ * skipped here, so a bad upstream event cannot abandon later frames already
+ * extracted from the same transport chunk. A StreamResourceLimitError raised by
+ * processEvent (e.g. a tool-argument or translated-output-total cap trip) is
+ * intentionally left to propagate to the caller, which routes it through the
+ * terminal error/cancellation path instead of logging and ignoring it.
  */
 /** The `event:` and `data:` field values of one SSE frame, already trimmed. */
 export interface SseFrameFields {
@@ -565,7 +574,14 @@ function processSseFrame(
 		return;
 	}
 
-	processEvent(eventType, data, controller, state);
+	try {
+		processEvent(eventType, data, controller, state);
+	} catch (error) {
+		if (error instanceof StreamResourceLimitError) {
+			throw error;
+		}
+		log.warn(`Failed to process SSE event ${eventType}: ${String(error)}`);
+	}
 }
 
 export function translateAnthropicStreamToResponses(

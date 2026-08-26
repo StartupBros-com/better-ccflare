@@ -381,6 +381,17 @@ export const useApplyRoutingProposal = () => {
 	return useMutation(getApplyRoutingProposalMutationOptions(queryClient));
 };
 
+export const useRoutingObservations = () => {
+	return useQuery({
+		queryKey: queryKeys.routingObservations(),
+		queryFn: () => api.getRoutingObservations(),
+		staleTime: 20_000,
+		refetchInterval: 60_000,
+		refetchIntervalInBackground: false,
+		gcTime: 5 * 60 * 1_000,
+	});
+};
+
 export const useAgents = () => {
 	return useQuery({
 		queryKey: queryKeys.agents(),
@@ -999,6 +1010,25 @@ export const useSetStrategy = () => {
 		mutationFn: (strategy: string) => api.setStrategy(strategy),
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["strategy"] });
+			queryClient.invalidateQueries({ queryKey: queryKeys.accounts() });
+		},
+	});
+};
+
+export const useModelCapacityRouting = () => {
+	return useQuery({
+		queryKey: ["model-capacity-routing"],
+		queryFn: () => api.getModelCapacityRouting(),
+	});
+};
+
+export const useSetModelCapacityRouting = () => {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (mode: "off" | "exhausted") =>
+			api.setModelCapacityRouting(mode),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ["model-capacity-routing"] });
 			queryClient.invalidateQueries({ queryKey: queryKeys.accounts() });
 		},
 	});

@@ -83,6 +83,7 @@ function seedDb(): Database {
 	db.run(`
 		CREATE TABLE accounts (
 			id TEXT PRIMARY KEY,
+			created_at INTEGER DEFAULT 1,
 			name TEXT,
 			provider TEXT,
 			refresh_token TEXT,

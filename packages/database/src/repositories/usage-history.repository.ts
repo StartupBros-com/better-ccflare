@@ -3,6 +3,7 @@ import type {
 	PredictionPoint,
 	UsageSnapshotRow,
 } from "@better-ccflare/types";
+import { getCleanupBatchSize } from "../adapters/bun-sql-adapter";
 import { BaseRepository } from "./base.repository";
 
 interface SnapshotDbRow {
@@ -11,6 +12,7 @@ interface SnapshotDbRow {
 	window_key: string;
 	utilization: number;
 	resets_at: number | null;
+	active?: number | boolean | string | null;
 }
 
 interface FleetSnapshotDbRow extends SnapshotDbRow {
@@ -98,6 +100,7 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 		accountId: string,
 		windows: CanonicalUsageWindow[],
 		now: number,
+		expectedCreatedAt?: number,
 	): Promise<void> {
 		// Build one value tuple per window, then insert them all in a SINGLE
 		// statement. A multi-row INSERT is atomic (all-or-nothing) on both SQLite
@@ -112,21 +115,42 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 				window.windowKey,
 				window.utilization,
 				window.resetsAtMs,
+				window.active ? 1 : 0,
 			);
 		}
 		if (count === 0) return;
-		const rows = Array.from({ length: count }, () => "(?, ?, ?, ?, ?)").join(
+		const rows = Array.from({ length: count }, () => "(?, ?, ?, ?, ?, ?)").join(
 			", ",
 		);
+		if (expectedCreatedAt === undefined) {
+			await this.run(
+				`INSERT INTO usage_snapshots (account_id, timestamp, window_key, utilization, resets_at, active)
+				 VALUES ${rows}`,
+				params,
+			);
+			return;
+		}
+
+		// A CTE makes the generation guard one statement across SQLite and
+		// PostgreSQL. Either every canonical window is inserted for the exact
+		// account row, or the SELECT produces zero rows after a same-ID replacement.
+		params.push(accountId, expectedCreatedAt);
 		await this.run(
-			`INSERT INTO usage_snapshots (account_id, timestamp, window_key, utilization, resets_at)
-			 VALUES ${rows}`,
+			`WITH snapshot_rows (account_id, timestamp, window_key, utilization, resets_at, active) AS (
+				VALUES ${rows}
+			)
+			INSERT INTO usage_snapshots (account_id, timestamp, window_key, utilization, resets_at, active)
+			SELECT account_id, timestamp, window_key, utilization, resets_at, active
+			FROM snapshot_rows
+			WHERE EXISTS (
+				SELECT 1 FROM accounts WHERE id = ? AND created_at = ?
+			)`,
 			params,
 		);
 	}
 
 	async getSeries(opts: GetSeriesOptions): Promise<UsageSnapshotRow[]> {
-		const clauses = ["account_id = ?"];
+		const clauses = ["account_id = ?", "COALESCE(active, 1) = 1"];
 		const whereParams: unknown[] = [opts.accountId];
 		if (opts.windowKey) {
 			clauses.push("window_key = ?");
@@ -169,7 +193,7 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 					`SELECT account_id, timestamp, window_key, utilization, resets_at
 					 FROM usage_snapshots
 					 WHERE ${clauses.join(" AND ")}
-					 ORDER BY timestamp ASC`,
+					 ORDER BY timestamp ASC, append_order ASC`,
 					whereParams,
 				);
 		return rows.map((r) => ({
@@ -209,7 +233,7 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 			`SELECT account_id, timestamp, window_key, utilization, resets_at
 			 FROM usage_snapshots
 			 WHERE account_id = ? AND window_key = ? AND timestamp >= ?
-			 ORDER BY timestamp ASC`,
+			 ORDER BY timestamp ASC, append_order ASC`,
 			[accountId, windowKey, sinceMs],
 		);
 		return rows.map((r) => ({
@@ -263,7 +287,7 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 		const bytewiseCollationSql = this.adapter.isSQLite
 			? "COLLATE BINARY"
 			: 'COLLATE "C"';
-		const filterClauses: string[] = [];
+		const filterClauses = ["COALESCE(snapshots.active, 1) = 1"];
 		const requestedWindowPlaceholder = requestedWindow
 			? bindParam(requestedWindow)
 			: null;
@@ -398,7 +422,8 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 				${filteredWhere}
 				ORDER BY snapshots.account_id ${bytewiseCollationSql} ASC,
 				         snapshots.window_key ${bytewiseCollationSql} ASC,
-				         snapshots.timestamp ASC`;
+				         snapshots.timestamp ASC,
+				         snapshots.append_order ASC`;
 		const dbRows = await this.query<FleetSnapshotDbRow>(fleetSql, params);
 		const rows = dbRows.map((r) => ({
 			accountId: r.account_id,
@@ -422,37 +447,63 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 		};
 	}
 
+	/**
+	 * Most recent snapshot for one window of one account, or null when the
+	 * account has never recorded that window. getSeries is ORDER BY timestamp
+	 * ASC (the chart and the regression both need it that way), so reading "the
+	 * latest value" through it would mean fetching the whole series just to take
+	 * the tail. Used as the durable fallback for providers whose usage only
+	 * arrives piggybacked on real traffic — Codex has no polling endpoint, so
+	 * after a restart this table is the only place its weekly percentage
+	 * survives (see getCachedOrPersistedCodexUsage in the accounts handler).
+	 */
+	async getLatestSnapshot(
+		accountId: string,
+		windowKey: string,
+	): Promise<UsageSnapshotRow | null> {
+		const rows = await this.query<SnapshotDbRow>(
+			`SELECT account_id, timestamp, window_key, utilization, resets_at, active
+			 FROM usage_snapshots
+			 WHERE account_id = ? AND window_key = ?
+			 ORDER BY timestamp DESC, append_order DESC
+			 LIMIT 1`,
+			[accountId, windowKey],
+		);
+		const row = rows[0];
+		if (!row || (row.active != null && Number(row.active) === 0)) return null;
+		return {
+			accountId: row.account_id,
+			timestamp: Number(row.timestamp),
+			windowKey: row.window_key,
+			utilization: Number(row.utilization),
+			resetsAt: row.resets_at == null ? null : Number(row.resets_at),
+		};
+	}
+
 	async deleteOlderThan(cutoffTs: number): Promise<number> {
 		// Batched like RequestRepository.deleteOlderThan/deletePayloadsOlderThan —
 		// an unbounded DELETE here can exceed the PG statement_timeout once the
 		// table is large, which previously caused retention cleanup to fail
 		// forever and let usage_snapshots grow unbounded (#384).
 		//
-		// usage_snapshots has no surrogate key column (append-only time series —
-		// see the CREATE TABLE comment in migrations.ts), and its natural key
-		// (account_id, timestamp, window_key) isn't declared unique. Selecting
-		// on the natural key with LIMIT only bounds the number of *distinct
-		// keys*, not physical rows: if duplicate keys exist, the outer DELETE
-		// removes every row matching each selected key, so a nominal 2000-row
-		// batch could still expand into an unbounded single-statement DELETE —
-		// exactly the PG statement_timeout failure this batching exists to
-		// avoid. Use each row's physical identity instead — SQLite's implicit
-		// `rowid` and PostgreSQL's system `ctid` column — so LIMIT always caps
-		// physical rows deleted per statement, independent of key duplicates.
-		// idx_usage_snapshots_ts (on timestamp alone) makes the inner SELECT
-		// efficient on both dialects.
-		const BATCH_SIZE = 2000;
-		const physicalIdSql = this.adapter.isSQLite
-			? `DELETE FROM usage_snapshots WHERE rowid IN (
-					SELECT rowid FROM usage_snapshots WHERE timestamp < ? LIMIT ?
-				)`
-			: `DELETE FROM usage_snapshots WHERE ctid IN (
-					SELECT ctid FROM usage_snapshots WHERE timestamp < ? LIMIT ?
-				)`;
+		// usage_snapshots' natural key (account_id, timestamp, window_key) isn't
+		// unique. Selecting that key with LIMIT would bound distinct values, not
+		// rows: duplicates could make one nominal batch delete unbounded rows.
+		// append_order is the durable database-generated surrogate key shared by
+		// SQLite and PostgreSQL, so it bounds the physical delete without relying
+		// on SQLite rowid or PostgreSQL ctid storage locations. The timestamp index
+		// makes the inner selection efficient on both dialects.
+		// Batch size is configurable via BETTER_CCFLARE_DB_CLEANUP_BATCH_SIZE
+		// (default 200) — lower it if rows are large and batches are timing
+		// out against statement_timeout (#412).
+		const BATCH_SIZE = getCleanupBatchSize();
+		const appendOrderSql = `DELETE FROM usage_snapshots WHERE append_order IN (
+			SELECT append_order FROM usage_snapshots WHERE timestamp < ? LIMIT ?
+		)`;
 		let total = 0;
 		let deleted: number;
 		do {
-			deleted = await this.runWithChanges(physicalIdSql, [
+			deleted = await this.runWithChanges(appendOrderSql, [
 				cutoffTs,
 				BATCH_SIZE,
 			]);

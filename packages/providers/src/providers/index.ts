@@ -20,6 +20,7 @@ export {
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV,
 	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
+	CODEX_PING_MODEL,
 	CODEX_PROMPT_CACHE_KEY_ENV,
 	CODEX_TURN_STATE_HEADER,
 	CODEX_VERSION,
@@ -48,23 +49,24 @@ export {
 	resolveCodexRequestModel,
 	suppressCodexExplicitCacheBreakpoint,
 } from "./codex/index";
+export { DeepseekProvider } from "./deepseek/index";
 export { KiloProvider } from "./kilo/index";
-export { MinimaxProvider } from "./minimax/index";
 export {
 	effortForThinkingBudget,
-	isMuseSparkMessagesPath,
-	isMuseSparkModel,
-	MUSE_SPARK_CONTEXT_WINDOW,
-	MUSE_SPARK_DEFAULT_ENDPOINT,
-	MUSE_SPARK_DEFAULT_MODEL,
-	MUSE_SPARK_MAX_OUTPUT_TOKENS,
-	MUSE_SPARK_MIN_THINKING_BUDGET_TOKENS,
-	MUSE_SPARK_MODEL_IDS,
-	MUSE_SPARK_MODEL_MAPPINGS,
-	MuseSparkProvider,
-	type MuseSparkSanitizeResult,
-	sanitizeMuseSparkRequestBody,
-} from "./muse-spark/index";
+	isMetaMessagesPath,
+	isMetaModel,
+	META_CONTEXT_WINDOW,
+	META_DEFAULT_ENDPOINT,
+	META_DEFAULT_MODEL,
+	META_MAX_OUTPUT_TOKENS,
+	META_MIN_THINKING_BUDGET_TOKENS,
+	META_MODEL_IDS,
+	META_MODEL_MAPPINGS,
+	MetaProvider,
+	type MetaSanitizeResult,
+	sanitizeMetaRequestBody,
+} from "./meta/index";
+export { MinimaxProvider } from "./minimax/index";
 export { NanoGPTProvider } from "./nanogpt/index";
 export { OllamaCloudProvider, OllamaProvider } from "./ollama/index";
 export { OpenAICompatibleProvider } from "./openai/index";

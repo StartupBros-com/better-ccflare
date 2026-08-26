@@ -27,11 +27,11 @@ export function teeStream(
 	let truncated = false;
 	let terminalState: "active" | "closed" | "errored" | "cancelled" = "active";
 
-	const runTerminalCallback = (callback: () => void): void => {
+	const runCollectorCallback = (callback: () => void): void => {
 		try {
 			callback();
 		} catch {
-			// Analytics callbacks must not change or block stream termination.
+			// Collector callbacks must not change the client stream lifecycle.
 		}
 	};
 
@@ -43,8 +43,9 @@ export function teeStream(
 
 				if (done) {
 					terminalState = "closed";
-					runTerminalCallback(() => onClose?.(buffered));
+					runCollectorCallback(() => onClose?.(buffered));
 					controller.close();
+					reader.releaseLock();
 					return;
 				}
 
@@ -66,19 +67,20 @@ export function teeStream(
 				}
 
 				// Notify chunk handler
-				onChunk?.(value);
+				runCollectorCallback(() => onChunk?.(value));
 			} catch (error) {
 				if (terminalState !== "active") return;
 				terminalState = "errored";
-				runTerminalCallback(() => onError?.(error as Error));
+				runCollectorCallback(() => onError?.(error as Error));
 				controller.error(error);
+				reader.releaseLock();
 			}
 		},
 
-		cancel(reason) {
+		async cancel(reason) {
 			if (terminalState !== "active") return;
 			terminalState = "cancelled";
-			runTerminalCallback(() => onCancel?.(reason));
+			runCollectorCallback(() => onCancel?.(reason));
 			// FORK DIVERGENCE from upstream 50ec29ba8d (which drains to `done`
 			// here instead of cancelling): in this fork, teeStream wraps the
 			// semantic-liveness / terminal-recovery stream chain, not the raw
@@ -95,7 +97,13 @@ export function teeStream(
 			// One piece of upstream's change IS adopted: teardown must not
 			// throw, so a rejection from cancelling an already-errored inner
 			// stream is swallowed rather than propagated.
-			return reader.cancel(reason).catch(() => {});
+			try {
+				await reader.cancel(reason);
+			} catch {
+				// Cancellation failure must not surface to the client.
+			} finally {
+				reader.releaseLock();
+			}
 		},
 	});
 }

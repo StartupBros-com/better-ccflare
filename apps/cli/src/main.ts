@@ -40,6 +40,7 @@ import {
 import { Config } from "@better-ccflare/config";
 import {
 	CLAUDE_MODEL_IDS,
+	getGitSha,
 	getVersionSync,
 	installOutboundProxy,
 	isFamilyAliasModel,
@@ -67,6 +68,7 @@ export const ACCOUNT_MODES = [
 	"console",
 	"zai",
 	"minimax",
+	"deepseek",
 	"nanogpt",
 	"anthropic-compatible",
 	"openai-compatible",
@@ -76,7 +78,7 @@ export const ACCOUNT_MODES = [
 	"codex",
 	"xai",
 	"ollama",
-	"muse-spark",
+	"meta",
 ] as const;
 
 type AccountMode = (typeof ACCOUNT_MODES)[number];
@@ -92,6 +94,7 @@ const ACCOUNT_MODE_DESCRIPTIONS: Record<AccountMode, string> = {
 	console: "Claude API account (OAuth)",
 	zai: "z.ai account (API key)",
 	minimax: "Minimax account (API key)",
+	deepseek: "DeepSeek account (API key)",
 	nanogpt: "NanoGPT provider (API key)",
 	"anthropic-compatible": "Anthropic-compatible provider (API key)",
 	"openai-compatible": "OpenAI-compatible provider (API key)",
@@ -101,7 +104,7 @@ const ACCOUNT_MODE_DESCRIPTIONS: Record<AccountMode, string> = {
 	codex: "Codex (OpenAI OAuth) provider",
 	xai: "xAI/Grok provider (imports local Grok CLI OAuth credentials)",
 	ollama: "Ollama local provider (no API key required)",
-	"muse-spark": "Muse Spark provider (API key)",
+	meta: "Meta Model API provider (API key)",
 };
 
 /**
@@ -724,7 +727,6 @@ function parseArgs(args: string[]): ParsedArgs {
 					modeValue = "claude-oauth";
 				}
 
-				parsed.mode = modeValue as AccountMode;
 				if (!ACCOUNT_MODES.includes(modeValue)) {
 					console.error(`❌ Invalid mode: ${modeValue}`);
 					console.error(`Valid modes: ${ACCOUNT_MODES.join(", ")}`);
@@ -760,6 +762,7 @@ function parseArgs(args: string[]): ParsedArgs {
 
 					fastExit(1);
 				}
+				parsed.mode = modeValue as AccountMode;
 				break;
 			}
 			case "--priority":
@@ -1073,6 +1076,19 @@ export async function resolveFamilyPolicyAliases(
 
 async function main() {
 	const args = process.argv.slice(2);
+	// Used by Docker release verification; emit no decoration or fallback value
+	// before parsing commands or initializing any application services.
+	if (args.includes("--git-sha")) {
+		const gitSha = getGitSha();
+		if (!gitSha) {
+			console.error("Git SHA is unavailable in this binary");
+			fastExit(1);
+			return;
+		}
+		console.log(gitSha);
+		fastExit(0);
+		return;
+	}
 	const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
 	let routingCommand: ManagedRoutingCliCommand | null;
 	try {

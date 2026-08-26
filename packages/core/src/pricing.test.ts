@@ -524,6 +524,29 @@ describe("getModelRates", () => {
 		});
 	});
 
+	it("returns peak DeepSeek fallback rates including cache reads", async () => {
+		expect(await getModelRates("deepseek-v4-flash")).toEqual({
+			input: 0.44,
+			output: 1.32,
+			cacheRead: 0.014,
+			cacheWrite: null,
+		});
+		expect(await getModelRates("deepseek-v4-pro")).toEqual({
+			input: 1.32,
+			output: 3.96,
+			cacheRead: 0.044,
+			cacheWrite: null,
+		});
+	});
+
+	it("charges DeepSeek cache-read tokens at the peak fallback rate", async () => {
+		const cost = await estimateCostUSD("deepseek-v4-flash", {
+			cacheReadInputTokens: 1_000_000,
+		});
+
+		expect(cost).toBeCloseTo(0.014, 10);
+	});
+
 	it("should return null for an unknown model without throwing", async () => {
 		const rates = await getModelRates("totally-unknown-model-xyz");
 

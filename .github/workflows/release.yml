@@ -71,6 +71,8 @@ jobs:
         run: bun run build:dashboard
 
       - name: Build non-Windows architectures
+        env:
+          CCFLARE_BUILD_PRODUCER: ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'github-release-binary' || '' }}
         run: |
           cd apps/cli
           CCFLARE_SKIP_PLATFORMS=bun-windows-x64 bun run build:multi

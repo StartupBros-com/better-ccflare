@@ -130,6 +130,29 @@ describe("AccountRepository — compare-and-set token/requires_reauth writes (ro
 			expect(row.refresh_token).toBe("rt-original");
 			expect(row.requires_reauth).toBe(0);
 		});
+
+		it("returns false when a same-token account ID was replaced with a newer generation", async () => {
+			await repository.setRequiresReauth("account-1", true);
+			db.run("UPDATE accounts SET created_at = ? WHERE id = ?", [
+				2,
+				"account-1",
+			]);
+
+			const result = await repository.updateTokensIfRefreshTokenMatches(
+				"account-1",
+				"rt-original",
+				"at-stale",
+				999,
+				"rt-stale",
+				1,
+			);
+
+			expect(result).toBe(false);
+			const row = getRaw("account-1");
+			expect(row.access_token).toBe("at-old");
+			expect(row.refresh_token).toBe("rt-original");
+			expect(row.requires_reauth).toBe(1);
+		});
 	});
 
 	describe("updateTokensIfRefreshTokenAbsent", () => {
@@ -246,6 +269,32 @@ describe("AccountRepository — compare-and-set token/requires_reauth writes (ro
 
 			expect(result).toBe(false);
 		});
+
+		it("returns false when a blank-token account ID was replaced with a newer generation", async () => {
+			db.run(
+				`INSERT INTO accounts (id, name, provider, refresh_token, access_token, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				[
+					"account-replaced-blank",
+					"Replacement",
+					"anthropic",
+					null,
+					"at-new",
+					2,
+					2,
+				],
+			);
+
+			const result = await repository.updateTokensIfRefreshTokenAbsent(
+				"account-replaced-blank",
+				"at-stale",
+				999,
+				"rt-stale",
+				1,
+			);
+
+			expect(result).toBe(false);
+			expect(getRaw("account-replaced-blank").access_token).toBe("at-new");
+		});
 	});
 
 	describe("flagRequiresReauthIfTokenMatches", () => {
@@ -273,6 +322,40 @@ describe("AccountRepository — compare-and-set token/requires_reauth writes (ro
 			const result = await repository.flagRequiresReauthIfTokenMatches(
 				"missing-account",
 				"rt-original",
+			);
+
+			expect(result).toBe(false);
+		});
+
+		it("does not flag a same-token account ID that belongs to a newer generation", async () => {
+			db.run("UPDATE accounts SET created_at = ? WHERE id = ?", [
+				2,
+				"account-1",
+			]);
+
+			const result = await repository.flagRequiresReauthIfTokenMatches(
+				"account-1",
+				"rt-original",
+				1,
+			);
+
+			expect(result).toBe(false);
+			expect(getRaw("account-1").requires_reauth).toBe(0);
+		});
+	});
+
+	describe("pauseIfActive", () => {
+		it("does not pause a same-token account ID that belongs to a newer generation", async () => {
+			db.run("UPDATE accounts SET created_at = ? WHERE id = ?", [
+				2,
+				"account-1",
+			]);
+
+			const result = await repository.pauseIfActive(
+				"account-1",
+				"oauth_invalid_grant",
+				"rt-original",
+				1,
 			);
 
 			expect(result).toBe(false);

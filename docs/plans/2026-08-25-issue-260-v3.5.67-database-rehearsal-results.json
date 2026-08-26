@@ -1,0 +1,220 @@
+{
+  "schemaVersion": 3,
+  "status": "passed",
+  "issue": 260,
+  "target": {
+    "tag": "v3.5.67",
+    "tagObject": "5e85a203f3c4766cfa408231c92d7a423fb90d4b",
+    "peeledCommit": "ebc904903dc828338cd2d5da707b0d3dd2d0922f",
+    "directMergeParent": "94cfc55bcdcce59fc94f4a85f1ac5b131486bc1a"
+  },
+  "manifest": "docs/plans/2026-08-24-issue-260-v3.5.67-database-acceptance.json",
+  "run": {
+    "startedAt": "2026-08-26T02:31:02.617Z",
+    "completedAt": "2026-08-26T02:31:06.261Z",
+    "executor": "temporary job-local TypeScript; not committed",
+    "entrypoint": "runGuardedRehearsal({ execute: true })",
+    "executorChecksPassed": 103,
+    "executorChecksFailed": 0
+  },
+  "environment": {
+    "postgresImage": "postgres:16",
+    "postgresContainer": "ccflare-u6-v3568-pg",
+    "postgresBinding": "127.0.0.1:55467",
+    "disposableOnly": true,
+    "productionAccessed": false,
+    "providerTrafficSent": false,
+    "credentialStoreRead": false
+  },
+  "targets": {
+    "sqlite": {
+      "source": "/home/will/.claude/jobs/74bb8f87/tmp/ccflare-u6-test-20260825b-source.sqlite",
+      "candidate": "/home/will/.claude/jobs/74bb8f87/tmp/ccflare-u6-test-20260825b-candidate.sqlite",
+      "generatedChild": "/home/will/.claude/jobs/74bb8f87/tmp/ccflare-u6-test-20260825b-candidate-child.sqlite",
+      "rollback": "/home/will/.claude/jobs/74bb8f87/tmp/ccflare-u6-test-20260825b-rollback.sqlite"
+    },
+    "postgres": {
+      "source": "postgresql://***:***@localhost:55467/ccflare_u6_source_test_b",
+      "candidate": "postgresql://***:***@127.0.0.1:55467/ccflare_u6_candidate_test_b",
+      "generatedChild": "postgresql://***:***@localhost:55467/ccflare_u6_candidate_test_b_child",
+      "rollback": "postgresql://***:***@127.0.0.1:55467/ccflare_u6_rollback_test_b"
+    }
+  },
+  "guard": {
+    "identitiesValidatedBeforeConnection": true,
+    "destructiveTargetsAbsentBeforeExecution": true,
+    "sourceFixturesCreatedThenDowngradedToLegacySnapshotShape": true,
+    "candidatesCreatedOnlyFromImmutableBackupOrDump": true,
+    "sourceFingerprintsRecheckedAfterCandidateMigration": true,
+    "rollbackRestoredToDistinctTargets": true,
+    "reverseSchemaOrProviderMigrationAttempted": false
+  },
+  "fixture": {
+    "sanitized": true,
+    "accounts": {
+      "canonicalMeta": 1,
+      "legacyMuseSparkAliases": 2,
+      "logicalCollision": true
+    },
+    "comboSlotsBeforeCollapse": 5,
+    "usageSnapshotsLegacyRows": 2,
+    "usageWindows": {
+      "rowsBeforeCollapse": 4,
+      "rowsAfterCollapse": 3,
+      "activeModelScoped": 1,
+      "inactiveAccountWideHistorical": 1,
+      "collidingPair": 1,
+      "survivorOwnedKeeper": "window-collision-survivor",
+      "discardedDuplicate": "window-collision-discarded"
+    },
+    "dependentReferences": [
+      "combo_slots.account_id",
+      "requests.account_used",
+      "usage_snapshots.account_id",
+      "usage_windows.account_id",
+      "combo_membership_exclusions.account_id",
+      "device_setup_jobs.account_id"
+    ]
+  },
+  "acceptance": {
+    "schema": {
+      "sqliteFreshAndUpgrade": true,
+      "postgresFreshAndUpgrade": true,
+      "sqliteAppendOrder": "INTEGER PRIMARY KEY AUTOINCREMENT",
+      "postgresAppendOrder": "BIGINT NOT NULL DEFAULT nextval('usage_snapshots_append_order_seq')",
+      "postgresAppendOrderUniqueIndex": true,
+      "activeNotNullDefaultOne": true,
+      "durableTimestampAppendOrderIndex": true
+    },
+    "aliasCollapse": {
+      "oneCanonicalMetaAccount": true,
+      "deterministicLogicalIdTieBreaks": true,
+      "aggregateAndRestrictiveStatePreserved": true,
+      "collidingComboSlotsMergedBeforeRepoint": true,
+      "collidingUsageWindowsMergedBeforeRepoint": true,
+      "usageWindowKeeperIsSurvivorOwned": true,
+      "usageWindowEarliestStartPreserved": true,
+      "usageWindowPeakAndEarliestFirst100Preserved": true,
+      "usageWindowSettledFieldsCopiedFromOneClosedSource": true,
+      "allOperationalDependentsRepointed": true
+    },
+    "repository": {
+      "newestInactiveReturnsNull": true,
+      "activeSeriesOmitsInactiveRows": true,
+      "rawHistoryRetainsInactiveRows": true,
+      "sameTimestampLaterInactiveAppendWins": true,
+      "sameTimestampHistoricalReadsUseAppendOrder": true,
+      "retentionUsesDurableAppendOrder": true,
+      "eligibleRowsDeletedPerDialect": 2,
+      "managedRulesRoundTripped": 1,
+      "managedExclusionsRoundTripped": 1,
+      "managedSlotsRoundTripped": 2,
+      "routingRevisionBeforeMutation": 25,
+      "routingRevisionAfterMutation": 26
+    },
+    "idempotenceAndRollback": {
+      "sqliteSecondMigrationMatchesFirst": true,
+      "postgresSecondMigrationMatchesFirst": true,
+      "sqliteSourceUnchanged": true,
+      "postgresSourceUnchanged": true,
+      "sqliteRollbackMatchesLegacySource": true,
+      "postgresRollbackMatchesLegacySource": true
+    }
+  },
+  "artifacts": {
+    "rawResult": {
+      "bytes": 18007,
+      "sha256": "389ac02193fef7c78a6120e566aa084c4fce1df70669a4a7965cec9d37de3940"
+    },
+    "sqliteBackup": {
+      "bytes": 495616,
+      "sha256": "5fc53f22d0b29933a85cb0900426e6ec1a5b8801742d4256af4ddebd38250a7c"
+    },
+    "postgresDump": {
+      "format": "custom",
+      "bytes": 67301,
+      "sha256": "8765dbbfc60c208cd3035cf0ecff67b3b4a49f82c256d64d64badf21e6e8b3a8"
+    }
+  },
+  "fingerprints": {
+    "sqlite": {
+      "sourceLogical": "3ed8b39c923008ab5db94d5a5d0abe1c3a8c0a6519db88bd4ffae579587fca18",
+      "candidateAfterFirstMigration": "ad512d9da9aa394c669d21ccf83df62e3133c79a63249002ac299ed00fdfa54d",
+      "candidateAfterSecondMigration": "ad512d9da9aa394c669d21ccf83df62e3133c79a63249002ac299ed00fdfa54d",
+      "generatedChild": "dcdbf99de2cf3fbcaae671f37ab1fdddef4c9942c66853d1967f7b28598e6761",
+      "rollbackLogical": "3ed8b39c923008ab5db94d5a5d0abe1c3a8c0a6519db88bd4ffae579587fca18"
+    },
+    "postgres": {
+      "sourceLogical": "143e9a2cd2e7c3091321ee5d1ae16c42727a64cb1a0a643808a3d96535d8860d",
+      "candidateAfterFirstMigration": "626b98df629f4f94e601a0c0864195d183867bacbffc8ffe02220fef67255d47",
+      "candidateAfterSecondMigration": "626b98df629f4f94e601a0c0864195d183867bacbffc8ffe02220fef67255d47",
+      "generatedChild": "959b80b2863989899143ce58f9abbef0535b15ca4ed253e1768eb3d3f43cf25e",
+      "rollbackLogical": "143e9a2cd2e7c3091321ee5d1ae16c42727a64cb1a0a643808a3d96535d8860d"
+    }
+  },
+  "verification": {
+    "isolatedDatabasePacket": {
+      "files": 7,
+      "testsPassed": 133,
+      "testsFailed": 0,
+      "assertions": 589,
+      "requiredLivePostgresMigrationsExecuted": true
+    },
+    "livePostgresIntegrations": {
+      "files": 3,
+      "testsPassed": 71,
+      "testsFailed": 0,
+      "assertions": 337
+    },
+    "authoritativeTotal": {
+      "testsPassed": 204,
+      "testsFailed": 0,
+      "assertions": 926
+    },
+    "commands": [
+      "bun test <each of seven database acceptance files in its own process>",
+      "CCFLARE_REQUIRE_LIVE_PG_MIGRATIONS=true DATABASE_URL=<redacted loopback test URL> bun test packages/database/src/migrations-pg.test.ts",
+      "BETTER_CCFLARE_TEST_POSTGRES_URL=<redacted loopback test URL> bun test packages/database/src/__tests__/managed-routing-postgres.integration.test.ts",
+      "BETTER_CCFLARE_TEST_POSTGRES_URL=<redacted loopback test URL> bun test packages/database/src/repositories/__tests__/server-tool-replay-issuance.repository.test.ts",
+      "BETTER_CCFLARE_TEST_POSTGRES_URL=<redacted loopback test URL> bun test packages/http-api/src/__tests__/pg-live-queries.test.ts"
+    ]
+  },
+  "defectsDiscoveredAndFixed": [
+    {
+      "paths": [
+        "packages/database/src/migrations.ts",
+        "packages/database/src/migrations-pg.ts"
+      ],
+      "failure": "Alias collapse deleted muse-spark account rows without repointing usage_windows.account_id; a blind repoint would also violate the unique logical window anchor when aliases owned the same window.",
+      "fix": "Merge colliding logical windows deterministically before repointing remaining rows in both SQLite and PostgreSQL, preserving a survivor-owned keeper, earliest start, maximum utilization, earliest first-100 observation, and one internally consistent settled source.",
+      "redEvidence": "SQLite 20 pass/1 fail; live PostgreSQL 16 pass/1 fail",
+      "greenEvidence": "SQLite 21 pass/0 fail; live PostgreSQL 17 pass/0 fail"
+    },
+    {
+      "path": "packages/database/src/repositories/usage-history.repository.ts",
+      "failure": "Historical sequence reads ordered only by timestamp, so equal-timestamp rows could be returned in reverse append order after storage-layout changes.",
+      "fix": "Use append_order ASC as the shared tie-break for unbucketed getSeries, getRawSnapshots, and fleet history.",
+      "redEvidence": "usage-history repository 27 pass/1 fail after VACUUM",
+      "greenEvidence": "usage-history repository 28 pass/0 fail, 71 assertions"
+    }
+  ],
+  "executorCorrections": [
+    "Await the SQLite source fingerprint before closing its database.",
+    "Avoid a catalog function/variable temporal-dead-zone collision.",
+    "Use assignment.membership_mode, matching the repository row contract.",
+    "Validate PostgreSQL's exact column set rather than requiring fresh and ALTER-upgraded tables to share physical ordinal order.",
+    "Normalize both actual and expected JSON before fingerprint comparisons."
+  ],
+  "backupSemantics": {
+    "productionSQLiteMigration": "best-effort backup; a backup failure is warned and migration proceeds",
+    "rehearsal": "externally backup-protected; the immutable source copy is created and hash-verified before candidate mutation",
+    "claim": "This evidence does not describe the production migration as backup-gated."
+  },
+  "limitations": [
+    "A combined seven-file Bun process produced 131 pass and two shared-:memory: contamination failures; all seven files passed in isolated processes, matching CI execution and the documented repository test-isolation contract.",
+    "The executor validates sanitized migration, catalog, repository, retention, and restore behavior, not production data volume or operational timing.",
+    "No provider traffic was sent; in particular, no scripted request reached an Anthropic-backed account.",
+    "No production database, credential store, service, deployment, release, tag, or package publication was accessed or mutated.",
+    "Failed-run disposable SQLite files and PostgreSQL databases remain because the database-drop cleanup command was guard-blocked; the passing run used fresh b-suffixed targets."
+  ]
+}

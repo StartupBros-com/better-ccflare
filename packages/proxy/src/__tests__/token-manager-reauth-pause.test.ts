@@ -136,6 +136,7 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 			account.id,
 			"oauth_invalid_grant",
 			"rt-upstream",
+			account.created_at,
 		);
 	});
 
@@ -155,6 +156,7 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 			account.id,
 			"auth_failure",
 			undefined,
+			account.created_at,
 		);
 	});
 
@@ -181,6 +183,7 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 			account.id,
 			"auth_failure",
 			null,
+			account.created_at,
 		);
 	});
 
@@ -198,6 +201,7 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 			account.id,
 			"oauth_invalid_grant",
 			" rt-with-padding ",
+			account.created_at,
 		);
 	});
 
@@ -219,6 +223,7 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 			account.id,
 			"oauth_invalid_grant",
 			"rt-rejected",
+			account.created_at,
 		);
 	});
 
@@ -501,12 +506,14 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 });
 
 describe("refreshAccessTokenSafe — pause-for-reauth at the chokepoint", () => {
-	function makeCtx(pauseResult = true) {
+	function makeCtx(account: Account, pauseResult = true) {
 		const pauseAccountIfActive = mock(async () => pauseResult);
 		const ctx = {
 			dbOps: {
 				pauseAccountIfActive,
-				getAccount: mock(async () => null),
+				getAccount: mock(async (accountId: string) =>
+					accountId === account.id ? account : null,
+				),
 				updateAccountTokens: mock(async () => {}),
 			},
 			asyncWriter: { enqueue: (fn: () => unknown) => fn() },
@@ -527,7 +534,7 @@ describe("refreshAccessTokenSafe — pause-for-reauth at the chokepoint", () => 
 		} as never);
 
 		const account = makeAccount();
-		const { ctx, pauseAccountIfActive } = makeCtx(true);
+		const { ctx, pauseAccountIfActive } = makeCtx(account, true);
 
 		await expect(
 			refreshAccessTokenSafe(account, ctx as never),
@@ -555,7 +562,7 @@ describe("refreshAccessTokenSafe — pause-for-reauth at the chokepoint", () => 
 			provider: "test-reauth-provider-expired",
 			refresh_token_issued_at: Date.now() - 366 * 24 * 60 * 60 * 1000,
 		});
-		const { ctx, pauseAccountIfActive } = makeCtx(true);
+		const { ctx, pauseAccountIfActive } = makeCtx(account, true);
 		let thrown: unknown;
 		try {
 			await refreshAccessTokenSafe(account, ctx as never);
@@ -569,11 +576,12 @@ describe("refreshAccessTokenSafe — pause-for-reauth at the chokepoint", () => 
 			account.id,
 			"oauth_invalid_grant",
 			"rt-original",
+			account.created_at,
 		);
 		clearAccountRefreshCache(account.id);
 	});
 
-	it("captures the refresh token before a concurrent reauth mutates the account", async () => {
+	it("does not quarantine after concurrent reauth replaces the refresh token", async () => {
 		const providerName = "test-reauth-token-snapshot-provider";
 		registerProvider({
 			name: providerName,
@@ -587,16 +595,16 @@ describe("refreshAccessTokenSafe — pause-for-reauth at the chokepoint", () => 
 		} as never);
 
 		const account = makeAccount({ provider: providerName });
-		const { ctx, pauseAccountIfActive } = makeCtx(true);
+		const { ctx, pauseAccountIfActive } = makeCtx(account, true);
 		await expect(
 			refreshAccessTokenSafe(account, ctx as never),
 		).rejects.toThrow();
 
-		expect(pauseAccountIfActive).toHaveBeenCalledWith(
-			account.id,
-			"oauth_invalid_grant",
-			"rt-original",
-		);
+		// The provider received the original credential, but a successful reauth
+		// replaced it before that failure completed. The old token must not
+		// quarantine the new credential generation.
+		expect(account.refresh_token).toBe("rt-new-after-reauth");
+		expect(pauseAccountIfActive).not.toHaveBeenCalled();
 		clearAccountRefreshCache(account.id);
 	});
 
@@ -610,7 +618,7 @@ describe("refreshAccessTokenSafe — pause-for-reauth at the chokepoint", () => 
 		} as never);
 
 		const account = makeAccount({ id: "acc-transient" });
-		const { ctx, pauseAccountIfActive } = makeCtx(true);
+		const { ctx, pauseAccountIfActive } = makeCtx(account, true);
 
 		await expect(
 			refreshAccessTokenSafe(account, ctx as never),
@@ -638,7 +646,7 @@ describe("refreshAccessTokenSafe — pause-for-reauth at the chokepoint", () => 
 			id: "acc-prose",
 			provider: "test-reauth-provider-prose",
 		});
-		const { ctx, pauseAccountIfActive } = makeCtx(true);
+		const { ctx, pauseAccountIfActive } = makeCtx(account, true);
 		await expect(
 			refreshAccessTokenSafe(account, ctx as never),
 		).rejects.toThrow();

@@ -17,7 +17,8 @@ export type AccountSetupMode =
 	| "console"
 	| "zai"
 	| "minimax"
-	| "muse-spark"
+	| "deepseek"
+	| "meta"
 	| "anthropic-compatible"
 	| "openai-compatible"
 	| "nanogpt"
@@ -50,11 +51,8 @@ const ACCOUNT_SETUP_ROUTING_METADATA = {
 	},
 	zai: { provider: "zai", routeClass: "api-key", billingType: "api" },
 	minimax: { provider: "minimax", routeClass: "api-key", billingType: "api" },
-	"muse-spark": {
-		provider: "muse-spark",
-		routeClass: "api-key",
-		billingType: "api",
-	},
+	deepseek: { provider: "deepseek", routeClass: "api-key", billingType: "api" },
+	meta: { provider: "meta", routeClass: "api-key", billingType: "api" },
 	"anthropic-compatible": {
 		provider: "anthropic-compatible",
 		routeClass: "api-key",

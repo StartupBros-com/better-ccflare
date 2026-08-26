@@ -22,6 +22,11 @@
 - **Z.ai** - Claude proxy service with API key authentication:
   - Lite, Pro, and Max plans with higher rate limits than direct Claude API
   - Uses API key authentication (no OAuth support)
+- **DeepSeek** - Native Anthropic-compatible API via `api.deepseek.com`:
+  - Claude request model IDs pass through for DeepSeek's server-side family remapping
+  - `deepseek-v4-flash` is a response usage/cost-attribution fallback when DeepSeek omits the response model; it does not rewrite outbound request model
+  - Uses API key authentication (`x-api-key` header, no OAuth support)
+  - Built on the same `BaseAnthropicCompatibleProvider` base as Minimax
 - **Anthropic-Compatible** - Generic provider for Anthropic-compatible APIs:
   - Supports custom endpoints
   - API key authentication only
@@ -40,7 +45,8 @@
   - Bearer token authentication via API key
   - Converts Anthropic-format requests to Ollama native `/api/chat` format
   - Converts NDJSON streaming responses back to Anthropic SSE
-- **Muse Spark** - Meta Model API at `https://api.meta.ai`:
+- **Meta** (`meta`) - Meta Model API at `https://api.meta.ai`:
+  - `meta` is the canonical provider identifier; legacy `muse-spark` is accepted only for server-side HTTP ingress compatibility
   - Anthropic-compatible Messages endpoint (`/v1/messages`, `/v1/messages/count_tokens`)
   - Models `muse-spark-1.2` (default), `muse-spark-1.1`, `muse-spark-1.2-contributor`
   - Bearer token authentication via API key
@@ -53,7 +59,7 @@
 - xAI and Qwen build on the OpenAI-compatible base but support OAuth (unlike generic OpenAI-compatible accounts, which are API-key only)
 - Codex talks to OpenAI's Responses API, a different shape from OpenAI's Chat Completions API used by the other OpenAI-compatible providers
 - OAuth is available for Anthropic, Vertex AI (Google Cloud credentials), xAI, Codex, and Qwen; all other providers are API-key only
-- API key authentication for Z.ai, OpenAI-compatible, NanoGPT, Minimax, and Ollama Cloud providers
+- API key authentication for Z.ai, OpenAI-compatible, NanoGPT, Minimax, DeepSeek, Meta, and Ollama Cloud providers
 - Ollama Cloud requires model mapping to translate Claude model names to Ollama models
 - Provider system supports format conversion between different API standards
 - Default OAuth client ID: `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (configurable via environment or config file) — this applies to the Anthropic provider; other OAuth providers (xAI, Codex, Qwen) use their own fixed client IDs
@@ -64,6 +70,7 @@
 - [OAuth Authentication Flow](#oauth-authentication-flow)
 - [AnthropicProvider Implementation](#anthropicprovider-implementation)
 - [ZaiProvider Implementation](#zaiprovider-implementation)
+- [DeepSeekProvider Implementation](#deepseekprovider-implementation)
 - [VertexAIProvider Implementation](#vertexaiprovider-implementation)
 - [OpenAI-Compatible Provider Implementation](#openai-compatible-provider-implementation)
 - [XaiProvider Implementation](#xaiprovider-implementation)
@@ -108,37 +115,45 @@ The better-ccflare providers system is a modular architecture designed to suppor
    - API key authentication
    - Automatic format conversion
 
-5. **Z.ai Provider** - Provides access to:
+5. **DeepSeek Provider** - Provides access to:
+   - **DeepSeek API** - Native Anthropic-compatible API via `api.deepseek.com`
+   - Claude request model IDs pass through for DeepSeek's server-side family remapping
+   - `deepseek-v4-flash` is a response usage/cost-attribution fallback when DeepSeek omits the response model; it does not rewrite outbound request model
+   - API key authentication (`x-api-key` header, no OAuth support)
+   - Same `BaseAnthropicCompatibleProvider` pattern as Minimax
+
+6. **Z.ai Provider** - Provides access to:
    - **Z.ai API** - Claude proxy service with enhanced rate limits
    - Uses API key authentication instead of OAuth
    - Supports Lite, Pro, and Max plans with ~3× the usage quota of equivalent Claude plans
 
-6. **Anthropic-Compatible Provider** - Provides access to:
+7. **Anthropic-Compatible Provider** - Provides access to:
    - **Any Anthropic-compatible API** - Custom endpoints, self-hosted models, etc.
    - Uses API key authentication
    - Supports custom endpoints for maximum flexibility
 
-7. **OpenAI-Compatible Provider** - Provides access to:
+8. **OpenAI-Compatible Provider** - Provides access to:
    - **Any OpenAI-compatible API** - OpenRouter, Together AI, local models, etc.
    - Uses API key authentication
    - Automatic format conversion between Anthropic and OpenAI API formats
    - Supports custom endpoints for maximum flexibility
 
-8. **Ollama Provider** - Provides access to:
+9. **Ollama Provider** - Provides access to:
    - **Ollama Anthropic API (v0.14.0+)** - Native `/v1/messages` compatibility
    - Default endpoint: `http://localhost:11434`
    - Optional custom endpoint for remote/self-hosted Ollama
    - No real API key required for authentication
 
-9. **Ollama Cloud Provider** - Provides access to:
+10. **Ollama Cloud Provider** - Provides access to:
    - **Ollama Cloud hosted API** at ollama.com
    - Converts Anthropic-format requests to Ollama native `/api/chat` format
    - NDJSON streaming responses converted back to Anthropic SSE
    - Bearer token authentication via API key
    - Model mapping required (configured via `model_mappings` on account)
 
-10. **Muse Spark Provider** - Provides access to:
+11. **Meta Provider** (`meta`) - Provides access to:
     - **Meta Model API** at `https://api.meta.ai` via its Anthropic-compatible Messages endpoint
+    - `meta` is the canonical provider identifier. Legacy `muse-spark` is server-side HTTP ingress compatibility only; it is not the provider identifier to configure.
     - Models `muse-spark-1.2` (default), `muse-spark-1.1`, and `muse-spark-1.2-contributor`
     - 1,048,576-token context window; 131,072-token maximum output
     - Bearer token authentication (`Authorization: Bearer`), not `x-api-key`
@@ -148,7 +163,7 @@ The better-ccflare providers system is a modular architecture designed to suppor
 The providers system handles:
 - OAuth authentication flows with PKCE security (Anthropic, and refresh-token/device-code variants for xAI, Codex, Qwen)
 - Google Cloud authentication (Vertex AI)
-- API key authentication (Z.ai, OpenAI-Compatible, NanoGPT, Minimax, Ollama Cloud)
+- API key authentication (Z.ai, OpenAI-Compatible, NanoGPT, Minimax, DeepSeek, Meta, Ollama Cloud)
 - Token lifecycle management (refresh, expiration)
 - Provider-specific request routing and header management
 - Rate limit detection and handling
@@ -180,7 +195,7 @@ class ProviderRegistry {
 
 ### Auto-Registration
 
-Providers are automatically registered when the package is imported. `packages/providers/src/index.ts` registers every provider (16 as of this writing: Alibaba Coding Plan, Anthropic, Codex, Bedrock, Kilo, OpenRouter, Qwen, Minimax, NanoGPT, Z.ai, Vertex AI, xAI, OpenAI-Compatible, Ollama, Ollama Cloud, Anthropic-Compatible) in one place:
+Providers are automatically registered when the package is imported. `packages/providers/src/index.ts` registers every provider (18 as of this writing: Alibaba Coding Plan, Anthropic, Codex, Bedrock, Kilo, OpenRouter, Qwen, Minimax, DeepSeek, NanoGPT, Z.ai, Vertex AI, xAI, OpenAI-Compatible, Ollama, Ollama Cloud, Anthropic-Compatible, Meta) in one place:
 
 ```typescript
 // In packages/providers/src/index.ts
@@ -338,9 +353,13 @@ prepareHeaders(headers: Headers, accessToken?: string, apiKey?: string): Headers
 
 The API key is stored in the `api_key` field of the account record for consistency with the authentication system.
 
-## MuseSparkProvider Implementation
+## DeepSeekProvider Implementation
 
-The MuseSparkProvider extends `BaseAnthropicCompatibleProvider` and serves Meta's Muse Spark models through the Meta Model API.
+The `DeepSeekProvider` (`deepseek`) extends `BaseAnthropicCompatibleProvider` and targets DeepSeek's native Anthropic-compatible API at `https://api.deepseek.com`. It uses an API key in the `x-api-key` header and preserves Claude request model IDs so DeepSeek can apply its server-side family remapping. `deepseek-v4-flash` is a response usage/cost-attribution fallback when DeepSeek omits the response model; it does not rewrite outbound request model. It inherits the same request/response compatibility pattern as Minimax, and account-specific `model_mappings` remain available when an explicit mapping is required.
+
+## MetaProvider Implementation
+
+The MetaProvider (`meta`) extends `BaseAnthropicCompatibleProvider` and serves Meta models through the Meta Model API. The legacy `muse-spark` name is retained only as server-side HTTP ingress compatibility; model IDs such as `muse-spark-1.2` are unchanged.
 
 ### Key Features
 
@@ -379,7 +398,7 @@ Meta's Messages endpoint is a wire-format adapter over its Responses pipeline, n
 | --- | --- | --- |
 | `stop_sequences`, `top_k`, `container`, `inference_geo` | dropped | explicitly rejected |
 | any unrecognised top-level field | dropped | unknown fields are rejected |
-| `thinking: {type: "disabled"}` | dropped | Muse Spark cannot disable reasoning |
+| `thinking: {type: "disabled"}` | dropped | Meta cannot disable reasoning |
 | `thinking: {type: "enabled", budget_tokens}` | clamped to `1024 ≤ budget < max_tokens` | outside that range is a 400 |
 | a valid thinking budget | also sets `output_config.effort` | Meta ignores `budget_tokens` for depth; only `effort` moves the dial |
 | `tool_choice: {type: "tool", name}` | rewritten to `{type: "any"}` | named tool choice is rejected |
@@ -397,12 +416,12 @@ Because `budget_tokens` alone has no effect on Meta's reasoning depth, the provi
 
 Meta reports quota with `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, `x-ratelimit-limit-tokens`, and `x-ratelimit-remaining-tokens` on every successful response. `parseRateLimit()` surfaces remaining requests (falling back to remaining tokens) so the load balancer can see headroom before a 429, and treats a 429 as rate-limited, using `retry-after` for the reset time when present.
 
-Standard-tier limits are 3,000 RPM / 4,000,000 TPM; contributor tier is 60 RPM / 2,100,000 TPM. Limits apply per team, not per API key — multiple keys on one team share a single quota, which is worth knowing before adding several Muse Spark accounts expecting independent budgets.
+Standard-tier limits are 3,000 RPM / 4,000,000 TPM; contributor tier is 60 RPM / 2,100,000 TPM. Limits apply per team, not per API key — multiple keys on one team share a single quota, which is worth knowing before adding several Meta accounts expecting independent budgets.
 
 ### Setup
 
 ```bash
-bun run cli --add-account meta --mode muse-spark --priority 10
+bun run cli --add-account meta --mode meta --priority 10
 ```
 
 Supply the Model API key when prompted. The custom endpoint is optional and defaults to `https://api.meta.ai`.
@@ -618,6 +637,12 @@ The `CodexProvider` (registered as `"codex"`) extends `BaseProvider` directly ra
 5. **Default Model Mapping Derived Live, Not Compiled**: `mapModel()` resolves each Claude family (opus/sonnet/haiku/fable) through `resolveProviderModelDefault("codex", family, accountId)`. Unlike other providers, Codex's factory default map is largely superseded at runtime: `packages/proxy/src/codex-model-catalog.ts` fetches the account's own model listing from `chatgpt.com/backend-api/codex/models` and derives a per-account family → model map from it (`deriveFamilyDefaults`), because the compiled guess (`gpt-5.3-codex` for opus/sonnet) 400s on ChatGPT-subscription accounts that don't support that model. See `docs/configuration.md` for the full precedence chain and the `CCFLARE_MODEL_DEFAULTS_PROVIDERS` override layer.
 6. **Reasoning Effort & Prompt Caching**: Requests carry a `reasoning.effort` resolved via `resolveReasoningEffort()`, and — enabled by default, opt-out via `CCFLARE_CODEX_PROMPT_CACHE_KEY=0` — a derived `prompt_cache_key` (session + instructions + first input item, hashed) attached only when the account resolves to OpenAI's own `chatgpt.com`/`api.openai.com` hosts. See `docs/configuration.md` for both env vars.
 7. **Rate Limit Detection**: `parseRateLimit()` reads Codex's `x-codex-primary-reset-at` / `x-codex-secondary-reset-at` (and legacy `x-codex-5h-reset-at` / `x-codex-7d-reset-at`) headers, using the soonest reset time; only HTTP 429 is treated as a hard rate limit.
+8. **On-Demand Usage Probe (the dashboard refresh button)**: Codex has no free usage endpoint — `supportsUsageTracking` is `false` and there is no polling, so the card's quota bars normally only update when real traffic happens to carry the `x-codex-*` headers. `POST /api/accounts/:id/refresh-usage` fills that gap by sending one deliberately minimal `/responses` request (a single `.`, `instructions: "ping"`, `stream: true`, `store: false`) and cancelling the body as soon as the headers are read (`packages/providers/src/providers/codex/on-demand-fetch.ts`). Three choices in that request are non-obvious and each fixed a real failure:
+   - **The model comes from the account's own listing, not from a constant.** An unknown model name is rejected *before* quota accounting, so a stale name returns a 400 with **no** `x-codex-*` headers at all and the refresh has nothing to report — which is exactly how a hardcoded `gpt-5-codex` broke it on ChatGPT-subscription accounts. `lowestTierCodexModel()` reads the same listing that feeds the family mapping. `CODEX_PING_MODEL` remains only as the blind fallback for an account whose listing has never been readable.
+   - **It pings the weakest listed model, not the frontier one.** The headers report the *subscription's* windows, not the model's, so the frontier model buys nothing here and costs the most per ping. `normalize()` sorts by OpenAI's own `priority`, so position is the tier: the last entry is the weakest, and nothing needs maintenance when OpenAI reshuffles the list. A one-model plan still gets that model.
+   - **`reasoning.effort` is pinned to `"low"`.** A body-level parameter the model dislikes is rejected *after* accounting, so the usage headers still arrive — the opposite of the model-name case. `"low"` is the cheapest effort every measured model accepts.
+
+   This probe spends quota, and the button's tooltip says so. It fires only on an explicit click; the periodic probe is a separate mechanism with different rules (see `docs/auto-refresh.md`).
 
 ## QwenProvider Implementation
 
@@ -1093,7 +1118,7 @@ interface Account {
 }
 ```
 
-**Note**: OAuth is available for Anthropic, Vertex AI, xAI, Codex, and Qwen. Z.ai, OpenAI-Compatible, NanoGPT, Minimax, and Ollama Cloud use API key authentication exclusively as they do not support OAuth.
+**Note**: OAuth is available for Anthropic, Vertex AI, xAI, Codex, and Qwen. Z.ai, OpenAI-Compatible, NanoGPT, Minimax, DeepSeek, Meta, and Ollama Cloud use API key authentication exclusively as they do not support OAuth.
 
 ### Token Refresh Strategy
 

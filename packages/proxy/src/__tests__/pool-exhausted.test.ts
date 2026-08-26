@@ -162,6 +162,7 @@ function makeContext(
 			getUsageThrottlingWeeklyEnabled: () => false,
 			getSystemPromptCacheTtl1h: () => false,
 			getAgentFrontmatterModelFallback: () => false,
+			getModelScopedCapacityRouting: () => "exhausted",
 		} as never,
 		provider: {
 			name: providerName,

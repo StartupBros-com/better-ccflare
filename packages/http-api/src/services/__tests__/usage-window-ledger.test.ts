@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { LIST_PRICE_ERAS, VALUE_PRICING_VERSION } from "@better-ccflare/core";
 import { DatabaseOperations, type UsageWindow } from "@better-ccflare/database";
 import type { CanonicalUsageWindow } from "@better-ccflare/types";
@@ -711,5 +711,61 @@ describe("UsageWindowLedger sliding placeholder resets", () => {
 
 		const windows = await dbOps.listUsageWindows({ accountId: ACCOUNT_ID });
 		expect(windows).toHaveLength(2);
+	});
+});
+
+describe("UsageWindowLedger generation fence", () => {
+	let dbOps: DatabaseOperations;
+
+	beforeEach(() => {
+		dbOps = new DatabaseOperations(":memory:", { walMode: false });
+	});
+
+	afterEach(async () => {
+		await dbOps.dispose();
+	});
+
+	it("does not open a ledger row when the account is replaced after getOpenUsageWindow resolves", async () => {
+		const generationA = 100;
+		const generationB = 200;
+		await seedAccount(dbOps, {
+			id: ACCOUNT_ID,
+			name: "generation A",
+			createdAt: generationA,
+		});
+		const ledger = new UsageWindowLedger(dbOps);
+		const original = dbOps.getOpenUsageWindow.bind(dbOps);
+		let replaced = false;
+		const getOpen = spyOn(dbOps, "getOpenUsageWindow").mockImplementation(
+			async (...args) => {
+				const open = await original(...args);
+				if (!replaced) {
+					replaced = true;
+					await dbOps
+						.getAdapter()
+						.run("DELETE FROM accounts WHERE id = ?", [ACCOUNT_ID]);
+					await dbOps
+						.getAdapter()
+						.run(
+							"INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)",
+							[ACCOUNT_ID, "generation B", generationB],
+						);
+				}
+				return open;
+			},
+		);
+		try {
+			const now = Date.parse("2026-08-25T00:00:00Z");
+			await ledger.observeSnapshot(
+				ACCOUNT_ID,
+				[sevenDay(20, now + 7 * DAY_MS)],
+				now,
+				generationA,
+			);
+		} finally {
+			getOpen.mockRestore();
+		}
+		expect(replaced).toBe(true);
+		expect(await dbOps.listUsageWindows({ accountId: ACCOUNT_ID })).toEqual([]);
 	});
 });

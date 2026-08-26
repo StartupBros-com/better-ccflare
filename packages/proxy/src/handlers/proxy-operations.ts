@@ -40,7 +40,11 @@ import {
 	suppressCodexExplicitCacheBreakpoint,
 	usageCache,
 } from "@better-ccflare/providers";
-import { transferResponseDrainTransport } from "@better-ccflare/providers/stream-drain";
+import {
+	drainReader,
+	getResponseDrainTransport,
+	transferResponseDrainTransport,
+} from "@better-ccflare/providers/stream-drain";
 import type {
 	Account,
 	RateLimitReason,
@@ -1962,19 +1966,8 @@ class AnthropicPreCommitAttemptScope {
 				if (result.done) break;
 				if (result.value) chunks.push(result.value);
 			}
-			reader.releaseLock();
 		} catch (error) {
-			if (!this.signal.aborted) {
-				// A rejected read leaves the classifier clone's reader locked even
-				// though the stream has already errored. Release that branch explicitly
-				// so it cannot retain tee bookkeeping after classification gives up.
-				try {
-					reader.releaseLock();
-				} catch {
-					// The errored reader may already have detached itself.
-				}
-				return null;
-			}
+			if (!this.signal.aborted) return null;
 			const reason = this.abortReason();
 			try {
 				void reader.cancel(reason).catch(() => undefined);
@@ -1985,6 +1978,8 @@ class AnthropicPreCommitAttemptScope {
 			// upstream source once both branches are released.
 			void discardUpstreamBody(response);
 			throw reason ?? error;
+		} finally {
+			reader.releaseLock();
 		}
 
 		try {
@@ -3812,16 +3807,19 @@ export async function proxyWithAccount(
 		// Pre-strip cache_control for (account, model) pairs known to reject it
 		// Synthetic transports (notably Bedrock) contain the upstream RESPONSE:
 		// never clone/buffer that response as though it were an outbound body.
-		const transformedBodyText = isSyntheticResponse
+		// Consume the one inspection clone now, then reconstruct an independent
+		// retry body from its text below. Keeping an unread Request clone as a
+		// retry template leaves a tee branch retaining the native request buffer.
+		let retryBodyText = isSyntheticResponse
 			? ""
 			: await transformedRequest.clone().text();
 		let currentCacheIdentityHasCacheControl: boolean | undefined =
 			isSyntheticResponse
 				? undefined
-				: hasCacheControlHintInJsonText(transformedBodyText);
+				: hasCacheControlHintInJsonText(retryBodyText);
 		let transformedBodyJson: Record<string, unknown> | null = null;
 		try {
-			transformedBodyJson = JSON.parse(transformedBodyText);
+			transformedBodyJson = JSON.parse(retryBodyText);
 		} catch {
 			// ignore
 		}
@@ -4267,27 +4265,12 @@ export async function proxyWithAccount(
 		const drainSupersededResponse = async (discarded: Response) => {
 			const body = discarded.body;
 			if (!body) return;
-			const timeoutMs = getInPlaceRetryDrainTimeoutMs();
-			const reader = body.getReader();
-			const deadline = Date.now() + timeoutMs;
-			while (true) {
-				const remainingMs = deadline - Date.now();
-				if (remainingMs <= 0) {
-					reader.cancel("in_place_529_retry_drain_timeout").catch(() => {});
-					return;
-				}
-				const result = await Promise.race([
-					reader.read().catch(() => ({ done: true }) as const),
-					new Promise<"timeout">((resolve) =>
-						setTimeout(() => resolve("timeout"), remainingMs),
-					),
-				]);
-				if (result === "timeout") {
-					reader.cancel("in_place_529_retry_drain_timeout").catch(() => {});
-					return;
-				}
-				if (result.done) return;
-			}
+			// This response is the sole owner of its registered fetch transport.
+			// Response.clone() tee siblings never inherit this authority.
+			await drainReader(body.getReader(), {
+				deadlineMs: getInPlaceRetryDrainTimeoutMs(),
+				transportAbort: getResponseDrainTransport(discarded),
+			});
 		};
 		if (
 			!isSyntheticResponse &&
@@ -4313,22 +4296,27 @@ export async function proxyWithAccount(
 				// Request should never silently lose the one it started with.
 				signal: req.signal,
 			});
+			retryBodyText = strippedBodyText;
 			currentCacheIdentityHasCacheControl =
-				hasCacheControlHintInJsonText(strippedBodyText);
+				hasCacheControlHintInJsonText(retryBodyText);
 			log.debug(
 				`Pre-stripped cache_control for known rejector: account=${account.name} model=${transformedModel}`,
 			);
 		}
 
-		// Capture a clone for in-place 529 retries before the body is consumed.
-		const transformedRequestForRetry = isSyntheticResponse
-			? transformedRequest
-			: transformedRequest.clone();
 		// The 529 in-place retry must resend the CURRENT physical transport, not
 		// the original request: thinking/cache-control retries and model fallback
 		// all replace the outbound body, and reverting silently changes the model.
+		// Rebuild its body from consumed retry text rather than holding an unread
+		// clone of the transformed request, which would retain a tee branch.
+		const retryRequest = new Request(transformedRequest.url, {
+			method: transformedRequest.method,
+			headers: transformedRequest.headers,
+			body: retryBodyText || undefined,
+			signal: req.signal,
+		});
 		let retrySourceRequest = providerRequest;
-		let retryTransformedTemplate = transformedRequestForRetry;
+		let retryTransformedTemplate = retryRequest;
 
 		// Make the request, or unwrap a provider response produced during transform.
 		// Both paths first replace/discard cache staging for this physical attempt.
@@ -4605,7 +4593,7 @@ export async function proxyWithAccount(
 			}
 
 			try {
-				const retryBodyJson = JSON.parse(transformedBodyText);
+				const retryBodyJson = JSON.parse(retryBodyText);
 				stripCacheControlFromOpenAIRequest(retryBodyJson);
 				let retryRequest: Request;
 				if (attemptPlan.providerName === "codex") {
@@ -6017,6 +6005,19 @@ export async function proxyWithAccount(
 				internalRequestStream,
 			);
 		}
+		const internalCustomTools = transformedRequest.headers.get(
+			"x-better-ccflare-codex-custom-tools",
+		);
+		if (internalCustomTools === "true" || internalCustomTools === "false") {
+			responseHeaders.set(
+				"x-better-ccflare-codex-custom-tools",
+				internalCustomTools,
+			);
+		}
+		// Inject the original request path so providers can identify the
+		// response type (e.g. /v1/models vs /v1/messages) in processResponse
+		// without needing the original request object.
+		responseHeaders.set("x-better-ccflare-request-path", requestMeta.path);
 		const taggedRawResponse = new Response(rawResponse.body, {
 			status: rawResponse.status,
 			statusText: rawResponse.statusText,
@@ -6120,11 +6121,18 @@ export async function proxyWithAccount(
 								"overload_529",
 								currentTransportModel ?? undefined,
 							);
-							const retrySource = new Request(retrySourceRequest.url, {
+							const retrySourceInit: RequestInit & { duplex?: "half" } = {
 								method: retrySourceRequest.method,
 								headers: retryHeaders,
-								body: await retrySourceRequest.clone().arrayBuffer(),
-							});
+							};
+							if (currentReplayBody) {
+								retrySourceInit.body = new Uint8Array(currentReplayBody);
+								retrySourceInit.duplex = "half";
+							}
+							const retrySource = new Request(
+								retrySourceRequest.url,
+								retrySourceInit,
+							);
 							let retryTransformed = await transformWithCurrentAttemptPlan(
 								attemptPlan,
 								retrySource,
@@ -6162,6 +6170,20 @@ export async function proxyWithAccount(
 							return null;
 						}
 
+						// A Codex retry re-transforms its reconstructed body. Read the
+						// transport's final metadata so the response tags describe the
+						// actual retry rather than the superseded first attempt.
+						const retryRequestStream = retryTransport.headers.get(
+							"x-better-ccflare-request-stream",
+						);
+						const retryCustomTools = retryTransport.headers.get(
+							"x-better-ccflare-codex-custom-tools",
+						);
+
+						// Mirror the first response's metadata tagging: providers read
+						// stream intent / custom-tool state from these headers, and the
+						// map fallback behind them has a 30s TTL a long backoff can
+						// outlive — the request ID alone is not enough.
 						const retryTaggedHeaders = new Headers(retryRaw.headers);
 						retryTaggedHeaders.set(
 							"x-better-ccflare-request-id",
@@ -6179,6 +6201,25 @@ export async function proxyWithAccount(
 								currentTransportModel,
 							);
 						}
+						if (
+							retryRequestStream === "true" ||
+							retryRequestStream === "false"
+						) {
+							retryTaggedHeaders.set(
+								"x-better-ccflare-request-stream",
+								retryRequestStream,
+							);
+						}
+						if (retryCustomTools === "true" || retryCustomTools === "false") {
+							retryTaggedHeaders.set(
+								"x-better-ccflare-codex-custom-tools",
+								retryCustomTools,
+							);
+						}
+						retryTaggedHeaders.set(
+							"x-better-ccflare-request-path",
+							requestMeta.path,
+						);
 						const retryTaggedRaw = new Response(retryRaw.body, {
 							status: retryRaw.status,
 							statusText: retryRaw.statusText,
@@ -6613,6 +6654,19 @@ export async function proxyWithAccount(
 							internalRequestStream,
 						);
 					}
+					if (
+						internalCustomTools === "true" ||
+						internalCustomTools === "false"
+					) {
+						rescueResponseHeaders.set(
+							"x-better-ccflare-codex-custom-tools",
+							internalCustomTools,
+						);
+					}
+					rescueResponseHeaders.set(
+						"x-better-ccflare-request-path",
+						requestMeta.path,
+					);
 					const rescueTaggedRaw = new Response(rawResponse.body, {
 						status: rawResponse.status,
 						statusText: rawResponse.statusText,

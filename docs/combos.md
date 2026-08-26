@@ -2,6 +2,8 @@
 
 Combos route a model family through an ordered set of account/model candidates. A family can use hand-maintained **Manual** slots, server-derived **Managed** membership, or both. The server's effective-routing view is authoritative; the dashboard and CLI display that view instead of reimplementing routing decisions.
 
+Combo routing is controlled by the config-file-only `combos_enabled` switch. It is **off by default**, so saved combos remain visible and editable but take no part in routing until an operator enables them in Settings → Advanced → Combos or through `GET`/`POST /api/config/combos-enabled`. This global switch is separate from a combo's and family assignment's enabled states.
+
 ## Contents
 
 1. [Families and concepts](#families-and-concepts)
@@ -29,7 +31,7 @@ Exactly one combo can be assigned to each supported family:
 | **Sonnet** | Sonnet-family models |
 | **Haiku** | Haiku-family models |
 
-A family route is active only when the family assignment, its assigned combo, and the relevant member or rule are enabled. If no active combo applies, the existing session-based router handles the request.
+A family route is active only when `combos_enabled`, the family assignment, its assigned combo, and the relevant member or rule are enabled. If no active combo applies, the existing session-based router handles the request.
 
 The main persisted objects are:
 

@@ -31,12 +31,13 @@ export const ACCOUNT_MODES = {
 	CONSOLE: "console", // Claude API account
 	ZAI: "zai", // z.ai account (API key)
 	MINIMAX: "minimax", // Minimax account (API key)
+	DEEPSEEK: "deepseek", // DeepSeek account (API key)
 	ANTHROPIC_COMPATIBLE: "anthropic-compatible", // Anthropic-compatible provider (API key)
 	OPENAI_COMPATIBLE: "openai-compatible", // OpenAI-compatible provider (API key)
 	NANOGPT: "nanogpt", // NanoGPT provider (API key)
 	XAI: "xai", // xAI/Grok account (Grok CLI OAuth)
 	OLLAMA: "ollama", // Ollama local provider (v0.14.0+, no API key required)
-	MUSE_SPARK: "muse-spark", // Meta Model API / Muse Spark (API key)
+	META: "meta", // Meta Model API / Muse Spark (API key)
 } as const;
 
 export type AccountMode = (typeof ACCOUNT_MODES)[keyof typeof ACCOUNT_MODES];
@@ -64,6 +65,8 @@ export function getProviderFromMode(mode: AccountMode): ProviderName {
 			return PROVIDER_NAMES.ZAI;
 		case ACCOUNT_MODES.MINIMAX:
 			return PROVIDER_NAMES.MINIMAX;
+		case ACCOUNT_MODES.DEEPSEEK:
+			return PROVIDER_NAMES.DEEPSEEK;
 		case ACCOUNT_MODES.ANTHROPIC_COMPATIBLE:
 			return PROVIDER_NAMES.ANTHROPIC_COMPATIBLE;
 		case ACCOUNT_MODES.OPENAI_COMPATIBLE:
@@ -74,8 +77,8 @@ export function getProviderFromMode(mode: AccountMode): ProviderName {
 			return PROVIDER_NAMES.XAI;
 		case ACCOUNT_MODES.OLLAMA:
 			return PROVIDER_NAMES.OLLAMA;
-		case ACCOUNT_MODES.MUSE_SPARK:
-			return PROVIDER_NAMES.MUSE_SPARK;
+		case ACCOUNT_MODES.META:
+			return PROVIDER_NAMES.META;
 		default:
 			return PROVIDER_NAMES.ANTHROPIC;
 	}

@@ -155,6 +155,69 @@ describe("translateAnthropicStreamToResponses", () => {
 		expect(usage.total_tokens).toBe(15);
 	});
 
+	test("skips a structurally malformed frame and continues later frames from the same chunk", async () => {
+		const events = [
+			// JSON-valid but structurally incomplete: processEvent previously
+			// dereferenced content_block.type and let the transform-level catch
+			// abandon every later frame extracted from this same chunk.
+			sseEvent("content_block_start", {
+				type: "content_block_start",
+				index: 0,
+			}),
+			sseEvent("message_start", {
+				type: "message_start",
+				message: { id: "msg_recovery", usage: { input_tokens: 7 } },
+			}),
+			sseEvent("content_block_start", {
+				type: "content_block_start",
+				index: 0,
+				content_block: { type: "text", text: "" },
+			}),
+			sseEvent("content_block_delta", {
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "text_delta", text: "recovered" },
+			}),
+			sseEvent("content_block_stop", {
+				type: "content_block_stop",
+				index: 0,
+			}),
+			sseEvent("message_delta", {
+				type: "message_delta",
+				delta: { stop_reason: "end_turn" },
+				usage: { output_tokens: 3 },
+			}),
+			sseEvent("message_stop", { type: "message_stop" }),
+		];
+
+		const parsed = await collectSseEvents(
+			translateAnthropicStreamToResponses(
+				makeAnthropicStream(events),
+				"resp_recovery",
+				"test-model",
+			),
+		);
+
+		expect(parsed.map((event) => event.event)).toEqual([
+			"response.created",
+			"response.in_progress",
+			"response.output_item.added",
+			"response.content_part.added",
+			"response.output_text.delta",
+			"response.output_text.done",
+			"response.content_part.done",
+			"response.output_item.done",
+			"response.completed",
+		]);
+		const completed = parsed[parsed.length - 1].data as Record<string, unknown>;
+		const response = completed.response as Record<string, unknown>;
+		expect(response.usage).toEqual({
+			input_tokens: 7,
+			output_tokens: 3,
+			total_tokens: 10,
+		});
+	});
+
 	test("tool call streaming — correct function_call item events", async () => {
 		const events = [
 			sseEvent("message_start", {

@@ -12,6 +12,7 @@ import { Button } from "../ui/button";
 import { Separator } from "../ui/separator";
 import { ComboCard, type ComboFamilyRoutingCardState } from "./ComboCard";
 import { ComboDialog } from "./ComboDialog";
+import { CombosIntroCard } from "./CombosIntroCard";
 import { FamilyActivationSection } from "./FamilyActivationSection";
 import {
 	type FamilyRoutingProjection,
@@ -81,6 +82,8 @@ export function CombosTab() {
 
 	return (
 		<div className="space-y-6">
+			<CombosIntroCard />
+
 			<FamilyActivationSection />
 
 			<Separator />

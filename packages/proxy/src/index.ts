@@ -101,7 +101,15 @@ export type {
 	CodexModelEntry,
 	CodexModelListing,
 } from "./codex-model-catalog";
-export { getCodexModels } from "./codex-model-catalog";
+export {
+	clearCodexModelCacheForAccount,
+	getCodexModels,
+	lowestTierCodexModel,
+} from "./codex-model-catalog";
+export {
+	recordCodexUsageSnapshot,
+	resetCodexUsageHistoryThrottle,
+} from "./codex-usage-history";
 export { readCodexWebSocketPercent } from "./codex-websocket-contract";
 export {
 	type DegradedOwnerDirectiveInput,
@@ -114,6 +122,7 @@ export {
 	checkAllAccountsHealth,
 	checkRefreshTokenHealth,
 	clearAccountRefreshCache,
+	clearAutoRefreshTrackingForAccount,
 	createGuardCorrelationVerifier,
 	createUsageThrottledResponse,
 	formatTokenHealthReport,
@@ -126,6 +135,7 @@ export {
 	isRefreshTokenLikelyExpired,
 	markAccountTokensFresh,
 	refreshCodexUsageForAccount,
+	registerAutoRefreshTrackingClearer,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
 	registerRefreshClearer,
@@ -134,13 +144,25 @@ export {
 	stopGlobalTokenHealthChecks,
 	type TokenHealthReport,
 	type TokenHealthStatus,
+	unregisterAutoRefreshTrackingClearer,
 	unregisterCodexUsageRefresher,
+	unregisterPollingRestarter,
+	unregisterRefreshClearer,
 } from "./handlers";
 export {
+	clearPendingRotationForDeletedAccount,
 	configurePendingRotationPersistence,
 	restorePendingRotations,
 } from "./handlers/pending-rotation-registry";
 export { createPendingRotationWal } from "./handlers/pending-rotation-wal";
+export {
+	clearRoutingObservations,
+	getRoutingObservations,
+	type RoutingObservation,
+	type RoutingObservationAccount,
+	recordRoutingObservation,
+	recordSelectedOrder,
+} from "./handlers/routing-observations";
 export {
 	runIntegrityCheckOnDemand,
 	startFullIntegrityCheckBackground,
@@ -167,6 +189,14 @@ export {
 	type ModelRouteSessionRegistryOptions,
 	parseModelRouteProfiles,
 } from "./model-route-profiles";
+export type {
+	OpenAICompatibleModelEntry,
+	OpenAICompatibleModelListing,
+} from "./openai-compatible-model-catalog";
+export {
+	clearOpenAICompatibleModelCacheForAccount,
+	getOpenAICompatibleModels,
+} from "./openai-compatible-model-catalog";
 export {
 	drainUsageCollector,
 	getUsageCollectorHealth,

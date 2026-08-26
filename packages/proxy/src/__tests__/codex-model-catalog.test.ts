@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
+	clearDerivedAccountModelDefaults,
 	clearDerivedProviderModelDefaults,
 	hasDerivedProviderModelDefaults,
 	resolveProviderModelDefault,
@@ -7,9 +8,12 @@ import {
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import {
+	clearCodexModelCacheForAccount,
 	clearCodexModelCacheForTests,
 	ensureCodexModelDefaults,
 	getCodexModels,
+	getKnownCodexModels,
+	lowestTierCodexModel,
 } from "../codex-model-catalog";
 import type { ProxyContext } from "../handlers/proxy-types";
 
@@ -240,6 +244,18 @@ describe("getCodexModels", () => {
 		]);
 	});
 
+	it("does not present a shared catalog as first-hand account knowledge", async () => {
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify(LIVE_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			})) as typeof globalThis.fetch;
+		await getCodexModels("acc-codex", makeCtx(makeAccount()));
+
+		expect(getKnownCodexModels("acc-codex")?.source).toBe("cached");
+		expect(getKnownCodexModels("acc-blind")).toBeNull();
+	});
+
 	// A 200 carrying nothing usable is not an answer. Recording it would mark the
 	// account as resolved and stop every later attempt, freezing it with no
 	// defaults because of one odd response.
@@ -299,7 +315,75 @@ describe("getCodexModels", () => {
 	});
 });
 
+describe("lowestTierCodexModel", () => {
+	it("names the weakest visible model in provider priority order", async () => {
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify(LIVE_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			})) as typeof globalThis.fetch;
+
+		const listing = await getCodexModels("acc-codex", makeCtx(makeAccount()));
+
+		expect(lowestTierCodexModel(listing)).toBe("gpt-5.4-mini");
+		expect(lowestTierCodexModel(listing)).not.toBe("gpt-5.6-sol");
+	});
+
+	it("returns the only model when a plan lists one", () => {
+		expect(
+			lowestTierCodexModel({
+				accountId: "acc-codex",
+				models: [
+					{
+						id: "gpt-5.6-sol",
+						displayName: "GPT-5.6-Sol",
+						description: null,
+						contextWindow: null,
+						maxContextWindow: null,
+						effectiveContextPercent: null,
+						supersededBy: null,
+					},
+				],
+				fetchedAt: 0,
+				source: "live",
+			}),
+		).toBe("gpt-5.6-sol");
+	});
+
+	it("returns null when there is no listing to read", () => {
+		expect(lowestTierCodexModel(null)).toBeNull();
+		expect(lowestTierCodexModel(undefined)).toBeNull();
+		expect(
+			lowestTierCodexModel({
+				accountId: "acc-codex",
+				models: [],
+				fetchedAt: 0,
+				source: "live",
+			}),
+		).toBeNull();
+	});
+});
+
 describe("derived-default provenance", () => {
+	it("clears exact-account defaults without discarding provider-wide advice", () => {
+		setDerivedProviderModelDefaults("codex", "acc-cleared-default", {
+			fable: "gpt-6-codex",
+			opus: "gpt-6-codex",
+			sonnet: "gpt-5.6-sol",
+			haiku: "gpt-5.6-sol",
+		});
+
+		clearDerivedAccountModelDefaults("codex", "acc-cleared-default");
+
+		expect(
+			hasDerivedProviderModelDefaults("codex", "acc-cleared-default"),
+		).toBe(false);
+		expect(
+			resolveProviderModelDefault("codex", "fable", "acc-cleared-default"),
+		).toBe("gpt-6-codex");
+		expect(resolveProviderModelDefault("codex", "fable")).toBe("gpt-6-codex");
+	});
+
 	it("does not mark a borrowed listing as exact or change provider defaults", async () => {
 		globalThis.fetch = (async () =>
 			new Response(JSON.stringify(LIVE_BODY), {
@@ -488,6 +572,48 @@ describe("derived-default provenance", () => {
 		expect(shared?.borrowedFrom).toBe(postResetAccount.id);
 		expect(shared?.models[0].id).toBe("gpt-6-codex");
 	});
+
+	it("does not publish a deleted account's stale fetch but retains provider advice", async () => {
+		let resolveStaleFetch: ((response: Response) => void) | undefined;
+		const source = makeAccount({ id: "acc-advisory-source" });
+		const deleted = makeAccount({ id: "acc-deleted-during-fetch" });
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify(LIVE_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			})) as typeof globalThis.fetch;
+		await getCodexModels(deleted.id, makeCtx(deleted));
+		expect(getKnownCodexModels(deleted.id)).not.toBeNull();
+		await getCodexModels(source.id, makeCtx(source));
+
+		globalThis.fetch = (() =>
+			new Promise<Response>((resolve) => {
+				resolveStaleFetch = resolve;
+			})) as typeof globalThis.fetch;
+		const staleRequest = getCodexModels(deleted.id, makeCtx(deleted));
+		await waitForFetchCount(() => (resolveStaleFetch ? 1 : 0), 1);
+
+		clearCodexModelCacheForAccount(deleted.id);
+		resolveStaleFetch?.(
+			new Response(JSON.stringify(NEW_FRONTIER_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const staleListing = await staleRequest;
+
+		expect(staleListing?.source).toBe("live");
+		expect(staleListing?.models[0].id).toBe("gpt-6-codex");
+		expect(getKnownCodexModels(deleted.id)).toBeNull();
+		expect(hasDerivedProviderModelDefaults("codex", deleted.id)).toBe(false);
+		expect(resolveProviderModelDefault("codex", "fable")).toBe("gpt-5.6-sol");
+
+		globalThis.fetch = (async () =>
+			new Response("nope", { status: 500 })) as typeof globalThis.fetch;
+		const shared = await getCodexModels(deleted.id, makeCtx(deleted));
+		expect(shared?.source).toBe("shared");
+		expect(shared?.borrowedFrom).toBe(source.id);
+	});
 });
 
 describe("ensureCodexModelDefaults", () => {
@@ -620,7 +746,43 @@ describe("ensureCodexModelDefaults", () => {
 		);
 	});
 
-	it("does not let an old completion clear a newer in-flight ensure", async () => {
+	it("does not recreate deletion-cleared retry state when a stale ensure fails", async () => {
+		let fetches = 0;
+		let resolveStaleFetch: ((response: Response) => void) | undefined;
+		const account = makeAccount({ id: "acc-stale-retry" });
+		globalThis.fetch = (() => {
+			fetches++;
+			return new Promise<Response>((resolve) => {
+				resolveStaleFetch = resolve;
+			});
+		}) as typeof globalThis.fetch;
+
+		const staleEnsure = ensureCodexModelDefaults(
+			account,
+			makeCtx(account),
+			() => 50_000,
+		);
+		await waitForFetchCount(() => fetches, 1);
+		clearCodexModelCacheForAccount(account.id);
+		resolveStaleFetch?.(new Response("nope", { status: 401 }));
+		await staleEnsure;
+
+		const replacementEnsure = ensureCodexModelDefaults(
+			account,
+			makeCtx(account),
+			() => 50_000,
+		);
+		await waitForFetchCount(() => fetches, 2);
+		resolveStaleFetch?.(
+			new Response(JSON.stringify(LIVE_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		await replacementEnsure;
+	});
+
+	it("lets a replacement ensure own the in-flight slot after account deletion", async () => {
 		let now = 30_000;
 		let fetches = 0;
 		const pending: Array<(response: Response) => void> = [];
@@ -636,7 +798,7 @@ describe("ensureCodexModelDefaults", () => {
 			() => now,
 		);
 		await waitForFetchCount(() => fetches, 1);
-		clearCodexModelCacheForTests();
+		clearCodexModelCacheForAccount(account.id);
 		const currentEnsure = ensureCodexModelDefaults(
 			account,
 			makeCtx(account),

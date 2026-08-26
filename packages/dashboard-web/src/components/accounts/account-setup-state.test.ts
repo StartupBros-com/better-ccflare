@@ -338,6 +338,29 @@ describe("account setup state", () => {
 		expect(outcome.createdAccountId).toBe("acct:survives/failures");
 	});
 
+	it("returns an empty-credential DeepSeek direct attempt to a retryable review", () => {
+		const creating = reduceAccountSetupState(reviewedState(), {
+			type: "creation-started",
+			kind: "direct",
+		});
+		expect(creating).toMatchObject({
+			stage: "finalizing",
+			finalizationLocked: true,
+		});
+
+		const retry = reduceAccountSetupState(creating, {
+			type: "creation-failed",
+			error: new Error("API key is required for DeepSeek accounts"),
+		});
+		expect(retry).toMatchObject({
+			stage: "review",
+			finalizationLocked: false,
+			reviewed: true,
+			error: "API key is required for DeepSeek accounts",
+		});
+		expect(accountSetupCanCreate(retry, "draft-a")).toBe(true);
+	});
+
 	it("requires an account-list check after ambiguous creation failure", () => {
 		const committing = reduceAccountSetupState(reviewedState(), {
 			type: "creation-started",

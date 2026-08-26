@@ -70,6 +70,18 @@ export function setDerivedAccountModelDefaults(
 }
 
 /**
+ * Forget defaults inferred from one account without discarding the provider's
+ * advisory defaults. Account removal needs this narrower operation because a
+ * same-ID replacement must not inherit the deleted account's exact evidence.
+ */
+export function clearDerivedAccountModelDefaults(
+	provider: string,
+	accountId: string,
+): void {
+	derivedByAccount.delete(derivedKey(provider, accountId));
+}
+
+/**
  * Record the family -> model map that a fresh account listing implies.
  *
  * A live listing is both exact account evidence and the newest provider-wide

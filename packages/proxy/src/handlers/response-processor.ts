@@ -8,6 +8,7 @@ import {
 } from "@better-ccflare/providers";
 import type { Account, RateLimitReason } from "@better-ccflare/types";
 import { circuitKeyFor, recordSuccess } from "../circuit-breaker";
+import { recordCodexUsageSnapshot } from "../codex-usage-history";
 import { drainBody } from "./discard-body-cancel";
 import { isInternalProbe, type ProxyContext } from "./proxy-types";
 import {
@@ -174,10 +175,24 @@ export function updateAccountMetadata(
 		});
 		if (codexUsage) {
 			const prevUsage = usageCache.get(account.id);
+			// Which window this session is riding. Both sides of the comparison
+			// below must read the same slot: a 5-hour boundary held against a
+			// weekly one would fabricate a rollover. With
+			// CODEX_FIVE_HOUR_WINDOW_ENABLED the slot stays pinned to the 5-hour
+			// window, as it was before OpenAI withdrew that window; otherwise it
+			// follows the shortest window this payload actually reports.
+			const windowSlot: "five_hour" | "seven_day" =
+				ctx.config.getCodexFiveHourWindowEnabled() ||
+				codexUsage.five_hour?.resets_at != null
+					? "five_hour"
+					: "seven_day";
 			const prevResetAt = (
-				prevUsage as { five_hour?: { resets_at: string | null } } | null
-			)?.five_hour?.resets_at;
-			const newResetAt = codexUsage.five_hour?.resets_at;
+				prevUsage as {
+					five_hour?: { resets_at: string | null };
+					seven_day?: { resets_at: string | null };
+				} | null
+			)?.[windowSlot]?.resets_at;
+			const newResetAt = codexUsage[windowSlot]?.resets_at;
 			const windowRolledOver =
 				prevResetAt != null &&
 				newResetAt != null &&
@@ -209,6 +224,20 @@ export function updateAccountMetadata(
 				`Updated Codex usage cache for ${account.name}: 5h=${codexUsage.five_hour?.utilization ?? "?"}%, 7d=${codexUsage.seven_day?.utilization ?? "?"}%`,
 			);
 
+			// The cache above expires in 10 minutes and dies with the process, so
+			// also persist the windows into usage_snapshots — the only place a Codex
+			// weekly percentage survives a restart. Throttled per account inside the
+			// helper (recordSnapshot has no dedup by design).
+			ctx.asyncWriter.enqueue(() =>
+				recordCodexUsageSnapshot(
+					ctx.dbOps,
+					account.id,
+					account.name,
+					codexUsage as unknown as Record<string, unknown>,
+					Date.now(),
+				).then(() => undefined),
+			);
+
 			// Update rate_limit_reset from usage headers so auto-refresh can track windows
 			const resetTimes = [
 				codexUsage.five_hour?.resets_at,
@@ -230,7 +259,7 @@ export function updateAccountMetadata(
 
 			if (windowRolledOver) {
 				log.info(
-					`Codex window rolled over for ${account.name}: ${prevResetAt} → ${newResetAt}, resetting session`,
+					`Codex ${windowSlot} window rolled over for ${account.name}: ${prevResetAt} → ${newResetAt}, resetting session`,
 				);
 				ctx.dbOps
 					.resetAccountSession(account.id, Date.now())

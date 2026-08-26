@@ -54,14 +54,21 @@ function makeDb() {
  * - an `Error` — the write rejects (DB unavailable).
  */
 function makeProxyContext(flagOutcome: boolean | Error = true) {
-	const flagCalls: Array<[string, string]> = [];
+	const flagCalls: Array<[string, string, number]> = [];
 	return {
 		runtime: { port: 8080, clientId: "test-client" },
 		refreshInFlight: new Map(),
 		dbOps: {
+			getAccount: mock(async (accountId: string) =>
+				accountId === row.id ? row : null,
+			),
 			flagRequiresReauthIfTokenMatches: mock(
-				async (accountId: string, expectedRefreshToken: string) => {
-					flagCalls.push([accountId, expectedRefreshToken]);
+				async (
+					accountId: string,
+					expectedRefreshToken: string,
+					expectedCreatedAt: number,
+				) => {
+					flagCalls.push([accountId, expectedRefreshToken, expectedCreatedAt]);
 					if (flagOutcome instanceof Error) throw flagOutcome;
 					return flagOutcome;
 				},
@@ -88,6 +95,7 @@ async function makeScheduler(
 				name: string;
 				provider: string;
 				refresh_token: string;
+				created_at: number;
 			},
 		): Promise<void>;
 	};
@@ -98,6 +106,7 @@ const row = {
 	name: "test-account",
 	provider: "qwen",
 	refresh_token: "RT1-consumed",
+	created_at: 1,
 };
 const invalidGrant = new OAuthRefreshTokenError(
 	"acc-1",
@@ -135,7 +144,7 @@ describe("AutoRefreshScheduler — rotation-race guard before requires_reauth", 
 			scheduler.flagIfDefinitiveAuthFailure(invalidGrant, row),
 		);
 
-		expect(proxyContext.flagCalls).toEqual([["acc-1", "RT1-consumed"]]);
+		expect(proxyContext.flagCalls).toEqual([["acc-1", "RT1-consumed", 1]]);
 		expect(
 			db.runCalls.find(([sql]) => sql.includes("requires_reauth")),
 		).toBeUndefined();
@@ -151,7 +160,7 @@ describe("AutoRefreshScheduler — rotation-race guard before requires_reauth", 
 			scheduler.flagIfDefinitiveAuthFailure(invalidGrant, row),
 		);
 
-		expect(proxyContext.flagCalls).toEqual([["acc-1", "RT1-consumed"]]);
+		expect(proxyContext.flagCalls).toEqual([["acc-1", "RT1-consumed", 1]]);
 		expect(events).toHaveLength(1);
 		expect(events[0]).toMatchObject({
 			accountId: "acc-1",
@@ -198,6 +207,7 @@ describe("AutoRefreshScheduler — rotation-race guard before requires_reauth", 
 			expiresAt: Date.now() + 60_000,
 			refreshToken: "rt-new",
 			attemptedRefreshToken: row.refresh_token,
+			createdAt: row.created_at,
 		});
 		const scheduler = await makeScheduler(db, proxyContext);
 

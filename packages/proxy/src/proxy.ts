@@ -1,9 +1,12 @@
 import {
 	formatXaiCacheCanary,
 	getModelFamily,
+	isForceAccountModelEnabled as isForceAccountModelRewriteEnabled,
 	MAX_REQUEST_BODY_BYTES,
 	RequestBodyTooLargeError,
 	requestEvents,
+	resolveBuildProvenance,
+	runForceAccountModelExempt,
 	ServiceUnavailableError,
 	trackClientVersion,
 } from "@better-ccflare/core";
@@ -88,6 +91,7 @@ import {
 	RequestBodyContext,
 	type RequestJsonBody,
 	RoutingAttemptLedger,
+	recordSelectedOrder,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
 	setXaiConvId,
@@ -97,6 +101,8 @@ import {
 	getCapacityDeferredModelRoutes,
 	getClientVisibleServerToolAccountId,
 	getReactiveModelCapacityBlocker,
+	isComboSessionFallbackDisabled,
+	isForceAccountModelEnabled,
 } from "./handlers/account-selector";
 import {
 	type AnthropicDegradedRequestSendState,
@@ -217,6 +223,22 @@ function forceRouteUnavailableResponse(
 				"x-better-ccflare-force-route": "unavailable",
 			},
 		},
+	);
+}
+
+/** No account can serve the effective model without rewriting it. */
+function createForceAccountModelResponse(model: string): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "service_unavailable_error",
+				code: "force_account_model_no_account",
+				model,
+				message: `No account can serve requested model ${model} without rewriting it.`,
+			},
+		}),
+		{ status: 503, headers: { "content-type": "application/json" } },
 	);
 }
 
@@ -428,11 +450,6 @@ function degradedSizeBucket(input: {
 	return nearTokens || nearBytes ? "near_threshold" : "small";
 }
 
-function isComboSessionFallbackDisabled(): boolean {
-	const value = process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK;
-	return /^(1|true|yes|on)$/i.test(value ?? "");
-}
-
 function createComboSessionFallbackDisabledResponse(
 	comboName: string,
 ): Response {
@@ -549,7 +566,21 @@ export function getUsageCollectorHealth(): UsageCollectorHealth {
  * @throws {ServiceUnavailableError} If all accounts fail to proxy the request
  * @throws {ProviderError} If unauthenticated proxy fails
  */
-export async function handleProxy(
+export function handleProxy(
+	req: Request,
+	url: URL,
+	ctx: ProxyContext,
+	apiKeyId?: string | null,
+	apiKeyName?: string | null,
+): Promise<Response> {
+	return isInternalProbe(req.headers, ctx)
+		? runForceAccountModelExempt(() =>
+				handleProxyImpl(req, url, ctx, apiKeyId, apiKeyName),
+			)
+		: handleProxyImpl(req, url, ctx, apiKeyId, apiKeyName);
+}
+
+async function handleProxyImpl(
 	req: Request,
 	url: URL,
 	ctx: ProxyContext,
@@ -732,13 +763,25 @@ async function handleProxyCoreImpl(
 	}
 
 	// 0. Silently ignore Claude Code internal endpoints (non-critical, not supported by all providers)
-	if (
-		url.pathname === "/api/event_logging/batch" ||
-		url.pathname === "/api/system/package-manager"
-	) {
+	if (url.pathname === "/api/event_logging/batch") {
 		return new Response(JSON.stringify({ success: true }), {
 			status: 200,
 			headers: { "Content-Type": "application/json" },
+		});
+	}
+
+	// This compatibility endpoint bypasses APIRouter. It is intentionally a
+	// resolver-only subset: no installation inference and no remote lookup.
+	if (url.pathname === "/api/system/package-manager") {
+		const provenance = resolveBuildProvenance();
+		return Response.json({
+			provenance: {
+				identity: provenance.identity,
+				producer: provenance.producer,
+				artifactMode: provenance.artifactMode,
+				proven: provenance.proven,
+				reason: provenance.reason,
+			},
 		});
 	}
 
@@ -970,6 +1013,11 @@ async function handleProxyCoreImpl(
 					{
 						frontmatterModelFallback:
 							ctx.config.getAgentFrontmatterModelFallback(),
+						// Selection intentionally reads the context setting and applies
+						// its own secret-verified probe carve-outs. The interceptor
+						// needs the ambient core view so the request-wide exemption
+						// reaches this rewrite path too.
+						forceAccountModel: isForceAccountModelRewriteEnabled(),
 					},
 				),
 		});
@@ -1618,6 +1666,11 @@ async function handleProxyCoreImpl(
 			reactivelyDepletedAccounts,
 		};
 	};
+	const applyUsageThrottlingAndRecord = (accounts: Account[]) => {
+		const selection = applyUsageThrottling(accounts);
+		recordSelectedOrder(effectiveModel, selection.available, Date.now());
+		return selection;
+	};
 
 	// Cache ownership is a property of the physical candidate that actually
 	// served a successful response, never of the account ranked first. Carry
@@ -1713,7 +1766,7 @@ async function handleProxyCoreImpl(
 		available: accounts,
 		predictivelyThrottled: throttledAccounts,
 		reactivelyDepletedAccounts,
-	} = applyUsageThrottling(selectedAccounts);
+	} = applyUsageThrottlingAndRecord(selectedAccounts);
 
 	if (canaryCandidate && accounts[0]?.provider === "codex") {
 		pacingBypassed = true;
@@ -1775,7 +1828,7 @@ async function handleProxyCoreImpl(
 			available: accounts,
 			predictivelyThrottled: throttledAccounts,
 			reactivelyDepletedAccounts,
-		} = applyUsageThrottling(selectedAccounts));
+		} = applyUsageThrottlingAndRecord(selectedAccounts));
 	}
 	const selectedCapacityDeferredRoutes =
 		getCapacityDeferredModelRoutes(requestMeta);
@@ -1884,7 +1937,7 @@ async function handleProxyCoreImpl(
 		// throw below can leave a stale mapping (KTD-5).
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 
-		if (requestMeta.comboName && isComboSessionFallbackDisabled()) {
+		if (requestMeta.comboName && isComboSessionFallbackDisabled(ctx)) {
 			return finishPacing(
 				pacingSlot,
 				await returnComboSessionFallbackDisabled(requestMeta.comboName, 0),
@@ -1909,6 +1962,20 @@ async function handleProxyCoreImpl(
 			return finishPacing(
 				pacingSlot,
 				createUsageThrottledResponse(throttledAccounts),
+			);
+		}
+
+		// This follows concrete capacity/throttling answers, which carry useful
+		// recovery information, but precedes generic empty-pool handling.
+		if (
+			effectiveModel &&
+			isForceAccountModelEnabled(ctx) &&
+			!trustedInternalAutoRefresh &&
+			!trustedInternalKeepalive
+		) {
+			return finishPacing(
+				pacingSlot,
+				createForceAccountModelResponse(effectiveModel),
 			);
 		}
 
@@ -2190,7 +2257,7 @@ async function handleProxyCoreImpl(
 			canReplayContextOverflow: () =>
 				!currentlyFinalSemanticRoute ||
 				deferredModelRoutes.length > 0 ||
-				(comboName !== null && !isComboSessionFallbackDisabled()),
+				(comboName !== null && !isComboSessionFallbackDisabled(ctx)),
 			anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
 			deferImplicitFallback: (model, fallbackRank) => {
 				deferModelRoute(
@@ -2811,7 +2878,7 @@ async function handleProxyCoreImpl(
 				.slice(i + 1)
 				.some((candidate) => !wouldSuppressProbe(candidate)) ||
 				(filteredComboInfo?.comboName != null &&
-					!isComboSessionFallbackDisabled()),
+					!isComboSessionFallbackDisabled(ctx)),
 		);
 		if (preferredResponse) return preferredResponse;
 
@@ -2930,7 +2997,8 @@ async function handleProxyCoreImpl(
 			}
 		}
 		const preferredResponse = await attemptPreferredContextOverflowRoute(
-			filteredComboInfo?.comboName != null && !isComboSessionFallbackDisabled(),
+			filteredComboInfo?.comboName != null &&
+				!isComboSessionFallbackDisabled(ctx),
 		);
 		if (preferredResponse) return preferredResponse;
 	}
@@ -2942,7 +3010,7 @@ async function handleProxyCoreImpl(
 	let throttledFallbackAccounts: Account[] = [];
 	let fallbackSelectionHadNoAvailable = false;
 	const disabledComboSessionFallbackName =
-		filteredComboInfo?.comboName && isComboSessionFallbackDisabled()
+		filteredComboInfo?.comboName && isComboSessionFallbackDisabled(ctx)
 			? filteredComboInfo.comboName
 			: null;
 	if (filteredComboInfo?.comboName && !disabledComboSessionFallbackName) {
@@ -3029,7 +3097,9 @@ async function handleProxyCoreImpl(
 				requestMeta.affinityOwnerDirective.owner.accountId,
 			);
 		}
-		const fallbackSelection = applyUsageThrottling(selectedFallbackAccounts);
+		const fallbackSelection = applyUsageThrottlingAndRecord(
+			selectedFallbackAccounts,
+		);
 		const filteredFallbackAccounts = fallbackSelection.available;
 		throttledFallbackAccounts = fallbackSelection.predictivelyThrottled;
 		reactivelyDepletedFallbackAccounts =

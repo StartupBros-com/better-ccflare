@@ -20,7 +20,8 @@ const creationMethodNames = [
 	"addBedrockAccount",
 	"addZaiAccount",
 	"addMinimaxAccount",
-	"addMuseSparkAccount",
+	"addDeepseekAccount",
+	"addMetaAccount",
 	"addNanoGPTAccount",
 	"addAlibabaCodingPlanAccount",
 	"addKiloAccount",
@@ -37,7 +38,8 @@ const creationCallbackNames = [
 	"onAddBedrockAccount",
 	"onAddZaiAccount",
 	"onAddMinimaxAccount",
-	"onAddMuseSparkAccount",
+	"onAddDeepseekAccount",
+	"onAddMetaAccount",
 	"onAddNanoGPTAccount",
 	"onAddAlibabaCodingPlanAccount",
 	"onAddKiloAccount",
@@ -130,7 +132,7 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 }
 
 describe("AccountsTab account creation identity", () => {
-	it("returns the exact immutable API accountId from all 14 creation callbacks", async () => {
+	it("returns the exact immutable API accountId from all 15 creation callbacks", async () => {
 		const calls: string[] = [];
 		const client = Object.fromEntries(
 			creationMethodNames.map((methodName, index) => [
@@ -154,7 +156,7 @@ describe("AccountsTab account creation identity", () => {
 
 		expect(Object.keys(callbacks)).toEqual([...creationCallbackNames]);
 		expect(calls).toEqual([...creationMethodNames]);
-		expect(afterCreate).toHaveBeenCalledTimes(14);
+		expect(afterCreate).toHaveBeenCalledTimes(15);
 		expect(identities).toEqual(
 			creationMethodNames.map((_, index) => ({
 				accountId: `server-id-${index}`,

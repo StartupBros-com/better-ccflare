@@ -9,11 +9,8 @@ import {
 // hand-maintain the account-mode list in three separate places (the
 // --mode validModes array, the --help text, and the "Available modes"
 // error printed when --add-account is given without --mode). Those
-// listings drifted: --help and the no-mode error were missing "ollama"
-// and "muse-spark". The fix hoists a single ACCOUNT_MODES constant that
-// all three listings derive from, so this suite asserts derivation
-// directly from the constant (no hardcoded mode list in the test) plus
-// an explicit pin for the two modes that were previously missing.
+// listings now derive from ACCOUNT_MODES, with canonical `meta` replacing
+// the legacy CLI-only `muse-spark` spelling.
 
 describe("ACCOUNT_MODES is the single source of truth for account modes", () => {
 	test("has no duplicate entries", () => {
@@ -35,15 +32,15 @@ describe("ACCOUNT_MODES is the single source of truth for account modes", () => 
 		}
 	});
 
-	test("regression pin: ollama and muse-spark appear in --help output", () => {
+	test("uses canonical meta mode rather than the legacy muse-spark CLI alias", () => {
 		const help = renderHelpText("0.0.0-test");
-		expect(help).toContain("ollama");
-		expect(help).toContain("muse-spark");
-	});
-
-	test("regression pin: ollama and muse-spark appear in the no-mode usage error", () => {
 		const usageError = renderAddAccountModeUsageError();
-		expect(usageError).toContain("ollama");
-		expect(usageError).toContain("muse-spark");
+
+		expect(ACCOUNT_MODES).toContain("meta");
+		expect(ACCOUNT_MODES).not.toContain("muse-spark");
+		expect(help).toContain("meta");
+		expect(help).not.toContain("muse-spark");
+		expect(usageError).toContain("meta");
+		expect(usageError).not.toContain("muse-spark");
 	});
 });

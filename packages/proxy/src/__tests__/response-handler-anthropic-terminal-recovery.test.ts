@@ -473,7 +473,9 @@ describe("forwardToClient SSE terminal-state propagation", () => {
 		}
 	});
 
-	it("preserves success:true and records state=client_cancelled when the client disconnects mid-stream", async () => {
+	// Client cancellation propagates through teeStream to the terminal-recovery
+	// wrapper, so the lifecycle records the downstream cancellation distinctly.
+	it("records downstream cancellation state when the client disconnects mid-stream", async () => {
 		// Claude Code cancels streams routinely (Esc, tool interrupts,
 		// client aborts). Those are NOT upstream failures or proxy defects
 		// — recording them as success:false would poison the success-rate

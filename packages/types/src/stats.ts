@@ -317,6 +317,13 @@ export interface HealthResponse {
 	 */
 	git_ref?: string;
 	build_date?: string;
+	distribution?: {
+		identity: string | null;
+		producer: "startupbros" | "tombii" | null;
+		artifactMode: "managed-source" | "docker" | "package" | "binary" | null;
+		proven: boolean;
+		reason: string;
+	};
 	pool?: PoolStatus;
 	routing?: RoutingHealth;
 	accounts_detail?: Array<AccountDetail>;

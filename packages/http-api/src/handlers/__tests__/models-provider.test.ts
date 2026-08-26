@@ -53,6 +53,10 @@ function makeContext(opts: {
 			supersededBy?: string | null;
 		}>;
 	} | null;
+	openaiCompatible?: {
+		models: Array<{ id: string; displayName: string }>;
+		source?: "live" | "cached";
+	} | null;
 	anthropic?: {
 		models: Array<{ id: string; displayName: string }>;
 		source: string;
@@ -71,6 +75,14 @@ function makeContext(opts: {
 							})),
 							fetchedAt: 1_000,
 							source: "live" as const,
+						}
+					: null,
+			openaiCompatibleModels: async () =>
+				opts.openaiCompatible
+					? {
+							models: opts.openaiCompatible.models,
+							fetchedAt: 1_000,
+							source: opts.openaiCompatible.source ?? "live",
 						}
 					: null,
 			get: async () => ({
@@ -167,6 +179,51 @@ describe("GET /api/models", () => {
 		]);
 		expect(body.models.every((m) => m.source === "account")).toBe(true);
 		expect(body.warning).toBeUndefined();
+	});
+
+	it("returns only the exact compatible account's discovered models", async () => {
+		const body = await ask(
+			makeContext({
+				openaiCompatible: {
+					models: [{ id: "local-only", displayName: "Local only" }],
+					source: "cached",
+				},
+			}),
+			"provider=openai-compatible&accountId=acc-oai",
+		);
+
+		expect(body.models).toEqual([
+			{ id: "local-only", displayName: "Local only", source: "account" },
+		]);
+		expect(body.source).toBe("cached");
+		expect(body.provider).toBe("openai-compatible");
+	});
+
+	it("does not use compatible account discovery for a mismatched requested provider", async () => {
+		let compatibleCalls = 0;
+		const context = makeContext({
+			codex: null,
+			openaiCompatible: {
+				models: [{ id: "local-only", displayName: "Local only" }],
+			},
+		});
+		const catalog = context.modelCatalog;
+		if (!catalog) throw new Error("test context is missing its model catalog");
+		catalog.openaiCompatibleModels = async () => {
+			compatibleCalls++;
+			return {
+				models: [{ id: "local-only", displayName: "Local only" }],
+				fetchedAt: 1_000,
+				source: "live",
+			};
+		};
+
+		const body = await ask(context, "provider=codex&accountId=acc-oai");
+
+		expect(compatibleCalls).toBe(0);
+		expect(body.provider).toBe("codex");
+		expect(body.models).toEqual([]);
+		expect(body.source).toBe("unavailable");
 	});
 
 	// Nothing is substituted here on purpose. A catalogue would fill the gap with

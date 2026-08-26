@@ -695,6 +695,12 @@ export function translateRequestToAnthropic(
 			continue;
 		}
 
+		if (item.type === "additional_tools") {
+			// The handler preserves this item in the private Codex passthrough carrier.
+			// It intentionally has no Anthropic message-content representation here.
+			continue;
+		}
+
 		emitWarn(
 			`Dropping unhandled Responses input item type "${itemType}" — no Anthropic mapping implemented`,
 		);

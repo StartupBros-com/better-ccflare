@@ -39,6 +39,7 @@ export {
 	TokenRefreshError,
 	ValidationError,
 } from "./errors";
+export * from "./force-account-model";
 export * from "./lifecycle";
 export {
 	type BoundedOAuthResponseText,
@@ -81,6 +82,7 @@ export {
 	parseCustomEndpointData,
 	parseModelFallbacks,
 	parseModelMappings,
+	providerAcceptsClientModel,
 	resolveCompatibleEndpoint,
 	resolveFamilyAliasModel,
 	validateAndSanitizeModelFallbacks,
@@ -120,6 +122,7 @@ export {
 	setPricingLogger,
 	type TokenBreakdown,
 } from "./pricing";
+export * from "./probe-backoff";
 export * from "./request-events";
 export {
 	SseFrameBuffer,

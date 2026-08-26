@@ -1,6 +1,7 @@
 import { Logger } from "@better-ccflare/logger";
 import type { Account, ComboFamily } from "@better-ccflare/types";
 import { ValidationError } from "./errors";
+import { isForceAccountModelEnabled } from "./force-account-model";
 import { LATEST_MODEL_BY_FAMILY } from "./models";
 import {
 	MAX_MODEL_MAPPING_CANDIDATES,
@@ -370,11 +371,26 @@ export function getModelList(
 	return [anthropicModel];
 }
 
+/** Providers whose upstream natively accepts Claude model ids. */
+const PROVIDERS_ACCEPTING_CLIENT_MODEL = new Set([
+	"anthropic",
+	"claude-console-api",
+	"deepseek",
+]);
+
+/** Whether this provider understands a Claude model id without translation. */
+export function providerAcceptsClientModel(
+	provider: string | null | undefined,
+): boolean {
+	return PROVIDERS_ACCEPTING_CLIENT_MODEL.has(provider ?? "anthropic");
+}
+
 /**
  * Map Anthropic model name to provider-specific model name (first in list).
  * Optimized for known model patterns with direct matching (O(1) vs O(n log n))
  */
 export function mapModelName(anthropicModel: string, account: Account): string {
+	if (isForceAccountModelEnabled()) return anthropicModel;
 	const list = getModelList(anthropicModel, account);
 	if (!list) return anthropicModel;
 

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { resolveBuildProvenance } from "@better-ccflare/core";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -447,7 +448,16 @@ describe("render_systemd_pin", () => {
 				"StartLimitIntervalSec=300s",
 				"StartLimitBurst=5",
 				"[Service]",
+				"Environment=KEEP_ME=unchanged",
+				"Environment=OPERATOR_OVERRIDE=must-not-survive",
 				"Environment=CCFLARE_BIN=/new/bin",
+				"Environment=CCFLARE_DISTRIBUTION=v1:startupbros-managed-source",
+				"Environment=CCFLARE_PRODUCER=startupbros",
+				"Environment=CCFLARE_ARTIFACT_MODE=managed-source",
+				"Environment=CCFLARE_GIT_SHA=abc123",
+				"Environment=CCFLARE_GIT_REF=refs/heads/main",
+				"Environment=CCFLARE_SOURCE_SHA=abc123",
+				"Environment=CCFLARE_SOURCE_REF=refs/heads/main",
 				`Environment=GUARD_SCRIPT=${guardScript}`,
 				"Environment=GUARD_SOURCE_ID=abc123",
 				"Environment=GUARD_POLICY_ID=pool-exhaustion-finite-recovery-v1",
@@ -487,9 +497,308 @@ describe("render_systemd_pin", () => {
 		expect(readFileSync(secondOutput, "utf8")).toBe(
 			readFileSync(output, "utf8"),
 		);
+		expect(readFileSync(output, "utf8")).toContain(
+			"Environment=KEEP_ME=unchanged",
+		);
+		expect(readFileSync(output, "utf8")).toContain(
+			"Environment=OPERATOR_OVERRIDE=must-not-survive",
+		);
 		expect(readFileSync(output, "utf8")).not.toContain(
 			"CCFLARE_GUARD_CORRELATION_SECRET",
 		);
+	});
+
+	test("preserves unrelated assignments from mixed Environment directives", () => {
+		const dir = tempDir();
+		const input = join(dir, "pin.conf");
+		const output = join(dir, "pin.rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
+		writeFileSync(
+			input,
+			[
+				"# BEGIN better-ccflare managed deployment",
+				"[Service]",
+				'Environment="NODE_OPTIONS=--max-old-space-size=4096" "CCFLARE_MAX_BODY_ADMISSION_QUEUE=400" "HTTP_PROXY=http://proxy.example"',
+				"# END better-ccflare managed deployment",
+				"",
+			].join("\n"),
+		);
+
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(0);
+		const rendered = readFileSync(output, "utf8");
+		expect(rendered).toContain(
+			'Environment="NODE_OPTIONS=--max-old-space-size=4096" "HTTP_PROXY=http://proxy.example"',
+		);
+		expect(rendered).not.toContain("CCFLARE_MAX_BODY_ADMISSION_QUEUE=400");
+		expect(rendered).toContain("Environment=CCFLARE_MAX_BODY_ADMISSION_QUEUE=500");
+	});
+
+	test("preserves only final effective unowned assignments after resets and excludes stale Docker provenance", () => {
+		const dir = tempDir();
+		const input = join(dir, "pin.conf");
+		const output = join(dir, "pin.rendered.conf");
+		const secondOutput = join(dir, "pin.second-rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
+		writeFileSync(
+			input,
+			[
+				"# BEGIN better-ccflare managed deployment",
+				"[Service]",
+				'Environment=HTTP_PROXY=http://before.example "KEEP=before reset" CCFLARE_VERSION=v3.5.65 CCFLARE_BUILD_DATE=2026-08-01',
+				"Environment=CCFLARE_CHECKOUT_SHA=checkout CCFLARE_EVENT_SHA=event CCFLARE_TAG_SHA=tag",
+				"Environment=",
+				'Environment="HTTP_PROXY=http://after.example" \\',
+				'  \'KEEP=after reset\' "CONTINUED=raw spelling"',
+				'Environment=HTTP_PROXY=http://final.example "KEEP=final value"',
+				"# END better-ccflare managed deployment",
+				"",
+			].join("\n"),
+		);
+
+		const render = (source: string, target: string) =>
+			bash(
+				[
+					`source ${shellQuote(helperScriptForShell)}`,
+					`render_systemd_pin ${shellQuote(shellPath(source))} ${shellQuote(shellPath(target))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
+				].join("\n"),
+			);
+
+		const first = render(input, output);
+		expect(first.exitCode).toBe(0);
+		const rendered = readFileSync(output, "utf8");
+		expect(rendered).toContain('Environment="CONTINUED=raw spelling"');
+		expect(rendered).toContain(
+			'Environment=HTTP_PROXY=http://final.example "KEEP=final value"',
+		);
+		for (const stale of [
+			"HTTP_PROXY=http://before.example",
+			"KEEP=before reset",
+			"HTTP_PROXY=http://after.example",
+			"KEEP=after reset",
+			"CCFLARE_VERSION=v3.5.65",
+			"CCFLARE_BUILD_DATE=2026-08-01",
+			"CCFLARE_CHECKOUT_SHA=checkout",
+			"CCFLARE_EVENT_SHA=event",
+			"CCFLARE_TAG_SHA=tag",
+		]) {
+			expect(rendered).not.toContain(stale);
+		}
+
+		const second = render(output, secondOutput);
+		expect(second.exitCode).toBe(0);
+		expect(readFileSync(secondOutput, "utf8")).toBe(rendered);
+	});
+
+	test("treats quoted empty Environment directives as resets", () => {
+		const dir = tempDir();
+		const input = join(dir, "pin.conf");
+		const output = join(dir, "pin.rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
+		writeFileSync(
+			input,
+			[
+				"# BEGIN better-ccflare managed deployment",
+				"[Service]",
+				"Environment=BEFORE_RESET=old",
+				'Environment=""',
+				"Environment=AFTER_DOUBLE_RESET=must-not-survive",
+				"Environment=''",
+				"Environment=AFTER_SINGLE_RESET=survives",
+				"# END better-ccflare managed deployment",
+				"",
+			].join("\n"),
+		);
+
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(0);
+		const rendered = readFileSync(output, "utf8");
+		expect(rendered).toContain("Environment=AFTER_SINGLE_RESET=survives");
+		expect(rendered).not.toContain("BEFORE_RESET=old");
+		expect(rendered).not.toContain("AFTER_DOUBLE_RESET=must-not-survive");
+	});
+
+	test("ignores comments within Environment continuations", () => {
+		const dir = tempDir();
+		const input = join(dir, "pin.conf");
+		const output = join(dir, "pin.rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
+		writeFileSync(
+			input,
+			[
+				"# BEGIN better-ccflare managed deployment",
+				"[Service]",
+				"Environment=HTTP_PROXY=http://proxy.example \\",
+				"  # This comment must not terminate the continuation.",
+				'  "KEEP=continued value"',
+				"# END better-ccflare managed deployment",
+				"",
+			].join("\n"),
+		);
+
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(0);
+		const rendered = readFileSync(output, "utf8");
+		expect(rendered).toContain(
+			'Environment=HTTP_PROXY=http://proxy.example "KEEP=continued value"',
+		);
+		expect(rendered).not.toContain("This comment must not terminate");
+	});
+
+	test("classifies escaped Environment names while retaining their raw spelling", () => {
+		const dir = tempDir();
+		const input = join(dir, "pin.conf");
+		const output = join(dir, "pin.rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
+		writeFileSync(
+			input,
+			[
+				"# BEGIN better-ccflare managed deployment",
+				"[Service]",
+				"Environment=HTTP_PROXY\\x3dhttp://proxy.example HTTPS_PROXY\\075http://secure-proxy.example CCFLARE_BIN\\x3d/stale/bin",
+				"# END better-ccflare managed deployment",
+				"",
+			].join("\n"),
+		);
+
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(0);
+		const rendered = readFileSync(output, "utf8");
+		expect(rendered).toContain(
+			"Environment=HTTP_PROXY\\x3dhttp://proxy.example HTTPS_PROXY\\075http://secure-proxy.example",
+		);
+		expect(rendered).not.toContain("CCFLARE_BIN\\x3d/stale/bin");
+	});
+
+	test("accepts documented C escapes without changing raw tokens", () => {
+		const dir = tempDir();
+		const input = join(dir, "pin.conf");
+		const output = join(dir, "pin.rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
+		const escapes = [
+			"a",
+			"b",
+			"f",
+			"n",
+			"r",
+			"t",
+			"v",
+			"\\",
+			'"',
+			"'",
+			"s",
+			"040",
+			"101",
+		];
+		const assignments = escapes.map((escape, index) => `ESCAPE_${index}=\\${escape}`);
+		writeFileSync(
+			input,
+			[
+				"# BEGIN better-ccflare managed deployment",
+				"[Service]",
+				`Environment=${assignments.join(" ")}`,
+				"# END better-ccflare managed deployment",
+				"",
+			].join("\n"),
+		);
+
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(readFileSync(output, "utf8")).toContain(
+			`Environment=${assignments.join(" ")}`,
+		);
+	});
+
+	test("rejects malformed C escapes in Environment directives", () => {
+		for (const invalid of ["\\x", "\\x3g", "\\08", "\\q"]) {
+			const dir = tempDir();
+			const input = join(dir, "pin.conf");
+			const output = join(dir, "pin.rendered.conf");
+			const { guard, policy, runner } = writeDigestFixtures(dir);
+			writeFileSync(
+				input,
+				[
+					"# BEGIN better-ccflare managed deployment",
+					"[Service]",
+					`Environment=HTTP_PROXY${invalid}http://proxy.example`,
+					"# END better-ccflare managed deployment",
+					"",
+				].join("\n"),
+			);
+
+			const result = bash(
+				[
+					`source ${shellQuote(helperScriptForShell)}`,
+					`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
+				].join("\n"),
+			);
+
+			expect(result.exitCode).toBe(2);
+			expect(capturedOutput(result.stderr, "stderr")).toContain(
+				"invalid systemd Environment directive: invalid escape",
+			);
+		}
+	});
+
+	test("does not preserve the deployment-owned update channel from mixed Environment directives", () => {
+		const dir = tempDir();
+		const input = join(dir, "pin.conf");
+		const output = join(dir, "pin.rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
+		writeFileSync(
+			input,
+			[
+				"# BEGIN better-ccflare managed deployment",
+				"[Service]",
+				'Environment="NODE_OPTIONS=--max-old-space-size=4096" \'CCFLARE_UPDATE_CHANNEL=nightly\' "HTTP_PROXY=http://proxy.example"',
+				"# END better-ccflare managed deployment",
+				"",
+			].join("\n"),
+		);
+
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(0);
+		const rendered = readFileSync(output, "utf8");
+		expect(rendered).toContain(
+			'Environment="NODE_OPTIONS=--max-old-space-size=4096" "HTTP_PROXY=http://proxy.example"',
+		);
+		expect(rendered).not.toContain("CCFLARE_UPDATE_CHANNEL=nightly");
 	});
 
 	test("leaves correlation credential generation to the restart-scoped runner", () => {
@@ -630,8 +939,39 @@ describe("render_systemd_pin", () => {
 	});
 });
 
+describe("deployment provenance pin", () => {
+	test("renders an exact managed-source identity and leaves a restored legacy pin unproven", () => {
+		const dir = tempDir();
+		const input = join(dir, "legacy.conf");
+		const output = join(dir, "rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
+		writeFileSync(input, "# legacy pin without provenance\n");
+		const result = bash([
+			`source ${shellQuote(helperScriptForShell)}`,
+			`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abcdef1234567890abcdef1234567890abcdef12 policy-v1 ${shellQuote(shellPath(policy))}`,
+		].join("\n"));
+		expect(result.exitCode).toBe(0);
+		const rendered = readFileSync(output, "utf8");
+		for (const line of [
+			"Environment=CCFLARE_DISTRIBUTION=v1:startupbros-managed-source",
+			"Environment=CCFLARE_PRODUCER=startupbros",
+			"Environment=CCFLARE_ARTIFACT_MODE=managed-source",
+			"Environment=CCFLARE_GIT_SHA=abcdef1234567890abcdef1234567890abcdef12",
+			"Environment=CCFLARE_GIT_REF=refs/heads/main",
+			"Environment=CCFLARE_SOURCE_SHA=abcdef1234567890abcdef1234567890abcdef12",
+			"Environment=CCFLARE_SOURCE_REF=refs/heads/main",
+		]) expect(rendered).toContain(line);
+
+		const legacy = resolveBuildProvenance({
+			CCFLARE_GIT_SHA: "abcdef1234567890abcdef1234567890abcdef12",
+			CCFLARE_GIT_REF: "refs/heads/main",
+		});
+		expect(legacy).toMatchObject({ proven: false, reason: "unknown_distribution" });
+	});
+});
+
 describe("configured_systemd_environment_value", () => {
-	test("reads the last plain or quoted numeric operator value", () => {
+	test("reads the last plain, quoted, or escaped numeric operator value", () => {
 		const dir = tempDir();
 		const pin = join(dir, "pin.conf");
 		writeFileSync(
@@ -640,6 +980,7 @@ describe("configured_systemd_environment_value", () => {
 				"[Service]",
 				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
 				'Environment="GUARD_TOTAL_DEADLINE_MS=900000"',
+				"Environment=GUARD_TOTAL_DEADLINE_MS\\075950000",
 				"",
 			].join("\n"),
 		);
@@ -650,7 +991,7 @@ describe("configured_systemd_environment_value", () => {
 			].join("\n"),
 		);
 		expect(result.exitCode).toBe(0);
-		expect(capturedOutput(result.stdout, "stdout").trim()).toBe("900000");
+		expect(capturedOutput(result.stdout, "stdout").trim()).toBe("950000");
 	});
 
 	test("matches systemd Service-section, reset, continuation, and last-wins semantics", () => {

@@ -14,11 +14,12 @@ function makeDb(rows: Array<Record<string, unknown>>) {
 	return {
 		run: mock(async () => {}),
 		runWithChanges: mock(async () => 1),
-		query: mock(async () => rows),
+		query: mock(async () => rows.map((row) => ({ created_at: 1, ...row }))),
 	};
 }
 
 function makeProxyContext(flagResult = true) {
+	const currentAccount = { ...baseRow, created_at: 1 };
 	const flagRequiresReauthIfTokenMatches = mock(
 		async (_accountId: string, _refreshToken: string) => flagResult,
 	);
@@ -26,7 +27,12 @@ function makeProxyContext(flagResult = true) {
 		context: {
 			runtime: { port: 8080, clientId: "test-client" },
 			refreshInFlight: new Map(),
-			dbOps: { flagRequiresReauthIfTokenMatches },
+			dbOps: {
+				getAccount: mock(async (accountId: string) =>
+					accountId === currentAccount.id ? currentAccount : null,
+				),
+				flagRequiresReauthIfTokenMatches,
+			},
 		},
 		flagRequiresReauthIfTokenMatches,
 	};
@@ -78,6 +84,7 @@ describe("AutoRefreshScheduler — proactive refresh pause-for-reauth", () => {
 		expect(flagRequiresReauthIfTokenMatches).toHaveBeenCalledWith(
 			"acc-oauth-proactive",
 			"rt-1",
+			1,
 		);
 	});
 
@@ -152,6 +159,7 @@ describe("AutoRefreshScheduler — proactive refresh pause-for-reauth", () => {
 		expect(flagRequiresReauthIfTokenMatches).toHaveBeenCalledWith(
 			"acc-oauth-proactive",
 			"rt-1",
+			1,
 		);
 	});
 
@@ -175,6 +183,7 @@ describe("AutoRefreshScheduler — proactive refresh pause-for-reauth", () => {
 		expect(flagRequiresReauthIfTokenMatches).toHaveBeenCalledWith(
 			"acc-oauth-proactive",
 			"rt-1",
+			1,
 		);
 	});
 

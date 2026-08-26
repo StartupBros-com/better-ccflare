@@ -15,6 +15,8 @@ export type PendingRotation = {
 	refreshToken?: string;
 	/** The refresh token the successful provider call consumed ("" when none). */
 	attemptedRefreshToken: string;
+	/** Durable identity of the account row that initiated the provider exchange. */
+	createdAt?: number;
 	recordedAt: number;
 };
 
@@ -30,12 +32,14 @@ export type PendingRotationDbOps = {
 		accessToken: string,
 		expiresAt: number,
 		refreshToken?: string,
+		expectedCreatedAt?: number,
 	): Promise<boolean>;
 	updateAccountTokensIfRefreshTokenAbsent(
 		accountId: string,
 		accessToken: string,
 		expiresAt: number,
 		refreshToken?: string,
+		expectedCreatedAt?: number,
 	): Promise<boolean>;
 };
 
@@ -83,14 +87,53 @@ export function configurePendingRotationPersistence(
 	persistence = value;
 }
 
-/** Restore encrypted outbox rows before any provider refresh can run. */
-export async function restorePendingRotations(): Promise<number> {
+export type PendingRotationGenerationResolver = (
+	accountId: string,
+) => Promise<{ created_at: number } | null>;
+
+/**
+ * Restore encrypted outbox rows before any provider refresh can run.
+ *
+ * Pre-generation WAL records are upgraded against the current durable account
+ * row before becoming visible to generation-bound callers. A missing row is an
+ * orphan, so its WAL entry is removed. Without a resolver, retain the legacy
+ * ID-only restore contract for maintenance callers and older tests.
+ */
+export async function restorePendingRotations(
+	resolveCurrentGeneration?: PendingRotationGenerationResolver,
+): Promise<number> {
 	if (!persistence) return 0;
 	const rows = await persistence.load();
+	let restored = 0;
 	for (const { accountId, rotation } of rows) {
-		if (!pending.has(accountId)) pending.set(accountId, rotation);
+		if (pending.has(accountId)) continue;
+		if (rotation.createdAt === undefined && resolveCurrentGeneration) {
+			const current = await resolveCurrentGeneration(accountId);
+			if (!current) {
+				await enqueuePersistenceWrite(accountId, (store) =>
+					store.remove(accountId),
+				);
+				continue;
+			}
+			const upgraded = { ...rotation, createdAt: current.created_at };
+			// Save before publishing in-memory: a crash after a successful legacy
+			// restore must not regress this entry to wildcard ownership.
+			await enqueuePersistenceWrite(accountId, (store) =>
+				store.save(accountId, upgraded),
+			);
+			pending.set(accountId, upgraded);
+			restored += 1;
+			continue;
+		}
+		pending.set(accountId, rotation);
+		restored += 1;
 	}
-	return rows.length;
+	return restored;
+}
+
+/** Remove a rotation only after the account row itself was deleted. */
+export function clearPendingRotationForDeletedAccount(accountId: string): void {
+	clearPendingRotation(accountId);
 }
 
 /**
@@ -133,12 +176,19 @@ export async function recordPendingRotation(
 		}
 	}
 	const existing = pending.get(accountId);
+	// Never compress anchors across account generations. A same-ID replacement
+	// must own its own outbox entry; otherwise an old entry could either fence a
+	// new account's rotation or, if it lacked a legacy generation, replay into it.
+	const sameGeneration = existing?.createdAt === rotation.createdAt;
 	const next = {
 		...rotation,
-		attemptedRefreshToken: existing
-			? existing.attemptedRefreshToken
-			: rotation.attemptedRefreshToken,
-		recordedAt: existing ? existing.recordedAt : Date.now(),
+		attemptedRefreshToken:
+			existing && sameGeneration
+				? existing.attemptedRefreshToken
+				: rotation.attemptedRefreshToken,
+		createdAt:
+			existing && sameGeneration ? existing.createdAt : rotation.createdAt,
+		recordedAt: existing && sameGeneration ? existing.recordedAt : Date.now(),
 	};
 	pending.set(accountId, next);
 	await persistPendingRotation(accountId, next);
@@ -161,15 +211,34 @@ async function persistPendingRotation(
 	}
 }
 
-/** Returns the pending rotation for the account, if any. */
+/**
+ * Returns the pending rotation for the account, if any.
+ *
+ * Supplying `expectedCreatedAt` fences a modern caller to its durable account
+ * generation. Omitting it preserves the legacy ID-only contract for old outbox
+ * entries and maintenance callers.
+ */
 export function getPendingRotation(
 	accountId: string,
+	expectedCreatedAt?: number,
 ): PendingRotation | undefined {
-	return pending.get(accountId);
+	const entry = pending.get(accountId);
+	return expectedCreatedAt === undefined ||
+		entry?.createdAt === expectedCreatedAt
+		? entry
+		: undefined;
 }
 
-/** Removes any pending rotation for the account. No-op if none exists. */
-export function clearPendingRotation(accountId: string): void {
+/**
+ * Removes a pending rotation only when it belongs to `expectedCreatedAt`, when
+ * supplied. ID-only callers retain the legacy unconditional behavior.
+ */
+export function clearPendingRotation(
+	accountId: string,
+	expectedCreatedAt?: number,
+): void {
+	const entry = getPendingRotation(accountId, expectedCreatedAt);
+	if (!entry) return;
 	pending.delete(accountId);
 	void enqueuePersistenceWrite(accountId, (store) =>
 		store.remove(accountId),
@@ -220,25 +289,43 @@ export function clearAllPendingRotationsForTests(): void {
 export async function flushPendingRotation(
 	accountId: string,
 	dbOps: PendingRotationDbOps,
+	expectedCreatedAt?: number,
 ): Promise<"none" | "persisted" | "superseded" | "failed"> {
-	const entry = pending.get(accountId);
+	const entry = getPendingRotation(accountId, expectedCreatedAt);
 	if (!entry) return "none";
 
 	try {
 		const persisted = entry.attemptedRefreshToken
-			? await dbOps.updateAccountTokensIfRefreshTokenMatches(
-					accountId,
-					entry.attemptedRefreshToken,
-					entry.accessToken,
-					entry.expiresAt,
-					entry.refreshToken,
-				)
-			: await dbOps.updateAccountTokensIfRefreshTokenAbsent(
-					accountId,
-					entry.accessToken,
-					entry.expiresAt,
-					entry.refreshToken,
-				);
+			? entry.createdAt === undefined
+				? await dbOps.updateAccountTokensIfRefreshTokenMatches(
+						accountId,
+						entry.attemptedRefreshToken,
+						entry.accessToken,
+						entry.expiresAt,
+						entry.refreshToken,
+					)
+				: await dbOps.updateAccountTokensIfRefreshTokenMatches(
+						accountId,
+						entry.attemptedRefreshToken,
+						entry.accessToken,
+						entry.expiresAt,
+						entry.refreshToken,
+						entry.createdAt,
+					)
+			: entry.createdAt === undefined
+				? await dbOps.updateAccountTokensIfRefreshTokenAbsent(
+						accountId,
+						entry.accessToken,
+						entry.expiresAt,
+						entry.refreshToken,
+					)
+				: await dbOps.updateAccountTokensIfRefreshTokenAbsent(
+						accountId,
+						entry.accessToken,
+						entry.expiresAt,
+						entry.refreshToken,
+						entry.createdAt,
+					);
 
 		if (persisted) {
 			const current = pending.get(accountId);
@@ -247,7 +334,7 @@ export async function flushPendingRotation(
 				await enqueuePersistenceWrite(accountId, (store) =>
 					store.remove(accountId),
 				);
-			} else if (current) {
+			} else if (current && current.createdAt === entry.createdAt) {
 				// A newer rotation was recorded while this flush's CAS write was
 				// still in flight. The CAS we just landed moved the DB's refresh
 				// token to entry.refreshToken (or left it at the anchor when the

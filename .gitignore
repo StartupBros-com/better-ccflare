@@ -44,5 +44,6 @@ test_*.sh
 *.db-shm
 .worktrees/
 docs/superpowers/
+docs/plans/
 packages/database/src/inline-integrity-check-worker.ts
 .tmp/

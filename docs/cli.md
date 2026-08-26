@@ -93,7 +93,7 @@ Options:
   --logs [N]           Stream latest N lines then follow
   --stats              Show statistics (JSON output)
   --add-account <name> Add a new account
-    --mode <claude-oauth|console>  Account mode (default: claude-oauth)
+    --mode <ACCOUNT_MODE>  Account mode (default: claude-oauth; see canonical list below)
     --priority <number>    Account priority (0-100, default: 0)
   --list               List all accounts
   --remove <name>      Remove an account
@@ -121,7 +121,7 @@ Add a new OAuth account to the load balancer pool.
 
 **Syntax:**
 ```bash
-bun run cli --add-account <name> --mode <claude-oauth|console|codex|qwen|xai|zai|minimax|muse-spark|anthropic-compatible|openai-compatible> --priority <number>
+bun run cli --add-account <name> --mode <claude-oauth|console|zai|minimax|deepseek|nanogpt|anthropic-compatible|openai-compatible|bedrock|kilo|alibaba-coding-plan|codex|xai|ollama|meta> --priority <number>
 ```
 
 **Note:** All flags must be provided explicitly as the CLI requires explicit parameters.
@@ -130,21 +130,29 @@ bun run cli --add-account <name> --mode <claude-oauth|console|codex|qwen|xai|zai
 - `--mode`: Account type (required)
   - `claude-oauth`: Claude CLI OAuth account
   - `console`: Claude API account
-  - `codex`: Codex/OpenAI account (OAuth)
-  - `qwen`: Qwen account (OAuth device code)
-  - `xai`: xAI/Grok account (imports local Grok CLI OAuth credentials from `~/.grok/auth.json`; token values are never displayed). xAI refresh tokens may rotate, so if you keep using Grok CLI separately, re-authenticate or refresh Grok CLI after importing so each tool has a fresh token chain. Per-request token usage is recorded from responses, and Grok Build credits usage is polled via grok.com gRPC-web for dashboard bars.
   - `zai`: z.ai account (API key)
-  - `openai-compatible`: OpenAI-compatible provider (API key)
+  - `minimax`: Minimax account (API key)
+  - `deepseek`: DeepSeek account (API key; native Anthropic-compatible endpoint at `api.deepseek.com`)
+  - `nanogpt`: NanoGPT account (API key)
+  - `anthropic-compatible`: Generic Anthropic-compatible provider (API key)
+  - `openai-compatible`: Generic OpenAI-compatible provider (API key)
+  - `bedrock`: AWS Bedrock account (AWS profile credentials)
+  - `kilo`: Kilo Gateway provider (API key)
+  - `alibaba-coding-plan`: Alibaba Coding Plan International provider (API key)
+  - `codex`: Codex (OpenAI OAuth) provider
+  - `xai`: xAI/Grok provider (imports local Grok CLI OAuth credentials)
+  - `ollama`: Ollama local provider (no API key required)
+  - `meta`: Meta Model API provider (API key). `meta` is canonical; `muse-spark` remains server-side HTTP ingress compatibility only.
 - `--priority`: Account priority (optional, defaults to 0)
   - Range: 0-100
   - Lower numbers indicate higher priority in load balancing
 
 **Account Setup Process:**
 1. Execute command with all required flags
-2. For OAuth accounts (claude-oauth/console), opens browser for authentication
+2. For OAuth accounts (`claude-oauth`/`console`), opens browser for authentication
 3. Waits for OAuth callback on localhost:7856
-4. For xAI/Grok accounts, imports existing Grok CLI OAuth credentials from `~/.grok/auth.json` without printing token values
-5. For API key accounts (zai/openai-compatible), prompts for API key
+4. For xAI/Grok accounts, imports existing Grok CLI OAuth credentials without printing token values
+5. For API key accounts (`zai`, `minimax`, `deepseek`, `nanogpt`, `anthropic-compatible`, `openai-compatible`, `kilo`, `alibaba-coding-plan`, and `meta`), prompts for API key; Bedrock uses AWS profile credentials, Codex and xAI use OAuth, and Ollama requires no API key
 6. Stores account credentials securely in the database
 
 #### `--list`
@@ -594,9 +602,9 @@ bun run cli --repair-db
 
 ```bash
 # Add multiple accounts with different priorities
-bun run cli --add-account "primary-account" --mode max --priority 10
-bun run cli --add-account "secondary-account" --mode max --priority 50
-bun run cli --add-account "backup-account" --mode max --priority 90
+bun run cli --add-account "primary-account" --mode claude-oauth --priority 10
+bun run cli --add-account "secondary-account" --mode claude-oauth --priority 50
+bun run cli --add-account "backup-account" --mode claude-oauth --priority 90
 
 # Monitor account status
 watch -n 5 'bun run cli --list'

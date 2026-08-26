@@ -800,6 +800,23 @@ describe("translateRequestToAnthropic", () => {
 		expect(warnings[0].msg).toContain("signature");
 	});
 
+	test("additional_tools is handled out of band without a false drop warning", () => {
+		const req: ResponsesRequest = {
+			model: "gpt-5.4-mini",
+			input: [
+				{
+					type: "additional_tools",
+					tools: [{ type: "computer_use_preview" }],
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		expect(warnings).toHaveLength(0);
+	});
+
 	test("unknown/future item type does not throw, drops item, warns with the literal type string", () => {
 		const req: ResponsesRequest = {
 			model: "claude-3-5-sonnet-20241022",

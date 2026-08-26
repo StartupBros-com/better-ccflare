@@ -60,6 +60,16 @@ jobs:
           packages/database/src/repositories/__tests__/combo-managed-policy.test.ts
           packages/database/src/repositories/__tests__/combo-priority.test.ts
 
+      - name: Run must-run PostgreSQL migration tests
+        env:
+          # This is the disposable loopback service above. The test name is part
+          # of the guard contract; do not replace with an ambient DATABASE_URL.
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/better_ccflare_test
+          CCFLARE_REQUIRE_LIVE_PG_MIGRATIONS: "true"
+        run: |
+          test "${DATABASE_URL#*://*:*@}" = "localhost:5432/better_ccflare_test"
+          bun test --timeout 15000 packages/database/src/migrations-pg.test.ts
+
       - name: Run focused PostgreSQL integration tests
         env:
           BETTER_CCFLARE_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/better_ccflare_test

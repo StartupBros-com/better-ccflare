@@ -278,6 +278,32 @@ BUNDLED_PRICING.meta = {
 	},
 };
 
+// Pricing for DeepSeek models (dollars per 1M tokens).
+// DeepSeek uses a dynamic peak/off-peak schedule; these static fallback values
+// intentionally use peak rates to avoid undercounting.
+BUNDLED_PRICING.deepseek = {
+	models: {
+		"deepseek-v4-pro": {
+			id: "deepseek-v4-pro",
+			name: "DeepSeek V4 Pro",
+			cost: {
+				input: 1.32,
+				output: 3.96,
+				cache_read: 0.044,
+			},
+		},
+		"deepseek-v4-flash": {
+			id: "deepseek-v4-flash",
+			name: "DeepSeek V4 Flash",
+			cost: {
+				input: 0.44,
+				output: 1.32,
+				cache_read: 0.014,
+			},
+		},
+	},
+};
+
 interface Logger {
 	warn(message: string, ...args: unknown[]): void;
 	debug(message: string, ...args: unknown[]): void;

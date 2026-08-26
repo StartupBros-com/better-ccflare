@@ -98,6 +98,8 @@ function assertPendingRotation(value: unknown): PendingRotation {
 		(candidate.refreshToken !== undefined &&
 			typeof candidate.refreshToken !== "string") ||
 		typeof candidate.attemptedRefreshToken !== "string" ||
+		(candidate.createdAt !== undefined &&
+			typeof candidate.createdAt !== "number") ||
 		typeof candidate.recordedAt !== "number"
 	) {
 		throw new Error("invalid pending rotation WAL payload");

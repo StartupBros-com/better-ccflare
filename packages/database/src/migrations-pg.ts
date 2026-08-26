@@ -342,7 +342,7 @@ const ROUTING_REVISION_API_KEY_PROVIDERS = [
 	"openrouter",
 	"alibaba-coding-plan",
 	"ollama-cloud",
-	"muse-spark",
+	"meta",
 ] as const;
 
 /** PostgreSQL mirror of SQLite's managed-routing revision clock. */
@@ -727,17 +727,31 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 	`);
 
 	// Create usage_snapshots table (see SQLite migration for rationale).
+	// The sequence is database-global and `nextval` is atomic across concurrent
+	// PostgreSQL connections, so equal-timestamp writes retain a durable append
+	// order without depending on the mutable `ctid` storage location.
+	await adapter.unsafe(
+		`CREATE SEQUENCE IF NOT EXISTS usage_snapshots_append_order_seq`,
+	);
 	await adapter.unsafe(`
 		CREATE TABLE IF NOT EXISTS usage_snapshots (
+			append_order BIGINT NOT NULL DEFAULT nextval('usage_snapshots_append_order_seq'),
 			account_id TEXT NOT NULL,
 			timestamp BIGINT NOT NULL,
 			window_key TEXT NOT NULL,
 			utilization DOUBLE PRECISION NOT NULL,
-			resets_at BIGINT
+			resets_at BIGINT,
+			active INTEGER NOT NULL DEFAULT 1
 		)
 	`);
 	await adapter.unsafe(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_snapshots_append_order ON usage_snapshots(append_order)`,
+	);
+	await adapter.unsafe(
 		`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_acct_win_time ON usage_snapshots(account_id, window_key, timestamp DESC)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_acct_win_time_append_order ON usage_snapshots(account_id, window_key, timestamp DESC, append_order DESC)`,
 	);
 	// Secondary index on timestamp alone for retention pruning (see SQLite migration).
 	await adapter.unsafe(
@@ -822,31 +836,36 @@ export async function addColumnTolerant(
  * Collapse duplicate `(name, provider, COALESCE(custom_endpoint,''))` rows in
  * the PostgreSQL `accounts` table into a single survivor per tuple, while
  * preserving as much working account state as possible. Mirrors the SQLite
- * helper `collapseAccountDuplicatesPreservingState` in semantics; differs
- * only in (a) using PostgreSQL's `ctid` as the row-ordering tiebreak
- * (PG's analogue of SQLite's `rowid`) and (b) using the async adapter API.
+ * helper `collapseAccountDuplicatesPreservingState` in semantics and uses the
+ * same logical account-id ordering after the business timestamps.
  *
- * Survivor selection (deterministic, stable across rows):
+ * Survivor selection (deterministic, stable across backends):
  *   1. Most recent `last_used`.
  *   2. Most recent `refresh_token_issued_at`.
  *   3. Most recent `created_at`.
- *   4. Smallest `ctid` (final tiebreak — older insert wins on full ties).
+ *   4. Lexicographically smallest logical account `id` on full ties.
  *
  * State that is merged into the survivor before the discarded rows are
  * deleted (see SQLite helper for the full rationale and column-by-column
  * rules). Dependent rows are repointed at the survivor's id before the
  * account row is removed: `combo_slots.account_id`, `requests.account_used`,
- * `usage_snapshots.account_id`, `combo_membership_exclusions.account_id`,
- * `device_setup_jobs.account_id`. `combo_slots.account_id` and
- * `combo_membership_exclusions.account_id` both have a real `ON DELETE
- * CASCADE` FK, so without this repointing we would silently delete combo
- * configurations / operator-configured exclusions. `combo_membership_
- * exclusions` also has a UNIQUE(family, combo_id, account_id) index, so
- * colliding discarded rows are dropped rather than repointed (see the
+ * `usage_snapshots.account_id`, `usage_windows.account_id`,
+ * `combo_membership_exclusions.account_id`, and `device_setup_jobs.account_id`.
+ * `combo_slots.account_id` and `combo_membership_exclusions.account_id` both
+ * have a real `ON DELETE CASCADE` FK, so without this repointing we would
+ * silently delete combo configurations / operator-configured exclusions.
+ * Colliding `combo_slots` merge before repointing: enabled wins, lower priority
+ * wins, and a survivor-owned slot is preferred as keeper (otherwise the lowest
+ * logical slot id). `usage_windows` has a UNIQUE(account_id, window_key,
+ * resets_at) index, so colliding logical windows preserve a survivor-owned row
+ * when available and merge lifecycle state before repointing.
+ * `combo_membership_exclusions` also has a UNIQUE(family, combo_id, account_id)
+ * index, so colliding discarded rows are dropped rather than repointed (see the
  * collision handling below). `requests.account_used`,
- * `usage_snapshots.account_id`, and `device_setup_jobs.account_id` are
- * plain TEXT columns with no FK, so without this repointing the request
- * history / usage history / device-setup jobs would orphan.
+ * `usage_snapshots.account_id`, `usage_windows.account_id`, and
+ * `device_setup_jobs.account_id` are plain TEXT columns with no FK, so without
+ * this repointing the request history / usage history / device-setup jobs would
+ * orphan.
  *
  * Idempotent — a no-op on already-deduped accounts.
  *
@@ -861,18 +880,216 @@ export async function addColumnTolerant(
  * $5/$6/$7 for (name, provider, endpoint) rather than re-binding them per
  * column.
  */
-const PG_GROUP_SCOPE = `WHERE name = $5 AND provider = $6
+// Treat the retired muse-spark alias as meta while selecting and merging a
+// duplicate group. The terminal UPDATE below then makes the survivor's stored
+// provider canonical without colliding with the unique index.
+const PG_CANONICAL_PROVIDER =
+	"CASE WHEN provider = 'muse-spark' THEN 'meta' ELSE provider END";
+const PG_GROUP_SCOPE = `WHERE name = $5 AND ${PG_CANONICAL_PROVIDER} = $6
 	                          AND COALESCE(custom_endpoint, '') = $7`;
 
 /**
  * Freshest non-NULL value of `col` across the duplicate group, using the same
  * ordering that selects the credential set: newest refresh token first, then
- * newest row. `col` is an internal literal, never user input.
+ * newest creation time, then the smallest logical account id. `col` is an
+ * internal literal, never user input.
  */
 function pgFreshest(col: string): string {
 	return `(SELECT ${col} FROM accounts ${PG_GROUP_SCOPE} AND ${col} IS NOT NULL
-		    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, created_at DESC
+		    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, created_at DESC, id ASC
 		    LIMIT 1)`;
+}
+
+async function mergeCollidingSlotsPg(
+	adapter: BunSqlAdapter,
+	survivorId: string,
+	discardedIds: string[],
+): Promise<{ merged: number; repointed: number }> {
+	const accountIds = [survivorId, ...discardedIds];
+	const placeholders = accountIds.map(() => "?").join(",");
+	const slots = await adapter.query<{
+		id: string;
+		combo_id: string;
+		account_id: string;
+		model: string;
+		priority: number | string;
+		enabled: number | string;
+	}>(
+		`SELECT id, combo_id, account_id, model, priority, enabled
+		 FROM combo_slots WHERE account_id IN (${placeholders})
+		 ORDER BY combo_id ASC, model ASC, id ASC`,
+		accountIds,
+	);
+	const groups = new Map<string, typeof slots>();
+	for (const slot of slots) {
+		const key = JSON.stringify([slot.combo_id, slot.model]);
+		const group = groups.get(key) ?? [];
+		group.push(slot);
+		groups.set(key, group);
+	}
+
+	let merged = 0;
+	let repointed = 0;
+	for (const group of groups.values()) {
+		if (group.length < 2) continue;
+		const keeper =
+			group.find((slot) => slot.account_id === survivorId) ?? group[0];
+		if (!keeper) continue;
+		const duplicates = group.filter((slot) => slot.id !== keeper.id);
+		const mergedPriority = Math.min(
+			...group.map((slot) => Number(slot.priority)),
+		);
+		const mergedEnabled = Math.max(
+			...group.map((slot) => Number(slot.enabled)),
+		);
+		if (duplicates.length > 0) {
+			const duplicatePlaceholders = duplicates.map(() => "?").join(",");
+			await adapter.runWithChanges(
+				`DELETE FROM combo_slots WHERE id IN (${duplicatePlaceholders})`,
+				duplicates.map((slot) => slot.id),
+			);
+			merged += duplicates.length;
+		}
+		await adapter.runWithChanges(
+			`UPDATE combo_slots
+			 SET account_id = ?, priority = ?, enabled = ?
+			 WHERE id = ?`,
+			[survivorId, mergedPriority, mergedEnabled, keeper.id],
+		);
+		repointed++;
+	}
+	return { merged, repointed };
+}
+
+type PgUsageWindowMergeRow = {
+	id: string;
+	account_id: string;
+	window_key: string;
+	started_at: number | string;
+	resets_at: number | string;
+	closed_at: number | string | null;
+	grant_type: string;
+	peak_utilization: number | string;
+	first_100_at: number | string | null;
+	value_usd: number | string | null;
+	input_tokens: number | string | null;
+	cache_read_input_tokens: number | string | null;
+	cache_creation_input_tokens: number | string | null;
+	output_tokens: number | string | null;
+	request_count: number | string | null;
+	model_breakdown: string | null;
+	unpriced_tokens: number | string | null;
+	projection_version: string | null;
+};
+
+function pgSettledWindowCompleteness(row: PgUsageWindowMergeRow): number {
+	return [
+		row.value_usd,
+		row.input_tokens,
+		row.cache_read_input_tokens,
+		row.cache_creation_input_tokens,
+		row.output_tokens,
+		row.request_count,
+		row.model_breakdown,
+		row.unpriced_tokens,
+		row.projection_version,
+	].filter((value) => value !== null).length;
+}
+
+async function mergeCollidingUsageWindowsPg(
+	adapter: BunSqlAdapter,
+	survivorId: string,
+	discardedIds: string[],
+): Promise<{ merged: number; repointed: number }> {
+	const accountIds = [survivorId, ...discardedIds];
+	const placeholders = accountIds.map(() => "?").join(",");
+	const windows = await adapter.query<PgUsageWindowMergeRow>(
+		`SELECT id, account_id, window_key, started_at, resets_at,
+		        closed_at, grant_type, peak_utilization, first_100_at,
+		        value_usd, input_tokens, cache_read_input_tokens,
+		        cache_creation_input_tokens, output_tokens, request_count,
+		        model_breakdown, unpriced_tokens, projection_version
+		 FROM usage_windows WHERE account_id IN (${placeholders})
+		 ORDER BY window_key ASC, resets_at ASC, id ASC`,
+		accountIds,
+	);
+	const groups = new Map<string, PgUsageWindowMergeRow[]>();
+	for (const window of windows) {
+		const key = JSON.stringify([window.window_key, String(window.resets_at)]);
+		const group = groups.get(key) ?? [];
+		group.push(window);
+		groups.set(key, group);
+	}
+
+	let merged = 0;
+	let repointed = 0;
+	for (const group of groups.values()) {
+		if (group.length < 2) continue;
+		const keeper =
+			group.find((window) => window.account_id === survivorId) ?? group[0];
+		if (!keeper) continue;
+		const settledSource = group
+			.filter((window) => window.closed_at !== null)
+			.sort(
+				(left, right) =>
+					Number(right.closed_at) - Number(left.closed_at) ||
+					pgSettledWindowCompleteness(right) -
+						pgSettledWindowCompleteness(left) ||
+					left.id.localeCompare(right.id),
+			)[0];
+		const source = settledSource ?? keeper;
+		const duplicates = group.filter((window) => window.id !== keeper.id);
+		const startedAt = Math.min(
+			...group.map((window) => Number(window.started_at)),
+		);
+		const peakUtilization = Math.max(
+			...group.map((window) => Number(window.peak_utilization)),
+		);
+		const first100At =
+			group
+				.map((window) => window.first_100_at)
+				.filter((value): value is number | string => value !== null)
+				.map(Number)
+				.sort((left, right) => left - right)[0] ?? null;
+		if (duplicates.length > 0) {
+			const duplicatePlaceholders = duplicates.map(() => "?").join(",");
+			await adapter.runWithChanges(
+				`DELETE FROM usage_windows WHERE id IN (${duplicatePlaceholders})`,
+				duplicates.map((window) => window.id),
+			);
+			merged += duplicates.length;
+		}
+		await adapter.runWithChanges(
+			`UPDATE usage_windows SET
+			   account_id = ?, started_at = ?, closed_at = ?, grant_type = ?,
+			   peak_utilization = ?, first_100_at = ?, value_usd = ?,
+			   input_tokens = ?, cache_read_input_tokens = ?,
+			   cache_creation_input_tokens = ?, output_tokens = ?,
+			   request_count = ?, model_breakdown = ?, unpriced_tokens = ?,
+			   projection_version = ?
+			 WHERE id = ?`,
+			[
+				survivorId,
+				startedAt,
+				source.closed_at,
+				source.grant_type,
+				peakUtilization,
+				first100At,
+				source.value_usd,
+				source.input_tokens,
+				source.cache_read_input_tokens,
+				source.cache_creation_input_tokens,
+				source.output_tokens,
+				source.request_count,
+				source.model_breakdown,
+				source.unpriced_tokens,
+				source.projection_version,
+				keeper.id,
+			],
+		);
+		repointed++;
+	}
+	return { merged, repointed };
 }
 
 export async function collapseAccountDuplicatesPreservingStatePg(
@@ -882,9 +1099,10 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 	// canonical form of the future UNIQUE index, matching the SQLite path.
 	// adapter.get returns one row; we need all groups — use unsafe.
 	const groups = (await adapter.unsafe(
-		`SELECT name, provider, COALESCE(custom_endpoint, '') AS ep
+		`SELECT name, ${PG_CANONICAL_PROVIDER} AS provider,
+			        COALESCE(custom_endpoint, '') AS ep
 		 FROM accounts
-		 GROUP BY name, provider, COALESCE(custom_endpoint, '')
+		 GROUP BY name, ${PG_CANONICAL_PROVIDER}, COALESCE(custom_endpoint, '')
 		 HAVING COUNT(*) > 1`,
 	)) as Array<{ name: string; provider: string; ep: string }>;
 	if (groups.length === 0) {
@@ -893,8 +1111,11 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 
 	let totalDeleted = 0;
 	let totalRepointedSlots = 0;
+	let totalMergedCollidingSlots = 0;
 	let totalRepointedRequests = 0;
 	let totalRepointedSnapshots = 0;
+	let totalRepointedWindows = 0;
+	let totalMergedCollidingWindows = 0;
 	let totalRepointedExclusions = 0;
 	let totalDroppedCollidingExclusions = 0;
 	let totalRepointedDeviceSetupJobs = 0;
@@ -903,12 +1124,12 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 		// Pick the survivor per tuple group.
 		const survivorRows = (await adapter.unsafe(
 			`SELECT id FROM accounts
-			 WHERE name = $1 AND provider = $2 AND COALESCE(custom_endpoint, '') = $3
+			 WHERE name = $1 AND ${PG_CANONICAL_PROVIDER} = $2 AND COALESCE(custom_endpoint, '') = $3
 			 ORDER BY
 			   COALESCE(last_used, 0) DESC,
 			   COALESCE(refresh_token_issued_at, 0) DESC,
 			   created_at DESC,
-			   ctid::text ASC
+			   id ASC
 			 LIMIT 1`,
 			[grp.name, grp.provider, grp.ep],
 		)) as Array<{ id: string }>;
@@ -920,7 +1141,7 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 		// Pull discarded ids for this tuple group.
 		const discardedRows = (await adapter.unsafe(
 			`SELECT id FROM accounts
-			 WHERE name = $1 AND provider = $2 AND COALESCE(custom_endpoint, '') = $3
+			 WHERE name = $1 AND ${PG_CANONICAL_PROVIDER} = $2 AND COALESCE(custom_endpoint, '') = $3
 			   AND id <> $4`,
 			[grp.name, grp.provider, grp.ep, survivor.id],
 		)) as Array<{ id: string }>;
@@ -940,9 +1161,9 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 		// that has a non-empty api_key), since API-key providers have no
 		// refresh_token at all.
 		const FRESHEST_CREDENTIAL_ROW_ID = `(SELECT id FROM accounts
-			      WHERE name = $1 AND provider = $2 AND COALESCE(custom_endpoint, '') = $3
+			      WHERE name = $1 AND ${PG_CANONICAL_PROVIDER} = $2 AND COALESCE(custom_endpoint, '') = $3
 			        AND refresh_token IS NOT NULL AND refresh_token <> ''
-			      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, ctid::text ASC
+			      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, id ASC
 			      LIMIT 1)`;
 		const mergedRows = (await adapter.unsafe(
 			`SELECT
@@ -953,9 +1174,9 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 			   (SELECT expires_at FROM accounts
 			    WHERE id = ${FRESHEST_CREDENTIAL_ROW_ID}) AS merged_expires_at,
 			   (SELECT api_key FROM accounts
-			    WHERE name = $1 AND provider = $2 AND COALESCE(custom_endpoint, '') = $3
+			    WHERE name = $1 AND ${PG_CANONICAL_PROVIDER} = $2 AND COALESCE(custom_endpoint, '') = $3
 			      AND api_key IS NOT NULL AND api_key <> ''
-			    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, created_at DESC, ctid::text ASC
+			    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, created_at DESC, id ASC
 			    LIMIT 1) AS merged_api_key,
 			   -- Read from the SAME freshest row as the three token fields
 			   -- above, using the identical nested lookup, so the survivor's
@@ -1068,6 +1289,14 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 			const idListPlaceholders = discardedIds
 				.map((_, i) => `$${i + 2}`)
 				.join(",");
+			// `combo_slots` is unique on (combo_id, account_id, model), so a
+			// direct repoint can collide when aliases own the same logical slot.
+			// Merge those collisions first, then repoint the remaining slots.
+			const mergedSlots = await mergeCollidingSlotsPg(
+				adapter,
+				survivor.id,
+				discardedIds,
+			);
 			const repointSlots = await adapter.runWithChanges(
 				`UPDATE combo_slots SET account_id = $1 WHERE account_id IN (${idListPlaceholders})`,
 				[survivor.id, ...discardedIds],
@@ -1078,6 +1307,18 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 			);
 			const repointSnapshots = await adapter.runWithChanges(
 				`UPDATE usage_snapshots SET account_id = $1 WHERE account_id IN (${idListPlaceholders})`,
+				[survivor.id, ...discardedIds],
+			);
+			// usage_windows is unique on (account_id, window_key, resets_at), so
+			// aliases can own rows that collide only after canonicalization. Merge
+			// those logical windows first, then repoint the non-colliding history.
+			const mergedWindows = await mergeCollidingUsageWindowsPg(
+				adapter,
+				survivor.id,
+				discardedIds,
+			);
+			const repointWindows = await adapter.runWithChanges(
+				`UPDATE usage_windows SET account_id = $1 WHERE account_id IN (${idListPlaceholders})`,
 				[survivor.id, ...discardedIds],
 			);
 
@@ -1133,9 +1374,12 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 			);
 
 			totalDeleted += deleted;
-			totalRepointedSlots += repointSlots;
+			totalMergedCollidingSlots += mergedSlots.merged;
+			totalRepointedSlots += repointSlots + mergedSlots.repointed;
 			totalRepointedRequests += repointRequests;
 			totalRepointedSnapshots += repointSnapshots;
+			totalMergedCollidingWindows += mergedWindows.merged;
+			totalRepointedWindows += repointWindows + mergedWindows.repointed;
 			totalDroppedCollidingExclusions += droppedCollidingExclusions;
 			totalRepointedExclusions += repointExclusions;
 			totalRepointedDeviceSetupJobs += repointDeviceSetupJobs;
@@ -1147,10 +1391,13 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 			`Collapsed ${totalDeleted} duplicate account row(s) across ${groups.length} ` +
 				`(name, provider, COALESCE(custom_endpoint,'')) tuple group(s) before creating ` +
 				`UNIQUE index. Each group kept the row with the freshest credentials ` +
-				`(most recent last_used → refresh_token_issued_at → created_at → smallest ctid) ` +
+				`(most recent last_used → refresh_token_issued_at → created_at → smallest account id) ` +
 				`and merged request counts / priority / paused state from the rest. ` +
-				`Repointed ${totalRepointedSlots} combo slot(s), ${totalRepointedRequests} ` +
+				`Merged ${totalMergedCollidingSlots} colliding combo slot(s) and repointed ` +
+				`${totalRepointedSlots} combo slot(s), ${totalRepointedRequests} ` +
 				`request-history row(s), ${totalRepointedSnapshots} usage-snapshot row(s), ` +
+				`merged ${totalMergedCollidingWindows} colliding usage-window row(s) and ` +
+				`repointed ${totalRepointedWindows} usage-window row(s), ` +
 				`and ${totalRepointedExclusions} combo-membership-exclusion row(s) ` +
 				`(dropped ${totalDroppedCollidingExclusions} colliding duplicate exclusion(s)), ` +
 				`and repointed ${totalRepointedDeviceSetupJobs} device-setup-job row(s), ` +
@@ -1176,6 +1423,12 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 
 	// Add columns that might be missing from older schema versions
 	const columnsToAdd: ColumnToAdd[] = [
+		{
+			table: "usage_snapshots",
+			column: "active",
+			definition:
+				"ALTER TABLE usage_snapshots ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+		},
 		{
 			table: "combo_family_assignments",
 			column: "membership_mode",
@@ -1379,6 +1632,32 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			await addColumnTolerant(adapter, col);
 		}
 	}
+
+	// Adding this column with a volatile nextval() DEFAULT forces PostgreSQL to
+	// materialize a distinct value for every legacy row while its DDL lock is
+	// held. It also establishes the atomic generator before another connection
+	// can insert a null/unordered snapshot; no SELECT MAX or process-local state
+	// participates in allocation.
+	await adapter.unsafe(
+		`CREATE SEQUENCE IF NOT EXISTS usage_snapshots_append_order_seq`,
+	);
+	if (!(await columnExists(adapter, "usage_snapshots", "append_order"))) {
+		await addColumnTolerant(adapter, {
+			table: "usage_snapshots",
+			column: "append_order",
+			definition:
+				"ALTER TABLE usage_snapshots ADD COLUMN append_order BIGINT NOT NULL DEFAULT nextval('usage_snapshots_append_order_seq')",
+		});
+	}
+	await adapter.unsafe(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_snapshots_append_order
+		 ON usage_snapshots(append_order)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_acct_win_time_append_order
+		 ON usage_snapshots(account_id, window_key, timestamp DESC, append_order DESC)`,
+	);
+
 	// Backfill choice: created_at, not "now" — see the SQLite mirror in
 	// migrations.ts (runMigrations()) for the full rationale. Conditioned on
 	// IS NULL so this is a no-op once every row has been backfilled once.
@@ -1694,15 +1973,23 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 	// Ensure usage_snapshots table exists (for upgrades from pre-usage-history installs)
 	await adapter.unsafe(`
 		CREATE TABLE IF NOT EXISTS usage_snapshots (
+			append_order BIGINT NOT NULL DEFAULT nextval('usage_snapshots_append_order_seq'),
 			account_id TEXT NOT NULL,
 			timestamp BIGINT NOT NULL,
 			window_key TEXT NOT NULL,
 			utilization DOUBLE PRECISION NOT NULL,
-			resets_at BIGINT
+			resets_at BIGINT,
+			active INTEGER NOT NULL DEFAULT 1
 		)
 	`);
 	await adapter.unsafe(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_snapshots_append_order ON usage_snapshots(append_order)`,
+	);
+	await adapter.unsafe(
 		`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_acct_win_time ON usage_snapshots(account_id, window_key, timestamp DESC)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_acct_win_time_append_order ON usage_snapshots(account_id, window_key, timestamp DESC, append_order DESC)`,
 	);
 	// Secondary index on timestamp alone for retention pruning (see SQLite migration).
 	await adapter.unsafe(
@@ -2098,6 +2385,15 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			[mapping.id, mapping.client, mapping.bedrock, now, now],
 		);
 	}
+
+	// A canonical provider update can collide with the already-installed unique
+	// index when legacy muse-spark and meta rows share a name and endpoint.
+	// Collapse those canonical groups first, then update the remaining singleton
+	// aliases. Errors propagate rather than leaving an unusable legacy row behind.
+	await collapseAccountDuplicatesPreservingStatePg(adapter);
+	await adapter.unsafe(
+		`UPDATE accounts SET provider = 'meta' WHERE provider = 'muse-spark'`,
+	);
 
 	log.info("PostgreSQL migrations completed");
 }

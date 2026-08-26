@@ -1,14 +1,34 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Config } from "@better-ccflare/config";
 import { DatabaseOperations } from "@better-ccflare/database";
+import {
+	clearDerivedProviderModelDefaults,
+	resolveProviderModelDefault,
+	setDerivedAccountModelDefaults,
+} from "@better-ccflare/providers";
 import { deriveComboRouteClass } from "@better-ccflare/providers/request-capabilities";
 import {
+	clearOpenAICompatibleModelCacheForAccount,
+	getOpenAICompatibleModels,
+} from "@better-ccflare/proxy";
+import {
+	createAccountCustomEndpointUpdateHandler,
+	createAccountPauseHandler,
 	createAccountResumeHandler,
 	createAccountsListHandler,
-	createMuseSparkAccountAddHandler,
+	createDeepseekAccountAddHandler,
+	createMetaAccountAddHandler,
 	createOpenAIAccountAddHandler,
 } from "../accounts";
 
@@ -37,6 +57,10 @@ const mockUsageCache = {
 	delete: (accountId: string) => {
 		mockUsageCache.cache.delete(accountId);
 	},
+
+	stopPolling: mock((accountId: string) => {
+		mockUsageCache.polling.delete(accountId);
+	}),
 
 	refreshNow: async (_accountId: string) => true,
 
@@ -75,16 +99,15 @@ const mockLog = {
 	error: () => {},
 };
 
-const mockClearAccountRefreshCache = (_accountId: string) => {
-	// Mock implementation
-};
+const mockClearAccountRefreshCache = mock((_accountId: string) => {});
+
+const mockClearAutoRefreshTrackingForAccount = mock((_accountId: string) => {});
 
 const mockCliCommands = {
 	removeAccount: () => ({ success: true, message: "Account removed" }),
 	pauseAccount: () => ({ success: true, message: "Account paused" }),
 	resumeAccount: () => ({ success: true, message: "Account resumed" }),
 };
-
 const mockDbOps = {
 	getDatabase: () => mockDatabase,
 	updateAccountPriority: () => {},
@@ -480,32 +503,54 @@ describe("Accounts Handler - Dashboard Usage Data Integration", () => {
 	});
 
 	describe("Account Management Integration", () => {
-		it("should clear usage cache when Anthropic account is removed", async () => {
+		it("stops polling and clears refresh lifecycle state only after successful removal", async () => {
 			const removeHandler = createMockAccountRemoveHandler();
-
-			// Setup: Account exists in database
 			mockQuery.get = () => ({ id: "test-account-id" });
-
-			// Mock successful removal
 			mockCliCommands.removeAccount = () => ({
 				success: true,
 				message: "Account removed",
 			});
+			mockUsageCache.stopPolling.mockClear();
+			mockClearAccountRefreshCache.mockClear();
+			mockClearAutoRefreshTrackingForAccount.mockClear();
 
-			// Track usageCache.delete calls
-			const deleteSpy = spyOn(mockUsageCache, "delete");
+			const response = await removeHandler(
+				{ json: async () => ({ confirm: "test-account-name" }) } as Request,
+				"test-account-name",
+			);
 
-			// Mock request body with confirmation
-			const mockRequest = {
-				json: async () => ({ confirm: "test-account-name" }),
-			} as Request;
-
-			// Execute the handler
-			const response = await removeHandler(mockRequest, "test-account-name");
-
-			// Verify usage cache was cleared for the removed account
-			expect(deleteSpy).toHaveBeenCalledWith("test-account-id");
+			expect(mockUsageCache.stopPolling).toHaveBeenCalledWith(
+				"test-account-id",
+			);
+			expect(mockClearAccountRefreshCache).toHaveBeenCalledWith(
+				"test-account-id",
+			);
+			expect(mockClearAutoRefreshTrackingForAccount).toHaveBeenCalledWith(
+				"test-account-id",
+			);
 			expect(response.ok).toBe(true);
+		});
+
+		it("does not stop polling or clear lifecycle state when removal fails", async () => {
+			const removeHandler = createMockAccountRemoveHandler();
+			mockQuery.get = () => ({ id: "test-account-id" });
+			mockCliCommands.removeAccount = () => ({
+				success: false,
+				message: "Account not found",
+			});
+			mockUsageCache.stopPolling.mockClear();
+			mockClearAccountRefreshCache.mockClear();
+			mockClearAutoRefreshTrackingForAccount.mockClear();
+
+			const response = await removeHandler(
+				{ json: async () => ({ confirm: "test-account-name" }) } as Request,
+				"test-account-name",
+			);
+
+			expect(response.ok).toBe(false);
+			expect(mockUsageCache.stopPolling).not.toHaveBeenCalled();
+			expect(mockClearAccountRefreshCache).not.toHaveBeenCalled();
+			expect(mockClearAutoRefreshTrackingForAccount).not.toHaveBeenCalled();
 		});
 
 		it("should clear usage cache when Anthropic account tokens are reloaded", async () => {
@@ -517,14 +562,19 @@ describe("Accounts Handler - Dashboard Usage Data Integration", () => {
 				provider: "anthropic",
 			});
 
-			// Track usageCache.delete calls
+			// Track usageCache.delete calls and reset deletion-only lifecycle mocks.
 			const deleteSpy = spyOn(mockUsageCache, "delete");
+			mockUsageCache.stopPolling.mockClear();
+			mockClearAutoRefreshTrackingForAccount.mockClear();
 
 			// Execute the handler
 			const response = await reloadHandler({} as Request, "test-account-id");
 
-			// Verify usage cache was cleared
+			// Reload intentionally clears the refresh and usage caches, but it must not
+			// tear down deletion-only polling or auto-refresh tracking state.
 			expect(deleteSpy).toHaveBeenCalledWith("test-account-id");
+			expect(mockUsageCache.stopPolling).not.toHaveBeenCalled();
+			expect(mockClearAutoRefreshTrackingForAccount).not.toHaveBeenCalled();
 			expect(response.ok).toBe(true);
 		});
 
@@ -1072,7 +1122,9 @@ function createMockAccountRemoveHandler() {
 			const account = mockQuery.get(accountName);
 
 			if (account) {
-				mockUsageCache.delete(account.id);
+				mockUsageCache.stopPolling(account.id);
+				mockClearAccountRefreshCache(account.id);
+				mockClearAutoRefreshTrackingForAccount(account.id);
 			}
 
 			return mockJsonResponse({
@@ -1222,11 +1274,33 @@ describe("Accounts Handler - OAuth control-plane hotfix (U8)", () => {
 		expect(byId.get("acct-active")).toBeNull();
 	});
 
-	it("R23: manual-pause resume works unchanged", async () => {
+	it("R23: manual pause does not perform deletion-only lifecycle cleanup", async () => {
+		await insertAccount("acct-pause", { paused: false });
+		mockUsageCache.stopPolling.mockClear();
+		mockClearAutoRefreshTrackingForAccount.mockClear();
+
+		const response = await createAccountPauseHandler(dbOps)(
+			new Request("http://localhost/api/accounts/acct-pause/pause", {
+				method: "POST",
+			}),
+			"acct-pause",
+		);
+
+		expect(response.status).toBe(200);
+		expect(mockUsageCache.stopPolling).not.toHaveBeenCalled();
+		expect(mockClearAutoRefreshTrackingForAccount).not.toHaveBeenCalled();
+		const row = await getRow("acct-pause");
+		expect(row.paused).toBe(1);
+		expect(row.pause_reason).toBe("manual");
+	});
+
+	it("R23: manual-pause resume works unchanged without deletion-only lifecycle cleanup", async () => {
 		await insertAccount("acct-manual-2", {
 			paused: true,
 			pauseReason: "manual",
 		});
+		mockUsageCache.stopPolling.mockClear();
+		mockClearAutoRefreshTrackingForAccount.mockClear();
 
 		const response = await createAccountResumeHandler(dbOps)(
 			new Request("http://localhost/api/accounts/acct-manual-2/resume", {
@@ -1238,6 +1312,8 @@ describe("Accounts Handler - OAuth control-plane hotfix (U8)", () => {
 
 		expect(response.status).toBe(200);
 		expect(payload.success).toBe(true);
+		expect(mockUsageCache.stopPolling).not.toHaveBeenCalled();
+		expect(mockClearAutoRefreshTrackingForAccount).not.toHaveBeenCalled();
 		const row = await getRow("acct-manual-2");
 		expect(row.paused).toBe(0);
 		expect(row.pause_reason).toBeNull();
@@ -1299,7 +1375,7 @@ describe("Accounts Handler - OAuth control-plane hotfix (U8)", () => {
  * U1 — Canonical static-key persistence in HTTP account creation (R1, R16, R17).
  *
  * These tests exercise the REAL createOpenAIAccountAddHandler and
- * createMuseSparkAccountAddHandler against a real DatabaseOperations instance
+ * createMetaAccountAddHandler against a real DatabaseOperations instance
  * backed by a temp SQLite file, so a regression in the INSERT row shape
  * actually fails these tests. No network traffic; credential columns only.
  *
@@ -1307,6 +1383,130 @@ describe("Accounts Handler - OAuth control-plane hotfix (U8)", () => {
  * (packages/cli-commands/src/commands/account.ts createOpenAIAccount): the key
  * in `api_key`, and `refresh_token`, `access_token`, AND `expires_at` all NULL.
  */
+describe("Accounts Handler - compatible endpoint catalog invalidation", () => {
+	let tmpDir: string;
+	let dbOps: DatabaseOperations;
+	let originalFetch: typeof globalThis.fetch;
+
+	beforeEach(() => {
+		tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "ccflare-compatible-endpoint-"),
+		);
+		dbOps = new DatabaseOperations(path.join(tmpDir, "test.db"));
+		originalFetch = globalThis.fetch;
+		clearOpenAICompatibleModelCacheForAccount("compatible-endpoint-change");
+		clearOpenAICompatibleModelCacheForAccount("compatible-endpoint-noop");
+		clearOpenAICompatibleModelCacheForAccount("anthropic-endpoint-change");
+		clearDerivedProviderModelDefaults();
+	});
+
+	afterEach(async () => {
+		globalThis.fetch = originalFetch;
+		clearOpenAICompatibleModelCacheForAccount("compatible-endpoint-change");
+		clearOpenAICompatibleModelCacheForAccount("compatible-endpoint-noop");
+		clearOpenAICompatibleModelCacheForAccount("anthropic-endpoint-change");
+		clearDerivedProviderModelDefaults();
+		await dbOps.close();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	async function insertAccount(
+		id: string,
+		provider: string,
+		endpoint: string,
+	): Promise<void> {
+		await dbOps.getAdapter().run(
+			`INSERT INTO accounts (
+				id, name, provider, api_key, created_at, request_count, total_requests, priority, custom_endpoint
+			) VALUES (?, ?, ?, ?, ?, 0, 0, 1, ?)`,
+			[id, id, provider, "test-key", Date.now(), endpoint],
+		);
+	}
+
+	function updateEndpoint(
+		accountId: string,
+		customEndpoint: string,
+	): Promise<Response> {
+		return createAccountCustomEndpointUpdateHandler(dbOps)(
+			new Request("http://local/api/accounts/custom-endpoint", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ customEndpoint }),
+			}),
+			accountId,
+		);
+	}
+
+	it("clears compatible catalog evidence after a successful endpoint change", async () => {
+		const accountId = "compatible-endpoint-change";
+		await insertAccount(
+			accountId,
+			"openai-compatible",
+			"https://before.example.com/v1",
+		);
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ data: [{ id: "before-model" }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			})) as typeof globalThis.fetch;
+		await getOpenAICompatibleModels(accountId, { dbOps } as never);
+		expect(
+			resolveProviderModelDefault("openai-compatible", "opus", accountId),
+		).toBe("before-model");
+
+		expect(
+			(await updateEndpoint(accountId, "https://after.example.com/v1")).ok,
+		).toBe(true);
+		globalThis.fetch = (async () =>
+			new Response("nope", { status: 500 })) as typeof globalThis.fetch;
+		expect(
+			await getOpenAICompatibleModels(accountId, { dbOps } as never),
+		).toBeNull();
+		expect(
+			resolveProviderModelDefault("openai-compatible", "opus", accountId),
+		).toBeUndefined();
+	});
+
+	it("retains compatible catalog evidence for a no-op endpoint update", async () => {
+		const accountId = "compatible-endpoint-noop";
+		const endpoint = "https://same.example.com/v1";
+		await insertAccount(accountId, "openai-compatible", endpoint);
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ data: [{ id: "same-model" }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			})) as typeof globalThis.fetch;
+		await getOpenAICompatibleModels(accountId, { dbOps } as never);
+
+		expect((await updateEndpoint(accountId, endpoint)).ok).toBe(true);
+		globalThis.fetch = (async () =>
+			new Response("nope", { status: 500 })) as typeof globalThis.fetch;
+		expect(
+			(await getOpenAICompatibleModels(accountId, { dbOps } as never))
+				?.models[0].id,
+		).toBe("same-model");
+	});
+
+	it("does not clear compatible defaults for a different provider's endpoint update", async () => {
+		const accountId = "anthropic-endpoint-change";
+		await insertAccount(
+			accountId,
+			"anthropic-compatible",
+			"https://before.example.com",
+		);
+		setDerivedAccountModelDefaults("openai-compatible", accountId, {
+			opus: "must-remain",
+		});
+
+		expect(
+			(await updateEndpoint(accountId, "https://after.example.com")).ok,
+		).toBe(true);
+		expect(
+			resolveProviderModelDefault("openai-compatible", "opus", accountId),
+		).toBe("must-remain");
+	});
+});
+
 describe("Accounts Handler - U1 static-key row-shape parity", () => {
 	let tmpDir: string;
 	let dbOps: DatabaseOperations;
@@ -1491,23 +1691,23 @@ describe("Accounts Handler - U1 static-key row-shape parity", () => {
 		);
 	});
 
-	it("creating a non-compatible API-key account through its own handler is unaffected (KTD2 — Muse Spark still canonical)", async () => {
-		const response = await createMuseSparkAccountAddHandler(dbOps)(
+	it("creating a canonical Meta API-key account persists provider=meta and the static credential shape", async () => {
+		const response = await createMetaAccountAddHandler(dbOps)(
 			makeAddRequest({
-				name: "muse-spark-u1",
-				apiKey: "ms-key-abcdef",
+				name: "meta-u1",
+				apiKey: "meta-key-abcdef",
 				priority: 7,
 			}),
 		);
 
 		expect(response.ok).toBe(true);
-		const payload = (await response.json()) as { account: { id: string } };
+		const payload = (await response.json()) as {
+			account: { id: string; provider: string };
+		};
 		const row = await fetchCredentialRow(payload.account.id);
 
-		// Muse Spark is the precedent canonical static-key shape: key in
-		// api_key only, refresh_token and access_token NULL, expires_at kept
-		// as the 1-year expiry. This must not regress as a side effect of U1.
-		expect(row.api_key).toBe("ms-key-abcdef");
+		expect(payload.account.provider).toBe("meta");
+		expect(row.api_key).toBe("meta-key-abcdef");
 		expect(row.refresh_token).toBeNull();
 		expect(row.access_token).toBeNull();
 		expect(row.expires_at).not.toBeNull();
@@ -1612,5 +1812,34 @@ describe("Accounts Handler - U1 static-key row-shape parity", () => {
 
 		expect(account).toBeDefined();
 		expect(account?.tokenStatus).toBe("valid");
+	});
+
+	it("creates DeepSeek accounts at the fixed endpoint with validated optional mappings", async () => {
+		const response = await createDeepseekAccountAddHandler(dbOps)(
+			makeAddRequest({
+				name: "deepseek-primary",
+				apiKey: "ds-test-key-12345",
+				priority: 10,
+				modelMappings: { sonnet: "deepseek-v4" },
+			}),
+		);
+
+		expect(response.ok).toBe(true);
+		const payload = (await response.json()) as {
+			accountId: string;
+			account: { id: string; provider: string };
+		};
+		expect(payload.accountId).toBe(payload.account.id);
+		expect(payload.account.provider).toBe("deepseek");
+		const row = await dbOps.getAdapter().get<{
+			custom_endpoint: string | null;
+			model_mappings: string | null;
+		}>("SELECT custom_endpoint, model_mappings FROM accounts WHERE id = ?", [
+			payload.account.id,
+		]);
+		expect(row).toEqual({
+			custom_endpoint: "https://api.deepseek.com/anthropic",
+			model_mappings: JSON.stringify({ sonnet: "deepseek-v4" }),
+		});
 	});
 });

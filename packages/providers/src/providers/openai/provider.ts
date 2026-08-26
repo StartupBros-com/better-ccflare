@@ -20,7 +20,10 @@ import {
 	applySkillElision,
 	resolveSkillElisionBlockedSkills,
 } from "../../utils/skill-elision";
-import { transferResponseDrainTransport } from "../../utils/stream-drain";
+import {
+	drainReader,
+	transferResponseDrainTransport,
+} from "../../utils/stream-drain";
 
 const log = new Logger("OpenAICompatibleProvider");
 
@@ -168,11 +171,14 @@ export class OpenAICompatibleProvider extends BaseProvider {
 				// original is discarded here. `clone()` teed the body — leaving
 				// the original branch unread keeps the tee buffering for a body
 				// nobody will ever consume, on every JSON response this provider
-				// converts. Cancelling disturbs it immediately; the promise is
-				// not awaited because nothing downstream depends on it. Only the
-				// success path may do this: the catch below falls through and
-				// returns the original, which must stay intact. See issue #356.
-				response.body?.cancel().catch(() => {});
+				// converts. `reader.cancel()` is a no-op on released Bun versions;
+				// draining to `done` releases the native buffer. The promise is not
+				// awaited because nothing downstream depends on it. Only the success
+				// path may do this: the catch below returns the original intact.
+				const discardedBody = response.body;
+				if (discardedBody && !discardedBody.locked) {
+					void drainReader(discardedBody.getReader());
+				}
 
 				return new Response(JSON.stringify(anthropicData), {
 					status: response.status,
@@ -293,17 +299,17 @@ export class OpenAICompatibleProvider extends BaseProvider {
 		outputTokens?: number;
 	} | null> {
 		try {
-			const clone = response.clone();
 			const contentType = response.headers.get("content-type");
 
 			// Handle streaming responses (SSE)
 			if (contentType?.includes("text/event-stream")) {
-				// For streaming, we can only extract usage from the final chunk
-				// This is complex to implement properly, so we'll return null for now
-				// In a full implementation, we'd need to buffer the entire stream
+				// For streaming, we can only extract usage from the final chunk.
+				// Return null without cloning: an unread clone leaves its tee branch
+				// open and retains the native buffer for a body nobody will consume.
 				return null;
 			} else {
 				// Handle non-streaming JSON responses
+				const clone = response.clone();
 				const json = (await clone.json()) as {
 					model?: string;
 					usage?: {
