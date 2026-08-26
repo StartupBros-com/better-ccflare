@@ -53,6 +53,7 @@ const serverToolReplayRuntimeModule = await import(
 const { handleProxy } = await import("../proxy");
 
 const PROFILE_MODEL = "claude-bccf-route-pro-primary-sol";
+const PROFILE_MODEL_1M = `${PROFILE_MODEL}[1m]`;
 const CAPABILITY_PROFILE_MODEL = "claude-bccf-route-sol-capability";
 const LOGICAL_MODEL = "claude-opus-5";
 const CHILD_MODEL = "claude-sonnet-4-5";
@@ -381,9 +382,12 @@ describe("Claude Code gateway model route profiles", () => {
 		});
 	});
 
-	it("serves exact safe discovery rows locally with no provider, database, strategy, or fetch work", async () => {
+	it("discovers only the hinted Sol picker locally without leaking route metadata", async () => {
 		const harness = makeContext(
-			makeRegistry({ expectedPhysicalModel: "physical-model-secret" }),
+			makeRegistry({
+				expectedPhysicalModel: "physical-model-secret",
+				clientContextWindowHint: "1m",
+			}),
 		);
 		const { fetchMock } = installJsonUpstream();
 		const request = new Request(
@@ -403,7 +407,7 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(JSON.parse(raw)).toEqual({
 			data: [
 				{
-					id: PROFILE_MODEL,
+					id: PROFILE_MODEL_1M,
 					display_name: "GPT-5.6 Sol · pro-primary",
 				},
 			],
@@ -455,6 +459,64 @@ describe("Claude Code gateway model route profiles", () => {
 		);
 		expect(harness.providerCanHandle).toHaveBeenCalledWith("/v1/models");
 		expect(harness.strategySelect).toHaveBeenCalledTimes(1);
+	});
+
+	it("routes legacy and hinted Sol picker ids through the same profile", async () => {
+		const harness = makeContext(
+			makeRegistry({ clientContextWindowHint: "1m" }),
+		);
+		const { requests } = installJsonUpstream();
+
+		for (const model of [PROFILE_MODEL, PROFILE_MODEL_1M]) {
+			const request = apiRequest("/v1/messages", model);
+			expect(
+				(await handleProxy(request, new URL(request.url), harness.ctx, "key-1"))
+					.status,
+			).toBe(200);
+		}
+
+		expect(requests).toHaveLength(2);
+		for (const request of requests) {
+			expect(request.url).toBe(
+				`https://upstream.test/${ROUTE_ACCOUNT_ID}/v1/messages`,
+			);
+			expect(await fetchedJson(request)).toMatchObject({
+				model: LOGICAL_MODEL,
+				output_config: { effort: "xhigh" },
+			});
+		}
+	});
+
+	it("inherits legacy and hinted Sol picker spellings as the same profile", async () => {
+		const harness = makeContext(
+			makeRegistry({ clientContextWindowHint: "1m" }),
+		);
+		const { requests } = installJsonUpstream();
+		const session = { "x-claude-code-session-id": "hinted-child-session" };
+		const root = apiRequest("/v1/messages", PROFILE_MODEL_1M, session);
+		expect(
+			(await handleProxy(root, new URL(root.url), harness.ctx, "key-1")).status,
+		).toBe(200);
+
+		for (const model of [PROFILE_MODEL, PROFILE_MODEL_1M]) {
+			const child = apiRequest("/v1/messages", model, {
+				...session,
+				"x-claude-code-agent-id": `hinted-child-${model}`,
+			});
+			expect(
+				(await handleProxy(child, new URL(child.url), harness.ctx, "key-1"))
+					.status,
+			).toBe(200);
+		}
+
+		expect(requests).toHaveLength(3);
+		for (const request of requests) {
+			expect(request.url).toBe(
+				`https://upstream.test/${ROUTE_ACCOUNT_ID}/v1/messages`,
+			);
+			expect((await fetchedJson(request)).model).toBe(LOGICAL_MODEL);
+		}
+		expect(harness.strategySelect).not.toHaveBeenCalled();
 	});
 
 	it("rewrites an explicit route, pins its account, defaults effort, and records provenance", async () => {
@@ -1810,6 +1872,30 @@ describe("Claude Code gateway model route profiles", () => {
 			"https://upstream.test/normal-route/v1/messages",
 		]);
 		expect(harness.ctx.modelRouteSessionRegistry?.size).toBe(0);
+	});
+
+	it("fails an unconfigured hinted reserved picker before provider, account, or fetch work", async () => {
+		const harness = makeContext(
+			makeRegistry({ clientContextWindowHint: "1m" }),
+		);
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest("/v1/messages", `${PROFILE_MODEL}[2m]`);
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({
+			error: { type: "model_route_unavailable", reason: "unknown_profile" },
+		});
+		expect(harness.providerCanHandle).toHaveBeenCalledTimes(1);
+		expect(harness.providerCanHandle).toHaveBeenCalledWith("/v1/messages");
+		expect(harness.getAllAccounts).not.toHaveBeenCalled();
+		expect(harness.strategySelect).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it.each([

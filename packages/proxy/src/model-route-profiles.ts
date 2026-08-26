@@ -25,6 +25,7 @@ const PROFILE_KEYS = new Set([
 	"exclusiveAccount",
 	"contextWindow",
 	"maxOutputTokens",
+	"clientContextWindowHint",
 ]);
 
 const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -41,7 +42,10 @@ export type ModelRouteSelection = "capability";
 
 export interface ModelRouteProfile {
 	readonly id: string;
+	/** Stable route ID accepted for backward-compatible picker requests. */
 	readonly publicModelId: string;
+	/** Client-facing route ID advertised by local model discovery. */
+	readonly discoveryModelId: string;
 	readonly displayName: string;
 	readonly description?: string;
 	readonly accountId?: string;
@@ -56,6 +60,8 @@ export interface ModelRouteProfile {
 	readonly contextWindow?: number;
 	/** Maximum response tokens for an explicit bounded profile. */
 	readonly maxOutputTokens?: number;
+	/** Opt-in context-window capability advertised to supported clients. */
+	readonly clientContextWindowHint?: "1m";
 }
 
 export type BoundedModelRouteProfile = ModelRouteProfile & {
@@ -139,6 +145,19 @@ function optionalPositiveInteger(
 		);
 	}
 	return value;
+}
+
+function optionalClientContextWindowHint(
+	entry: Record<string, unknown>,
+	index: number,
+): "1m" | undefined {
+	if (!("clientContextWindowHint" in entry)) return undefined;
+	if (entry.clientContextWindowHint !== "1m") {
+		throw configError(
+			`profile ${index} field clientContextWindowHint must be exactly 1m`,
+		);
+	}
+	return "1m";
 }
 
 /**
@@ -255,6 +274,18 @@ export function parseModelRouteProfiles(
 			"maxOutputTokens",
 			index,
 		);
+		const clientContextWindowHint = optionalClientContextWindowHint(
+			candidate,
+			index,
+		);
+		if (
+			clientContextWindowHint !== undefined &&
+			(contextWindow !== undefined || maxOutputTokens !== undefined)
+		) {
+			throw configError(
+				`profile ${index} clientContextWindowHint must omit contextWindow and maxOutputTokens`,
+			);
+		}
 		if ((contextWindow === undefined) !== (maxOutputTokens === undefined)) {
 			throw configError(
 				`profile ${index} fields contextWindow and maxOutputTokens must be provided together`,
@@ -300,9 +331,12 @@ export function parseModelRouteProfiles(
 			}
 		}
 
-		return {
+		const discoveryModelId =
+			clientContextWindowHint === "1m" ? `${publicModelId}[1m]` : publicModelId;
+		const profile: ModelRouteProfile = {
 			id,
 			publicModelId,
+			discoveryModelId,
 			displayName: requiredString(
 				candidate,
 				"displayName",
@@ -320,6 +354,9 @@ export function parseModelRouteProfiles(
 			...(exclusiveAccount === undefined ? {} : { exclusiveAccount }),
 			...(contextWindow === undefined ? {} : { contextWindow }),
 			...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
+			...(clientContextWindowHint === undefined
+				? {}
+				: { clientContextWindowHint }),
 			logicalModel: requiredString(
 				candidate,
 				"logicalModel",
@@ -330,6 +367,7 @@ export function parseModelRouteProfiles(
 			expectedProvider,
 			expectedPhysicalModel,
 		};
+		return profile;
 	});
 }
 
@@ -442,9 +480,14 @@ export class ModelRouteSessionRegistry {
 		this.profilesById = new Map(
 			profiles.map((profile) => [profile.id, profile]),
 		);
-		this.profilesByPublicModelId = new Map(
-			profiles.map((profile) => [profile.publicModelId, profile]),
-		);
+		const profilesByPublicModelId = new Map<string, ModelRouteProfile>();
+		for (const profile of profiles) {
+			profilesByPublicModelId.set(profile.publicModelId, profile);
+			if (profile.discoveryModelId !== profile.publicModelId) {
+				profilesByPublicModelId.set(profile.discoveryModelId, profile);
+			}
+		}
+		this.profilesByPublicModelId = profilesByPublicModelId;
 	}
 
 	get size(): number {
@@ -457,6 +500,13 @@ export class ModelRouteSessionRegistry {
 
 	hasPublicModelId(modelId: string): boolean {
 		return this.profilesByPublicModelId.has(modelId);
+	}
+
+	isPublicModelIdForProfile(
+		modelId: string,
+		profile: ModelRouteProfile,
+	): boolean {
+		return this.profilesByPublicModelId.get(modelId) === profile;
 	}
 
 	isProfileOnlyAccount(accountId: string): boolean {
@@ -481,8 +531,8 @@ export class ModelRouteSessionRegistry {
 		readonly id: string;
 		readonly display_name: string;
 	}> {
-		return Array.from(this.profilesByPublicModelId.values(), (profile) => ({
-			id: profile.publicModelId,
+		return Array.from(this.profilesById.values(), (profile) => ({
+			id: profile.discoveryModelId,
 			display_name: profile.displayName,
 		}));
 	}
