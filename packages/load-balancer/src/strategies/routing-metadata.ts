@@ -1,3 +1,4 @@
+import { probeBackoffRank } from "@better-ccflare/core";
 import type {
 	Account,
 	RequestMeta,
@@ -190,6 +191,21 @@ export function compareStrategyCandidates(
 	}
 
 	return PRESSURE_RANK[pressureB.band] - PRESSURE_RANK[pressureA.band];
+}
+
+/**
+ * Apply SessionStrategy's probe-backoff penalty before its immutable candidate
+ * tier while preserving exact candidate identity and quota-pressure ordering.
+ */
+export function compareSessionStrategyCandidates(
+	a: StrategyCandidate,
+	b: StrategyCandidate,
+	meta?: RequestMeta,
+): number {
+	const probePreference =
+		probeBackoffRank(a.account.id) - probeBackoffRank(b.account.id);
+	if (probePreference !== 0) return probePreference;
+	return compareStrategyCandidates(a, b, meta);
 }
 
 /**

@@ -85,48 +85,48 @@ afterEach(() => {
 });
 
 describe("SessionStrategy — probe-backoff queue penalty", () => {
-	it("puts a penalised account behind a healthy one that ranks lower", () => {
+	it("puts a penalised account behind a healthy one that ranks lower", async () => {
 		const backedOff = makeAccount({ id: "sick", name: "sick", priority: 0 });
 		const healthy = makeAccount({ id: "well", name: "well", priority: 5 });
 		penalise(backedOff.id);
 
-		const order = strategy.select([backedOff, healthy], meta);
+		const order = await strategy.select([backedOff, healthy], meta);
 
 		// Priority 0 would normally win outright. A sustained refusal outranks it.
 		expect(order.map((a) => a.id)).toEqual(["well", "sick"]);
 	});
 
-	it("leaves the usual priority order alone when nobody is penalised", () => {
+	it("leaves the usual priority order alone when nobody is penalised", async () => {
 		const first = makeAccount({ id: "first", name: "first", priority: 0 });
 		const second = makeAccount({ id: "second", name: "second", priority: 5 });
 
-		const order = strategy.select([second, first], meta);
+		const order = await strategy.select([second, first], meta);
 
 		expect(order.map((a) => a.id)).toEqual(["first", "second"]);
 	});
 
-	it("still selects a penalised account when it is the only one left", () => {
+	it("still selects a penalised account when it is the only one left", async () => {
 		const backedOff = makeAccount({ id: "sick", name: "sick" });
 		penalise(backedOff.id);
 
-		const order = strategy.select([backedOff], meta);
+		const order = await strategy.select([backedOff], meta);
 
 		// A penalty, not a ban. Dropping it here would mean routing nowhere.
 		expect(order.map((a) => a.id)).toEqual(["sick"]);
 	});
 
-	it("orders penalised accounts among themselves by priority", () => {
+	it("orders penalised accounts among themselves by priority", async () => {
 		const low = makeAccount({ id: "low", name: "low", priority: 9 });
 		const high = makeAccount({ id: "high", name: "high", priority: 1 });
 		penalise(low.id);
 		penalise(high.id);
 
-		const order = strategy.select([low, high], meta);
+		const order = await strategy.select([low, high], meta);
 
 		expect(order.map((a) => a.id)).toEqual(["high", "low"]);
 	});
 
-	it("restores an account to its place as soon as the backoff deadline passes", () => {
+	it("restores an account to its place as soon as the backoff deadline passes", async () => {
 		const backedOff = makeAccount({ id: "sick", name: "sick", priority: 0 });
 		const healthy = makeAccount({ id: "well", name: "well", priority: 5 });
 
@@ -134,7 +134,7 @@ describe("SessionStrategy — probe-backoff queue penalty", () => {
 		// stale entry can never keep an account penalised forever.
 		setProbeBackoff(backedOff.id, Date.now() - 1000);
 
-		const order = strategy.select([backedOff, healthy], meta);
+		const order = await strategy.select([backedOff, healthy], meta);
 
 		expect(order.map((a) => a.id)).toEqual(["sick", "well"]);
 	});

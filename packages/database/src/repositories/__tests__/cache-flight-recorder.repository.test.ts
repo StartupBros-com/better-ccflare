@@ -179,12 +179,12 @@ describe("cache flight recorder schema", () => {
 		const adapter = {
 			unsafe: async (sql: string) => {
 				statements.push(sql);
+				return [];
 			},
 			// Reports both column and index existence checks as satisfied so
 			// runMigrationsPg's unique-index/dedup migration (unrelated to the
-			// recorder tables this test exercises) is a no-op: its collapse
-			// helper reads rows back via adapter.unsafe(), which this mock
-			// doesn't model.
+			// recorder tables this test exercises) sees no duplicate groups to
+			// collapse when its helper reads rows via adapter.unsafe().
 			get: async <T>(sql: string): Promise<T | null> =>
 				sql.includes("information_schema.columns") || sql.includes("pg_indexes")
 					? ({ exists: 1 } as T)

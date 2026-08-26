@@ -60,6 +60,7 @@ function captureAdapter(statements: string[]): BunSqlAdapter {
 		},
 		unsafe: async (sql: string) => {
 			statements.push(sql);
+			return [];
 		},
 	} as unknown as BunSqlAdapter;
 }

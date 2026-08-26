@@ -664,6 +664,23 @@ describe("CLI Integration Tests", () => {
 			expect(output).toContain("Invalid mode");
 			expect(output).toContain("Valid modes:");
 		});
+
+		it("should reject the legacy muse-spark CLI mode", async () => {
+			const result = await runCLI([
+				"--add-account",
+				"test-account",
+				"--mode",
+				"muse-spark",
+				"--priority",
+				"0",
+			]);
+
+			expect(result.exitCode).toBe(1);
+			const output = result.stdout + result.stderr;
+			expect(output).toContain("Invalid mode: muse-spark");
+			expect(output).toContain("Valid modes:");
+			expect(output).not.toContain("muse-spark,");
+		});
 	});
 
 	describe("Argument Parsing", () => {

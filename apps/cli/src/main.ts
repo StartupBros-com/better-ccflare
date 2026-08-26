@@ -727,7 +727,6 @@ function parseArgs(args: string[]): ParsedArgs {
 					modeValue = "claude-oauth";
 				}
 
-				parsed.mode = modeValue as AccountMode;
 				if (!ACCOUNT_MODES.includes(modeValue)) {
 					console.error(`❌ Invalid mode: ${modeValue}`);
 					console.error(`Valid modes: ${ACCOUNT_MODES.join(", ")}`);
@@ -763,6 +762,7 @@ function parseArgs(args: string[]): ParsedArgs {
 
 					fastExit(1);
 				}
+				parsed.mode = modeValue as AccountMode;
 				break;
 			}
 			case "--priority":
