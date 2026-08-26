@@ -241,6 +241,50 @@ function translateContentItem(c: {
 	return { ok: false, reason: `unknown content type "${c.type}"` };
 }
 
+function translateInstructionContent(
+	role: "system" | "developer",
+	parts: unknown[],
+): string[] {
+	const textBlocks: string[] = [];
+	for (const rawPart of parts) {
+		if (
+			rawPart === null ||
+			typeof rawPart !== "object" ||
+			Array.isArray(rawPart)
+		) {
+			throw new InvalidInstructionError(
+				`${role} message content must be text-only`,
+			);
+		}
+		const part = rawPart as {
+			type: unknown;
+			text?: unknown;
+			refusal?: unknown;
+			image_url?: unknown;
+			file_id?: unknown;
+		};
+		const translated = translateContentItem(part);
+		if (
+			!translated.ok ||
+			translated.block.type !== "text" ||
+			(part.type !== "input_text" &&
+				part.type !== "output_text" &&
+				part.type !== "refusal")
+		) {
+			throw new InvalidInstructionError(
+				`${role} message content must be text-only`,
+			);
+		}
+		textBlocks.push(translated.block.text);
+	}
+	if (textBlocks.length === 0) {
+		throw new InvalidInstructionError(
+			`${role} message content must be text-only`,
+		);
+	}
+	return textBlocks;
+}
+
 function mergeConsecutiveSameRole(
 	messages: AnthropicMessage[],
 ): AnthropicMessage[] {
@@ -325,25 +369,43 @@ export function translateRequestToAnthropic(
 
 			// OpenAI permits content as either a string (shorthand for a single
 			// input_text part) or an array of structured parts; normalize both
-			// into a parts array before validating each part below. Anything
-			// else is runtime-malformed input (content is type-required) that
-			// would throw on the loop below — drop-with-warn instead.
+			// into a parts array before validating each part below. A malformed
+			// shape fails closed for instructions, but ordinary messages keep the
+			// existing drop-with-warn behavior.
+			const isInstruction = role === "system" || role === "developer";
+			// Check position before content filtering so an unsupported late
+			// instruction cannot silently disappear from the conversation.
+			if (isInstruction && messages.length > 0) {
+				throw new InvalidInstructionError(
+					`${role} message must appear before conversation content`,
+				);
+			}
+
 			let parts: unknown[];
 			if (typeof item.content === "string") {
 				parts = [{ type: "input_text", text: item.content }];
 			} else if (Array.isArray(item.content)) {
 				parts = item.content as unknown[];
 			} else {
+				if (isInstruction) {
+					throw new InvalidInstructionError(
+						`${role} message content must be text-only`,
+					);
+				}
 				emitWarn(
 					`Dropping message with role "${role}" — content is neither a string nor an array, cannot translate`,
 				);
 				continue;
 			}
 
+			if (isInstruction) {
+				instructionBlocks.push(...translateInstructionContent(role, parts));
+				continue;
+			}
+
 			const content: AnthropicContent[] = [];
 			let malformedCount = 0;
 			let rejectedCount = 0;
-			let hasImageInstructionContent = false;
 			for (const rawC of parts) {
 				if (rawC === null || typeof rawC !== "object" || Array.isArray(rawC)) {
 					malformedCount++;
@@ -356,12 +418,6 @@ export function translateRequestToAnthropic(
 					image_url?: unknown;
 					file_id?: unknown;
 				};
-				if (
-					(role === "system" || role === "developer") &&
-					contentItem.type === "input_image"
-				) {
-					hasImageInstructionContent = true;
-				}
 				const res = translateContentItem(contentItem);
 				if (res.ok) {
 					content.push(res.block);
@@ -394,31 +450,6 @@ export function translateRequestToAnthropic(
 				continue;
 			}
 
-			// system and developer roles carry request instructions. Anthropic
-			// /v1/messages accepts them only through the top-level system field, so
-			// preserve their input order while extracting text. Fail closed when
-			// translation cannot preserve either their content or their position.
-			if (role === "system" || role === "developer") {
-				if (messages.length > 0) {
-					throw new InvalidInstructionError(
-						`${role} message must appear before conversation content`,
-					);
-				}
-				if (hasImageInstructionContent) {
-					throw new InvalidInstructionError(
-						`${role} message content must be text-only`,
-					);
-				}
-				for (const c of content) {
-					if (c.type !== "text") {
-						throw new InvalidInstructionError(
-							`${role} message content must be text-only`,
-						);
-					}
-					instructionBlocks.push(c.text);
-				}
-				continue;
-			}
 			messages.push({ role, content });
 			continue;
 		}

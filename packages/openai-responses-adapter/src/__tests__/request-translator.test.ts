@@ -1252,6 +1252,52 @@ describe("translateRequestToAnthropic", () => {
 		}
 	});
 
+	test("leading system and developer content fails closed when translation cannot preserve policy", () => {
+		for (const role of ["system", "developer"] as const) {
+			for (const content of [
+				// biome-ignore lint/suspicious/noExplicitAny: exercising an unsupported Responses input part
+				[{ type: "input_file", file_id: "file_policy" }] as any,
+				// biome-ignore lint/suspicious/noExplicitAny: exercising a malformed instruction part
+				[null] as any,
+				// biome-ignore lint/suspicious/noExplicitAny: exercising malformed text in an instruction part
+				[{ type: "input_text", text: 1 }] as any,
+			]) {
+				const req: ResponsesRequest = {
+					model: "claude-3-5-sonnet-20241022",
+					input: [
+						{ type: "message", role, content },
+						{ type: "message", role: "user", content: "hello" },
+					],
+				};
+
+				expect(() => translateRequestToAnthropic(req)).toThrow(
+					`${role} message content must be text-only`,
+				);
+			}
+		}
+	});
+
+	test("late system and developer instructions are rejected before invalid content can be filtered", () => {
+		for (const role of ["system", "developer"] as const) {
+			const req: ResponsesRequest = {
+				model: "claude-3-5-sonnet-20241022",
+				input: [
+					{ type: "message", role: "user", content: "conversation" },
+					{
+						type: "message",
+						role,
+						// biome-ignore lint/suspicious/noExplicitAny: exercising an unsupported Responses input part
+						content: [{ type: "input_file", file_id: "file_policy" }] as any,
+					},
+				],
+			};
+
+			expect(() => translateRequestToAnthropic(req)).toThrow(
+				`${role} message must appear before conversation content`,
+			);
+		}
+	});
+
 	// --- Findings #1 / #4: malformed-content warn batching + empty-content drop ---
 
 	test("message with a single null content element (only element) is dropped entirely, not emitted as an empty-content message", () => {

@@ -1106,6 +1106,40 @@ describe("Responses request body admission", () => {
 			});
 		});
 
+		test("rejects late unsupported system and developer instructions before proxying", async () => {
+			for (const role of ["system", "developer"]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({
+					model: "claude-haiku-4-5",
+					input: [
+						{ type: "message", role: "user", content: "first user" },
+						{
+							type: "message",
+							role,
+							content: [{ type: "input_file", file_id: "file_policy" }],
+						},
+					],
+				});
+
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+
+				expect(response.status).toBe(400);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: `${role} message must appear before conversation content`,
+					},
+				});
+			}
+		});
+
 		test("rejects a system message after conversation content before proxying", async () => {
 			const [proxy, calls] = countingProxy();
 			const req = request({
