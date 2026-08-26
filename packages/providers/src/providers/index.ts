@@ -49,6 +49,7 @@ export {
 	resolveCodexRequestModel,
 	suppressCodexExplicitCacheBreakpoint,
 } from "./codex/index";
+export { DeepseekProvider } from "./deepseek/index";
 export { KiloProvider } from "./kilo/index";
 export {
 	effortForThinkingBudget,

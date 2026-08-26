@@ -75,6 +75,7 @@ describe("providerAcceptsClientModel", () => {
 	it("is true only for providers whose upstream speaks Claude model ids", () => {
 		expect(providerAcceptsClientModel("anthropic")).toBe(true);
 		expect(providerAcceptsClientModel("claude-console-api")).toBe(true);
+		expect(providerAcceptsClientModel("deepseek")).toBe(true);
 		expect(providerAcceptsClientModel("codex")).toBe(false);
 		expect(providerAcceptsClientModel("zai")).toBe(false);
 	});

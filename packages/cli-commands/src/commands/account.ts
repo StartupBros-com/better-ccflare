@@ -42,6 +42,7 @@ export interface AddAccountOptionsWithAdapter {
 		| "console"
 		| "zai"
 		| "minimax"
+		| "deepseek"
 		| "anthropic-compatible"
 		| "openai-compatible"
 		| "nanogpt"
@@ -92,6 +93,7 @@ export interface AccountListItemWithMode extends AccountListItem {
 		| "console"
 		| "zai"
 		| "minimax"
+		| "deepseek"
 		| "anthropic-compatible"
 		| "openai-compatible"
 		| "nanogpt"
@@ -182,6 +184,50 @@ async function createMinimaxAccount(
 		],
 	);
 	return toCreatedAccountIdentity({ id: accountId, name, provider: "minimax" });
+}
+
+const DEEPSEEK_ENDPOINT = "https://api.deepseek.com/anthropic";
+
+/** Create a DeepSeek account with its fixed Anthropic-compatible endpoint. */
+async function createDeepseekAccount(
+	dbOps: DatabaseOperations,
+	name: string,
+	apiKey: string,
+	priority: number,
+	modelMappings?: { [key: string]: string | string[] } | null,
+): Promise<CreatedAccountIdentity> {
+	const accountId = crypto.randomUUID();
+	const now = Date.now();
+	const validatedApiKey = validateApiKey(apiKey, "DeepSeek API key");
+	const validatedPriority = validatePriority(priority, "priority");
+	let validatedModelMappings: string | null = null;
+	if (modelMappings && Object.keys(modelMappings).length > 0) {
+		validatedModelMappings = JSON.stringify(
+			validateAndSanitizeModelMappings(modelMappings),
+		);
+	}
+
+	await dbOps.getAdapter().run(
+		`INSERT INTO accounts (
+			id, name, provider, api_key, refresh_token, access_token,
+			expires_at, created_at, request_count, total_requests, priority, custom_endpoint, model_mappings
+		) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, 0, 0, ?, ?, ?)`,
+		[
+			accountId,
+			name,
+			"deepseek",
+			validatedApiKey,
+			now,
+			validatedPriority,
+			DEEPSEEK_ENDPOINT,
+			validatedModelMappings,
+		],
+	);
+	return toCreatedAccountIdentity({
+		id: accountId,
+		name,
+		provider: "deepseek",
+	});
 }
 
 /**
@@ -1529,6 +1575,23 @@ export async function addAccount(
 		console.log(`\nAccount '${name}' added successfully!`);
 		console.log("Type: Minimax (API key)");
 		return createdAccount;
+	} else if (mode === "deepseek") {
+		const apiKey = await adapter.input("\nEnter your DeepSeek API key: ");
+		const finalModelMappings = await promptModelMappings(
+			adapter,
+			modelMappings,
+		);
+		const createdAccount = await createDeepseekAccount(
+			dbOps,
+			name,
+			apiKey,
+			providedPriority || 0,
+			finalModelMappings,
+		);
+		console.log(`\nAccount '${name}' added successfully!`);
+		console.log("Type: DeepSeek (API key)");
+		console.log(`Endpoint: ${DEEPSEEK_ENDPOINT}`);
+		return createdAccount;
 	} else if (mode === "nanogpt") {
 		// Handle NanoGPT accounts with API keys
 		const apiKey = await adapter.input("\nEnter your NanoGPT API key: ");
@@ -1946,6 +2009,7 @@ export async function getAccountsList(
 				if (
 					account.provider === "zai" ||
 					account.provider === "minimax" ||
+					account.provider === "deepseek" ||
 					account.provider === "anthropic-compatible" ||
 					account.provider === "bedrock" ||
 					account.provider === "openrouter" ||

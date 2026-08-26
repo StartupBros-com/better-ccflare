@@ -25,6 +25,14 @@ export {
 	verifyGuardCorrelationEnvelope,
 } from "./guard-correlation-auth";
 export {
+	clearPendingRotation,
+	flushPendingRotation,
+	getPendingRotation,
+	type PendingRotation,
+	type PendingRotationDbOps,
+	recordPendingRotation,
+} from "./pending-rotation-registry";
+export {
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
 	createPoolExhaustedResponse,

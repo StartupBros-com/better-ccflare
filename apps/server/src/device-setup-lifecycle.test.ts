@@ -77,6 +77,7 @@ mock.module("@better-ccflare/proxy", () => {
 		drainUsageCollector: async () => {},
 		forceCloseCircuit: () => {},
 		getCodexModels: async () => null,
+		getOpenAICompatibleModels: async () => null,
 		getModelCatalog: () => null,
 		getUsageCollectorHealth: () => null,
 		getValidAccessToken: async () => null,

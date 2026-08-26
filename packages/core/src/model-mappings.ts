@@ -375,6 +375,7 @@ export function getModelList(
 const PROVIDERS_ACCEPTING_CLIENT_MODEL = new Set([
 	"anthropic",
 	"claude-console-api",
+	"deepseek",
 ]);
 
 /** Whether this provider understands a Claude model id without translation. */

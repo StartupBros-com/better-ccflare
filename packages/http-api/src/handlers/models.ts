@@ -90,14 +90,14 @@ export function createModelsHandler(context: APIContext) {
 			return jsonResponse(await context.modelCatalog.get());
 		}
 
-		// An account's own listing beats every catalogue: it is the only one
-		// that knows what this subscription may call. Providers without such a
-		// listing fall through to the generic path below, unchanged.
-		if (accountId && context.modelCatalog?.codexModels) {
-			const listing = await context.modelCatalog.codexModels(accountId);
+		// Account listings are entitlement evidence, so select their discovery
+		// path by the requested provider. In particular, an arbitrary
+		// openai-compatible endpoint must never answer a Codex (or other) query.
+		if (accountId && requested === "codex") {
+			const listing = await context.modelCatalog?.codexModels?.(accountId);
 			if (listing) {
 				return jsonResponse({
-					provider: requested,
+					provider: "codex",
 					models: listing.models.map((model) => ({
 						id: model.id,
 						displayName: model.displayName,
@@ -120,6 +120,34 @@ export function createModelsHandler(context: APIContext) {
 						: {}),
 				});
 			}
+		}
+
+		if (accountId && requested === "openai-compatible") {
+			const listing =
+				await context.modelCatalog?.openaiCompatibleModels?.(accountId);
+			if (listing) {
+				return jsonResponse({
+					provider: "openai-compatible",
+					models: listing.models.map((model) => ({
+						id: model.id,
+						displayName: model.displayName,
+						source: "account" as const,
+					})),
+					fetchedAt: listing.fetchedAt,
+					source: listing.source,
+				});
+			}
+		}
+
+		if (accountId) {
+			return jsonResponse({
+				provider: requested,
+				models: [],
+				fetchedAt: Date.now(),
+				source: "unavailable",
+				warning:
+					"No account-specific listing is available for this provider/account combination.",
+			});
 		}
 
 		if (requested === "" || isAnthropicProvider(requested)) {

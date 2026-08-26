@@ -384,6 +384,7 @@ class API extends HttpClient {
 			| "console"
 			| "zai"
 			| "minimax"
+			| "deepseek"
 			| "anthropic-compatible"
 			| "openai-compatible"
 			| "nanogpt"
@@ -631,6 +632,35 @@ class API extends HttpClient {
 	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/minimax";
+
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
+
+		try {
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
+			const duration = Date.now() - startTime;
+			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
+			return response;
+		} catch (error) {
+			const duration = Date.now() - startTime;
+			this.logger.error(`✗ POST ${url} - ERROR (${duration}ms)`, {
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
+			if (error instanceof HttpError) {
+				throw new Error(error.message);
+			}
+			throw error;
+		}
+	}
+
+	async addDeepseekAccount(data: {
+		name: string;
+		apiKey: string;
+		priority: number;
+		modelMappings?: { [key: string]: string };
+	}): Promise<AccountCreatedApiResponse> {
+		const startTime = Date.now();
+		const url = "/api/accounts/deepseek";
 
 		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 

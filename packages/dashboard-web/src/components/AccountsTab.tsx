@@ -54,6 +54,7 @@ type AccountCreationClient = Pick<
 	| "addBedrockAccount"
 	| "addZaiAccount"
 	| "addMinimaxAccount"
+	| "addDeepseekAccount"
 	| "addMetaAccount"
 	| "addNanoGPTAccount"
 	| "addAlibabaCodingPlanAccount"
@@ -126,6 +127,14 @@ export function createAccountCreationCallbacks(
 		) =>
 			immutableAccountIdentity(
 				() => client.addMinimaxAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddDeepseekAccount: (
+			params: Parameters<typeof client.addDeepseekAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addDeepseekAccount(params),
 				afterCreate,
 				onError,
 			),
@@ -317,6 +326,7 @@ export function AccountsTab() {
 			| "console"
 			| "zai"
 			| "minimax"
+			| "deepseek"
 			| "anthropic-compatible"
 			| "openai-compatible"
 			| "nanogpt"
@@ -395,6 +405,13 @@ export function AccountsTab() {
 	}) => {
 		return accountCreationCallbacks.onAddMinimaxAccount(params);
 	};
+
+	const handleAddDeepseekAccount = async (params: {
+		name: string;
+		apiKey: string;
+		priority: number;
+		modelMappings?: { [key: string]: string };
+	}) => accountCreationCallbacks.onAddDeepseekAccount(params);
 
 	const handleAddMetaAccount = async (params: {
 		name: string;
@@ -739,6 +756,7 @@ export function AccountsTab() {
 							onAddBedrockAccount={handleAddBedrockAccount}
 							onAddZaiAccount={handleAddZaiAccount}
 							onAddMinimaxAccount={handleAddMinimaxAccount}
+							onAddDeepseekAccount={handleAddDeepseekAccount}
 							onAddNanoGPTAccount={handleAddNanoGPTAccount}
 							onAddAlibabaCodingPlanAccount={handleAddAlibabaCodingPlanAccount}
 							onAddKiloAccount={handleAddKiloAccount}

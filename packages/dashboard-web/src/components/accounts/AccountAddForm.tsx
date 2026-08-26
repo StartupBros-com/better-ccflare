@@ -82,6 +82,7 @@ interface AccountAddFormProps {
 			| "console"
 			| "zai"
 			| "minimax"
+			| "deepseek"
 			| "anthropic-compatible"
 			| "openai-compatible"
 			| "nanogpt"
@@ -111,6 +112,12 @@ interface AccountAddFormProps {
 		name: string;
 		apiKey: string;
 		priority: number;
+	}) => Promise<AccountCreationIdentity>;
+	onAddDeepseekAccount: (params: {
+		name: string;
+		apiKey: string;
+		priority: number;
+		modelMappings?: { [key: string]: string };
 	}) => Promise<AccountCreationIdentity>;
 	onAddMetaAccount: (params: {
 		name: string;
@@ -198,6 +205,7 @@ export function AccountAddForm({
 	onCompleteAccount,
 	onAddZaiAccount,
 	onAddMinimaxAccount,
+	onAddDeepseekAccount,
 	onAddMetaAccount,
 	onAddAnthropicCompatibleAccount,
 	onAddNanoGPTAccount,
@@ -224,6 +232,7 @@ export function AccountAddForm({
 			| "console"
 			| "zai"
 			| "minimax"
+			| "deepseek"
 			| "meta"
 			| "anthropic-compatible"
 			| "openai-compatible"
@@ -425,6 +434,7 @@ export function AccountAddForm({
 			const apiKeyErrors: Partial<Record<AccountSetupMode, string>> = {
 				zai: "API key is required for z.ai accounts",
 				minimax: "API key is required for Minimax accounts",
+				deepseek: "API key is required for DeepSeek accounts",
 				meta: "API key is required for Meta Model API accounts",
 				nanogpt: "API key is required for NanoGPT accounts",
 				"anthropic-compatible":
@@ -639,6 +649,12 @@ export function AccountAddForm({
 		}
 	};
 
+	/** A direct-mode guard runs after transition; restore the review state before returning. */
+	const abortDirectCreation = (message: string) => {
+		transitionAccountSetup({ type: "creation-failed", error: message });
+		onError(message);
+	};
+
 	const handleAddAccount = async () => {
 		if (!requireCurrentRoutingReview()) return;
 		if (!validateAccountDetails()) return;
@@ -659,6 +675,7 @@ export function AccountAddForm({
 				| "console"
 				| "zai"
 				| "minimax"
+				| "deepseek"
 				| "anthropic-compatible"
 				| "openai-compatible"
 				| "bedrock"
@@ -673,7 +690,9 @@ export function AccountAddForm({
 
 		if (newAccount.mode === "vertex-ai") {
 			if (!newAccount.projectId) {
-				onError("Google Cloud Project ID is required for Vertex AI accounts");
+				abortDirectCreation(
+					"Google Cloud Project ID is required for Vertex AI accounts",
+				);
 				return;
 			}
 			// For Vertex AI accounts, we don't need OAuth flow
@@ -690,11 +709,11 @@ export function AccountAddForm({
 
 		if (newAccount.mode === "bedrock") {
 			if (!newAccount.profile) {
-				onError("AWS profile is required for Bedrock accounts");
+				abortDirectCreation("AWS profile is required for Bedrock accounts");
 				return;
 			}
 			if (!newAccount.awsRegion) {
-				onError(
+				abortDirectCreation(
 					"Region not found for selected profile. Configure ~/.aws/config",
 				);
 				return;
@@ -715,7 +734,7 @@ export function AccountAddForm({
 
 		if (newAccount.mode === "zai") {
 			if (!newAccount.apiKey) {
-				onError("API key is required for z.ai accounts");
+				abortDirectCreation("API key is required for z.ai accounts");
 				return;
 			}
 			// Build model mappings from form fields
@@ -738,7 +757,7 @@ export function AccountAddForm({
 
 		if (newAccount.mode === "minimax") {
 			if (!newAccount.apiKey) {
-				onError("API key is required for Minimax accounts");
+				abortDirectCreation("API key is required for Minimax accounts");
 				return;
 			}
 			// For Minimax accounts, we don't need OAuth flow and use default tier
@@ -752,9 +771,26 @@ export function AccountAddForm({
 			return;
 		}
 
+		if (newAccount.mode === "deepseek") {
+			if (!newAccount.apiKey) {
+				abortDirectCreation("API key is required for DeepSeek accounts");
+				return;
+			}
+			const modelMappings = buildAccountModelMappings(newAccount);
+			const identity = await onAddDeepseekAccount({
+				name: newAccount.name,
+				apiKey: newAccount.apiKey,
+				priority: newAccount.priority,
+				modelMappings:
+					Object.keys(modelMappings).length > 0 ? modelMappings : undefined,
+			});
+			await completeCreatedAccount(identity);
+			return;
+		}
+
 		if (newAccount.mode === "meta") {
 			if (!newAccount.apiKey) {
-				onError("API key is required for Meta Model API accounts");
+				abortDirectCreation("API key is required for Meta Model API accounts");
 				return;
 			}
 			const modelMappings = buildAccountModelMappings(newAccount);
@@ -772,7 +808,7 @@ export function AccountAddForm({
 
 		if (newAccount.mode === "nanogpt") {
 			if (!newAccount.apiKey) {
-				onError("API key is required for NanoGPT accounts");
+				abortDirectCreation("API key is required for NanoGPT accounts");
 				return;
 			}
 			// Build model mappings from form fields
@@ -793,7 +829,7 @@ export function AccountAddForm({
 
 		if (newAccount.mode === "kilo") {
 			if (!newAccount.apiKey) {
-				onError("API key is required for Kilo Gateway accounts");
+				abortDirectCreation("API key is required for Kilo Gateway accounts");
 				return;
 			}
 			const kiloModelMappings = buildAccountModelMappings(newAccount);
@@ -812,7 +848,9 @@ export function AccountAddForm({
 
 		if (newAccount.mode === "alibaba-coding-plan") {
 			if (!newAccount.apiKey) {
-				onError("API key is required for Alibaba Coding Plan accounts");
+				abortDirectCreation(
+					"API key is required for Alibaba Coding Plan accounts",
+				);
 				return;
 			}
 			const modelMappings = buildAccountModelMappings(newAccount);
@@ -829,7 +867,7 @@ export function AccountAddForm({
 
 		if (newAccount.mode === "openrouter") {
 			if (!newAccount.apiKey) {
-				onError("API key is required for OpenRouter accounts");
+				abortDirectCreation("API key is required for OpenRouter accounts");
 				return;
 			}
 			const modelMappings = buildAccountModelMappings(newAccount);
@@ -846,7 +884,9 @@ export function AccountAddForm({
 
 		if (newAccount.mode === "anthropic-compatible") {
 			if (!newAccount.apiKey) {
-				onError("API key is required for Anthropic-compatible accounts");
+				abortDirectCreation(
+					"API key is required for Anthropic-compatible accounts",
+				);
 				return;
 			}
 			// Build model mappings object
@@ -868,11 +908,15 @@ export function AccountAddForm({
 
 		if (newAccount.mode === "openai-compatible") {
 			if (!newAccount.apiKey) {
-				onError("API key is required for OpenAI-compatible accounts");
+				abortDirectCreation(
+					"API key is required for OpenAI-compatible accounts",
+				);
 				return;
 			}
 			if (!newAccount.customEndpoint) {
-				onError("Endpoint URL is required for OpenAI-compatible accounts");
+				abortDirectCreation(
+					"Endpoint URL is required for OpenAI-compatible accounts",
+				);
 				return;
 			}
 
@@ -910,7 +954,7 @@ export function AccountAddForm({
 
 		if (newAccount.mode === "ollama-cloud") {
 			if (!newAccount.apiKey) {
-				onError("API key is required for Ollama Cloud");
+				abortDirectCreation("API key is required for Ollama Cloud");
 				return;
 			}
 			const modelMappings = buildAccountModelMappings(newAccount);
@@ -1091,6 +1135,7 @@ export function AccountAddForm({
 										| "console"
 										| "zai"
 										| "minimax"
+										| "deepseek"
 										| "meta"
 										| "anthropic-compatible"
 										| "openai-compatible"
@@ -1121,6 +1166,7 @@ export function AccountAddForm({
 									<SelectItem value="bedrock">AWS Bedrock</SelectItem>
 									<SelectItem value="zai">z.ai (API Key)</SelectItem>
 									<SelectItem value="minimax">Minimax (API Key)</SelectItem>
+									<SelectItem value="deepseek">DeepSeek (API Key)</SelectItem>
 									<SelectItem value="meta">Meta Model API (API Key)</SelectItem>
 									<SelectItem value="nanogpt">NanoGPT (API Key)</SelectItem>
 									<SelectItem value="anthropic-compatible">
@@ -2128,6 +2174,56 @@ export function AccountAddForm({
 								</div>
 							</>
 						)}
+						{newAccount.mode === "deepseek" && (
+							<>
+								<div className="space-y-2">
+									<Label htmlFor="apiKey">DeepSeek API Key</Label>
+									<Input
+										id="apiKey"
+										type="password"
+										value={newAccount.apiKey}
+										onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
+											setNewAccount({
+												...newAccount,
+												apiKey: event.currentTarget.value,
+											})
+										}
+										placeholder="Enter your DeepSeek API key"
+									/>
+								</div>
+								<p className="text-xs text-muted-foreground">
+									Uses the fixed endpoint https://api.deepseek.com/anthropic.
+								</p>
+								<div className="grid grid-cols-2 gap-2">
+									{(["fable", "opus", "sonnet", "haiku"] as const).map(
+										(family) => (
+											<div className="space-y-1" key={family}>
+												<Label
+													htmlFor={`deepseek-${family}`}
+													className="text-sm"
+												>
+													{family[0].toUpperCase() + family.slice(1)} model
+													(optional)
+												</Label>
+												<Input
+													id={`deepseek-${family}`}
+													value={newAccount[`${family}Model`]}
+													onChange={(
+														event: React.ChangeEvent<HTMLInputElement>,
+													) =>
+														setNewAccount({
+															...newAccount,
+															[`${family}Model`]: event.currentTarget.value,
+														})
+													}
+												/>
+											</div>
+										),
+									)}
+								</div>
+							</>
+						)}
+
 						{newAccount.mode === "meta" && (
 							<>
 								<div className="space-y-2">

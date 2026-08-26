@@ -17,6 +17,7 @@ export type AccountSetupMode =
 	| "console"
 	| "zai"
 	| "minimax"
+	| "deepseek"
 	| "meta"
 	| "anthropic-compatible"
 	| "openai-compatible"
@@ -50,6 +51,7 @@ const ACCOUNT_SETUP_ROUTING_METADATA = {
 	},
 	zai: { provider: "zai", routeClass: "api-key", billingType: "api" },
 	minimax: { provider: "minimax", routeClass: "api-key", billingType: "api" },
+	deepseek: { provider: "deepseek", routeClass: "api-key", billingType: "api" },
 	meta: { provider: "meta", routeClass: "api-key", billingType: "api" },
 	"anthropic-compatible": {
 		provider: "anthropic-compatible",

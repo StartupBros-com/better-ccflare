@@ -189,6 +189,14 @@ export {
 	type ModelRouteSessionRegistryOptions,
 	parseModelRouteProfiles,
 } from "./model-route-profiles";
+export type {
+	OpenAICompatibleModelEntry,
+	OpenAICompatibleModelListing,
+} from "./openai-compatible-model-catalog";
+export {
+	clearOpenAICompatibleModelCacheForAccount,
+	getOpenAICompatibleModels,
+} from "./openai-compatible-model-catalog";
 export {
 	drainUsageCollector,
 	getUsageCollectorHealth,

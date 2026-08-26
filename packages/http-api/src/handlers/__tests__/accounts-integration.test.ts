@@ -12,11 +12,22 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Config } from "@better-ccflare/config";
 import { DatabaseOperations } from "@better-ccflare/database";
+import {
+	clearDerivedProviderModelDefaults,
+	resolveProviderModelDefault,
+	setDerivedAccountModelDefaults,
+} from "@better-ccflare/providers";
 import { deriveComboRouteClass } from "@better-ccflare/providers/request-capabilities";
 import {
+	clearOpenAICompatibleModelCacheForAccount,
+	getOpenAICompatibleModels,
+} from "@better-ccflare/proxy";
+import {
+	createAccountCustomEndpointUpdateHandler,
 	createAccountPauseHandler,
 	createAccountResumeHandler,
 	createAccountsListHandler,
+	createDeepseekAccountAddHandler,
 	createMetaAccountAddHandler,
 	createOpenAIAccountAddHandler,
 } from "../accounts";
@@ -1372,6 +1383,130 @@ describe("Accounts Handler - OAuth control-plane hotfix (U8)", () => {
  * (packages/cli-commands/src/commands/account.ts createOpenAIAccount): the key
  * in `api_key`, and `refresh_token`, `access_token`, AND `expires_at` all NULL.
  */
+describe("Accounts Handler - compatible endpoint catalog invalidation", () => {
+	let tmpDir: string;
+	let dbOps: DatabaseOperations;
+	let originalFetch: typeof globalThis.fetch;
+
+	beforeEach(() => {
+		tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "ccflare-compatible-endpoint-"),
+		);
+		dbOps = new DatabaseOperations(path.join(tmpDir, "test.db"));
+		originalFetch = globalThis.fetch;
+		clearOpenAICompatibleModelCacheForAccount("compatible-endpoint-change");
+		clearOpenAICompatibleModelCacheForAccount("compatible-endpoint-noop");
+		clearOpenAICompatibleModelCacheForAccount("anthropic-endpoint-change");
+		clearDerivedProviderModelDefaults();
+	});
+
+	afterEach(async () => {
+		globalThis.fetch = originalFetch;
+		clearOpenAICompatibleModelCacheForAccount("compatible-endpoint-change");
+		clearOpenAICompatibleModelCacheForAccount("compatible-endpoint-noop");
+		clearOpenAICompatibleModelCacheForAccount("anthropic-endpoint-change");
+		clearDerivedProviderModelDefaults();
+		await dbOps.close();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	async function insertAccount(
+		id: string,
+		provider: string,
+		endpoint: string,
+	): Promise<void> {
+		await dbOps.getAdapter().run(
+			`INSERT INTO accounts (
+				id, name, provider, api_key, created_at, request_count, total_requests, priority, custom_endpoint
+			) VALUES (?, ?, ?, ?, ?, 0, 0, 1, ?)`,
+			[id, id, provider, "test-key", Date.now(), endpoint],
+		);
+	}
+
+	function updateEndpoint(
+		accountId: string,
+		customEndpoint: string,
+	): Promise<Response> {
+		return createAccountCustomEndpointUpdateHandler(dbOps)(
+			new Request("http://local/api/accounts/custom-endpoint", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ customEndpoint }),
+			}),
+			accountId,
+		);
+	}
+
+	it("clears compatible catalog evidence after a successful endpoint change", async () => {
+		const accountId = "compatible-endpoint-change";
+		await insertAccount(
+			accountId,
+			"openai-compatible",
+			"https://before.example.com/v1",
+		);
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ data: [{ id: "before-model" }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			})) as typeof globalThis.fetch;
+		await getOpenAICompatibleModels(accountId, { dbOps } as never);
+		expect(
+			resolveProviderModelDefault("openai-compatible", "opus", accountId),
+		).toBe("before-model");
+
+		expect(
+			(await updateEndpoint(accountId, "https://after.example.com/v1")).ok,
+		).toBe(true);
+		globalThis.fetch = (async () =>
+			new Response("nope", { status: 500 })) as typeof globalThis.fetch;
+		expect(
+			await getOpenAICompatibleModels(accountId, { dbOps } as never),
+		).toBeNull();
+		expect(
+			resolveProviderModelDefault("openai-compatible", "opus", accountId),
+		).toBeUndefined();
+	});
+
+	it("retains compatible catalog evidence for a no-op endpoint update", async () => {
+		const accountId = "compatible-endpoint-noop";
+		const endpoint = "https://same.example.com/v1";
+		await insertAccount(accountId, "openai-compatible", endpoint);
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ data: [{ id: "same-model" }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			})) as typeof globalThis.fetch;
+		await getOpenAICompatibleModels(accountId, { dbOps } as never);
+
+		expect((await updateEndpoint(accountId, endpoint)).ok).toBe(true);
+		globalThis.fetch = (async () =>
+			new Response("nope", { status: 500 })) as typeof globalThis.fetch;
+		expect(
+			(await getOpenAICompatibleModels(accountId, { dbOps } as never))
+				?.models[0].id,
+		).toBe("same-model");
+	});
+
+	it("does not clear compatible defaults for a different provider's endpoint update", async () => {
+		const accountId = "anthropic-endpoint-change";
+		await insertAccount(
+			accountId,
+			"anthropic-compatible",
+			"https://before.example.com",
+		);
+		setDerivedAccountModelDefaults("openai-compatible", accountId, {
+			opus: "must-remain",
+		});
+
+		expect(
+			(await updateEndpoint(accountId, "https://after.example.com")).ok,
+		).toBe(true);
+		expect(
+			resolveProviderModelDefault("openai-compatible", "opus", accountId),
+		).toBe("must-remain");
+	});
+});
+
 describe("Accounts Handler - U1 static-key row-shape parity", () => {
 	let tmpDir: string;
 	let dbOps: DatabaseOperations;
@@ -1677,5 +1812,34 @@ describe("Accounts Handler - U1 static-key row-shape parity", () => {
 
 		expect(account).toBeDefined();
 		expect(account?.tokenStatus).toBe("valid");
+	});
+
+	it("creates DeepSeek accounts at the fixed endpoint with validated optional mappings", async () => {
+		const response = await createDeepseekAccountAddHandler(dbOps)(
+			makeAddRequest({
+				name: "deepseek-primary",
+				apiKey: "ds-test-key-12345",
+				priority: 10,
+				modelMappings: { sonnet: "deepseek-v4" },
+			}),
+		);
+
+		expect(response.ok).toBe(true);
+		const payload = (await response.json()) as {
+			accountId: string;
+			account: { id: string; provider: string };
+		};
+		expect(payload.accountId).toBe(payload.account.id);
+		expect(payload.account.provider).toBe("deepseek");
+		const row = await dbOps.getAdapter().get<{
+			custom_endpoint: string | null;
+			model_mappings: string | null;
+		}>("SELECT custom_endpoint, model_mappings FROM accounts WHERE id = ?", [
+			payload.account.id,
+		]);
+		expect(row).toEqual({
+			custom_endpoint: "https://api.deepseek.com/anthropic",
+			model_mappings: JSON.stringify({ sonnet: "deepseek-v4" }),
+		});
 	});
 });

@@ -22,6 +22,11 @@
 - **Z.ai** - Claude proxy service with API key authentication:
   - Lite, Pro, and Max plans with higher rate limits than direct Claude API
   - Uses API key authentication (no OAuth support)
+- **DeepSeek** - Native Anthropic-compatible API via `api.deepseek.com`:
+  - Claude request model IDs pass through for DeepSeek's server-side family remapping
+  - `deepseek-v4-flash` is a response usage/cost-attribution fallback when DeepSeek omits the response model; it does not rewrite outbound request model
+  - Uses API key authentication (`x-api-key` header, no OAuth support)
+  - Built on the same `BaseAnthropicCompatibleProvider` base as Minimax
 - **Anthropic-Compatible** - Generic provider for Anthropic-compatible APIs:
   - Supports custom endpoints
   - API key authentication only
@@ -54,7 +59,7 @@
 - xAI and Qwen build on the OpenAI-compatible base but support OAuth (unlike generic OpenAI-compatible accounts, which are API-key only)
 - Codex talks to OpenAI's Responses API, a different shape from OpenAI's Chat Completions API used by the other OpenAI-compatible providers
 - OAuth is available for Anthropic, Vertex AI (Google Cloud credentials), xAI, Codex, and Qwen; all other providers are API-key only
-- API key authentication for Z.ai, OpenAI-compatible, NanoGPT, Minimax, and Ollama Cloud providers
+- API key authentication for Z.ai, OpenAI-compatible, NanoGPT, Minimax, DeepSeek, Meta, and Ollama Cloud providers
 - Ollama Cloud requires model mapping to translate Claude model names to Ollama models
 - Provider system supports format conversion between different API standards
 - Default OAuth client ID: `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (configurable via environment or config file) — this applies to the Anthropic provider; other OAuth providers (xAI, Codex, Qwen) use their own fixed client IDs
@@ -65,6 +70,7 @@
 - [OAuth Authentication Flow](#oauth-authentication-flow)
 - [AnthropicProvider Implementation](#anthropicprovider-implementation)
 - [ZaiProvider Implementation](#zaiprovider-implementation)
+- [DeepSeekProvider Implementation](#deepseekprovider-implementation)
 - [VertexAIProvider Implementation](#vertexaiprovider-implementation)
 - [OpenAI-Compatible Provider Implementation](#openai-compatible-provider-implementation)
 - [XaiProvider Implementation](#xaiprovider-implementation)
@@ -109,36 +115,43 @@ The better-ccflare providers system is a modular architecture designed to suppor
    - API key authentication
    - Automatic format conversion
 
-5. **Z.ai Provider** - Provides access to:
+5. **DeepSeek Provider** - Provides access to:
+   - **DeepSeek API** - Native Anthropic-compatible API via `api.deepseek.com`
+   - Claude request model IDs pass through for DeepSeek's server-side family remapping
+   - `deepseek-v4-flash` is a response usage/cost-attribution fallback when DeepSeek omits the response model; it does not rewrite outbound request model
+   - API key authentication (`x-api-key` header, no OAuth support)
+   - Same `BaseAnthropicCompatibleProvider` pattern as Minimax
+
+6. **Z.ai Provider** - Provides access to:
    - **Z.ai API** - Claude proxy service with enhanced rate limits
    - Uses API key authentication instead of OAuth
    - Supports Lite, Pro, and Max plans with ~3× the usage quota of equivalent Claude plans
 
-6. **Anthropic-Compatible Provider** - Provides access to:
+7. **Anthropic-Compatible Provider** - Provides access to:
    - **Any Anthropic-compatible API** - Custom endpoints, self-hosted models, etc.
    - Uses API key authentication
    - Supports custom endpoints for maximum flexibility
 
-7. **OpenAI-Compatible Provider** - Provides access to:
+8. **OpenAI-Compatible Provider** - Provides access to:
    - **Any OpenAI-compatible API** - OpenRouter, Together AI, local models, etc.
    - Uses API key authentication
    - Automatic format conversion between Anthropic and OpenAI API formats
    - Supports custom endpoints for maximum flexibility
 
-8. **Ollama Provider** - Provides access to:
+9. **Ollama Provider** - Provides access to:
    - **Ollama Anthropic API (v0.14.0+)** - Native `/v1/messages` compatibility
    - Default endpoint: `http://localhost:11434`
    - Optional custom endpoint for remote/self-hosted Ollama
    - No real API key required for authentication
 
-9. **Ollama Cloud Provider** - Provides access to:
+10. **Ollama Cloud Provider** - Provides access to:
    - **Ollama Cloud hosted API** at ollama.com
    - Converts Anthropic-format requests to Ollama native `/api/chat` format
    - NDJSON streaming responses converted back to Anthropic SSE
    - Bearer token authentication via API key
    - Model mapping required (configured via `model_mappings` on account)
 
-10. **Meta Provider** (`meta`) - Provides access to:
+11. **Meta Provider** (`meta`) - Provides access to:
     - **Meta Model API** at `https://api.meta.ai` via its Anthropic-compatible Messages endpoint
     - `meta` is the canonical provider identifier. Legacy `muse-spark` is server-side HTTP ingress compatibility only; it is not the provider identifier to configure.
     - Models `muse-spark-1.2` (default), `muse-spark-1.1`, and `muse-spark-1.2-contributor`
@@ -150,7 +163,7 @@ The better-ccflare providers system is a modular architecture designed to suppor
 The providers system handles:
 - OAuth authentication flows with PKCE security (Anthropic, and refresh-token/device-code variants for xAI, Codex, Qwen)
 - Google Cloud authentication (Vertex AI)
-- API key authentication (Z.ai, OpenAI-Compatible, NanoGPT, Minimax, Ollama Cloud)
+- API key authentication (Z.ai, OpenAI-Compatible, NanoGPT, Minimax, DeepSeek, Meta, Ollama Cloud)
 - Token lifecycle management (refresh, expiration)
 - Provider-specific request routing and header management
 - Rate limit detection and handling
@@ -182,7 +195,7 @@ class ProviderRegistry {
 
 ### Auto-Registration
 
-Providers are automatically registered when the package is imported. `packages/providers/src/index.ts` registers every provider (16 as of this writing: Alibaba Coding Plan, Anthropic, Codex, Bedrock, Kilo, OpenRouter, Qwen, Minimax, NanoGPT, Z.ai, Vertex AI, xAI, OpenAI-Compatible, Ollama, Ollama Cloud, Anthropic-Compatible) in one place:
+Providers are automatically registered when the package is imported. `packages/providers/src/index.ts` registers every provider (18 as of this writing: Alibaba Coding Plan, Anthropic, Codex, Bedrock, Kilo, OpenRouter, Qwen, Minimax, DeepSeek, NanoGPT, Z.ai, Vertex AI, xAI, OpenAI-Compatible, Ollama, Ollama Cloud, Anthropic-Compatible, Meta) in one place:
 
 ```typescript
 // In packages/providers/src/index.ts
@@ -339,6 +352,10 @@ prepareHeaders(headers: Headers, accessToken?: string, apiKey?: string): Headers
 ```
 
 The API key is stored in the `api_key` field of the account record for consistency with the authentication system.
+
+## DeepSeekProvider Implementation
+
+The `DeepSeekProvider` (`deepseek`) extends `BaseAnthropicCompatibleProvider` and targets DeepSeek's native Anthropic-compatible API at `https://api.deepseek.com`. It uses an API key in the `x-api-key` header and preserves Claude request model IDs so DeepSeek can apply its server-side family remapping. `deepseek-v4-flash` is a response usage/cost-attribution fallback when DeepSeek omits the response model; it does not rewrite outbound request model. It inherits the same request/response compatibility pattern as Minimax, and account-specific `model_mappings` remain available when an explicit mapping is required.
 
 ## MetaProvider Implementation
 
@@ -1101,7 +1118,7 @@ interface Account {
 }
 ```
 
-**Note**: OAuth is available for Anthropic, Vertex AI, xAI, Codex, and Qwen. Z.ai, OpenAI-Compatible, NanoGPT, Minimax, and Ollama Cloud use API key authentication exclusively as they do not support OAuth.
+**Note**: OAuth is available for Anthropic, Vertex AI, xAI, Codex, and Qwen. Z.ai, OpenAI-Compatible, NanoGPT, Minimax, DeepSeek, Meta, and Ollama Cloud use API key authentication exclusively as they do not support OAuth.
 
 ### Token Refresh Strategy
 

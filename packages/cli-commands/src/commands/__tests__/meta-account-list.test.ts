@@ -44,6 +44,18 @@ describe("getAccountsList Meta classification", () => {
 		expect(result[0]?.mode).toBe("meta");
 	});
 
+	it("reports the mode as deepseek, not console", async () => {
+		const dbOps = {
+			getAllAccounts: async () => [
+				metaAccount({ id: "deepseek-1", provider: "deepseek" }),
+			],
+		};
+
+		const result = await getAccountsList(dbOps as never);
+
+		expect(result[0]?.mode).toBe("deepseek");
+	});
+
 	it("does not report a static API-key account as expired", async () => {
 		const dbOps = { getAllAccounts: async () => [metaAccount()] };
 

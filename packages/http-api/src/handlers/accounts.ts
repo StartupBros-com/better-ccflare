@@ -43,6 +43,7 @@ import {
 	clearAccountRefreshCache,
 	clearAutoRefreshTrackingForAccount,
 	clearCodexModelCacheForAccount,
+	clearOpenAICompatibleModelCacheForAccount,
 	clearPendingRotationForDeletedAccount,
 	getBindingConstraint,
 	getUsageThrottleStatus,
@@ -1091,6 +1092,11 @@ export function createAccountRemoveHandler(dbOps: DatabaseOperations) {
 			// A same-ID replacement must fetch its own model list rather than inherit
 			// state published by the deleted account's pending request.
 			clearCodexModelCacheForAccount(accountId);
+			clearOpenAICompatibleModelCacheForAccount(accountId);
+
+			// Clear provider usage and account-scoped depletion evidence only after
+			// deletion succeeds; reload/reauth must retain both owners.
+			usageCache.delete(accountId);
 
 			// Deletion is the only lifecycle transition that proves no live account
 			// can still own this rotation. Reload and re-auth must retain it.
@@ -1916,6 +1922,125 @@ export function createMinimaxAccountAddHandler(dbOps: DatabaseOperations) {
 				error instanceof Error
 					? error
 					: new Error("Failed to create Minimax account"),
+			);
+		}
+	};
+}
+
+/** Create a DeepSeek API-key account at the provider's fixed endpoint. */
+export function createDeepseekAccountAddHandler(dbOps: DatabaseOperations) {
+	return async (req: Request): Promise<Response> => {
+		try {
+			const body = await req.json();
+			const name = validateString(body.name, "name", {
+				required: true,
+				minLength: 1,
+				maxLength: 100,
+				pattern: patterns.accountName,
+				patternErrorMessage:
+					"can only contain letters, numbers, spaces, hyphens, underscores, and dots",
+				transform: sanitizers.trim,
+			});
+			if (!name) return errorResponse(BadRequest("Account name is required"));
+
+			const apiKey = validateString(body.apiKey, "apiKey", {
+				required: true,
+				minLength: 1,
+				transform: sanitizers.trim,
+			});
+			if (!apiKey) return errorResponse(BadRequest("API key is required"));
+
+			const priority =
+				validateNumber(body.priority, "priority", {
+					min: 0,
+					max: 100,
+					integer: true,
+				}) || 0;
+			let modelMappings: string | null = null;
+			if (body.modelMappings !== undefined) {
+				if (
+					!body.modelMappings ||
+					typeof body.modelMappings !== "object" ||
+					Array.isArray(body.modelMappings)
+				) {
+					return errorResponse(BadRequest("Model mappings must be an object"));
+				}
+				const validated = validateAndSanitizeModelMappings(body.modelMappings);
+				if (!validated) {
+					return errorResponse(BadRequest("Invalid model mappings"));
+				}
+				if (Object.keys(validated).length > 0) {
+					modelMappings = JSON.stringify(validated);
+				}
+			}
+
+			const accountId = crypto.randomUUID();
+			const now = Date.now();
+			const endpoint = "https://api.deepseek.com/anthropic";
+			const db = dbOps.getAdapter();
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"deepseek",
+				endpoint,
+			);
+			if (conflict) return conflict;
+
+			await db.run(
+				`INSERT INTO accounts (
+					id, name, provider, api_key, refresh_token, access_token,
+					expires_at, created_at, request_count, total_requests, priority, custom_endpoint, model_mappings
+				) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)`,
+				[
+					accountId,
+					name,
+					"deepseek",
+					apiKey,
+					now,
+					0,
+					0,
+					priority,
+					endpoint,
+					modelMappings,
+				],
+			);
+
+			return accountCreatedResponse(accountId, {
+				message: `DeepSeek account '${name}' added successfully`,
+				account: {
+					id: accountId,
+					name,
+					provider: "deepseek",
+					requestCount: 0,
+					totalRequests: 0,
+					lastUsed: null,
+					created: new Date(now).toISOString(),
+					paused: false,
+					priority,
+					tokenStatus: "valid" as const,
+					tokenExpiresAt: new Date(
+						now + 365 * 24 * 60 * 60 * 1000,
+					).toISOString(),
+					rateLimitStatus: "OK",
+					rateLimitReset: null,
+					rateLimitRemaining: null,
+					rateLimitedUntil: null,
+					sessionInfo: "No active session",
+					hasRefreshToken: false,
+				},
+			});
+		} catch (error) {
+			log.error("DeepSeek account creation error:", error);
+			if (error instanceof ValidationError) {
+				return errorResponse(BadRequest(error.message));
+			}
+			if (isUniqueConstraintError(error)) {
+				return errorResponse(BadRequest("Account name is already taken"));
+			}
+			return errorResponse(
+				error instanceof Error
+					? error
+					: new Error("Failed to create DeepSeek account"),
 			);
 		}
 	};
@@ -3124,13 +3249,23 @@ export function createAccountCustomEndpointUpdateHandler(
 				},
 			);
 
-			// Update account custom endpoint
-			await dbOps
-				.getAdapter()
-				.run("UPDATE accounts SET custom_endpoint = ? WHERE id = ?", [
-					customEndpoint || null,
-					accountId,
-				]);
+			const adapter = dbOps.getAdapter();
+			const account = await adapter.get<{
+				provider: string;
+			}>("SELECT provider FROM accounts WHERE id = ?", [accountId]);
+
+			// A conditional write makes a no-op observable without treating SQLite's
+			// matched-row count as an endpoint mutation.
+			const changed = await adapter.runWithChanges(
+				"UPDATE accounts SET custom_endpoint = ? WHERE id = ? AND custom_endpoint IS DISTINCT FROM ?",
+				[customEndpoint || null, accountId, customEndpoint || null],
+			);
+
+			if (changed > 0 && account?.provider === "openai-compatible") {
+				// The prior endpoint's models are not evidence for the newly selected
+				// endpoint. This also fences any discovery request started before it.
+				clearOpenAICompatibleModelCacheForAccount(accountId);
+			}
 
 			log.info(`Updated custom endpoint for account ${accountId}`);
 

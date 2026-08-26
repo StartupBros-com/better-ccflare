@@ -89,6 +89,7 @@ function makeCtx(opts: {
 
 const claudeAccount = makeAccount({ id: "claude-1", provider: "anthropic" });
 const codexAccount = makeAccount({ id: "codex-1", provider: "codex" });
+const deepseekAccount = makeAccount({ id: "deepseek-1", provider: "deepseek" });
 
 describe("selectAccountsForRequest — force account model", () => {
 	it("sends a provider model id only to accounts of that provider", async () => {
@@ -107,10 +108,10 @@ describe("selectAccountsForRequest — force account model", () => {
 		expect(result.map((a) => a.id)).toEqual(["codex-1"]);
 	});
 
-	it("sends a Claude model id only to accounts that speak Claude ids", async () => {
+	it("selects every account that natively accepts the requested Claude model id", async () => {
 		clearCodexModelCacheForTests();
 		const { ctx } = makeCtx({
-			accounts: [claudeAccount, codexAccount],
+			accounts: [claudeAccount, codexAccount, deepseekAccount],
 			forceAccountModel: true,
 		});
 
@@ -120,7 +121,7 @@ describe("selectAccountsForRequest — force account model", () => {
 			"claude-opus-4-1",
 		);
 
-		expect(result.map((a) => a.id)).toEqual(["claude-1"]);
+		expect(result.map((a) => a.id)).toEqual(["claude-1", "deepseek-1"]);
 	});
 
 	it("keeps every account that can serve the model, so failover still works", async () => {
@@ -244,6 +245,22 @@ describe("selectAccountsForRequest — force account model, forced-account heade
 		// Empty, which proxy.ts answers as force_account_model_no_account —
 		// and specifically not [claude-1], which would be the account swap.
 		expect(result).toEqual([]);
+	});
+
+	it("honours a DeepSeek header for a Claude model id", async () => {
+		clearCodexModelCacheForTests();
+		const { ctx } = makeCtx({
+			accounts: [claudeAccount, deepseekAccount],
+			forceAccountModel: true,
+		});
+
+		const result = await selectAccountsForRequest(
+			metaForcing("deepseek-1"),
+			ctx,
+			"claude-opus-4-1",
+		);
+
+		expect(result.map((a) => a.id)).toEqual(["deepseek-1"]);
 	});
 
 	it("still honours the header when the named account can serve the model", async () => {

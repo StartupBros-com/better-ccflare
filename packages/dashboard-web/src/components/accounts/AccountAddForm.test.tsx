@@ -111,6 +111,49 @@ describe("AccountAddForm provider contracts", () => {
 		);
 	});
 
+	it("validates DeepSeek credentials before creation and unwinds every direct credential guard", () => {
+		expect(source).toContain(
+			'deepseek: "API key is required for DeepSeek accounts",',
+		);
+
+		const handlerStart = source.indexOf(
+			"const handleAddAccount = async () => {",
+		);
+		expect(handlerStart).toBeGreaterThanOrEqual(0);
+		const handlerEnd = source.indexOf(
+			"\n\tconst handleCodeSubmit",
+			handlerStart,
+		);
+		const handler = source.slice(handlerStart, handlerEnd);
+		const credentialModes = [
+			"zai",
+			"minimax",
+			"deepseek",
+			"meta",
+			"nanogpt",
+			"kilo",
+			"alibaba-coding-plan",
+			"openrouter",
+			"anthropic-compatible",
+			"openai-compatible",
+			"ollama-cloud",
+		];
+
+		for (const mode of credentialModes) {
+			const branchStart = handler.indexOf(`newAccount.mode === "${mode}"`);
+			expect(branchStart).toBeGreaterThanOrEqual(0);
+			const nextBranch = handler.indexOf(
+				"if (newAccount.mode ===",
+				branchStart + 1,
+			);
+			const branch = handler.slice(
+				branchStart,
+				nextBranch === -1 ? undefined : nextBranch,
+			);
+			expect(branch).toContain("abortDirectCreation(");
+		}
+	});
+
 	it("renders a Fable input everywhere the existing family mapping UI is shown", () => {
 		const fableLabels = source.match(/Fable Model/g)?.length ?? 0;
 		const opusLabels = source.match(/Opus Model/g)?.length ?? 0;

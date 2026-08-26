@@ -14,6 +14,7 @@ const deleteUsageCache = spyOn(usageCache, "delete").mockImplementation(
 const clearAccountRefreshCache = mock(() => {});
 const clearAutoRefreshTrackingForAccount = mock(() => {});
 const clearCodexModelCacheForAccount = mock(() => {});
+const clearOpenAICompatibleModelCacheForAccount = mock(() => {});
 const clearPendingRotationForDeletedAccount = mock(() => {});
 
 mock.module("@better-ccflare/cli-commands", () => ({ removeAccountById }));
@@ -21,6 +22,7 @@ mock.module("@better-ccflare/proxy", () => ({
 	clearAccountRefreshCache,
 	clearAutoRefreshTrackingForAccount,
 	clearCodexModelCacheForAccount,
+	clearOpenAICompatibleModelCacheForAccount,
 	clearPendingRotationForDeletedAccount,
 	getBindingConstraint: () => undefined,
 	getUsageThrottleStatus: () => undefined,
@@ -55,6 +57,7 @@ afterEach(() => {
 	clearAccountRefreshCache.mockClear();
 	clearAutoRefreshTrackingForAccount.mockClear();
 	clearCodexModelCacheForAccount.mockClear();
+	clearOpenAICompatibleModelCacheForAccount.mockClear();
 	clearPendingRotationForDeletedAccount.mockClear();
 });
 
@@ -75,6 +78,12 @@ describe("createAccountRemoveHandler cleanup contract", () => {
 		clearCodexModelCacheForAccount.mockImplementationOnce(() =>
 			callOrder.push("clearCodexModelCatalog"),
 		);
+		clearOpenAICompatibleModelCacheForAccount.mockImplementationOnce(() =>
+			callOrder.push("clearOpenAICompatibleModelCatalog"),
+		);
+		deleteUsageCache.mockImplementationOnce(() =>
+			callOrder.push("clearUsageCache"),
+		);
 		clearPendingRotationForDeletedAccount.mockImplementationOnce(() =>
 			callOrder.push("clearPendingRotation"),
 		);
@@ -90,6 +99,8 @@ describe("createAccountRemoveHandler cleanup contract", () => {
 			"clearRefreshCache",
 			"clearAutoRefreshTracking",
 			"clearCodexModelCatalog",
+			"clearOpenAICompatibleModelCatalog",
+			"clearUsageCache",
 			"clearPendingRotation",
 		]);
 
@@ -108,6 +119,10 @@ describe("createAccountRemoveHandler cleanup contract", () => {
 			"account-1",
 		);
 		expect(clearCodexModelCacheForAccount).toHaveBeenCalledWith("account-1");
+		expect(clearOpenAICompatibleModelCacheForAccount).toHaveBeenCalledWith(
+			"account-1",
+		);
+		expect(deleteUsageCache).toHaveBeenCalledWith("account-1");
 		expect(clearPendingRotationForDeletedAccount).toHaveBeenCalledWith(
 			"account-1",
 		);
