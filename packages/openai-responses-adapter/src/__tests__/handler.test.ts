@@ -1,6 +1,11 @@
 import { describe, expect, it, test } from "bun:test";
 import * as zlib from "node:zlib";
 import { handleResponsesRequest } from "../handler";
+import {
+	MAX_RESPONSES_CONTENT_PARTS,
+	MAX_RESPONSES_INPUT_ITEMS,
+	MAX_RESPONSES_TOOLS,
+} from "../request-limits";
 import type { HandleProxyFn } from "../types";
 
 const ANTHROPIC_MESSAGE_BODY = JSON.stringify({
@@ -98,7 +103,14 @@ describe("handleResponsesRequest", () => {
 			method: "POST",
 			body: JSON.stringify({
 				model: "gpt-5.4-mini",
-				input: [additionalTools],
+				input: [
+					{
+						type: "message",
+						role: "user",
+						content: [{ type: "input_text", text: "Use the supplied tools" }],
+					},
+					additionalTools,
+				],
 				stream: false,
 			}),
 			headers: { "Content-Type": "application/json" },
@@ -964,5 +976,690 @@ describe("Responses request body admission", () => {
 		expect(forwarded?.signal.aborted).toBe(false);
 		controller.abort();
 		expect(forwarded?.signal.aborted).toBe(true);
+	});
+
+	describe("Responses structural request admission", () => {
+		function request(body: Record<string, unknown>): Request {
+			return new Request("http://localhost/v1/responses", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+		}
+
+		function countingProxy(): [HandleProxyFn, () => number] {
+			let calls = 0;
+			return [
+				async () => {
+					calls += 1;
+					return new Response(ANTHROPIC_MESSAGE_BODY, {
+						headers: { "content-type": "application/json" },
+					});
+				},
+				() => calls,
+			];
+		}
+
+		test("rejects more than the input-item limit without truncating or proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: Array.from({ length: MAX_RESPONSES_INPUT_ITEMS + 1 }, () => ({
+					type: "message",
+					role: "user",
+					content: "x",
+				})),
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(413);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "Too many input items",
+				},
+			});
+		});
+
+		test("accepts exactly the input-item limit", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: Array.from({ length: MAX_RESPONSES_INPUT_ITEMS }, () => ({
+					type: "message",
+					role: "user",
+					content: "x",
+				})),
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls()).toBe(1);
+		});
+
+		test("rejects oversized message and agent_message content arrays without proxying", async () => {
+			const oversizedContent = Array.from(
+				{ length: MAX_RESPONSES_CONTENT_PARTS + 1 },
+				() => ({ type: "input_text", text: "x" }),
+			);
+			for (const item of [
+				{ type: "message", role: "user", content: oversizedContent },
+				{
+					type: "agent_message",
+					author: "planner",
+					recipient: "coder",
+					content: oversizedContent,
+				},
+			]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({ model: "claude-haiku-4-5", input: [item] });
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+				expect(response.status).toBe(413);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: `Too many ${item.type} content parts`,
+					},
+				});
+			}
+		});
+
+		test("rejects an aggregate content-part overflow without proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const firstItemParts = Math.floor(MAX_RESPONSES_CONTENT_PARTS / 2);
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: "user",
+						content: Array.from({ length: firstItemParts }, () => ({
+							type: "input_text",
+							text: "x",
+						})),
+					},
+					{
+						type: "agent_message",
+						author: "planner",
+						recipient: "coder",
+						content: Array.from(
+							{
+								length: MAX_RESPONSES_CONTENT_PARTS - firstItemParts + 1,
+							},
+							() => ({ type: "input_text", text: "x" }),
+						),
+					},
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(413);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "Too many agent_message content parts",
+				},
+			});
+		});
+
+		test("accepts exactly the message content-part limit", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: "user",
+						content: Array.from(
+							{ length: MAX_RESPONSES_CONTENT_PARTS },
+							() => ({ type: "input_text", text: "x" }),
+						),
+					},
+				],
+			});
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls()).toBe(1);
+		});
+
+		test("accepts the exact content-part limit split across same-role messages", async () => {
+			let forwarded: { messages?: Array<{ content?: unknown[] }> } | undefined;
+			let calls = 0;
+			const proxy: HandleProxyFn = async (proxyRequest) => {
+				calls += 1;
+				forwarded = (await proxyRequest.json()) as typeof forwarded;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: "user",
+						content: [{ type: "input_text", text: "first" }],
+					},
+					{
+						type: "message",
+						role: "user",
+						content: Array.from(
+							{ length: MAX_RESPONSES_CONTENT_PARTS - 1 },
+							() => ({ type: "input_text", text: "x" }),
+						),
+					},
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls).toBe(1);
+			expect(forwarded?.messages).toHaveLength(1);
+			expect(forwarded?.messages?.[0].content).toHaveLength(
+				MAX_RESPONSES_CONTENT_PARTS,
+			);
+		});
+
+		test("drops a hostile non-string content discriminator without throwing", async () => {
+			let forwarded: { messages?: unknown } | undefined;
+			let calls = 0;
+			const proxy: HandleProxyFn = async (proxyRequest) => {
+				calls += 1;
+				forwarded = (await proxyRequest.json()) as typeof forwarded;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: "user",
+						content: [
+							{ type: { toString: null, valueOf: null } },
+							{ type: "input_text", text: "keep me" },
+						],
+					},
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls).toBe(1);
+			expect(forwarded?.messages).toEqual([
+				{ role: "user", content: [{ type: "text", text: "keep me" }] },
+			]);
+		});
+
+		test("preserves system policy and developer instructions before user input", async () => {
+			let forwarded: { messages?: unknown; system?: unknown } | undefined;
+			let calls = 0;
+			const proxy: HandleProxyFn = async (proxyRequest) => {
+				calls += 1;
+				forwarded = (await proxyRequest.json()) as typeof forwarded;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{ type: "message", role: "system", content: "system first" },
+					{ type: "message", role: "developer", content: "developer second" },
+					{ type: "message", role: "system", content: "system third" },
+					{ type: "message", role: "user", content: "hello" },
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls).toBe(1);
+			expect(forwarded?.system).toBe(
+				"system first\n\ndeveloper second\n\nsystem third",
+			);
+			expect(forwarded?.messages).toEqual([
+				{ role: "user", content: [{ type: "text", text: "hello" }] },
+			]);
+		});
+
+		test("rejects non-text system content before proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: "system",
+						content: [
+							{
+								type: "input_image",
+								image_url: "https://example.com/policy.png",
+							},
+						],
+					},
+					{ type: "message", role: "user", content: "hello" },
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+
+			expect(response.status).toBe(400);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "system message content must be text-only",
+				},
+			});
+		});
+
+		test("rejects late unsupported system and developer instructions before proxying", async () => {
+			for (const role of ["system", "developer"]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({
+					model: "claude-haiku-4-5",
+					input: [
+						{ type: "message", role: "user", content: "first user" },
+						{
+							type: "message",
+							role,
+							content: [{ type: "input_file", file_id: "file_policy" }],
+						},
+					],
+				});
+
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+
+				expect(response.status).toBe(400);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: `${role} message must appear before conversation content`,
+					},
+				});
+			}
+		});
+
+		test("rejects a system message after conversation content before proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{ type: "message", role: "user", content: "first user" },
+					{ type: "message", role: "system", content: "late policy" },
+					{ type: "message", role: "user", content: "second user" },
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+
+			expect(response.status).toBe(400);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "system message must appear before conversation content",
+				},
+			});
+		});
+
+		test("drops a hostile non-string message role without throwing", async () => {
+			let forwarded: { messages?: unknown } | undefined;
+			let calls = 0;
+			const proxy: HandleProxyFn = async (proxyRequest) => {
+				calls += 1;
+				forwarded = (await proxyRequest.json()) as typeof forwarded;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: { toString: null, valueOf: null },
+						content: [],
+					},
+					{ type: "message", role: "user", content: "keep me" },
+				],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls).toBe(1);
+			expect(forwarded?.messages).toEqual([
+				{ role: "user", content: [{ type: "text", text: "keep me" }] },
+			]);
+		});
+
+		test("rejects empty string input before proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({ model: "claude-haiku-4-5", input: "" });
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(400);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "input must contain at least one translatable message",
+				},
+			});
+		});
+
+		test("rejects non-array tools with the invalid-request envelope before proxying", async () => {
+			for (const tools of [null, {}, "not-an-array"]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({ model: "claude-haiku-4-5", input: "Hi", tools });
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+				expect(response.status).toBe(400);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: "tools must be an array",
+					},
+				});
+			}
+		});
+
+		test("rejects non-object tool entries with required choice before proxying", async () => {
+			for (const tool of [null, 1, "tool", []]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({
+					model: "claude-haiku-4-5",
+					input: "Hi",
+					tools: [tool],
+					tool_choice: "required",
+				});
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+				expect(response.status).toBe(400);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: "Invalid tool definition",
+					},
+				});
+			}
+		});
+
+		test("rejects a non-string tool discriminator without proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: "Hi",
+				tools: [{ type: { toString: null, valueOf: null } }],
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(400);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "Invalid tool definition",
+				},
+			});
+		});
+
+		test("forwards a null-parameter function tool with required choice", async () => {
+			let forwarded: Record<string, unknown> | undefined;
+			const proxy: HandleProxyFn = async (request) => {
+				forwarded = (await request.json()) as Record<string, unknown>;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: "Hi",
+				tools: [{ type: "function", name: "lookup", parameters: null }],
+				tool_choice: "required",
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+
+			expect(response.status).toBe(200);
+			expect(forwarded?.tools).toEqual([{ name: "lookup", input_schema: {} }]);
+			expect(forwarded?.tool_choice).toEqual({ type: "any" });
+		});
+
+		test("forwards a named choice when its function tool is compatible", async () => {
+			let forwarded: Record<string, unknown> | undefined;
+			const proxy: HandleProxyFn = async (proxyRequest) => {
+				forwarded = (await proxyRequest.json()) as Record<string, unknown>;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: "Hi",
+				tools: [
+					{ type: "web_search_preview" },
+					{ type: "function", name: "lookup" },
+				],
+				tool_choice: { type: "function", name: "lookup" },
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(forwarded?.tools).toEqual([{ name: "lookup", input_schema: {} }]);
+			expect(forwarded?.tool_choice).toEqual({ type: "tool", name: "lookup" });
+		});
+
+		test("rejects malformed function tools before proxying", async () => {
+			for (const tool of [
+				{ type: "function", name: "" },
+				{ type: "function", name: 1 },
+				{ type: "function", name: "lookup", description: 1 },
+				{ type: "function", name: "lookup", parameters: "schema" },
+				{ type: "function", name: "lookup", parameters: [] },
+			]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({
+					model: "claude-haiku-4-5",
+					input: "Hi",
+					tools: [tool],
+				});
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+				expect(response.status).toBe(400);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: "Invalid function tool definition",
+					},
+				});
+			}
+		});
+
+		test("keeps unsupported non-function built-ins skippable", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: "Hi",
+				tools: [{ type: "web_search_preview" }],
+			});
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls()).toBe(1);
+		});
+
+		test("rejects required or named tool choices with no compatible function tool", async () => {
+			for (const toolChoice of [
+				"required",
+				{ type: "function", name: "lookup" },
+			]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({
+					model: "claude-haiku-4-5",
+					input: "Hi",
+					tools: [{ type: "web_search_preview" }],
+					tool_choice: toolChoice,
+				});
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+				expect(response.status).toBe(400);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: "tool_choice requires a compatible function tool",
+					},
+				});
+			}
+		});
+
+		test("rejects more than the tool limit without proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: "Hi",
+				tools: Array.from({ length: MAX_RESPONSES_TOOLS + 1 }, () => ({
+					type: "function",
+					name: "tool",
+				})),
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(413);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "Too many tools",
+				},
+			});
+		});
 	});
 });

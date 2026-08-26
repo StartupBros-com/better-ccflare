@@ -1112,7 +1112,11 @@ async function handleProxyCoreImpl(
 			source === "inherited" && configuredEffectivePicker;
 		if (
 			inheritedPickerModel &&
-			effectiveModelAfterInterception !== profile.publicModelId
+			(effectiveModelAfterInterception === null ||
+				!modelRouteRegistry.isPublicModelIdForProfile(
+					effectiveModelAfterInterception,
+					profile,
+				))
 		) {
 			return modelRouteUnavailableResponse(
 				effectiveModelAfterInterception,

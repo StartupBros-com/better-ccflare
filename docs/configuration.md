@@ -376,14 +376,15 @@ provider/model capability, omit `accountId` and set `selection` to `capability`:
 ```bash
 CCFLARE_MODEL_ROUTE_PROFILES_JSON='[
   {
-    "id": "sol-capability",
+    "id": "pro-primary-sol",
     "displayName": "GPT 5.6 Sol pool",
     "description": "Uses any healthy Codex account mapped to GPT 5.6 Sol",
     "selection": "capability",
     "logicalModel": "claude-opus-5",
     "defaultEffort": "xhigh",
     "expectedProvider": "codex",
-    "expectedPhysicalModel": "gpt-5.6-sol"
+    "expectedPhysicalModel": "gpt-5.6-sol",
+    "clientContextWindowHint": "1m"
   }
 ]'
 ```
@@ -419,6 +420,7 @@ account UUID is copied into the public discovery response.
 | `exclusiveAccount` | no | Exact-account profiles only; defaults to `false`. When `true`, reserves the named account for exact configured route profiles that name it |
 | `contextWindow` | no | Exact-account profiles only; required with `maxOutputTokens`. Positive integer total context bound |
 | `maxOutputTokens` | no | Exact-account profiles only; required with `contextWindow`. Positive integer less than `contextWindow`; caps request output |
+| `clientContextWindowHint` | no | Only `"1m"` is accepted. It is a Claude Code context-classification hint and is invalid with bounded `contextWindow` or `maxOutputTokens` |
 
 At startup, better-ccflare logs only the configured profile count, never the JSON, account IDs, logical models, or physical models. Legacy profiles name exact account IDs, so keep those values in a protected environment file or service-manager credential rather than committing a real deployment value. Capability profiles contain no account IDs, but their provider/model constraints are still operational configuration and should be protected accordingly.
 
@@ -459,9 +461,15 @@ Point Claude Code's Anthropic base URL and authentication at better-ccflare as u
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 ```
 
-When at least one route profile is configured, authenticated `GET /v1/models` requests are answered locally with only each reserved public model ID and display name. Discovery metadata is not enforcement: it does not select an account, impose profile bounds, or contact an upstream provider. The route-profile setting is read once at process start, so changing it requires a restart. Claude Code labels these entries as gateway models in `/model`.
+When at least one route profile is configured, authenticated `GET /v1/models` requests are answered locally with one preferred public model ID and display name for each profile. Discovery metadata is not enforcement: it does not select an account, impose profile bounds, or contact an upstream provider. Claude Code labels these entries as gateway models in `/model`.
 
-The reserved IDs are intentionally opaque to Claude Code's built-in model-family inference. To expose effort, `xhigh`, and `max` controls for one discovered profile, pair that same public ID with Claude Code's [custom model option](https://code.claude.com/docs/en/model-config):
+Every profile keeps the stable legacy ID `claude-bccf-route-<id>`. For a profile with `clientContextWindowHint: "1m"`, discovery instead emits the preferred ID `claude-bccf-route-<id>[1m]`; better-ccflare accepts both exact spellings for that profile, but emits only the preferred row. Claude Code strips `[1m]` before API transport, while better-ccflare also accepts the suffixed spelling verbatim for protocol robustness. This opt-in is a Claude Code client context-classification hint, not a provider-capacity claim or admission enforcement.
+
+Keep `autoCompactWindow` below independently verified effective provider capacity. For the current Sol route, the configured 800,000-token compaction target is below its 828,400-token effective capacity; the raw catalog maximum is 872,000 tokens.
+
+The route-profile JSON is restart-scoped: changing it requires a restart. Removing `clientContextWindowHint` makes discovery return the unsuffixed legacy ID again, while that legacy ID remains stable throughout.
+
+Reserved IDs normally remain intentionally opaque to Claude Code's built-in model-family inference. The `clientContextWindowHint: "1m"` suffix is the opt-in exception, motivated by Claude Code 2.1.243's unknown-alias fallback. To expose effort, `xhigh`, and `max` controls for one discovered profile, pair that same public ID with Claude Code's [custom model option](https://code.claude.com/docs/en/model-config):
 
 ```bash
 ANTHROPIC_CUSTOM_MODEL_OPTION=claude-bccf-route-premium-reasoning

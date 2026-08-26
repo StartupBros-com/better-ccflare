@@ -14,7 +14,15 @@ import {
 	RECOVERY_STATUS_HEADER,
 	recoveryScopeForCode,
 } from "@better-ccflare/types/routing-recovery";
-import { translateRequestToAnthropic } from "./request-translator";
+import {
+	MAX_RESPONSES_CONTENT_PARTS,
+	MAX_RESPONSES_INPUT_ITEMS,
+	MAX_RESPONSES_TOOLS,
+} from "./request-limits";
+import {
+	InvalidInstructionError,
+	translateRequestToAnthropic,
+} from "./request-translator";
 import { translateAnthropicResponseToResponses } from "./response-translator";
 import { translateAnthropicStreamToResponses } from "./stream-translator";
 import type { HandleProxyFn, ResponseItem, ResponsesRequest } from "./types";
@@ -79,6 +87,105 @@ function openAiRequestError(status: 400 | 413, message: string): Response {
 			error: { type: "invalid_request_error", message },
 		}),
 		{ status, headers: { "Content-Type": "application/json" } },
+	);
+}
+
+function oversizedContentItemType(
+	input: unknown,
+): "message" | "agent_message" | undefined {
+	if (!Array.isArray(input)) return undefined;
+	let totalContentParts = 0;
+	for (const rawItem of input) {
+		if (
+			rawItem === null ||
+			typeof rawItem !== "object" ||
+			Array.isArray(rawItem)
+		) {
+			continue;
+		}
+		const item = rawItem as Record<string, unknown>;
+		if (item.type !== "message" && item.type !== "agent_message") continue;
+		if (Array.isArray(item.content)) {
+			totalContentParts += item.content.length;
+		} else if (item.type === "message" && typeof item.content === "string") {
+			totalContentParts += 1;
+		}
+		if (totalContentParts > MAX_RESPONSES_CONTENT_PARTS) return item.type;
+	}
+	return undefined;
+}
+
+function hasInvalidToolEntry(tools: unknown[]): boolean {
+	return tools.some(
+		(rawTool) =>
+			rawTool === null ||
+			typeof rawTool !== "object" ||
+			Array.isArray(rawTool) ||
+			typeof (rawTool as Record<string, unknown>).type !== "string",
+	);
+}
+
+function hasMalformedFunctionTool(tools: unknown[]): boolean {
+	return tools.some((rawTool) => {
+		if (
+			rawTool === null ||
+			typeof rawTool !== "object" ||
+			Array.isArray(rawTool)
+		) {
+			return false;
+		}
+		const tool = rawTool as Record<string, unknown>;
+		if (tool.type !== "function") return false;
+		return (
+			typeof tool.name !== "string" ||
+			tool.name.length === 0 ||
+			(tool.description !== undefined &&
+				typeof tool.description !== "string") ||
+			(tool.parameters !== undefined &&
+				tool.parameters !== null &&
+				(typeof tool.parameters !== "object" || Array.isArray(tool.parameters)))
+		);
+	});
+}
+
+function hasCompatibleFunctionTool(
+	tools: unknown[] | undefined,
+	name?: string,
+): boolean {
+	return (
+		tools?.some((rawTool) => {
+			if (
+				rawTool === null ||
+				typeof rawTool !== "object" ||
+				Array.isArray(rawTool)
+			) {
+				return false;
+			}
+			const tool = rawTool as Record<string, unknown>;
+			return (
+				tool.type === "function" && (name === undefined || tool.name === name)
+			);
+		}) ?? false
+	);
+}
+
+function hasUnsatisfiedToolChoice(
+	tools: unknown[] | undefined,
+	toolChoice: unknown,
+): boolean {
+	if (toolChoice === "required") return !hasCompatibleFunctionTool(tools);
+	if (
+		toolChoice === null ||
+		typeof toolChoice !== "object" ||
+		Array.isArray(toolChoice)
+	) {
+		return false;
+	}
+	const choice = toolChoice as Record<string, unknown>;
+	if (choice.type !== "function") return false;
+	return (
+		typeof choice.name !== "string" ||
+		!hasCompatibleFunctionTool(tools, choice.name)
 	);
 }
 
@@ -270,6 +377,34 @@ export async function handleResponsesRequest(
 			],
 		};
 	}
+	if (body.input.length > MAX_RESPONSES_INPUT_ITEMS) {
+		return openAiRequestError(413, "Too many input items");
+	}
+	const oversizedContentType = oversizedContentItemType(body.input);
+	if (oversizedContentType !== undefined) {
+		return openAiRequestError(
+			413,
+			`Too many ${oversizedContentType} content parts`,
+		);
+	}
+	if (body.tools !== undefined && !Array.isArray(body.tools)) {
+		return openAiRequestError(400, "tools must be an array");
+	}
+	if (body.tools && body.tools.length > MAX_RESPONSES_TOOLS) {
+		return openAiRequestError(413, "Too many tools");
+	}
+	if (body.tools && hasInvalidToolEntry(body.tools)) {
+		return openAiRequestError(400, "Invalid tool definition");
+	}
+	if (body.tools && hasMalformedFunctionTool(body.tools)) {
+		return openAiRequestError(400, "Invalid function tool definition");
+	}
+	if (hasUnsatisfiedToolChoice(body.tools, body.tool_choice)) {
+		return openAiRequestError(
+			400,
+			"tool_choice requires a compatible function tool",
+		);
+	}
 
 	// `previous_response_id` is intentionally ignored. Codex only sends this
 	// field over its WebSocket path (see codex-rs/core/src/client.rs:get_incremental_items).
@@ -280,9 +415,23 @@ export async function handleResponsesRequest(
 	const responseId = `resp_${crypto.randomBytes(12).toString("hex")}`;
 
 	// 4. Translate to Anthropic format
-	const anthropicBody = translateRequestToAnthropic(
-		body as typeof body & { input: ResponseItem[] },
-	);
+	let anthropicBody: ReturnType<typeof translateRequestToAnthropic>;
+	try {
+		anthropicBody = translateRequestToAnthropic(
+			body as typeof body & { input: ResponseItem[] },
+		);
+	} catch (error) {
+		if (error instanceof InvalidInstructionError) {
+			return openAiRequestError(400, error.message);
+		}
+		throw error;
+	}
+	if (anthropicBody.messages.length === 0) {
+		return openAiRequestError(
+			400,
+			"input must contain at least one translatable message",
+		);
+	}
 
 	// 4b. Preserve an existing valid Claude session envelope. Otherwise bridge
 	// the Responses identity into that envelope with documented precedence.

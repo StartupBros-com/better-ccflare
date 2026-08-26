@@ -20,6 +20,7 @@
 		"test:compat:claude-2.1.207": "bun test tests/compat/claude-code-2.1.207/reactive-compaction.test.ts",
 		"test:compat:claude-2.1.212-ping": "bun test tests/compat/claude-code-2.1.212/ping-watchdog.test.ts",
 		"test:compat:claude-2.1.224-structured-output": "bun test tests/compat/claude-code-2.1.224/structured-output.test.ts",
+		"test:compat:claude-2.1.243-context-window": "bun test tests/compat/claude-code-2.1.243/unknown-model-context-window.test.ts",
 		"build": "echo \"🏗️  Building better-ccflare v$(node -p \"require('./package.json').version\")\" && bun run build:dashboard && bun run build:cli",
 		"build:dashboard": "bun run --cwd packages/dashboard-web build",
 		"build:cli": "bun run --cwd apps/cli build",
