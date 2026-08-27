@@ -184,9 +184,15 @@ export interface ProviderAttemptPlan {
 		apiKey?: string,
 	) => Headers;
 	readonly transformRequestBody: (request: Request) => Promise<Request>;
+	/**
+	 * The controller is owned by the exact upstream fetch that produced
+	 * `response`, so transformed streaming responses can abort only the
+	 * discarded transport without poisoning a later in-place retry.
+	 */
 	readonly processResponse: (
 		response: Response,
 		requestHeaders?: Headers,
+		transportAbort?: AbortController,
 	) => Promise<Response>;
 	readonly parseRateLimit: (response: Response) => RateLimitInfo;
 	readonly parseRateLimitFromBody?: (

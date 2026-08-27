@@ -22,6 +22,7 @@ const expectedColumns = [
 	"account_benched",
 	"route_suppressed",
 	"circuit_counted",
+	"upstream_evidence",
 ];
 
 const expectedIndexes = [
@@ -207,6 +208,7 @@ describe("routing_attempts migrations", () => {
 		)`);
 
 			runMigrations(db);
+			expect(columns(db)).toEqual(expectedColumns);
 			expect(indexes(db)).toEqual(expect.arrayContaining(expectedIndexes));
 		} finally {
 			db.close();
@@ -238,6 +240,11 @@ describe("routing_attempts migrations", () => {
 		for (const index of expectedIndexes) {
 			expect(source).toContain(index);
 		}
+		expect(source).toContain('table: "routing_attempts"');
+		expect(source).toContain('column: "upstream_evidence"');
+		expect(source).toContain(
+			"ALTER TABLE routing_attempts ADD COLUMN upstream_evidence TEXT",
+		);
 		const pgTable = source.match(
 			/CREATE TABLE IF NOT EXISTS routing_attempts \(([\s\S]*?)\n\t\t\)/,
 		)?.[1];

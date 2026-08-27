@@ -222,6 +222,7 @@ function routingAttempt(
 		accountBenched: false,
 		routeSuppressed: true,
 		circuitCounted: false,
+		upstreamEvidence: null,
 		...overrides,
 	};
 }

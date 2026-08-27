@@ -136,6 +136,32 @@ function makeRequest(body: ArrayBuffer) {
 	});
 }
 
+function makeTransportMappingContext(transportModel: string): ProxyContext {
+	const ctx = makeProxyContext();
+	ctx.provider = {
+		...ctx.provider,
+		transformRequestBody: async (request: Request) => {
+			const body = (await request.json()) as Record<string, unknown>;
+			return new Request(request.url, {
+				method: request.method,
+				headers: request.headers,
+				body: JSON.stringify({ ...body, model: transportModel }),
+				signal: request.signal,
+			});
+		},
+	} as never;
+	return ctx;
+}
+
+function makeTransportMappingAccount(
+	overrides: Partial<Account> = {},
+): Account {
+	return makeAccount({
+		...overrides,
+		provider: "transport-test-provider" as never,
+	});
+}
+
 function jsonResponse(body: object, status: number) {
 	return new Response(JSON.stringify(body), {
 		status,
@@ -358,6 +384,158 @@ describe("proxyWithAccount — combo override success-conditioning / observabili
 		expect(startMessage.appliedModel == null).toBe(true);
 		expect(startMessage.comboModelOverrideFrom == null).toBe(true);
 		expect(startMessage.comboModelOverrideTo == null).toBe(true);
+	});
+
+	it("persists client-requested and physical transport models for a successful implicit failover", async () => {
+		const handleStart = installUsageCollector();
+		globalThis.fetch = mock(async () =>
+			jsonResponse(
+				{
+					id: "msg_implicit_failover",
+					type: "message",
+					role: "assistant",
+					content: [{ type: "text", text: "hi" }],
+					model: "gpt-5.6-terra",
+					stop_reason: "end_turn",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+				200,
+			),
+		);
+
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			makeTransportMappingAccount(),
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			1,
+			makeTransportMappingContext("gpt-5.6-terra"),
+		);
+
+		expect(result?.status).toBe(200);
+		expect(handleStart).toHaveBeenCalledTimes(1);
+		const startMessage = handleStart.mock.calls[0]?.[0] as StartMessage;
+		expect(startMessage.originalModel).toBe("claude-fable-5");
+		expect(startMessage.appliedModel).toBe("gpt-5.6-terra");
+		expect(result?.headers.get("x-better-ccflare-model-rewrite")).toBe(
+			"claude-fable-5->gpt-5.6-terra",
+		);
+	});
+
+	it("leaves model provenance null when successful physical transport matches the client model", async () => {
+		const handleStart = installUsageCollector();
+		globalThis.fetch = mock(async () =>
+			jsonResponse(
+				{
+					id: "msg_matching_transport",
+					type: "message",
+					role: "assistant",
+					content: [{ type: "text", text: "hi" }],
+					model: "claude-fable-5",
+					stop_reason: "end_turn",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+				200,
+			),
+		);
+
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			makeTransportMappingAccount(),
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			makeTransportMappingContext("claude-fable-5"),
+		);
+
+		expect(result?.status).toBe(200);
+		const startMessage = handleStart.mock.calls[0]?.[0] as StartMessage;
+		expect(startMessage.originalModel).toBeNull();
+		expect(startMessage.appliedModel).toBeNull();
+		expect(result?.headers.get("x-better-ccflare-model-rewrite")).toBeNull();
+	});
+
+	it("keeps a logical route-profile rewrite instead of replacing it with physical transport provenance", async () => {
+		const handleStart = installUsageCollector();
+		globalThis.fetch = mock(async () =>
+			jsonResponse(
+				{
+					id: "msg_route_profile",
+					type: "message",
+					role: "assistant",
+					content: [{ type: "text", text: "hi" }],
+					model: "gpt-5.6-terra",
+					stop_reason: "end_turn",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+				200,
+			),
+		);
+
+		const bodyBuffer = makeRequestBody("claude-sonnet-5");
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			makeTransportMappingAccount(),
+			makeRequestMeta({
+				originalModel: "claude-fable-5",
+				appliedModel: "claude-sonnet-5",
+			}),
+			bodyBuffer,
+			() => undefined,
+			1,
+			makeTransportMappingContext("gpt-5.6-terra"),
+		);
+
+		expect(result?.status).toBe(200);
+		const startMessage = handleStart.mock.calls[0]?.[0] as StartMessage;
+		expect(startMessage.originalModel).toBe("claude-fable-5");
+		expect(startMessage.appliedModel).toBe("claude-sonnet-5");
+		expect(result?.headers.get("x-better-ccflare-model-rewrite")).toBe(
+			"claude-fable-5->claude-sonnet-5",
+		);
+	});
+
+	it("keeps a failed physical attempt in routing_attempts without request model provenance", async () => {
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ error: { message: "rate limited" } }, 429),
+		);
+		const ctx = makeTransportMappingContext("gpt-5.6-terra");
+		const saveRoutingAttempt = mock(async () => undefined);
+		ctx.dbOps.saveRoutingAttempt = saveRoutingAttempt as never;
+		ctx.asyncWriter = {
+			enqueue: mock((job: () => Promise<void>) => {
+				void job();
+			}),
+		} as never;
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+
+		expect(
+			await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				makeTransportMappingAccount(),
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				1,
+				ctx,
+			),
+		).toBeNull();
+
+		const attempt = saveRoutingAttempt.mock.calls[0]?.[0] as Record<
+			string,
+			unknown
+		>;
+		expect(attempt.attemptedModel).toBe("gpt-5.6-terra");
+		expect("originalModel" in attempt).toBe(false);
+		expect("appliedModel" in attempt).toBe(false);
 	});
 
 	it("captures an xAI success receipt with the exact model fallback route candidate", async () => {

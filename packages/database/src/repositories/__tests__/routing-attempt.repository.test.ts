@@ -32,6 +32,7 @@ function attempt(
 		accountBenched: false,
 		routeSuppressed: true,
 		circuitCounted: false,
+		upstreamEvidence: null,
 		...overrides,
 	};
 }
@@ -85,6 +86,31 @@ describe("RoutingAttemptRepository", () => {
 		expect(
 			db.prepare("SELECT COUNT(*) AS count FROM routing_attempts").get(),
 		).toEqual({ count: 2 });
+	});
+
+	it("round trips nullable sanitized upstream evidence", async () => {
+		const evidence = JSON.stringify({
+			status: 429,
+			headers: { "x-should-retry": "true" },
+			body_snippet: "rate limit exceeded",
+		});
+		await attempts.append(
+			attempt({ id: "with-evidence", upstreamEvidence: evidence }),
+		);
+		await attempts.append(
+			attempt({ id: "without-evidence", upstreamEvidence: null }),
+		);
+
+		expect(
+			db
+				.prepare(
+					"SELECT id, upstream_evidence FROM routing_attempts ORDER BY id ASC",
+				)
+				.all(),
+		).toEqual([
+			{ id: "with-evidence", upstream_evidence: evidence },
+			{ id: "without-evidence", upstream_evidence: null },
+		]);
 	});
 
 	it("rejects duplicate immutable attempt ids", async () => {

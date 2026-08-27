@@ -31,6 +31,7 @@ export interface RoutingAttemptData {
 	accountBenched: boolean;
 	routeSuppressed: boolean;
 	circuitCounted: boolean;
+	upstreamEvidence: string | null;
 }
 
 interface SummaryRow {
@@ -62,8 +63,8 @@ export class RoutingAttemptRepository extends BaseRepository<RoutingAttemptData>
 				id, parent_request_id, timestamp, provider, account_id,
 				attempted_model, model_family, status_code, reason, scope,
 				available_at, failover_attempts, physical_attempt, account_benched,
-				route_suppressed, circuit_counted
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				route_suppressed, circuit_counted, upstream_evidence
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			[
 				data.id,
 				data.parentRequestId,
@@ -81,6 +82,7 @@ export class RoutingAttemptRepository extends BaseRepository<RoutingAttemptData>
 				data.accountBenched ? 1 : 0,
 				data.routeSuppressed ? 1 : 0,
 				data.circuitCounted ? 1 : 0,
+				data.upstreamEvidence,
 			],
 		);
 	}

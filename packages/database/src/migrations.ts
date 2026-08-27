@@ -350,7 +350,8 @@ function ensureRoutingAttemptsSchema(db: Database): void {
 			physical_attempt INTEGER CHECK (physical_attempt IS NULL OR physical_attempt >= 1),
 			account_benched INTEGER NOT NULL CHECK (account_benched IN (0, 1)),
 			route_suppressed INTEGER NOT NULL CHECK (route_suppressed IN (0, 1)),
-			circuit_counted INTEGER NOT NULL CHECK (circuit_counted IN (0, 1))
+			circuit_counted INTEGER NOT NULL CHECK (circuit_counted IN (0, 1)),
+			upstream_evidence TEXT CHECK (upstream_evidence IS NULL OR length(upstream_evidence) <= 2048)
 		)
 	`);
 	db.run(
@@ -1505,6 +1506,12 @@ export function runMigrations(db: Database, dbPath?: string): void {
 	ensureSchema(db);
 	// Repair an interrupted additive routing-attempt migration independently.
 	ensureRoutingAttemptsSchema(db);
+	if (!tableHasColumn(db, "routing_attempts", "upstream_evidence")) {
+		db.prepare(
+			"ALTER TABLE routing_attempts ADD COLUMN upstream_evidence TEXT CHECK (upstream_evidence IS NULL OR length(upstream_evidence) <= 2048)",
+		).run();
+		log.info("Added bounded upstream evidence to routing attempts");
+	}
 
 	// Check if columns exist before adding them
 	const accountsInfo = db

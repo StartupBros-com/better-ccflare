@@ -736,8 +736,12 @@ function materializeCustomPlan(
 			Reflect.apply(rawPrepareHeaders, plan, [headers, accessToken, apiKey]),
 		transformRequestBody: (request) =>
 			Reflect.apply(rawTransformRequestBody, plan, [request]),
-		processResponse: (response, requestHeaders) =>
-			Reflect.apply(rawProcessResponse, plan, [response, requestHeaders]),
+		processResponse: (response, requestHeaders, transportAbort) =>
+			Reflect.apply(rawProcessResponse, plan, [
+				response,
+				requestHeaders,
+				transportAbort,
+			]),
 		parseRateLimit: (response) =>
 			Reflect.apply(rawParseRateLimit, plan, [response]),
 		...(rawParseRateLimitFromBody
@@ -846,11 +850,12 @@ function materializeLegacyPlan(
 						context.beforePhysicalTransport,
 					])
 			: async (request) => request,
-		processResponse: (response, requestHeaders) =>
+		processResponse: (response, requestHeaders, transportAbort) =>
 			Reflect.apply(processResponse, provider, [
 				response,
 				accountView,
 				requestHeaders,
+				transportAbort,
 			]),
 		parseRateLimit: (response) =>
 			Reflect.apply(parseRateLimit, provider, [response]),

@@ -77,7 +77,12 @@ const lastRoutingAttempt = (ctx: ProxyContext) => {
 	const calls = (ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>).mock
 		.calls;
 	return calls[calls.length - 1]?.[0] as
-		| { reason: string; scope: string; routeSuppressed: boolean }
+		| {
+				reason: string;
+				scope: string;
+				routeSuppressed: boolean;
+				upstreamEvidence: string | null;
+		  }
 		| undefined;
 };
 
@@ -110,22 +115,22 @@ function makeRequest(body: ArrayBuffer, headers: Record<string, string> = {}) {
  * Passing window headers via `extra` models a genuine limit, which also carries
  * `x-should-retry: true` and MUST still bench.
  */
-function burst429(extra: Record<string, string> = {}): Response {
-	return new Response(
-		JSON.stringify({
-			type: "error",
-			error: { type: "rate_limit_error", message: "rate limit exceeded" },
-		}),
-		{
-			status: 429,
-			headers: {
-				"content-type": "application/json",
-				"x-robots-tag": "none",
-				"x-should-retry": "true",
-				...extra,
-			},
+function burst429(
+	extra: Record<string, string> = {},
+	body = JSON.stringify({
+		type: "error",
+		error: { type: "rate_limit_error", message: "rate limit exceeded" },
+	}),
+): Response {
+	return new Response(body, {
+		status: 429,
+		headers: {
+			"content-type": "application/json",
+			"x-robots-tag": "none",
+			"x-should-retry": "true",
+			...extra,
 		},
-	);
+	});
 }
 
 function ok200(): Response {
@@ -154,6 +159,7 @@ function makeCtx(): ProxyContext {
 			saveRequest: mock((..._args: unknown[]) => Promise.resolve()),
 			saveRoutingAttempt: mock((..._args: unknown[]) => Promise.resolve()),
 			updateAccountUsage: mock(() => Promise.resolve()),
+			updateAccountRateLimitMeta: mock(() => Promise.resolve()),
 			getAdapter: mock(() => ({
 				run: mock(() => Promise.resolve()),
 				get: mock(() => Promise.resolve(null)),
@@ -256,6 +262,234 @@ describe("proxyWithAccount — windowless 429 is not benched (issue #301)", () =
 		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
 	});
 
+	it("persists bounded, allowlisted evidence for a windowless 429", async () => {
+		globalThis.fetch = mock(async () =>
+			burst429(
+				{
+					"request-id": "upstream-request-id",
+					"cf-ray": "ray-id",
+					"set-cookie": "session=secret",
+					authorization: "Bearer secret",
+				},
+				"x".repeat(513),
+			),
+		);
+
+		const ctx = makeCtx();
+		const body = makeRequestBody();
+		await runProxy(makeAccount(), ctx, makeRequest(body), body);
+
+		const attempt = lastRoutingAttempt(ctx);
+		const evidence = JSON.parse(attempt?.upstreamEvidence ?? "");
+		expect(attempt).toMatchObject({
+			reason: "windowless_429",
+			upstreamEvidence: expect.any(String),
+		});
+		expect(evidence).toEqual({
+			status: 429,
+			headers: {
+				"cf-ray": "ray-id",
+				"content-type": "application/json",
+				"request-id": "upstream-request-id",
+				"x-should-retry": "true",
+			},
+			body_snippet: "x".repeat(512),
+		});
+		expect(evidence.headers).not.toHaveProperty("set-cookie");
+		expect(evidence.headers).not.toHaveProperty("authorization");
+	});
+
+	it("rejects sensitive names even when they match a rate-limit prefix", async () => {
+		globalThis.fetch = mock(async () =>
+			burst429({
+				"x-ratelimit-private-credential": "Bearer private-secret",
+				"x-ratelimit-remaining": "0",
+			}),
+		);
+
+		const ctx = makeCtx();
+		const body = makeRequestBody();
+		await runProxy(makeAccount(), ctx, makeRequest(body), body);
+
+		const evidence = JSON.parse(
+			lastRoutingAttempt(ctx)?.upstreamEvidence ?? "",
+		);
+		expect(evidence.headers).not.toHaveProperty(
+			"x-ratelimit-private-credential",
+		);
+		expect(evidence.headers).toHaveProperty("x-ratelimit-remaining", "0");
+	});
+
+	it("bounds serialized evidence when an allowlisted header is oversized", async () => {
+		globalThis.fetch = mock(async () =>
+			burst429({ "request-id": "x".repeat(5_000) }),
+		);
+
+		const ctx = makeCtx();
+		const body = makeRequestBody();
+		await runProxy(makeAccount(), ctx, makeRequest(body), body);
+
+		const evidence = lastRoutingAttempt(ctx)?.upstreamEvidence;
+		expect(evidence).toBeDefined();
+		expect(evidence?.length).toBeLessThanOrEqual(2_048);
+		expect(JSON.parse(evidence ?? "").headers).toMatchObject({
+			"request-id": "x".repeat(128),
+		});
+	});
+
+	it("stores headers but suppresses the raw body when payload storage is disabled", async () => {
+		globalThis.fetch = mock(async () =>
+			burst429({ "request-id": "upstream-request-id" }, "sensitive body"),
+		);
+
+		const ctx = makeCtx();
+		ctx.config = { getStorePayloads: () => false } as never;
+		const body = makeRequestBody();
+		await runProxy(makeAccount(), ctx, makeRequest(body), body);
+
+		const evidence = JSON.parse(
+			lastRoutingAttempt(ctx)?.upstreamEvidence ?? "",
+		);
+		expect(evidence).toEqual({
+			status: 429,
+			headers: {
+				"content-type": "application/json",
+				"request-id": "upstream-request-id",
+				"x-should-retry": "true",
+			},
+		});
+		expect(evidence).not.toHaveProperty("body_snippet");
+	});
+
+	it("caps captured header values and the total header count", async () => {
+		const extraHeaders = Object.fromEntries(
+			Array.from({ length: 20 }, (_, index) => [
+				`x-ratelimit-test-${index}`,
+				String(index),
+			]),
+		);
+		globalThis.fetch = mock(async () => burst429(extraHeaders));
+
+		const ctx = makeCtx();
+		const body = makeRequestBody();
+		await runProxy(makeAccount(), ctx, makeRequest(body), body);
+
+		const evidence = JSON.parse(
+			lastRoutingAttempt(ctx)?.upstreamEvidence ?? "",
+		);
+		expect(Object.keys(evidence.headers)).toHaveLength(12);
+	});
+
+	it("does not serialize a trailing high surrogate in a bounded body snippet", async () => {
+		globalThis.fetch = mock(async () => burst429({}, `${"x".repeat(511)}🙂`));
+
+		const ctx = makeCtx();
+		const body = makeRequestBody();
+		await runProxy(makeAccount(), ctx, makeRequest(body), body);
+
+		const evidence = JSON.parse(
+			lastRoutingAttempt(ctx)?.upstreamEvidence ?? "",
+		);
+		expect(evidence.body_snippet).toBe("x".repeat(511));
+	});
+
+	it("uses one total 50ms budget for slow-dribbling discard-bound evidence", async () => {
+		const encoder = new TextEncoder();
+		let streamController: ReadableStreamDefaultController<Uint8Array> | null =
+			null;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				streamController = controller;
+				let emitted = 0;
+				const emit = () => {
+					controller.enqueue(encoder.encode("x"));
+					emitted++;
+					if (emitted < 100) timer = setTimeout(emit, 20);
+				};
+				timer = setTimeout(emit, 20);
+			},
+			cancel() {
+				if (timer !== undefined) clearTimeout(timer);
+			},
+		});
+		const upstream = new Response(stream, {
+			status: 429,
+			headers: {
+				"content-type": "application/json",
+				"x-should-retry": "true",
+			},
+		});
+		globalThis.fetch = mock(async (input) => {
+			if (!(input instanceof Request))
+				throw new Error("expected Request input");
+			input.signal.addEventListener(
+				"abort",
+				() => {
+					if (timer !== undefined) clearTimeout(timer);
+					streamController?.error(input.signal.reason);
+				},
+				{ once: true },
+			);
+			return upstream;
+		});
+
+		const ctx = makeCtx();
+		const body = makeRequestBody();
+		const startedAt = performance.now();
+		expect(
+			await runProxy(makeAccount(), ctx, makeRequest(body), body),
+		).toBeNull();
+		expect(performance.now() - startedAt).toBeLessThan(150);
+	});
+
+	it("records headers-only evidence for a 200 Anthropic rate-limit signal", async () => {
+		globalThis.fetch = mock(
+			async () =>
+				new Response("deliverable upstream body", {
+					status: 200,
+					headers: {
+						"anthropic-ratelimit-unified-status": "rate_limited",
+						"request-id": "upstream-request-id",
+					},
+				}),
+		);
+
+		const ctx = makeCtx();
+		const body = makeRequestBody();
+		expect(
+			await runProxy(makeAccount(), ctx, makeRequest(body), body),
+		).toBeNull();
+
+		const evidence = JSON.parse(
+			lastRoutingAttempt(ctx)?.upstreamEvidence ?? "",
+		);
+		expect(evidence).toEqual({
+			status: 200,
+			headers: {
+				"anthropic-ratelimit-unified-status": "rate_limited",
+				"request-id": "upstream-request-id",
+			},
+		});
+		expect(evidence).not.toHaveProperty("body_snippet");
+	});
+
+	it("does not record an attempt or upstream evidence for a 200 response", async () => {
+		globalThis.fetch = mock(async () => ok200());
+
+		const ctx = makeCtx();
+		const body = makeRequestBody();
+		const response = await runProxy(
+			makeAccount(),
+			ctx,
+			makeRequest(body),
+			body,
+		);
+
+		expect(response?.status).toBe(200);
+		expect(ctx.dbOps.saveRoutingAttempt).not.toHaveBeenCalled();
+	});
+
 	// The operational point of not benching: the account is immediately routable
 	// again, exactly as production showed it to be (200s two seconds either side
 	// of the rejected request).
@@ -315,6 +549,7 @@ describe("proxyWithAccount — windowless 429 is not benched (issue #301)", () =
 				"anthropic-ratelimit-unified-reset": String(
 					Math.floor(Date.now() / 1000) + 300,
 				),
+				"x-ratelimit-remaining": "0",
 			});
 		});
 
@@ -331,6 +566,13 @@ describe("proxyWithAccount — windowless 429 is not benched (issue #301)", () =
 		expect(typeof account.rate_limited_until).toBe("number");
 		expect(saveReasons(ctx)).toContain("model_fallback_429");
 		expect(saveReasons(ctx)).not.toContain("windowless_429");
+		const evidence = JSON.parse(
+			lastRoutingAttempt(ctx)?.upstreamEvidence ?? "",
+		);
+		expect(evidence.headers).toMatchObject({
+			"anthropic-ratelimit-unified-reset": expect.any(String),
+			"x-ratelimit-remaining": "0",
+		});
 	});
 
 	// The fail-closed property, end to end. A genuinely spent window was measured

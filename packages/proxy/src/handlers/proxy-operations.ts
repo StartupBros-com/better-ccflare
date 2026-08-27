@@ -130,6 +130,7 @@ import {
 	sessionIdForObservation,
 } from "../session-account-observer";
 import { combineChunks } from "../stream-tee";
+import { isModelRewrite } from "../worker-messages";
 import { getXaiConvId } from "./account-selector";
 import { cancelDiscardedResponseBody } from "./discard-body-cancel";
 import {
@@ -474,8 +475,8 @@ function bindProviderAttemptPlan(plan: ProviderAttemptPlan): Provider {
 		prepareHeaders: (headers, accessToken, apiKey) =>
 			plan.prepareHeaders(headers, accessToken, apiKey),
 		transformRequestBody: (request) => plan.transformRequestBody(request),
-		processResponse: (response, _account, requestHeaders) =>
-			plan.processResponse(response, requestHeaders),
+		processResponse: (response, _account, requestHeaders, drainAbort) =>
+			plan.processResponse(response, requestHeaders, drainAbort),
 		parseRateLimit: (response) => plan.parseRateLimit(response),
 		...(plan.parseRateLimitFromBody
 			? { parseRateLimitFromBody: plan.parseRateLimitFromBody }
@@ -509,6 +510,260 @@ function getCodexCacheLaneRescueReserveMs(candidateBudgetMs: number): number {
 // alone. Either way the ORIGINAL (untouched) response is what actually gets
 // forwarded to the client -- this only bounds the *classification* read.
 const MAX_FINAL_CANDIDATE_CLASSIFICATION_BODY_BYTES = 64 * 1024;
+
+const MAX_UPSTREAM_EVIDENCE_BODY_CHARS = 512;
+const MAX_UPSTREAM_EVIDENCE_BODY_BYTES = MAX_UPSTREAM_EVIDENCE_BODY_CHARS * 4;
+const MAX_UPSTREAM_EVIDENCE_JSON_CHARS = 2048;
+const MAX_UPSTREAM_EVIDENCE_HEADERS = 12;
+const MAX_UPSTREAM_EVIDENCE_HEADER_VALUE_CHARS = 128;
+// Diagnostics must never make a failover wait on a stalled upstream body.
+const UPSTREAM_EVIDENCE_BODY_CAPTURE_DEADLINE_MS = 50;
+const UPSTREAM_EVIDENCE_HEADER_NAMES = new Set([
+	"retry-after",
+	"x-should-retry",
+	"request-id",
+	"cf-ray",
+	"content-type",
+]);
+const UPSTREAM_EVIDENCE_HEADER_PREFIXES = [
+	"anthropic-ratelimit-",
+	"x-ratelimit-",
+] as const;
+const UPSTREAM_EVIDENCE_SENSITIVE_HEADER_PARTS = [
+	"authorization",
+	"cookie",
+	"token",
+	"secret",
+	"key",
+	"credential",
+	"session",
+	"password",
+] as const;
+let upstreamEvidencePayloadSuppressionLogged = false;
+
+function stripTrailingUnpairedHighSurrogate(value: string): string {
+	const lastCodeUnit = value.charCodeAt(value.length - 1);
+	return lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff
+		? value.slice(0, -1)
+		: value;
+}
+
+function truncateEvidenceText(value: string, maxChars: number): string {
+	return stripTrailingUnpairedHighSurrogate(value.slice(0, maxChars));
+}
+
+function isUpstreamEvidenceHeader(name: string): boolean {
+	if (
+		UPSTREAM_EVIDENCE_SENSITIVE_HEADER_PARTS.some((part) => name.includes(part))
+	) {
+		return false;
+	}
+	return (
+		UPSTREAM_EVIDENCE_HEADER_NAMES.has(name) ||
+		UPSTREAM_EVIDENCE_HEADER_PREFIXES.some((prefix) => name.startsWith(prefix))
+	);
+}
+
+function serializeUpstreamEvidence(
+	status: number,
+	headers: Record<string, string>,
+	bodySnippet: string | null,
+): string {
+	const boundedHeaders: Record<string, string> = {};
+	for (const [name, value] of Object.entries(headers)) {
+		const candidate = { ...boundedHeaders, [name]: value };
+		if (
+			JSON.stringify({
+				status,
+				headers: candidate,
+				...(bodySnippet === null ? {} : { body_snippet: "" }),
+			}).length <= MAX_UPSTREAM_EVIDENCE_JSON_CHARS
+		) {
+			boundedHeaders[name] = value;
+		}
+	}
+
+	let boundedBodySnippet =
+		bodySnippet === null
+			? null
+			: stripTrailingUnpairedHighSurrogate(bodySnippet);
+	let serialized = JSON.stringify({
+		status,
+		headers: boundedHeaders,
+		...(boundedBodySnippet === null
+			? {}
+			: { body_snippet: boundedBodySnippet }),
+	});
+	while (
+		boundedBodySnippet !== null &&
+		serialized.length > MAX_UPSTREAM_EVIDENCE_JSON_CHARS &&
+		boundedBodySnippet.length > 0
+	) {
+		boundedBodySnippet = stripTrailingUnpairedHighSurrogate(
+			boundedBodySnippet.slice(0, -1),
+		);
+		serialized = JSON.stringify({
+			status,
+			headers: boundedHeaders,
+			...(boundedBodySnippet === null
+				? {}
+				: { body_snippet: boundedBodySnippet }),
+		});
+	}
+	return serialized;
+}
+
+function handOffEvidenceReaderToDiscardDrain(
+	reader: ReadableStreamDefaultReader<Uint8Array>,
+	response: Response,
+	pendingRead?: Promise<unknown>,
+	deadlineMs = getInPlaceRetryDrainTimeoutMs(),
+): void {
+	const transportAbort = getResponseDrainTransport(response);
+	transportAbort?.abort(
+		new Error("Upstream evidence body capture deadline exceeded"),
+	);
+	try {
+		// Transformed provider streams use cancel as their public release signal;
+		// their own cleanup resolves the explicit exact-transport controller.
+		void reader.cancel().catch(() => {});
+	} catch {
+		// The reader may already have errored after the transport abort.
+	}
+	const drain = () => {
+		void drainReader(reader, {
+			deadlineMs,
+			transportAbort,
+		}).catch(() => {});
+	};
+	if (pendingRead) {
+		void pendingRead.then(drain, drain);
+	} else {
+		drain();
+	}
+}
+
+/** Capture bounded diagnostics only from a body that will be discarded. */
+async function captureSanitizedUpstreamEvidence(
+	ctx: ProxyContext,
+	response: Response,
+	{ consumeOriginalBody = false }: { consumeOriginalBody?: boolean } = {},
+): Promise<string> {
+	const headers: Record<string, string> = {};
+	for (const [name, value] of response.headers) {
+		const lowerName = name.toLowerCase();
+		if (!isUpstreamEvidenceHeader(lowerName)) continue;
+		headers[lowerName] = truncateEvidenceText(
+			value,
+			MAX_UPSTREAM_EVIDENCE_HEADER_VALUE_CHARS,
+		);
+		if (Object.keys(headers).length === MAX_UPSTREAM_EVIDENCE_HEADERS) break;
+	}
+
+	const shouldCaptureBody = consumeOriginalBody && response.status >= 400;
+	const shouldStorePayloads = ctx.config.getStorePayloads?.() ?? true;
+	if (shouldCaptureBody && !shouldStorePayloads) {
+		if (!upstreamEvidencePayloadSuppressionLogged) {
+			upstreamEvidencePayloadSuppressionLogged = true;
+			log.info(
+				"Upstream evidence body snippet suppressed because payload storage is disabled",
+			);
+		}
+		return serializeUpstreamEvidence(response.status, headers, null);
+	}
+	if (!shouldCaptureBody) {
+		return serializeUpstreamEvidence(response.status, headers, null);
+	}
+
+	let bodySnippet: string | null = null;
+	const body = response.body;
+	if (!body)
+		return serializeUpstreamEvidence(response.status, headers, bodySnippet);
+
+	const reader = body.getReader();
+	const decoder = new TextDecoder();
+	const captureDeadlineAt =
+		performance.now() + UPSTREAM_EVIDENCE_BODY_CAPTURE_DEADLINE_MS;
+	let bytesRead = 0;
+	let handOffToDiscardDrain = false;
+	let pendingRead: ReturnType<typeof reader.read> | undefined;
+	bodySnippet = "";
+	try {
+		while (
+			bodySnippet.length < MAX_UPSTREAM_EVIDENCE_BODY_CHARS &&
+			bytesRead < MAX_UPSTREAM_EVIDENCE_BODY_BYTES
+		) {
+			const remainingMs = captureDeadlineAt - performance.now();
+			if (remainingMs <= 0) {
+				handOffToDiscardDrain = true;
+				break;
+			}
+			let readTimeout: ReturnType<typeof setTimeout> | undefined;
+			const currentRead = reader.read();
+			pendingRead = currentRead;
+			const readResult = await Promise.race([
+				currentRead,
+				new Promise<null>((resolve) => {
+					readTimeout = setTimeout(() => resolve(null), remainingMs);
+				}),
+			]);
+			if (readTimeout !== undefined) clearTimeout(readTimeout);
+			if (readResult === null) {
+				handOffToDiscardDrain = true;
+				break;
+			}
+			pendingRead = undefined;
+			const { done, value } = readResult;
+			if (done) {
+				bodySnippet += truncateEvidenceText(
+					decoder.decode(),
+					MAX_UPSTREAM_EVIDENCE_BODY_CHARS - bodySnippet.length,
+				);
+				break;
+			}
+			if (!value) continue;
+
+			const remainingBytes = MAX_UPSTREAM_EVIDENCE_BODY_BYTES - bytesRead;
+			const boundedChunk = value.subarray(0, remainingBytes);
+			bodySnippet += truncateEvidenceText(
+				decoder.decode(boundedChunk, { stream: true }),
+				MAX_UPSTREAM_EVIDENCE_BODY_CHARS - bodySnippet.length,
+			);
+			bytesRead += boundedChunk.byteLength;
+			if (
+				boundedChunk.byteLength < value.byteLength ||
+				bodySnippet.length === MAX_UPSTREAM_EVIDENCE_BODY_CHARS ||
+				bytesRead === MAX_UPSTREAM_EVIDENCE_BODY_BYTES
+			) {
+				bodySnippet += truncateEvidenceText(
+					decoder.decode(),
+					MAX_UPSTREAM_EVIDENCE_BODY_CHARS - bodySnippet.length,
+				);
+				handOffToDiscardDrain = true;
+				break;
+			}
+		}
+	} catch {
+		// Evidence is best-effort: failed reads must not alter failover.
+	} finally {
+		if (handOffToDiscardDrain) {
+			handOffEvidenceReaderToDiscardDrain(
+				reader,
+				response,
+				pendingRead,
+				UPSTREAM_EVIDENCE_BODY_CAPTURE_DEADLINE_MS,
+			);
+		} else {
+			try {
+				reader.releaseLock();
+			} catch {
+				// The reader may already be released after an upstream read failure.
+			}
+		}
+	}
+
+	return serializeUpstreamEvidence(response.status, headers, bodySnippet);
+}
 
 type RawAttemptFailureScope = "not-classified" | "account" | "model" | "family";
 
@@ -4795,6 +5050,13 @@ export async function proxyWithAccount(
 				modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
 				statusCode: 402,
 				reason,
+				upstreamEvidence: await captureSanitizedUpstreamEvidence(
+					ctx,
+					failureResponse,
+					{
+						consumeOriginalBody: true,
+					},
+				),
 				scope: "account",
 				availableAt: null,
 				failoverAttempts,
@@ -4848,6 +5110,10 @@ export async function proxyWithAccount(
 				modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
 				statusCode: 400,
 				reason,
+				upstreamEvidence: await captureSanitizedUpstreamEvidence(
+					ctx,
+					failureResponse,
+				),
 				scope: "request",
 				availableAt: null,
 				failoverAttempts,
@@ -4935,6 +5201,13 @@ export async function proxyWithAccount(
 					modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
 					statusCode: 429,
 					reason,
+					upstreamEvidence: await captureSanitizedUpstreamEvidence(
+						ctx,
+						failureResponse,
+						{
+							consumeOriginalBody: true,
+						},
+					),
 					scope: "request",
 					availableAt: null,
 					failoverAttempts,
@@ -5022,6 +5295,13 @@ export async function proxyWithAccount(
 					modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
 					statusCode: 429,
 					reason: auditReason,
+					upstreamEvidence: await captureSanitizedUpstreamEvidence(
+						ctx,
+						failureResponse,
+						{
+							consumeOriginalBody: true,
+						},
+					),
 					scope: "account",
 					availableAt: account.rate_limited_until,
 					failoverAttempts,
@@ -5104,6 +5384,13 @@ export async function proxyWithAccount(
 				modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
 				statusCode: 429,
 				reason,
+				upstreamEvidence: await captureSanitizedUpstreamEvidence(
+					ctx,
+					failureResponse,
+					{
+						consumeOriginalBody: true,
+					},
+				),
 				scope: decision.scope,
 				availableAt: availableAt,
 				failoverAttempts,
@@ -5199,6 +5486,13 @@ export async function proxyWithAccount(
 				modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
 				statusCode: 429,
 				reason,
+				upstreamEvidence: await captureSanitizedUpstreamEvidence(
+					ctx,
+					failureResponse,
+					{
+						consumeOriginalBody: true,
+					},
+				),
 				scope: "model",
 				availableAt: modelAvailableAt,
 				failoverAttempts,
@@ -5405,6 +5699,13 @@ export async function proxyWithAccount(
 								: null,
 							statusCode: 429,
 							reason,
+							upstreamEvidence: await captureSanitizedUpstreamEvidence(
+								ctx,
+								rawResponse,
+								{
+									consumeOriginalBody: true,
+								},
+							),
 							scope: "account",
 							availableAt: account.rate_limited_until,
 							failoverAttempts,
@@ -5471,6 +5772,13 @@ export async function proxyWithAccount(
 								usageCache.getRateLimitedUntil.bind(usageCache),
 							);
 							const reason = "model_fallback_429";
+							const upstreamEvidence = await captureSanitizedUpstreamEvidence(
+								ctx,
+								rawResponse,
+								{
+									consumeOriginalBody: true,
+								},
+							);
 							const cooldownBefore = captureCooldownState(account);
 							const circuitCounted = applyRateLimitCooldown(
 								account,
@@ -5492,6 +5800,7 @@ export async function proxyWithAccount(
 									: null,
 								statusCode: 429,
 								reason,
+								upstreamEvidence,
 								scope: "account",
 								availableAt: account.rate_limited_until,
 								failoverAttempts,
@@ -5936,6 +6245,13 @@ export async function proxyWithAccount(
 								usageCache.getRateLimitedUntil.bind(usageCache),
 							);
 							const reason = "all_models_exhausted_429";
+							const upstreamEvidence = await captureSanitizedUpstreamEvidence(
+								ctx,
+								rawResponse,
+								{
+									consumeOriginalBody: true,
+								},
+							);
 							const cooldownBefore = captureCooldownState(account);
 							const circuitCounted = applyRateLimitCooldown(
 								account,
@@ -5957,6 +6273,7 @@ export async function proxyWithAccount(
 									: null,
 								statusCode: 429,
 								reason,
+								upstreamEvidence,
 								scope: "account",
 								availableAt: account.rate_limited_until,
 								failoverAttempts,
@@ -6024,6 +6341,7 @@ export async function proxyWithAccount(
 		let response = await attemptPlan.processResponse(
 			taggedRawResponse,
 			req.headers,
+			getResponseDrainTransport(taggedRawResponse),
 		);
 		if (attemptPlan.providerName === "codex" && currentTransportAttemptId) {
 			finalizedCodexAttemptIds.add(currentTransportAttemptId);
@@ -6224,6 +6542,7 @@ export async function proxyWithAccount(
 						const retryResponse = await attemptPlan.processResponse(
 							retryTaggedRaw,
 							req.headers,
+							getResponseDrainTransport(retryTaggedRaw),
 						);
 
 						await discardUpstreamBody(response);
@@ -6674,6 +6993,7 @@ export async function proxyWithAccount(
 					response = await attemptPlan.processResponse(
 						rescueTaggedRaw,
 						req.headers,
+						getResponseDrainTransport(rescueTaggedRaw),
 					);
 					if (currentTransportAttemptId) {
 						finalizedCodexAttemptIds.add(currentTransportAttemptId);
@@ -6836,7 +7156,10 @@ export async function proxyWithAccount(
 			// sole telemetry path for response-processor classifications, so its
 			// observation can be emitted exactly once regardless of terminal,
 			// retained, or ordinary failover disposition.
-			const enqueueObservedRateLimitAttempt = (routeSuppressed: boolean) => {
+			const enqueueObservedRateLimitAttempt = async (
+				routeSuppressed: boolean,
+				consumeOriginalBody: boolean,
+			): Promise<void> => {
 				if (!rateLimitObservation) return;
 				const attemptedModel = currentTransportModel ?? null;
 				enqueueRoutingAttempt(ctx, {
@@ -6848,6 +7171,13 @@ export async function proxyWithAccount(
 					modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
 					statusCode: rateLimitObservation.status,
 					reason: rateLimitObservation.reason,
+					upstreamEvidence: await captureSanitizedUpstreamEvidence(
+						ctx,
+						response,
+						{
+							consumeOriginalBody,
+						},
+					),
 					scope: "account",
 					availableAt: rateLimitObservation.availableAt,
 					failoverAttempts,
@@ -6911,7 +7241,7 @@ export async function proxyWithAccount(
 					attemptProxyContext(),
 				);
 			if (hostedDispatchCommitted()) {
-				enqueueObservedRateLimitAttempt(false);
+				await enqueueObservedRateLimitAttempt(false, false);
 				// The first hosted provider response is authoritative for this inbound
 				// request. Preserve it exactly; converting it into an account miss would
 				// invite model/account/guard replay after an irreversible execution.
@@ -6921,7 +7251,7 @@ export async function proxyWithAccount(
 				);
 			}
 			if (wasProtectedLifecycleForLatestResponse()) {
-				enqueueObservedRateLimitAttempt(false);
+				await enqueueObservedRateLimitAttempt(false, false);
 				return await forwardTerminalRateLimitResponse(
 					response.status === 529
 						? createProtectedAnthropicOverloadResponse({
@@ -6939,7 +7269,14 @@ export async function proxyWithAccount(
 			if (routeSuppressed) {
 				routingAttemptLedger.blockAccount(account.id);
 			}
-			enqueueObservedRateLimitAttempt(routeSuppressed);
+			const retainsRateLimitResponse =
+				isTerminalRateLimitStatus &&
+				(returnRateLimitedResponseOnExhaustion ||
+					routingAttemptLedger !== undefined);
+			await enqueueObservedRateLimitAttempt(
+				routeSuppressed,
+				!retainsRateLimitResponse,
+			);
 			if (returnRateLimitedResponseOnExhaustion && isTerminalRateLimitStatus) {
 				log.warn(
 					`Account ${account.name} returned final ${response.status} rate-limit/capacity response, forwarding upstream response instead of pool_exhausted`,
@@ -7020,6 +7357,25 @@ export async function proxyWithAccount(
 		// or downstream body delivery. The outer request scheduler arbitrates this
 		// candidate against any retained terminal before committing exactly one
 		// winner; every losing body is released exactly once.
+		const hasLogicalModelRewrite = isModelRewrite(
+			requestMeta.originalModel,
+			attemptAppliedModel,
+		);
+		const clientRequestedModel =
+			requestMeta.originalModel ?? baseBodyContext.getModel();
+		const hasTransportModelProvenance =
+			response.ok &&
+			!hasLogicalModelRewrite &&
+			clientRequestedModel !== null &&
+			currentTransportModel !== null &&
+			clientRequestedModel !== currentTransportModel;
+		const forwardOriginalModel = hasTransportModelProvenance
+			? clientRequestedModel
+			: requestMeta.originalModel;
+		const forwardAppliedModel = hasTransportModelProvenance
+			? currentTransportModel
+			: attemptAppliedModel;
+
 		const responseLifecycle = activeLifecycleForLatestResponse();
 		const forwardOptions = {
 			requestId: requestMeta.id,
@@ -7037,8 +7393,8 @@ export async function proxyWithAccount(
 			retryAttempt: 0,
 			failoverAttempts,
 			agentUsed: requestMeta.agentUsed,
-			originalModel: requestMeta.originalModel,
-			appliedModel: attemptAppliedModel,
+			originalModel: forwardOriginalModel,
+			appliedModel: forwardAppliedModel,
 			attemptedModel: currentTransportModel,
 			agentAttributionSource: requestMeta.agentAttributionSource ?? null,
 			comboName: requestMeta.comboName,
