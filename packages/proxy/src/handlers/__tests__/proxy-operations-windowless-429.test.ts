@@ -72,16 +72,13 @@ function makeRequestMeta(): RequestMeta {
 	};
 }
 
-/**
- * The LAST positional argument of saveRequest is clientSessionId. Asserting on
- * the tail rather than a fixed index is deliberate: this branch originally
- * dropped the two trailing arguments because it was copied from a sibling 429
- * path that later grew them, and a hardcoded index would not have caught that.
- */
-const lastSaveArg = (ctx: ProxyContext) => {
-	const calls = (ctx.dbOps.saveRequest as ReturnType<typeof mock>).mock.calls;
-	const args = calls[calls.length - 1] as unknown[];
-	return args[args.length - 1];
+/** Return the one immutable routing attempt object created by this branch. */
+const lastRoutingAttempt = (ctx: ProxyContext) => {
+	const calls = (ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>).mock
+		.calls;
+	return calls[calls.length - 1]?.[0] as
+		| { reason: string; scope: string; routeSuppressed: boolean }
+		| undefined;
 };
 
 function makeRequestBody(model = "claude-sonnet-4-5") {
@@ -155,6 +152,7 @@ function makeCtx(): ProxyContext {
 					Promise.resolve({ consecutiveRateLimits: 1, applied: true }),
 			),
 			saveRequest: mock((..._args: unknown[]) => Promise.resolve()),
+			saveRoutingAttempt: mock((..._args: unknown[]) => Promise.resolve()),
 			updateAccountUsage: mock(() => Promise.resolve()),
 			getAdapter: mock(() => ({
 				run: mock(() => Promise.resolve()),
@@ -198,8 +196,8 @@ const marks = (ctx: ProxyContext) =>
 	(ctx.dbOps.markAccountRateLimited as ReturnType<typeof mock>).mock.calls
 		.length;
 const saveReasons = (ctx: ProxyContext) =>
-	(ctx.dbOps.saveRequest as ReturnType<typeof mock>).mock.calls.map(
-		(c) => (c as unknown[])[6],
+	(ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>).mock.calls.map(
+		(c) => ((c as unknown[])[0] as { reason: string }).reason,
 	);
 /** markAccountRateLimited(accountId, until, reason, incrementStreak) */
 const markCalls = (ctx: ProxyContext) =>
@@ -250,7 +248,12 @@ describe("proxyWithAccount — windowless 429 is not benched (issue #301)", () =
 		expect(saveReasons(ctx)).not.toContain("model_fallback_429");
 		// The audit row must stay correlated with its originating client session,
 		// exactly as the out_of_credits and model_fallback_429 rows do.
-		expect(lastSaveArg(ctx)).toBe("sess-1");
+		expect(lastRoutingAttempt(ctx)).toMatchObject({
+			reason: "windowless_429",
+			scope: "request",
+			routeSuppressed: false,
+		});
+		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
 	});
 
 	// The operational point of not benching: the account is immediately routable
@@ -273,6 +276,33 @@ describe("proxyWithAccount — windowless 429 is not benched (issue #301)", () =
 		expect(second?.status).toBe(200);
 		expect(marks(ctx)).toBe(0);
 		expect(account.rate_limited_until).toBeNull();
+	});
+
+	it("allows a different account and then the rejected account to recover without a route dampener", async () => {
+		let calls = 0;
+		globalThis.fetch = mock(async () => {
+			calls++;
+			return calls === 1 ? burst429() : ok200();
+		});
+
+		const ctx = makeCtx();
+		const first = makeAccount({ id: "windowless-first" });
+		const second = makeAccount({ id: "windowless-second" });
+		const body = makeRequestBody();
+
+		expect(await runProxy(first, ctx, makeRequest(body), body)).toBeNull();
+		expect((await runProxy(second, ctx, makeRequest(body), body))?.status).toBe(
+			200,
+		);
+		expect((await runProxy(first, ctx, makeRequest(body), body))?.status).toBe(
+			200,
+		);
+		expect(calls).toBe(3);
+		expect(first.rate_limited_until).toBeNull();
+		expect(
+			usageCache.getModelScopedExhaustion(first.id, "claude-sonnet-4-5", null),
+		).toBeNull();
+		expect(marks(ctx)).toBe(0);
 	});
 
 	// Regression guard: a 429 that reports a reset is a REAL window limit and

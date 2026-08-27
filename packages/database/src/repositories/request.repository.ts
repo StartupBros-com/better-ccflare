@@ -501,16 +501,16 @@ export class RequestRepository extends BaseRepository<RequestData> {
 		const params = rangeMs ? [Date.now() - rangeMs] : [];
 
 		const result = await this.get<{
-			total_requests: number;
-			successful_requests: number;
-			avg_response_time: number | null;
-			total_tokens: number | null;
-			total_cost_usd: number | null;
-			input_tokens: number | null;
-			output_tokens: number | null;
-			cache_read_input_tokens: number | null;
-			cache_creation_input_tokens: number | null;
-			avg_tokens_per_second: number | null;
+			total_requests: unknown;
+			successful_requests: unknown;
+			avg_response_time: unknown;
+			total_tokens: unknown;
+			total_cost_usd: unknown;
+			input_tokens: unknown;
+			output_tokens: unknown;
+			cache_read_input_tokens: unknown;
+			cache_creation_input_tokens: unknown;
+			avg_tokens_per_second: unknown;
 		}>(
 			`
 			SELECT
@@ -530,17 +530,26 @@ export class RequestRepository extends BaseRepository<RequestData> {
 			params,
 		);
 
+		// Bun.SQL returns PostgreSQL COUNT/SUM BIGINT values as strings. Normalize
+		// here so this cross-dialect public API always fulfills its number contract.
 		return {
-			totalRequests: result?.total_requests || 0,
-			successfulRequests: result?.successful_requests || 0,
-			avgResponseTime: result?.avg_response_time || null,
-			totalTokens: result?.total_tokens || 0,
-			totalCostUsd: result?.total_cost_usd || 0,
-			inputTokens: result?.input_tokens || 0,
-			outputTokens: result?.output_tokens || 0,
-			cacheReadInputTokens: result?.cache_read_input_tokens || 0,
-			cacheCreationInputTokens: result?.cache_creation_input_tokens || 0,
-			avgTokensPerSecond: result?.avg_tokens_per_second || null,
+			totalRequests: Number(result?.total_requests) || 0,
+			successfulRequests: Number(result?.successful_requests) || 0,
+			avgResponseTime:
+				result?.avg_response_time == null
+					? null
+					: Number(result.avg_response_time),
+			totalTokens: Number(result?.total_tokens) || 0,
+			totalCostUsd: Number(result?.total_cost_usd) || 0,
+			inputTokens: Number(result?.input_tokens) || 0,
+			outputTokens: Number(result?.output_tokens) || 0,
+			cacheReadInputTokens: Number(result?.cache_read_input_tokens) || 0,
+			cacheCreationInputTokens:
+				Number(result?.cache_creation_input_tokens) || 0,
+			avgTokensPerSecond:
+				result?.avg_tokens_per_second == null
+					? null
+					: Number(result.avg_tokens_per_second),
 		};
 	}
 

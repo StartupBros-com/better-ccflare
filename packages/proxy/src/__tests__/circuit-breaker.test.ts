@@ -58,6 +58,32 @@ describe("shouldCountAsCircuitFailure (named predicate)", () => {
 	});
 });
 
+describe("recordFailure outcomes", () => {
+	test("reports whether this call entered breaker failure accounting", () => {
+		const disabled = new CircuitBreaker({ enabled: false });
+		expect(
+			disabled.recordFailure(KEY_A, "upstream_529_overloaded_with_reset", T0),
+		).toBe(false);
+
+		const enabled = new CircuitBreaker({ failureThreshold: 1 });
+		expect(enabled.recordFailure(KEY_A, "model_fallback_429", T0)).toBe(false);
+		expect(
+			enabled.recordFailure(
+				KEY_A,
+				"upstream_529_overloaded_with_reset",
+				T0 + 1,
+			),
+		).toBe(true);
+		expect(
+			enabled.recordFailure(
+				KEY_A,
+				"upstream_529_overloaded_with_reset",
+				T0 + 2,
+			),
+		).toBe(false);
+	});
+});
+
 describe("closed -> open", () => {
 	test("five consecutive 529s open the circuit on the configured threshold", () => {
 		const cb = new CircuitBreaker();
@@ -362,7 +388,9 @@ describe("env kill-switch", () => {
 		process.env[CIRCUIT_BREAKER_ENV] = "0";
 		expect(getDefaultCircuitBreaker().isEnabled()).toBe(false);
 		// shouldAllow on the module-level wrappers must pass through.
-		moduleRecordFailure(KEY_A, "upstream_529_overloaded_with_reset", T0);
+		expect(
+			moduleRecordFailure(KEY_A, "upstream_529_overloaded_with_reset", T0),
+		).toBe(false);
 		expect(moduleShouldAllow(KEY_A, T0 + 1)).toBe(true);
 	});
 });

@@ -163,6 +163,7 @@ interface ContextHarness {
 	ctx: ProxyContext;
 	markAccountRateLimited: ReturnType<typeof mock>;
 	saveRequest: ReturnType<typeof mock>;
+	saveRoutingAttempt: ReturnType<typeof mock>;
 	getActiveComboForFamily: ReturnType<typeof mock>;
 	strategySelect: ReturnType<typeof mock>;
 	flush: () => Promise<void>;
@@ -184,6 +185,7 @@ function makeContext(
 		},
 	);
 	const saveRequest = mock(async (..._args: unknown[]) => undefined);
+	const saveRoutingAttempt = mock(async (..._args: unknown[]) => undefined);
 	const getActiveComboForFamily = mock(async () => options.combo ?? null);
 	const strategySelect = mock(() => accounts);
 	const getAllAccounts = mock(async () =>
@@ -205,6 +207,7 @@ function makeContext(
 			getActiveComboForFamily,
 			markAccountRateLimited,
 			saveRequest,
+			saveRoutingAttempt,
 			updateAccountUsage: mock(async () => undefined),
 			updateAccountRateLimitMeta: mock(async () => undefined),
 			getAdapter: mock(() => ({
@@ -244,6 +247,7 @@ function makeContext(
 		ctx,
 		markAccountRateLimited,
 		saveRequest,
+		saveRoutingAttempt,
 		getActiveComboForFamily,
 		strategySelect,
 		flush: async () => {
@@ -326,12 +330,19 @@ describe("raw upstream HTTP 402 routing", () => {
 		expect(harness.markAccountRateLimited.mock.calls[0]?.[2]).toBe(
 			"upstream_402_payment_required",
 		);
-		expect(harness.saveRequest).toHaveBeenCalledTimes(1);
-		expect(harness.saveRequest.mock.calls[0]?.[4]).toBe(402);
-		expect(harness.saveRequest.mock.calls[0]?.[5]).toBe(false);
-		expect(harness.saveRequest.mock.calls[0]?.[6]).toBe(
-			"upstream_402_payment_required",
-		);
+		expect(harness.saveRoutingAttempt).toHaveBeenCalledTimes(1);
+		expect(harness.saveRoutingAttempt.mock.calls[0]?.[0]).toMatchObject({
+			parentRequestId: expect.any(String),
+			accountId: account.id,
+			statusCode: 402,
+			reason: "upstream_402_payment_required",
+			scope: "account",
+			availableAt: null,
+			accountBenched: true,
+			routeSuppressed: false,
+			circuitCounted: false,
+		});
+		expect(harness.saveRequest).not.toHaveBeenCalled();
 		expect(getRequestRateLimitOutcomes(request)).toEqual([
 			expect.objectContaining({
 				accountId: account.id,
@@ -502,9 +513,9 @@ describe("raw upstream HTTP 402 routing", () => {
 		expect(harness.markAccountRateLimited.mock.calls[0]?.[2]).toBe(
 			"upstream_402_payment_required",
 		);
-		expect(harness.saveRequest).toHaveBeenCalledTimes(1);
-		expect(harness.saveRequest.mock.calls[0]?.[4]).toBe(402);
-		expect(harness.saveRequest.mock.calls[0]?.[6]).toBe(
+		expect(harness.saveRoutingAttempt).toHaveBeenCalledTimes(1);
+		expect(harness.saveRoutingAttempt.mock.calls[0]?.[0]?.statusCode).toBe(402);
+		expect(harness.saveRoutingAttempt.mock.calls[0]?.[0]?.reason).toBe(
 			"upstream_402_payment_required",
 		);
 		expect(getRequestRateLimitOutcomes(request)).toEqual([
@@ -616,9 +627,9 @@ describe("raw upstream HTTP 402 routing", () => {
 		expect(harness.markAccountRateLimited.mock.calls[0]?.[2]).toBe(
 			"all_models_exhausted_429",
 		);
-		expect(harness.saveRequest).toHaveBeenCalledTimes(1);
-		expect(harness.saveRequest.mock.calls[0]?.[4]).toBe(429);
-		expect(harness.saveRequest.mock.calls[0]?.[6]).toBe(
+		expect(harness.saveRoutingAttempt).toHaveBeenCalledTimes(1);
+		expect(harness.saveRoutingAttempt.mock.calls[0]?.[0]?.statusCode).toBe(429);
+		expect(harness.saveRoutingAttempt.mock.calls[0]?.[0]?.reason).toBe(
 			"all_models_exhausted_429",
 		);
 	});
@@ -679,8 +690,10 @@ describe("raw upstream HTTP 402 routing", () => {
 			expect(callCount).toBe(2);
 			expect(retry402.cancelReasons).toEqual([undefined]);
 			expect(harness.markAccountRateLimited).toHaveBeenCalledTimes(1);
-			expect(harness.saveRequest.mock.calls[0]?.[4]).toBe(402);
-			expect(harness.saveRequest.mock.calls[0]?.[6]).toBe(
+			expect(harness.saveRoutingAttempt.mock.calls[0]?.[0]?.statusCode).toBe(
+				402,
+			);
+			expect(harness.saveRoutingAttempt.mock.calls[0]?.[0]?.reason).toBe(
 				"upstream_402_payment_required",
 			);
 			expect(getRequestRateLimitOutcomes(request)).toEqual([

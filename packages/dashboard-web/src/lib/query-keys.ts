@@ -1,3 +1,5 @@
+import type { RoutingAttemptSummaryWindow } from "@better-ccflare/types";
+
 export const queryKeys = {
 	all: ["better-ccflare"] as const,
 	accounts: () => [...queryKeys.all, "accounts"] as const,
@@ -47,6 +49,8 @@ export const queryKeys = {
 	storage: () => [...queryKeys.all, "storage"] as const,
 	routingObservations: () =>
 		[...queryKeys.all, "routing", "observations"] as const,
+	routingAttemptSummary: (window: RoutingAttemptSummaryWindow = "24h") =>
+		[...queryKeys.all, "routing-attempts", "summary", { window }] as const,
 	usageHistory: (account?: string, range?: string) =>
 		[...queryKeys.all, "usage-history", { account, range }] as const,
 	usageWindows: (account?: string, windowKey = "seven_day", limit = 20) =>

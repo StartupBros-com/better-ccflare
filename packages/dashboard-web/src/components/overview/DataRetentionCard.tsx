@@ -1,3 +1,4 @@
+import type { CleanupResponse } from "@better-ccflare/types";
 import { useEffect, useState } from "react";
 import {
 	useCleanupNow,
@@ -14,6 +15,26 @@ import {
 } from "../ui/card";
 import { Input } from "../ui/input";
 import { Switch } from "../ui/switch";
+
+export function DataRetentionCleanupSummary({
+	cleanup,
+}: {
+	cleanup: CleanupResponse;
+}) {
+	return (
+		<p>
+			Removed {cleanup.removedPayloads} payloads (
+			{cleanup.payloadCutoffIso ? (
+				<>older than {new Date(cleanup.payloadCutoffIso).toLocaleString()}</>
+			) : (
+				<>all — storage disabled</>
+			)}
+			) and {cleanup.removedRequests} requests (older than{" "}
+			{new Date(cleanup.requestCutoffIso).toLocaleString()}) and{" "}
+			{cleanup.removedRoutingAttempts} routing attempts.
+		</p>
+	);
+}
 
 export function DataRetentionCard() {
 	const { data, isLoading } = useRetention();
@@ -138,19 +159,7 @@ export function DataRetentionCard() {
 
 				{cleanupNow.data && (
 					<div className="text-xs text-muted-foreground space-y-1">
-						<p>
-							Removed {cleanupNow.data.removedPayloads} payloads (
-							{cleanupNow.data.payloadCutoffIso ? (
-								<>
-									older than{" "}
-									{new Date(cleanupNow.data.payloadCutoffIso).toLocaleString()}
-								</>
-							) : (
-								<>all — storage disabled</>
-							)}
-							) and {cleanupNow.data.removedRequests} requests (older than{" "}
-							{new Date(cleanupNow.data.requestCutoffIso).toLocaleString()}).
-						</p>
+						<DataRetentionCleanupSummary cleanup={cleanupNow.data} />
 						{(cleanupNow.data.dbSizeBytes > 0 ||
 							cleanupNow.data.tableRowCounts.length > 0) && (
 							<details>

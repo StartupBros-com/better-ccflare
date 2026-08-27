@@ -125,6 +125,7 @@ import {
 	BodyAdmissionController,
 	withBodyAdmission,
 } from "./body-admission";
+import { scheduleAdaptiveVacuumAfterRetentionCleanup } from "./retention-cleanup";
 import {
 	createUsagePollingTrackingClearer,
 	isCurrentUsagePollingAccount,
@@ -1541,40 +1542,19 @@ export default async function startServer(options?: {
 		try {
 			const payloadDays = config.getDataRetentionDays();
 			const requestDays = config.getRequestRetentionDays();
-			const { removedRequests, removedPayloads } =
-				await dbOps.cleanupOldRequests(
-					payloadDays * TIME_CONSTANTS.DAY,
-					requestDays * TIME_CONSTANTS.DAY,
-				);
-			if (removedRequests > 0 || removedPayloads > 0) {
-				log.info(
-					`Periodic cleanup: removed ${removedRequests} requests, ${removedPayloads} payloads in ${Date.now() - startTime}ms`,
-				);
-				// Reclaim freed pages adaptively. incrementalVacuumAdaptive()
-				// scales reclaim with the current freelist: in steady state it
-				// returns a small chunk (or no-ops on an empty freelist), but
-				// after a retention *drop* — which dumps a large surplus of free
-				// pages onto the freelist — it drains that surplus over a handful
-				// of hourly ticks instead of weeks. Each underlying worker call is
-				// bounded (~64 MiB) and the per-tick total is capped (~1 GiB), with
-				// yields between chunks, so the single writer slot is never held
-				// long and concurrent main-thread writes (rate-limit updates, OAuth
-				// refresh, post-processor inserts) aren't starved. Off-thread via
-				// the incremental-vacuum worker. Fire-and-forget so the cleanup
-				// callback isn't blocked on it.
-				dbOps
-					.incrementalVacuumAdaptive()
-					.then((r) => {
-						if (r.reclaimedPages > 0) {
-							log.info(
-								`Adaptive incremental vacuum reclaimed ${r.reclaimedPages} pages in ${r.chunks} chunk(s)`,
-							);
-						}
-					})
-					.catch((err) => {
-						log.error(`Incremental vacuum error: ${err}`);
-					});
-			}
+			const cleanupResult = await dbOps.cleanupOldRequests(
+				payloadDays * TIME_CONSTANTS.DAY,
+				requestDays * TIME_CONSTANTS.DAY,
+			);
+			// Reclaim freed pages adaptively after any retention deletion. This is
+			// intentionally fire-and-forget: every worker call is bounded and
+			// off-thread, so the cleanup callback never holds the main writer slot.
+			scheduleAdaptiveVacuumAfterRetentionCleanup(
+				cleanupResult,
+				dbOps,
+				log,
+				Date.now() - startTime,
+			);
 			const usageHistoryDays = config.getUsageHistoryRetentionDays();
 			const removedSnapshots = await dbOps.pruneUsageSnapshots(
 				Date.now() - usageHistoryDays * TIME_CONSTANTS.DAY,

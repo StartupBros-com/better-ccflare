@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Logger } from "@better-ccflare/logger";
 import { addPerformanceIndexes } from "./performance-indexes";
+import { ROUTING_ATTEMPT_REASON_SQL } from "./routing-attempt-taxonomy";
 
 const log = new Logger("DatabaseMigrations");
 
@@ -331,6 +332,45 @@ function ensureServerToolReplayIssuanceSchema(db: Database): void {
 	`);
 }
 
+function ensureRoutingAttemptsSchema(db: Database): void {
+	db.run(`
+		CREATE TABLE IF NOT EXISTS routing_attempts (
+			id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 128),
+			parent_request_id TEXT NOT NULL CHECK (length(parent_request_id) BETWEEN 1 AND 128),
+			timestamp INTEGER NOT NULL CHECK (timestamp >= 0),
+			provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 128),
+			account_id TEXT NOT NULL CHECK (length(account_id) BETWEEN 1 AND 256),
+			attempted_model TEXT CHECK (attempted_model IS NULL OR length(attempted_model) BETWEEN 1 AND 512),
+			model_family TEXT CHECK (model_family IS NULL OR length(model_family) BETWEEN 1 AND 128),
+			status_code INTEGER NOT NULL CHECK (status_code BETWEEN 100 AND 599),
+			reason TEXT NOT NULL CHECK (reason IN (${ROUTING_ATTEMPT_REASON_SQL})),
+			scope TEXT NOT NULL CHECK (scope IN ('account', 'family', 'model', 'request')),
+			available_at INTEGER CHECK (available_at IS NULL OR available_at >= 0),
+			failover_attempts INTEGER NOT NULL CHECK (failover_attempts >= 0),
+			physical_attempt INTEGER CHECK (physical_attempt IS NULL OR physical_attempt >= 1),
+			account_benched INTEGER NOT NULL CHECK (account_benched IN (0, 1)),
+			route_suppressed INTEGER NOT NULL CHECK (route_suppressed IN (0, 1)),
+			circuit_counted INTEGER NOT NULL CHECK (circuit_counted IN (0, 1))
+		)
+	`);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_routing_attempts_timestamp
+		 ON routing_attempts(timestamp DESC, id DESC)`,
+	);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_routing_attempts_parent_timestamp
+		 ON routing_attempts(parent_request_id, timestamp ASC, id ASC)`,
+	);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_routing_attempts_reason_scope_timestamp
+		 ON routing_attempts(reason, scope, timestamp DESC)`,
+	);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_routing_attempts_account_timestamp
+		 ON routing_attempts(account_id, timestamp DESC)`,
+	);
+}
+
 export function ensureSchema(db: Database): void {
 	// Apply auto_vacuum = INCREMENTAL before any tables exist so fresh DBs are
 	// born in incremental-vacuum mode. SQLite stores this in the DB header and
@@ -407,6 +447,8 @@ export function ensureSchema(db: Database): void {
 			client_session_id TEXT
 		)
 	`);
+
+	ensureRoutingAttemptsSchema(db);
 
 	// Create indexes for faster queries
 	db.run(
@@ -1461,6 +1503,8 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 export function runMigrations(db: Database, dbPath?: string): void {
 	// Ensure base schema exists first (outside transaction as it creates tables)
 	ensureSchema(db);
+	// Repair an interrupted additive routing-attempt migration independently.
+	ensureRoutingAttemptsSchema(db);
 
 	// Check if columns exist before adding them
 	const accountsInfo = db

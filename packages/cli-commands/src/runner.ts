@@ -606,7 +606,11 @@ export async function runCli(argv: string[]): Promise<void> {
 		setAccountPriority,
 	} = accountCommands;
 	const { analyzePerformance } = analyzeCommands;
-	const { clearRequestHistory, resetAllStats } = statsCommands;
+	const {
+		clearRequestHistory,
+		formatClearRequestHistoryResult,
+		resetAllStats,
+	} = statsCommands;
 	const { checkReauthNeeded, checkTokenHealth } = tokenCommands;
 
 	// Initialize DI container and services
@@ -779,9 +783,7 @@ export async function runCli(argv: string[]): Promise<void> {
 
 			case "clear-history": {
 				const result = await clearRequestHistory(dbOps, config);
-				console.log(
-					`Cleared ${result.removedPayloads} payloads and ${result.removedRequests} request records`,
-				);
+				console.log(formatClearRequestHistoryResult(result));
 				break;
 			}
 

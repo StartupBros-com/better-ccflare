@@ -132,6 +132,7 @@ import {
 	createRequestsSummaryHandler,
 } from "./handlers/requests";
 import { createRequestsStreamHandler } from "./handlers/requests-stream";
+import { createRoutingAttemptsSummaryHandler } from "./handlers/routing-attempts";
 import { createRoutingObservationsHandler } from "./handlers/routing-observations";
 import { createSessionAccountHandler } from "./handlers/sessions";
 import { createStatsHandler, createStatsResetHandler } from "./handlers/stats";
@@ -254,6 +255,8 @@ export class APIRouter {
 		);
 		const logsStreamHandler = createLogsStreamHandler();
 		const logsHistoryHandler = createLogsHistoryHandler();
+		const routingAttemptsSummaryHandler =
+			createRoutingAttemptsSummaryHandler(dbOps);
 		const analyticsHandler = createAnalyticsHandler(this.context);
 		const usageHistoryHandler = createUsageHistoryHandler(this.context);
 		const usageWindowsHandler = createUsageWindowsHandler(this.context);
@@ -380,6 +383,9 @@ export class APIRouter {
 		const routingObservationsHandler = createRoutingObservationsHandler();
 		this.handlers.set("GET:/api/routing/observations", () =>
 			routingObservationsHandler(),
+		);
+		this.handlers.set("GET:/api/routing-attempts/summary", (_req, url) =>
+			routingAttemptsSummaryHandler(url),
 		);
 
 		this.handlers.set("POST:/api/oauth/init", (req) => oauthInitHandler(req));

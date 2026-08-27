@@ -15,6 +15,7 @@ export * from "./logging";
 export * from "./provider-capabilities";
 export * from "./rate-limit-reason";
 export * from "./request";
+export * from "./routing-attempt";
 export * from "./routing-recovery";
 export * from "./stats";
 export * from "./strategy";

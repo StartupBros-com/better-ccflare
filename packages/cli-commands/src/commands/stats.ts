@@ -17,13 +17,26 @@ export async function resetAllStats(dbOps: DatabaseOperations): Promise<void> {
  * Pass 1: delete payloads older than payloadDays.
  * Pass 2: delete request metadata older than requestDays.
  */
+export interface ClearRequestHistoryResult {
+	removedRequests: number;
+	removedPayloads: number;
+	removedRoutingAttempts: number;
+}
+
 export async function clearRequestHistory(
 	dbOps: DatabaseOperations,
 	config: Config,
-): Promise<{ removedRequests: number; removedPayloads: number }> {
+): Promise<ClearRequestHistoryResult> {
 	const payloadMs = config.getDataRetentionDays() * 24 * 60 * 60 * 1000;
 	const requestMs = config.getRequestRetentionDays() * 24 * 60 * 60 * 1000;
 	return dbOps.cleanupOldRequests(payloadMs, requestMs);
+}
+
+/** Shared wording for both packaged and legacy CLI renderers. */
+export function formatClearRequestHistoryResult(
+	result: ClearRequestHistoryResult,
+): string {
+	return `Cleared ${result.removedPayloads} payloads, ${result.removedRequests} request records, and ${result.removedRoutingAttempts} routing attempts`;
 }
 
 /**

@@ -1,5 +1,6 @@
 import { Logger } from "@better-ccflare/logger";
 import type { BunSqlAdapter } from "./adapters/bun-sql-adapter";
+import { ROUTING_ATTEMPT_REASON_SQL } from "./routing-attempt-taxonomy";
 
 const log = new Logger("DatabaseMigrations-PG");
 
@@ -455,6 +456,47 @@ async function columnDataType(
 	return result?.data_type ?? null;
 }
 
+async function ensureRoutingAttemptsSchemaPg(
+	adapter: BunSqlAdapter,
+): Promise<void> {
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS routing_attempts (
+			id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 128),
+			parent_request_id TEXT NOT NULL CHECK (length(parent_request_id) BETWEEN 1 AND 128),
+			timestamp BIGINT NOT NULL CHECK (timestamp >= 0),
+			provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 128),
+			account_id TEXT NOT NULL CHECK (length(account_id) BETWEEN 1 AND 256),
+			attempted_model TEXT CHECK (attempted_model IS NULL OR length(attempted_model) BETWEEN 1 AND 512),
+			model_family TEXT CHECK (model_family IS NULL OR length(model_family) BETWEEN 1 AND 128),
+			status_code INTEGER NOT NULL CHECK (status_code BETWEEN 100 AND 599),
+			reason TEXT NOT NULL CHECK (reason IN (${ROUTING_ATTEMPT_REASON_SQL})),
+			scope TEXT NOT NULL CHECK (scope IN ('account', 'family', 'model', 'request')),
+			available_at BIGINT CHECK (available_at IS NULL OR available_at >= 0),
+			failover_attempts INTEGER NOT NULL CHECK (failover_attempts >= 0),
+			physical_attempt INTEGER CHECK (physical_attempt IS NULL OR physical_attempt >= 1),
+			account_benched INTEGER NOT NULL CHECK (account_benched IN (0, 1)),
+			route_suppressed INTEGER NOT NULL CHECK (route_suppressed IN (0, 1)),
+			circuit_counted INTEGER NOT NULL CHECK (circuit_counted IN (0, 1))
+		)
+	`);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_routing_attempts_timestamp
+		 ON routing_attempts(timestamp DESC, id DESC)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_routing_attempts_parent_timestamp
+		 ON routing_attempts(parent_request_id, timestamp ASC, id ASC)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_routing_attempts_reason_scope_timestamp
+		 ON routing_attempts(reason, scope, timestamp DESC)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_routing_attempts_account_timestamp
+		 ON routing_attempts(account_id, timestamp DESC)`,
+	);
+}
+
 /**
  * Ensure the full schema exists for PostgreSQL
  */
@@ -537,6 +579,7 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 		)
 	`);
 
+	await ensureRoutingAttemptsSchemaPg(adapter);
 	// Create indexes for requests
 	await adapter.unsafe(
 		`CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp DESC)`,
@@ -1410,6 +1453,9 @@ export async function collapseAccountDuplicatesPreservingStatePg(
  * Run PostgreSQL-specific migrations
  */
 export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
+	// Repair an interrupted additive routing-attempt migration independently.
+	await ensureRoutingAttemptsSchemaPg(adapter);
+
 	// The turn observation column below carries a foreign key to the new
 	// registry tables, so legacy upgrades must create the recorder tables before
 	// the additive column loop attempts the ALTER. The turn observation indexes

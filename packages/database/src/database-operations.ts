@@ -67,6 +67,11 @@ import {
 	type RequestData,
 	RequestRepository,
 } from "./repositories/request.repository";
+import {
+	type RoutingAttemptData,
+	RoutingAttemptRepository,
+	type RoutingAttemptSummaryWindow,
+} from "./repositories/routing-attempt.repository";
 import { ServerToolReplayIssuanceRepository } from "./repositories/server-tool-replay-issuance.repository";
 import { StatsRepository } from "./repositories/stats.repository";
 import { StrategyRepository } from "./repositories/strategy.repository";
@@ -378,6 +383,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 	// Repositories
 	private accounts: AccountRepository;
 	private requests: RequestRepository;
+	private routingAttempts: RoutingAttemptRepository;
 	private oauth: OAuthRepository;
 	private strategy: StrategyRepository;
 	private stats: StatsRepository;
@@ -532,6 +538,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 		// Initialize repositories
 		this.accounts = new AccountRepository(this.adapter);
 		this.requests = new RequestRepository(this.adapter);
+		this.routingAttempts = new RoutingAttemptRepository(this.adapter);
 		this.oauth = new OAuthRepository(this.adapter);
 		this.strategy = new StrategyRepository(this.adapter);
 		this.stats = new StatsRepository(this.adapter);
@@ -1480,6 +1487,31 @@ OAuth tokens will need to be re-authenticated.
 		);
 	}
 
+	async saveRoutingAttempt(data: RoutingAttemptData): Promise<void> {
+		await withDatabaseRetry(
+			() => this.routingAttempts.append(data),
+			this.retryConfig,
+			"saveRoutingAttempt",
+		);
+	}
+
+	async getRoutingAttemptSummary(input: {
+		window: RoutingAttemptSummaryWindow;
+		now?: number;
+	}) {
+		return this.routingAttempts.getSummary(input.window, input.now);
+	}
+
+	async resetStatistics(): Promise<void> {
+		await this.adapter.runBatchWithChanges([
+			{ sql: "DELETE FROM requests" },
+			{ sql: "DELETE FROM routing_attempts" },
+			{
+				sql: "UPDATE accounts SET request_count = 0, session_request_count = 0",
+			},
+		]);
+	}
+
 	async updateRequestUsage(
 		requestId: string,
 		usage: RequestData["usage"],
@@ -1666,6 +1698,7 @@ OAuth tokens will need to be re-authenticated.
 	): Promise<{
 		removedRequests: number;
 		removedPayloads: number;
+		removedRoutingAttempts: number;
 	}> {
 		const now = Date.now();
 
@@ -1677,17 +1710,21 @@ OAuth tokens will need to be re-authenticated.
 
 		// Pass 2 — request metadata
 		let removedRequests = 0;
+		let removedRoutingAttempts = 0;
 		if (
 			typeof requestRetentionMs === "number" &&
 			Number.isFinite(requestRetentionMs)
 		) {
 			const requestCutoff = now - requestRetentionMs;
 			removedRequests = await this.requests.deleteOlderThan(requestCutoff);
+			removedRoutingAttempts =
+				await this.routingAttempts.deleteOlderThan(requestCutoff);
 		}
 
 		return {
 			removedRequests,
 			removedPayloads: removedPayloadsByAge + removedOrphans,
+			removedRoutingAttempts,
 		};
 	}
 

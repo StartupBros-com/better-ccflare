@@ -438,6 +438,178 @@ describe("processProxyResponse — 529 overload reason", () => {
 		// Keepalive requests skip cooldown marking
 		expect(calls.markRateLimited).toHaveLength(0);
 	});
+
+	it("reports one post-cooldown observation with actual state and omits keepalive replays", async () => {
+		const account = makeAccount();
+		const resetTime = Date.now() + 30 * 60_000;
+		const { ctx } = makeCtxWithReason({
+			isStream: false,
+			rateLimited: true,
+			resetTime,
+		});
+		const observations: unknown[] = [];
+		const response = new Response('{"type":"error"}', { status: 529 });
+
+		await processProxyResponse(
+			response,
+			account,
+			ctx,
+			undefined,
+			undefined,
+			(observation) => observations.push(observation),
+		);
+
+		expect(observations).toEqual([
+			expect.objectContaining({
+				reason: "upstream_529_overloaded_with_reset",
+				status: 529,
+				accountBenched: true,
+				availableAt: account.rate_limited_until,
+				circuitCounted: false,
+			}),
+		]);
+
+		await processProxyResponse(
+			new Response('{"type":"error"}', { status: 529 }),
+			account,
+			ctx,
+			undefined,
+			{
+				headers: new Headers({
+					"x-better-ccflare-keepalive": "true",
+					"x-better-ccflare-internal-probe-secret": "test-secret",
+				}),
+			},
+			(observation) => observations.push(observation),
+		);
+		expect(observations).toHaveLength(1);
+	});
+});
+
+function deferred<T = void>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
+async function settleWithin<T>(
+	promise: Promise<T>,
+	description: string,
+): Promise<T> {
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_, reject) => {
+				timeout = setTimeout(
+					() => reject(new Error(`${description} did not settle`)),
+					100,
+				);
+			}),
+		]);
+	} finally {
+		if (timeout) clearTimeout(timeout);
+	}
+}
+
+describe("processProxyResponse — rate-limit observation failures", () => {
+	it("contains a synchronous observer throw without changing cooldown or failover", async () => {
+		const account = makeAccount();
+		const { ctx, calls } = makeCtx({
+			isStream: false,
+			rateLimited: true,
+			resetTime: Date.now() + 30 * 60_000,
+		});
+		let observerCalled = false;
+
+		const resultPromise = processProxyResponse(
+			new Response('{"error":"rate_limit"}', { status: 429 }),
+			account,
+			ctx,
+			undefined,
+			undefined,
+			() => {
+				observerCalled = true;
+				throw new Error("observer failed");
+			},
+		);
+
+		// Observation remains synchronous, so proxyWithAccount sees it before
+		// processProxyResponse yields while the callback failure stays contained.
+		expect(observerCalled).toBe(true);
+		expect(await resultPromise).toBe(true);
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(account.rate_limited_until).not.toBeNull();
+	});
+
+	it("contains an asynchronous observer rejection without an unhandled rejection", async () => {
+		const account = makeAccount();
+		const { ctx, calls } = makeCtx({
+			isStream: false,
+			rateLimited: true,
+			resetTime: Date.now() + 30 * 60_000,
+		});
+		const unhandled: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandledRejection);
+		try {
+			const result = await processProxyResponse(
+				new Response('{"error":"rate_limit"}', { status: 429 }),
+				account,
+				ctx,
+				undefined,
+				undefined,
+				async () => {
+					throw new Error("observer rejected");
+				},
+			);
+
+			// Let Bun report any unhandled rejection after the callback's promise
+			// settles; this is a bounded settlement turn, not a timing sleep.
+			await settleWithin(
+				new Promise<void>((resolve) => setImmediate(resolve)),
+				"rejection reporting",
+			);
+			expect(result).toBe(true);
+			expect(calls.markRateLimited).toHaveLength(1);
+			expect(account.rate_limited_until).not.toBeNull();
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.removeListener("unhandledRejection", onUnhandledRejection);
+		}
+	});
+
+	it("does not wait for a delayed observer before returning the cooldown failover result", async () => {
+		const account = makeAccount();
+		const { ctx, calls } = makeCtx({
+			isStream: false,
+			rateLimited: true,
+			resetTime: Date.now() + 30 * 60_000,
+		});
+		const observationFinished = deferred<void>();
+
+		const result = await settleWithin(
+			processProxyResponse(
+				new Response('{"error":"rate_limit"}', { status: 429 }),
+				account,
+				ctx,
+				undefined,
+				undefined,
+				() => observationFinished.promise,
+			),
+			"rate-limit failover",
+		);
+		const cooldownAtFailover = account.rate_limited_until;
+
+		expect(result).toBe(true);
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(cooldownAtFailover).not.toBeNull();
+		observationFinished.resolve();
+		await settleWithin(observationFinished.promise, "delayed observation");
+		expect(account.rate_limited_until).toBe(cooldownAtFailover);
+	});
 });
 
 describe("processProxyResponse — in-memory cooldown mutation", () => {
@@ -658,11 +830,29 @@ describe("processProxyResponse - native xAI capacity classification (R5-R10)", (
 			headers: { "content-type": "application/json" },
 		});
 
-		const result = await processProxyResponse(response, account, ctx);
+		const observations: unknown[] = [];
+		const result = await processProxyResponse(
+			response,
+			account,
+			ctx,
+			undefined,
+			undefined,
+			(observation) => observations.push(observation),
+		);
 
 		expect(result).toBe(true);
 		expect(calls.markRateLimited).toHaveLength(1);
 		expect(calls.markRateLimited[0]?.reason).toBe("xai_capacity_402");
+		expect(observations).toEqual([
+			expect.objectContaining({
+				reason: "xai_capacity_402",
+				status: 402,
+				accountBenched: true,
+				availableAt: account.rate_limited_until,
+				// Awaited persistence intentionally bypasses the breaker.
+				circuitCounted: false,
+			}),
+		]);
 	});
 
 	it("awaits the durable cooldown write before resolving (R9)", async () => {
@@ -857,6 +1047,46 @@ describe("processProxyResponse - native xAI capacity classification (R5-R10)", (
 		const reset = calls.markRateLimited[0]?.resetTime ?? 0;
 		expect(reset).toBeGreaterThanOrEqual(before + THIRTY_SECONDS - 1000);
 		expect(reset).toBeLessThanOrEqual(Date.now() + THIRTY_SECONDS + 1000);
+	});
+
+	it.each([
+		{
+			name: "with reset",
+			resetTime: Date.now() + 30_000,
+			reason: "upstream_429_with_reset",
+		},
+		{
+			name: "without reset",
+			resetTime: undefined,
+			reason: "upstream_429_no_reset_probe_cooldown",
+		},
+	] as const)("reports native xAI 429 %s through the observation seam", async ({
+		resetTime,
+		reason,
+	}) => {
+		const account = makeXaiAccount({ id: "xai-1" });
+		const { ctx } = makeXaiCtx({
+			rateLimitInfo: { isRateLimited: true, resetTime },
+		});
+		const observations: unknown[] = [];
+		await processProxyResponse(
+			new Response('{"error":"rate limited"}', { status: 429 }),
+			account,
+			ctx,
+			undefined,
+			undefined,
+			(observation) => observations.push(observation),
+		);
+
+		expect(observations).toEqual([
+			expect.objectContaining({
+				reason,
+				status: 429,
+				accountBenched: true,
+				availableAt: account.rate_limited_until,
+				circuitCounted: false,
+			}),
+		]);
 	});
 
 	it("native xAI 400 does not classify as rate-limited", async () => {

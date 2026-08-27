@@ -5,7 +5,11 @@
  * { removedRequests, removedPayloads } — not the old { count } shape.
  */
 import { describe, expect, it, mock } from "bun:test";
-import { clearRequestHistory, compactDatabase } from "../stats";
+import {
+	clearRequestHistory,
+	compactDatabase,
+	formatClearRequestHistoryResult,
+} from "../stats";
 
 // ---------------------------------------------------------------------------
 // Minimal stubs
@@ -21,9 +25,13 @@ function makeConfig(payloadDays = 3, requestDays = 90) {
 function makeDbOps(result: {
 	removedRequests: number;
 	removedPayloads: number;
+	removedRoutingAttempts?: number;
 }) {
 	return {
-		cleanupOldRequests: mock(async () => result),
+		cleanupOldRequests: mock(async () => ({
+			removedRoutingAttempts: 0,
+			...result,
+		})),
 	} as unknown as import("@better-ccflare/database").DatabaseOperations;
 }
 
@@ -216,6 +224,33 @@ describe("clearRequestHistory", () => {
 
 			expect(result.removedRequests).toBe(42);
 			expect(result.removedPayloads).toBe(17);
+		});
+
+		it("preserves removedRoutingAttempts from dbOps.cleanupOldRequests", async () => {
+			const dbOps = makeDbOps({
+				removedRequests: 42,
+				removedPayloads: 17,
+				removedRoutingAttempts: 9,
+			});
+			const config = makeConfig();
+
+			const result = await clearRequestHistory(dbOps, config);
+
+			expect(result).toEqual({
+				removedRequests: 42,
+				removedPayloads: 17,
+				removedRoutingAttempts: 9,
+			});
+		});
+
+		it("formats routing-attempt removals for both CLI renderers", () => {
+			expect(
+				formatClearRequestHistoryResult({
+					removedRequests: 42,
+					removedPayloads: 17,
+					removedRoutingAttempts: 9,
+				}),
+			).toBe("Cleared 17 payloads, 42 request records, and 9 routing attempts");
 		});
 
 		it("returns zero counts when nothing was deleted", async () => {

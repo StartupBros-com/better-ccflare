@@ -78,6 +78,13 @@ export type {
 // Re-export repository classes
 export { ModelTranslationRepository } from "./repositories/model-translation.repository";
 export {
+	ROUTING_ATTEMPT_SUMMARY_WINDOWS,
+	type RoutingAttemptData,
+	RoutingAttemptRepository,
+	type RoutingAttemptSummary,
+	type RoutingAttemptSummaryWindow,
+} from "./repositories/routing-attempt.repository";
+export {
 	type ReserveReplayIssuanceRangeInput,
 	SERVER_TOOL_REPLAY_ISSUANCE_MAX,
 	SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX,
@@ -95,4 +102,10 @@ export type {
 } from "./repositories/usage-windows.repository";
 // Re-export retry utilities for external use (from your improvements)
 export { withDatabaseRetry, withDatabaseRetrySync } from "./retry";
+export {
+	ROUTING_ATTEMPT_REASONS,
+	ROUTING_ATTEMPT_SCOPES,
+	type RoutingAttemptReason,
+	type RoutingAttemptScope,
+} from "./routing-attempt-taxonomy";
 export { DatabaseOperations };

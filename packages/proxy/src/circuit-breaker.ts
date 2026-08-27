@@ -433,19 +433,22 @@ export class CircuitBreaker {
 	 * backoff (2x previous cooldown, capped at halfOpenBackoffMaxMs).
 	 *
 	 * In `open`: shouldAllow already rejected the request, so this can
-	 * only happen from a stale caller; counted anyway as a streak
-	 * refresh so the cooldown window extends if upstream is still down.
+	 * only happen from a stale caller; its cooldown refresh preserves the
+	 * existing breaker state but does not count as a newly recorded failure.
+	 *
+	 * @returns true only when this call records a breaker failure. Disabled,
+	 * excluded, and already-open refresh paths return false.
 	 */
 	recordFailure(
 		key: CircuitKey,
 		kind: FailureKind,
 		now: number = Date.now(),
-	): void {
-		if (!this.enabled) return;
+	): boolean {
+		if (!this.enabled) return false;
 		if (!shouldCountAsCircuitFailure(kind)) {
 			// Model-scoped 429: do not let this tip the breaker. The
 			// client-side fallback path is the recovery mechanism.
-			return;
+			return false;
 		}
 
 		const composite = makeKey(key.provider, key.accountId);
@@ -480,7 +483,7 @@ export class CircuitBreaker {
 			log.warn(
 				`circuit_reopened provider=${entry.provider} account=${entry.accountId} cooldown_ms=${nextCooldownMs} reason=probe_failure`,
 			);
-			return;
+			return true;
 		}
 
 		if (entry.state === "open") {
@@ -507,7 +510,7 @@ export class CircuitBreaker {
 			entry.cooldownEndsAt = now + extendedCooldownMs;
 			entry.openedAt = now;
 			entry.previousCooldownMs = extendedCooldownMs;
-			return;
+			return false;
 		}
 
 		// closed → maybe open
@@ -521,6 +524,7 @@ export class CircuitBreaker {
 				`circuit_open provider=${entry.provider} account=${entry.accountId} failures=${entry.failureCount} kind=${kind}`,
 			);
 		}
+		return true;
 	}
 
 	getState(key: CircuitKey): CircuitState {
@@ -631,8 +635,8 @@ export function recordFailure(
 	key: CircuitKey,
 	kind: FailureKind,
 	now?: number,
-): void {
-	getDefaultCircuitBreaker().recordFailure(key, kind, now);
+): boolean {
+	return getDefaultCircuitBreaker().recordFailure(key, kind, now);
 }
 
 export function getState(key: CircuitKey): CircuitState {

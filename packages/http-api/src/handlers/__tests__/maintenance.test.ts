@@ -25,7 +25,11 @@ function makeConfig(
 }
 
 function makeDbOps(
-	cleanupResult = { removedRequests: 0, removedPayloads: 0 },
+	cleanupResult = {
+		removedRequests: 0,
+		removedPayloads: 0,
+		removedRoutingAttempts: 0,
+	},
 	compactResult = {
 		walBusy: 0,
 		walLog: 0,
@@ -76,14 +80,19 @@ describe("createCleanupHandler", () => {
 			expect(body).not.toHaveProperty("cutoffIso");
 		});
 
-		it("includes removedRequests and removedPayloads", async () => {
-			const dbOps = makeDbOps({ removedRequests: 10, removedPayloads: 5 });
+		it("includes removedRequests, removedPayloads, and removedRoutingAttempts", async () => {
+			const dbOps = makeDbOps({
+				removedRequests: 10,
+				removedPayloads: 5,
+				removedRoutingAttempts: 3,
+			});
 			const handler = createCleanupHandler(dbOps, makeConfig());
 			const response = await handler();
 			const body = (await response.json()) as Record<string, unknown>;
 
 			expect(body.removedRequests).toBe(10);
 			expect(body.removedPayloads).toBe(5);
+			expect(body.removedRoutingAttempts).toBe(3);
 		});
 	});
 
