@@ -476,7 +476,8 @@ async function ensureRoutingAttemptsSchemaPg(
 			physical_attempt INTEGER CHECK (physical_attempt IS NULL OR physical_attempt >= 1),
 			account_benched INTEGER NOT NULL CHECK (account_benched IN (0, 1)),
 			route_suppressed INTEGER NOT NULL CHECK (route_suppressed IN (0, 1)),
-			circuit_counted INTEGER NOT NULL CHECK (circuit_counted IN (0, 1))
+			circuit_counted INTEGER NOT NULL CHECK (circuit_counted IN (0, 1)),
+			upstream_evidence TEXT CHECK (upstream_evidence IS NULL OR length(upstream_evidence) <= 2048)
 		)
 	`);
 	await adapter.unsafe(
@@ -1669,6 +1670,12 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			column: "last_verified_at",
 			definition:
 				"ALTER TABLE cache_flight_recorder_partitions ADD COLUMN last_verified_at BIGINT",
+		},
+		{
+			table: "routing_attempts",
+			column: "upstream_evidence",
+			definition:
+				"ALTER TABLE routing_attempts ADD COLUMN upstream_evidence TEXT CHECK (upstream_evidence IS NULL OR length(upstream_evidence) <= 2048)",
 		},
 	];
 

@@ -519,6 +519,8 @@ describe("materializeProviderAttemptPlan", () => {
 		const sharedAccount = accountFixture();
 		const inputReplayMode: ServerToolReplayAtom[] = ["native-Anthropic"];
 		const outputReplayMode: ServerToolReplayAtom[] = ["proxy-evidence-v1"];
+		const transportAbort = new AbortController();
+		let observedTransportAbort: AbortController | undefined;
 		let provider: Provider;
 		const thisValues: unknown[] = [];
 		provider = baseProvider({
@@ -539,8 +541,14 @@ describe("materializeProviderAttemptPlan", () => {
 				thisValues.push(this);
 				return request;
 			},
-			async processResponse(response) {
+			async processResponse(
+				response,
+				_account,
+				_requestHeaders,
+				responseTransportAbort,
+			) {
 				thisValues.push(this);
+				observedTransportAbort = responseTransportAbort;
 				return response;
 			},
 			parseRateLimit() {
@@ -593,7 +601,12 @@ describe("materializeProviderAttemptPlan", () => {
 		expect(headers.get("x-token")).toBe("token");
 		expect(headers.get("x-api-key")).toBe("key");
 		await plan.transformRequestBody(requestFor());
-		await plan.processResponse(Response.json({ ok: true }), new Headers());
+		await plan.processResponse(
+			Response.json({ ok: true }),
+			new Headers(),
+			transportAbort,
+		);
+		expect(observedTransportAbort).toBe(transportAbort);
 		expect(plan.parseRateLimit(new Response(null, { status: 429 }))).toEqual({
 			isRateLimited: true,
 			remaining: 3,
