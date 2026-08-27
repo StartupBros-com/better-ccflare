@@ -6412,8 +6412,10 @@ export async function proxyWithAccount(
 				}
 				break;
 			} catch (error) {
-				activeAttemptCommitment?.abortIfDeadlineElapsed();
 				const websocketReceipt = getCurrentCodexWebSocketReceipt();
+				if (websocketReceipt?.frameWritten) {
+					activeAttemptCommitment?.abortIfDeadlineElapsed();
+				}
 				if (activeAttemptCommitment?.isPrivateDeadline()) {
 					if (websocketReceipt?.frameWritten) {
 						websocketReceipt.markPostWriteFailure("semantic_stall");
