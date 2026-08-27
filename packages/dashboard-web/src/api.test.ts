@@ -86,6 +86,33 @@ afterEach(() => {
 	api.request = originalRequest;
 });
 
+describe("maintenance dashboard API contracts", () => {
+	it("returns the shared cleanup response including removed routing attempts", async () => {
+		requestMock = mock(async (url: string) => {
+			if (url === "/api/maintenance/cleanup") {
+				return {
+					removedRequests: 4,
+					removedPayloads: 2,
+					removedRoutingAttempts: 7,
+					payloadCutoffIso: "2026-08-23T00:00:00.000Z",
+					requestCutoffIso: "2026-05-28T00:00:00.000Z",
+					dbSizeBytes: 0,
+					tableRowCounts: [],
+				};
+			}
+			return { success: true };
+		});
+		api.request = requestMock as typeof api.request;
+
+		const result = await api.cleanupNow();
+
+		expect(result.removedRoutingAttempts).toBe(7);
+		expect(callFor("/api/maintenance/cleanup")[1]).toMatchObject({
+			method: "POST",
+		});
+	});
+});
+
 describe("managed-routing dashboard API contracts", () => {
 	it("uses durable device-setup contracts and copies only reviewed command fields", async () => {
 		const command = {

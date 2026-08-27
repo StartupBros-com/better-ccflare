@@ -12,6 +12,7 @@ import type {
 	AnalyticsResponse,
 	AnomalyInsightsResponse,
 	CacheInsightsResponse,
+	CleanupResponse,
 	Combo,
 	ComboFamily,
 	ComboFamilyAssignment,
@@ -33,6 +34,8 @@ import type {
 	ModelCatalogResponse,
 	RequestPayload,
 	RequestResponse,
+	RoutingAttemptSummaryResponse,
+	RoutingAttemptSummaryWindow,
 	StatsWithAccounts,
 	UsageHistoryResponse,
 } from "@better-ccflare/types";
@@ -144,6 +147,8 @@ export type {
 	AgentWorkspace,
 	RequestPayload,
 	RequestResponse,
+	RoutingAttemptSummaryResponse,
+	RoutingAttemptSummaryWindow,
 } from "@better-ccflare/types";
 
 // Agent response interface
@@ -2145,36 +2150,16 @@ class API extends HttpClient {
 		}
 	}
 
-	async cleanupNow(): Promise<{
-		removedRequests: number;
-		removedPayloads: number;
-		payloadCutoffIso: string | null;
-		requestCutoffIso: string;
-		dbSizeBytes: number;
-		tableRowCounts: Array<{
-			name: string;
-			rowCount: number;
-			dataBytes?: number;
-		}>;
-	}> {
+	async cleanupNow(): Promise<CleanupResponse> {
 		const startTime = Date.now();
 		const url = "/api/maintenance/cleanup";
 
 		this.logger.debug(`→ POST ${url}`);
 
 		try {
-			const response = await this.post<{
-				removedRequests: number;
-				removedPayloads: number;
-				payloadCutoffIso: string | null;
-				requestCutoffIso: string;
-				dbSizeBytes: number;
-				tableRowCounts: Array<{
-					name: string;
-					rowCount: number;
-					dataBytes?: number;
-				}>;
-			}>(url, undefined, { timeout: 10 * 60 * 1000 });
+			const response = await this.post<CleanupResponse>(url, undefined, {
+				timeout: 10 * 60 * 1000,
+			});
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -2732,6 +2717,26 @@ class API extends HttpClient {
 		this.logger.debug(`→ GET ${url}`);
 		try {
 			const response = await this.get<RoutingObservationsResponse>(url);
+			const duration = Date.now() - startTime;
+			this.logger.debug(`← GET ${url} - 200 (${duration}ms)`);
+			return response;
+		} catch (error) {
+			const duration = Date.now() - startTime;
+			this.logger.error(`✗ GET ${url} - ERROR (${duration}ms)`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			throw error;
+		}
+	}
+
+	async getRoutingAttemptSummary(
+		window: RoutingAttemptSummaryWindow = "24h",
+	): Promise<RoutingAttemptSummaryResponse> {
+		const startTime = Date.now();
+		const url = `/api/routing-attempts/summary?window=${window}`;
+		this.logger.debug(`→ GET ${url}`);
+		try {
+			const response = await this.get<RoutingAttemptSummaryResponse>(url);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← GET ${url} - 200 (${duration}ms)`);
 			return response;

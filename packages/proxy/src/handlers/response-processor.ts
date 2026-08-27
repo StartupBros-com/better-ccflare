@@ -6,7 +6,11 @@ import {
 	parseCodexUsageHeaders,
 	usageCache,
 } from "@better-ccflare/providers";
-import type { Account, RateLimitReason } from "@better-ccflare/types";
+import type {
+	Account,
+	RateLimitReason,
+	RoutingAttemptReason,
+} from "@better-ccflare/types";
 import { circuitKeyFor, recordSuccess } from "../circuit-breaker";
 import { recordCodexUsageSnapshot } from "../codex-usage-history";
 import { drainBody } from "./discard-body-cancel";
@@ -18,6 +22,15 @@ import {
 } from "./rate-limit-cooldown";
 
 const log = new Logger("ResponseProcessor");
+
+/** Immutable post-classification data for request-local routing telemetry. */
+export interface RateLimitObservation {
+	reason: RoutingAttemptReason;
+	status: number;
+	accountBenched: boolean;
+	availableAt: number | null;
+	circuitCounted: boolean;
+}
 
 /**
  * Releases a `response.clone()` tee branch that a provider hook (parseUsage /
@@ -98,8 +111,8 @@ export function handleRateLimitResponse(
 	rateLimitInfo: ReturnType<Provider["parseRateLimit"]>,
 	ctx: ProxyContext,
 	status = 429,
-): void {
-	if (!rateLimitInfo.resetTime) return;
+): boolean {
+	if (!rateLimitInfo.resetTime) return false;
 
 	// Prefer a provider-supplied typed reason (e.g. XaiProvider's
 	// `xai_capacity_402`) over the generic status-derived default so a 402
@@ -109,7 +122,7 @@ export function handleRateLimitResponse(
 		(status === 529
 			? "upstream_529_overloaded_with_reset"
 			: "upstream_429_with_reset");
-	applyRateLimitCooldown(
+	return applyRateLimitCooldown(
 		account,
 		{
 			resetTime: rateLimitInfo.resetTime,
@@ -375,6 +388,7 @@ export async function processProxyResponse(
 	ctx: ProxyContext,
 	requestId?: string,
 	requestMeta?: { headers?: Headers; path?: string },
+	onRateLimit?: (observation: RateLimitObservation) => void | Promise<void>,
 ): Promise<boolean> {
 	let rateLimitInfo = ctx.provider.parseRateLimit(response);
 
@@ -447,54 +461,87 @@ export async function processProxyResponse(
 			log.warn(
 				`Keepalive replay for ${account.name} got ${response.status} — skipping cooldown (synthetic burst, not a real per-account rate limit)`,
 			);
-		} else if (account.provider === "xai") {
-			// Native xAI capacity/rate-limit signal (R5-R10): this is direct
-			// upstream evidence from XaiProvider.parseRateLimit, not an
-			// inferred/derived signal, so it is routed through the
-			// awaited-persist cooldown variant. Selection reads fresh account
-			// state from the DB on every request (no process-local breaker), so
-			// the durable single-row UPDATE must land before this promise
-			// resolves, otherwise a fast follow-up request (e.g. an immediate
-			// next turn in the same conversation) could race ahead of the
-			// write and reselect the same still-cooling-down account.
-			//
-			// Priority order (never relabel a 402 as a 429, `reason` always
-			// carries the provider-supplied classification through):
-			//   1. A direct resetTime from the response itself (Retry-After /
-			//      unified headers), handled above via rateLimitInfo.resetTime.
-			//   2. For a direct 402 (or a provider-classified xai_capacity_402)
-			//      only, a fresh, future cached xAI credits.resets_at from
-			//      usageCache (missing/invalid/stale/past entries are ignored).
-			//      Scoped to 402 because a transient 429 has no billing-window
-			//      semantics: inheriting the cached reset could bench an
-			//      otherwise-healthy account for hours on a short-lived blip.
-			//   3. The bounded no-reset probe cooldown (exponential backoff).
-			const isDirect402 =
-				response.status === 402 || rateLimitInfo.reason === "xai_capacity_402";
-			const cachedResetTime = isDirect402
-				? resolveXaiCachedResetTime(account.id)
-				: null;
-			await applyRateLimitCooldownAwaitingPersist(
-				account,
-				{
-					resetTime: rateLimitInfo.resetTime ?? cachedResetTime ?? undefined,
-					remaining: rateLimitInfo.remaining,
-					reason: rateLimitInfo.reason,
-				},
-				ctx,
-			);
-		} else if (rateLimitInfo.resetTime) {
-			handleRateLimitResponse(account, rateLimitInfo, ctx, response.status);
 		} else {
-			// Mark as rate-limited even without reset time. Route through
-			// applyRateLimitCooldown, which ramps the consecutive counter for
-			// reset-less 429s but applies a fixed overload cooldown for 529s
-			// and leaves the streak untouched there — see rate-limit-cooldown.ts.
-			const reason: RateLimitReason =
-				response.status === 529
-					? "upstream_529_overloaded_no_reset"
-					: "upstream_429_no_reset_probe_cooldown";
-			applyRateLimitCooldown(account, { reason }, ctx);
+			const cooldownBefore = {
+				until: account.rate_limited_until,
+				at: account.rate_limited_at,
+				reason: account.rate_limited_reason,
+			};
+			let reason: RoutingAttemptReason;
+			let circuitCounted = false;
+			if (account.provider === "xai") {
+				// Native xAI capacity/rate-limit signal (R5-R10): this is direct
+				// upstream evidence from XaiProvider.parseRateLimit, not an
+				// inferred/derived signal, so it is routed through the
+				// awaited-persist cooldown variant. Selection reads fresh account
+				// state from the DB on every request (no process-local breaker), so
+				// the durable single-row UPDATE must land before this promise
+				// resolves, otherwise a fast follow-up request could race ahead of
+				// the write and reselect the same still-cooling-down account.
+				const isDirect402 =
+					response.status === 402 ||
+					rateLimitInfo.reason === "xai_capacity_402";
+				const cachedResetTime = isDirect402
+					? resolveXaiCachedResetTime(account.id)
+					: null;
+				reason =
+					rateLimitInfo.reason === "xai_capacity_402" || isDirect402
+						? "xai_capacity_402"
+						: rateLimitInfo.resetTime
+							? "upstream_429_with_reset"
+							: "upstream_429_no_reset_probe_cooldown";
+				await applyRateLimitCooldownAwaitingPersist(
+					account,
+					{
+						resetTime: rateLimitInfo.resetTime ?? cachedResetTime ?? undefined,
+						remaining: rateLimitInfo.remaining,
+						reason: rateLimitInfo.reason,
+					},
+					ctx,
+				);
+			} else if (rateLimitInfo.resetTime) {
+				reason =
+					rateLimitInfo.reason === "upstream_529_overloaded_with_reset" ||
+					response.status === 529
+						? "upstream_529_overloaded_with_reset"
+						: "upstream_429_with_reset";
+				circuitCounted = handleRateLimitResponse(
+					account,
+					rateLimitInfo,
+					ctx,
+					response.status,
+				);
+			} else {
+				// Mark as rate-limited even without reset time. Route through
+				// applyRateLimitCooldown, which ramps the consecutive counter for
+				// reset-less 429s but applies a fixed overload cooldown for 529s
+				// and leaves the streak untouched there — see rate-limit-cooldown.ts.
+				reason =
+					response.status === 529
+						? "upstream_529_overloaded_no_reset"
+						: "upstream_429_no_reset_probe_cooldown";
+				circuitCounted = applyRateLimitCooldown(account, { reason }, ctx);
+			}
+			try {
+				void Promise.resolve(
+					onRateLimit?.({
+						reason,
+						status: response.status,
+						accountBenched:
+							account.rate_limited_until !== cooldownBefore.until ||
+							account.rate_limited_at !== cooldownBefore.at ||
+							account.rate_limited_reason !== cooldownBefore.reason,
+						availableAt: account.rate_limited_until,
+						circuitCounted,
+					}),
+				).catch((error) => {
+					// Observability must never alter rate-limit, terminal, or failover flow.
+					log.warn("Rate-limit observation callback failed:", error);
+				});
+			} catch (error) {
+				// Observability must never alter rate-limit, terminal, or failover flow.
+				log.warn("Rate-limit observation callback failed:", error);
+			}
 		}
 		// Also update metadata for rate-limited responses
 		const bypassSession =

@@ -302,6 +302,7 @@ export interface RetentionSetRequest {
 export interface CleanupResponse {
 	removedRequests: number;
 	removedPayloads: number;
+	removedRoutingAttempts: number;
 	payloadCutoffIso: string | null;
 	requestCutoffIso: string;
 	dbSizeBytes: number;

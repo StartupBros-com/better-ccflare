@@ -361,10 +361,10 @@ export function applyRateLimitCooldown(
 	rateLimitInfo: RateLimitCooldownInput,
 	ctx: ProxyContext,
 	breaker: CircuitBreaker = getDefaultCircuitBreaker(),
-): void {
+): boolean {
 	const { cooldownUntil, reason, isOverload, skipped } =
 		applyRateLimitCooldownInMemory(account, rateLimitInfo);
-	if (skipped) return;
+	if (skipped) return false;
 
 	// Feed the circuit breaker. The exclusion predicate in
 	// `CircuitBreaker.recordFailure` short-circuits model-scoped reasons
@@ -375,7 +375,7 @@ export function applyRateLimitCooldown(
 	// never reach this call (applyRateLimitCooldownInMemory returns
 	// skipped=true and this function already returned), which is what
 	// prevents double-counting when a 529 arrives mid-429-bench.
-	breaker.recordFailure(
+	const circuitCounted = breaker.recordFailure(
 		{ provider: account.provider, accountId: account.id },
 		reason,
 		Date.now(),
@@ -420,7 +420,7 @@ export function applyRateLimitCooldown(
 		log.warn(
 			`[ccflare] account=${account.name} upstream_overloaded reason=${reason} until=${new Date(cooldownUntil).toISOString()} (529 — transient, streak untouched)`,
 		);
-		return;
+		return circuitCounted;
 	}
 
 	const rateLimitError = new RateLimitError(
@@ -429,6 +429,7 @@ export function applyRateLimitCooldown(
 		rateLimitInfo.remaining,
 	);
 	logError(rateLimitError, log);
+	return circuitCounted;
 }
 
 /**

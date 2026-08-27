@@ -5,6 +5,11 @@ import "@better-ccflare/core";
 import { BunSqlAdapter } from "../adapters/bun-sql-adapter";
 import { ensureSchemaPg, runMigrationsPg } from "../migrations-pg";
 import { ComboRepository } from "../repositories/combo.repository";
+import { RequestRepository } from "../repositories/request.repository";
+import {
+	type RoutingAttemptData,
+	RoutingAttemptRepository,
+} from "../repositories/routing-attempt.repository";
 
 const configuredPostgresUrl = process.env.BETTER_CCFLARE_TEST_POSTGRES_URL;
 
@@ -195,7 +200,226 @@ async function expectPolicyConstraints(adapter: BunSqlAdapter): Promise<void> {
 	).rejects.toThrow();
 }
 
+function routingAttempt(
+	id: string,
+	timestamp: number,
+	overrides: Partial<RoutingAttemptData> = {},
+): RoutingAttemptData {
+	return {
+		id,
+		parentRequestId: "recovered",
+		timestamp,
+		provider: "anthropic",
+		accountId: "account-1",
+		attemptedModel: "claude-opus-4",
+		modelFamily: "opus",
+		statusCode: 429,
+		reason: "model_scoped_429",
+		scope: "model",
+		availableAt: null,
+		failoverAttempts: 1,
+		physicalAttempt: 1,
+		accountBenched: false,
+		routeSuppressed: true,
+		circuitCounted: false,
+		...overrides,
+	};
+}
+
+function terminalRequest(
+	id: string,
+	success: boolean,
+): Parameters<RequestRepository["save"]>[0] {
+	return {
+		id,
+		method: "POST",
+		path: "/v1/messages",
+		accountUsed: "account-1",
+		statusCode: success ? 200 : 429,
+		success,
+		errorMessage: success ? null : "terminal error",
+		responseTime: 1,
+		failoverAttempts: 0,
+	};
+}
+
+interface RoutingAttemptIndexRow {
+	name: string;
+	columns: string;
+}
+
+async function routingAttemptIndexes(
+	adapter: BunSqlAdapter,
+): Promise<RoutingAttemptIndexRow[]> {
+	return adapter.query<RoutingAttemptIndexRow>(
+		`SELECT index_class.relname AS name,
+			string_agg(attribute.attname, ',' ORDER BY index_key.ordinality) AS columns
+		 FROM pg_class table_class
+		 JOIN pg_index index_meta ON index_meta.indrelid = table_class.oid
+		 JOIN pg_class index_class ON index_class.oid = index_meta.indexrelid
+		 JOIN LATERAL unnest(index_meta.indkey) WITH ORDINALITY
+			AS index_key(attnum, ordinality) ON TRUE
+		 JOIN pg_attribute attribute
+			ON attribute.attrelid = table_class.oid
+			AND attribute.attnum = index_key.attnum
+		 WHERE table_class.relname = 'routing_attempts'
+			AND index_class.relname LIKE 'idx_routing_attempts_%'
+		 GROUP BY index_class.relname
+		 ORDER BY index_class.relname`,
+	);
+}
+
 describePostgres("managed routing PostgreSQL integration", () => {
+	it("persists append-only routing attempts independently from terminal request history", async () => {
+		await withDisposableDatabase(async (adapter) => {
+			await ensureSchemaPg(adapter);
+			await runMigrationsPg(adapter);
+			await ensureSchemaPg(adapter);
+			await runMigrationsPg(adapter);
+
+			expect(await routingAttemptIndexes(adapter)).toEqual([
+				{
+					name: "idx_routing_attempts_account_timestamp",
+					columns: "account_id,timestamp",
+				},
+				{
+					name: "idx_routing_attempts_parent_timestamp",
+					columns: "parent_request_id,timestamp,id",
+				},
+				{
+					name: "idx_routing_attempts_reason_scope_timestamp",
+					columns: "reason,scope,timestamp",
+				},
+				{
+					name: "idx_routing_attempts_timestamp",
+					columns: "timestamp,id",
+				},
+			]);
+			expect(
+				await adapter.query<{ foreign_key_count: string }>(
+					`SELECT COUNT(*) AS foreign_key_count
+				 FROM pg_constraint constraint_meta
+				 JOIN pg_class table_class ON table_class.oid = constraint_meta.conrelid
+				 WHERE table_class.relname = 'routing_attempts'
+					AND constraint_meta.contype = 'f'`,
+				),
+			).toEqual([{ foreign_key_count: "0" }]);
+
+			const attempts = new RoutingAttemptRepository(adapter);
+			const requests = new RequestRepository(adapter);
+			const summaryNow = 1_724_666_400_000;
+
+			// These writes precede their terminal parent rows; the table deliberately
+			// has no FK because a failover may be recorded before finalization.
+			await attempts.append(routingAttempt("recovered-1", summaryNow));
+			await attempts.append(
+				routingAttempt("recovered-2", summaryNow, {
+					physicalAttempt: 2,
+					reason: "out_of_credits",
+					scope: "family",
+				}),
+			);
+			await attempts.append(
+				routingAttempt("failed-1", summaryNow, {
+					parentRequestId: "failed",
+					reason: "upstream_402_payment_required",
+					scope: "account",
+				}),
+			);
+			await attempts.append(
+				routingAttempt("awaiting-1", summaryNow, {
+					parentRequestId: "awaiting",
+					reason: "windowless_429",
+					scope: "request",
+				}),
+			);
+			await attempts.append(
+				routingAttempt("missing-1", summaryNow, {
+					parentRequestId: "missing",
+				}),
+			);
+			await expect(
+				attempts.append(routingAttempt("recovered-1", summaryNow)),
+			).rejects.toThrow();
+
+			await requests.save(terminalRequest("recovered", true));
+			await requests.save(terminalRequest("failed", false));
+			await requests.save(terminalRequest("awaiting", false));
+			await adapter.run("UPDATE requests SET success = NULL WHERE id = ?", [
+				"awaiting",
+			]);
+
+			expect(await attempts.getSummary("1h", summaryNow)).toEqual({
+				firstObservedAt: "2024-08-26T10:00:00.000Z",
+				totalAttempts: 5,
+				distinctRequests: 4,
+				recoveredRequests: 1,
+				terminalFailureRequests: 1,
+				awaitingTerminalRequests: 2,
+				byReasonScope: [
+					{
+						reason: "model_scoped_429",
+						scope: "model",
+						attemptCount: 2,
+						distinctRequests: 2,
+						recoveredRequests: 1,
+						terminalFailureRequests: 0,
+						awaitingTerminalRequests: 1,
+					},
+					{
+						reason: "out_of_credits",
+						scope: "family",
+						attemptCount: 1,
+						distinctRequests: 1,
+						recoveredRequests: 1,
+						terminalFailureRequests: 0,
+						awaitingTerminalRequests: 0,
+					},
+					{
+						reason: "upstream_402_payment_required",
+						scope: "account",
+						attemptCount: 1,
+						distinctRequests: 1,
+						recoveredRequests: 0,
+						terminalFailureRequests: 1,
+						awaitingTerminalRequests: 0,
+					},
+					{
+						reason: "windowless_429",
+						scope: "request",
+						attemptCount: 1,
+						distinctRequests: 1,
+						recoveredRequests: 0,
+						terminalFailureRequests: 0,
+						awaitingTerminalRequests: 1,
+					},
+				],
+			});
+
+			await attempts.append(
+				routingAttempt("old-orphan", summaryNow - 10_000, {
+					parentRequestId: "deleted-parent",
+				}),
+			);
+			await attempts.append(
+				routingAttempt("recent-orphan", summaryNow - 1_000, {
+					parentRequestId: "recent-missing-parent",
+				}),
+			);
+			expect(await attempts.deleteOlderThan(summaryNow - 5_000)).toBe(1);
+			expect(
+				await adapter.query<{ id: string }>(
+					"SELECT id FROM routing_attempts WHERE id LIKE ? ORDER BY id",
+					["%orphan"],
+				),
+			).toEqual([{ id: "recent-orphan" }]);
+
+			const aggregate = await requests.aggregateStats(24 * 60 * 60 * 1000);
+			expect(aggregate.totalRequests).toBe(3);
+			expect(aggregate.successfulRequests).toBe(1);
+		});
+	});
+
 	it("tracks legacy-mirrored credential shape without secret-rotation churn", async () => {
 		await withDisposableDatabase(async (adapter) => {
 			await ensureSchemaPg(adapter);

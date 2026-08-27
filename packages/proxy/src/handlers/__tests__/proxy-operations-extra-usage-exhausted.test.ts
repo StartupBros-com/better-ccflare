@@ -69,12 +69,13 @@ function makeProxyContextWithAsyncExec(): ProxyContext {
 		(_accountId: string, _until: number, _reason: string) =>
 			Promise.resolve({ consecutiveRateLimits: 1, applied: true }),
 	);
-	const saveRequest = mock((..._args: unknown[]) => Promise.resolve());
+	const saveRoutingAttempt = mock((..._args: unknown[]) => Promise.resolve());
 	return {
 		strategy: { getNextAccount: () => null } as never,
 		dbOps: {
 			markAccountRateLimited,
-			saveRequest,
+			saveRequest: mock((..._args: unknown[]) => Promise.resolve()),
+			saveRoutingAttempt,
 			updateAccountUsage: mock(() => Promise.resolve()),
 			getAdapter: mock(() => ({
 				run: mock(() => Promise.resolve()),
@@ -190,100 +191,74 @@ describe("proxyWithAccount — extra_usage_exhausted (issue #293)", () => {
 		>;
 		expect(markMock.mock.calls.length).toBe(0);
 
-		// saveRequest was called once with reason "extra_usage_exhausted",
-		// status 400, success false, and usage { model: <requested model> }.
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
-		expect(saveMock.mock.calls.length).toBe(1);
-		const args = saveMock.mock.calls[0] as unknown[];
-		// 5th positional arg is the `statusCode` parameter.
-		expect(args[4]).toBe(400);
-		// 6th positional arg is the `success` parameter.
-		expect(args[5]).toBe(false);
-		// 7th positional arg is the `reason` parameter.
-		expect(args[6]).toBe("extra_usage_exhausted");
-		// 10th positional arg is the `usage` parameter.
-		expect(args[9]).toEqual({ model: "claude-sonnet-4-5" });
+		const saveMock = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
+		expect(saveMock).toHaveBeenCalledTimes(1);
+		const attempt = saveMock.mock.calls[0]?.[0];
+		expect(attempt).toMatchObject({
+			parentRequestId: "req-1",
+			provider: "anthropic",
+			accountId: account.id,
+			attemptedModel: "claude-sonnet-4-5",
+			modelFamily: "sonnet",
+			statusCode: 400,
+			reason: "extra_usage_exhausted",
+			scope: "request",
+			availableAt: null,
+			failoverAttempts: 0,
+			physicalAttempt: null,
+			accountBenched: false,
+			routeSuppressed: false,
+			circuitCounted: false,
+		});
+		expect(attempt?.id).toEqual(expect.any(String));
+		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
 	});
 
-	it("passes requestMeta attribution sources and rewritten models through to saveRequest", async () => {
+	it("keeps terminal request persistence separate from an attempt write", async () => {
 		globalThis.fetch = mock(async () => extraUsageExhaustedResponse());
-
 		const ctx = makeProxyContextWithAsyncExec();
 		const account = makeAccount();
-		const bodyBuffer = makeRequestBody("claude-sonnet-4-5");
-		const req = makeRequest(bodyBuffer);
+		const bodyBuffer = makeRequestBody();
 
-		await proxyWithAccount(
-			req,
+		const response = await proxyWithAccount(
+			makeRequest(bodyBuffer),
 			new URL("https://proxy.local/v1/messages"),
 			account,
-			{
-				...makeRequestMeta(),
-				project: "Harness",
-				agentUsed: "reviewer",
-				projectAttributionSource: "header_project",
-				agentAttributionSource: "header_agent",
-				originalModel: "claude-sonnet-4-5",
-				appliedModel: "claude-opus-4-6",
-			},
+			makeRequestMeta(),
 			bodyBuffer,
 			() => undefined,
 			0,
 			ctx,
 		);
 
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
-		expect(saveMock.mock.calls.length).toBe(1);
-		const args = saveMock.mock.calls[0] as unknown[];
-		// Full positional order (0-indexed): id, method, path, accountUsed,
-		// statusCode, success, errorMessage, responseTime, failoverAttempts,
-		// usage, agentUsed, apiKeyId, apiKeyName, project, billingType,
-		// comboName, originalModel, appliedModel, projectAttributionSource,
-		// agentAttributionSource.
-		expect(args[6]).toBe("extra_usage_exhausted");
-		expect(args[10]).toBe("reviewer");
-		expect(args[13]).toBe("Harness");
-		expect(args[16]).toBe("claude-sonnet-4-5");
-		expect(args[17]).toBe("claude-opus-4-6");
-		expect(args[18]).toBe("header_project");
-		expect(args[19]).toBe("header_agent");
+		expect(response?.status).toBe(400);
+		expect(ctx.dbOps.saveRoutingAttempt).toHaveBeenCalledTimes(1);
+		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
 	});
 
-	it("persists null/null originalModel/appliedModel when requestMeta carries an unmodified pair", async () => {
+	it("delivers the retained client error when the async attempt write rejects", async () => {
 		globalThis.fetch = mock(async () => extraUsageExhaustedResponse());
-
 		const ctx = makeProxyContextWithAsyncExec();
-		const account = makeAccount();
-		const bodyBuffer = makeRequestBody("claude-sonnet-4-5");
-		const req = makeRequest(bodyBuffer);
+		ctx.dbOps.saveRoutingAttempt = mock(async () => {
+			throw new Error("attempt database unavailable");
+		});
+		const bodyBuffer = makeRequestBody();
 
-		await proxyWithAccount(
-			req,
+		const response = await proxyWithAccount(
+			makeRequest(bodyBuffer),
 			new URL("https://proxy.local/v1/messages"),
-			account,
-			{
-				...makeRequestMeta(),
-				// Agent-detected but NOT rewritten: original === applied. The
-				// direct extra_usage_exhausted save path must match the other
-				// direct persistence sites and gate through isModelRewrite.
-				originalModel: "claude-sonnet-4-5",
-				appliedModel: "claude-sonnet-4-5",
-				projectAttributionSource: "path_project",
-				agentAttributionSource: "prompt_agent",
-			},
+			makeAccount(),
+			makeRequestMeta(),
 			bodyBuffer,
 			() => undefined,
 			0,
 			ctx,
 		);
 
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
-		expect(saveMock.mock.calls.length).toBe(1);
-		const args = saveMock.mock.calls[0] as unknown[];
-		expect(args[16]).toBeNull();
-		expect(args[17]).toBeNull();
-		expect(args[18]).toBe("path_project");
-		expect(args[19]).toBe("prompt_agent");
+		expect(response?.status).toBe(400);
+		expect(await response?.json()).toMatchObject({ type: "error" });
+		expect(ctx.dbOps.saveRoutingAttempt).toHaveBeenCalledTimes(1);
+		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
 	});
 
 	it("classifies extra usage returned by an in-place 529 recovery through the shared boundary", async () => {

@@ -11,6 +11,7 @@ import {
 	ProviderError,
 	TIME_CONSTANTS,
 } from "@better-ccflare/core";
+import type { RoutingAttemptData } from "@better-ccflare/database";
 import {
 	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
 	withSanitizedProxyHeaders,
@@ -47,7 +48,6 @@ import {
 } from "@better-ccflare/providers/stream-drain";
 import type {
 	Account,
-	RateLimitReason,
 	RequestMeta,
 	ServerToolCapabilityDecision,
 	ServerToolCapabilityTuple,
@@ -130,7 +130,6 @@ import {
 	sessionIdForObservation,
 } from "../session-account-observer";
 import { combineChunks } from "../stream-tee";
-import { isModelRewrite } from "../worker-messages";
 import { getXaiConvId } from "./account-selector";
 import { cancelDiscardedResponseBody } from "./discard-body-cancel";
 import {
@@ -149,7 +148,11 @@ import {
 	recordRequestRateLimitOutcome,
 } from "./rate-limit-scope";
 import { makeProxyRequest, validateProviderPath } from "./request-handler";
-import { handleProxyError, processProxyResponse } from "./response-processor";
+import {
+	handleProxyError,
+	processProxyResponse,
+	type RateLimitObservation,
+} from "./response-processor";
 import { isRetryable429 } from "./retryable-429";
 import type { DeterministicFailureCapabilityKey } from "./routing-attempt-ledger";
 import {
@@ -172,6 +175,60 @@ import {
 } from "./token-manager";
 
 const log = new Logger("ProxyOperations");
+
+type RoutingAttemptWrite = Omit<RoutingAttemptData, "id">;
+
+type CooldownState = Pick<
+	Account,
+	"rate_limited_until" | "rate_limited_at" | "rate_limited_reason"
+>;
+
+function captureCooldownState(account: Account): CooldownState {
+	return {
+		rate_limited_until: account.rate_limited_until,
+		rate_limited_at: account.rate_limited_at,
+		rate_limited_reason: account.rate_limited_reason,
+	};
+}
+
+/** True only if this attempt changed the account's in-memory cooldown state. */
+function appliedCooldown(account: Account, before: CooldownState): boolean {
+	return (
+		account.rate_limited_until !== before.rate_limited_until ||
+		account.rate_limited_at !== before.rate_limited_at ||
+		account.rate_limited_reason !== before.rate_limited_reason
+	);
+}
+
+/**
+ * Best-effort routing-failure telemetry. The immutable snapshot is created at
+ * classification time, before it crosses the asynchronous writer boundary, so
+ * database backpressure or failure can never influence routing or delivery.
+ */
+function enqueueRoutingAttempt(
+	ctx: ProxyContext,
+	attempt: RoutingAttemptWrite,
+): void {
+	const immutableAttempt = Object.freeze({
+		id: crypto.randomUUID(),
+		...attempt,
+	});
+	try {
+		ctx.asyncWriter.enqueue(() => {
+			try {
+				return Promise.resolve(
+					ctx.dbOps.saveRoutingAttempt(immutableAttempt),
+				).catch((error: unknown) => {
+					log.warn("Failed to persist routing attempt:", error);
+				});
+			} catch (error) {
+				log.warn("Failed to enqueue routing attempt write:", error);
+			}
+		});
+	} catch (error) {
+		log.warn("Routing attempt writer rejected enqueue:", error);
+	}
+}
 
 /**
  * Replace an upstream response with the stream released by the Anthropic
@@ -1912,6 +1969,26 @@ class AnthropicPreCommitAttemptScope {
 		return (
 			!this.routingSignal.aborted && this.deadlineController.signal.aborted
 		);
+	}
+
+	/**
+	 * Synchronize a semantic-gate timeout with this transport's live signal.
+	 * The gate and this scope intentionally share an absolute deadline, but two
+	 * same-tick timers can otherwise let the gate reject first and disposal clear
+	 * this scope's timer before it aborts the already-written WebSocket frame.
+	 */
+	abortIfDeadlineElapsed(): void {
+		if (
+			this.deadlineController.signal.aborted ||
+			Date.now() < this.timing.deadlineAt
+		) {
+			return;
+		}
+		if (this.deadlineTimer !== undefined) {
+			clearTimeout(this.deadlineTimer);
+			this.deadlineTimer = undefined;
+		}
+		this.deadlineController.abort(this.deadlineError);
 	}
 
 	/** Promote an irreversible transport write onto the request-wide boundary. */
@@ -4681,17 +4758,20 @@ export async function proxyWithAccount(
 			// mislabeled with this generic reason. Every other provider's 402
 			// handling awaits the same bounded durable cooldown persistence here.
 			if (account.provider === "xai") return null;
-			const reason: RateLimitReason = "upstream_402_payment_required";
+			const reason = "upstream_402_payment_required";
 			const cooldownUntil = extractCooldownUntil(
 				failureResponse,
 				account.id,
 				usageCache.getRateLimitedUntil.bind(usageCache),
 			);
+			const cooldownBefore = captureCooldownState(account);
 			await applyRateLimitCooldownAwaitingPersist(
 				account,
 				{ resetTime: cooldownUntil, reason },
 				ctx,
 			);
+			const accountBenched = appliedCooldown(account, cooldownBefore);
+			const routeSuppressed = routingAttemptLedger !== undefined;
 			routingAttemptLedger?.blockAccount(account.id);
 			recordRequestRateLimitOutcome(req, {
 				accountId: account.id,
@@ -4706,37 +4786,26 @@ export async function proxyWithAccount(
 				`Account ${account.name} returned payment required (402${attemptedModel ? `, model=${attemptedModel}` : ""}) — ` +
 					"applying bounded account probe cooldown and failing over without model fallback",
 			);
-			const responseTime = Date.now() - requestMeta.timestamp;
-			ctx.asyncWriter.enqueue(() =>
-				ctx.dbOps.saveRequest(
-					crypto.randomUUID(),
-					req.method,
-					url.pathname,
-					account.id,
-					402,
-					false,
-					reason,
-					responseTime,
-					failoverAttempts,
-					attemptedModel ? { model: attemptedModel } : undefined,
-					requestMeta.agentUsed ?? undefined,
-					apiKeyId ?? undefined,
-					apiKeyName ?? undefined,
-					requestMeta.project ?? null,
-					undefined,
-					requestMeta.comboName ?? null,
-					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-						? (requestMeta.originalModel ?? null)
+			enqueueRoutingAttempt(ctx, {
+				parentRequestId: requestMeta.id,
+				timestamp: Date.now(),
+				provider: account.provider,
+				accountId: account.id,
+				attemptedModel: attemptedModel,
+				modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
+				statusCode: 402,
+				reason,
+				scope: "account",
+				availableAt: null,
+				failoverAttempts,
+				physicalAttempt:
+					routingAttemptLedger && routingAttemptLedger.physicalAttemptCount > 0
+						? routingAttemptLedger.physicalAttemptCount
 						: null,
-					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-						? (requestMeta.appliedModel ?? null)
-						: null,
-					requestMeta.projectAttributionSource ?? null,
-					requestMeta.agentAttributionSource ?? null,
-					null,
-					requestMeta.clientSessionId ?? null,
-				),
-			);
+				accountBenched,
+				routeSuppressed,
+				circuitCounted: false,
+			});
 			return {
 				scope: "account",
 				attemptedModel,
@@ -4765,42 +4834,31 @@ export async function proxyWithAccount(
 				return null;
 			}
 
-			const reason: RateLimitReason = "extra_usage_exhausted";
+			const reason = "extra_usage_exhausted";
 			log.warn(
 				`Account ${account.name} extra_usage_exhausted (400${attemptedModel ? `, model=${attemptedModel}` : ""}) — ` +
 					"retaining the original response and continuing request-local failover without a global cooldown",
 			);
-			const responseTime = Date.now() - requestMeta.timestamp;
-			ctx.asyncWriter.enqueue(() =>
-				ctx.dbOps.saveRequest(
-					crypto.randomUUID(),
-					req.method,
-					url.pathname,
-					account.id,
-					400,
-					false,
-					reason,
-					responseTime,
-					failoverAttempts,
-					attemptedModel ? { model: attemptedModel } : undefined,
-					requestMeta.agentUsed ?? undefined,
-					apiKeyId ?? undefined,
-					apiKeyName ?? undefined,
-					requestMeta.project ?? null,
-					undefined,
-					requestMeta.comboName ?? null,
-					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-						? (requestMeta.originalModel ?? null)
+			enqueueRoutingAttempt(ctx, {
+				parentRequestId: requestMeta.id,
+				timestamp: Date.now(),
+				provider: account.provider,
+				accountId: account.id,
+				attemptedModel: attemptedModel,
+				modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
+				statusCode: 400,
+				reason,
+				scope: "request",
+				availableAt: null,
+				failoverAttempts,
+				physicalAttempt:
+					routingAttemptLedger && routingAttemptLedger.physicalAttemptCount > 0
+						? routingAttemptLedger.physicalAttemptCount
 						: null,
-					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-						? (requestMeta.appliedModel ?? null)
-						: null,
-					requestMeta.projectAttributionSource ?? null,
-					requestMeta.agentAttributionSource ?? null,
-					null,
-					requestMeta.clientSessionId ?? null,
-				),
-			);
+				accountBenched: false,
+				routeSuppressed: false,
+				circuitCounted: false,
+			});
 
 			if (!routingAttemptLedger) {
 				return {
@@ -4861,44 +4919,34 @@ export async function proxyWithAccount(
 			// out_of_credits, and keepalive traffic — the exact preconditions
 			// upstream's placement required.
 			if (isRetryable429(failureResponse, isClaudeProvider)) {
-				const reason: RateLimitReason = "windowless_429";
+				const reason = "windowless_429";
 				log.warn(
 					`Account ${account.name} returned a windowless 429 (${
 						attemptedModel ? `model=${attemptedModel}, ` : ""
 					}x-should-retry with no rate-limit window) — request-scoped, ` +
 						`NOT benching account; failing over to next account`,
 				);
-				const responseTime = Date.now() - requestMeta.timestamp;
-				ctx.asyncWriter.enqueue(() =>
-					ctx.dbOps.saveRequest(
-						crypto.randomUUID(),
-						req.method,
-						url.pathname,
-						account.id,
-						429,
-						false,
-						reason,
-						responseTime,
-						failoverAttempts,
-						attemptedModel ? { model: attemptedModel } : undefined,
-						requestMeta.agentUsed ?? undefined,
-						apiKeyId ?? undefined,
-						apiKeyName ?? undefined,
-						requestMeta.project ?? null,
-						undefined,
-						requestMeta.comboName ?? null,
-						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-							? (requestMeta.originalModel ?? null)
+				enqueueRoutingAttempt(ctx, {
+					parentRequestId: requestMeta.id,
+					timestamp: Date.now(),
+					provider: account.provider,
+					accountId: account.id,
+					attemptedModel: attemptedModel,
+					modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
+					statusCode: 429,
+					reason,
+					scope: "request",
+					availableAt: null,
+					failoverAttempts,
+					physicalAttempt:
+						routingAttemptLedger &&
+						routingAttemptLedger.physicalAttemptCount > 0
+							? routingAttemptLedger.physicalAttemptCount
 							: null,
-						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-							? (requestMeta.appliedModel ?? null)
-							: null,
-						requestMeta.projectAttributionSource ?? null,
-						requestMeta.agentAttributionSource ?? null,
-						null,
-						requestMeta.clientSessionId ?? null,
-					),
-				);
+					accountBenched: false,
+					routeSuppressed: false,
+					circuitCounted: false,
+				});
 				return {
 					scope: "model",
 					attemptedModel,
@@ -4918,7 +4966,7 @@ export async function proxyWithAccount(
 					account.id,
 					usageCache.getRateLimitedUntil.bind(usageCache),
 				);
-				const auditReason: RateLimitReason = "model_fallback_429";
+				const auditReason = "model_fallback_429";
 				// Read the header directly, never extractCooldownUntil's output: that
 				// collapses header, usage-poller and synthetic values into one number
 				// and cannot tell an instruction from a guess.
@@ -4926,6 +4974,7 @@ export async function proxyWithAccount(
 					decision.accountWindowResetAt,
 					getAnthropicRateLimitResetAt(failureResponse, Date.now()),
 				);
+				const cooldownBefore = captureCooldownState(account);
 				await applyRateLimitCooldownAwaitingPersist(
 					account,
 					{
@@ -4945,6 +4994,8 @@ export async function proxyWithAccount(
 					},
 					ctx,
 				);
+				const accountBenched = appliedCooldown(account, cooldownBefore);
+				const routeSuppressed = routingAttemptLedger !== undefined;
 				routingAttemptLedger?.blockAccount(account.id);
 				recordRequestRateLimitOutcome(req, {
 					accountId: account.id,
@@ -4962,37 +5013,27 @@ export async function proxyWithAccount(
 						`(model=${attemptedModel ?? "unknown"}, family=${decision.family ?? "unknown"}, reason=${decision.reason}) — ` +
 						"benching account and stopping same-account model fallback",
 				);
-				const responseTime = Date.now() - requestMeta.timestamp;
-				ctx.asyncWriter.enqueue(() =>
-					ctx.dbOps.saveRequest(
-						crypto.randomUUID(),
-						req.method,
-						url.pathname,
-						account.id,
-						429,
-						false,
-						auditReason,
-						responseTime,
-						failoverAttempts,
-						attemptedModel ? { model: attemptedModel } : undefined,
-						requestMeta.agentUsed ?? undefined,
-						apiKeyId ?? undefined,
-						apiKeyName ?? undefined,
-						requestMeta.project ?? null,
-						undefined,
-						requestMeta.comboName ?? null,
-						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-							? (requestMeta.originalModel ?? null)
+				enqueueRoutingAttempt(ctx, {
+					parentRequestId: requestMeta.id,
+					timestamp: Date.now(),
+					provider: account.provider,
+					accountId: account.id,
+					attemptedModel: attemptedModel,
+					modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
+					statusCode: 429,
+					reason: auditReason,
+					scope: "account",
+					availableAt: account.rate_limited_until,
+					failoverAttempts,
+					physicalAttempt:
+						routingAttemptLedger &&
+						routingAttemptLedger.physicalAttemptCount > 0
+							? routingAttemptLedger.physicalAttemptCount
 							: null,
-						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-							? (requestMeta.appliedModel ?? null)
-							: null,
-						requestMeta.projectAttributionSource ?? null,
-						requestMeta.agentAttributionSource ?? null,
-						null,
-						requestMeta.clientSessionId ?? null,
-					),
-				);
+					accountBenched,
+					routeSuppressed,
+					circuitCounted: false,
+				});
 				return {
 					scope: "account",
 					attemptedModel,
@@ -5048,43 +5089,32 @@ export async function proxyWithAccount(
 				reason: decision.reason,
 				availableAt,
 			});
-			const reason: RateLimitReason = "model_scoped_429";
+			const reason = "model_scoped_429";
 			log.warn(
 				`Account ${account.name} generic 429 classified ${decision.scope} scoped ` +
 					`(model=${attemptedModel}, family=${decision.family}, evidence_age_ms=${decision.snapshotAgeMs ?? "unknown"}) — ` +
 					"NOT benching account; pruning only the evidenced route scope",
 			);
-			const responseTime = Date.now() - requestMeta.timestamp;
-			ctx.asyncWriter.enqueue(() =>
-				ctx.dbOps.saveRequest(
-					crypto.randomUUID(),
-					req.method,
-					url.pathname,
-					account.id,
-					429,
-					false,
-					reason,
-					responseTime,
-					failoverAttempts,
-					{ model: attemptedModel },
-					requestMeta.agentUsed ?? undefined,
-					apiKeyId ?? undefined,
-					apiKeyName ?? undefined,
-					requestMeta.project ?? null,
-					undefined,
-					requestMeta.comboName ?? null,
-					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-						? (requestMeta.originalModel ?? null)
+			enqueueRoutingAttempt(ctx, {
+				parentRequestId: requestMeta.id,
+				timestamp: Date.now(),
+				provider: account.provider,
+				accountId: account.id,
+				attemptedModel: attemptedModel,
+				modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
+				statusCode: 429,
+				reason,
+				scope: decision.scope,
+				availableAt: availableAt,
+				failoverAttempts,
+				physicalAttempt:
+					routingAttemptLedger && routingAttemptLedger.physicalAttemptCount > 0
+						? routingAttemptLedger.physicalAttemptCount
 						: null,
-					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-						? (requestMeta.appliedModel ?? null)
-						: null,
-					requestMeta.projectAttributionSource ?? null,
-					requestMeta.agentAttributionSource ?? null,
-					null,
-					requestMeta.clientSessionId ?? null,
-				),
-			);
+				accountBenched: false,
+				routeSuppressed: availableAt !== null,
+				circuitCounted: false,
+			});
 			return {
 				scope: decision.scope,
 				attemptedModel,
@@ -5099,7 +5129,9 @@ export async function proxyWithAccount(
 		 * recording its actual expiry keeps the terminal response aligned with the
 		 * state subsequent requests will consult.
 		 */
-		const recordExactModelExhaustion = (attemptedModel: string): void => {
+		const recordExactModelExhaustion = (
+			attemptedModel: string,
+		): number | null => {
 			const betaSignature = req.headers.get("anthropic-beta");
 			usageCache.markModelScopedExhausted(
 				account.id,
@@ -5111,6 +5143,7 @@ export async function proxyWithAccount(
 				attemptedModel,
 				betaSignature,
 			);
+			const availableAt = marker?.expiresAt ?? null;
 			recordRequestRateLimitOutcome(req, {
 				accountId: account.id,
 				status: 429,
@@ -5118,8 +5151,9 @@ export async function proxyWithAccount(
 				family: getModelFamily(attemptedModel),
 				attemptedModel,
 				reason: "out_of_credits",
-				availableAt: marker?.expiresAt ?? null,
+				availableAt,
 			});
+			return availableAt;
 		};
 
 		/**
@@ -5148,43 +5182,34 @@ export async function proxyWithAccount(
 				};
 			}
 
-			const reason: RateLimitReason = "out_of_credits";
-			if (attemptedModel) recordExactModelExhaustion(attemptedModel);
+			const reason = "out_of_credits";
+			const modelAvailableAt = attemptedModel
+				? recordExactModelExhaustion(attemptedModel)
+				: null;
 			log.warn(
 				`Account ${account.name} out_of_credits (429${attemptedModel ? `, model=${attemptedModel}` : ""}) — ` +
 					"model/beta-scoped, NOT benching account; pruning this exact model from request-local routing",
 			);
-			const responseTime = Date.now() - requestMeta.timestamp;
-			ctx.asyncWriter.enqueue(() =>
-				ctx.dbOps.saveRequest(
-					crypto.randomUUID(),
-					req.method,
-					url.pathname,
-					account.id,
-					429,
-					false,
-					reason,
-					responseTime,
-					failoverAttempts,
-					attemptedModel ? { model: attemptedModel } : undefined,
-					requestMeta.agentUsed ?? undefined,
-					apiKeyId ?? undefined,
-					apiKeyName ?? undefined,
-					requestMeta.project ?? null,
-					undefined,
-					requestMeta.comboName ?? null,
-					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-						? (requestMeta.originalModel ?? null)
+			enqueueRoutingAttempt(ctx, {
+				parentRequestId: requestMeta.id,
+				timestamp: Date.now(),
+				provider: account.provider,
+				accountId: account.id,
+				attemptedModel: attemptedModel,
+				modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
+				statusCode: 429,
+				reason,
+				scope: "model",
+				availableAt: modelAvailableAt,
+				failoverAttempts,
+				physicalAttempt:
+					routingAttemptLedger && routingAttemptLedger.physicalAttemptCount > 0
+						? routingAttemptLedger.physicalAttemptCount
 						: null,
-					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-						? (requestMeta.appliedModel ?? null)
-						: null,
-					requestMeta.projectAttributionSource ?? null,
-					requestMeta.agentAttributionSource ?? null,
-					null,
-					requestMeta.clientSessionId ?? null,
-				),
-			);
+				accountBenched: false,
+				routeSuppressed: modelAvailableAt !== null,
+				circuitCounted: false,
+			});
 			return {
 				scope: "model",
 				attemptedModel,
@@ -5351,10 +5376,11 @@ export async function proxyWithAccount(
 						Number.isFinite(codexRateLimitInfo.resetTime) &&
 						codexRateLimitInfo.resetTime > Date.now();
 					if (verifiedCodexReset) {
-						const reason: RateLimitReason = "upstream_429_with_reset";
+						const reason = "upstream_429_with_reset";
 						log.warn(
 							`Account ${account.name} received a verified Codex quota reset — persisting account cooldown before failover`,
 						);
+						const cooldownBefore = captureCooldownState(account);
 						await applyRateLimitCooldownAwaitingPersist(
 							account,
 							{
@@ -5364,44 +5390,33 @@ export async function proxyWithAccount(
 							},
 							ctx,
 						);
+						const accountBenched = appliedCooldown(account, cooldownBefore);
+						const routeSuppressed = routingAttemptLedger !== undefined;
+						const attemptedModel = currentTransportModel ?? requestedModel;
 						routingAttemptLedger?.blockAccount(account.id);
-						const responseTime = Date.now() - requestMeta.timestamp;
-						ctx.asyncWriter.enqueue(() =>
-							ctx.dbOps.saveRequest(
-								crypto.randomUUID(),
-								req.method,
-								url.pathname,
-								account.id,
-								429,
-								false,
-								reason,
-								responseTime,
-								failoverAttempts,
-								requestedModel ? { model: requestedModel } : undefined,
-								requestMeta.agentUsed ?? undefined,
-								apiKeyId ?? undefined,
-								apiKeyName ?? undefined,
-								requestMeta.project ?? null,
-								undefined,
-								requestMeta.comboName ?? null,
-								isModelRewrite(
-									requestMeta.originalModel,
-									requestMeta.appliedModel,
-								)
-									? (requestMeta.originalModel ?? null)
+						enqueueRoutingAttempt(ctx, {
+							parentRequestId: requestMeta.id,
+							timestamp: Date.now(),
+							provider: account.provider,
+							accountId: account.id,
+							attemptedModel,
+							modelFamily: attemptedModel
+								? getModelFamily(attemptedModel)
+								: null,
+							statusCode: 429,
+							reason,
+							scope: "account",
+							availableAt: account.rate_limited_until,
+							failoverAttempts,
+							physicalAttempt:
+								routingAttemptLedger &&
+								routingAttemptLedger.physicalAttemptCount > 0
+									? routingAttemptLedger.physicalAttemptCount
 									: null,
-								isModelRewrite(
-									requestMeta.originalModel,
-									requestMeta.appliedModel,
-								)
-									? (requestMeta.appliedModel ?? null)
-									: null,
-								requestMeta.projectAttributionSource ?? null,
-								requestMeta.agentAttributionSource ?? null,
-								null,
-								requestMeta.clientSessionId ?? null,
-							),
-						);
+							accountBenched,
+							routeSuppressed,
+							circuitCounted: false,
+						});
 						await finalizeCurrentCodexTransport(rawResponse);
 						await discardUpstreamBody(rawResponse);
 						return null;
@@ -5455,50 +5470,40 @@ export async function proxyWithAccount(
 								account.id,
 								usageCache.getRateLimitedUntil.bind(usageCache),
 							);
-							const reason: RateLimitReason = "model_fallback_429";
-							applyRateLimitCooldown(
+							const reason = "model_fallback_429";
+							const cooldownBefore = captureCooldownState(account);
+							const circuitCounted = applyRateLimitCooldown(
 								account,
 								{ resetTime: cooldownUntil, reason },
 								ctx,
 							);
+							const attemptedModel = currentTransportModel ?? requestedModel;
+							const accountBenched = appliedCooldown(account, cooldownBefore);
+							const routeSuppressed = routingAttemptLedger !== undefined;
 							routingAttemptLedger?.blockAccount(account.id);
-							const responseTime = Date.now() - requestMeta.timestamp;
-							ctx.asyncWriter.enqueue(() =>
-								ctx.dbOps.saveRequest(
-									crypto.randomUUID(),
-									req.method,
-									url.pathname,
-									account.id,
-									429,
-									false,
-									reason,
-									responseTime,
-									failoverAttempts,
-									requestedModel ? { model: requestedModel } : undefined,
-									requestMeta.agentUsed ?? undefined,
-									apiKeyId ?? undefined,
-									apiKeyName ?? undefined,
-									requestMeta.project ?? null,
-									undefined,
-									requestMeta.comboName ?? null,
-									isModelRewrite(
-										requestMeta.originalModel,
-										requestMeta.appliedModel,
-									)
-										? (requestMeta.originalModel ?? null)
+							enqueueRoutingAttempt(ctx, {
+								parentRequestId: requestMeta.id,
+								timestamp: Date.now(),
+								provider: account.provider,
+								accountId: account.id,
+								attemptedModel,
+								modelFamily: attemptedModel
+									? getModelFamily(attemptedModel)
+									: null,
+								statusCode: 429,
+								reason,
+								scope: "account",
+								availableAt: account.rate_limited_until,
+								failoverAttempts,
+								physicalAttempt:
+									routingAttemptLedger &&
+									routingAttemptLedger.physicalAttemptCount > 0
+										? routingAttemptLedger.physicalAttemptCount
 										: null,
-									isModelRewrite(
-										requestMeta.originalModel,
-										requestMeta.appliedModel,
-									)
-										? (requestMeta.appliedModel ?? null)
-										: null,
-									requestMeta.projectAttributionSource ?? null,
-									requestMeta.agentAttributionSource ?? null,
-									null,
-									requestMeta.clientSessionId ?? null,
-								),
-							);
+								accountBenched,
+								routeSuppressed,
+								circuitCounted,
+							});
 							await finalizeCurrentCodexTransport(rawResponse);
 							await discardUpstreamBody(rawResponse);
 							return null;
@@ -5930,50 +5935,40 @@ export async function proxyWithAccount(
 								account.id,
 								usageCache.getRateLimitedUntil.bind(usageCache),
 							);
-							const reason: RateLimitReason = "all_models_exhausted_429";
-							applyRateLimitCooldown(
+							const reason = "all_models_exhausted_429";
+							const cooldownBefore = captureCooldownState(account);
+							const circuitCounted = applyRateLimitCooldown(
 								account,
 								{ resetTime: cooldownUntil, reason },
 								ctx,
 							);
+							const attemptedModel = currentTransportModel ?? requestedModel;
+							const accountBenched = appliedCooldown(account, cooldownBefore);
+							const routeSuppressed = routingAttemptLedger !== undefined;
 							routingAttemptLedger?.blockAccount(account.id);
-							const responseTime = Date.now() - requestMeta.timestamp;
-							ctx.asyncWriter.enqueue(() =>
-								ctx.dbOps.saveRequest(
-									crypto.randomUUID(),
-									req.method,
-									url.pathname,
-									account.id,
-									429,
-									false,
-									reason,
-									responseTime,
-									failoverAttempts,
-									requestedModel ? { model: requestedModel } : undefined,
-									requestMeta.agentUsed ?? undefined,
-									apiKeyId ?? undefined,
-									apiKeyName ?? undefined,
-									requestMeta.project ?? null,
-									undefined,
-									requestMeta.comboName ?? null,
-									isModelRewrite(
-										requestMeta.originalModel,
-										requestMeta.appliedModel,
-									)
-										? (requestMeta.originalModel ?? null)
+							enqueueRoutingAttempt(ctx, {
+								parentRequestId: requestMeta.id,
+								timestamp: Date.now(),
+								provider: account.provider,
+								accountId: account.id,
+								attemptedModel,
+								modelFamily: attemptedModel
+									? getModelFamily(attemptedModel)
+									: null,
+								statusCode: 429,
+								reason,
+								scope: "account",
+								availableAt: account.rate_limited_until,
+								failoverAttempts,
+								physicalAttempt:
+									routingAttemptLedger &&
+									routingAttemptLedger.physicalAttemptCount > 0
+										? routingAttemptLedger.physicalAttemptCount
 										: null,
-									isModelRewrite(
-										requestMeta.originalModel,
-										requestMeta.appliedModel,
-									)
-										? (requestMeta.appliedModel ?? null)
-										: null,
-									requestMeta.projectAttributionSource ?? null,
-									requestMeta.agentAttributionSource ?? null,
-									null,
-									requestMeta.clientSessionId ?? null,
-								),
-							);
+								accountBenched,
+								routeSuppressed,
+								circuitCounted,
+							});
 						}
 					}
 					await finalizeCurrentCodexTransport(rawResponse);
@@ -6417,6 +6412,7 @@ export async function proxyWithAccount(
 				}
 				break;
 			} catch (error) {
+				activeAttemptCommitment?.abortIfDeadlineElapsed();
 				const websocketReceipt = getCurrentCodexWebSocketReceipt();
 				if (activeAttemptCommitment?.isPrivateDeadline()) {
 					if (websocketReceipt?.frameWritten) {
@@ -6815,12 +6811,16 @@ export async function proxyWithAccount(
 		const responseForRateLimitCheck = shouldPreserveTerminalRateLimitResponse
 			? await boundResponseBodyForClassification(response.clone())
 			: response;
+		let rateLimitObservation: RateLimitObservation | null = null;
 		const isRateLimited = await processProxyResponse(
 			responseForRateLimitCheck,
 			account,
 			attemptProxyContext(),
 			requestMeta.id,
 			requestMeta,
+			(observation) => {
+				rateLimitObservation = observation;
+			},
 		);
 		if (responseForRateLimitCheck !== response) {
 			// The rate-limit check ran on a clone whose header-only use is done.
@@ -6830,6 +6830,35 @@ export async function proxyWithAccount(
 			cancelDiscardedResponseBody(responseForRateLimitCheck);
 		}
 		if (isRateLimited) {
+			// Every raw-response writer above returns before this point. This is the
+			// sole telemetry path for response-processor classifications, so its
+			// observation can be emitted exactly once regardless of terminal,
+			// retained, or ordinary failover disposition.
+			const enqueueObservedRateLimitAttempt = (routeSuppressed: boolean) => {
+				if (!rateLimitObservation) return;
+				const attemptedModel = currentTransportModel ?? null;
+				enqueueRoutingAttempt(ctx, {
+					parentRequestId: requestMeta.id,
+					timestamp: Date.now(),
+					provider: account.provider,
+					accountId: account.id,
+					attemptedModel,
+					modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
+					statusCode: rateLimitObservation.status,
+					reason: rateLimitObservation.reason,
+					scope: "account",
+					availableAt: rateLimitObservation.availableAt,
+					failoverAttempts,
+					physicalAttempt:
+						routingAttemptLedger &&
+						routingAttemptLedger.physicalAttemptCount > 0
+							? routingAttemptLedger.physicalAttemptCount
+							: null,
+					accountBenched: rateLimitObservation.accountBenched,
+					routeSuppressed,
+					circuitCounted: rateLimitObservation.circuitCounted,
+				});
+			};
 			const comboNameAtAttempt = requestMeta.comboName ?? null;
 			const forwardTerminalRateLimitResponse = (
 				terminalResponse: Response,
@@ -6880,6 +6909,7 @@ export async function proxyWithAccount(
 					attemptProxyContext(),
 				);
 			if (hostedDispatchCommitted()) {
+				enqueueObservedRateLimitAttempt(false);
 				// The first hosted provider response is authoritative for this inbound
 				// request. Preserve it exactly; converting it into an account miss would
 				// invite model/account/guard replay after an irreversible execution.
@@ -6889,6 +6919,7 @@ export async function proxyWithAccount(
 				);
 			}
 			if (wasProtectedLifecycleForLatestResponse()) {
+				enqueueObservedRateLimitAttempt(false);
 				return await forwardTerminalRateLimitResponse(
 					response.status === 529
 						? createProtectedAnthropicOverloadResponse({
@@ -6900,9 +6931,13 @@ export async function proxyWithAccount(
 					failoverAttempts,
 				);
 			}
-			if (req.headers.get("x-better-ccflare-keepalive") !== "true") {
-				routingAttemptLedger?.blockAccount(account.id);
+			const routeSuppressed =
+				req.headers.get("x-better-ccflare-keepalive") !== "true" &&
+				routingAttemptLedger !== undefined;
+			if (routeSuppressed) {
+				routingAttemptLedger.blockAccount(account.id);
 			}
+			enqueueObservedRateLimitAttempt(routeSuppressed);
 			if (returnRateLimitedResponseOnExhaustion && isTerminalRateLimitStatus) {
 				log.warn(
 					`Account ${account.name} returned final ${response.status} rate-limit/capacity response, forwarding upstream response instead of pool_exhausted`,

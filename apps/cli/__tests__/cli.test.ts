@@ -683,6 +683,15 @@ describe("CLI Integration Tests", () => {
 		});
 	});
 
+	describe("Clear history", () => {
+		it("reports removed routing attempts in the packaged CLI renderer", async () => {
+			const result = await runCLI(["--clear-history"]);
+
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain("routing attempts");
+		});
+	});
+
 	describe("Argument Parsing", () => {
 		it("should parse port number correctly", async () => {
 			const result = await runCLI(["--help", "--port", "8081"]);

@@ -103,6 +103,7 @@ function makeProxyContext(): ProxyContext {
 		dbOps: {
 			markAccountRateLimited: mock(() => Promise.resolve(1)),
 			saveRequest: mock(() => Promise.resolve()),
+			saveRoutingAttempt: mock(() => Promise.resolve()),
 			updateAccountUsage: mock(() => Promise.resolve()),
 			getAdapter: mock(() => ({
 				run: mock(() => Promise.resolve()),
@@ -241,6 +242,20 @@ function makeReceipt(
 		},
 	};
 	return receipt;
+}
+
+async function waitForCondition(
+	condition: () => boolean,
+	timeoutMs = 1_000,
+): Promise<void> {
+	const deadlineAt = Date.now() + timeoutMs;
+	while (!condition()) {
+		const remainingMs = deadlineAt - Date.now();
+		if (remainingMs <= 0) {
+			throw new Error(`condition did not become true within ${timeoutMs}ms`);
+		}
+		await Bun.sleep(Math.min(10, remainingMs));
+	}
 }
 
 function installUsageCollector(): void {
@@ -2056,6 +2071,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(httpCalls).toBe(0);
 		expect(postWriteMarks).toBe(1);
 		expect(receipt.stickyHttp).toBe(true);
+		await waitForCondition(() => webSocketSignal?.aborted === true);
 		expect(webSocketSignal?.aborted).toBe(true);
 		expect(upstreamCancels).toBe(0);
 		expect(progressEventsSent).toBeGreaterThanOrEqual(2);
@@ -2672,6 +2688,21 @@ describe("proxyWithAccount: verified Codex 429 recovery provenance", () => {
 		);
 		expect(account.rate_limited_until).toBeGreaterThan(Date.now());
 		expect(account.rate_limited_reason).toBe("upstream_429_with_reset");
+		expect(ctx.dbOps.saveRoutingAttempt).toHaveBeenCalledWith(
+			expect.objectContaining({
+				parentRequestId: "codex-verified-reset",
+				accountId: account.id,
+				attemptedModel: "gpt-5.4",
+				modelFamily: null,
+				statusCode: 429,
+				reason: "upstream_429_with_reset",
+				scope: "account",
+				accountBenched: true,
+				routeSuppressed: false,
+				circuitCounted: false,
+			}),
+		);
+		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
 		expect(persistedAccount.rate_limited_until).toBeGreaterThan(Date.now());
 
 		const terminal = createRoutingTerminalResponse({

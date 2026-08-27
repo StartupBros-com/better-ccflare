@@ -1273,6 +1273,7 @@ async function main() {
 		disableApiKey,
 		enableApiKey,
 		forceResetRateLimit,
+		formatClearRequestHistoryResult,
 		formatApiKeyForDisplay,
 		formatApiKeyGenerationResult,
 		formatRebuildWindowsReport,
@@ -1565,7 +1566,7 @@ async function main() {
 		const cliConfig = container.resolve<Config>(SERVICE_KEYS.Config);
 		const result = await clearRequestHistory(dbOps, cliConfig);
 		console.log(
-			`✅ Request history cleared successfully (${result.removedPayloads} payloads, ${result.removedRequests} requests removed)`,
+			`✅ Request history cleared successfully (${formatClearRequestHistoryResult(result)})`,
 		);
 		await exitGracefully(0);
 	}

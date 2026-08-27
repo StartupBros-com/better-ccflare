@@ -8,6 +8,7 @@ import type {
 	ComboSlotUpdateInput,
 	DeviceSetupJobStatus,
 	DeviceSetupJobView,
+	RoutingAttemptSummaryWindow,
 } from "@better-ccflare/types";
 import { COMMON_MODELS } from "@better-ccflare/types";
 import {
@@ -385,6 +386,19 @@ export const useRoutingObservations = () => {
 	return useQuery({
 		queryKey: queryKeys.routingObservations(),
 		queryFn: () => api.getRoutingObservations(),
+		staleTime: 20_000,
+		refetchInterval: 60_000,
+		refetchIntervalInBackground: false,
+		gcTime: 5 * 60 * 1_000,
+	});
+};
+
+export const useRoutingAttemptSummary = (
+	window: RoutingAttemptSummaryWindow = "24h",
+) => {
+	return useQuery({
+		queryKey: queryKeys.routingAttemptSummary(window),
+		queryFn: () => api.getRoutingAttemptSummary(window),
 		staleTime: 20_000,
 		refetchInterval: 60_000,
 		refetchIntervalInBackground: false,

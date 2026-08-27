@@ -95,12 +95,13 @@ function makeProxyContextWithAsyncExec(): ProxyContext {
 		(_accountId: string, _until: number, _reason: string) =>
 			Promise.resolve({ consecutiveRateLimits: 1, applied: true }),
 	);
-	const saveRequest = mock((..._args: unknown[]) => Promise.resolve());
+	const saveRoutingAttempt = mock((..._args: unknown[]) => Promise.resolve());
 	return {
 		strategy: { getNextAccount: () => null } as never,
 		dbOps: {
 			markAccountRateLimited,
-			saveRequest,
+			saveRequest: mock((..._args: unknown[]) => Promise.resolve()),
+			saveRoutingAttempt,
 			updateAccountUsage: mock(() => Promise.resolve()),
 			updateAccountRateLimitMeta: mock(() => Promise.resolve()),
 			getAdapter: mock(() => ({
@@ -227,15 +228,15 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 		>;
 		expect(markMock.mock.calls.length).toBe(0);
 
-		// saveRequest was called once with reason "out_of_credits" and
+		// saveRoutingAttempt was called once with reason "out_of_credits" and
 		// usage { model: <requested model> }.
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		const saveMock = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
 		expect(saveMock.mock.calls.length).toBe(1);
 		const args = saveMock.mock.calls[0] as unknown[];
 		// 7th positional arg is the `reason` parameter.
-		expect(args[6]).toBe("out_of_credits");
+		expect(args[0]?.reason).toBe("out_of_credits");
 		// 10th positional arg is the `usage` parameter.
-		expect(args[9]).toEqual({ model: "claude-sonnet-4-5" });
+		expect(args[0]?.attemptedModel).toBe("claude-sonnet-4-5");
 	});
 
 	it("keeps fallback-model out_of_credits scoped instead of benching the account", async () => {
@@ -287,11 +288,11 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 			typeof mock
 		>;
 		expect(markMock.mock.calls.length).toBe(0);
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		const saveMock = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
 		expect(saveMock.mock.calls.length).toBe(1);
 		const args = saveMock.mock.calls[0] as unknown[];
-		expect(args[6]).toBe("out_of_credits");
-		expect(args[9]).toEqual({ model: "claude-opus-4-8" });
+		expect(args[0]?.reason).toBe("out_of_credits");
+		expect(args[0]?.attemptedModel).toBe("claude-opus-4-8");
 		const marker = usageCache.getModelScopedExhaustion(
 			account.id,
 			"claude-opus-4-8",
@@ -343,7 +344,7 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 		expect(account.rate_limited_until).toBeNull();
 
 		// keepalive path skips the audit row and does not create routing evidence.
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		const saveMock = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
 		expect(saveMock.mock.calls.length).toBe(0);
 		expect(
 			usageCache.getModelScopedExhaustion(
@@ -387,7 +388,7 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 				null,
 			),
 		).not.toBeNull();
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		const saveMock = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
 		expect(saveMock.mock.calls.length).toBe(1);
 	});
 
@@ -444,7 +445,7 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 			{
 				...makeRequestMeta(),
 				// Agent-detected but NOT rewritten: original === applied. Before the
-				// fix, the three direct 429 saveRequest call sites persisted this
+				// fix, the three direct 429 saveRoutingAttempt call sites persisted this
 				// equal pair unconditionally, bypassing isModelRewrite and
 				// corrupting observability.
 				originalModel: "claude-sonnet-4-5",
@@ -456,12 +457,13 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 			ctx,
 		);
 
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		const saveMock = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
 		expect(saveMock.mock.calls.length).toBe(1);
 		const args = saveMock.mock.calls[0] as unknown[];
 		// 17th/18th positional args are originalModel/appliedModel.
-		expect(args[16]).toBeNull();
-		expect(args[17]).toBeNull();
+		expect(args[0]?.parentRequestId).toBe("req-1");
+		expect(args[0]?.accountBenched).toBe(false);
+		expect(args[0]?.routeSuppressed).toBe(true);
 	});
 });
 
@@ -683,9 +685,9 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 				attemptedModel: "claude-fable-5",
 			}),
 		]);
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
-		expect(saveMock.mock.calls[0]?.[6]).toBe("model_scoped_429");
-		expect(saveMock.mock.calls[0]?.[9]).toEqual({ model: "claude-fable-5" });
+		const saveMock = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
+		expect(saveMock.mock.calls[0]?.[0]?.reason).toBe("model_scoped_429");
+		expect(saveMock.mock.calls[0]?.[0]?.attemptedModel).toBe("claude-fable-5");
 	});
 
 	it("isolates the exact inactive-account-window live fixture to Fable", async () => {
@@ -803,9 +805,9 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 				availableAt: INCIDENT_NOW + 120_000,
 			}),
 		]);
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
-		expect(saveMock.mock.calls[0]?.[6]).toBe("model_scoped_429");
-		expect(saveMock.mock.calls[0]?.[9]).toEqual({ model: "claude-fable-5" });
+		const saveMock = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
+		expect(saveMock.mock.calls[0]?.[0]?.reason).toBe("model_scoped_429");
+		expect(saveMock.mock.calls[0]?.[0]?.attemptedModel).toBe("claude-fable-5");
 	});
 
 	it("cancels the discarded body for a model-scoped no-fallback 429", async () => {
@@ -1140,11 +1142,11 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 			family: "fable",
 			attemptedModel: "claude-fable-5-20260701",
 		});
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
-		expect(saveMock.mock.calls[0]?.[6]).toBe("model_scoped_429");
-		expect(saveMock.mock.calls[0]?.[9]).toEqual({
-			model: "claude-fable-5-20260701",
-		});
+		const saveMock = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
+		expect(saveMock.mock.calls[0]?.[0]?.reason).toBe("model_scoped_429");
+		expect(saveMock.mock.calls[0]?.[0]?.attemptedModel).toBe(
+			"claude-fable-5-20260701",
+		);
 	});
 
 	it("a concrete success clears only the matching exact beta and family", async () => {
@@ -1274,7 +1276,7 @@ describe("proxyWithAccount — durable account cooldown ordering", () => {
 			cooldownStarted.resolve();
 			return cooldownPersist.promise;
 		});
-		ctx.dbOps.saveRequest = mock(() => auditPersist.promise);
+		ctx.dbOps.saveRoutingAttempt = mock(() => auditPersist.promise);
 		const paymentRequired = observableErrorResponse(402);
 		globalThis.fetch = mock(async () => paymentRequired.response);
 		const account = makeAccount();
@@ -1299,11 +1301,11 @@ describe("proxyWithAccount — durable account cooldown ordering", () => {
 		await cooldownStarted.promise;
 		await Promise.resolve();
 		expect(operationSettled).toBe(false);
-		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
+		expect(ctx.dbOps.saveRoutingAttempt).not.toHaveBeenCalled();
 
 		cooldownPersist.resolve(1);
 		await expect(operation).resolves.toBeNull();
-		expect(ctx.dbOps.saveRequest).toHaveBeenCalledTimes(1);
+		expect(ctx.dbOps.saveRoutingAttempt).toHaveBeenCalledTimes(1);
 		let auditSettled = false;
 		void auditPersist.promise.then(() => {
 			auditSettled = true;
@@ -1324,7 +1326,7 @@ describe("proxyWithAccount — durable account cooldown ordering", () => {
 			cooldownStarted.resolve();
 			return cooldownPersist.promise;
 		});
-		ctx.dbOps.saveRequest = mock(() => auditPersist.promise);
+		ctx.dbOps.saveRoutingAttempt = mock(() => auditPersist.promise);
 		const hardAccount429 = observableErrorResponse(429, {
 			"anthropic-ratelimit-unified-status": "rate_limited",
 			"retry-after": "120",
@@ -1352,11 +1354,11 @@ describe("proxyWithAccount — durable account cooldown ordering", () => {
 		await cooldownStarted.promise;
 		await Promise.resolve();
 		expect(operationSettled).toBe(false);
-		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
+		expect(ctx.dbOps.saveRoutingAttempt).not.toHaveBeenCalled();
 
 		cooldownPersist.resolve(1);
 		await expect(operation).resolves.toBeNull();
-		expect(ctx.dbOps.saveRequest).toHaveBeenCalledTimes(1);
+		expect(ctx.dbOps.saveRoutingAttempt).toHaveBeenCalledTimes(1);
 		let auditSettled = false;
 		void auditPersist.promise.then(() => {
 			auditSettled = true;
@@ -1455,9 +1457,15 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 				availableAt: INCIDENT_NOW + 120_000,
 			}),
 		]);
-		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		const saveMock = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
 		expect(saveMock).toHaveBeenCalledTimes(1);
-		expect(saveMock.mock.calls[0]?.[6]).toBe("model_fallback_429");
+		expect(saveMock.mock.calls[0]?.[0]).toMatchObject({
+			reason: "model_fallback_429",
+			scope: "account",
+			accountBenched: true,
+			routeSuppressed: true,
+			circuitCounted: false,
+		});
 		expect(routingAttemptLedger.claim(account.id, "claude-opus-4-8")).toBe(
 			false,
 		);
@@ -1899,10 +1907,10 @@ describe("proxyWithAccount — scoped failures returned by a 529 retry", () => {
 				reason: "out_of_credits",
 			}),
 		]);
-		const exactSave = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		const exactSave = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
 		expect(exactSave).toHaveBeenCalledTimes(1);
-		expect(exactSave.mock.calls[0]?.[6]).toBe("out_of_credits");
-		expect(exactSave.mock.calls[0]?.[9]).toEqual({ model: "claude-fable-5" });
+		expect(exactSave.mock.calls[0]?.[0]?.reason).toBe("out_of_credits");
+		expect(exactSave.mock.calls[0]?.[0]?.attemptedModel).toBe("claude-fable-5");
 	});
 
 	it("keeps 529 -> fresh positive family evidence scoped and leaves Opus eligible", async () => {
@@ -1956,10 +1964,12 @@ describe("proxyWithAccount — scoped failures returned by a 529 retry", () => {
 				attemptedModel: "claude-fable-5",
 			}),
 		]);
-		const familySave = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		const familySave = ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>;
 		expect(familySave).toHaveBeenCalledTimes(1);
-		expect(familySave.mock.calls[0]?.[6]).toBe("model_scoped_429");
-		expect(familySave.mock.calls[0]?.[9]).toEqual({ model: "claude-fable-5" });
+		expect(familySave.mock.calls[0]?.[0]?.reason).toBe("model_scoped_429");
+		expect(familySave.mock.calls[0]?.[0]?.attemptedModel).toBe(
+			"claude-fable-5",
+		);
 	});
 
 	it("keeps stale usage model-scoped but explicit hard signals account-scoped after a 529", async () => {

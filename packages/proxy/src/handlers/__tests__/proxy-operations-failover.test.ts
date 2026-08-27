@@ -40,6 +40,20 @@ import type { ProxyContext } from "../proxy-types";
 // real chunked-drain behaviour (rather than delegating to the actual
 // module) so every other discard site funnelled through this same helper
 // elsewhere in this file keeps working identically.
+async function waitForCondition(
+	predicate: () => boolean,
+	description: string,
+	timeoutMs = 1_000,
+): Promise<void> {
+	const deadlineAt = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadlineAt) {
+			throw new Error(`Timed out waiting for ${description}`);
+		}
+		await Bun.sleep(1);
+	}
+}
+
 const discardedResponses: Response[] = [];
 async function drainBody(body: ReadableStream<Uint8Array>): Promise<void> {
 	const reader = body.getReader();
@@ -186,6 +200,7 @@ function makeProxyContext(): ProxyContext {
 					Promise.resolve({ consecutiveRateLimits: 1, applied: true }),
 			),
 			saveRequest: mock((..._args: unknown[]) => Promise.resolve()),
+			saveRoutingAttempt: mock((..._args: unknown[]) => Promise.resolve()),
 			updateAccountUsage: mock(() => Promise.resolve()),
 			getAdapter: mock(() => ({
 				run: mock(() => Promise.resolve()),
@@ -2284,7 +2299,7 @@ describe("proxyWithAccount — rate limit audit trail (issue #178)", () => {
 	});
 });
 
-describe("proxyWithAccount — attribution source pass-through to saveRequest (P2)", () => {
+describe("proxyWithAccount — routing attempt writers", () => {
 	let originalFetch: typeof globalThis.fetch;
 
 	beforeEach(() => {
@@ -2295,196 +2310,87 @@ describe("proxyWithAccount — attribution source pass-through to saveRequest (P
 		globalThis.fetch = originalFetch;
 	});
 
-	it("passes requestMeta.projectAttributionSource/agentAttributionSource through to saveRequest at positions 18/19 on the model_fallback_429 failover path", async () => {
+	it("records a no-fallback 429 as an account-suppressed model_fallback attempt", async () => {
 		globalThis.fetch = mock(async () =>
-			jsonResponse(
-				{
-					error: {
-						type: "api_error",
-						message:
-							"Rate limit exceeded: limit_rpm/qwen/qwen3.6-plus:free/abc",
-					},
-				},
-				429,
-			),
+			jsonResponse({ error: { message: "rate limited" } }, 429),
 		);
-
 		const ctx = makeProxyContextWithAsyncExec();
 		const bodyBuffer = makeRequestBody();
-		const req = makeRequest(bodyBuffer);
+		const ledger = new RoutingAttemptLedger();
 
-		await proxyWithAccount(
-			req,
-			new URL("https://proxy.local/v1/messages"),
-			makeAccount(), // no model_fallbacks -> model_fallback_429 path
-			makeRequestMeta({
-				projectAttributionSource: "header_project",
-				agentAttributionSource: "header_agent",
-			}),
-			bodyBuffer,
-			() => undefined,
-			0,
-			ctx,
-		);
+		expect(
+			await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				makeAccount(),
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				3,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				ledger,
+			),
+		).toBeNull();
 
-		const saveRequestMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
-		expect(saveRequestMock.mock.calls.length).toBeGreaterThan(0);
-		const args = saveRequestMock.mock.calls[0] as unknown[];
-		// Full positional order (0-indexed): id, method, path, accountUsed,
-		// statusCode, success, errorMessage, responseTime, failoverAttempts,
-		// usage, agentUsed, apiKeyId, apiKeyName, project, billingType,
-		// comboName, originalModel, appliedModel, projectAttributionSource,
-		// agentAttributionSource.
-		expect(args[18]).toBe("header_project");
-		expect(args[19]).toBe("header_agent");
+		const attempt = (ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>)
+			.mock.calls[0]?.[0];
+		expect(attempt).toMatchObject({
+			parentRequestId: "req-1",
+			attemptedModel: "qwen/qwen3.6-plus:free",
+			modelFamily: null,
+			statusCode: 429,
+			reason: "model_fallback_429",
+			scope: "account",
+			failoverAttempts: 3,
+			physicalAttempt: 1,
+			accountBenched: true,
+			routeSuppressed: true,
+			circuitCounted: false,
+		});
+		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
 	});
 
-	it("passes null attribution sources through to saveRequest when requestMeta omits them", async () => {
+	it("records all exhausted mapped models separately from terminal request persistence", async () => {
 		globalThis.fetch = mock(async () =>
-			jsonResponse(
-				{
-					error: {
-						type: "api_error",
-						message: "Rate limit exceeded: limit_rpm/model/abc",
-					},
-				},
-				429,
-			),
+			jsonResponse({ error: { message: "rate limited" } }, 429),
 		);
-
 		const ctx = makeProxyContextWithAsyncExec();
 		const bodyBuffer = makeRequestBody();
-		const req = makeRequest(bodyBuffer);
-
 		await proxyWithAccount(
-			req,
+			makeRequest(bodyBuffer),
 			new URL("https://proxy.local/v1/messages"),
 			makeAccount({
 				model_mappings: JSON.stringify({
-					sonnet: [
-						"qwen/qwen3.6-plus:free",
-						"bytedance-seed/dola-seed-2.0-pro:free",
-					],
+					sonnet: ["qwen/qwen3.6-plus:free", "fallback-model"],
 				}),
 			}),
-			makeRequestMeta(), // no attribution source overrides
+			makeRequestMeta(),
 			bodyBuffer,
 			() => undefined,
 			0,
 			ctx,
 		);
-
-		const saveRequestMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
-		const reasons = saveRequestMock.mock.calls.map(
-			(args: unknown[]) => args[6] as string,
-		);
-		expect(reasons).toContain("all_models_exhausted_429");
-		const call = saveRequestMock.mock.calls.find(
-			(args: unknown[]) => args[6] === "all_models_exhausted_429",
-		) as unknown[];
-		expect(call[18]).toBeNull();
-		expect(call[19]).toBeNull();
-	});
-});
-
-describe("proxyWithAccount — originalModel/appliedModel gated by isModelRewrite on direct 429 saveRequest paths (P2)", () => {
-	let originalFetch: typeof globalThis.fetch;
-
-	beforeEach(() => {
-		originalFetch = globalThis.fetch;
-	});
-
-	afterEach(() => {
-		globalThis.fetch = originalFetch;
-	});
-
-	it("persists null/null (not the equal pair) on the model_fallback_429 path when requestMeta carries an unmodified originalModel/appliedModel pair", async () => {
-		globalThis.fetch = mock(async () =>
-			jsonResponse(
-				{
-					error: {
-						type: "api_error",
-						message:
-							"Rate limit exceeded: limit_rpm/qwen/qwen3.6-plus:free/abc",
-					},
-				},
-				429,
-			),
-		);
-
-		const ctx = makeProxyContextWithAsyncExec();
-		const bodyBuffer = makeRequestBody();
-		const req = makeRequest(bodyBuffer);
-
-		await proxyWithAccount(
-			req,
-			new URL("https://proxy.local/v1/messages"),
-			makeAccount(), // no model_fallbacks -> model_fallback_429 path
-			makeRequestMeta({
-				// Agent-detected but NOT rewritten: original === applied. Before the
-				// fix this bypassed isModelRewrite and persisted the equal pair,
-				// making an untouched request look like a real rewrite.
-				originalModel: "claude-sonnet-4-5",
-				appliedModel: "claude-sonnet-4-5",
+		const attempts = (
+			ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>
+		).mock.calls.map((call) => call[0]);
+		expect(attempts).toContainEqual(
+			expect.objectContaining({
+				attemptedModel: "fallback-model",
+				modelFamily: null,
+				reason: "all_models_exhausted_429",
+				scope: "account",
+				accountBenched: true,
+				routeSuppressed: false,
+				circuitCounted: true,
 			}),
-			bodyBuffer,
-			() => undefined,
-			0,
-			ctx,
 		);
-
-		const saveRequestMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
-		expect(saveRequestMock.mock.calls.length).toBeGreaterThan(0);
-		const args = saveRequestMock.mock.calls[0] as unknown[];
-		expect(args[16]).toBeNull();
-		expect(args[17]).toBeNull();
-	});
-
-	it("still persists a genuine originalModel/appliedModel rewrite pair on the all_models_exhausted_429 path", async () => {
-		globalThis.fetch = mock(async () =>
-			jsonResponse(
-				{
-					error: {
-						type: "api_error",
-						message: "Rate limit exceeded: limit_rpm/model/abc",
-					},
-				},
-				429,
-			),
-		);
-
-		const ctx = makeProxyContextWithAsyncExec();
-		const bodyBuffer = makeRequestBody();
-		const req = makeRequest(bodyBuffer);
-
-		await proxyWithAccount(
-			req,
-			new URL("https://proxy.local/v1/messages"),
-			makeAccount({
-				model_mappings: JSON.stringify({
-					sonnet: [
-						"qwen/qwen3.6-plus:free",
-						"bytedance-seed/dola-seed-2.0-pro:free",
-					],
-				}),
-			}),
-			makeRequestMeta({
-				originalModel: "claude-sonnet-4-5",
-				appliedModel: "qwen/qwen3.6-plus:free",
-			}),
-			bodyBuffer,
-			() => undefined,
-			0,
-			ctx,
-		);
-
-		const saveRequestMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
-		const call = saveRequestMock.mock.calls.find(
-			(args: unknown[]) => args[6] === "all_models_exhausted_429",
-		) as unknown[];
-		expect(call).toBeDefined();
-		expect(call[16]).toBe("claude-sonnet-4-5");
-		expect(call[17]).toBe("qwen/qwen3.6-plus:free");
+		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
 	});
 });
 
@@ -3461,9 +3367,15 @@ describe("proxyWithAccount: Codex 529 rate-limited failover does not hang on aba
 		expect(outcome).not.toBe(TIMEOUT);
 		expect(outcome).toBeNull();
 
-		// Give the transform's background processEvents() task a tick to
-		// observe the exact fetch transport abort and run its own cleanup.
-		await Bun.sleep(20);
+		// `processEvents()` releases this asynchronously after proxyWithAccount
+		// resolves. Wait for the observable cleanup instead of assuming a scheduler
+		// tick has run, while retaining the exact-one transport ownership assertion.
+		await waitForCondition(
+			() =>
+				upstream.getTransportAbortCalls() === 1 &&
+				upstream.getReleaseLockCalls() > 0,
+			"the abandoned transport to abort and release its reader",
+		);
 		expect(upstream.getTransportAbortCalls()).toBe(1);
 		expect(upstream.getCancelCalls()).toBe(0);
 		expect(upstream.getReleaseLockCalls()).toBeGreaterThan(0);
@@ -3984,7 +3896,8 @@ describe("proxyWithAccount - native xAI capacity failover (R5-R10, AE3/AE4a)", (
 
 		const bodyBuffer = makeRequestBody();
 		const req = makeRequest(bodyBuffer);
-		const ctx = makeProxyContext();
+		const ctx = makeProxyContextWithAsyncExec();
+		const ledger = new RoutingAttemptLedger();
 
 		const result = await proxyWithAccount(
 			req,
@@ -3995,10 +3908,15 @@ describe("proxyWithAccount - native xAI capacity failover (R5-R10, AE3/AE4a)", (
 			() => undefined,
 			0,
 			ctx,
-			// modelOverride, apiKeyId, apiKeyName, requestBodyContext,
-			// returnRateLimitedResponseOnExhaustion left at defaults: this is a
-			// MIDDLE candidate (not the final one), matching AE3's "candidate two
-			// serves the request" setup.
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			ledger,
+			// This is a middle candidate: the request-local ledger retains the
+			// original terminal while later candidates continue.
 		);
 
 		expect(result).toBeNull();
@@ -4010,6 +3928,20 @@ describe("proxyWithAccount - native xAI capacity failover (R5-R10, AE3/AE4a)", (
 		expect(markMock).toHaveBeenCalled();
 		const [, , reason] = markMock.mock.calls[0];
 		expect(reason).toBe("xai_capacity_402");
+		const attempts = (
+			ctx.dbOps.saveRoutingAttempt as ReturnType<typeof mock>
+		).mock.calls.map((call) => call[0]);
+		expect(attempts).toEqual([
+			expect.objectContaining({
+				statusCode: 402,
+				reason: "xai_capacity_402",
+				scope: "account",
+				physicalAttempt: 1,
+				accountBenched: true,
+				routeSuppressed: true,
+				circuitCounted: false,
+			}),
+		]);
 	});
 
 	it("middle-candidate xAI 429 also fails over and persists the standard reason (never relabeled as xai_capacity_402)", async () => {

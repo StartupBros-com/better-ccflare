@@ -115,17 +115,39 @@ describe("cooldown chokepoint — breaker fed from applyRateLimitCooldown", () =
 		// to 5). We assert "counts toward opening" by checking the failure
 		// count rose by exactly one and the circuit stays closed.
 		expect(breaker.getState(KEY)).toBe("closed");
-		applyRateLimitCooldown(
-			accountFor(),
-			{ reason: OVERLOAD_529 },
-			ctx,
-			breaker,
-		);
+		expect(
+			applyRateLimitCooldown(
+				accountFor(),
+				{ reason: OVERLOAD_529 },
+				ctx,
+				breaker,
+			),
+		).toBe(true);
 		expect(breaker.getState(KEY)).toBe("closed");
 
 		const snap = breaker.snapshot().find((s) => s.accountId === KEY.accountId);
 		expect(snap).toBeDefined();
 		expect(snap?.failureCount).toBe(1);
+	});
+
+	it("reports disabled and enabled breaker outcomes exactly", () => {
+		const ctx = makeContext();
+		expect(
+			applyRateLimitCooldown(
+				accountFor(),
+				{ reason: OVERLOAD_529 },
+				ctx,
+				new CircuitBreaker({ enabled: false }),
+			),
+		).toBe(false);
+		expect(
+			applyRateLimitCooldown(
+				accountFor(),
+				{ reason: OVERLOAD_529 },
+				ctx,
+				new CircuitBreaker(),
+			),
+		).toBe(true);
 	});
 
 	it("test 2: a model_fallback_429 through applyRateLimitCooldown does NOT open the circuit", () => {
@@ -164,7 +186,9 @@ describe("cooldown chokepoint — breaker fed from applyRateLimitCooldown", () =
 		account.rate_limited_reason = "upstream_429_with_reset";
 		account.rate_limited_at = T0 - 1000;
 
-		applyRateLimitCooldown(account, { reason: OVERLOAD_529 }, ctx, breaker);
+		expect(
+			applyRateLimitCooldown(account, { reason: OVERLOAD_529 }, ctx, breaker),
+		).toBe(false);
 
 		// The forward guard must have returned BEFORE recordFailure ran —
 		// the breaker should not have any entry for this account.

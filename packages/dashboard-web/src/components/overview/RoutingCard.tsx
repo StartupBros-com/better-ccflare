@@ -1,6 +1,8 @@
 import { StrategyName } from "@better-ccflare/core";
+import type { RoutingAttemptSummaryResponse } from "@better-ccflare/types";
 import {
 	useModelCapacityRouting,
+	useRoutingAttemptSummary,
 	useSetModelCapacityRouting,
 	useSetStrategy,
 	useStrategy,
@@ -72,6 +74,10 @@ export function getStrategySelectItems(
 	];
 }
 
+export type RoutingAttemptSummaryViewState =
+	| { status: "loading" | "error" }
+	| { status: "success"; data: RoutingAttemptSummaryResponse };
+
 export interface RoutingCardViewProps {
 	strategy: string;
 	onStrategyChange: (strategy: string) => void;
@@ -81,6 +87,7 @@ export interface RoutingCardViewProps {
 	capacitySource: "env" | "file" | "default";
 	onCapacityChange: (mode: "off" | "exhausted") => void;
 	capacityDisabled: boolean;
+	routingAttempts?: RoutingAttemptSummaryViewState;
 }
 
 /**
@@ -97,6 +104,7 @@ export function RoutingCardView({
 	capacitySource,
 	onCapacityChange,
 	capacityDisabled,
+	routingAttempts = { status: "loading" },
 }: RoutingCardViewProps) {
 	const strategyEnvLocked = strategySource === "env";
 	const capacityEnvLocked = capacitySource === "env";
@@ -197,6 +205,80 @@ export function RoutingCardView({
 							}
 						/>
 					</div>
+
+					<section
+						className="space-y-2 border-t pt-4"
+						aria-labelledby="routing-attempt-summary-heading"
+					>
+						<div className="space-y-1">
+							<h4
+								id="routing-attempt-summary-heading"
+								className="text-sm font-medium"
+							>
+								Routing attempts (last 24 hours)
+							</h4>
+							<p className="text-xs text-muted-foreground">
+								These are upstream routing events, not terminal client failures.
+								Telemetry is post-deployment only; historical routing attempts
+								were not backfilled.
+							</p>
+						</div>
+						{routingAttempts.status === "loading" && (
+							<p className="text-sm text-muted-foreground" role="status">
+								Loading routing-attempt summary…
+							</p>
+						)}
+						{routingAttempts.status === "error" && (
+							<p className="text-sm text-muted-foreground" role="alert">
+								Routing-attempt summary is unavailable.
+							</p>
+						)}
+						{routingAttempts.status === "success" &&
+							(routingAttempts.data.totalAttempts === 0 ? (
+								<p className="text-sm text-muted-foreground">
+									No upstream routing attempts in this window.
+								</p>
+							) : (
+								<div className="space-y-2 text-sm">
+									<p>
+										{routingAttempts.data.totalAttempts} attempts across{" "}
+										{routingAttempts.data.distinctRequests} logical requests
+									</p>
+									<p className="text-muted-foreground">
+										{routingAttempts.data.recoveredRequests} recovered;{" "}
+										{routingAttempts.data.terminalFailureRequests} terminal
+										failure; {routingAttempts.data.awaitingTerminalRequests}{" "}
+										awaiting terminal
+									</p>
+									{routingAttempts.data.firstObservedAt && (
+										<p className="text-muted-foreground">
+											First observed{" "}
+											<time dateTime={routingAttempts.data.firstObservedAt}>
+												{new Date(
+													routingAttempts.data.firstObservedAt,
+												).toLocaleString()}
+											</time>
+										</p>
+									)}
+									<ul
+										className="space-y-1"
+										aria-label="Routing attempt reason and scope outcomes"
+									>
+										{routingAttempts.data.byReasonScope.map((row) => (
+											<li key={`${row.reason}:${row.scope}`}>
+												<span className="font-medium">
+													{row.reason} · {row.scope}
+												</span>{" "}
+												{row.attemptCount} attempts; {row.recoveredRequests}{" "}
+												recovered; {row.terminalFailureRequests} terminal
+												failure; {row.awaitingTerminalRequests} awaiting
+												terminal
+											</li>
+										))}
+									</ul>
+								</div>
+							))}
+					</section>
 				</div>
 			</CardContent>
 		</Card>
@@ -209,6 +291,13 @@ export function RoutingCard() {
 	const { data: capacity, isLoading: capacityLoading } =
 		useModelCapacityRouting();
 	const setCapacity = useSetModelCapacityRouting();
+	const routingAttempts = useRoutingAttemptSummary("24h");
+	const routingAttemptsView: RoutingAttemptSummaryViewState =
+		routingAttempts.isError
+			? { status: "error" }
+			: routingAttempts.data
+				? { status: "success", data: routingAttempts.data }
+				: { status: "loading" };
 
 	return (
 		<RoutingCardView
@@ -220,6 +309,7 @@ export function RoutingCard() {
 			capacitySource={capacity?.source ?? "default"}
 			onCapacityChange={(mode) => setCapacity.mutate(mode)}
 			capacityDisabled={capacityLoading || setCapacity.isPending}
+			routingAttempts={routingAttemptsView}
 		/>
 	);
 }

@@ -48,14 +48,20 @@ function insertRequest(
 // through the real RequestRepository methods (via BunSqlAdapter).
 // We import just the request repository to avoid pulling in the full DI stack.
 import { RequestRepository } from "../repositories/request.repository";
+import { RoutingAttemptRepository } from "../repositories/routing-attempt.repository";
 
 async function runCleanup(
 	db: Database,
 	payloadRetentionMs: number,
 	requestRetentionMs?: number,
-): Promise<{ removedRequests: number; removedPayloads: number }> {
+): Promise<{
+	removedRequests: number;
+	removedPayloads: number;
+	removedRoutingAttempts: number;
+}> {
 	const adapter = new BunSqlAdapter(db);
 	const repo = new RequestRepository(adapter);
+	const routingAttempts = new RoutingAttemptRepository(adapter);
 
 	const now = Date.now();
 
@@ -67,17 +73,21 @@ async function runCleanup(
 
 	// Pass 2 — request metadata
 	let removedRequests = 0;
+	let removedRoutingAttempts = 0;
 	if (
 		typeof requestRetentionMs === "number" &&
 		Number.isFinite(requestRetentionMs)
 	) {
 		const requestCutoff = now - requestRetentionMs;
 		removedRequests = await repo.deleteOlderThan(requestCutoff);
+		removedRoutingAttempts =
+			await routingAttempts.deleteOlderThan(requestCutoff);
 	}
 
 	return {
 		removedRequests,
 		removedPayloads: removedPayloadsByAge + removedOrphans,
+		removedRoutingAttempts,
 	};
 }
 
@@ -108,6 +118,45 @@ describe("cleanupOldRequests", () => {
 		it("does NOT return a top-level { count } field", async () => {
 			const result = await runCleanup(db, 7 * 24 * 60 * 60 * 1000);
 			expect(result).not.toHaveProperty("count");
+		});
+
+		it("adds removedRoutingAttempts without changing request or payload counts", async () => {
+			const old = Date.now() - 95 * 24 * 60 * 60 * 1000;
+			db.prepare(`INSERT INTO routing_attempts (
+				id, parent_request_id, timestamp, provider, account_id, attempted_model,
+				model_family, status_code, reason, scope, available_at,
+				failover_attempts, physical_attempt, account_benched, route_suppressed,
+				circuit_counted
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+				"old-attempt",
+				"missing-parent",
+				old,
+				"anthropic",
+				"account",
+				"claude-opus-4",
+				"opus",
+				429,
+				"model_scoped_429",
+				"model",
+				null,
+				0,
+				null,
+				0,
+				1,
+				0,
+			);
+
+			const result = await runCleanup(
+				db,
+				7 * 24 * 60 * 60 * 1000,
+				90 * 24 * 60 * 60 * 1000,
+			);
+
+			expect(result).toEqual({
+				removedRequests: 0,
+				removedPayloads: 0,
+				removedRoutingAttempts: 1,
+			});
 		});
 	});
 

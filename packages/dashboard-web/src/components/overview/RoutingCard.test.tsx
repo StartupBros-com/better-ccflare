@@ -5,6 +5,7 @@
  * See LICENSE.md in the project root for license terms.
  */
 import { describe, expect, it } from "bun:test";
+import type { RoutingAttemptSummaryResponse } from "@better-ccflare/types";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
 	getStrategySelectItems,
@@ -12,6 +13,41 @@ import {
 	type RoutingCardViewProps,
 	type StrategySelectItem,
 } from "./RoutingCard";
+
+const emptySummary: RoutingAttemptSummaryResponse = {
+	window: "24h",
+	generatedAt: "2026-08-26T12:00:00.000Z",
+	windowStart: "2026-08-25T12:00:00.000Z",
+	windowEnd: "2026-08-26T12:00:00.000Z",
+	firstObservedAt: null,
+	totalAttempts: 0,
+	distinctRequests: 0,
+	recoveredRequests: 0,
+	terminalFailureRequests: 0,
+	awaitingTerminalRequests: 0,
+	byReasonScope: [],
+};
+
+const populatedSummary: RoutingAttemptSummaryResponse = {
+	...emptySummary,
+	firstObservedAt: "2026-08-25T10:00:00.000Z",
+	totalAttempts: 4,
+	distinctRequests: 3,
+	recoveredRequests: 1,
+	terminalFailureRequests: 1,
+	awaitingTerminalRequests: 1,
+	byReasonScope: [
+		{
+			reason: "model_scoped_429",
+			scope: "model",
+			attemptCount: 4,
+			distinctRequests: 3,
+			recoveredRequests: 1,
+			terminalFailureRequests: 1,
+			awaitingTerminalRequests: 1,
+		},
+	],
+};
 
 function render(overrides: Partial<RoutingCardViewProps> = {}): string {
 	const props: RoutingCardViewProps = {
@@ -129,6 +165,49 @@ describe("RoutingCardView", () => {
 	it("does not throw when the effective strategy is not listed", () => {
 		const html = render({ strategy: "least-used" });
 		expect(html).toContain('role="combobox"');
+	});
+
+	describe("routing-attempt aggregate section", () => {
+		it("renders a loading state that distinguishes upstream routing events from terminal client failures", () => {
+			const html = render({ routingAttempts: { status: "loading" } });
+			expect(html).toContain("Routing attempts (last 24 hours)");
+			expect(html).toContain("post-deployment only");
+			expect(html).toContain("not backfilled");
+			expect(html).toContain("Loading routing-attempt summary");
+			expect(html).toContain(
+				"upstream routing events, not terminal client failures",
+			);
+		});
+
+		it("renders an empty state without a chart, identifier drilldown, or observed timestamp", () => {
+			const html = render({
+				routingAttempts: { status: "success", data: emptySummary },
+			});
+			expect(html).toContain("No upstream routing attempts in this window.");
+			expect(html).not.toContain("First observed");
+			expect(html).not.toContain("accountId");
+			expect(html).not.toContain("chart");
+		});
+
+		it("renders a text-labelled populated aggregate with reason and scope rows", () => {
+			const html = render({
+				routingAttempts: { status: "success", data: populatedSummary },
+			});
+			expect(html).toContain("4 attempts across 3 logical requests");
+			expect(html).toContain("First observed");
+			expect(html).toContain('dateTime="2026-08-25T10:00:00.000Z"');
+			expect(html).toContain("1 recovered");
+			expect(html).toContain("1 terminal failure");
+			expect(html).toContain("model_scoped_429 · model");
+			expect(html).toContain(
+				"4 attempts; 1 recovered; 1 terminal failure; 1 awaiting terminal",
+			);
+		});
+
+		it("renders an inline error state", () => {
+			const html = render({ routingAttempts: { status: "error" } });
+			expect(html).toContain("Routing-attempt summary is unavailable.");
+		});
 	});
 });
 
