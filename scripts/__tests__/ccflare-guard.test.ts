@@ -84,7 +84,10 @@ async function allocatePort() {
 	return address.port;
 }
 
-async function startProductionNodeGuard(upstreamBase: string) {
+async function startProductionNodeGuard(
+	upstreamBase: string,
+	extraEnv: Record<string, string> = {},
+) {
 	const listenPort = await allocatePort();
 	const guardPath = fileURLToPath(
 		new URL("../ccflare-guard.mjs", import.meta.url),
@@ -101,6 +104,7 @@ async function startProductionNodeGuard(upstreamBase: string) {
 			GUARD_MAX_WAIT_MS: "2000",
 			GUARD_RETRY_ATTEMPT_HEADROOM_MS: "10",
 			GUARD_RETRY_JITTER_MS: "0",
+			...extraEnv,
 		},
 		stdio: ["ignore", "pipe", "pipe"],
 		windowsHide: true,
@@ -141,6 +145,26 @@ async function startProductionNodeGuard(upstreamBase: string) {
 		child,
 		waitForEvent,
 	};
+}
+
+async function waitForChildExit(
+	child: ChildProcess,
+	timeoutMs = 2_000,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+	return Promise.race([
+		new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+			(resolve) => {
+				if (child.exitCode !== null || child.signalCode !== null) {
+					resolve({ code: child.exitCode, signal: child.signalCode });
+					return;
+				}
+				child.once("exit", (code, signal) => resolve({ code, signal }));
+			},
+		),
+		Bun.sleep(timeoutMs).then(() => {
+			throw new Error("guard subprocess did not exit in time");
+		}),
+	]);
 }
 
 async function listen(server: Server) {
@@ -2867,6 +2891,58 @@ describe("source-controlled guard", () => {
 		await waitFor(() => guard.state.recoveryWaits.current === 0);
 		expect(guard.state.counters.recoveryWaitReleased).toBe(1);
 	});
+
+	test("propagates natural and forced drain outcomes through the real guard process", async () => {
+		const natural = await startProductionNodeGuard("http://127.0.0.1:1", {
+			GUARD_SHUTDOWN_GRACE_MS: "100",
+		});
+		expect(natural.child.kill("SIGTERM")).toBe(true);
+		expect(await natural.waitForEvent("guard_shutdown_terminal")).toMatchObject({
+			outcome: "natural",
+			exitStatus: 0,
+		});
+		expect(await waitForChildExit(natural.child)).toEqual({
+			code: 0,
+			signal: null,
+		});
+
+		let enteredResolve: (() => void) | undefined;
+		let releaseResolve: (() => void) | undefined;
+		const entered = new Promise<void>((resolve) => {
+			enteredResolve = resolve;
+		});
+		const release = new Promise<void>((resolve) => {
+			releaseResolve = resolve;
+		});
+		const upstreamBase = await listen(
+			http.createServer(async (_req, res) => {
+				enteredResolve?.();
+				await release;
+				if (!res.destroyed) res.end("released");
+			}),
+		);
+		const forced = await startProductionNodeGuard(upstreamBase, {
+			GUARD_SHUTDOWN_GRACE_MS: "20",
+		});
+		const request = fetch(`${forced.baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "complete",
+		}).catch((error) => error);
+		try {
+			await entered;
+			expect(forced.child.kill("SIGTERM")).toBe(true);
+			expect(
+				await forced.waitForEvent("guard_shutdown_terminal"),
+			).toMatchObject({ outcome: "forced", exitStatus: 70 });
+			expect(await waitForChildExit(forced.child)).toEqual({
+				code: 70,
+				signal: null,
+			});
+		} finally {
+			releaseResolve?.();
+			await request;
+		}
+	}, 10_000);
 
 	test("reports one natural terminal shutdown outcome and remains idempotent", async () => {
 		const events: Array<Record<string, unknown>> = [];

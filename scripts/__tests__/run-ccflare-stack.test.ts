@@ -474,6 +474,7 @@ describe("run-ccflare-stack RSS containment behavior", () => {
 		for (const env of [
 			{ RUNNER_RSS_THRESHOLD_BYTES: "10240" },
 			rssPolicy({ RUNNER_RSS_CONSECUTIVE_SAMPLES: "bad" }),
+			rssPolicy({ RUNNER_RSS_MAX_RECYCLES: "0" }),
 		]) {
 			const runner = await spawnRunner(programs, env);
 			const result = await waitForExit(runner.child);
