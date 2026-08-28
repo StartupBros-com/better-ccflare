@@ -20,6 +20,8 @@ import type { ProxyContext } from "../proxy-types";
 import { getRequestRateLimitOutcomes } from "../rate-limit-scope";
 
 const NOW = 1_800_000_000_000;
+const FABLE = "claude-fable-5";
+const AUTHORIZED_AGENT_ID = "proxy-operations-402-route-intent";
 
 function makeAccount(id: string, overrides: Partial<Account> = {}): Account {
 	return {
@@ -89,6 +91,17 @@ function makeRequest(body = makeBody()): Request {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body,
+	});
+}
+
+function makeAuthorizedRequest(): Request {
+	return new Request("https://proxy.local/v1/messages", {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			"x-better-ccflare-agent-id": AUTHORIZED_AGENT_ID,
+		},
+		body: makeBody(FABLE),
 	});
 }
 
@@ -205,6 +218,9 @@ function makeContext(
 		dbOps: {
 			getAllAccounts,
 			getActiveComboForFamily,
+			getAgentPreference: mock(async (agentId: string) =>
+				agentId === AUTHORIZED_AGENT_ID ? { model: "claude-opus-4-8" } : null,
+			),
 			markAccountRateLimited,
 			saveRequest,
 			saveRoutingAttempt,
@@ -730,7 +746,7 @@ describe("raw upstream HTTP 402 routing", () => {
 			callCount++;
 			return callCount === 1 ? first.response : second.response;
 		}) as unknown as typeof fetch;
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 
 		const response = await handleProxy(
 			request,
@@ -832,7 +848,7 @@ describe("U5 canary: AE4 model-scoped Fast failure advances to standard GLM", ()
 			// Second attempt (standard GLM) succeeds
 			return successResponse(model);
 		}) as unknown as typeof fetch;
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 
 		const response = await handleProxy(
 			request,
@@ -868,7 +884,7 @@ describe("U5 canary: AE4 model-scoped Fast failure advances to standard GLM", ()
 			}
 			return successResponse(model);
 		}) as unknown as typeof fetch;
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 
 		const response = await handleProxy(
 			request,
@@ -898,7 +914,7 @@ describe("U5 canary: AE5 account-wide 402 ends the account attempt without tryin
 			attemptedModels.push(body.model ?? "missing");
 			return upstream.response;
 		}) as unknown as typeof fetch;
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 
 		const response = await handleProxy(
 			request,
@@ -962,7 +978,7 @@ describe("U5 canary: AE5 account-wide 402 ends the account attempt without tryin
 			// Preferred account succeeds
 			return successResponse(model);
 		}) as unknown as typeof fetch;
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 
 		const response = await handleProxy(
 			request,
@@ -1012,7 +1028,7 @@ describe("U5 canary: AE6 billed canary result is recorded as evidence only, not 
 				},
 			);
 		}) as unknown as typeof fetch;
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 
 		const response = await handleProxy(
 			request,
@@ -1057,7 +1073,7 @@ describe("U5 canary: AE6 billed canary result is recorded as evidence only, not 
 				},
 			);
 		}) as unknown as typeof fetch;
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 
 		const response = await handleProxy(
 			request,

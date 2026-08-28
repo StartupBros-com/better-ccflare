@@ -311,7 +311,11 @@ describe("selectAccountsForRequest — model-scoped capacity routing", () => {
 			}),
 		});
 		cacheUsage(fallbackAccount.id, weeklyScoped("Fable"));
-		const fallbackMeta = makeRequestMeta();
+		const fallbackMeta = makeRequestMeta({
+			agentUsed: "capacity-routing-test-agent",
+			originalModel: "claude-sonnet-4-5",
+			appliedModel: "claude-fable-5",
+		});
 
 		const fallbackResult = await selectAccountsForRequest(
 			fallbackMeta,

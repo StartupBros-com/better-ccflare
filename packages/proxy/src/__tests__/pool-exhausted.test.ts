@@ -27,6 +27,11 @@ const { handleProxy } = await import("../proxy");
 const originalFetch = globalThis.fetch;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+// A real persisted agent-preference rewrite (mocked dbOps.getAgentPreference
+// resolved for this id, paired with the x-better-ccflare-agent-id header on
+// the request) authorizes traffic to a Codex/provider-default account as
+// deliberate routing intent, distinct from ordinary stock-model traffic.
+const CODEX_ROUTED_AGENT_ID = "pool-exhausted-codex-routed-agent";
 const MEANINGFUL_PROGRESS_ENV =
 	"CCFLARE_ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS";
 const RESCUE_ACTIVATION_ENV =
@@ -177,10 +182,10 @@ function makeContext(
 	};
 }
 
-function makeRequest(): Request {
+function makeRequest(extraHeaders: Record<string, string> = {}): Request {
 	return new Request("https://proxy.local/v1/messages", {
 		method: "POST",
-		headers: { "Content-Type": "application/json" },
+		headers: { "Content-Type": "application/json", ...extraHeaders },
 		body: JSON.stringify({
 			model: "claude-sonnet-4-5",
 			messages: [{ role: "user", content: "hello" }],
@@ -295,6 +300,13 @@ describe("routing terminal — 503 response", () => {
 		ctx.dbOps.getAllAccounts = mock(async () =>
 			upstreamReturned ? [{ ...staleRow }] : [account],
 		) as never;
+		// This test's subject — Codex-specific rate-limit-header parsing and
+		// cooldown-persistence recovery — genuinely requires a Codex account, so
+		// a real persisted agent-preference rewrite (not ordinary stock traffic)
+		// authorizes it past the ordinary-pool model-integrity fence.
+		ctx.dbOps.getAgentPreference = mock(async (agentId: string) =>
+			agentId === CODEX_ROUTED_AGENT_ID ? { model: "gpt-5.4-codex" } : null,
+		) as never;
 		ctx.dbOps.markAccountRateLimited =
 			failureMode === "reject"
 				? (mock(async () => {
@@ -319,7 +331,9 @@ describe("routing terminal — 503 response", () => {
 		}) as unknown as typeof fetch;
 
 		const responseStartedAt = performance.now();
-		const request = makeRequest();
+		const request = makeRequest({
+			"x-better-ccflare-agent-id": CODEX_ROUTED_AGENT_ID,
+		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const elapsed = performance.now() - responseStartedAt;
 
@@ -579,15 +593,23 @@ describe("routing terminal — 503 response", () => {
 	});
 
 	it("includes account info in response when accounts are paused/rate-limited", async () => {
+		// Natively-serving provider: this test's subject is the terminal's
+		// paused/rate-limited account inventory, not managed-routing model
+		// mapping, so the accounts must pass the ordinary stock-model integrity
+		// fence (a Codex account with model_mappings: null would resolve as a
+		// provider-default rewrite and disappear from the inventory entirely,
+		// rather than surfacing as paused/rate-limited).
 		const pausedAccount = makeAccount({
 			id: "acc-paused",
 			name: "paused-account",
+			provider: "anthropic",
 			paused: true,
 			pause_reason: "manual",
 		});
 		const rateLimitedAccount = makeAccount({
 			id: "acc-rl",
 			name: "rate-limited-account",
+			provider: "anthropic",
 			rate_limited_until: Date.now() + 60_000,
 			rate_limited_reason: "upstream_429_with_reset",
 		});
@@ -612,10 +634,13 @@ describe("routing terminal — 503 response", () => {
 	});
 
 	it("includes next_available_at ISO timestamp when rate-limited accounts exist", async () => {
+		// Natively-serving provider: see the "includes account info" test above —
+		// this test's subject is next_available_at surfacing, not model mapping.
 		const cooldownUntil = Date.now() + 3_600_000; // 1 hour from now
 		const rateLimitedAccount = makeAccount({
 			id: "acc-rl",
 			name: "rate-limited-account",
+			provider: "anthropic",
 			rate_limited_until: cooldownUntil,
 			rate_limited_reason: "upstream_429_with_reset",
 		});
@@ -638,11 +663,14 @@ describe("routing terminal — 503 response", () => {
 	});
 
 	it("sets Retry-After to seconds until next_available_at when rate-limited accounts exist", async () => {
+		// Natively-serving provider: see the "includes account info" test above —
+		// this test's subject is the Retry-After header, not model mapping.
 		const now = Date.UTC(2026, 3, 28, 12, 0, 0);
 		const cooldownUntil = now + 3_600_000; // 1 hour
 		const rateLimitedAccount = makeAccount({
 			id: "acc-rl",
 			name: "rate-limited-account",
+			provider: "anthropic",
 			rate_limited_until: cooldownUntil,
 			rate_limited_reason: "upstream_429_with_reset",
 		});
@@ -716,20 +744,35 @@ describe("routing terminal — 503 response", () => {
 	});
 
 	it("returns retryable pool exhaustion for mixed finite global and Fable route recovery without an upstream attempt", async () => {
+		// Natively-serving, non-anthropic provider: this test's subject is
+		// pool-exhausted terminal recovery-scope semantics across a mixed
+		// rate-limited/usage-capped pool, not managed-routing model mapping, so
+		// the accounts must pass the ordinary stock-model integrity fence for the
+		// stock "claude-fable-4-5" request below. "claude-console-api" natively
+		// serves Claude model ids (native_passthrough, same as "anthropic"), but
+		// deliberately isn't "anthropic": evaluateHardCapacity only treats a
+		// 100%-utilized weekly_scoped family window as a hard block without an
+		// explicit paid-overage-disabled billing signal when provider ===
+		// "anthropic" — using "anthropic" here would silently stop proving the
+		// Fable exhaustion this test asserts and fall through to a different
+		// (route_unavailable) terminal.
 		const now = Date.UTC(2026, 6, 20, 12);
 		const primary = makeAccount({
 			id: "acc-global-primary",
 			name: "primary",
+			provider: "claude-console-api",
 			rate_limited_until: now + 60_000,
 			rate_limited_reason: "upstream_429_with_reset",
 		});
 		const secondary = makeAccount({
 			id: "acc-fable-secondary",
 			name: "secondary",
+			provider: "claude-console-api",
 		});
 		const tertiary = makeAccount({
 			id: "acc-fable-tertiary",
 			name: "tertiary",
+			provider: "claude-console-api",
 		});
 		const realDateNow = Date.now;
 		Date.now = () => now;

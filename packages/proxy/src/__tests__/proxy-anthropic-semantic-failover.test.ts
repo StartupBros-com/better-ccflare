@@ -115,6 +115,7 @@ const { alignRouteCandidateIds, handleProxy } = await import("../proxy");
 const MODEL = "claude-opus-4-8";
 const OPUS_SIBLING = "claude-opus-4-8-20260701";
 const FABLE = "claude-fable-5";
+const AUTHORIZED_AGENT_ID = "semantic-failover-route-intent";
 const SESSION = "semantic-failover-session";
 const TIMEOUT_ENV = "CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS";
 const MEANINGFUL_PROGRESS_ENV = ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_ENV;
@@ -837,7 +838,9 @@ function makeContext(accounts: Account[], combo: ComboWithSlots | null = null) {
 		dbOps: {
 			getAllAccounts: mock(async () => accounts),
 			getActiveComboForFamily: mock(async () => combo),
-			getAgentPreference: mock(async () => null),
+			getAgentPreference: mock(async (agentId: string) =>
+				agentId === AUTHORIZED_AGENT_ID ? { model: MODEL } : null,
+			),
 		},
 		runtime: { port: 8080, clientId: "test" },
 		config: {
@@ -915,6 +918,64 @@ function makeCodexRequest(
 		headers: request.headers,
 		body: JSON.stringify({
 			model: MODEL,
+			messages: [{ role: "user", content: "hello" }],
+			...(includeSessionMetadata
+				? {
+						metadata: {
+							user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+						},
+					}
+				: {}),
+			max_tokens: 16,
+			stream,
+		}),
+	});
+}
+
+function makeAuthorizedRequest(
+	signal?: AbortSignal,
+	forcedAccountId?: string,
+	stream = true,
+	userAgent?: string,
+): Request {
+	const request = makeRequest(
+		signal,
+		forcedAccountId,
+		stream,
+		FABLE,
+		userAgent,
+	);
+	const headers = new Headers(request.headers);
+	headers.set("x-better-ccflare-agent-id", AUTHORIZED_AGENT_ID);
+	return new Request(request, { headers });
+}
+
+function makeAuthorizedCustomRequest(body: Record<string, unknown>): Request {
+	return new Request("https://proxy.local/v1/messages", {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			"anthropic-version": "2023-06-01",
+			"x-better-ccflare-agent-id": AUTHORIZED_AGENT_ID,
+		},
+		body: JSON.stringify({ ...body, model: FABLE }),
+	});
+}
+
+function makeAuthorizedCodexRequest(
+	options: { includeSessionMetadata?: boolean; stream?: boolean } = {},
+): Request {
+	const includeSessionMetadata = options.includeSessionMetadata ?? true;
+	const stream = options.stream ?? true;
+	return new Request("https://proxy.local/v1/messages", {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			"anthropic-version": "2023-06-01",
+			"x-better-ccflare-agent-id": AUTHORIZED_AGENT_ID,
+		},
+		body: JSON.stringify({
+			model: FABLE,
 			messages: [{ role: "user", content: "hello" }],
 			...(includeSessionMetadata
 				? {
@@ -1098,7 +1159,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			return sseResponse(stalledCodexStream(() => undefined));
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		await response.text();
 
@@ -1119,7 +1180,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				: sseResponse(byteStream(codexFailureStream("api_error")));
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as {
 			error: { attempted_routes: number };
@@ -1197,7 +1258,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 
 		let status = 0;
 		try {
-			const request = makeCodexRequest();
+			const request = makeAuthorizedCodexRequest();
 			const response = await handleProxy(request, new URL(request.url), ctx);
 			status = response.status;
 			await response.text();
@@ -1247,7 +1308,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			return sseResponse(byteStream(codexFailureStream("api_error")));
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		if (scenario === "synthetic_internal") {
 			request.headers.set("x-better-ccflare-keepalive", "true");
 			stampInternalAutoRefreshAuth(request.headers);
@@ -1293,7 +1354,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 
@@ -1413,7 +1474,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				);
 			}) as unknown as typeof fetch;
 
-			const firstRequest = makeCodexRequest();
+			const firstRequest = makeAuthorizedCodexRequest();
 			const firstResponse = await handleProxy(
 				firstRequest,
 				new URL(firstRequest.url),
@@ -1421,7 +1482,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 			const firstBody = await firstResponse.text();
 
-			const secondRequest = makeCodexRequest();
+			const secondRequest = makeAuthorizedCodexRequest();
 			const secondResponse = await handleProxy(
 				secondRequest,
 				new URL(secondRequest.url),
@@ -1429,7 +1490,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 			const secondBody = await secondResponse.text();
 
-			const thirdRequest = makeCodexRequest();
+			const thirdRequest = makeAuthorizedCodexRequest();
 			const thirdResponse = await handleProxy(
 				thirdRequest,
 				new URL(thirdRequest.url),
@@ -1497,7 +1558,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 
@@ -1531,7 +1592,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			return openAiJsonResponse("xai json recovered");
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest({ stream: false });
+		const request = makeAuthorizedCodexRequest({ stream: false });
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as {
 			content?: Array<{ type?: string; text?: string }>;
@@ -1699,21 +1760,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const request = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(440_000) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(440_000) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 50_000,
-				stream: true,
-			}),
+			max_tokens: 50_000,
+			stream: true,
 		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
@@ -1765,21 +1818,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				: sseResponse(byteStream(codexContextOverflowStream()));
 		}) as unknown as typeof fetch;
 
-		const request = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const request = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(440_000) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(440_000) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 50_000,
-				stream: true,
-			}),
+			max_tokens: 50_000,
+			stream: true,
 		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
@@ -1835,21 +1880,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const request = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(440_000) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(440_000) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 50_000,
-				stream: true,
-			}),
+			max_tokens: 50_000,
+			stream: true,
 		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
@@ -1918,21 +1955,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 					);
 		}) as unknown as typeof fetch;
 
-		const request = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const request = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(440_000) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(440_000) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 50_000,
-				stream: true,
-			}),
+			max_tokens: 50_000,
+			stream: true,
 		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
@@ -2006,21 +2035,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const request = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(440_000) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(440_000) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 50_000,
-				stream,
-			}),
+			max_tokens: 50_000,
+			stream,
 		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as {
@@ -2098,21 +2119,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const request = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(440_000) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(440_000) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 50_000,
-				stream: true,
-			}),
+			max_tokens: 50_000,
+			stream: true,
 		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
@@ -2233,21 +2246,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			});
 		}) as unknown as typeof fetch;
 
-		const request = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const request = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(440_000) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(440_000) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 50_000,
-				stream: true,
-			}),
+			max_tokens: 50_000,
+			stream: true,
 		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
@@ -2318,21 +2323,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			});
 		}) as unknown as typeof fetch;
 
-		const request = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const request = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(440_000) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(440_000) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 50_000,
-				stream: true,
-			}),
+			max_tokens: 50_000,
+			stream: true,
 		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
@@ -2541,21 +2538,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			});
 		}) as unknown as typeof fetch;
 
-		const baseRequest = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const baseRequest = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(440_000) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(440_000) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 50_000,
-				stream: false,
-			}),
+			max_tokens: 50_000,
+			stream: false,
 		});
 		const request = new Request(baseRequest, { signal: callerAbort.signal });
 		const response = await handleProxy(request, new URL(request.url), ctx);
@@ -2619,21 +2608,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const request = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(440_000) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(440_000) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 50_000,
-				stream: false,
-			}),
+			max_tokens: 50_000,
+			stream: false,
 		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as {
@@ -2698,7 +2679,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 					);
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest({ stream: false });
+		const request = makeAuthorizedCodexRequest({ stream: false });
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as { error?: { code?: string } };
 
@@ -2920,7 +2901,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as {
 			error?: { type?: string; code?: string; message?: string };
@@ -3081,7 +3062,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			return sseResponse(byteStream(codexContextOverflowStream()));
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 
@@ -3169,7 +3150,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			},
 		) as unknown as typeof fetch;
 
-		const request = makeCodexRequest({ stream: false });
+		const request = makeAuthorizedCodexRequest({ stream: false });
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 		await new Promise((resolve) => setTimeout(resolve, 0));
@@ -3309,7 +3290,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			},
 		) as unknown as typeof fetch;
 
-		const request = makeCodexRequest({ stream: false });
+		const request = makeAuthorizedCodexRequest({ stream: false });
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as {
 			content?: Array<{ type?: string; text?: string }>;
@@ -3383,7 +3364,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			},
 		) as unknown as typeof fetch;
 
-		const request = makeCodexRequest({ stream: false });
+		const request = makeAuthorizedCodexRequest({ stream: false });
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as {
 			content?: Array<{ type?: string; text?: string }>;
@@ -3468,7 +3449,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			},
 		) as unknown as typeof fetch;
 
-		const request = makeCodexRequest({ stream: false });
+		const request = makeAuthorizedCodexRequest({ stream: false });
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as {
 			content?: Array<{ type?: string; text?: string }>;
@@ -3574,21 +3555,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			return codexContextOverflowResponse("before-degraded-denial");
 		}) as unknown as typeof fetch;
 
-		const request = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const request = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(70 * 1024) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(70 * 1024) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 16,
-				stream,
-			}),
+			max_tokens: 16,
+			stream,
 		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
@@ -3709,21 +3682,13 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			return codexContextOverflowResponse("discard-before-protected-overload");
 		}) as unknown as typeof fetch;
 
-		const request = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"anthropic-version": "2023-06-01",
+		const request = makeAuthorizedCustomRequest({
+			messages: [{ role: "user", content: "x".repeat(70 * 1024) }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
 			},
-			body: JSON.stringify({
-				model: MODEL,
-				messages: [{ role: "user", content: "x".repeat(70 * 1024) }],
-				metadata: {
-					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-				},
-				max_tokens: 16,
-				stream: false,
-			}),
+			max_tokens: 16,
+			stream: false,
 		});
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as { error?: { type?: string } };
@@ -3752,7 +3717,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			return sseResponse(byteStream(codexContextOverflowStream()));
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 
@@ -3814,7 +3779,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			return new Response(tailBody, { status: 200, headers });
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const responseBody = await response.text();
 		await new Promise((resolve) => setTimeout(resolve, 0));
@@ -3870,7 +3835,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 		await new Promise((resolve) => setTimeout(resolve, 0));
@@ -3911,7 +3876,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				: sseResponse(byteStream(CODEX_SUCCESS_STREAM));
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 
@@ -3953,7 +3918,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				: sseResponse(byteStream(CODEX_SUCCESS_STREAM));
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 
@@ -4087,7 +4052,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			return sseResponse(stalledCodexStream(() => undefined));
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as {
 			error: { code: string; attempted_routes: number };
@@ -4131,7 +4096,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			});
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 		const elapsedMs = Date.now() - startedAt;
@@ -4161,7 +4126,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			return sseResponse(stalledCodexStream(() => undefined));
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		await response.text();
 
@@ -4181,7 +4146,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			return sseResponse(byteStream(codexFailureStream(errorType)));
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		await response.text();
 
@@ -4210,7 +4175,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 
@@ -4992,7 +4957,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				: sseResponse(byteStream(SUCCESS));
 		}) as unknown as typeof fetch;
 
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 
 		expect(await response.text()).toEndWith(SUCCESS);
@@ -5030,7 +4995,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				: sseResponse(byteStream(SUCCESS));
 		}) as unknown as typeof fetch;
 
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 
 		expect(await response.text()).toEndWith(SUCCESS);
@@ -5144,7 +5109,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			});
 		}) as unknown as typeof fetch;
 
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const responseBody = await response.text();
 
@@ -5171,7 +5136,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 
@@ -5373,7 +5338,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				: sseResponse(byteStream(TRANSIENT_ERROR));
 		}) as unknown as typeof fetch;
 
-		const request = makeRequest();
+		const request = makeAuthorizedRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as {
 			error: {
@@ -5645,7 +5610,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		}) as unknown as typeof fetch;
 
 		const callerAbort = new AbortController();
-		const request = makeRequest(callerAbort.signal);
+		const request = makeAuthorizedRequest(callerAbort.signal);
 		const responsePromise = handleProxy(request, new URL(request.url), ctx);
 		const outcome = await Promise.race([
 			responsePromise.then(
@@ -5735,7 +5700,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const request = makeCodexRequest();
+		const request = makeAuthorizedCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
 		await persistence.collector.drain();

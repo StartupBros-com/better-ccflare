@@ -95,6 +95,18 @@ function makeRequestMeta(overrides: Partial<RequestMeta> = {}): RequestMeta {
 	};
 }
 
+function agentPreferenceRewrite(
+	appliedModel: string,
+	overrides: Partial<RequestMeta> = {},
+): Partial<RequestMeta> {
+	return {
+		agentUsed: "account-selector-test-agent",
+		originalModel: "claude-sonnet-4-5",
+		appliedModel,
+		...overrides,
+	};
+}
+
 function makeCombo(slots: ComboWithSlots["slots"]): ComboWithSlots {
 	return {
 		id: "combo-1",
@@ -774,6 +786,9 @@ describe("selectAccountsForRequest — authoritative owner capture", () => {
 				config: { mode: "enforce" },
 			} as ProxyContext["anthropicDegradedMode"];
 			const meta = makeRequestMeta({
+				...(label === "Codex OAuth"
+					? agentPreferenceRewrite("claude-opus-4-8")
+					: {}),
 				clientSessionId: `unrelated-${label}`,
 			});
 
@@ -813,7 +828,11 @@ describe("selectAccountsForRequest — authoritative owner capture", () => {
 		} as ProxyContext["anthropicDegradedMode"];
 
 		const selected = await selectAccountsForRequest(
-			makeRequestMeta({ clientSessionId: "ownerless-codex" }),
+			makeRequestMeta(
+				agentPreferenceRewrite("claude-opus-4-8", {
+					clientSessionId: "ownerless-codex",
+				}),
+			),
 			ctx,
 			"claude-opus-4-8",
 			{ degradedOwner: { inspection, requestKind: "large" } },
@@ -1095,7 +1114,7 @@ describe("selectAccountsForRequest — profile-only account eligibility", () => 
 		await expect(
 			selectAccountsForRequest(meta, ctx, "claude-fable-5"),
 		).rejects.toMatchObject({ reason: "model_mapping_mismatch" });
-		expect(ctx.strategy.select).toHaveBeenCalledWith([], expect.anything());
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
 	});
 
 	it("excludes profile-only combo slots before implicit session fallback", async () => {
@@ -3126,7 +3145,11 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 		const strategy = mock((_accounts: Account[]) => [preferred, fallback]);
 		const ctx = makeExhaustedCapacityCtx({ accounts: [preferred, fallback] });
 		ctx.strategy.select = strategy;
-		const fableMeta = makeRequestMeta({ clientSessionId: "conversation-1" });
+		const fableMeta = makeRequestMeta(
+			agentPreferenceRewrite("claude-fable-5", {
+				clientSessionId: "conversation-1",
+			}),
+		);
 
 		const fable = await selectAccountsForRequest(
 			fableMeta,
@@ -3184,7 +3207,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 		});
 		cacheUsage(account.id, weeklyScoped("Fable"));
 		const ctx = makeExhaustedCapacityCtx({ accounts: [account] });
-		const meta = makeRequestMeta();
+		const meta = makeRequestMeta(agentPreferenceRewrite("claude-fable-5"));
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
 
@@ -3224,7 +3247,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 		});
 		cacheUsage(exhausted.id, weeklyScoped("Fable"));
 		cacheUsage(paused.id, weeklyScoped("Fable"));
-		const meta = makeRequestMeta();
+		const meta = makeRequestMeta(agentPreferenceRewrite("claude-fable-5"));
 		const ctx = makeExhaustedCapacityCtx({ accounts: [exhausted, paused] });
 		ctx.strategy.select = mock((accounts: Account[]) =>
 			accounts.filter((account) => !account.paused),
@@ -3255,7 +3278,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 			}),
 		});
 		cacheUsage(account.id, weeklyScoped("Fable"));
-		const meta = makeRequestMeta();
+		const meta = makeRequestMeta(agentPreferenceRewrite("claude-fable-5"));
 
 		const result = await selectAccountsForRequest(
 			meta,
@@ -3286,7 +3309,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 			spend: { enabled: false },
 			limits: [...weeklyScoped("Fable").limits, ...weeklyScoped("Opus").limits],
 		});
-		const meta = makeRequestMeta();
+		const meta = makeRequestMeta(agentPreferenceRewrite("claude-fable-5"));
 
 		const result = await selectAccountsForRequest(
 			meta,
@@ -3324,7 +3347,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 			"",
 			Date.now() + 60_000,
 		);
-		const meta = makeRequestMeta();
+		const meta = makeRequestMeta(agentPreferenceRewrite("claude-fable-5"));
 
 		const result = await selectAccountsForRequest(
 			meta,
@@ -3363,7 +3386,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 			}),
 		});
 		cacheUsage(account.id, weeklyScoped("Fable"));
-		const meta = makeRequestMeta();
+		const meta = makeRequestMeta(agentPreferenceRewrite("claude-fable-5"));
 		const ctx = makeExhaustedCapacityCtx({ accounts: [account] });
 
 		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
@@ -3386,7 +3409,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 			}),
 		});
 		cacheUsage(account.id, weeklyScoped("Fable"));
-		const meta = makeRequestMeta();
+		const meta = makeRequestMeta(agentPreferenceRewrite("claude-fable-5"));
 		const ctx = makeCtx({ accounts: [account] });
 		ctx.strategy.select = mock(() => {
 			throw new Error("selection failed");
@@ -3416,11 +3439,13 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 		const ctx = makeExhaustedCapacityCtx({
 			accounts: [excludedHealthy, allowedBlocked],
 		});
-		const meta = makeRequestMeta({
-			headers: new Headers({
-				"x-better-ccflare-exclude-providers": "anthropic-oauth",
+		const meta = makeRequestMeta(
+			agentPreferenceRewrite("claude-fable-5", {
+				headers: new Headers({
+					"x-better-ccflare-exclude-providers": "anthropic-oauth",
+				}),
 			}),
-		});
+		);
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
 
@@ -3445,7 +3470,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 			spend: { enabled: false },
 			limits: [...weeklyScoped("Fable").limits, ...weeklyScoped("Opus").limits],
 		});
-		const meta = makeRequestMeta();
+		const meta = makeRequestMeta(agentPreferenceRewrite("claude-fable-5"));
 
 		const result = await selectAccountsForRequest(
 			meta,
@@ -3481,7 +3506,7 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 				},
 			],
 		});
-		const meta = makeRequestMeta();
+		const meta = makeRequestMeta(agentPreferenceRewrite("claude-fable-5"));
 
 		const result = await selectAccountsForRequest(
 			meta,
@@ -4306,11 +4331,13 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			model_mappings: JSON.stringify({ opus: "physical-included" }),
 		});
 		const ctx = makeCtx({ accounts: [excluded, included] });
-		const meta = serverToolMeta({
-			headers: new Headers({
-				"x-better-ccflare-exclude-providers": excludedProvider,
+		const meta = serverToolMeta(
+			agentPreferenceRewrite("claude-opus-4-8", {
+				headers: new Headers({
+					"x-better-ccflare-exclude-providers": excludedProvider,
+				}),
 			}),
-		});
+		);
 
 		try {
 			await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
@@ -4381,7 +4408,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 				],
 			});
 			const ctx = makeExhaustedCapacityCtx({ accounts: [account] });
-			const meta = serverToolMeta();
+			const meta = serverToolMeta(agentPreferenceRewrite("claude-fable-5"));
 
 			const result = await selectAccountsForRequest(
 				meta,
@@ -4473,12 +4500,14 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			).toEqual(["account:capable"]);
 			return accounts;
 		});
-		const meta = serverToolMeta({
-			affinityOwnerSnapshot: {
-				candidateId: "account:incapable",
-				accountId: incapable.id,
-			},
-		});
+		const meta = serverToolMeta(
+			agentPreferenceRewrite("claude-opus-4-8", {
+				affinityOwnerSnapshot: {
+					candidateId: "account:incapable",
+					accountId: incapable.id,
+				},
+			}),
+		);
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
 
@@ -4536,7 +4565,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			});
 			const ctx = makeCtx({ accounts: [account] });
 			const { resumeAccount } = useSessionStrategy(ctx);
-			const meta = serverToolMeta();
+			const meta = serverToolMeta(agentPreferenceRewrite("claude-opus-4-8"));
 
 			const result = await selectAccountsForRequest(
 				meta,
@@ -4593,7 +4622,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			cacheUsage(account.id, blockedFableCapacity());
 			const ctx = makeCtx({ accounts: [account] });
 			const { resumeAccount } = useSessionStrategy(ctx);
-			const meta = serverToolMeta();
+			const meta = serverToolMeta(agentPreferenceRewrite("claude-fable-5"));
 
 			await expect(
 				selectAccountsForRequest(meta, ctx, "claude-fable-5"),
@@ -4639,7 +4668,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			cacheUsage(account.id, blockedFableCapacity());
 			const ctx = makeExhaustedCapacityCtx({ accounts: [account] });
 			const { resumeAccount } = useSessionStrategy(ctx);
-			const meta = serverToolMeta();
+			const meta = serverToolMeta(agentPreferenceRewrite("claude-fable-5"));
 
 			const result = await selectAccountsForRequest(
 				meta,
@@ -4778,7 +4807,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 				});
 				const ctx = makeCtx({ accounts: [account] });
 				const { resumeAccount } = useSessionStrategy(ctx);
-				const meta = serverToolMeta();
+				const meta = serverToolMeta(agentPreferenceRewrite("claude-opus-4-8"));
 
 				await expect(
 					selectAccountsForRequest(meta, ctx, "claude-opus-4-8"),
@@ -4828,7 +4857,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			});
 			const ctx = makeCtx({ accounts: [incapable, capable] });
 			const { resumeAccount } = useSessionStrategy(ctx);
-			const meta = serverToolMeta();
+			const meta = serverToolMeta(agentPreferenceRewrite("claude-opus-4-8"));
 
 			const result = await selectAccountsForRequest(
 				meta,
@@ -4930,7 +4959,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			expect(strategyAccounts).toEqual([capable]);
 			return strategyAccounts;
 		});
-		const meta = serverToolMeta();
+		const meta = serverToolMeta(agentPreferenceRewrite("claude-opus-4-8"));
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
 
@@ -5107,7 +5136,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			expect(accounts).toEqual([normalCapable]);
 			return accounts;
 		});
-		const meta = serverToolMeta();
+		const meta = serverToolMeta(agentPreferenceRewrite("claude-opus-4-8"));
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
 
@@ -5281,7 +5310,11 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			ctx.anthropicDegradedMode = {
 				config: { mode: "enforce" },
 			} as ProxyContext["anthropicDegradedMode"];
-			const meta = serverToolMeta({ clientSessionId: "degraded-capability" });
+			const meta = serverToolMeta(
+				agentPreferenceRewrite("claude-opus-4-8", {
+					clientSessionId: "degraded-capability",
+				}),
+			);
 			const inspection: AnthropicDegradedRouteInspection = {
 				cohortKey: "capability-cohort" as AnthropicDegradedCohortKey,
 				state: "open",
@@ -5321,7 +5354,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			model_mappings: JSON.stringify({ opus: "physical-temporary" }),
 		});
 		const ctx = makeCtx({ accounts: [paused] });
-		const meta = serverToolMeta();
+		const meta = serverToolMeta(agentPreferenceRewrite("claude-opus-4-8"));
 
 		try {
 			await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
@@ -5409,6 +5442,229 @@ describe("selectAccountsForRequest — pool-floor alarm on the force-route path"
 		} finally {
 			errors.mockRestore();
 		}
+	});
+});
+
+describe("ordinary stock-model admission", () => {
+	it("excludes a mapped Codex route before strategy when no Opus combo is active", async () => {
+		const mappedCodex = makeAccount({
+			id: "codex-opus-mapped",
+			provider: "codex",
+			priority: 25,
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		const nativeAnthropic = makeAccount({
+			id: "anthropic-opus-native",
+			priority: 30,
+		});
+		const ctx = makeCtx({ accounts: [mappedCodex, nativeAnthropic] });
+		const meta = makeRequestMeta();
+
+		const selected = await selectAccountsForRequest(meta, ctx, "claude-opus-5");
+
+		expect(ctx.strategy.select).toHaveBeenCalledWith(
+			[nativeAnthropic],
+			expect.anything(),
+		);
+		expect(selected.map((account) => account.id)).toEqual([nativeAnthropic.id]);
+		expect(meta.routingSelectionDiagnostics).toMatchObject({
+			mode: "enforce",
+			structuralCandidateCount: 2,
+			eligibleCandidateCount: 1,
+			excludedCandidateCount: 1,
+			selectedCandidateCount: 1,
+		});
+	});
+
+	it.each([
+		["claude-sonnet-4-5", "sonnet"],
+		["claude-opus-4-8-20260701", "opus"],
+		["CLAUDE-SONNET-4-5", "sonnet"],
+	] as const)("excludes mapped Codex and keeps the native account for anchored stock model %s", async (model, family) => {
+		const mappedCodex = makeAccount({
+			id: `codex-${family}-mapped-${model}`,
+			provider: "codex",
+			priority: 25,
+			model_mappings: JSON.stringify({ [family]: "gpt-5.6-sol" }),
+		});
+		const nativeAnthropic = makeAccount({
+			id: `anthropic-${family}-native-${model}`,
+			priority: 30,
+		});
+		const ctx = makeCtx({ accounts: [mappedCodex, nativeAnthropic] });
+
+		const selected = await selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			model,
+		);
+
+		expect(selected.map((account) => account.id)).toEqual([nativeAnthropic.id]);
+	});
+
+	it("does not treat Codex's provider-default capability as ordinary-model admission", async () => {
+		const defaultCodex = makeAccount({
+			id: "codex-provider-default",
+			provider: "codex",
+			priority: 25,
+			model_mappings: null,
+		});
+		const nativeAnthropic = makeAccount({
+			id: "anthropic-native",
+			priority: 30,
+		});
+		const ctx = makeCtx({ accounts: [defaultCodex, nativeAnthropic] });
+
+		const selected = await selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			"claude-opus-5",
+		);
+
+		expect(selected.map((account) => account.id)).toEqual([nativeAnthropic.id]);
+	});
+
+	it("accepts an explicit exact mapping only when every candidate remains unchanged", async () => {
+		const unchangedMappedCodex = makeAccount({
+			id: "codex-opus-unchanged",
+			provider: "codex",
+			model_mappings: JSON.stringify({
+				"claude-opus-5": [" claude-opus-5 ", "claude-opus-5"],
+			}),
+		});
+		const ctx = makeCtx({ accounts: [unchangedMappedCodex] });
+
+		const selected = await selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			"claude-opus-5",
+		);
+
+		expect(selected.map((account) => account.id)).toEqual([
+			unchangedMappedCodex.id,
+		]);
+	});
+
+	it("rejects a changing family-mapping tail for a bare family alias", async () => {
+		const changingMappedCodex = makeAccount({
+			id: "codex-opus-changing-tail",
+			provider: "codex",
+			model_mappings: JSON.stringify({
+				opus: [" opus ", "gpt-5.6-terra"],
+			}),
+		});
+		const nativeAnthropic = makeAccount({ id: "anthropic-opus-alias" });
+		const ctx = makeCtx({
+			accounts: [changingMappedCodex, nativeAnthropic],
+		});
+
+		const selected = await selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			"opus",
+		);
+
+		expect(selected.map((account) => account.id)).toEqual([nativeAnthropic.id]);
+	});
+
+	it("keeps a changing mapping authorized after an actual agent preference rewrite", async () => {
+		const mappedCodex = makeAccount({
+			id: "codex-agent-preference",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		const ctx = makeCtx({ accounts: [mappedCodex] });
+		const meta = makeRequestMeta({
+			agentUsed: "editor-agent",
+			originalModel: "claude-sonnet-5",
+			appliedModel: "claude-opus-5",
+		});
+
+		const selected = await selectAccountsForRequest(meta, ctx);
+
+		expect(selected.map((account) => account.id)).toEqual([mappedCodex.id]);
+	});
+
+	it("keeps active Fable combo substitution authorized", async () => {
+		const codexComboMember = makeAccount({
+			id: "codex-fable-combo",
+			provider: "codex",
+			priority: 25,
+			model_mappings: JSON.stringify({ fable: "gpt-5.6-sol" }),
+		});
+		const nativeAnthropic = makeAccount({ id: "anthropic-fable-native" });
+		const combo = makeCombo([
+			{
+				id: "fable-codex-slot",
+				combo_id: "combo-1",
+				account_id: codexComboMember.id,
+				model: "claude-fable-5",
+				priority: 0,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({
+			accounts: [codexComboMember, nativeAnthropic],
+			activeCombo: combo,
+		});
+
+		const selected = await selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			"claude-fable-5",
+		);
+
+		expect(selected.map((account) => account.id)).toEqual([
+			codexComboMember.id,
+		]);
+	});
+
+	it("falls back from an exhausted combo only to native same-model routes", async () => {
+		const exhaustedComboMember = makeAccount({
+			id: "codex-exhausted-combo",
+			provider: "codex",
+			paused: true,
+			model_mappings: JSON.stringify({ fable: "gpt-5.6-sol" }),
+		});
+		const unrelatedMappedProvider = makeAccount({
+			id: "codex-normal-fallback",
+			provider: "codex",
+			model_mappings: JSON.stringify({ fable: "gpt-5.6-sol" }),
+		});
+		const nativeAnthropic = makeAccount({ id: "anthropic-fable-fallback" });
+		const combo = makeCombo([
+			{
+				id: "exhausted-fable-slot",
+				combo_id: "combo-1",
+				account_id: exhaustedComboMember.id,
+				model: "claude-fable-5",
+				priority: 0,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({
+			accounts: [
+				exhaustedComboMember,
+				unrelatedMappedProvider,
+				nativeAnthropic,
+			],
+			activeCombo: combo,
+		});
+		ctx.strategy.select = mock((accounts: Account[]) =>
+			accounts.filter((account) => !account.paused),
+		);
+
+		const selected = await selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			"claude-fable-5",
+		);
+
+		expect(ctx.strategy.select).toHaveBeenCalledWith(
+			[nativeAnthropic],
+			expect.anything(),
+		);
+		expect(selected.map((account) => account.id)).toEqual([nativeAnthropic.id]);
 	});
 });
 
