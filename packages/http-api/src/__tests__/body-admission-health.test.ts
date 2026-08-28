@@ -11,17 +11,8 @@ const dbOps = {
 
 describe("body admission health", () => {
 	test("exposes only aggregate admission counters with no request identifiers", async () => {
-		const handler = createHealthHandler(
-			dbOps,
-			config,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			() => ({
+		const handler = createHealthHandler(dbOps, config, {
+			getBodyAdmissionHealth: () => ({
 				enabled: true,
 				budgetBytes: 268435456,
 				reservedBytes: 8388608,
@@ -40,7 +31,7 @@ describe("body admission health", () => {
 				path: "/v1/messages",
 				accountId: "must-not-leak",
 			}),
-		);
+		});
 
 		const body = (
 			await handler(new URL("http://localhost/health"))

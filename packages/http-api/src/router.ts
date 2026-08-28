@@ -205,19 +205,16 @@ export class APIRouter {
 		} = this.context;
 
 		// Create handlers
-		const healthHandler = createHealthHandler(
-			dbOps,
-			config,
+		const healthHandler = createHealthHandler(dbOps, config, {
 			getAsyncWriterHealth,
 			getUsageWorkerHealth,
 			getIntegrityStatus,
-			undefined,
 			getAnthropicDegradedHealth,
 			getRetentionStatus,
-			() => getStrategy?.()?.getRoutingHealth?.(),
+			getRoutingHealth: () => getStrategy?.()?.getRoutingHealth?.(),
 			getBodyAdmissionHealth,
 			getMemorySnapshot,
-		);
+		});
 		const statsHandler = createStatsHandler(dbOps);
 		const statsResetHandler = createStatsResetHandler(dbOps);
 		const storageHandler = createStorageHandler(dbOps);

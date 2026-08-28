@@ -82,10 +82,8 @@ describe("health runtime payload", () => {
 			getHealthDetailEnabled: () => false,
 		} as unknown as import("@better-ccflare/config").Config;
 
-		const handler = createHealthHandler(
-			db,
-			config,
-			() => ({
+		const handler = createHealthHandler(db, config, {
+			getAsyncWriterHealth: () => ({
 				healthy: true,
 				failureCount: 0,
 				recentDrops: 0,
@@ -99,10 +97,10 @@ describe("health runtime payload", () => {
 				payloadDropped: 0,
 				payloadDroppedBytes: 0,
 			}),
-			() => ({
+			getUsageWorkerHealth: () => ({
 				state: "healthy",
 			}),
-		);
+		});
 
 		const url = new URL("http://localhost/health");
 		const response = await handler(url);
@@ -134,18 +132,8 @@ describe("health runtime payload", () => {
 			getHealthDetailEnabled: () => false,
 		} as unknown as import("@better-ccflare/config").Config;
 
-		const response = await createHealthHandler(
-			db,
-			config,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			() => ({
+		const response = await createHealthHandler(db, config, {
+			getMemorySnapshot: () => ({
 				rss: 101,
 				heapTotal: 102,
 				heapUsed: 103,
@@ -157,7 +145,7 @@ describe("health runtime payload", () => {
 				uptimeSeconds: 12,
 				lifecycle: { trackedStreams: 4, pendingRequests: 5 },
 			}),
-		)(new URL("http://localhost/health"));
+		})(new URL("http://localhost/health"));
 		const body = (await response.json()) as HealthResponse;
 
 		expect(body.runtime?.memory).toEqual({
@@ -219,17 +207,9 @@ describe("health runtime payload", () => {
 			},
 		};
 
-		const response = await createHealthHandler(
-			db,
-			config,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			() => routing,
-		)(new URL("http://localhost/health"));
+		const response = await createHealthHandler(db, config, {
+			getRoutingHealth: () => routing,
+		})(new URL("http://localhost/health"));
 		const body = (await response.json()) as HealthResponse;
 
 		expect(body.routing).toEqual(routing);
@@ -302,15 +282,9 @@ describe("health runtime payload", () => {
 			saturation: false,
 		};
 
-		const response = await createHealthHandler(
-			db,
-			config,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			() => anthropicDegraded,
-		)(new URL("http://localhost/health?detail=1"));
+		const response = await createHealthHandler(db, config, {
+			getAnthropicDegradedHealth: () => anthropicDegraded,
+		})(new URL("http://localhost/health?detail=1"));
 		const body = (await response.json()) as HealthResponse;
 
 		expect(body.runtime?.anthropicDegraded).toEqual(anthropicDegraded);
@@ -400,24 +374,15 @@ describe("health runtime payload", () => {
 			droppedEvidence: 0,
 			saturation: false,
 		};
-		const first = createHealthHandler(
-			db,
-			config,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			() => ({ ...base, bootId: "or1_boot_first" }),
-		);
-		const second = createHealthHandler(
-			db,
-			config,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			() => ({ ...base, bootId: "or1_boot_second" }),
-		);
+		const first = createHealthHandler(db, config, {
+			getAnthropicDegradedHealth: () => ({ ...base, bootId: "or1_boot_first" }),
+		});
+		const second = createHealthHandler(db, config, {
+			getAnthropicDegradedHealth: () => ({
+				...base,
+				bootId: "or1_boot_second",
+			}),
+		});
 
 		const firstBody = (await (
 			await first(new URL("http://localhost/health"))
@@ -448,20 +413,13 @@ describe("health runtime payload", () => {
 		} as unknown as import("@better-ccflare/config").Config;
 
 		const lastSuccessAt = Date.now() - 60_000;
-		const handler = createHealthHandler(
-			db,
-			config,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			() => ({
+		const handler = createHealthHandler(db, config, {
+			getRetentionStatus: () => ({
 				lastSuccessAt,
 				lastError: null,
 				lastErrorAt: null,
 			}),
-		);
+		});
 
 		const url = new URL("http://localhost/health");
 		const response = await handler(url);
@@ -486,20 +444,13 @@ describe("health runtime payload", () => {
 		} as unknown as import("@better-ccflare/config").Config;
 
 		const lastErrorAt = Date.now() - 5_000;
-		const handler = createHealthHandler(
-			db,
-			config,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			() => ({
+		const handler = createHealthHandler(db, config, {
+			getRetentionStatus: () => ({
 				lastSuccessAt: null,
 				lastError: "statement timeout",
 				lastErrorAt,
 			}),
-		);
+		});
 
 		const url = new URL("http://localhost/health");
 		const response = await handler(url);
