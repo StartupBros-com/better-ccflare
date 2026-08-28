@@ -27,32 +27,11 @@ describe("issue #382 — 529 in-place retry Request clone", () => {
 		expect(source).not.toMatch(/transformedRequestForRetry/);
 	});
 
-	it("materializes the transformed outbound body through the shared consume-once replay", () => {
+	it("rebuilds the retry Request from retryBodyText instead of a clone", () => {
 		const source = readSource();
 		expect(source).toMatch(
-			/materializeRequestForTransport\(\s*transformedRequest\s*,?\s*\)/,
+			/const retryRequest = new Request\(transformedRequest\.url, \{[\s\S]*?body: retryBodyText \|\| undefined,/,
 		);
-		expect(source).not.toMatch(/transformedRequest\.clone\(\)/);
-	});
-
-	it("does not retain a body-bearing retry Request or transformed template on success", () => {
-		const source = readSource();
-		expect(source).not.toMatch(/\bretryTransformedTemplate\b/);
-		expect(source).not.toMatch(
-			/const retryRequest = new Request\(transformedRequest\.url/,
-		);
-		expect(source).toMatch(/\bretryTransportReplay\b/);
-	});
-
-	it("forces models by consuming and rebuilding the transformed request", () => {
-		const source = readSource();
-		const forceModel = source.match(
-			/export async function forceModelInTransformedRequest\([\s\S]*?\n\}/,
-		)?.[0];
-
-		expect(forceModel).toBeDefined();
-		expect(forceModel).toMatch(/materializeRequestForTransport\(request\)/);
-		expect(forceModel).not.toMatch(/request\.clone\(\)/);
 	});
 
 	it("releases every bounded Codex retry drain reader and aborts only its registered transport", () => {

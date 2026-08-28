@@ -16,6 +16,8 @@ function encodeJson(body: RequestJsonBody): ArrayBuffer {
 }
 
 export class RequestBodyContext {
+	readonly originalBuffer: ArrayBuffer | null;
+
 	private currentBuffer: ArrayBuffer | null;
 	private parsedBody: RequestJsonBody | null = null;
 	private parseAttempted = false;
@@ -33,6 +35,7 @@ export class RequestBodyContext {
 	}
 
 	constructor(buffer: ArrayBuffer | null) {
+		this.originalBuffer = buffer;
 		this.currentBuffer = buffer;
 	}
 
