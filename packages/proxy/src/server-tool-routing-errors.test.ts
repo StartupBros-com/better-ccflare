@@ -30,8 +30,8 @@ describe("server-tool routing errors", () => {
 		],
 		[
 			"no_implementation",
-			503,
-			"service_unavailable",
+			400,
+			"invalid_request_error",
 			"server_tool_capability_unavailable",
 		],
 		[
@@ -60,6 +60,41 @@ describe("server-tool routing errors", () => {
 				capability: CAPABILITY_SUMMARY,
 			},
 		});
+	});
+
+	it("serializes no_implementation as an honest permanent terminal", async () => {
+		const response = createServerToolRoutingErrorResponse(
+			new ServerToolRoutingError({
+				reason: "no_implementation",
+				capabilitySummary: CAPABILITY_SUMMARY,
+				requestedToolTypes: ["web_search_20250305", "web_search_20250305"],
+			}),
+		);
+		const body = (await response.json()) as {
+			error: { message: string; requested_tools?: string[] };
+		};
+
+		expect(response.status).toBe(400);
+		expect(response.status).toBeLessThan(500);
+		expect(body.error.requested_tools).toEqual(["web_search_20250305"]);
+		expect(body.error.message).toContain("permanent capability gap");
+		expect(body.error.message).toContain("web_search_20250305");
+		expect(body.error.message).not.toMatch(/usually temporary|try again/i);
+	});
+
+	it("omits requested_tools when no tool types are provided", async () => {
+		const response = createServerToolRoutingErrorResponse(
+			new ServerToolRoutingError({
+				reason: "no_implementation",
+				capabilitySummary: CAPABILITY_SUMMARY,
+			}),
+		);
+		const body = (await response.json()) as {
+			error: { message: string };
+		};
+
+		expect(body.error).not.toHaveProperty("requested_tools");
+		expect(body.error.message).toContain("permanent capability gap");
 	});
 
 	it("preserves a forced incapable tuple without exposing a substitute route", async () => {

@@ -1231,7 +1231,7 @@ describe("global model-first routing", () => {
 			blocked.id,
 		)}:${encodeURIComponent(OPUS)}`;
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(400);
 		expect(body.error).toMatchObject({
 			code: "server_tool_capability_unavailable",
 			reason: "no_implementation",

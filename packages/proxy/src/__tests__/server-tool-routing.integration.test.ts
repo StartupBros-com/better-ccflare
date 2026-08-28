@@ -580,9 +580,9 @@ describe("server-tool routing integration", () => {
 			};
 		};
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(400);
 		expect(body.error).toMatchObject({
-			type: "service_unavailable",
+			type: "invalid_request_error",
 			code: "server_tool_capability_unavailable",
 			reason: "no_implementation",
 			capability: {
@@ -771,7 +771,7 @@ describe("server-tool routing integration", () => {
 			};
 		};
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(400);
 		expect(body.error).toMatchObject({
 			code: "server_tool_capability_unavailable",
 			reason: "no_implementation",
@@ -1021,7 +1021,7 @@ describe("server-tool routing integration", () => {
 			error: { code: string; reason: string };
 		};
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(400);
 		expect(body.error).toMatchObject({
 			code: "server_tool_capability_unavailable",
 			reason: "no_implementation",
