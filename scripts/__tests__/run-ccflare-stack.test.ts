@@ -189,93 +189,17 @@ function writeOptionalTunnelFixture(dir: string): string {
 	return tunnel;
 }
 
-async function runStackInvocation(
-	programs: { upstream: string; guard: string },
-	extraEnv: Record<string, string> = {},
-): Promise<{
-	upstream: { secret: string; logLevel: string; argv: string[] };
-	guard: { secret: string; argv: string[] };
-	stdout: string;
-	stderr: string;
-}> {
-	const captureDir = tempDir("ccflare-stack-capture-");
-	mkdirSync(captureDir, { recursive: true });
-	const upstreamPort = await allocatePort();
-	const guardPort = await allocatePort();
-	const tunnelPort = await allocatePort();
-	const child = spawn("bash", [runnerScript], {
-		cwd: repoRoot,
-		env: {
-			...process.env,
-			LOG_LEVEL: undefined,
-			CAPTURE_DIR: captureDir,
-			CCFLARE_BIN: programs.upstream,
-			GUARD_SCRIPT: programs.guard,
-			NODE_BIN: process.execPath,
-			CCFLARE_UPSTREAM_PORT: String(upstreamPort),
-			GUARD_PORT: String(guardPort),
-			AI_GATEWAY_LOCAL_PORT: String(tunnelPort),
-			AI_GATEWAY_TUNNEL_ENABLED: "0",
-			AI_GATEWAY_TUNNEL_REQUIRED: "1",
-			CCFLARE_GUARD_CORRELATION_SECRET: "inherited-value-must-be-replaced",
-			RUNNER_HEALTH_POLL_INTERVAL_MS: "10",
-			RUNNER_HEALTH_MAX_ATTEMPTS: "100",
-			RUNNER_HEALTH_STABILITY_DELAY_MS: "0",
-			RUNNER_CIRCUIT_HOLD: "false",
-			RUNNER_PROC_ROOT: join(captureDir, "proc"),
-			...extraEnv,
-		},
-		stdio: ["ignore", "pipe", "pipe"],
-	});
-	let stdout = "";
-	let stderr = "";
-	child.stdout.on("data", (chunk) => {
-		stdout += chunk.toString();
-	});
-	child.stderr.on("data", (chunk) => {
-		stderr += chunk.toString();
-	});
-	const started = Date.now();
-	while (
-		(!existsSync(join(captureDir, "upstream.json")) ||
-			!existsSync(join(captureDir, "guard.json"))) &&
-		Date.now() - started < 10_000
-	) {
-		await Bun.sleep(10);
-	}
-	if (
-		!existsSync(join(captureDir, "upstream.json")) ||
-		!existsSync(join(captureDir, "guard.json"))
-	) {
-		child.kill("SIGKILL");
-		throw new Error(`runner fixture timed out:\n${stdout}\n${stderr}`);
-	}
-	child.kill("SIGTERM");
-	const exitCode = await new Promise<number | null>((resolve) =>
-		child.once("exit", resolve),
-	);
-	if (exitCode !== 143) {
-		throw new Error(
-			`runner fixture exited ${exitCode}:\nstdout:\n${stdout}\nstderr:\n${stderr}`,
-		);
-	}
-	const upstream = JSON.parse(
-		readFileSync(join(captureDir, "upstream.json"), "utf8").trim(),
-	);
-	const guard = JSON.parse(
-		readFileSync(join(captureDir, "guard.json"), "utf8").trim(),
-	);
-	return { upstream, guard, stdout, stderr };
-}
-
-async function spawnRunner(
-	programs: { upstream: string; guard: string },
-	extraEnv: Record<string, string> = {},
-): Promise<{
+type SpawnedRunnerFixture = {
 	child: ReturnType<typeof spawn>;
 	captureDir: string;
 	getOutput: () => { stdout: string; stderr: string };
-}> {
+};
+
+async function spawnRunnerFixture(
+	programs: { upstream: string; guard: string },
+	extraEnv: Record<string, string> = {},
+	options: { unsetLogLevel?: boolean } = {},
+): Promise<SpawnedRunnerFixture> {
 	const captureDir = tempDir("ccflare-stack-capture-");
 	mkdirSync(captureDir, { recursive: true });
 	const upstreamPort = await allocatePort();
@@ -285,6 +209,7 @@ async function spawnRunner(
 		cwd: repoRoot,
 		env: {
 			...process.env,
+			...(options.unsetLogLevel ? { LOG_LEVEL: undefined } : {}),
 			CAPTURE_DIR: captureDir,
 			CCFLARE_BIN: programs.upstream,
 			GUARD_SCRIPT: programs.guard,
@@ -317,6 +242,60 @@ async function spawnRunner(
 		captureDir,
 		getOutput: () => ({ stdout, stderr }),
 	};
+}
+
+async function runStackInvocation(
+	programs: { upstream: string; guard: string },
+	extraEnv: Record<string, string> = {},
+): Promise<{
+	upstream: { secret: string; logLevel: string; argv: string[] };
+	guard: { secret: string; argv: string[] };
+	stdout: string;
+	stderr: string;
+}> {
+	const runner = await spawnRunnerFixture(programs, extraEnv, {
+		unsetLogLevel: true,
+	});
+	const { child, captureDir } = runner;
+	const started = Date.now();
+	while (
+		(!existsSync(join(captureDir, "upstream.json")) ||
+			!existsSync(join(captureDir, "guard.json"))) &&
+		Date.now() - started < 10_000
+	) {
+		await Bun.sleep(10);
+	}
+	const { stdout, stderr } = runner.getOutput();
+	if (
+		!existsSync(join(captureDir, "upstream.json")) ||
+		!existsSync(join(captureDir, "guard.json"))
+	) {
+		child.kill("SIGKILL");
+		throw new Error(`runner fixture timed out:\n${stdout}\n${stderr}`);
+	}
+	child.kill("SIGTERM");
+	const exitCode = await new Promise<number | null>((resolve) =>
+		child.once("exit", resolve),
+	);
+	if (exitCode !== 143) {
+		throw new Error(
+			`runner fixture exited ${exitCode}:\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+		);
+	}
+	const upstream = JSON.parse(
+		readFileSync(join(captureDir, "upstream.json"), "utf8").trim(),
+	);
+	const guard = JSON.parse(
+		readFileSync(join(captureDir, "guard.json"), "utf8").trim(),
+	);
+	return { upstream, guard, stdout, stderr };
+}
+
+async function spawnRunner(
+	programs: { upstream: string; guard: string },
+	extraEnv: Record<string, string> = {},
+): Promise<SpawnedRunnerFixture> {
+	return spawnRunnerFixture(programs, extraEnv);
 }
 
 async function waitForOutput(
@@ -410,6 +389,19 @@ async function stopRunner(
 }
 
 describe("run-ccflare-stack upstream environment", () => {
+	test("uses one owned sleep per RSS sample instead of the restart backoff slicer", () => {
+		const source = readFileSync(runnerScript, "utf8");
+		const watchdog = source.match(/rss_watchdog\(\) \{([\s\S]*?)\n\}/)?.[1];
+		const wait = source.match(/wait_watchdog_interval\(\) \{([\s\S]*?)\n\}/)?.[1];
+		expect(watchdog).toBeDefined();
+		expect(watchdog).toContain(
+			'wait_watchdog_interval "$RUNNER_RSS_POLL_INTERVAL_MS" || return 0',
+		);
+		expect(watchdog).not.toContain("sleep_ms");
+		expect(wait).toContain("sleep_pid=$!");
+		expect(wait).toContain("trap 'kill");
+	});
+
 	test("declares the complete fail-closed RSS watchdog contract", () => {
 		const source = readFileSync(runnerScript, "utf8");
 		for (const key of [

@@ -276,11 +276,23 @@ proc_rss_bytes() {
 	return 1
 }
 
+wait_watchdog_interval() {
+	local interval_ms="$1" sleep_pid status
+	sleep "$(printf '%d.%03d' "$((interval_ms / 1000))" "$((interval_ms % 1000))")" &
+	sleep_pid=$!
+	trap 'kill "$sleep_pid" 2>/dev/null || true' TERM INT EXIT
+	set +e
+	wait "$sleep_pid"
+	status=$?
+	set -e
+	trap - TERM INT EXIT
+	return "$status"
+}
+
 rss_watchdog() {
 	local pid="$1" identity="$2" generation_started_ms="$3" streak=0 now rss current_identity
 	while :; do
-		sleep_ms "$RUNNER_RSS_POLL_INTERVAL_MS"
-		((shutdown_requested)) && return 0
+		wait_watchdog_interval "$RUNNER_RSS_POLL_INTERVAL_MS" || return 0
 		current_identity="$(proc_start_time "$pid" 2>/dev/null)" || continue
 		[[ "$current_identity" == "$identity" ]] || continue
 		kill -0 "$pid" 2>/dev/null || continue
