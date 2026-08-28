@@ -37,6 +37,23 @@ RUNNER_RESTART_BACKOFF_MAX_MS=${RUNNER_RESTART_BACKOFF_MAX_MS:-30000}
 RUNNER_RESTART_MAX_FAILURES=${RUNNER_RESTART_MAX_FAILURES:-3}
 RUNNER_RESTART_WINDOW_MS=${RUNNER_RESTART_WINDOW_MS:-300000}
 RUNNER_RESTART_STABLE_MS=${RUNNER_RESTART_STABLE_MS:-60000}
+rss_policy_keys=(RUNNER_RSS_THRESHOLD_BYTES RUNNER_RSS_POLL_INTERVAL_MS RUNNER_RSS_MIN_UPTIME_MS RUNNER_RSS_CONSECUTIVE_SAMPLES RUNNER_RSS_RECYCLE_COOLDOWN_MS RUNNER_RSS_MAX_RECYCLES RUNNER_RSS_RECYCLE_WINDOW_MS)
+rss_policy_present=0
+for rss_key in "${rss_policy_keys[@]}"; do
+	[[ -v "$rss_key" ]] && ((rss_policy_present += 1))
+done
+if ((rss_policy_present != 0 && rss_policy_present != ${#rss_policy_keys[@]})); then
+	printf 'invalid runner RSS policy: all seven values must be configured together\n' >&2
+	exit 64
+fi
+RUNNER_RSS_THRESHOLD_BYTES=${RUNNER_RSS_THRESHOLD_BYTES:-0}
+RUNNER_RSS_POLL_INTERVAL_MS=${RUNNER_RSS_POLL_INTERVAL_MS:-60000}
+RUNNER_RSS_MIN_UPTIME_MS=${RUNNER_RSS_MIN_UPTIME_MS:-0}
+RUNNER_RSS_CONSECUTIVE_SAMPLES=${RUNNER_RSS_CONSECUTIVE_SAMPLES:-1}
+RUNNER_RSS_RECYCLE_COOLDOWN_MS=${RUNNER_RSS_RECYCLE_COOLDOWN_MS:-0}
+RUNNER_RSS_MAX_RECYCLES=${RUNNER_RSS_MAX_RECYCLES:-0}
+RUNNER_RSS_RECYCLE_WINDOW_MS=${RUNNER_RSS_RECYCLE_WINDOW_MS:-86400000}
+RUNNER_PROC_ROOT=${RUNNER_PROC_ROOT:-/proc}
 # When the local breaker opens, a systemd-managed runner must exit so the
 # service is not reported active while its stack children are down. The
 # managed unit uses Restart=on-failure plus StartLimit* to own the outer
@@ -49,6 +66,7 @@ RUNNER_CIRCUIT_EXIT_STATUS=75
 upstream_pid=""
 guard_pid=""
 ai_gateway_tunnel_pid=""
+watchdog_pid=""
 cleanup_ran=0
 shutdown_requested=0
 fatal_startup=0
@@ -58,6 +76,9 @@ child_exit_class="failure"
 restart_failure_count=0
 restart_window_started_ms=0
 stack_started_ms=0
+rss_recycle_count=0
+rss_recycle_window_started_ms=0
+rss_last_recycle_ms=0
 
 log() {
 	printf '[%s] %s\n' "$(date -Is)" "$*"
@@ -95,6 +116,20 @@ validate_bounded_ms RUNNER_RESTART_BACKOFF_MAX_MS "$RUNNER_RESTART_BACKOFF_MAX_M
 validate_bounded_int RUNNER_RESTART_MAX_FAILURES "$RUNNER_RESTART_MAX_FAILURES" 1 100
 validate_bounded_ms RUNNER_RESTART_WINDOW_MS "$RUNNER_RESTART_WINDOW_MS" 1 2147483647
 validate_bounded_ms RUNNER_RESTART_STABLE_MS "$RUNNER_RESTART_STABLE_MS" 0 2147483647
+validate_bounded_ms RUNNER_RSS_POLL_INTERVAL_MS "$RUNNER_RSS_POLL_INTERVAL_MS" 1 2147483647
+validate_bounded_ms RUNNER_RSS_MIN_UPTIME_MS "$RUNNER_RSS_MIN_UPTIME_MS" 0 2147483647
+validate_bounded_int RUNNER_RSS_CONSECUTIVE_SAMPLES "$RUNNER_RSS_CONSECUTIVE_SAMPLES" 1 1000000
+validate_bounded_ms RUNNER_RSS_RECYCLE_COOLDOWN_MS "$RUNNER_RSS_RECYCLE_COOLDOWN_MS" 0 2147483647
+validate_bounded_int RUNNER_RSS_MAX_RECYCLES "$RUNNER_RSS_MAX_RECYCLES" 0 1000000
+validate_bounded_ms RUNNER_RSS_RECYCLE_WINDOW_MS "$RUNNER_RSS_RECYCLE_WINDOW_MS" 1 2147483647
+if [[ ! "$RUNNER_RSS_THRESHOLD_BYTES" =~ ^(0|[1-9][0-9]{0,15})$ ]] || ((RUNNER_RSS_THRESHOLD_BYTES > 9007199254740991)); then
+	log "invalid RUNNER_RSS_THRESHOLD_BYTES=${RUNNER_RSS_THRESHOLD_BYTES}; expected 0..9007199254740991"
+	exit 64
+fi
+if ((RUNNER_RSS_THRESHOLD_BYTES > 0 && RUNNER_RSS_MAX_RECYCLES < 1)); then
+	log "invalid runner RSS policy: enabled threshold requires at least one recycle"
+	exit 64
+fi
 validate_bounded_int AI_GATEWAY_TUNNEL_READY_ATTEMPTS "$AI_GATEWAY_TUNNEL_READY_ATTEMPTS" 1 10000
 validate_bounded_ms AI_GATEWAY_TUNNEL_POLL_INTERVAL_MS "$AI_GATEWAY_TUNNEL_POLL_INTERVAL_MS" 1 60000
 validate_bounded_int AI_GATEWAY_SSH_CONNECT_TIMEOUT_SECONDS "$AI_GATEWAY_SSH_CONNECT_TIMEOUT_SECONDS" 1 300
@@ -209,9 +244,118 @@ stop_stack_children() {
 	wait "${guard_pid:-0}" 2>/dev/null || true
 	wait "${upstream_pid:-0}" 2>/dev/null || true
 	wait "${ai_gateway_tunnel_pid:-0}" 2>/dev/null || true
+	if [[ -n "$watchdog_pid" ]]; then
+		kill "$watchdog_pid" 2>/dev/null || true
+		wait "$watchdog_pid" 2>/dev/null || true
+	fi
 	guard_pid=""
 	upstream_pid=""
 	ai_gateway_tunnel_pid=""
+	watchdog_pid=""
+}
+
+proc_start_time() {
+	local line rest
+	IFS= read -r line <"$RUNNER_PROC_ROOT/$1/stat" || return 1
+	rest="${line##*) }"
+	set -- $rest
+	[[ "${20}" =~ ^[0-9]+$ ]] || return 1
+	printf '%s\n' "${20}"
+}
+
+proc_rss_bytes() {
+	local key kib unit extra
+	while read -r key kib unit extra; do
+		if [[ "$key" == "VmRSS:" ]]; then
+			[[ "$kib" =~ ^[0-9]+$ && "$unit" == "kB" && -z "${extra:-}" ]] || return 1
+			((kib <= 8796093022207)) || return 1
+			printf '%s\n' "$((kib * 1024))"
+			return 0
+		fi
+	done <"$RUNNER_PROC_ROOT/$1/status"
+	return 1
+}
+
+rss_watchdog() {
+	local pid="$1" identity="$2" generation_started_ms="$3" streak=0 now rss current_identity
+	while :; do
+		sleep_ms "$RUNNER_RSS_POLL_INTERVAL_MS"
+		((shutdown_requested)) && return 0
+		current_identity="$(proc_start_time "$pid" 2>/dev/null)" || continue
+		[[ "$current_identity" == "$identity" ]] || continue
+		kill -0 "$pid" 2>/dev/null || continue
+		now="$(epoch_ms)"
+		((now - generation_started_ms >= RUNNER_RSS_MIN_UPTIME_MS)) || continue
+		((rss_last_recycle_ms == 0 || now - rss_last_recycle_ms >= RUNNER_RSS_RECYCLE_COOLDOWN_MS)) || continue
+		rss="$(proc_rss_bytes "$pid" 2>/dev/null)" || continue
+		if ((rss >= RUNNER_RSS_THRESHOLD_BYTES)); then
+			((streak += 1))
+		else
+			streak=0
+		fi
+		if ((streak >= RUNNER_RSS_CONSECUTIVE_SAMPLES)); then
+			if ((rss_recycle_count >= RUNNER_RSS_MAX_RECYCLES && rss_recycle_window_started_ms > 0 && now - rss_recycle_window_started_ms < RUNNER_RSS_RECYCLE_WINDOW_MS)); then
+				log "RSS recycle suppressed; cap exhausted; recycles=${rss_recycle_count}; window_ms=${RUNNER_RSS_RECYCLE_WINDOW_MS}"
+				streak=0
+				continue
+			fi
+			log "RSS recycle trigger; upstream_pid=${pid}; rss_bytes=${rss}; threshold_bytes=${RUNNER_RSS_THRESHOLD_BYTES}; samples=${streak}"
+			return 66
+		fi
+	done
+}
+
+stop_guard_for_memory_recycle() {
+	local pid="$1" stop_budget_ms="$2" started_ms now_ms elapsed_ms remaining_ms poll_ms status enforcer_pid
+	log "stopping ccflare guard pid=${pid} for memory recycle; stop_budget_ms=${stop_budget_ms}"
+	kill "$pid" 2>/dev/null || true
+	(
+		started_ms="$(epoch_ms)"
+		while kill -0 "$pid" 2>/dev/null; do
+			now_ms="$(epoch_ms)"
+			elapsed_ms=$((now_ms - started_ms))
+			if ((elapsed_ms >= stop_budget_ms)); then
+				log "ccflare guard pid=${pid} did not stop after ${stop_budget_ms}ms during memory recycle; sending SIGKILL"
+				kill -KILL "$pid" 2>/dev/null || true
+				exit 0
+			fi
+			remaining_ms=$((stop_budget_ms - elapsed_ms))
+			poll_ms=$((remaining_ms < STOP_POLL_INTERVAL_MS ? remaining_ms : STOP_POLL_INTERVAL_MS))
+			sleep "$(printf '%d.%03d' "$((poll_ms / 1000))" "$((poll_ms % 1000))")" || true
+		done
+	) &
+	enforcer_pid=$!
+	set +e
+	wait "$pid"
+	status=$?
+	kill "$enforcer_pid" 2>/dev/null
+	wait "$enforcer_pid" 2>/dev/null
+	set -e
+	return "$status"
+}
+
+stop_stack_for_memory_recycle() {
+	local guard_status=1
+	log "memory recycle drain starting; ordering=guard,upstream,tunnel; grace_ms=${GUARD_SHUTDOWN_GRACE_MS}"
+	if [[ -n "$guard_pid" ]] && kill -0 "$guard_pid" 2>/dev/null; then
+		if stop_guard_for_memory_recycle "$guard_pid" "$GUARD_STOP_BUDGET_MS"; then
+			guard_status=0
+		else
+			guard_status=$?
+		fi
+	fi
+	case "$guard_status" in
+		0) log "memory recycle guard drain outcome=natural status=0" ;;
+		70) log "memory recycle guard drain outcome=forced status=70" ;;
+		*) log "memory recycle failed: unknown guard drain status=${guard_status}"; return 1 ;;
+	esac
+	guard_pid=""
+	stop_child "better-ccflare upstream" "$upstream_pid" 5000
+	stop_child "ai-gateway ssh tunnel" "$ai_gateway_tunnel_pid" 5000
+	[[ -n "$watchdog_pid" ]] && { kill "$watchdog_pid" 2>/dev/null || true; wait "$watchdog_pid" 2>/dev/null || true; }
+	wait "${upstream_pid:-0}" 2>/dev/null || true
+	wait "${ai_gateway_tunnel_pid:-0}" 2>/dev/null || true
+	upstream_pid=""; ai_gateway_tunnel_pid=""; watchdog_pid=""
 }
 
 cleanup() {
@@ -499,13 +643,25 @@ run_stack_once() {
 	if [[ -n "$ai_gateway_tunnel_pid" ]]; then
 		child_pids+=("$ai_gateway_tunnel_pid")
 	fi
+	if ((RUNNER_RSS_THRESHOLD_BYTES > 0)); then
+		local upstream_identity
+		upstream_identity="$(proc_start_time "$upstream_pid")" || { log "cannot capture upstream proc start-time identity"; fatal_startup=1; return 1; }
+		rss_watchdog "$upstream_pid" "$upstream_identity" "$stack_started_ms" &
+		watchdog_pid=$!
+		child_pids+=("$watchdog_pid")
+	fi
 	local exited_pid=""
 	set +e
 	wait -n -p exited_pid "${child_pids[@]}"
 	child_exit_status=$?
 	set -e
+	if [[ -n "$watchdog_pid" && "$exited_pid" == "$watchdog_pid" && "$child_exit_status" == "66" ]]; then
+		child_exit_name="RSS watchdog"
+		child_exit_class="memory-recycle"
+	else
 	child_exit_name="$(child_name_for_pid "$exited_pid")"
 	classify_child_exit
+	fi
 	log "ccflare stack child exited; child=${child_exit_name}; status=${child_exit_status}; class=${child_exit_class}"
 	if [[ "$child_exit_class" == "intentional" ]]; then
 		return 0
@@ -600,6 +756,17 @@ while :; do
 		exit 143
 	fi
 
+	if [[ "$child_exit_class" == "memory-recycle" ]]; then
+		now_ms="$(epoch_ms)"
+		if ((rss_recycle_window_started_ms == 0 || now_ms - rss_recycle_window_started_ms >= RUNNER_RSS_RECYCLE_WINDOW_MS)); then
+			rss_recycle_window_started_ms=$now_ms; rss_recycle_count=0
+		fi
+		if stop_stack_for_memory_recycle; then
+			((rss_recycle_count += 1)); rss_last_recycle_ms=$now_ms
+			log "restarting stack after memory recycle; recycle_count=${rss_recycle_count}; no_failure_backoff=true"
+			continue
+		fi
+	fi
 	stop_stack_children "$RUNNER_FAILURE_STOP_BUDGET_MS"
 	if ((shutdown_requested)); then
 		exit 143

@@ -57,6 +57,9 @@ export const DEFAULT_GUARD_DELAY_INSPECTION_TIMEOUT_MS = 5_000;
 // evaluateGuardRetry's docstring in ccflare-guard-policy.mjs for the
 // rationale.
 export const DEFAULT_GUARD_ALLOW_LEGACY_POOL_BODY = false;
+// sysexits.h EX_SOFTWARE: bounded, non-signal status reserved for a drain that
+// reached its deadline and had to destroy remaining connections.
+export const GUARD_FORCED_DRAIN_EXIT_STATUS = 70;
 export const GUARD_REQUEST_ID_HEADER = "x-better-ccflare-guard-request-id";
 export const GUARD_CORRELATION_SECRET_HEADER =
 	"x-better-ccflare-guard-correlation-secret";
@@ -357,10 +360,7 @@ function parseDeclaredContentLength(req) {
 
 function classifyRequestBody(req, maxRequestBodyBytes) {
 	const declaredLength = parseDeclaredContentLength(req);
-	if (
-		declaredLength != null &&
-		declaredLength > BigInt(maxRequestBodyBytes)
-	) {
+	if (declaredLength != null && declaredLength > BigInt(maxRequestBodyBytes)) {
 		return {
 			declaredBytes: maxRequestBodyBytes + 1,
 			declaredLength,
@@ -402,7 +402,8 @@ function drainRequest(
 	req.once("end", cleanup);
 	req.once("close", cleanup);
 	req.once("aborted", cleanup);
-	timer = setTimeout(() => {
+	timer = setTimeout(
+		() => {
 		if (drained) return;
 		timer = undefined;
 		// A rejected upload has no useful continuation. Destroying the request
@@ -422,7 +423,9 @@ function drainRequest(
 		} catch {
 			// Telemetry callbacks must never prevent the socket teardown.
 		}
-	}, Math.max(1, timeoutMs));
+		},
+		Math.max(1, timeoutMs),
+	);
 	timer.unref?.();
 	try {
 		req.resume();
@@ -1564,7 +1567,10 @@ export function createGuard(options = {}) {
 
 	function acquireBodyReader(id, signal, reservationBytes) {
 		if (signal?.aborted) return Promise.reject(signal.reason || abortError());
-		if (bodyReaderQueue.length === 0 && canAcquireBodyReader(reservationBytes)) {
+		if (
+			bodyReaderQueue.length === 0 &&
+			canAcquireBodyReader(reservationBytes)
+		) {
 			return Promise.resolve(grantBodyReaderLease(0, reservationBytes));
 		}
 		if (bodyReaderQueue.length >= maxQueue) {
@@ -2766,10 +2772,7 @@ export function createGuard(options = {}) {
 				req,
 				context.signal,
 				maxRequestBodyBytes,
-				Math.min(
-					requestDrainTimeoutMs,
-					Math.max(1, context.remainingMs()),
-				),
+				Math.min(requestDrainTimeoutMs, Math.max(1, context.remainingMs())),
 				() => onRequestDrainTimeout(context),
 				bodyPlan.declaredLength,
 			);
@@ -2890,16 +2893,27 @@ export function createGuard(options = {}) {
 		});
 	}
 
+	let shutdownPromise = null;
 	function shutdown(signal, { exitProcess = false } = {}) {
+		if (shutdownPromise) return shutdownPromise;
 		// This state transition must precede server.close(): already-open sockets
 		// may otherwise admit fresh work during the close/drain race.
 		draining = true;
 		log("guard_shutdown", { signal, openSockets: sockets.size });
-		server.close(() => {
-			if (exitProcess) process.exit(0);
-		});
+		shutdownPromise = new Promise((resolve) => {
+			let terminal = false;
+			let timer;
+			const finish = (outcome, exitStatus) => {
+				if (terminal) return;
+				terminal = true;
+				clearTimeout(timer);
+				log("guard_shutdown_terminal", { signal, outcome, exitStatus });
+				resolve({ outcome, exitStatus });
+				if (exitProcess) process.exit(exitStatus);
+			};
+			server.close(() => finish("natural", 0));
 		server.closeIdleConnections?.();
-		const timer = setTimeout(() => {
+			timer = setTimeout(() => {
 			log("guard_force_close", {
 				signal,
 				openSockets: sockets.size,
@@ -2907,9 +2921,11 @@ export function createGuard(options = {}) {
 			});
 			server.closeAllConnections?.();
 			for (const socket of sockets) socket.destroy();
-			if (exitProcess) process.exit(0);
+				finish("forced", GUARD_FORCED_DRAIN_EXIT_STATUS);
 		}, shutdownGraceMs);
 		timer.unref();
+		});
+		return shutdownPromise;
 	}
 
 	return {

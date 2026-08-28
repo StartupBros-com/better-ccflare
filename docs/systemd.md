@@ -101,7 +101,7 @@ The critical problem: Bun validates these variables in C++ runtime **before any 
 **Known-valid variables** (use with caution, may break in future Bun versions):
 
 | Variable | Purpose | Example |
-|---|---|---|
+| -------------------------- | --------------------------- | ------------------- |
 | `BUN_JSC_forceRAMSize` | Cap JSC heap size in bytes | `2147483648` (2 GB) |
 | `BUN_JSC_useJIT` | Disable JIT compilation | `0` |
 | `BUN_JSC_forceGCSlowPaths` | Force slow GC paths (debug) | `1` |
@@ -109,7 +109,7 @@ The critical problem: Bun validates these variables in C++ runtime **before any 
 **Invalid variables that will crash Bun:**
 
 | Variable | Why it fails |
-|---|---|
+| ---------------------- | -------------------------------------- |
 | `BUN_JSC_smallHeap` | Not a real JSC option despite the name |
 | `BUN_JSC_aggressiveGC` | Not a real JSC option |
 | Any typo or guess | JSC option validation is strict |
@@ -193,6 +193,18 @@ its cushion (605 seconds with the defaults) so in-flight requests can drain.
 The runner logs both budgets at startup and when the guard starts. Operators
 may override the failure budget in the service environment, but should keep it
 below the systemd `StartLimitIntervalSec` window.
+
+The managed source pin explicitly enables runner-owned Bun RSS containment with
+the complete tuple `4294967296` bytes, `60000` ms polling, `1800000` ms minimum
+uptime, 5 consecutive high samples, `3600000` ms cooldown, and at most 3
+recycles per `86400000` ms window. Source defaults remain disabled
+(`RUNNER_RSS_THRESHOLD_BYTES=0`). The watchdog reads only the exact supervised
+upstream PID and verifies its `/proc/<pid>/stat` start time before every
+`VmRSS` sample; it never scans by process name. A trigger drains the guard
+first, then stops Bun, and does not consume the ordinary child-failure circuit.
+All seven values are an all-or-none policy: partial or non-production managed
+deployment values fail validation. The rollback compatibility path accepts an
+older pin only when the entire tuple is absent.
 
 Without the preflight script, an invalid `BUN_JSC_*` variable would burn through all 5 restart attempts in ~25 seconds, causing total proxy downtime until an operator notices.
 
@@ -339,7 +351,7 @@ Perform another full-stack restart and confirm a new boot ID, `mode: "observe"`,
 Compare rates over similarly sized natural-traffic windows. Counters reset on every restart, and opaque account/owner identifiers rotate with the boot ID, so compare distributions and behavior rather than attempting cross-boot identifier joins.
 
 | Signal | Source | Observation pass criterion |
-|---|---|---|
+| ---------------------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Client status and body | Existing client/application telemetry | Status and Anthropic error type/message shape match the off baseline; do not add raw body logging. |
 | Account choice | Existing request/account attribution; boot-local `physical_attempt.accountId` diagnostics | Candidate order and account distribution show no observe-only routing change. |
 | Owner continuity | Repeated session/account attribution; boot-local `transition` events with `subject: "owner"` | Existing owners remain authoritative and hypothetical retention does not remap affinity. |
@@ -421,7 +433,7 @@ At `0`, eligible traffic retains the current conversation-key behavior. At `100`
 Codex trace schema 9 keeps the schema 8 canary fields and adds physical-attempt identity so retries and failover no longer collapse into one logical request:
 
 | Field | Meaning |
-|---|---|
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `cache_key_assignment` | Intended `conversation` or `session` arm for eligible canary traffic |
 | `cache_key_cohort_id` | Short domain-separated digest of the normalized session UUID for assignment-stability checks |
 | `conversation_id` | Short digest of the logical conversation identity, independent of the outbound cache key |
