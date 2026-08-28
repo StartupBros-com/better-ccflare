@@ -399,6 +399,74 @@ describe("routing terminal responses", () => {
 		).toBeNull();
 	});
 
+	it("keeps a policy-excluded zero-route terminal topology and recovery free", async () => {
+		const now = Date.UTC(2026, 6, 17, 12);
+		const terminal = createRoutingTerminalResponse({
+			source: "selection",
+			accounts: [
+				makeAccount({
+					rate_limited_until: now + 60_000,
+					rate_limited_reason: "upstream_429_with_reset",
+				}),
+			],
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 0,
+			now,
+			routingSelectionDiagnostics: {
+				mode: "enforce",
+				structuralCandidateCount: 1,
+				eligibleCandidateCount: 0,
+				excludedCandidateCount: 1,
+				selectedCandidateCount: 0,
+				zeroAttemptReason: "policy_excluded",
+				forcedRoute: false,
+				capabilityProfile: false,
+				routeProfile: false,
+			},
+			routeCircuitRecoveryHint: {
+				allCandidatesOpen: true,
+				candidateCount: 1,
+				probeLeased: false,
+				retryAt: now + 60_000,
+				reason: "semantic_stream_stall",
+			},
+		});
+
+		expect(terminal.kind).toBe("route_unavailable");
+		expect(terminal.response.headers.get("retry-after")).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-route-status"),
+		).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-pool-status"),
+		).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-recovery-scope"),
+		).toBeNull();
+		const parsed = await body(terminal.response);
+		expect(parsed.error).toMatchObject({
+			code: "route_unavailable",
+			attempted_routes: 0,
+			accounts: [],
+			routing_diagnostics: {
+				mode: "enforce",
+				structural_candidate_count: 1,
+				eligible_candidate_count: 0,
+				excluded_candidate_count: 1,
+				selected_candidate_count: 0,
+				zero_attempt_reason: "policy_excluded",
+			},
+		});
+		expect(parsed.error).not.toHaveProperty("next_available_at");
+		expect(parsed.error).not.toHaveProperty("route_circuit");
+		expect(parsed.error).not.toHaveProperty("account");
+		expect(parsed.error).not.toHaveProperty("provider");
+		expect(parsed.error).not.toHaveProperty("slot");
+		expect(JSON.stringify(parsed.error)).not.toContain("account-1");
+		expect(JSON.stringify(parsed.error)).not.toContain("anthropic");
+	});
+
 	it("returns retryable model_pool_exhausted for finite model-only capacity", async () => {
 		const now = Date.UTC(2026, 6, 17, 12);
 		const next = now + 60_001;

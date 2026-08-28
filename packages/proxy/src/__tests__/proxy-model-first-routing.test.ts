@@ -37,6 +37,7 @@ const FABLE_SIBLING = "claude-fable-5-20260701";
 const OPUS = "claude-opus-4-8";
 const OPUS_NEXT = "claude-opus-5";
 const SONNET = "claude-sonnet-4-5";
+const MAPPED_ROUTING_AGENT_ID = "model-first-mapped-routing-agent";
 
 const originalFetch = globalThis.fetch;
 const originalOverloadRetry = process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
@@ -155,6 +156,9 @@ function makeContext(accounts: Account[], combo: ComboWithSlots): ProxyContext {
 			getComboRoutingPolicy: mock(async (family: ComboFamily) =>
 				makeRoutingPolicy(combo, family),
 			),
+			getAgentPreference: mock(async (agentId: string) =>
+				agentId === MAPPED_ROUTING_AGENT_ID ? { model: FABLE } : null,
+			),
 		},
 		runtime: { port: 8080, clientId: "test" },
 		config: {
@@ -198,6 +202,24 @@ function makeRequest(extraHeaders: Record<string, string> = {}): Request {
 	});
 }
 
+function makeAuthorizedMappedRequest(
+	extraHeaders: Record<string, string> = {},
+): Request {
+	return new Request("https://proxy.local/v1/messages", {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			"x-better-ccflare-agent-id": MAPPED_ROUTING_AGENT_ID,
+			...extraHeaders,
+		},
+		body: JSON.stringify({
+			model: SONNET,
+			messages: [{ role: "user", content: "hello" }],
+			max_tokens: 16,
+		}),
+	});
+}
+
 function makeServerToolRequest(): Request {
 	return new Request("https://proxy.local/v1/messages", {
 		method: "POST",
@@ -209,6 +231,23 @@ function makeServerToolRequest(): Request {
 		},
 		body: JSON.stringify({
 			model: FABLE,
+			messages: [{ role: "user", content: "hello" }],
+			max_tokens: 16,
+			stream: false,
+			tools: [{ type: "web_search_20250305", name: "web_search" }],
+		}),
+	});
+}
+
+function makeAuthorizedServerToolRequest(): Request {
+	const baseRequest = makeServerToolRequest();
+	const headers = new Headers(baseRequest.headers);
+	headers.set("x-better-ccflare-agent-id", MAPPED_ROUTING_AGENT_ID);
+	return new Request(baseRequest.url, {
+		method: baseRequest.method,
+		headers,
+		body: JSON.stringify({
+			model: SONNET,
 			messages: [{ role: "user", content: "hello" }],
 			max_tokens: 16,
 			stream: false,
@@ -539,6 +578,57 @@ describe("global model-first routing", () => {
 		).toBe(3);
 	});
 
+	it("does not dispatch an ordinary Opus request to a mapped Codex fallback without route intent", async () => {
+		const codex = makeAccount("ordinary-opus-mapped-codex");
+		codex.provider = "codex";
+		codex.api_key = null;
+		codex.access_token = "ordinary-opus-codex-token";
+		codex.expires_at = Date.now() + 60 * 60 * 1000;
+		codex.priority = 25;
+		codex.model_mappings = JSON.stringify({ opus: ["gpt-5.6-sol"] });
+		const anthropic = makeAccount("ordinary-opus-native-anthropic");
+		anthropic.provider = "anthropic";
+		anthropic.priority = 30;
+		anthropic.model_mappings = null;
+		const ctx = makeContext([codex, anthropic], makeCombo({ account: codex }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		const dispatches: Array<{ url: string; model: string }> = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			dispatches.push({
+				url: upstreamRequest.url,
+				model: ((await upstreamRequest.clone().json()) as { model: string })
+					.model,
+			});
+			return success();
+		}) as unknown as typeof fetch;
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: OPUS_NEXT,
+				messages: [{ role: "user", content: "hello" }],
+				max_tokens: 16,
+			}),
+		});
+
+		const response = await run(ctx, request);
+
+		expect(response.status).toBe(200);
+		expect(dispatches).toEqual([
+			{
+				url: "https://api.anthropic.com/v1/messages",
+				model: OPUS_NEXT,
+			},
+		]);
+		expect(usageHandleStart.mock.calls.at(-1)?.[0]).toMatchObject({
+			accountId: anthropic.id,
+		});
+	});
+
 	it("tries a post-combo normal Fable route before queued degradation", async () => {
 		const comboAccount = makeAccount("combo-only-a");
 		const normalAccount = makeAccount("normal-only-b");
@@ -552,7 +642,7 @@ describe("global model-first routing", () => {
 				: exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([
@@ -577,7 +667,7 @@ describe("global model-first routing", () => {
 				: exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([
@@ -1101,13 +1191,13 @@ describe("global model-first routing", () => {
 			attempt.model === OPUS ? success() : exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([{ account: account.id, model: OPUS }]);
 		expect(usageHandleStart).toHaveBeenCalledTimes(1);
 		expect(usageHandleStart.mock.calls[0]?.[0]).toMatchObject({
-			originalModel: FABLE,
+			originalModel: SONNET,
 			appliedModel: OPUS,
 			comboModelOverrideFrom: null,
 			comboModelOverrideTo: null,
@@ -1133,7 +1223,7 @@ describe("global model-first routing", () => {
 				: exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([
@@ -1170,7 +1260,7 @@ describe("global model-first routing", () => {
 		cacheCurrentFableExhaustion(blocked.id);
 		const attempts = installFetch(() => success());
 
-		const response = await run(ctx, makeServerToolRequest());
+		const response = await run(ctx, makeAuthorizedServerToolRequest());
 
 		const deferredCandidateId = `capacity-deferred:${encodeURIComponent(
 			blocked.id,
@@ -1219,7 +1309,7 @@ describe("global model-first routing", () => {
 		cacheCurrentFableExhaustion(blocked.id);
 		const attempts = installFetch(() => success());
 
-		const response = await run(ctx, makeServerToolRequest());
+		const response = await run(ctx, makeAuthorizedServerToolRequest());
 		const body = (await response.json()) as {
 			error: {
 				code: string;
@@ -1263,7 +1353,7 @@ describe("global model-first routing", () => {
 				: exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([{ account: later.id, model: OPUS }]);
@@ -1294,7 +1384,7 @@ describe("global model-first routing", () => {
 				: exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([{ account: later.id, model: FABLE_SIBLING }]);
@@ -1312,7 +1402,7 @@ describe("global model-first routing", () => {
 		expect(getRateLimitProbeAdmission(account)).toBe("admitted");
 		const attempts = installFetch(() => success());
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([{ account: account.id, model: OPUS }]);
@@ -1351,7 +1441,7 @@ describe("global model-first routing", () => {
 			expect(getRateLimitProbeAdmission(account)).toBe("admitted");
 			const attempts = installFetch(() => success());
 
-			const response = await run(ctx);
+			const response = await run(ctx, makeAuthorizedMappedRequest());
 
 			expect(response.status).toBe(400);
 			expect(await response.json()).toMatchObject({
@@ -1414,7 +1504,7 @@ describe("global model-first routing", () => {
 			expect(getRateLimitProbeAdmission(suppressed)).toBe("admitted");
 			const attempts = installFetch(() => success());
 
-			const response = await run(ctx);
+			const response = await run(ctx, makeAuthorizedMappedRequest());
 
 			expect(response.status).toBe(200);
 			expect(attempts).toEqual([{ account: suppressed.id, model: OPUS }]);
@@ -1459,7 +1549,7 @@ describe("global model-first routing", () => {
 					}),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([
@@ -1496,7 +1586,7 @@ describe("global model-first routing", () => {
 			attempt.account === strategyFirst.id ? success() : exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([{ account: strategyFirst.id, model: OPUS }]);
@@ -1533,7 +1623,7 @@ describe("global model-first routing", () => {
 				: exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([
@@ -1563,7 +1653,7 @@ describe("global model-first routing", () => {
 			attempt.account === second.id ? success() : exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([
@@ -1588,7 +1678,7 @@ describe("global model-first routing", () => {
 			attempt.model === OPUS_NEXT ? success() : exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([
@@ -1627,7 +1717,7 @@ describe("global model-first routing", () => {
 				: exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([
@@ -1661,7 +1751,7 @@ describe("global model-first routing", () => {
 				),
 		);
 
-		await expect(run(ctx)).rejects.toThrow(
+		await expect(run(ctx, makeAuthorizedMappedRequest())).rejects.toThrow(
 			"OAuth tokens have expired for accounts: aged-deferred-oauth",
 		);
 		expect(attempts).toEqual([]);
@@ -1700,7 +1790,7 @@ describe("global model-first routing", () => {
 				),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(529);
 		expect(attempts).toEqual([{ account: account.id, model: FABLE }]);
@@ -1757,7 +1847,7 @@ describe("global model-first routing", () => {
 		});
 		const attempts = installFetch(() => success());
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 		const body = (await response.json()) as {
 			error?: { code?: string };
 		};
@@ -1844,7 +1934,7 @@ describe("global model-first routing", () => {
 			return exactModelExhausted();
 		});
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 		const body = (await response.json()) as {
 			error?: { code?: string };
 		};
@@ -1881,7 +1971,7 @@ describe("global model-first routing", () => {
 		});
 		const attempts = installFetch(() => success());
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([{ account: clear.id, model: OPUS }]);
@@ -1916,7 +2006,7 @@ describe("global model-first routing", () => {
 		});
 		const attempts = installFetch(() => success());
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 		const body = (await response.json()) as {
 			error?: { code?: string };
 		};
@@ -1948,7 +2038,7 @@ describe("global model-first routing", () => {
 
 		const response = await run(
 			ctx,
-			makeRequest({
+			makeAuthorizedMappedRequest({
 				"x-better-ccflare-exclude-providers": "anthropic-oauth",
 			}),
 		);
@@ -1981,7 +2071,7 @@ describe("global model-first routing", () => {
 				: exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([
@@ -2021,7 +2111,7 @@ describe("global model-first routing", () => {
 				: exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([
@@ -2045,7 +2135,7 @@ describe("global model-first routing", () => {
 			attempt.model === SONNET ? success() : exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([
@@ -2069,13 +2159,13 @@ describe("global model-first routing", () => {
 			attempt.model === SONNET ? success() : exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([{ account: account.id, model: SONNET }]);
-		expect(usageHandleStart.mock.calls[0]?.[0]).toMatchObject({
-			originalModel: FABLE,
-			appliedModel: SONNET,
+		expect(ctx.strategy.select.mock.calls[0]?.[1]).toMatchObject({
+			originalModel: SONNET,
+			appliedModel: FABLE,
 		});
 	});
 
@@ -2118,7 +2208,7 @@ describe("global model-first routing", () => {
 			attempt.model === SONNET ? success() : exactModelExhausted(),
 		);
 
-		const response = await run(ctx);
+		const response = await run(ctx, makeAuthorizedMappedRequest());
 
 		expect(response.status).toBe(200);
 		expect(attempts).toEqual([{ account: account.id, model: SONNET }]);

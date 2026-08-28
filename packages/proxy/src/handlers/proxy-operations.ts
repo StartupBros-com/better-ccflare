@@ -131,7 +131,11 @@ import {
 } from "../session-account-observer";
 import { combineChunks } from "../stream-tee";
 import { isModelRewrite } from "../worker-messages";
-import { getXaiConvId } from "./account-selector";
+import {
+	ForceRouteUnavailableError,
+	getRouteProfileConstraintViolation,
+	getXaiConvId,
+} from "./account-selector";
 import { cancelDiscardedResponseBody } from "./discard-body-cancel";
 import {
 	ERROR_MESSAGES,
@@ -3069,6 +3073,15 @@ export async function proxyWithAccount(
 			physicalModel: string | null,
 			requireSelectedCandidateBinding = false,
 		): ProviderAttemptPlan => {
+			const constraintViolation = getRouteProfileConstraintViolation(
+				account,
+				requestMeta,
+				admittedRequestModel,
+				physicalModel,
+			);
+			if (constraintViolation) {
+				throw new ForceRouteUnavailableError(account.id, constraintViolation);
+			}
 			const capability = resolveExactServerToolCapability(
 				physicalModel,
 				requireSelectedCandidateBinding,
@@ -7507,6 +7520,9 @@ export async function proxyWithAccount(
 					? err
 					: new HostedDispatchTerminalError("ambiguous_transport", err);
 			return createHostedDispatchTerminalResponse(terminalError);
+		}
+		if (err instanceof ForceRouteUnavailableError) {
+			throw err;
 		}
 		if (err instanceof ServerToolCandidateCapabilityError) {
 			// Exact capability drift is request-local. It must not pause the account,

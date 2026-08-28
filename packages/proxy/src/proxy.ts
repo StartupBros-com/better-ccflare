@@ -1833,6 +1833,26 @@ async function handleProxyCoreImpl(
 	const selectedCapacityDeferredRoutes =
 		getCapacityDeferredModelRoutes(requestMeta);
 	let pacingSlot = pacingObservation?.slot ?? null;
+	// A route-profile constraint violation discovered while materializing a
+	// candidate's attempt plan (pre-transport, before any upstream send) is
+	// that candidate's failure alone — it says nothing about a sibling
+	// candidate's mapping. Only surface the redacted terminal once nothing
+	// else in the current loop/route can be attempted; otherwise report "not
+	// yet terminal" (null) so the call site's existing finality-aware
+	// ServerToolCandidateCapabilityError branch pattern can move on to the
+	// next candidate.
+	const handleForceRouteUnavailableAfterAttempt = async (
+		error: unknown,
+		isFinalCandidate: boolean,
+	): Promise<Response | null> => {
+		if (!(error instanceof ForceRouteUnavailableError)) return null;
+		await routingAttemptLedger.discardTerminalResponse();
+		if (!isFinalCandidate) return null;
+		return finishPacing(
+			pacingSlot,
+			forceRouteUnavailableResponse(error, requestMeta.routeProfileId == null),
+		);
+	};
 	routingAttemptLedger.bindPhysicalAttemptBudgetTerminal({
 		requestId: requestMeta.id,
 		terminalize: async (error) => {
@@ -2550,6 +2570,16 @@ async function handleProxyCoreImpl(
 				anthropicDegradedSendState,
 			);
 		} catch (error) {
+			const forceRouteResponse = await handleForceRouteUnavailableAfterAttempt(
+				error,
+				isFinalDeferredRoute,
+			);
+			if (forceRouteResponse) return forceRouteResponse;
+			if (error instanceof ForceRouteUnavailableError) {
+				upstreamAttempts +=
+					routingAttemptLedger.attemptedCount - attemptedBefore;
+				return null;
+			}
 			if (error instanceof ServerToolCandidateCapabilityError) {
 				upstreamAttempts +=
 					routingAttemptLedger.attemptedCount - attemptedBefore;
@@ -2819,6 +2849,16 @@ async function handleProxyCoreImpl(
 				anthropicDegradedSendState,
 			);
 		} catch (error) {
+			const forceRouteResponse = await handleForceRouteUnavailableAfterAttempt(
+				error,
+				isFinalSelectedCandidate,
+			);
+			if (forceRouteResponse) return forceRouteResponse;
+			if (error instanceof ForceRouteUnavailableError) {
+				upstreamAttempts +=
+					routingAttemptLedger.attemptedCount - attemptedBefore;
+				continue;
+			}
 			if (error instanceof ServerToolCandidateCapabilityError) {
 				upstreamAttempts +=
 					routingAttemptLedger.attemptedCount - attemptedBefore;
@@ -2952,7 +2992,14 @@ async function handleProxyCoreImpl(
 				anthropicDegradedSendState,
 			);
 		} catch (error) {
-			if (error instanceof ServerToolCandidateCapabilityError) {
+			const forceRouteResponse = await handleForceRouteUnavailableAfterAttempt(
+				error,
+				isFinalSelectedCandidate,
+			);
+			if (forceRouteResponse) return forceRouteResponse;
+			if (error instanceof ForceRouteUnavailableError) {
+				response = null;
+			} else if (error instanceof ServerToolCandidateCapabilityError) {
 				const forcedResponse = recordServerToolCandidateCapabilityFailure(
 					error,
 					attemptedBefore,
@@ -3186,6 +3233,17 @@ async function handleProxyCoreImpl(
 						anthropicDegradedSendState,
 					);
 				} catch (error) {
+					const forceRouteResponse =
+						await handleForceRouteUnavailableAfterAttempt(
+							error,
+							isFinalFallbackCandidate,
+						);
+					if (forceRouteResponse) return forceRouteResponse;
+					if (error instanceof ForceRouteUnavailableError) {
+						upstreamAttempts +=
+							routingAttemptLedger.attemptedCount - attemptedBefore;
+						continue;
+					}
 					if (error instanceof ServerToolCandidateCapabilityError) {
 						upstreamAttempts +=
 							routingAttemptLedger.attemptedCount - attemptedBefore;
@@ -3291,7 +3349,15 @@ async function handleProxyCoreImpl(
 						anthropicDegradedSendState,
 					);
 				} catch (error) {
-					if (error instanceof ServerToolCandidateCapabilityError) {
+					const forceRouteResponse =
+						await handleForceRouteUnavailableAfterAttempt(
+							error,
+							isFinalFallbackCandidate,
+						);
+					if (forceRouteResponse) return forceRouteResponse;
+					if (error instanceof ForceRouteUnavailableError) {
+						response = null;
+					} else if (error instanceof ServerToolCandidateCapabilityError) {
 						const forcedResponse = recordServerToolCandidateCapabilityFailure(
 							error,
 							attemptedBefore,

@@ -66,12 +66,135 @@ import {
 
 const log = new Logger("AccountSelector");
 
+const STOCK_CLAUDE_FAMILY_ALIASES = new Set([
+	"fable",
+	"opus",
+	"sonnet",
+	"haiku",
+]);
+
 export function isForceAccountModelEnabled(ctx: ProxyContext): boolean {
 	return ctx.config?.getForceAccountModel?.() ?? false;
 }
 
 function isClaudeModelId(model: string): boolean {
 	return getModelFamily(model) !== null;
+}
+
+/**
+ * Route-profile constraints are server-derived metadata, distinct from public
+ * force-account routes. Every executable mapping candidate must remain within
+ * the profile's one expected physical model; an array is a fallback list, not
+ * an allowed model set.
+ */
+export function getRouteProfileConstraintViolation(
+	account: Account,
+	meta: Pick<
+		RequestMeta,
+		| "routeProfileId"
+		| "routeProfileSelection"
+		| "routeExpectedProvider"
+		| "routeExpectedPhysicalModel"
+		| "routeProfileExpectedPhysicalModel"
+	>,
+	logicalModel: string | null | undefined,
+	concretePhysicalModel?: string | null,
+): "provider_mismatch" | "model_mapping_mismatch" | null {
+	if (!meta.routeProfileId?.trim()) return null;
+
+	const expectedProvider = meta.routeExpectedProvider?.trim().toLowerCase();
+	if (
+		expectedProvider &&
+		account.provider.trim().toLowerCase() !== expectedProvider
+	) {
+		return "provider_mismatch";
+	}
+
+	const expectedPhysicalModel = (
+		meta.routeExpectedPhysicalModel ??
+		(meta.routeProfileSelection === "capability"
+			? meta.routeProfileExpectedPhysicalModel
+			: null)
+	)?.trim();
+	if (!expectedPhysicalModel) return null;
+
+	const candidates =
+		concretePhysicalModel !== undefined
+			? [concretePhysicalModel]
+			: logicalModel?.trim()
+				? (() => {
+						const mapped = getModelList(logicalModel, account);
+						return mapped && mapped.length > 0 ? mapped : [logicalModel];
+					})()
+				: [];
+	return candidates.length > 0 &&
+		candidates.every(
+			(candidate) =>
+				typeof candidate === "string" &&
+				candidate.trim() === expectedPhysicalModel,
+		)
+		? null
+		: "model_mapping_mismatch";
+}
+
+/**
+ * The ordinary-pool integrity fence is intentionally narrow. It covers the
+ * stock logical Claude IDs (plus their supported bare family aliases), but
+ * leaves custom logical IDs on their existing routing contract.
+ */
+function isStockClaudeModelOrFamilyAlias(model: string): boolean {
+	const normalized = model.trim().toLowerCase();
+	return (
+		STOCK_CLAUDE_FAMILY_ALIASES.has(normalized) ||
+		(normalized.startsWith("claude-") && getModelFamily(normalized) !== null)
+	);
+}
+
+function hasActualAgentPreferenceRewrite(meta: RequestMeta): boolean {
+	return (
+		meta.agentUsed != null &&
+		meta.originalModel != null &&
+		meta.appliedModel != null &&
+		meta.originalModel !== meta.appliedModel
+	);
+}
+
+/**
+ * Ordinary stock-model traffic may only enter the pool through a route that
+ * preserves the client model. Configured mappings are allowed only when every
+ * candidate is the same model after trim; provider defaults never establish
+ * this admission, because they can represent a provider-side rewrite.
+ *
+ * Unknown/undeclared providers intentionally remain eligible when they have
+ * no explicit mapping so existing representation adapters retain their native
+ * pass-through behavior.
+ */
+function isOrdinaryStockModelAccountEligible(
+	account: Account,
+	model: string,
+): boolean {
+	const requestedModel = model.trim();
+	const configured = getConfiguredModelMapping(requestedModel, account);
+	if (configured) {
+		return (
+			configured.models.length > 0 &&
+			configured.models.every(
+				(candidate) => candidate.trim() === requestedModel,
+			)
+		);
+	}
+
+	try {
+		return (
+			resolveAccountLogicalModelCapability(account, requestedModel)
+				.provenance !== "provider_default"
+		);
+	} catch {
+		// This selector has historically admitted unknown provider adapters. A
+		// malformed/third-party capability declaration must not turn that into a
+		// new exclusion in the absence of an explicit changing mapping.
+		return true;
+	}
 }
 
 function accountServesModel(account: Account, model: string): boolean {
@@ -1708,6 +1831,54 @@ function applyImplicitFallbackPolicy(
 }
 
 /**
+ * Apply the ordinary-pool model-integrity fence before candidate metadata,
+ * capacity deferral, and strategy selection can observe a changing route.
+ * Explicit force/profile routes and active combo slots take earlier branches;
+ * an actual agent preference rewrite is deliberate model-routing intent.
+ */
+function applyOrdinaryStockModelEligibility(
+	accounts: Account[],
+	meta: RequestMeta,
+	effectiveModel: string | null,
+): Account[] {
+	if (
+		!effectiveModel ||
+		!isStockClaudeModelOrFamilyAlias(effectiveModel) ||
+		meta.routeProfileId != null ||
+		hasActualAgentPreferenceRewrite(meta)
+	) {
+		return accounts;
+	}
+
+	const eligible = accounts.filter((account) =>
+		isOrdinaryStockModelAccountEligible(account, effectiveModel),
+	);
+	if (eligible.length === accounts.length) return accounts;
+
+	const existing = meta.routingSelectionDiagnostics;
+	const structural = boundedRoutingSelectionCount(
+		existing?.structuralCandidateCount ?? accounts.length,
+	);
+	const eligibleCount = Math.min(
+		structural,
+		boundedRoutingSelectionCount(eligible.length),
+	);
+	meta.routingSelectionDiagnostics = {
+		mode: "enforce",
+		structuralCandidateCount: structural,
+		eligibleCandidateCount: eligibleCount,
+		excludedCandidateCount: structural - eligibleCount,
+		selectedCandidateCount: existing?.selectedCandidateCount ?? 0,
+		zeroAttemptReason:
+			eligibleCount === 0 ? "policy_excluded" : "all_unavailable",
+		forcedRoute: false,
+		capabilityProfile: false,
+		routeProfile: false,
+	};
+	return eligible;
+}
+
+/**
  * Match an account against the root capability declared by a dynamic model
  * route profile.  The profile's logical model is intentionally used here,
  * rather than the current child-agent model: a session must remain inside the
@@ -1725,10 +1896,9 @@ function matchesCapabilityRouteProfile(
 	if (!expectedProvider || !expectedPhysicalModel || !logicalModel) {
 		return false;
 	}
-	if (account.provider.trim().toLowerCase() !== expectedProvider) return false;
-	const mappedModels = getModelList(logicalModel, account);
-	const firstPhysicalModel = mappedModels?.[0]?.trim() ?? logicalModel;
-	return firstPhysicalModel === expectedPhysicalModel;
+	return (
+		getRouteProfileConstraintViolation(account, meta, logicalModel) === null
+	);
 }
 
 function capabilityRouteUnavailable(
@@ -2005,28 +2175,16 @@ async function selectAccountsForRequestInternal(
 				);
 			}
 			if (meta.routeProfileId) {
-				if (
-					meta.routeExpectedProvider &&
-					forcedAccount.provider !== meta.routeExpectedProvider
-				) {
+				const constraintViolation = getRouteProfileConstraintViolation(
+					forcedAccount,
+					meta,
+					effectiveModel,
+				);
+				if (constraintViolation) {
 					throw new ForceRouteUnavailableError(
 						forcedAccountId,
-						"provider_mismatch",
+						constraintViolation,
 					);
-				}
-				if (meta.routeExpectedPhysicalModel) {
-					const mappedModels = effectiveModel
-						? getModelList(effectiveModel, forcedAccount)
-						: null;
-					const firstPhysicalModel = effectiveModel
-						? (mappedModels?.[0] ?? effectiveModel)
-						: null;
-					if (firstPhysicalModel !== meta.routeExpectedPhysicalModel) {
-						throw new ForceRouteUnavailableError(
-							forcedAccountId,
-							"model_mapping_mismatch",
-						);
-					}
 				}
 			}
 			let forcedRouting: RoutingCandidateMetadata | undefined;
@@ -2215,6 +2373,9 @@ async function selectAccountsForRequestInternal(
 				matchesCapabilityRouteProfile(account, meta) &&
 				!isProviderExcludedForRequest(account, excludedProviders),
 		);
+		if (matchingAccounts.length === 0) {
+			throw capabilityRouteUnavailable(meta, matchingAccounts);
+		}
 		const selected = await getOrderedAccounts(
 			meta,
 			ctx,
@@ -2697,8 +2858,10 @@ async function selectAccountsForRequestInternal(
 		options.degradedOwner,
 		priorServerToolCatalog,
 		(accounts) => {
-			const eligible = applyNormalImplicitFallbackPolicy(
-				applyExclusions(accounts),
+			const eligible = applyOrdinaryStockModelEligibility(
+				applyNormalImplicitFallbackPolicy(applyExclusions(accounts)),
+				meta,
+				effectiveModel,
 			);
 			return effectiveModel &&
 				isForceAccountModelEnabled(ctx) &&

@@ -2108,6 +2108,169 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(harness.strategySelect).toHaveBeenCalledTimes(1);
 	});
 
+	it("rejects an exact profile when a later configured physical fallback differs", async () => {
+		const routed = makeAccount();
+		routed.model_mappings = JSON.stringify({
+			opus: ["gpt-5.6-sol", "gpt-5.6-terra"],
+		});
+		const harness = makeContext(
+			makeRegistry({ expectedPhysicalModel: "gpt-5.6-sol" }),
+			{ accounts: [routed] },
+		);
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest("/v1/messages", PROFILE_MODEL);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({
+			error: { reason: "model_mapping_mismatch" },
+		});
+		expect(harness.strategySelect).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("rejects a capability profile when a later configured physical fallback differs", async () => {
+		const candidate = makeAccount("capability-multi-map");
+		candidate.model_mappings = JSON.stringify({
+			opus: ["gpt-5.6-sol", "gpt-5.6-terra"],
+		});
+		const harness = makeContext(makeCapabilityRegistry(), {
+			accounts: [candidate],
+		});
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest("/v1/messages", CAPABILITY_PROFILE_MODEL);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({
+			error: { reason: "model_mapping_mismatch" },
+		});
+		expect(harness.strategySelect).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("fails closed when an inherited capability child maps outside the root physical model", async () => {
+		const routed = makeAccount();
+		routed.model_mappings = JSON.stringify({
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+		});
+		const harness = makeContext(makeCapabilityRegistry(), {
+			accounts: [routed],
+		});
+		const { fetchMock, requests } = installJsonUpstream();
+		const session = {
+			"x-claude-code-session-id": "capability-child-physical-mismatch",
+		};
+		const root = apiRequest("/v1/messages", CAPABILITY_PROFILE_MODEL, session);
+		expect(
+			(await handleProxy(root, new URL(root.url), harness.ctx, "key-1")).status,
+		).toBe(200);
+		expect(
+			getServedAccountObservation(session["x-claude-code-session-id"]),
+		).toMatchObject({
+			accountId: ROUTE_ACCOUNT_ID,
+			routeProfileId: "sol-capability",
+		});
+
+		const child = apiRequest("/v1/messages", CHILD_MODEL, {
+			...session,
+			"x-claude-code-agent-id": "capability-child-physical-mismatch",
+		});
+		const response = await handleProxy(
+			child,
+			new URL(child.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(503);
+		const payload = (await response.json()) as {
+			error: Record<string, unknown>;
+		};
+		expect(payload.error).toMatchObject({
+			type: "force_route_unavailable",
+			reason: "model_mapping_mismatch",
+		});
+		expect(payload.error).not.toHaveProperty("account_id");
+		expect(JSON.stringify(payload)).not.toContain(ROUTE_ACCOUNT_ID);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(requests).toHaveLength(1);
+	});
+
+	it("advances past a candidate whose inherited child mapping diverges to a compliant sibling candidate", async () => {
+		// Regression for issue #284: a ForceRouteUnavailableError raised by the
+		// pre-transport route-profile constraint check inside a single
+		// candidate's attempt plan is that candidate's failure alone. With two
+		// capability-matching accounts, the first candidate's divergent child
+		// mapping must not short-circuit the whole request into a 503 — the
+		// second, compliant candidate must still be attempted and win.
+		const mismatched = makeAccount();
+		mismatched.model_mappings = JSON.stringify({
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+		});
+		const compliant = makeAccount("capability-child-compliant-secondary");
+		compliant.model_mappings = JSON.stringify({
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-sol",
+		});
+		const harness = makeContext(makeCapabilityRegistry(), {
+			accounts: [mismatched, compliant],
+		});
+		harness.strategySelect.mockImplementation(
+			(accounts: Account[]) => accounts,
+		);
+		const { fetchMock, requests } = installJsonUpstream();
+		const session = {
+			"x-claude-code-session-id": "capability-child-second-candidate",
+		};
+		const root = apiRequest("/v1/messages", CAPABILITY_PROFILE_MODEL, session);
+		expect(
+			(await handleProxy(root, new URL(root.url), harness.ctx, "key-1")).status,
+		).toBe(200);
+		expect(
+			getServedAccountObservation(session["x-claude-code-session-id"]),
+		).toMatchObject({
+			accountId: ROUTE_ACCOUNT_ID,
+			routeProfileId: "sol-capability",
+		});
+
+		const child = apiRequest("/v1/messages", CHILD_MODEL, {
+			...session,
+			"x-claude-code-agent-id": "capability-child-second-candidate",
+		});
+		const response = await handleProxy(
+			child,
+			new URL(child.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		// The mismatched candidate must never reach transport (0 requests for
+		// it), yet the request as a whole must still succeed via the second,
+		// compliant candidate — proving both candidates were considered.
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(requests).toHaveLength(2);
+		expect(requests[0]?.url).toContain(`/${ROUTE_ACCOUNT_ID}/v1/messages`);
+		expect(requests[1]?.url).toContain(
+			"/capability-child-compliant-secondary/v1/messages",
+		);
+	});
+
 	it("applies the exact route rewrite, account pin, and default effort to count_tokens", async () => {
 		const fallback = makeAccount("normal-route");
 		const harness = makeContext(makeRegistry(), {

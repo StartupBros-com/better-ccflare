@@ -108,7 +108,12 @@ afterEach(() => {
 
 describe("handleProxy usage throttling", () => {
 	it("returns 529 with Retry-After when all selected accounts are throttled", async () => {
-		const account = makeAccount();
+		// Natively-serving provider: this test's subject is usage-throttling
+		// admission, not managed-routing model mapping, so the account must pass
+		// the ordinary stock-model integrity fence (a Codex account with
+		// model_mappings: null would resolve as a provider-default rewrite and
+		// be excluded before the throttle check runs).
+		const account = makeAccount({ provider: "anthropic" });
 		const now = Date.UTC(2026, 3, 28, 12, 0, 0);
 		const resetAt = new Date(now + 2 * 60 * 60 * 1000).toISOString();
 		usageCache.set(account.id, {

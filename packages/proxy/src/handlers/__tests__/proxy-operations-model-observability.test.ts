@@ -267,6 +267,40 @@ describe("proxyWithAccount — combo override success-conditioning / observabili
 		return handleStart;
 	}
 
+	it("rejects a direct profile attempt whose concrete planned model escapes profile metadata before transport", async () => {
+		installUsageCollector();
+		const fetchMock = mock(async () =>
+			jsonResponse({ id: "must-not-dispatch" }, 200),
+		);
+		globalThis.fetch = fetchMock;
+		const bodyBuffer = makeRequestBody("claude-sonnet-4-5");
+
+		await expect(
+			proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				makeAccount({
+					model_mappings: JSON.stringify({
+						"claude-sonnet-4-5": "physical-outside-profile",
+					}),
+				}),
+				makeRequestMeta({
+					routeProfileId: "profile-physical-boundary",
+					routeExpectedProvider: "openai-compatible",
+					routeExpectedPhysicalModel: "physical-in-profile",
+				}),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+			),
+		).rejects.toMatchObject({
+			name: "ForceRouteUnavailableError",
+			reason: "model_mapping_mismatch",
+		});
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
 	it("combo override wins over an earlier agent rewrite: applied_model = combo override, original_model = client model, delta.from = agent baseline", async () => {
 		const handleStart = installUsageCollector();
 		globalThis.fetch = mock(async () =>

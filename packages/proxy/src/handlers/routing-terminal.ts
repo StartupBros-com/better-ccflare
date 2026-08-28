@@ -680,6 +680,28 @@ export function createRoutingTerminalResponse(
 			}),
 		};
 	}
+	// A selector that conclusively excluded every ordinary route on model-integrity
+	// policy has no capacity or circuit topology to report. This must precede
+	// model/pool recovery classification: the raw account snapshot can contain a
+	// finite cooldown, but that is not a recovery claim for a route policy did
+	// not admit. Keep the bounded aggregate diagnostics, while withholding route
+	// names and any retry-authorizing circuit hint.
+	if (
+		options.source === "selection" &&
+		options.routingSelectionDiagnostics?.zeroAttemptReason === "policy_excluded"
+	) {
+		return {
+			kind: "route_unavailable",
+			response: createRouteUnavailableResponse({
+				accounts: [],
+				now,
+				message: options.message,
+				attemptedRoutes: 0,
+				routingSelectionDiagnostics: options.routingSelectionDiagnostics,
+				routeCircuitRecoveryHint: null,
+			}),
+		};
+	}
 	const allAttemptedRoutesAuthFailed =
 		options.source === "attempts" &&
 		(options.authFailureCount ?? 0) > 0 &&

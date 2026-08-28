@@ -244,8 +244,14 @@ describe("KTD-5: clearSession on no-account-served exits", () => {
 	});
 
 	it("clears on the usage-throttled early return", async () => {
+		// Natively-serving provider: this test's subject is the KTD-5 session
+		// clear on the usage-throttle exit, not managed-routing model mapping, so
+		// the account must pass the ordinary stock-model integrity fence (a Codex
+		// account with model_mappings: null would resolve as a provider-default
+		// rewrite and be excluded before the throttle check runs).
 		const account = makeAccount({
 			id: "acc-throttled",
+			provider: "anthropic",
 			access_token: "access-token",
 			expires_at: Date.now() + 60_000,
 		});
