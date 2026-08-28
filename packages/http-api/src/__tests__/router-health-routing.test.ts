@@ -152,6 +152,18 @@ describe("APIRouter — GET /health routing block (#197)", () => {
 			dbOps,
 			alertService,
 			getStrategy: () => strategy,
+			getMemorySnapshot: () => ({
+				rss: 101,
+				heapTotal: 102,
+				heapUsed: 103,
+				external: 104,
+				arrayBuffers: 105,
+				startupRss: 100,
+				peakRss: 110,
+				rssGrowth: 1,
+				uptimeSeconds: 12,
+				lifecycle: { trackedStreams: 4, pendingRequests: 5 },
+			}),
 		} as unknown as APIContext;
 		const router = new APIRouter(context);
 
@@ -161,6 +173,18 @@ describe("APIRouter — GET /health routing block (#197)", () => {
 		expect(res?.status).toBe(200);
 		const body = (await res?.json()) as HealthResponse;
 
+		expect(body.runtime?.memory).toEqual({
+			rss: 101,
+			heapTotal: 102,
+			heapUsed: 103,
+			external: 104,
+			arrayBuffers: 105,
+			startupRss: 100,
+			peakRss: 110,
+			rssGrowth: 1,
+			uptimeSeconds: 12,
+			lifecycle: { trackedStreams: 4, pendingRequests: 5 },
+		});
 		expect(body.routing).toEqual({
 			affinityEntries: 1,
 			routeSuppressionEntries: 0,

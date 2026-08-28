@@ -129,13 +129,12 @@ describe("createHealthHandler — pool.usage_exhausted in the response", () => {
 				{ id: "a2", name: "a2", provider: "anthropic", paused: false },
 			]),
 			config,
-			undefined,
-			undefined,
-			undefined,
-			(account) => ({
-				utilization: account.id === "a2" ? 100 : 10,
-				resetMs: null,
-			}),
+			{
+				getAccountUsageInfo: (account) => ({
+					utilization: account.id === "a2" ? 100 : 10,
+					resetMs: null,
+				}),
+			},
 		);
 
 		const response = await handler(new URL("http://localhost/health"));

@@ -75,6 +75,22 @@ type IntegrityStatusFn = () => IntegrityStatus;
 type AnthropicDegradedHealthFn = () => AnthropicDegradedRuntimeHealth;
 type RetentionStatusFn = () => RetentionStatus;
 
+export type HealthHandlerRuntimeProviders = Readonly<{
+	getAsyncWriterHealth?: AsyncWriterHealthFn;
+	getUsageWorkerHealth?: UsageWorkerHealthFn;
+	getIntegrityStatus?: IntegrityStatusFn;
+	getAccountUsageInfo?: AccountUsageInfoFn;
+	getAnthropicDegradedHealth?: AnthropicDegradedHealthFn;
+	getRetentionStatus?: RetentionStatusFn;
+	getRoutingHealth?: () => RoutingHealth | undefined;
+	getBodyAdmissionHealth?: () => NonNullable<
+		NonNullable<HealthResponse["runtime"]>["bodyAdmission"]
+	>;
+	getMemorySnapshot?: () => NonNullable<
+		NonNullable<HealthResponse["runtime"]>["memory"]
+	>;
+}>;
+
 export function computePoolStatus(
 	accounts: Account[],
 	now: number,
@@ -166,16 +182,17 @@ function toHttpStatus(status: HealthResponse["status"]): 200 | 503 {
 export function createHealthHandler(
 	dbOps: DatabaseOperations,
 	config: Config,
-	getAsyncWriterHealth?: AsyncWriterHealthFn,
-	getUsageWorkerHealth?: UsageWorkerHealthFn,
-	getIntegrityStatus?: IntegrityStatusFn,
-	getAccountUsageInfo: AccountUsageInfoFn = usageCacheUsageInfo,
-	getAnthropicDegradedHealth?: AnthropicDegradedHealthFn,
-	getRetentionStatus?: RetentionStatusFn,
-	getRoutingHealth?: () => RoutingHealth | undefined,
-	getBodyAdmissionHealth?: () => NonNullable<
-		NonNullable<HealthResponse["runtime"]>["bodyAdmission"]
-	>,
+	{
+		getAsyncWriterHealth,
+		getUsageWorkerHealth,
+		getIntegrityStatus,
+		getAccountUsageInfo = usageCacheUsageInfo,
+		getAnthropicDegradedHealth,
+		getRetentionStatus,
+		getRoutingHealth,
+		getBodyAdmissionHealth,
+		getMemorySnapshot,
+	}: HealthHandlerRuntimeProviders = {},
 ) {
 	const normalCache = new TtlCache<HealthResponse>(2000);
 	const detailCache = new TtlCache<HealthResponse>(2000);
@@ -253,6 +270,12 @@ export function createHealthHandler(
 			const runtime = response.runtime ?? {};
 			response.runtime = runtime;
 			runtime.anthropicDegraded = getAnthropicDegradedHealth();
+		}
+
+		if (getMemorySnapshot) {
+			const runtime = response.runtime ?? {};
+			response.runtime = runtime;
+			runtime.memory = getMemorySnapshot();
 		}
 
 		if (getBodyAdmissionHealth) {
