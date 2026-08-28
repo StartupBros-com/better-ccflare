@@ -200,6 +200,7 @@ export class APIRouter {
 			getAnthropicDegradedHealth,
 			getRetentionStatus,
 			getBodyAdmissionHealth,
+			getMemorySnapshot,
 			getStrategy,
 		} = this.context;
 
@@ -215,6 +216,7 @@ export class APIRouter {
 			getRetentionStatus,
 			() => getStrategy?.()?.getRoutingHealth?.(),
 			getBodyAdmissionHealth,
+			getMemorySnapshot,
 		);
 		const statsHandler = createStatsHandler(dbOps);
 		const statsResetHandler = createStatsResetHandler(dbOps);
@@ -298,9 +300,9 @@ export class APIRouter {
 		const versionCheckHandler = createVersionCheckHandler();
 
 		// Debug/profiling handlers
-		const heapStatsHandler = createHeapStatsHandler();
+		const heapStatsHandler = createHeapStatsHandler(getMemorySnapshot);
 		const heapSnapshotHandler = createHeapSnapshotHandler();
-		const rssHandler = createRssHandler();
+		const rssHandler = createRssHandler(getMemorySnapshot);
 
 		// API Key handlers
 		const apiKeysListHandler = createApiKeysListHandler(dbOps);

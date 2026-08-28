@@ -11,21 +11,27 @@
 
 // @ts-expect-error — bun:jsc types are incomplete; generateHeapSnapshotForDebugging exists at runtime
 import { generateHeapSnapshotForDebugging, heapStats } from "bun:jsc";
+import { MemoryMonitor } from "@better-ccflare/core";
+import type { MemorySnapshot } from "@better-ccflare/types";
 
 /**
  * Returns JSC heap statistics — object counts by type, heap size,
  * extra memory (native allocations outside JSC). Diff two calls
  * to see what's accumulating.
  */
-export function createHeapStatsHandler() {
-	return (): Response => {
-		const stats = heapStats();
-		const rss = process.memoryUsage.rss();
+export function createHeapStatsHandler(
+	getMemorySnapshot?: () => MemorySnapshot,
+) {
+	const fallbackMonitor = new MemoryMonitor();
+	const readMemory = getMemorySnapshot ?? (() => fallbackMonitor.snapshot());
 
+	return (): Response => {
+		const memory = readMemory();
 		return Response.json({
-			rss_mb: Math.round(rss / 1024 / 1024),
+			rss_mb: Math.round(memory.rss / 1024 / 1024),
 			timestamp: new Date().toISOString(),
-			heap: stats,
+			heap: heapStats(),
+			memory,
 		});
 	};
 }
@@ -59,14 +65,18 @@ export function createHeapSnapshotHandler() {
  * Lightweight RSS check — just the number, no heap walk.
  * Use for continuous monitoring: while true; do curl -s .../rss; sleep 30; done
  */
-export function createRssHandler() {
+export function createRssHandler(getMemorySnapshot?: () => MemorySnapshot) {
+	const fallbackMonitor = new MemoryMonitor();
+	const readMemory = getMemorySnapshot ?? (() => fallbackMonitor.snapshot());
+
 	return (): Response => {
-		const rss = process.memoryUsage.rss();
+		const memory = readMemory();
 		return Response.json({
-			rss_bytes: rss,
-			rss_mb: Math.round(rss / 1024 / 1024),
+			rss_bytes: memory.rss,
+			rss_mb: Math.round(memory.rss / 1024 / 1024),
 			timestamp: new Date().toISOString(),
-			uptime_s: Math.round(process.uptime()),
+			uptime_s: Math.round(memory.uptimeSeconds),
+			memory,
 		});
 	};
 }

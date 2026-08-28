@@ -123,6 +123,57 @@ describe("health runtime payload", () => {
 		});
 	});
 
+	it("includes the supported aggregate memory snapshot in runtime health", async () => {
+		const db = {
+			getAllAccounts: async () => [
+				{ name: "acc1", paused: false, rate_limited_until: null },
+			],
+		} as unknown as import("@better-ccflare/database").DatabaseOperations;
+		const config = {
+			getStrategy: () => "session",
+			getHealthDetailEnabled: () => false,
+		} as unknown as import("@better-ccflare/config").Config;
+
+		const response = await createHealthHandler(
+			db,
+			config,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			() => ({
+				rss: 101,
+				heapTotal: 102,
+				heapUsed: 103,
+				external: 104,
+				arrayBuffers: 105,
+				startupRss: 100,
+				peakRss: 110,
+				rssGrowth: 1,
+				uptimeSeconds: 12,
+				lifecycle: { trackedStreams: 4, pendingRequests: 5 },
+			}),
+		)(new URL("http://localhost/health"));
+		const body = (await response.json()) as HealthResponse;
+
+		expect(body.runtime?.memory).toEqual({
+			rss: 101,
+			heapTotal: 102,
+			heapUsed: 103,
+			external: 104,
+			arrayBuffers: 105,
+			startupRss: 100,
+			peakRss: 110,
+			rssGrowth: 1,
+			uptimeSeconds: 12,
+			lifecycle: { trackedStreams: 4, pendingRequests: 5 },
+		});
+	});
+
 	it("omits optional runtime and routing health when callbacks are not provided", async () => {
 		const db = {
 			getAllAccounts: async () => [

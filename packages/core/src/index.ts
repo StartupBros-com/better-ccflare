@@ -41,6 +41,7 @@ export {
 } from "./errors";
 export * from "./force-account-model";
 export * from "./lifecycle";
+export * from "./memory-monitor";
 export {
 	type BoundedOAuthResponseText,
 	MAX_OAUTH_ERROR_INPUT_LENGTH,

@@ -16,6 +16,7 @@ import {
 	initializeNanoGPTPricingIfAccountsExist,
 	installOutboundProxy,
 	intervalManager,
+	MemoryMonitor,
 	NETWORK,
 	registerCleanup,
 	registerDisposable,
@@ -1300,6 +1301,7 @@ export default async function startServer(options?: {
 		queueLimit: config.getMaxBodyAdmissionQueue(),
 	});
 	activeBodyAdmission = bodyAdmission;
+	const memoryMonitor = new MemoryMonitor();
 	// Route profiles are strict operator intent. Validate before database startup,
 	// background jobs, or the HTTP listener can make this process look healthy.
 	const modelRouteProfiles = parseModelRouteProfiles();
@@ -1638,6 +1640,18 @@ export default async function startServer(options?: {
 				}),
 			getRetentionStatus,
 			getBodyAdmissionHealth: () => bodyAdmission.snapshot(),
+			getMemorySnapshot: () => {
+				const admission = bodyAdmission.snapshot();
+				return memoryMonitor.snapshot({
+					bodyAdmission: {
+						activeLeases: admission.activeLeases,
+						reservedBytes: admission.reservedBytes,
+						queuedRequests: admission.queuedRequests,
+					},
+					trackedStreams: inflightStreams.size,
+					pendingRequests: serverInstance?.pendingRequests ?? 0,
+				});
+			},
 			getStrategy: () => currentStrategy,
 			internalProbeSecret,
 			localControlSecret,
@@ -2433,14 +2447,13 @@ export default async function startServer(options?: {
 		throw error;
 	}
 
-	// Memory monitoring - log RSS every 60s with warnings at growth thresholds
-	const baselineRss = process.memoryUsage.rss();
+	// Memory monitoring - log the same restart-scoped snapshot served by APIs.
 	const memLog = new Logger("MemoryMonitor");
 	memoryMonitorInterval = setInterval(() => {
-		const mem = process.memoryUsage();
-		const rssMb = Math.round(mem.rss / 1024 / 1024);
-		const heapMb = Math.round(mem.heapUsed / 1024 / 1024);
-		const growthBytes = mem.rss - baselineRss;
+		const memory = memoryMonitor.snapshot();
+		const rssMb = Math.round(memory.rss / 1024 / 1024);
+		const heapMb = Math.round(memory.heapUsed / 1024 / 1024);
+		const growthBytes = memory.rssGrowth;
 		const growthMb = Math.round(growthBytes / 1024 / 1024);
 
 		if (growthBytes > MEMORY_GROWTH_ERROR_BYTES) {

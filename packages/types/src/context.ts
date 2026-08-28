@@ -11,6 +11,7 @@ import type { ApiKey } from "./api-key";
 import type {
 	AnthropicDegradedRuntimeHealth,
 	IntegrityStatus,
+	MemorySnapshot,
 	RetentionStatus,
 	RoutingHealth,
 } from "./stats";
@@ -88,6 +89,8 @@ export interface APIContext {
 	/** Fixed aggregate-only, restart-scoped degraded-mode health snapshot. */
 	getAnthropicDegradedHealth?: () => AnthropicDegradedRuntimeHealth;
 	getRetentionStatus?: () => RetentionStatus;
+	/** Restart-scoped, aggregate-only process memory and lifecycle telemetry. */
+	getMemorySnapshot?: () => MemorySnapshot;
 	/** Aggregate-only process-local Bun request-body admission telemetry. */
 	getBodyAdmissionHealth?: () => {
 		enabled: boolean;

@@ -295,6 +295,33 @@ export interface AnthropicDegradedRuntimeHealth {
 	saturation: boolean;
 }
 
+/**
+ * Allow-listed, aggregate-only process memory telemetry. All memory values
+ * except `uptimeSeconds` are raw bytes. `external` includes `arrayBuffers`,
+ * so consumers must keep both fields separate rather than summing them into
+ * an invented native-memory metric.
+ */
+export interface MemorySnapshot {
+	rss: number;
+	heapTotal: number;
+	heapUsed: number;
+	external: number;
+	arrayBuffers: number;
+	startupRss: number;
+	peakRss: number;
+	rssGrowth: number;
+	uptimeSeconds: number;
+	lifecycle?: {
+		bodyAdmission?: {
+			activeLeases: number;
+			reservedBytes: number;
+			queuedRequests: number;
+		};
+		trackedStreams?: number;
+		pendingRequests?: number;
+	};
+}
+
 // Health check response
 export interface HealthResponse {
 	status: string;
@@ -337,6 +364,7 @@ export interface HealthResponse {
 			state: string;
 		};
 		anthropicDegraded?: AnthropicDegradedRuntimeHealth;
+		memory?: MemorySnapshot;
 		bodyAdmission?: {
 			enabled: boolean;
 			budgetBytes: number;

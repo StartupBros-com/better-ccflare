@@ -176,6 +176,9 @@ export function createHealthHandler(
 	getBodyAdmissionHealth?: () => NonNullable<
 		NonNullable<HealthResponse["runtime"]>["bodyAdmission"]
 	>,
+	getMemorySnapshot?: () => NonNullable<
+		NonNullable<HealthResponse["runtime"]>["memory"]
+	>,
 ) {
 	const normalCache = new TtlCache<HealthResponse>(2000);
 	const detailCache = new TtlCache<HealthResponse>(2000);
@@ -253,6 +256,12 @@ export function createHealthHandler(
 			const runtime = response.runtime ?? {};
 			response.runtime = runtime;
 			runtime.anthropicDegraded = getAnthropicDegradedHealth();
+		}
+
+		if (getMemorySnapshot) {
+			const runtime = response.runtime ?? {};
+			response.runtime = runtime;
+			runtime.memory = getMemorySnapshot();
 		}
 
 		if (getBodyAdmissionHealth) {
