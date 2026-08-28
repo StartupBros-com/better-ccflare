@@ -8,6 +8,11 @@
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import {
+	BODY_MODEL_AFTER_TRANSFORM,
+	createClaudeRequestBody,
+	runProxyRequestBodyWorkload,
+} from "../../../../bench/proxy-request-memory-harness";
+import {
 	BodyAdmissionController,
 	withBodyAdmission,
 } from "../../../../apps/server/src/body-admission";
@@ -107,6 +112,38 @@ describe("proxy response-body ownership baseline", () => {
 	const cleanups: Array<() => void> = [];
 	afterEach(() => {
 		for (const cleanup of cleanups.splice(0)) cleanup();
+	});
+
+	it("request body: forwards one boundary-sized transformed body without response lifecycle work", async () => {
+		const bodyBytes = 4 * 1024;
+		const generated = createClaudeRequestBody(bodyBytes);
+		expect(generated.byteLength).toBe(bodyBytes);
+
+		const result = await runProxyRequestBodyWorkload({
+			bodyBytes,
+			concurrency: 1,
+		});
+
+		expect(result).toEqual({
+			bodyBytes,
+			concurrency: 1,
+			generatedBodyBytes: [bodyBytes],
+			responses: [{ status: 204, responseBytes: 0 }],
+			upstream: {
+				requests: 1,
+				receivedBodyBytes: [bodyBytes],
+				receivedModels: [BODY_MODEL_AFTER_TRANSFORM],
+				completed: 1,
+				cancelled: 0,
+				aborted: 0,
+				responseStream: {
+					pulls: 0,
+					completed: 0,
+					cancelled: 0,
+					aborted: 0,
+				},
+			},
+		});
 	});
 
 	it("success: fully drains one forwarded finite response and releases its admission lease", async () => {
