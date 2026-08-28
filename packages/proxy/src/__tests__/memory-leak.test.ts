@@ -8,14 +8,15 @@
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import {
-	BODY_MODEL_AFTER_TRANSFORM,
-	createClaudeRequestBody,
-	runProxyRequestBodyWorkload,
-} from "../../../../bench/proxy-request-memory-harness";
-import {
 	BodyAdmissionController,
 	withBodyAdmission,
 } from "../../../../apps/server/src/body-admission";
+import {
+	BODY_MODEL_AFTER_TRANSFORM,
+	BODY_MODEL_BEFORE_TRANSFORM,
+	createClaudeRequestBody,
+	runProxyRequestBodyWorkload,
+} from "../../../../bench/proxy-request-memory-harness";
 import {
 	cancelDiscardedResponseBody,
 	drainBody,
@@ -37,6 +38,123 @@ type Upstream = {
 };
 
 const encoder = new TextEncoder();
+const PROCESS_MEMORY_FIELDS = [
+	"arrayBuffers",
+	"external",
+	"heapTotal",
+	"heapUsed",
+	"rss",
+];
+const HEAP_STATS_SCALAR_FIELDS = [
+	"extraMemorySize",
+	"globalObjectCount",
+	"heapCapacity",
+	"heapSize",
+	"objectCount",
+	"protectedGlobalObjectCount",
+	"protectedObjectCount",
+];
+
+type RequestBodyWorkloadResult = Awaited<
+	ReturnType<typeof runProxyRequestBodyWorkload>
+>;
+
+function expectNumericRecord(
+	record: Record<string, number>,
+	expectedFields: string[],
+): void {
+	expect(Object.keys(record).sort()).toEqual(expectedFields);
+	expect(Object.values(record).every(Number.isFinite)).toBe(true);
+}
+
+function expectRequestBodyAttribution(
+	result: RequestBodyWorkloadResult,
+	bodyBytes: number,
+	expectedModel: string,
+	expectedPhaseNames: string[],
+): void {
+	expect(result).toMatchObject({
+		bun: Bun.version,
+		platform: `${process.platform}/${process.arch}`,
+		bodyBytes,
+		concurrency: 1,
+		expectedModel,
+		generatedBodyBytes: [bodyBytes],
+		responses: [{ status: 204, responseBytes: 0 }],
+		upstream: {
+			requests: 1,
+			receivedBodyBytes: [bodyBytes],
+			receivedModels: [expectedModel],
+			completed: 1,
+			cancelled: 0,
+			aborted: 0,
+			responseStream: {
+				pulls: 0,
+				completed: 0,
+				cancelled: 0,
+				aborted: 0,
+			},
+		},
+	});
+	expect(result.phases.map((phase) => phase.name)).toEqual(expectedPhaseNames);
+	expect(result.memoryAccounting.rssArithmeticRemainder).toContain(
+		"not native memory",
+	);
+	expect(result.memoryAccounting.arrayBuffers).toContain("subset of external");
+	expect(result.memoryAccounting.phaseDeltas).toContain("not additive");
+	expect(result.memoryAccounting.childIsolation).toContain(
+		"child process memory is excluded",
+	);
+	expect(result.upstreamProcess).toMatchObject({
+		ready: true,
+		statsFetched: true,
+		terminationRequested: true,
+		exited: true,
+		exitCode: 0,
+	});
+	expect(result.upstreamProcess.pid).toBeGreaterThan(0);
+	expect(() => process.kill(result.upstreamProcess.pid, 0)).toThrow();
+
+	const baseline = result.phases[0];
+	const baselineRemainder = baseline.rssArithmeticRemainder.absolute;
+	for (const phase of result.phases) {
+		expect(phase.observationCount).toBe(1);
+		expectNumericRecord(phase.absolute.memory, PROCESS_MEMORY_FIELDS);
+		expectNumericRecord(phase.absolute.heapStats, HEAP_STATS_SCALAR_FIELDS);
+		expectNumericRecord(
+			phase.deltaFromWaveBaseline.memory,
+			PROCESS_MEMORY_FIELDS,
+		);
+		expectNumericRecord(
+			phase.deltaFromWaveBaseline.heapStats,
+			HEAP_STATS_SCALAR_FIELDS,
+		);
+		expect(Number.isFinite(phase.rssArithmeticRemainder.absolute)).toBe(true);
+		expect(
+			Number.isFinite(phase.rssArithmeticRemainder.deltaFromWaveBaseline),
+		).toBe(true);
+		expect(phase.rssArithmeticRemainder.absolute).toBe(
+			phase.absolute.memory.rss -
+				phase.absolute.memory.heapTotal -
+				phase.absolute.memory.external,
+		);
+		expect(phase.rssArithmeticRemainder.deltaFromWaveBaseline).toBe(
+			phase.rssArithmeticRemainder.absolute - baselineRemainder,
+		);
+	}
+
+	expect(
+		Object.values(baseline.deltaFromWaveBaseline.memory).every(
+			(value) => value === 0,
+		),
+	).toBe(true);
+	expect(
+		Object.values(baseline.deltaFromWaveBaseline.heapStats).every(
+			(value) => value === 0,
+		),
+	).toBe(true);
+	expect(baseline.rssArithmeticRemainder.deltaFromWaveBaseline).toBe(0);
+}
 
 function startUpstream(): Upstream {
 	const state = {
@@ -122,28 +240,139 @@ describe("proxy response-body ownership baseline", () => {
 		const result = await runProxyRequestBodyWorkload({
 			bodyBytes,
 			concurrency: 1,
+			transformMode: "clone-rewrite",
 		});
+		expect(result.transformMode).toBe("clone-rewrite");
+		expectRequestBodyAttribution(
+			result,
+			bodyBytes,
+			BODY_MODEL_AFTER_TRANSFORM,
+			[
+				"pre-body-baseline",
+				"exact-size-body-generated",
+				"inbound-request-constructed",
+				"prepare-request-body-complete",
+				"request-body-context-constructed",
+				"request-body-context-parsed",
+				"provider-before-transform",
+				"provider-clone-text-read",
+				"provider-json-parsed",
+				"provider-stringify-request-rebuilt",
+				"loopback-response-received",
+				"proxy-with-account-complete",
+				"response-consumed",
+				"post-gc-settled",
+			],
+		);
+	});
 
-		expect(result).toEqual({
+	it("request body: passthrough preserves the source model at an explicit provider boundary", async () => {
+		const bodyBytes = 4 * 1024;
+		const result = await runProxyRequestBodyWorkload({
 			bodyBytes,
 			concurrency: 1,
-			generatedBodyBytes: [bodyBytes],
-			responses: [{ status: 204, responseBytes: 0 }],
-			upstream: {
-				requests: 1,
-				receivedBodyBytes: [bodyBytes],
-				receivedModels: [BODY_MODEL_AFTER_TRANSFORM],
-				completed: 1,
-				cancelled: 0,
-				aborted: 0,
-				responseStream: {
-					pulls: 0,
-					completed: 0,
-					cancelled: 0,
-					aborted: 0,
-				},
-			},
+			transformMode: "passthrough",
 		});
+
+		expect(result.transformMode).toBe("passthrough");
+		expectRequestBodyAttribution(
+			result,
+			bodyBytes,
+			BODY_MODEL_BEFORE_TRANSFORM,
+			[
+				"pre-body-baseline",
+				"exact-size-body-generated",
+				"inbound-request-constructed",
+				"prepare-request-body-complete",
+				"request-body-context-constructed",
+				"request-body-context-parsed",
+				"provider-before-transform",
+				"provider-passthrough-return",
+				"loopback-response-received",
+				"proxy-with-account-complete",
+				"response-consumed",
+				"post-gc-settled",
+			],
+		);
+	});
+
+	it("request body: consume-rebuild attributes source consumption before rebuilding", async () => {
+		const bodyBytes = 4 * 1024;
+		const result = await runProxyRequestBodyWorkload({
+			bodyBytes,
+			concurrency: 1,
+			transformMode: "consume-rebuild",
+		});
+
+		expect(result.transformMode).toBe("consume-rebuild");
+		expectRequestBodyAttribution(
+			result,
+			bodyBytes,
+			BODY_MODEL_AFTER_TRANSFORM,
+			[
+				"pre-body-baseline",
+				"exact-size-body-generated",
+				"inbound-request-constructed",
+				"prepare-request-body-complete",
+				"request-body-context-constructed",
+				"request-body-context-parsed",
+				"provider-before-transform",
+				"provider-source-text-read",
+				"provider-json-parsed",
+				"provider-stringify-request-rebuilt",
+				"loopback-response-received",
+				"proxy-with-account-complete",
+				"response-consumed",
+				"post-gc-settled",
+			],
+		);
+	});
+
+	it("request body: aggregates every concurrent phase without inventing samples", async () => {
+		const concurrency = 2;
+		const bodyBytes = 4 * 1024;
+		const result = await runProxyRequestBodyWorkload({
+			bodyBytes,
+			concurrency,
+			transformMode: "passthrough",
+		});
+
+		expect(result.upstream).toMatchObject({
+			requests: concurrency,
+			receivedBodyBytes: [bodyBytes, bodyBytes],
+			receivedModels: [
+				BODY_MODEL_BEFORE_TRANSFORM,
+				BODY_MODEL_BEFORE_TRANSFORM,
+			],
+			completed: concurrency,
+			cancelled: 0,
+			aborted: 0,
+		});
+		expect(result.upstreamProcess).toMatchObject({
+			ready: true,
+			statsFetched: true,
+			terminationRequested: true,
+			exited: true,
+			exitCode: 0,
+		});
+		expect(() => process.kill(result.upstreamProcess.pid, 0)).toThrow();
+		for (const phase of result.phases) {
+			const expected =
+				phase.name === "pre-body-baseline" || phase.name === "post-gc-settled"
+					? 1
+					: concurrency;
+			expect(phase.observationCount).toBe(expected);
+		}
+	});
+
+	it("request body: rejects unknown transform modes before opening transport", async () => {
+		await expect(
+			runProxyRequestBodyWorkload({
+				bodyBytes: 4 * 1024,
+				concurrency: 1,
+				transformMode: "unknown" as never,
+			}),
+		).rejects.toThrow("unsupported proxy memory transform mode: unknown");
 	});
 
 	it("success: fully drains one forwarded finite response and releases its admission lease", async () => {
