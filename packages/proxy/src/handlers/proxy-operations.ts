@@ -115,6 +115,11 @@ import {
 } from "../pre-transport-deadline";
 import { RequestBodyContext } from "../request-body-context";
 import {
+	createRequestReplay,
+	materializeRequestForTransport,
+	type RequestReplay,
+} from "../request-replay";
+import {
 	forwardToClient,
 	handleAnthropicSseRateLimit,
 	type ResponseHandlerOptions,
@@ -1295,18 +1300,24 @@ export async function forceModelInTransformedRequest(
 	request: Request,
 	model: string,
 ): Promise<Request> {
+	let materialized;
 	try {
-		const text = await request.clone().text();
-		const body = JSON.parse(text);
-		if (body.model === model) return request;
-		body.model = model;
-		return new Request(request.url, {
-			method: request.method,
-			headers: new Headers(request.headers),
-			body: JSON.stringify(body),
-		});
+		materialized = await materializeRequestForTransport(request);
 	} catch {
 		return request;
+	}
+	try {
+		const body = JSON.parse(materialized.replay.bodyText ?? "");
+		if (body.model === model) return materialized.request;
+		body.model = model;
+		return materialized.replay
+			.withBodyText(JSON.stringify(body))
+			.createRequest();
+	} catch {
+		// Materialization consumed the source. Preserve malformed/non-JSON bodies
+		// through the independently rebuilt transport instead of returning a spent
+		// Request whose body can no longer be sent.
+		return materialized.request;
 	}
 }
 
@@ -4136,15 +4147,22 @@ export async function proxyWithAccount(
 			Boolean(requestMeta.cacheFlightRecorderConversationId);
 		const isSyntheticResponse = isSyntheticProviderResponse(transformedRequest);
 
-		// Pre-strip cache_control for (account, model) pairs known to reject it
 		// Synthetic transports (notably Bedrock) contain the upstream RESPONSE:
-		// never clone/buffer that response as though it were an outbound body.
-		// Consume the one inspection clone now, then reconstruct an independent
-		// retry body from its text below. Keeping an unread Request clone as a
-		// retry template leaves a tee branch retaining the native request buffer.
-		let retryBodyText = isSyntheticResponse
-			? ""
-			: await transformedRequest.clone().text();
+		// never consume that response as though it were an outbound request body.
+		// Real transports are consumed once, then rebuilt from an independently
+		// owned replay snapshot. The snapshot is lightweight text and metadata;
+		// it creates a body-bearing Request only if a retry or rescue is taken.
+		let retryTransportReplay: RequestReplay | null = null;
+		let retryBodyText = "";
+		if (!isSyntheticResponse) {
+			const materialized = await materializeRequestForTransport(
+				transformedRequest,
+			);
+			transformedRequest = materialized.request;
+			retryTransportReplay = materialized.replay;
+			retryBodyText = retryTransportReplay.bodyText ?? "";
+		}
+		// Pre-strip cache_control for (account, model) pairs known to reject it.
 		let currentCacheIdentityHasCacheControl: boolean | undefined =
 			isSyntheticResponse
 				? undefined
@@ -4618,16 +4636,13 @@ export async function proxyWithAccount(
 				>[0],
 			);
 			const strippedBodyText = JSON.stringify(transformedBodyJson);
-			transformedRequest = new Request(transformedRequest.url, {
-				method: transformedRequest.method,
-				headers: transformedRequest.headers,
-				body: strippedBodyText,
-				// A URL-based rebuild drops the signal — carry it over. Belt-and-
-				// braces: executeCacheAwareProviderAttempt below also threads an
-				// explicit AbortSignal into every physical transport, but a rebuilt
-				// Request should never silently lose the one it started with.
-				signal: req.signal,
-			});
+			if (!retryTransportReplay) {
+				throw new Error("Missing transformed transport replay");
+			}
+			retryTransportReplay = retryTransportReplay.withBodyText(
+				strippedBodyText,
+			);
+			transformedRequest = retryTransportReplay.createRequest();
 			retryBodyText = strippedBodyText;
 			currentCacheIdentityHasCacheControl =
 				hasCacheControlHintInJsonText(retryBodyText);
@@ -4639,16 +4654,32 @@ export async function proxyWithAccount(
 		// The 529 in-place retry must resend the CURRENT physical transport, not
 		// the original request: thinking/cache-control retries and model fallback
 		// all replace the outbound body, and reverting silently changes the model.
-		// Rebuild its body from consumed retry text rather than holding an unread
-		// clone of the transformed request, which would retain a tee branch.
-		const retryRequest = new Request(transformedRequest.url, {
-			method: transformedRequest.method,
-			headers: transformedRequest.headers,
-			body: retryBodyText || undefined,
-			signal: req.signal,
-		});
-		let retrySourceRequest = providerRequest;
-		let retryTransformedTemplate = retryRequest;
+		// Keep the transformed snapshot only; materialize its Request inside the
+		// actual retry/rescue branch so a successful request owns one body stream.
+		const initialRetrySourceReplay = createRequestReplay(providerRequest, null);
+		let retrySourceReplay = initialRetrySourceReplay;
+		const materializeRetryTransport = async (
+			request: Request,
+		): Promise<Request> => {
+			const materialized = await materializeRequestForTransport(request);
+			retryTransportReplay = materialized.replay;
+			retryBodyText = materialized.replay.bodyText ?? "";
+			return materialized.request;
+		};
+		const createRetrySourceRequest = (
+			body: ArrayBuffer | null,
+			retryHeaders: Headers,
+			rememberSource = true,
+		): Request => {
+			const retrySource = retrySourceReplay.createRequest({
+				body: body ? new Uint8Array(body) : null,
+				headers: retryHeaders,
+			});
+			if (rememberSource) {
+				retrySourceReplay = createRequestReplay(retrySource, null);
+			}
+			return retrySource;
+		};
 
 		// Make the request, or unwrap a provider response produced during transform.
 		// Both paths first replace/discard cache staging for this physical attempt.
@@ -4673,20 +4704,13 @@ export async function proxyWithAccount(
 			const filteredBodyBuffer = filterThinkingBlocks(currentReplayBody);
 
 			if (filteredBodyBuffer && filteredBodyBuffer !== currentReplayBody) {
-				// Retry the request with filtered body
-				const retryRequestInit: RequestInit & { duplex?: "half" } = {
-					method: req.method,
-					headers,
-					body: new Uint8Array(filteredBodyBuffer),
-					duplex: "half",
-					signal: req.signal,
-				};
-
 				await finalizeCurrentCodexTransport(rawResponse);
 				await discardUpstreamBody(rawResponse);
 				stampCodexAttempt(headers, "thinking_retry");
-				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
-				retrySourceRequest = retryProviderRequest.clone();
+				const retryProviderRequest = createRetrySourceRequest(
+					filteredBodyBuffer,
+					headers,
+				);
 
 				let retryTransformedRequest = await transformWithCurrentAttemptPlan(
 					attemptPlan,
@@ -4696,9 +4720,9 @@ export async function proxyWithAccount(
 					retryTransformedRequest,
 					currentTransportModel,
 				);
-				retryTransformedTemplate = retryTransformedRequest.clone();
-
-				const retryTransportRequest = retryTransformedTemplate.clone();
+				const retryTransportRequest = await materializeRetryTransport(
+					retryTransformedRequest,
+				);
 				currentReplayBody = filteredBodyBuffer;
 				currentCacheIdentityHasCacheControl = undefined;
 				// Make the retry request (or unwrap a synthetic provider response).
@@ -4735,19 +4759,13 @@ export async function proxyWithAccount(
 				log.info(
 					`Codex rejected retained encrypted reasoning for account ${account.name}, retrying with proxy-minted reasoning blocks removed`,
 				);
-				const retryRequestInit: RequestInit & { duplex?: "half" } = {
-					method: req.method,
-					headers,
-					body: new Uint8Array(strippedBodyBuffer),
-					duplex: "half",
-					signal: req.signal,
-				};
-
 				await finalizeCurrentCodexTransport(rawResponse);
 				await discardUpstreamBody(rawResponse);
 				stampCodexAttempt(headers, "reasoning_retry");
-				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
-				retrySourceRequest = retryProviderRequest.clone();
+				const retryProviderRequest = createRetrySourceRequest(
+					strippedBodyBuffer,
+					headers,
+				);
 
 				let retryTransformedRequest = await transformWithCurrentAttemptPlan(
 					attemptPlan,
@@ -4757,9 +4775,9 @@ export async function proxyWithAccount(
 					retryTransformedRequest,
 					currentTransportModel,
 				);
-				retryTransformedTemplate = retryTransformedRequest.clone();
-
-				const retryTransportRequest = retryTransformedTemplate.clone();
+				const retryTransportRequest = await materializeRetryTransport(
+					retryTransformedRequest,
+				);
 				currentReplayBody = strippedBodyBuffer;
 				currentCacheIdentityHasCacheControl = undefined;
 				rawResponse = await executeCacheAwareProviderAttempt(
@@ -4795,18 +4813,13 @@ export async function proxyWithAccount(
 				log.info(
 					`Claude rejected clear_thinking context edit without thinking enabled for account ${account.name}, retrying with the edit removed`,
 				);
-				const retryRequestInit: RequestInit & { duplex?: "half" } = {
-					method: req.method,
-					headers,
-					body: new Uint8Array(strippedBodyBuffer),
-					duplex: "half",
-				};
-
 				await finalizeCurrentCodexTransport(rawResponse);
 				await discardUpstreamBody(rawResponse);
 				stampCodexAttempt(headers, "other_retry");
-				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
-				retrySourceRequest = retryProviderRequest.clone();
+				const retryProviderRequest = createRetrySourceRequest(
+					strippedBodyBuffer,
+					headers,
+				);
 
 				let retryTransformedRequest = await transformWithCurrentAttemptPlan(
 					attemptPlan,
@@ -4816,9 +4829,9 @@ export async function proxyWithAccount(
 					retryTransformedRequest,
 					currentTransportModel,
 				);
-				retryTransformedTemplate = retryTransformedRequest.clone();
-
-				const retryTransportRequest = retryTransformedTemplate.clone();
+				const retryTransportRequest = await materializeRetryTransport(
+					retryTransformedRequest,
+				);
 				currentReplayBody = strippedBodyBuffer;
 				currentCacheIdentityHasCacheControl = undefined;
 				rawResponse = await executeCacheAwareProviderAttempt(
@@ -4871,12 +4884,11 @@ export async function proxyWithAccount(
 					"prompt_cache_breakpoint_retry",
 					currentTransportModel ?? undefined,
 				);
-				const retrySource = new Request(providerRequest.url, {
-					method: providerRequest.method,
-					headers: retryHeaders,
+				const retrySource = initialRetrySourceReplay.createRequest({
 					body: new Uint8Array(replayBody),
+					headers: retryHeaders,
 				});
-				retrySourceRequest = retrySource.clone();
+				retrySourceReplay = createRequestReplay(retrySource, null);
 				let retryTransformed = await transformWithCurrentAttemptPlan(
 					attemptPlan,
 					retrySource,
@@ -4885,19 +4897,9 @@ export async function proxyWithAccount(
 					retryTransformed,
 					currentTransportModel,
 				);
-				// Materialize two independent requests. Reusing nested clone branches here
-				// can leave Bun waiting on tee bookkeeping after the compatibility probe.
-				const retryTransformedBody = await retryTransformed.text();
-				retryTransformedTemplate = new Request(retryTransformed.url, {
-					method: retryTransformed.method,
-					headers: retryTransformed.headers,
-					body: retryTransformedBody,
-				});
-				const retryTransport = new Request(retryTransformed.url, {
-					method: retryTransformed.method,
-					headers: retryTransformed.headers,
-					body: retryTransformedBody,
-				});
+				const retryTransport = await materializeRetryTransport(
+					retryTransformed,
+				);
 				rawResponse = await executeCacheAwareProviderAttempt(
 					retryTransport,
 					replayBody,
@@ -4938,29 +4940,28 @@ export async function proxyWithAccount(
 					if (!retryReplayBody) {
 						throw new Error("Failed to strip cache_control from replay body");
 					}
-					const retrySource = new Request(providerRequest.url, {
-						method: providerRequest.method,
-						headers: retryHeaders,
+					const retrySource = initialRetrySourceReplay.createRequest({
 						body: new Uint8Array(retryReplayBody),
+						headers: retryHeaders,
 					});
 					currentReplayBody = retryReplayBody;
 					currentCacheIdentityHasCacheControl = undefined;
-					retrySourceRequest = retrySource.clone();
+					retrySourceReplay = createRequestReplay(retrySource, null);
 					const retryTransformed = await transformWithCurrentAttemptPlan(
 						attemptPlan,
 						retrySource,
 					);
-					retryTransformedTemplate = retryTransformed.clone();
-					retryRequest = retryTransformedTemplate.clone();
+					retryRequest = await materializeRetryTransport(retryTransformed);
 				} else {
-					const retryBodyText = JSON.stringify(retryBodyJson);
-					retryRequest = new Request(transformedRequest.url, {
-						method: transformedRequest.method,
-						headers: transformedRequest.headers,
-						body: retryBodyText,
-						// A URL-based rebuild drops the signal — carry it over.
-						signal: req.signal,
-					});
+					const strippedRetryBodyText = JSON.stringify(retryBodyJson);
+					if (!retryTransportReplay) {
+						throw new Error("Missing transformed transport replay");
+					}
+					retryTransportReplay = retryTransportReplay.withBodyText(
+						strippedRetryBodyText,
+					);
+					retryBodyText = strippedRetryBodyText;
+					retryRequest = retryTransportReplay.createRequest();
 					// The physical retry is already provider-transformed, but keepalive
 					// must re-enter from the normalized source and receive exactly one
 					// transform. Strip rejected markers from that source projection rather
@@ -4969,7 +4970,6 @@ export async function proxyWithAccount(
 						stripCacheControlFromReplayBody(currentReplayBody);
 					currentCacheIdentityHasCacheControl =
 						hasCacheControlHintInJsonText(retryBodyText);
-					retryTransformedTemplate = retryRequest.clone();
 					// The codex branch above already drains the pre-retry rawResponse
 					// via discardUpstreamBody; this branch has no equivalent call, so
 					// drain it here before the reassignment below drops the reference.
@@ -6077,12 +6077,13 @@ export async function proxyWithAccount(
 								headers: fallbackHeaders,
 								body: new Uint8Array(patchedBody),
 								duplex: "half",
+								signal: req.signal,
 							};
 							const retryProviderRequest = new Request(
 								fallbackPlan.targetUrl,
 								retryRequestInit,
 							);
-							retrySourceRequest = retryProviderRequest.clone();
+							retrySourceReplay = createRequestReplay(retryProviderRequest, null);
 							retryTransformedRequest = await transformWithCurrentAttemptPlan(
 								fallbackPlan,
 								retryProviderRequest,
@@ -6167,9 +6168,10 @@ export async function proxyWithAccount(
 						headers = fallbackHeaders;
 						currentTransportModel = nextModel;
 						targetUrl = fallbackPlan.targetUrl;
-						retryTransformedTemplate = retryTransformedRequest.clone();
 
-						const retryTransportRequest = retryTransformedRequest;
+						const retryTransportRequest = await materializeRetryTransport(
+							retryTransformedRequest,
+						);
 						currentReplayBody = patchedBody;
 						currentCacheIdentityHasCacheControl = undefined;
 						// Attribution advances only once a concrete request is ready to
@@ -6395,11 +6397,16 @@ export async function proxyWithAccount(
 							await discardUpstreamBody(response);
 							throw error;
 						}
-						let retryTransport = retryTransformedTemplate.clone();
+						if (!retryTransportReplay) break;
 						// Reserve before backoff or touching the trusted 529. A denied
 						// follower returns it untouched to the outer terminal authority.
+						// Reservation observes only request metadata, so keep this planning
+						// copy bodyless and instantiate the actual transport after backoff.
+						const retryReservationRequest = retryTransportReplay.createRequest({
+							body: null,
+						});
 						const degradedReservation = reservePhysicalSend(
-							retryTransport,
+							retryReservationRequest,
 							currentTransportModel,
 							response,
 						);
@@ -6426,25 +6433,19 @@ export async function proxyWithAccount(
 						// destructive drain below and the cache staging/fetch in the
 						// shared executor.
 						commitPhysicalSendReservation(degradedReservation, response);
+						let retryTransport: Request;
 						if (attemptPlan.providerName === "codex") {
-							const retryHeaders = new Headers(retrySourceRequest.headers);
+							const retryHeaders = retrySourceReplay.copyHeaders();
 							await drainSupersededResponse(response);
 							stampCodexAttempt(
 								retryHeaders,
 								"overload_529",
 								currentTransportModel ?? undefined,
 							);
-							const retrySourceInit: RequestInit & { duplex?: "half" } = {
-								method: retrySourceRequest.method,
-								headers: retryHeaders,
-							};
-							if (currentReplayBody) {
-								retrySourceInit.body = new Uint8Array(currentReplayBody);
-								retrySourceInit.duplex = "half";
-							}
-							const retrySource = new Request(
-								retrySourceRequest.url,
-								retrySourceInit,
+							const retrySource = createRetrySourceRequest(
+								currentReplayBody,
+								retryHeaders,
+								false,
 							);
 							let retryTransformed = await transformWithCurrentAttemptPlan(
 								attemptPlan,
@@ -6456,7 +6457,7 @@ export async function proxyWithAccount(
 									currentTransportModel,
 								);
 							}
-							retryTransport = retryTransformed;
+							retryTransport = await materializeRetryTransport(retryTransformed);
 						} else {
 							// Non-codex providers reach this loop too (the anthropic
 							// provider marks bare 529 overloaded_error responses as rate
@@ -6467,6 +6468,7 @@ export async function proxyWithAccount(
 								response,
 								"in_place_529_retry_superseded",
 							);
+							retryTransport = retryTransportReplay.createRequest();
 						}
 						const retryRaw = await executeCacheAwareProviderAttempt(
 							retryTransport,
@@ -6899,25 +6901,16 @@ export async function proxyWithAccount(
 							? "codex_precommit_sse_retry_superseded"
 							: "codex_precommit_cache_lane_rescue_superseded",
 					);
-					const rescueHeaders = new Headers(retrySourceRequest.headers);
+					const rescueHeaders = retrySourceReplay.copyHeaders();
 					stampCodexAttempt(
 						rescueHeaders,
 						codexPrecommitRetryCause,
 						currentTransportModel ?? undefined,
 					);
-					const rescueRequestInit: RequestInit & { duplex?: "half" } = {
-						method: retrySourceRequest.method,
-						headers: rescueHeaders,
-					};
-					if (currentReplayBody) {
-						rescueRequestInit.body = new Uint8Array(currentReplayBody);
-						rescueRequestInit.duplex = "half";
-					}
-					const rescueSourceRequest = new Request(
-						retrySourceRequest.url,
-						rescueRequestInit,
+					const rescueSourceRequest = createRetrySourceRequest(
+						currentReplayBody,
+						rescueHeaders,
 					);
-					retrySourceRequest = rescueSourceRequest.clone();
 					let rescueTransformedRequest = await transformWithCurrentAttemptPlan(
 						attemptPlan,
 						rescueSourceRequest,
@@ -6926,11 +6919,11 @@ export async function proxyWithAccount(
 						rescueTransformedRequest,
 						currentTransportModel,
 					);
-					retryTransformedTemplate = rescueTransformedRequest.clone();
-					const rescueBodyText = await rescueTransformedRequest.clone().text();
+					const rescueTransportRequest = await materializeRetryTransport(
+						rescueTransformedRequest,
+					);
 					currentCacheIdentityHasCacheControl =
-						hasCacheControlHintInJsonText(rescueBodyText);
-					const rescueTransportRequest = rescueTransformedRequest;
+						hasCacheControlHintInJsonText(retryBodyText);
 					rawResponse = await executeCacheAwareProviderAttempt(
 						rescueTransportRequest,
 						currentReplayBody,
