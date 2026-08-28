@@ -3621,6 +3621,10 @@ async function handleProxyCoreImpl(
 					new ServerToolRoutingError({
 						reason: "no_implementation",
 						capabilitySummary: currentServerToolCapabilitySummary(),
+						requestedToolTypes:
+							requestMeta.serverToolRequirements?.declarations?.map(
+								(d) => d.type,
+							),
 					}),
 				),
 			);
@@ -3649,6 +3653,10 @@ async function handleProxyCoreImpl(
 				new ServerToolRoutingError({
 					reason: "no_implementation",
 					capabilitySummary: currentServerToolCapabilitySummary(),
+					requestedToolTypes:
+						requestMeta.serverToolRequirements?.declarations?.map(
+							(d) => d.type,
+						),
 				}),
 			),
 		);

@@ -24,6 +24,7 @@ interface ServerToolRoutingErrorOptions {
 	readonly reason: ServerToolRoutingErrorReason;
 	readonly accountId?: string;
 	readonly capabilitySummary?: ServerToolRoutingCapabilitySummary;
+	readonly requestedToolTypes?: readonly string[];
 }
 
 const ERROR_SPEC = Object.freeze({
@@ -40,11 +41,11 @@ const ERROR_SPEC = Object.freeze({
 		message: "The requested server-tool semantics are not supported.",
 	}),
 	no_implementation: Object.freeze({
-		status: 503,
-		type: "service_unavailable",
+		status: 400,
+		type: "invalid_request_error",
 		code: "server_tool_capability_unavailable",
 		message:
-			"No configured provider route implements the requested server-tool semantics.",
+			"No configured provider route implements the requested server-tool semantics. This is a permanent capability gap in this proxy's account pool, not a transient failure - retrying cannot succeed until an operator adds a server-tool-capable route. Fall back to a client-side alternative tool instead of retrying.",
 	}),
 	replay_unavailable: Object.freeze({
 		status: 503,
@@ -92,21 +93,39 @@ function snapshotCapabilitySummary(
 	});
 }
 
+function snapshotRequestedToolTypes(
+	requestedToolTypes: readonly string[] | undefined,
+): readonly string[] | undefined {
+	const deduped = Array.from(
+		new Set(requestedToolTypes?.filter((toolType) => toolType !== "") ?? []),
+	);
+	return deduped.length > 0 ? Object.freeze(deduped) : undefined;
+}
+
 /** Typed, request-local capability terminal. It never mutates route/account state. */
 export class ServerToolRoutingError extends Error {
 	readonly reason: ServerToolRoutingErrorReason;
 	readonly accountId: string | undefined;
 	readonly capabilitySummary: ServerToolRoutingCapabilitySummary | undefined;
+	readonly requestedToolTypes: readonly string[] | undefined;
 
 	constructor(options: ServerToolRoutingErrorOptions) {
 		const spec = ERROR_SPEC[options.reason];
-		super(spec.message);
+		const requestedToolTypes = snapshotRequestedToolTypes(
+			options.requestedToolTypes,
+		);
+		super(
+			requestedToolTypes
+				? `${spec.message} Requested server tool(s): ${requestedToolTypes.join(", ")}.`
+				: spec.message,
+		);
 		this.name = "ServerToolRoutingError";
 		this.reason = options.reason;
 		this.accountId = options.accountId;
 		this.capabilitySummary = snapshotCapabilitySummary(
 			options.capabilitySummary,
 		);
+		this.requestedToolTypes = requestedToolTypes;
 	}
 }
 
@@ -144,9 +163,12 @@ export function createServerToolRoutingErrorResponse(
 		type: spec.type,
 		code: spec.code,
 		reason: error.reason,
-		message: spec.message,
+		message: error.message,
 	};
 	if (error.accountId !== undefined) bodyError.account_id = error.accountId;
+	if (error.requestedToolTypes !== undefined) {
+		bodyError.requested_tools = error.requestedToolTypes;
+	}
 	if (error.capabilitySummary !== undefined) {
 		bodyError.capability = error.capabilitySummary;
 	}

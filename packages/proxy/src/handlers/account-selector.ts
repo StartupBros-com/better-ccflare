@@ -455,11 +455,19 @@ export function getClientVisibleServerToolAccountId(
 function throwServerToolCapabilityPoolError(meta: RequestMeta): never {
 	const summary = meta.serverToolCapabilitySummary;
 	if (!summary) {
-		throw new ServerToolRoutingError({ reason: "no_implementation" });
+		throw new ServerToolRoutingError({
+			reason: "no_implementation",
+			requestedToolTypes: meta.serverToolRequirements?.declarations?.map(
+				(d) => d.type,
+			),
+		});
 	}
 	throw new ServerToolRoutingError({
 		reason: capabilityPoolErrorReason(meta, summary),
 		capabilitySummary: summary,
+		requestedToolTypes: meta.serverToolRequirements?.declarations?.map(
+			(d) => d.type,
+		),
 	});
 }
 
