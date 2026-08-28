@@ -38,16 +38,21 @@ function snapshot(state: RequestBodyUpstreamState): RequestBodyUpstreamState {
 function parseOptions(args: string[]): {
 	bodyBytes: number;
 	expectedModel: string;
+	responseDelayMs: number;
 } {
 	const bodyBytes = Number.parseInt(args[0] ?? "", 10);
 	const expectedModel = args[1];
+	const responseDelayMs = Number.parseInt(args[2] ?? "0", 10);
 	if (!Number.isSafeInteger(bodyBytes) || bodyBytes <= 0) {
 		throw new Error("fixture bodyBytes must be a positive integer");
 	}
 	if (!expectedModel) {
 		throw new Error("fixture expectedModel must be non-empty");
 	}
-	return { bodyBytes, expectedModel };
+	if (!Number.isSafeInteger(responseDelayMs) || responseDelayMs < 0) {
+		throw new Error("fixture responseDelayMs must be a nonnegative integer");
+	}
+	return { bodyBytes, expectedModel, responseDelayMs };
 }
 
 async function main(): Promise<void> {
@@ -117,6 +122,9 @@ async function main(): Promise<void> {
 				) {
 					state.cancelled += 1;
 					return new Response(null, { status: 400 });
+				}
+				if (options.responseDelayMs > 0) {
+					await Bun.sleep(options.responseDelayMs);
 				}
 				state.completed += 1;
 				// A bodyless success keeps response allocation outside this request-body

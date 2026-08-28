@@ -11,10 +11,13 @@ import {
 	BodyAdmissionController,
 	withBodyAdmission,
 } from "../../../../apps/server/src/body-admission";
+import type { RequestBodyUpstreamState } from "../../../../bench/fixtures/proxy-request-memory-upstream";
 import {
 	BODY_MODEL_AFTER_TRANSFORM,
 	BODY_MODEL_BEFORE_TRANSFORM,
 	createClaudeRequestBody,
+	isHeapSettled,
+	PROXY_MEMORY_CHILD_READY_TYPE,
 	runProxyRequestBodyWorkload,
 } from "../../../../bench/proxy-request-memory-harness";
 import {
@@ -58,6 +61,8 @@ const HEAP_STATS_SCALAR_FIELDS = [
 type RequestBodyWorkloadResult = Awaited<
 	ReturnType<typeof runProxyRequestBodyWorkload>
 >;
+
+const HARNESS_PATH = `${import.meta.dir}/../../../../bench/proxy-request-memory-harness.ts`;
 
 function expectNumericRecord(
 	record: Record<string, number>,
@@ -261,7 +266,7 @@ describe("proxy response-body ownership baseline", () => {
 				"loopback-response-received",
 				"proxy-with-account-complete",
 				"response-consumed",
-				"post-gc-settled",
+				"post-gc-heap-settled",
 			],
 		);
 	});
@@ -291,7 +296,7 @@ describe("proxy response-body ownership baseline", () => {
 				"loopback-response-received",
 				"proxy-with-account-complete",
 				"response-consumed",
-				"post-gc-settled",
+				"post-gc-heap-settled",
 			],
 		);
 	});
@@ -323,7 +328,7 @@ describe("proxy response-body ownership baseline", () => {
 				"loopback-response-received",
 				"proxy-with-account-complete",
 				"response-consumed",
-				"post-gc-settled",
+				"post-gc-heap-settled",
 			],
 		);
 	});
@@ -358,12 +363,112 @@ describe("proxy response-body ownership baseline", () => {
 		expect(() => process.kill(result.upstreamProcess.pid, 0)).toThrow();
 		for (const phase of result.phases) {
 			const expected =
-				phase.name === "pre-body-baseline" || phase.name === "post-gc-settled"
+				phase.name === "pre-body-baseline" ||
+				phase.name === "post-gc-heap-settled"
 					? 1
 					: concurrency;
 			expect(phase.observationCount).toBe(expected);
 		}
 	});
+
+	it("request body: labels settling by its heapUsed-only predicate", () => {
+		expect(isHeapSettled(1_000_000, 1_200_000)).toBe(true);
+		expect(isHeapSettled(1_000_000, 1_300_000)).toBe(false);
+		expect(isHeapSettled(-1, 0)).toBe(false);
+		expect(["post-gc-heap-settled"].includes("post-gc-settled")).toBe(false);
+	});
+
+	it("request body: parent signals reap an active isolated upstream child", async () => {
+		const subprocess = Bun.spawn({
+			cmd: [process.execPath, HARNESS_PATH],
+			env: {
+				...process.env,
+				PROXY_MEMORY_WAVES: "1",
+				PROXY_MEMORY_CONCURRENCY: "1",
+				PROXY_MEMORY_BODY_BYTES: "4096",
+				PROXY_MEMORY_CHILD_RESPONSE_DELAY_MS: "5000",
+			},
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const reader = subprocess.stdout.getReader();
+		const decoder = new TextDecoder();
+		let buffered = "";
+		let childPid: number | undefined;
+		let childControlUrl: string | undefined;
+		const deadline = Date.now() + 8_000;
+		try {
+			while (!childPid && Date.now() < deadline) {
+				const remaining = deadline - Date.now();
+				const chunk = await Promise.race([
+					reader.read(),
+					Bun.sleep(remaining).then(() => {
+						throw new Error("timed out waiting for child-ready event");
+					}),
+				]);
+				if (chunk.done)
+					throw new Error("harness exited before child-ready event");
+				buffered += decoder.decode(chunk.value, { stream: true });
+				let newline = buffered.indexOf("\n");
+				while (newline >= 0) {
+					const line = buffered.slice(0, newline);
+					buffered = buffered.slice(newline + 1);
+					const event = JSON.parse(line) as Record<string, unknown>;
+					if (event.type === PROXY_MEMORY_CHILD_READY_TYPE) {
+						childPid = event.pid as number;
+						childControlUrl = event.controlUrl as string;
+						break;
+					}
+					newline = buffered.indexOf("\n");
+				}
+			}
+			expect(childPid).toBeGreaterThan(0);
+			expect(childControlUrl).toStartWith("http://127.0.0.1:");
+			if (!childPid || !childControlUrl) {
+				throw new Error("child-ready event lacked process control fields");
+			}
+
+			let active = false;
+			while (!active && Date.now() < deadline) {
+				const response = await fetch(childControlUrl, {
+					signal: AbortSignal.timeout(500),
+				});
+				const stats = (await response.json()) as RequestBodyUpstreamState;
+				active = stats.requests === 1 && stats.completed === 0;
+				if (!active) await Bun.sleep(20);
+			}
+			expect(active).toBe(true);
+
+			subprocess.kill("SIGTERM");
+			const exitCode = await Promise.race([
+				subprocess.exited,
+				Bun.sleep(4_000).then(() => {
+					throw new Error("timed out waiting for signalled harness exit");
+				}),
+			]);
+			expect(exitCode).toBe(143);
+			await eventually(() => {
+				try {
+					process.kill(childPid, 0);
+					return false;
+				} catch {
+					return true;
+				}
+			});
+		} finally {
+			await reader.cancel().catch(() => undefined);
+			if (subprocess.exitCode === null) subprocess.kill("SIGKILL");
+			if (childPid) {
+				try {
+					process.kill(childPid, "SIGKILL");
+				} catch {
+					// Already reaped by the parent, which is the expected path.
+				}
+			}
+			await Promise.race([subprocess.exited, Bun.sleep(1_000)]);
+		}
+	}, 12_000);
 
 	it("request body: rejects unknown transform modes before opening transport", async () => {
 		await expect(

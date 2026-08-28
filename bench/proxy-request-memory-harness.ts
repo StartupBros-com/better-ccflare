@@ -75,7 +75,7 @@ type RequestBodyPhaseName =
 	| "loopback-response-received"
 	| "proxy-with-account-complete"
 	| "response-consumed"
-	| "post-gc-settled";
+	| "post-gc-heap-settled";
 
 type LifecycleUpstreamCounts = {
 	requests: number;
@@ -144,10 +144,10 @@ type WaveResult = {
 	wave: number;
 	before: Sample;
 	peak: Sample;
-	settled: Sample;
+	heapSettled: Sample;
 	deltas: {
 		peakFromBefore: SampleDelta;
-		settledFromBefore: SampleDelta;
+		heapSettledFromBefore: SampleDelta;
 	};
 	requestBody: ProxyRequestBodyWorkloadResult;
 	responseLifecycle: ResponseLifecycleResult;
@@ -168,6 +168,8 @@ const CHILD_STARTUP_TIMEOUT_MS = 5_000;
 const CHILD_STATS_TIMEOUT_MS = 5_000;
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 const CHILD_STDERR_TIMEOUT_MS = 1_000;
+export const PROXY_MEMORY_CHILD_READY_TYPE =
+	"proxy-request-memory-managed-child-ready";
 const REQUEST_BODY_UPSTREAM_FIXTURE = `${import.meta.dir}/fixtures/proxy-request-memory-upstream.ts`;
 const PROXY_MEMORY_TRANSFORM_MODES: readonly ProxyMemoryTransformMode[] = [
 	"passthrough",
@@ -194,7 +196,7 @@ const CLONE_REWRITE_PHASE_ORDER: readonly RequestBodyPhaseName[] = [
 	"loopback-response-received",
 	"proxy-with-account-complete",
 	"response-consumed",
-	"post-gc-settled",
+	"post-gc-heap-settled",
 ];
 
 const PASSTHROUGH_PHASE_ORDER: readonly RequestBodyPhaseName[] = [
@@ -209,7 +211,7 @@ const PASSTHROUGH_PHASE_ORDER: readonly RequestBodyPhaseName[] = [
 	"loopback-response-received",
 	"proxy-with-account-complete",
 	"response-consumed",
-	"post-gc-settled",
+	"post-gc-heap-settled",
 ];
 
 const CONSUME_REBUILD_PHASE_ORDER: readonly RequestBodyPhaseName[] = [
@@ -226,7 +228,7 @@ const CONSUME_REBUILD_PHASE_ORDER: readonly RequestBodyPhaseName[] = [
 	"loopback-response-received",
 	"proxy-with-account-complete",
 	"response-consumed",
-	"post-gc-settled",
+	"post-gc-heap-settled",
 ];
 
 const MEMORY_ACCOUNTING_NOTES = {
@@ -248,6 +250,18 @@ function positiveInteger(name: string, fallback: number): number {
 	const value = Number.parseInt(process.env[name] ?? String(fallback), 10);
 	if (!Number.isSafeInteger(value) || value <= 0) {
 		throw new Error(`${name} must be a positive integer`);
+	}
+	return value;
+}
+
+function nonNegativeInteger(name: string, fallback: number): number {
+	const raw = process.env[name] ?? String(fallback);
+	if (!/^\d+$/.test(raw)) {
+		throw new Error(`${name} must be a nonnegative integer`);
+	}
+	const value = Number(raw);
+	if (!Number.isSafeInteger(value)) {
+		throw new Error(`${name} must be a nonnegative integer`);
 	}
 	return value;
 }
@@ -293,6 +307,10 @@ const discardDeadlineMs = positiveInteger(
 	"PROXY_MEMORY_DISCARD_DEADLINE_MS",
 	20,
 );
+const childResponseDelayMs = nonNegativeInteger(
+	"PROXY_MEMORY_CHILD_RESPONSE_DELAY_MS",
+	0,
+);
 const transformMode = configuredTransformMode();
 
 function numericFields(value: unknown): NumericRecord {
@@ -315,17 +333,18 @@ function forceGc(): void {
 	if (typeof Bun.gc === "function") Bun.gc(true);
 }
 
-async function settle(): Promise<Sample> {
+export function isHeapSettled(previousHeapUsed: number, heapUsed: number): boolean {
+	return previousHeapUsed >= 0 && Math.abs(heapUsed - previousHeapUsed) < 256 * 1024;
+}
+
+async function settleHeap(): Promise<Sample> {
 	let previous = -1;
 	let current = sample();
 	for (let iteration = 0; iteration < 10; iteration += 1) {
 		await Bun.sleep(0);
 		forceGc();
 		current = sample();
-		if (
-			previous >= 0 &&
-			Math.abs(current.memory.heapUsed - previous) < 256 * 1024
-		) {
+		if (isHeapSettled(previous, current.memory.heapUsed)) {
 			return current;
 		}
 		previous = current.memory.heapUsed;
@@ -484,6 +503,38 @@ type ManagedRequestBodyUpstream = {
 	fetchStats: () => Promise<RequestBodyUpstreamState>;
 	stop: () => Promise<RequestBodyUpstreamProcessState>;
 };
+
+type ManagedRequestBodyUpstreamStop = ManagedRequestBodyUpstream["stop"];
+
+const managedRequestBodyUpstreamStops =
+	new Set<ManagedRequestBodyUpstreamStop>();
+
+async function stopManagedRequestBodyUpstreams(): Promise<void> {
+	const results = await Promise.allSettled(
+		[...managedRequestBodyUpstreamStops].map((stop) => stop()),
+	);
+	const failures = results
+		.filter(
+			(result): result is PromiseRejectedResult => result.status === "rejected",
+		)
+		.map((result) => result.reason);
+	if (failures.length > 0) {
+		throw new AggregateError(failures, "managed upstream child cleanup failed");
+	}
+}
+
+function installMainSignalHandlers(): void {
+	let shutdown: Promise<void> | undefined;
+	const handle = (exitCode: 130 | 143): void => {
+		shutdown ??= stopManagedRequestBodyUpstreams()
+			.catch((error) => {
+				console.error("proxy request memory child cleanup failed:", error);
+			})
+			.finally(() => process.exit(exitCode));
+	};
+	process.once("SIGINT", () => handle(130));
+	process.once("SIGTERM", () => handle(143));
+}
 
 async function withDeadline<T>(
 	operation: Promise<T>,
@@ -662,6 +713,7 @@ async function terminateRequestBodyUpstream(
 async function startRequestBodyUpstream(options: {
 	bodyBytes: number;
 	expectedModel: string;
+	responseDelayMs: number;
 }): Promise<ManagedRequestBodyUpstream> {
 	const child = Bun.spawn({
 		cmd: [
@@ -669,6 +721,7 @@ async function startRequestBodyUpstream(options: {
 			REQUEST_BODY_UPSTREAM_FIXTURE,
 			String(options.bodyBytes),
 			options.expectedModel,
+			String(options.responseDelayMs),
 		],
 		stdin: "ignore",
 		stdout: "pipe",
@@ -685,13 +738,11 @@ async function startRequestBodyUpstream(options: {
 	};
 	let stopPromise: Promise<RequestBodyUpstreamProcessState> | undefined;
 	const stop = (): Promise<RequestBodyUpstreamProcessState> => {
-		stopPromise ??= terminateRequestBodyUpstream(
-			child,
-			stderrPromise,
-			lifecycle,
-		);
+		stopPromise ??= terminateRequestBodyUpstream(child, stderrPromise, lifecycle)
+			.finally(() => managedRequestBodyUpstreamStops.delete(stop));
 		return stopPromise;
 	};
+	managedRequestBodyUpstreamStops.add(stop);
 
 	let ready: RequestBodyUpstreamReadyMessage;
 	try {
@@ -729,7 +780,7 @@ async function startRequestBodyUpstream(options: {
 	}
 
 	const origin = `http://127.0.0.1:${ready.port}`;
-	return {
+	const managed: ManagedRequestBodyUpstream = {
 		url: `${origin}${REQUEST_BODY_UPSTREAM_PATH}`,
 		pid: child.pid,
 		async fetchStats() {
@@ -765,6 +816,16 @@ async function startRequestBodyUpstream(options: {
 		},
 		stop,
 	};
+	if (import.meta.main) {
+		process.stdout.write(
+			`${JSON.stringify({
+				type: PROXY_MEMORY_CHILD_READY_TYPE,
+				pid: child.pid,
+				controlUrl: `${origin}${REQUEST_BODY_UPSTREAM_STATS_PATH}`,
+			})}\n`,
+		);
+	}
+	return managed;
 }
 
 function makeMemoryAccount(): Account {
@@ -923,6 +984,7 @@ export async function runProxyRequestBodyWorkload(
 	const upstream = await startRequestBodyUpstream({
 		bodyBytes,
 		expectedModel,
+		responseDelayMs: childResponseDelayMs,
 	});
 	const generatedBodyBytes: number[] = [];
 	let phaseRecorder: ReturnType<typeof createPhaseRecorder> | undefined;
@@ -937,7 +999,7 @@ export async function runProxyRequestBodyWorkload(
 		// Establish the baseline only after the child has reached its explicit
 		// ready state. Child RSS is never part of process.memoryUsage(), and the
 		// parent's small subprocess bookkeeping is now present in every phase.
-		const baseline = await settle();
+		const baseline = await settleHeap();
 		phaseRecorder = createPhaseRecorder(
 			baseline,
 			transformMode === "passthrough"
@@ -1042,7 +1104,7 @@ export async function runProxyRequestBodyWorkload(
 				`isolated loopback request-body oracle mismatch: ${JSON.stringify({ responses, upstream: snapshot })}`,
 			);
 		}
-		phaseRecorder.record("post-gc-settled", await settle());
+		phaseRecorder.record("post-gc-heap-settled", await settleHeap());
 	} catch (error) {
 		workloadFailed = true;
 		workloadError = error;
@@ -1264,16 +1326,16 @@ async function runWave(wave: number): Promise<WaveResult> {
 	observePeak();
 	const responseLifecycle = await runResponseLifecycleModes(observePeak);
 	observePeak();
-	const settled = await settle();
+	const heapSettled = await settleHeap();
 	if (!peak) throw new Error("memory peak was not observed");
 	return {
 		wave,
 		before: waveBefore,
 		peak,
-		settled,
+		heapSettled,
 		deltas: {
 			peakFromBefore: sampleDelta(waveBefore, peak),
-			settledFromBefore: sampleDelta(waveBefore, settled),
+			heapSettledFromBefore: sampleDelta(waveBefore, heapSettled),
 		},
 		requestBody,
 		responseLifecycle,
@@ -1307,9 +1369,9 @@ function printTable(results: WaveResult[]): void {
 		"body MiB",
 		"conc",
 		"peak Δ heap MiB",
-		"settled Δ heap MiB",
+		"heap-settled Δ heap MiB",
 		"peak Δ RSS MiB",
-		"settled Δ RSS MiB",
+		"heap-settled Δ RSS MiB",
 		"physical success",
 		"response c/c/a",
 		"leases",
@@ -1320,9 +1382,9 @@ function printTable(results: WaveResult[]): void {
 		formatMebibytes(result.requestBody.bodyBytes),
 		String(result.requestBody.concurrency),
 		formatMebibytes(result.deltas.peakFromBefore.memory.heapUsed),
-		formatMebibytes(result.deltas.settledFromBefore.memory.heapUsed),
+		formatMebibytes(result.deltas.heapSettledFromBefore.memory.heapUsed),
 		formatMebibytes(result.deltas.peakFromBefore.memory.rss),
-		formatMebibytes(result.deltas.settledFromBefore.memory.rss),
+		formatMebibytes(result.deltas.heapSettledFromBefore.memory.rss),
 		`${result.requestBody.upstream.completed}/${result.requestBody.upstream.requests}`,
 		`${result.responseLifecycle.upstream.completed}/${result.responseLifecycle.upstream.cancelled}/${result.responseLifecycle.upstream.aborted}`,
 		`${result.responseLifecycle.bodyAdmission.activeLeases}/${result.responseLifecycle.bodyAdmission.counters.released}`,
@@ -1429,6 +1491,7 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
+	installMainSignalHandlers();
 	main()
 		.then(() => process.exit(0))
 		.catch((error) => {
