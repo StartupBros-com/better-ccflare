@@ -84,7 +84,10 @@ async function allocatePort() {
 	return address.port;
 }
 
-async function startProductionNodeGuard(upstreamBase: string) {
+async function startProductionNodeGuard(
+	upstreamBase: string,
+	extraEnv: Record<string, string> = {},
+) {
 	const listenPort = await allocatePort();
 	const guardPath = fileURLToPath(
 		new URL("../ccflare-guard.mjs", import.meta.url),
@@ -101,6 +104,7 @@ async function startProductionNodeGuard(upstreamBase: string) {
 			GUARD_MAX_WAIT_MS: "2000",
 			GUARD_RETRY_ATTEMPT_HEADROOM_MS: "10",
 			GUARD_RETRY_JITTER_MS: "0",
+			...extraEnv,
 		},
 		stdio: ["ignore", "pipe", "pipe"],
 		windowsHide: true,
@@ -141,6 +145,26 @@ async function startProductionNodeGuard(upstreamBase: string) {
 		child,
 		waitForEvent,
 	};
+}
+
+async function waitForChildExit(
+	child: ChildProcess,
+	timeoutMs = 2_000,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+	return Promise.race([
+		new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+			(resolve) => {
+				if (child.exitCode !== null || child.signalCode !== null) {
+					resolve({ code: child.exitCode, signal: child.signalCode });
+					return;
+				}
+				child.once("exit", (code, signal) => resolve({ code, signal }));
+			},
+		),
+		Bun.sleep(timeoutMs).then(() => {
+			throw new Error("guard subprocess did not exit in time");
+		}),
+	]);
 }
 
 async function listen(server: Server) {
@@ -419,9 +443,7 @@ describe("source-controlled guard", () => {
 		expect(DEFAULT_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES).toBe(
 			256 * 1024 * 1024,
 		);
-		expect(MAX_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES).toBe(
-			256 * 1024 * 1024,
-		);
+		expect(MAX_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES).toBe(256 * 1024 * 1024);
 		expect(MIN_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES).toBe(1_024);
 		expect(() =>
 			createGuard({
@@ -525,10 +547,7 @@ describe("source-controlled guard", () => {
 		expect(guard.state.active).toBe(0);
 
 		slowSocket.write("0\r\n\r\n");
-		const slowResponse = await readRawResponsesUntil(
-			slowSocket,
-			"upstream-ok",
-		);
+		const slowResponse = await readRawResponsesUntil(slowSocket, "upstream-ok");
 		expect(slowResponse).toContain("HTTP/1.1 200");
 		await waitFor(
 			() => guard.state.active === 0 && guard.state.bodyReaders.active === 0,
@@ -905,7 +924,9 @@ describe("source-controlled guard", () => {
 	test.each([
 		["missing", undefined],
 		["malformed", "not-a-canonical-32-byte-secret"],
-	])("discards client correlation when the guard credential is %s", async (_name, guardCorrelationSecret) => {
+	])(
+		"discards client correlation when the guard credential is %s",
+		async (_name, guardCorrelationSecret) => {
 		let forwardedEnvelope: string | null = "not-observed";
 		const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
 			env: {},
@@ -929,7 +950,8 @@ describe("source-controlled guard", () => {
 
 		expect(await response.text()).toBe("ok");
 		expect(forwardedEnvelope).toBeNull();
-	});
+		},
+	);
 
 	test("forwards a protected 529 exactly once while stripping internal response headers", async () => {
 		const protectedBody = JSON.stringify({
@@ -2394,10 +2416,9 @@ describe("source-controlled guard", () => {
 	test.each([
 		{ name: "limited", path: "/v1/messages", maxActive: 2 },
 		{ name: "passthrough", path: "/v1/models", maxActive: 4 },
-	])("holds the $name body reservation until stalled forwarding finishes", async ({
-		path,
-		maxActive,
-	}) => {
+	])(
+		"holds the $name body reservation until stalled forwarding finishes",
+		async ({ path, maxActive }) => {
 		let forwarded = 0;
 		let releaseFirstForward: (() => void) | undefined;
 		const firstForwardReleased = new Promise<void>((resolve) => {
@@ -2458,7 +2479,8 @@ describe("source-controlled guard", () => {
 		expect(guard.state.bodyReaders.reservedBytesPeak).toBeLessThanOrEqual(
 			4_096,
 		);
-	});
+		},
+	);
 
 	test("admits a smaller tail after aborting a budget-blocked FIFO head", async () => {
 		let forwarded = 0;
@@ -2519,9 +2541,7 @@ describe("source-controlled guard", () => {
 
 			blockedHeadController.abort();
 			await blockedHead;
-			await waitFor(
-				() => guard.state.counters.bodyReaderQueueAborted === 1,
-			);
+			await waitFor(() => guard.state.counters.bodyReaderQueueAborted === 1);
 			const tailResponse = await tail;
 			expect(await tailResponse.text()).toBe("tail-forwarded");
 			expect(forwarded).toBe(1);
@@ -2870,6 +2890,129 @@ describe("source-controlled guard", () => {
 		await pending;
 		await waitFor(() => guard.state.recoveryWaits.current === 0);
 		expect(guard.state.counters.recoveryWaitReleased).toBe(1);
+	});
+
+	test("propagates natural and forced drain outcomes through the real guard process", async () => {
+		const natural = await startProductionNodeGuard("http://127.0.0.1:1", {
+			GUARD_SHUTDOWN_GRACE_MS: "100",
+		});
+		expect(natural.child.kill("SIGTERM")).toBe(true);
+		expect(await natural.waitForEvent("guard_shutdown_terminal")).toMatchObject({
+			outcome: "natural",
+			exitStatus: 0,
+		});
+		expect(await waitForChildExit(natural.child)).toEqual({
+			code: 0,
+			signal: null,
+		});
+
+		let enteredResolve: (() => void) | undefined;
+		let releaseResolve: (() => void) | undefined;
+		const entered = new Promise<void>((resolve) => {
+			enteredResolve = resolve;
+		});
+		const release = new Promise<void>((resolve) => {
+			releaseResolve = resolve;
+		});
+		const upstreamBase = await listen(
+			http.createServer(async (_req, res) => {
+				enteredResolve?.();
+				await release;
+				if (!res.destroyed) res.end("released");
+			}),
+		);
+		const forced = await startProductionNodeGuard(upstreamBase, {
+			GUARD_SHUTDOWN_GRACE_MS: "20",
+		});
+		const request = fetch(`${forced.baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "complete",
+		}).catch((error) => error);
+		try {
+			await entered;
+			expect(forced.child.kill("SIGTERM")).toBe(true);
+			expect(
+				await forced.waitForEvent("guard_shutdown_terminal"),
+			).toMatchObject({ outcome: "forced", exitStatus: 70 });
+			expect(await waitForChildExit(forced.child)).toEqual({
+				code: 70,
+				signal: null,
+			});
+		} finally {
+			releaseResolve?.();
+			await request;
+		}
+	}, 10_000);
+
+	test("reports one natural terminal shutdown outcome and remains idempotent", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const { guard } = await startGuard("http://127.0.0.1:1", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			shutdownGraceMs: 100,
+		});
+
+		const first = guard.shutdown("test");
+		const second = guard.shutdown("test-again");
+		expect(second).toBe(first);
+		expect(await first).toEqual({ outcome: "natural", exitStatus: 0 });
+		expect(
+			events.filter((event) => event.event === "guard_shutdown_terminal"),
+		).toEqual([expect.objectContaining({ outcome: "natural", exitStatus: 0 })]);
+		await Bun.sleep(130);
+		expect(events.some((event) => event.event === "guard_force_close")).toBe(
+			false,
+		);
+	});
+
+	test("reports a distinct forced terminal shutdown outcome at the deadline", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let handlerEnteredResolve: (() => void) | undefined;
+		let releaseHandlerResolve: (() => void) | undefined;
+		const handlerEntered = new Promise<void>((resolve) => {
+			handlerEnteredResolve = resolve;
+		});
+		const releaseHandler = new Promise<void>((resolve) => {
+			releaseHandlerResolve = resolve;
+		});
+		const upstreamBase = await listen(
+			http.createServer(async (_req, res) => {
+				handlerEnteredResolve?.();
+				await releaseHandler;
+				if (!res.destroyed) res.end("released");
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			shutdownGraceMs: 20,
+		});
+		const request = fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "complete",
+		}).catch((error) => error);
+
+		try {
+			await handlerEntered;
+			const result = await guard.shutdown("test");
+			expect(result).toEqual({ outcome: "forced", exitStatus: 70 });
+			expect(
+				events.filter((event) => event.event === "guard_force_close"),
+			).toHaveLength(1);
+			expect(
+				events.filter((event) => event.event === "guard_shutdown_terminal"),
+			).toEqual([
+				expect.objectContaining({ outcome: "forced", exitStatus: 70 }),
+			]);
+			expect(
+				events.some(
+					(event) =>
+						event.event === "guard_shutdown_terminal" &&
+						event.outcome === "natural",
+				),
+			).toBe(false);
+		} finally {
+			releaseHandlerResolve?.();
+			await request;
+		}
 	});
 
 	test("bounds marked pool retries by the configured attempt count", async () => {
@@ -3436,10 +3579,9 @@ describe("source-controlled guard", () => {
 	test.each([
 		{ name: "trusted header", headers: true, allowLegacyPoolBody: false },
 		{ name: "legacy body", headers: false, allowLegacyPoolBody: true },
-	])("preserves a body-only recovery hint above the request-wide silence ceiling on the $name path", async ({
-		headers,
-		allowLegacyPoolBody,
-	}) => {
+	])(
+		"preserves a body-only recovery hint above the request-wide silence ceiling on the $name path",
+		async ({ headers, allowLegacyPoolBody }) => {
 		const events: Array<Record<string, unknown>> = [];
 		let attempts = 0;
 		const body = JSON.stringify({
@@ -3454,7 +3596,9 @@ describe("source-controlled guard", () => {
 				if (attempts === 1) {
 					res.writeHead(503, {
 						"content-type": "application/json",
-						...(headers ? { "x-better-ccflare-pool-status": "exhausted" } : {}),
+							...(headers
+								? { "x-better-ccflare-pool-status": "exhausted" }
+								: {}),
 					});
 					res.end(body);
 					return;
@@ -3494,7 +3638,8 @@ describe("source-controlled guard", () => {
 		expect(guard.state.counters.deadlineExceeded).toBe(0);
 		expect(guard.state.counters.recoverySilenceBudgetExceeded).toBe(1);
 		expect(guard.state.counters.finalError).toBe(1);
-	});
+		},
+	);
 
 	test("reserves retry headroom and caps only optional jitter for a feasible recovery hint", async () => {
 		const events: Array<Record<string, unknown>> = [];

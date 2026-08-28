@@ -179,6 +179,13 @@ const deployOwned = new Set([
   "GUARD_SHUTDOWN_GRACE_MS",
   "RUNNER_SHA256",
   "RUNNER_FAILURE_STOP_BUDGET_MS",
+  "RUNNER_RSS_THRESHOLD_BYTES",
+  "RUNNER_RSS_POLL_INTERVAL_MS",
+  "RUNNER_RSS_MIN_UPTIME_MS",
+  "RUNNER_RSS_CONSECUTIVE_SAMPLES",
+  "RUNNER_RSS_RECYCLE_COOLDOWN_MS",
+  "RUNNER_RSS_MAX_RECYCLES",
+  "RUNNER_RSS_RECYCLE_WINDOW_MS",
 ]);
 
 const decodeEscape = (input, index) => {
@@ -422,6 +429,13 @@ render_systemd_pin() {
 		printf 'Environment=%s\n' "GUARD_MAX_RECOVERY_WAITS=$max_recovery_waits"
 		printf 'Environment=%s\n' "GUARD_SHUTDOWN_GRACE_MS=$shutdown_grace_ms"
 		printf '%s\n' "Environment=RUNNER_FAILURE_STOP_BUDGET_MS=30000"
+		printf '%s\n' "Environment=RUNNER_RSS_THRESHOLD_BYTES=4294967296"
+		printf '%s\n' "Environment=RUNNER_RSS_POLL_INTERVAL_MS=60000"
+		printf '%s\n' "Environment=RUNNER_RSS_MIN_UPTIME_MS=1800000"
+		printf '%s\n' "Environment=RUNNER_RSS_CONSECUTIVE_SAMPLES=5"
+		printf '%s\n' "Environment=RUNNER_RSS_RECYCLE_COOLDOWN_MS=3600000"
+		printf '%s\n' "Environment=RUNNER_RSS_MAX_RECYCLES=3"
+		printf '%s\n' "Environment=RUNNER_RSS_RECYCLE_WINDOW_MS=86400000"
 		printf 'KillMode=%s\n' "$kill_mode"
 		printf 'TimeoutStopSec=%s\n' "$stop_timeout"
 		printf 'Restart=%s\n' "$restart"
@@ -770,6 +784,20 @@ deployment_timing_value() {
 	'
 }
 
+validate_production_rss_policy_values() {
+	if [[ "$#" -ne 8 ]]; then return 2; fi
+	local label="$8"
+	local -a values=("$1" "$2" "$3" "$4" "$5" "$6" "$7")
+	local -a expected=(4294967296 60000 1800000 5 3600000 3 86400000)
+	local index
+	for index in "${!values[@]}"; do
+		if [[ "${values[$index]}" != "${expected[$index]}" ]]; then
+			echo "unsafe ${label}runner RSS recycle policy; expected exact managed production tuple" >&2
+			return 1
+		fi
+	done
+}
+
 validate_deployment_timing() {
 	if [[ "$#" -ne 1 || ! -f "$1" ]]; then
 		echo "validate_deployment_timing requires one existing systemd pin" >&2
@@ -777,6 +805,7 @@ validate_deployment_timing() {
 	fi
 
 	local pin="$1" deadline_ms retry_attempt_headroom_ms max_recovery_sleep_ms shutdown_grace_ms max_recovery_waits max_request_body_bytes max_buffered_request_body_bytes body_admission_budget_bytes body_admission_queue_limit kill_mode stop_timeout
+	local rss_threshold rss_poll rss_min_uptime rss_samples rss_cooldown rss_max_recycles rss_window
 	local stop_timeout_usec stop_timeout_ms minimum_stop_timeout_usec
 	body_admission_budget_bytes="$(
 		configured_systemd_environment_value "$pin" CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES
@@ -810,6 +839,19 @@ validate_deployment_timing() {
 		"$max_request_body_bytes" \
 		"$max_buffered_request_body_bytes" \
 		"" || return 1
+	for rss_entry in \
+		"rss_threshold:RUNNER_RSS_THRESHOLD_BYTES" \
+		"rss_poll:RUNNER_RSS_POLL_INTERVAL_MS" \
+		"rss_min_uptime:RUNNER_RSS_MIN_UPTIME_MS" \
+		"rss_samples:RUNNER_RSS_CONSECUTIVE_SAMPLES" \
+		"rss_cooldown:RUNNER_RSS_RECYCLE_COOLDOWN_MS" \
+		"rss_max_recycles:RUNNER_RSS_MAX_RECYCLES" \
+		"rss_window:RUNNER_RSS_RECYCLE_WINDOW_MS"; do
+		local_name="${rss_entry%%:*}"; env_name="${rss_entry#*:}"
+		value="$(configured_systemd_environment_value "$pin" "$env_name")" || { echo "systemd pin is missing $env_name" >&2; return 1; }
+		printf -v "$local_name" '%s' "$value"
+	done
+	validate_production_rss_policy_values "$rss_threshold" "$rss_poll" "$rss_min_uptime" "$rss_samples" "$rss_cooldown" "$rss_max_recycles" "$rss_window" "" || return 1
 	deadline_ms="$(
 		configured_systemd_environment_value "$pin" GUARD_TOTAL_DEADLINE_MS
 	)" || {
@@ -947,6 +989,7 @@ validate_effective_systemd_policy() {
 	local stop_timeout_usec restart_sec_usec start_limit_interval_usec stop_timeout_ms
 	local minimum_stop_timeout_usec
 	local minimum_start_limit_interval_usec=300000000 minimum_restart_sec_usec=5000000
+	local rss_threshold rss_poll rss_min_uptime rss_samples rss_cooldown rss_max_recycles rss_window rss_present=0
 	if [[ "$#" -eq 2 ]]; then
 		allow_missing_new_guard_limits="$2"
 	fi
@@ -965,6 +1008,27 @@ validate_effective_systemd_policy() {
 		start_limit_burst="$(systemctl show "$service" --property=StartLimitBurst --value)" || return 1
 	fi
 	effective_environment="$(systemctl show "$service" --property=Environment --value)" || return 1
+	for rss_entry in \
+		"rss_threshold:RUNNER_RSS_THRESHOLD_BYTES" \
+		"rss_poll:RUNNER_RSS_POLL_INTERVAL_MS" \
+		"rss_min_uptime:RUNNER_RSS_MIN_UPTIME_MS" \
+		"rss_samples:RUNNER_RSS_CONSECUTIVE_SAMPLES" \
+		"rss_cooldown:RUNNER_RSS_RECYCLE_COOLDOWN_MS" \
+		"rss_max_recycles:RUNNER_RSS_MAX_RECYCLES" \
+		"rss_window:RUNNER_RSS_RECYCLE_WINDOW_MS"; do
+		local_name="${rss_entry%%:*}"; env_name="${rss_entry#*:}"
+		if value="$(systemd_environment_text_value "$effective_environment" "$env_name")"; then
+			printf -v "$local_name" '%s' "$value"; ((rss_present += 1))
+		fi
+	done
+	if ((rss_present == 0)) && [[ "$allow_missing_new_guard_limits" == "1" ]]; then
+		: # Old-pin rollback compatibility: the entire newer tuple may be absent.
+	elif ((rss_present != 7)); then
+		echo "effective systemd environment has a partial runner RSS recycle tuple" >&2
+		return 1
+	else
+		validate_production_rss_policy_values "$rss_threshold" "$rss_poll" "$rss_min_uptime" "$rss_samples" "$rss_cooldown" "$rss_max_recycles" "$rss_window" "effective " || return 1
+	fi
 	if ! effective_body_admission_budget_bytes="$(
 		systemd_environment_text_value "$effective_environment" CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES
 	)"; then
