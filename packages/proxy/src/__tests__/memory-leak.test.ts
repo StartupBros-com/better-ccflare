@@ -1,124 +1,233 @@
 /**
- * Memory leak reproduction test.
+ * Deterministic ownership baseline for proxy response bodies.
  *
- * Sends concurrent large-body requests through the proxy and measures
- * RSS growth. Before the fix in this PR, RSS grew ~5MB per request due
- * to unsized requestBody in StartMessage + incomplete state cleanup.
- * After the fix, growth should be bounded by MAX_REQUEST_BODY_BYTES.
- *
- * Run: bun test packages/proxy/src/__tests__/memory-leak.test.ts
+ * These tests intentionally do not gate allocator metrics. RSS and JSC heap
+ * totals vary with Bun's allocator and GC scheduling; lifecycle ownership does
+ * not. Each case uses a port-0 Bun.serve upstream and real fetch traffic, then
+ * asserts the exact upstream and BodyAdmissionController terminal state.
  */
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+import {
+	BodyAdmissionController,
+	withBodyAdmission,
+} from "../../../../apps/server/src/body-admission";
+import {
+	cancelDiscardedResponseBody,
+	drainBody,
+} from "../handlers/discard-body-cancel";
+import { makeProxyRequest } from "../handlers/request-handler";
 
-describe("memory leak regression", () => {
-	// Helper: build a Claude-shaped request body of a given size
-	function makeLargeRequestBody(sizeKB: number): string {
-		const message = {
-			model: "claude-sonnet-4-5-20250514",
-			max_tokens: 1024,
-			messages: [
-				{
-					role: "user",
-					// Pad content to reach target size
-					content: "x".repeat(sizeKB * 1024),
+type Mode = "finite" | "empty" | "hanging";
+
+type Upstream = {
+	url: (mode: Mode) => string;
+	state: {
+		requests: number;
+		completed: number;
+		cancelled: number;
+		aborted: number;
+		pulls: number;
+	};
+	stop: () => void;
+};
+
+const encoder = new TextEncoder();
+
+function startUpstream(): Upstream {
+	const state = {
+		requests: 0,
+		completed: 0,
+		cancelled: 0,
+		aborted: 0,
+		pulls: 0,
+	};
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		idleTimeout: 0,
+		fetch(request) {
+			state.requests += 1;
+			request.signal.addEventListener(
+				"abort",
+				() => {
+					state.aborted += 1;
 				},
-			],
-		};
-		return JSON.stringify(message);
+				{ once: true },
+			);
+			const mode = new URL(request.url).pathname.slice(1) as Mode;
+			if (mode === "empty") {
+				state.completed += 1;
+				return new Response(null, { status: 204 });
+			}
+			let sent = false;
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					pull(controller) {
+						state.pulls += 1;
+						if (!sent) {
+							sent = true;
+							controller.enqueue(encoder.encode("data: chunk\n\n"));
+							if (mode === "finite") {
+								state.completed += 1;
+								controller.close();
+							}
+						}
+					},
+					cancel() {
+						state.cancelled += 1;
+					},
+				}),
+				{ headers: { "content-type": "text/event-stream" } },
+			);
+		},
+	});
+	return {
+		url: (mode) => `http://127.0.0.1:${server.port}/${mode}`,
+		state,
+		stop: () => server.stop(true),
+	};
+}
+
+async function eventually(predicate: () => boolean): Promise<void> {
+	for (let attempt = 0; attempt < 50; attempt += 1) {
+		if (predicate()) return;
+		await Bun.sleep(10);
 	}
+	throw new Error("fixture did not reach its expected terminal state");
+}
 
-	it("requestBody cap prevents multi-MB structured clones", () => {
-		// Simulate what response-handler.ts does before postMessage
-		const MAX_REQUEST_BODY_BYTES = 256 * 1024;
-		const largeBody = new TextEncoder().encode(makeLargeRequestBody(2048)); // 2MB body
+async function readOne(response: Response): Promise<void> {
+	const reader = response.body?.getReader();
+	if (!reader) throw new Error("expected a streaming response");
+	await reader.read();
+	reader.releaseLock();
+}
 
-		// Before fix: full body was base64-encoded (2MB * 1.33 = 2.66MB per message)
-		const uncappedSize = Buffer.from(largeBody).toString("base64").length;
-
-		// After fix: capped to 256KB before base64 encoding
-		const cappedSize = Buffer.from(
-			largeBody.byteLength <= MAX_REQUEST_BODY_BYTES
-				? largeBody
-				: largeBody.subarray(0, MAX_REQUEST_BODY_BYTES),
-		).toString("base64").length;
-
-		// Uncapped would be ~2.7MB, capped should be ~341KB (256KB * 1.33)
-		expect(uncappedSize).toBeGreaterThan(2_000_000);
-		expect(cappedSize).toBeLessThan(350_000);
-		expect(cappedSize).toBeGreaterThan(300_000); // 256KB base64 = ~341KB
+describe("proxy response-body ownership baseline", () => {
+	const cleanups: Array<() => void> = [];
+	afterEach(() => {
+		for (const cleanup of cleanups.splice(0)) cleanup();
 	});
 
-	it("freeRequestState releases startMessage fields", () => {
-		// Simulate RequestState with a large startMessage
-		const state = {
-			chunks: [new Uint8Array(1024), new Uint8Array(1024)],
-			chunksBytes: 2048,
-			buffer: "some accumulated text",
-			startMessage: {
-				type: "start" as const,
-				requestId: "test-123",
-				accountId: "acc-1",
+	it("success: fully drains one forwarded finite response and releases its admission lease", async () => {
+		const upstream = startUpstream();
+		cleanups.push(upstream.stop);
+		const admission = new BodyAdmissionController({ budgetBytes: 1024 });
+		const response = await withBodyAdmission(
+			new Request(upstream.url("finite"), {
 				method: "POST",
-				path: "/v1/messages",
-				timestamp: Date.now(),
-				requestHeaders: {
-					authorization: "Bearer sk-ant-...",
-					"content-type": "application/json",
-					"x-custom-header": "value",
-				},
-				requestBody: "x".repeat(256 * 1024), // 256KB base64 string
-				responseStatus: 200,
-				responseHeaders: {
-					"content-type": "application/json",
-					"x-ratelimit-remaining": "100",
-				},
-				isStream: true,
-				providerName: "anthropic",
-				agentUsed: null,
-				apiKeyId: null,
-				apiKeyName: null,
-				retryAttempt: 0,
-				failoverAttempts: 0,
-			},
-		};
+				body: "x",
+				headers: { "content-length": "1" },
+			}),
+			admission,
+			async () =>
+				makeProxyRequest(upstream.url("finite"), "POST", new Headers()),
+		);
 
-		// Simulate freeRequestState (matches post-processor.worker.ts)
-		function freeRequestState(s: typeof state): void {
-			s.chunks.length = 0;
-			s.chunksBytes = 0;
-			s.buffer = "";
-			s.startMessage.requestBody = null;
-			s.startMessage.requestHeaders = {};
-			s.startMessage.responseHeaders = {};
-		}
-
-		// Before cleanup, startMessage holds ~256KB
-		expect(state.startMessage.requestBody).not.toBeNull();
-		expect(Object.keys(state.startMessage.requestHeaders).length).toBe(3);
-
-		freeRequestState(state);
-
-		// After cleanup, large fields are released
-		expect(state.startMessage.requestBody).toBeNull();
-		expect(Object.keys(state.startMessage.requestHeaders).length).toBe(0);
-		expect(Object.keys(state.startMessage.responseHeaders).length).toBe(0);
-		expect(state.chunks.length).toBe(0);
-		expect(state.buffer).toBe("");
+		expect(await response.text()).toContain("data: chunk");
+		expect(upstream.state).toMatchObject({
+			requests: 1,
+			completed: 1,
+			cancelled: 0,
+			aborted: 0,
+		});
+		expect(admission.snapshot()).toMatchObject({
+			reservedBytes: 0,
+			activeLeases: 0,
+			queuedRequests: 0,
+			counters: { admitted: 1, released: 1 },
+		});
 	});
 
-	it("concurrent requests stay within memory budget", () => {
-		const MAX_REQUEST_BODY_BYTES = 256 * 1024;
-		const CONCURRENT_REQUESTS = 15; // Simulates a 15-agent wave
-		const BODY_SIZE_KB = 2048; // 2MB each (typical Claude Code conversation)
+	it("boundary/empty: releases admission immediately when the upstream has no body", async () => {
+		const upstream = startUpstream();
+		cleanups.push(upstream.stop);
+		const admission = new BodyAdmissionController({ budgetBytes: 1024 });
+		const response = await withBodyAdmission(
+			new Request(upstream.url("empty"), {
+				method: "POST",
+				body: "x",
+				headers: { "content-length": "1" },
+			}),
+			admission,
+			async () =>
+				makeProxyRequest(upstream.url("empty"), "POST", new Headers()),
+		);
 
-		// Without cap: 15 * 2MB * 1.33 (base64) * 2 (structured clone) = ~80MB
-		const uncappedMemory = CONCURRENT_REQUESTS * BODY_SIZE_KB * 1024 * 1.33 * 2;
+		expect(response.status).toBe(204);
+		// fetch represents an empty HTTP response as a closed stream; ownership is
+		// nevertheless released before the caller receives it.
+		expect(await response.text()).toBe("");
+		expect(upstream.state).toMatchObject({ requests: 1, completed: 1 });
+		expect(admission.snapshot()).toMatchObject({
+			reservedBytes: 0,
+			activeLeases: 0,
+			counters: { admitted: 1, released: 1 },
+		});
+	});
 
-		// With cap: 15 * 256KB * 1.33 (base64) = ~5MB
-		const cappedMemory = CONCURRENT_REQUESTS * MAX_REQUEST_BODY_BYTES * 1.33;
+	it("cancellation/error: caller abort reaches the live upstream transport", async () => {
+		const upstream = startUpstream();
+		cleanups.push(upstream.stop);
+		const aborter = new AbortController();
+		const response = await makeProxyRequest(
+			upstream.url("hanging"),
+			"POST",
+			new Headers(),
+			undefined,
+			false,
+			aborter.signal,
+		);
+		await readOne(response);
+		aborter.abort();
+		await eventually(
+			() => upstream.state.aborted === 1 || upstream.state.cancelled === 1,
+		);
 
-		expect(uncappedMemory).toBeGreaterThan(70_000_000); // ~80MB without cap
-		expect(cappedMemory).toBeLessThan(6_000_000); // ~5MB with cap
-		expect(uncappedMemory / cappedMemory).toBeGreaterThan(10); // >10x reduction
+		expect(upstream.state.requests).toBe(1);
+		expect(
+			upstream.state.aborted + upstream.state.cancelled,
+		).toBeGreaterThanOrEqual(1);
+	});
+
+	it("integration: drains finite discards, deadlines hanging discards, and does not retry success", async () => {
+		const upstream = startUpstream();
+		cleanups.push(upstream.stop);
+
+		const finite = await makeProxyRequest(
+			upstream.url("finite"),
+			"POST",
+			new Headers(),
+		);
+		if (!finite.body) throw new Error("expected finite body");
+		await drainBody(finite.body);
+		expect(upstream.state).toMatchObject({
+			requests: 1,
+			completed: 1,
+			cancelled: 0,
+			aborted: 0,
+		});
+
+		const hanging = await makeProxyRequest(
+			upstream.url("hanging"),
+			"POST",
+			new Headers(),
+		);
+		await readOne(hanging);
+		cancelDiscardedResponseBody(hanging, { deadlineMs: 20 });
+		await eventually(
+			() => upstream.state.aborted === 1 || upstream.state.cancelled === 1,
+		);
+
+		// This successful request characterizes the lazy retry path: no retry is
+		// scheduled merely because a response body was successfully consumed.
+		const success = await makeProxyRequest(
+			upstream.url("finite"),
+			"POST",
+			new Headers(),
+		);
+		await success.text();
+		expect(upstream.state.requests).toBe(3);
+		expect(upstream.state.completed).toBe(2);
 	});
 });
