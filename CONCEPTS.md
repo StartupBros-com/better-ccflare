@@ -3,6 +3,35 @@
 Words that mean something specific in this codebase. Definitions here are the shared
 vocabulary that `docs/` and `AGENTS.md` can cite without redefining.
 
+## Routing
+
+### Root-capable pool
+
+The accounts admitted by a capability profile because each can serve the profile's root
+logical model through its expected provider and physical model. Membership establishes the
+preferred pool for descendants; it does not force every child family onto the root physical
+model.
+
+### Commit-bound routing
+
+A route policy that may walk authorized fallbacks before provider work begins, then preserves
+the selected lane once an irreversible dispatch or meaningful response makes replay unsafe.
+Availability is flexible while candidates are hypothetical and strict after work may have
+happened.
+
+### Child route home
+
+The first successful provider, account class, and physical-model lane selected for one child
+conversation. Later turns prefer that home for cache and turn continuity; a genuine
+availability failure may establish a new home without remapping the parent or siblings.
+
+### Trusted internal helper
+
+A Claude Code side request, such as WebSearch, whose authenticated caller and session lineage
+validate through the same private authority as the parent request even when it carries no
+subagent marker. Helper classification grants no capability by itself: the chosen provider
+route must still hold an exact reviewed proof.
+
 ## Usage measurement
 
 ### Canonical usage window
