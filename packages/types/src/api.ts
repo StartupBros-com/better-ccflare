@@ -17,6 +17,40 @@ export interface ComboSlotInfo {
 	slots: Array<{ accountId: string; modelOverride: string }>;
 }
 
+/** Server-derived request lineage used only by internal routing state. */
+export type RouteLineageMetadata =
+	| {
+			readonly kind: "root" | "helper";
+			readonly childHomeKey: null;
+	  }
+	| {
+			readonly kind: "descendant";
+			/** Restart-scoped opaque key; never the raw Claude Code agent id. */
+			readonly childHomeKey: string | null;
+	  };
+
+/** Ordered capability-descendant fallback rung represented by one candidate. */
+export type RouteFallbackRung =
+	| "profile_requested_model"
+	| "profile_root_model"
+	| "global_requested_model";
+
+/** Success-conditioned mutation applied to a descendant's preferred home. */
+export type RouteHomeAction =
+	| "none"
+	| "retained"
+	| "initial_commit"
+	| "repinned";
+
+/** Bounded reason that permits an established descendant home to be replaced. */
+export type RouteRepinReason =
+	| "structural_removal"
+	| "hard_exclusion"
+	| "account_unavailable"
+	| "model_capacity"
+	| "credential_failure"
+	| "route_circuit_open";
+
 /**
  * Immutable routing identity for one configured candidate. Normal routes use
  * one candidate per account; combos use one candidate per slot, so the same
@@ -33,6 +67,10 @@ export interface RoutingCandidateMetadata {
 	modelOverride: string | null;
 	/** Model-lane pressure for this exact candidate, when safely comparable. */
 	quotaPressure: AccountQuotaPressure | null;
+	/** Fallback position represented by this candidate, when descendant routing applies. */
+	routeFallbackRung?: RouteFallbackRung | null;
+	/** Logical model evaluated by this exact fallback candidate. */
+	effectiveLogicalModel?: string | null;
 	/**
 	 * Exact server-tool admission result for this candidate and physical model.
 	 * Absent for ordinary requests so legacy routing sidecars remain unchanged.
@@ -162,6 +200,14 @@ export interface RequestMeta {
 	headers?: Headers;
 	/** Server-derived exact-account route. Never populated directly from a public header. */
 	forcedAccountId?: string | null;
+	/** Internal trusted lineage; raw child-agent identity is never retained here. */
+	routeLineage?: RouteLineageMetadata | null;
+	/** Client-requested logical model used to compile a descendant route plan. */
+	requestedLogicalModel?: string | null;
+	/** Outcome of success-conditioned descendant-home handling for this request. */
+	routeHomeAction?: RouteHomeAction | null;
+	/** Why an established descendant home was replaced, if one was replaced. */
+	routeRepinReason?: RouteRepinReason | null;
 	/** Restart-scoped model route profile that produced the server-derived route. */
 	routeProfileId?: string | null;
 	/** Selection mode of the route profile; capability profiles use a live account pool. */

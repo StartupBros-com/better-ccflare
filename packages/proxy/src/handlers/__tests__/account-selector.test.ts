@@ -19,6 +19,7 @@ import type {
 	AnthropicDegradedRouteInspection,
 } from "../../anthropic-degraded-mode";
 import { CacheAffinityOrderer } from "../../cache-affinity-orderer";
+import { deriveClaudeCodeRouteLineage } from "../../claude-code-request";
 import { DegradedOwnerOverlay } from "../../degraded-owner-overlay";
 import {
 	ModelRouteSessionRegistry,
@@ -3862,6 +3863,78 @@ describe("selectAccountsForRequest — lane identity and quota pressure", () => 
 			"claude-opus-4-8",
 			"beta-b,context-1m",
 		]);
+	});
+
+	it("isolates profile child lanes by sibling, caller, and session", () => {
+		const childHeaders = (agentId: string) =>
+			new Headers({ "x-claude-code-agent-id": agentId });
+		const lineage = (
+			agentId: string,
+			callerIdentity = "api-key-id:caller-a",
+			sessionId = "conversation-child",
+		) =>
+			deriveClaudeCodeRouteLineage(childHeaders(agentId), {
+				callerIdentity,
+				sessionId,
+			});
+		const lane = (
+			routeLineage: ReturnType<typeof deriveClaudeCodeRouteLineage>,
+			clientSessionId = "conversation-child",
+		) =>
+			deriveAffinityLaneKey(
+				makeRequestMeta({
+					clientSessionId,
+					routeProfileId: "gpt-sol-capability",
+					routeLineage,
+				}),
+				"claude-sonnet-4-5",
+			);
+
+		const childA = lane(lineage("child-a"));
+		const childB = lane(lineage("child-b"));
+		const otherCaller = lane(lineage("child-a", "api-key-id:caller-b"));
+		const otherSession = lane(
+			lineage("child-a", "api-key-id:caller-a", "other-session"),
+			"other-session",
+		);
+
+		expect(childA).not.toBeNull();
+		expect(JSON.parse(childA as string)[0]).toBe(
+			"routing-lane-profile-child-v1",
+		);
+		expect(new Set([childA, childB, otherCaller, otherSession]).size).toBe(4);
+		expect(childA).not.toContain("child-a");
+	});
+
+	it("does not give parent or marker-only traffic a child route home", () => {
+		const parent = makeRequestMeta({
+			clientSessionId: "conversation-parent",
+			routeProfileId: "gpt-sol-capability",
+			routeLineage: deriveClaudeCodeRouteLineage(new Headers(), {
+				callerIdentity: "api-key-id:caller-a",
+				sessionId: "conversation-parent",
+			}),
+		});
+		const markerOnly = makeRequestMeta({
+			clientSessionId: "conversation-parent",
+			routeProfileId: "gpt-sol-capability",
+			routeLineage: deriveClaudeCodeRouteLineage(
+				new Headers({
+					"x-anthropic-billing-header": "cc_is_subagent=true",
+				}),
+				{
+					callerIdentity: "api-key-id:caller-a",
+					sessionId: "conversation-parent",
+				},
+			),
+		});
+
+		expect(
+			JSON.parse(
+				deriveAffinityLaneKey(parent, "claude-sonnet-4-5") as string,
+			)[0],
+		).toBe("routing-lane-profile-v1");
+		expect(deriveAffinityLaneKey(markerOnly, "claude-sonnet-4-5")).toBeNull();
 	});
 
 	it("derives comparable quota metadata for OAuth subscription accounts with null billing_type", async () => {

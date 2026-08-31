@@ -805,6 +805,15 @@ export function deriveAffinityLaneKey(
 	] as const;
 	const routeProfileId = meta.routeProfileId?.trim();
 	if (!routeProfileId) return JSON.stringify(legacyLane);
+	if (meta.routeLineage?.kind === "descendant") {
+		if (!meta.routeLineage.childHomeKey) return null;
+		return JSON.stringify([
+			"routing-lane-profile-child-v1",
+			routeProfileId,
+			meta.routeLineage.childHomeKey,
+			...legacyLane.slice(1),
+		]);
+	}
 	// Profile-scoped lanes intentionally use a distinct version/tag. This keeps
 	// the long-standing ordinary-traffic JSON shape/indexes stable while making
 	// capability pools unable to inherit an owner retained by a native lane.
