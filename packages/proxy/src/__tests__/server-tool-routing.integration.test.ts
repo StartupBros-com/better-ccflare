@@ -1472,4 +1472,53 @@ describe("server-tool routing integration", () => {
 		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(refreshCalls.value).toBe(0);
 	});
+
+	it("treats Claude Code's exact beta Messages query as capability-equivalent", async () => {
+		const endpointContracts: ProviderServerToolCapabilityEndpointContract[] =
+			[];
+		const account = makeAccount({
+			id: "claude-code-beta-query-account",
+			name: "claude-code-beta-query-account",
+			api_key: "query-key",
+			refresh_token: "",
+		});
+		const { ctx, provider } = makeContext(account, (candidateProvider) => {
+			candidateProvider.createServerToolCapabilityTuple = (context) => {
+				endpointContracts.push(context.endpointContract);
+				return makeTuple(context, candidateProvider.name);
+			};
+			candidateProvider.resolveServerToolCapability = (
+				_requirements,
+				tuple,
+			) => ({
+				decision: "proven",
+				proof: makeProof(tuple, "beta-query-proof"),
+			});
+		});
+		provider.parseRateLimit = () => ({ isRateLimited: false });
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ ok: true }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const request = makeServerToolRequest({
+			query: "beta=true",
+			claudeCodeForcedChoice: true,
+		});
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(request.url).toEndWith("/v1/messages?beta=true");
+		expect(endpointContracts.length).toBeGreaterThanOrEqual(3);
+		expect(endpointContracts).toEqual(
+			endpointContracts.map(() => ({
+				routeClass: "anthropic_messages",
+				queryPresent: false,
+			})),
+		);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+	});
 });

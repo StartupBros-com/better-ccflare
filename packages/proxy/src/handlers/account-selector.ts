@@ -430,9 +430,9 @@ function evaluateCandidateServerToolCapability(input: {
 	}
 	const requestTarget = splitRequestTarget(input.meta.path);
 	const capabilityQuery =
-		requestTarget.query.length > 0
+		input.meta.serverToolQueryPresent === undefined
 			? requestTarget.query
-			: input.meta.serverToolQueryPresent === true
+			: input.meta.serverToolQueryPresent
 				? "present"
 				: "";
 	let tuple: ServerToolCapabilityTuple | undefined;

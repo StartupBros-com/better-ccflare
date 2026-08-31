@@ -555,6 +555,16 @@ export function getUsageCollectorHealth(): UsageCollectorHealth {
 // ===== MAIN HANDLER =====
 
 /**
+ * Claude's beta Messages client appends this exact namespace marker even though
+ * it does not change the request semantics consumed by provider adapters. Keep
+ * every other query fail-closed for server-tool proof binding.
+ */
+function hasServerToolCapabilityQuery(url: URL): boolean {
+	if (url.search.length === 0) return false;
+	return !(url.pathname === "/v1/messages" && url.search === "?beta=true");
+}
+
+/**
  * Main proxy handler - orchestrates the entire proxy flow
  *
  * This function coordinates the proxy process by:
@@ -1232,7 +1242,7 @@ async function handleProxyCoreImpl(
 		// Selection needs only the semantic presence bit. Keep the raw query out of
 		// routing metadata while allowing the provider materializer to derive the
 		// same endpoint contract here and at pretransport binding.
-		requestMeta.serverToolQueryPresent = url.search.length > 0;
+		requestMeta.serverToolQueryPresent = hasServerToolCapabilityQuery(url);
 		if (serverToolRequirements.invalid?.length) {
 			return createUnservedServerToolRoutingErrorResponse(
 				new ServerToolRoutingError({ reason: "invalid_requirement" }),
