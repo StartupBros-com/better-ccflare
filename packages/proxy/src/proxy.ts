@@ -2396,6 +2396,7 @@ async function handleProxyCoreImpl(
 	};
 	const settleRoutedResponse = async (
 		candidate: PreparedProxyAccountResponse | Response,
+		commitSuccessfulCandidateHome: () => void,
 	): Promise<SettledRouteResponse | null> => {
 		if (req.signal.aborted) {
 			try {
@@ -2419,6 +2420,7 @@ async function handleProxyCoreImpl(
 		}
 		if (!isPreparedProxyAccountResponse(candidate)) {
 			await routingAttemptLedger.discardTerminalResponse();
+			if (candidate.ok) commitSuccessfulCandidateHome();
 			return { response: candidate, candidateWon: true };
 		}
 		// Caller cancellation owns the terminal even when an earlier route left a
@@ -2426,10 +2428,14 @@ async function handleProxyCoreImpl(
 		// HTTP status: an upstream provider is allowed to return its own 499.
 		if (candidate.disposition === "irreversible_no_replay") {
 			await routingAttemptLedger.discardTerminalResponse();
+			if (candidate.response.ok) commitSuccessfulCandidateHome();
 			return { response: await candidate.commit(), candidateWon: true };
 		}
 		if (candidate.response.ok && candidate.canSupersedeRetainedTerminal()) {
 			await routingAttemptLedger.discardTerminalResponse();
+			// Commit after arbitration but before forwardToClient captures route-home
+			// provenance in durable request history and response metadata.
+			commitSuccessfulCandidateHome();
 			return { response: await candidate.commit(), candidateWon: true };
 		}
 		// A failed or rescue-incompatible non-final candidate is only one queue
@@ -2441,6 +2447,8 @@ async function handleProxyCoreImpl(
 		}
 		const retainedTerminalResponse = await deliverRetainedTerminalResponse();
 		if (!retainedTerminalResponse) {
+			// A failed terminal may win delivery, but only a successful lane can own
+			// a descendant home.
 			return { response: await candidate.commit(), candidateWon: true };
 		}
 		await candidate.discard("superseded by retained upstream terminal");
@@ -2687,10 +2695,11 @@ async function handleProxyCoreImpl(
 		}
 		if (!response) return null;
 
-		const settled = await settleRoutedResponse(response);
+		const settled = await settleRoutedResponse(response, () =>
+			commitDescendantRouteHome(route.account, route.candidateId),
+		);
 		if (!settled) return null;
 		if (settled.candidateWon) {
-			commitDescendantRouteHome(route.account, route.candidateId);
 			recordXaiAffinityIfServed(
 				settled.response,
 				route.account,
@@ -2981,10 +2990,11 @@ async function handleProxyCoreImpl(
 			);
 		}
 		if (response) {
-			const settled = await settleRoutedResponse(response);
+			const settled = await settleRoutedResponse(response, () =>
+				commitDescendantRouteHome(accounts[i], candidateId),
+			);
 			if (settled) {
 				if (settled.candidateWon) {
-					commitDescendantRouteHome(accounts[i], candidateId);
 					recordXaiAffinityIfServed(settled.response, accounts[i], candidateId);
 					recordCachePacingRoute(
 						pacingObservation,
@@ -3118,10 +3128,11 @@ async function handleProxyCoreImpl(
 			);
 		}
 		if (response) {
-			const settled = await settleRoutedResponse(response);
+			const settled = await settleRoutedResponse(response, () =>
+				commitDescendantRouteHome(accounts[i], candidateId),
+			);
 			if (settled) {
 				if (settled.candidateWon) {
-					commitDescendantRouteHome(accounts[i], candidateId);
 					recordXaiAffinityIfServed(settled.response, accounts[i], candidateId);
 					recordCachePacingRoute(
 						pacingObservation,
@@ -3370,21 +3381,26 @@ async function handleProxyCoreImpl(
 					);
 				}
 				if (response) {
-					const settled = await settleRoutedResponse(response);
+					const fallbackAccount = fallbackAccounts[i];
+					if (!fallbackAccount) {
+						throw new Error("fallback candidate alignment lost");
+					}
+					const settled = await settleRoutedResponse(response, () =>
+						commitDescendantRouteHome(fallbackAccount, candidateId),
+					);
 					if (settled) {
 						if (settled.candidateWon) {
-							commitDescendantRouteHome(fallbackAccounts[i], candidateId);
 							recordXaiAffinityIfServed(
 								settled.response,
-								fallbackAccounts[i],
+								fallbackAccount,
 								candidateId,
 							);
 							recordCachePacingRoute(
 								pacingObservation,
 								{
-									accountId: fallbackAccounts[i].id,
-									accountName: fallbackAccounts[i].name,
-									provider: fallbackAccounts[i].provider,
+									accountId: fallbackAccount.id,
+									accountName: fallbackAccount.name,
+									provider: fallbackAccount.provider,
 								},
 								{
 									candidate: pacingEligible,
@@ -3479,21 +3495,26 @@ async function handleProxyCoreImpl(
 					);
 				}
 				if (response) {
-					const settled = await settleRoutedResponse(response);
+					const fallbackAccount = fallbackAccounts[i];
+					if (!fallbackAccount) {
+						throw new Error("fallback candidate alignment lost");
+					}
+					const settled = await settleRoutedResponse(response, () =>
+						commitDescendantRouteHome(fallbackAccount, candidateId),
+					);
 					if (settled) {
 						if (settled.candidateWon) {
-							commitDescendantRouteHome(fallbackAccounts[i], candidateId);
 							recordXaiAffinityIfServed(
 								settled.response,
-								fallbackAccounts[i],
+								fallbackAccount,
 								candidateId,
 							);
 							recordCachePacingRoute(
 								pacingObservation,
 								{
-									accountId: fallbackAccounts[i].id,
-									accountName: fallbackAccounts[i].name,
-									provider: fallbackAccounts[i].provider,
+									accountId: fallbackAccount.id,
+									accountName: fallbackAccount.name,
+									provider: fallbackAccount.provider,
 								},
 								{
 									candidate: pacingEligible,

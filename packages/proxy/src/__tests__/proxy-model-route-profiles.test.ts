@@ -2400,16 +2400,22 @@ describe("Claude Code gateway model route profiles", () => {
 		const firstChild = apiRequest("/v1/messages", CHILD_MODEL, childHeaders, {
 			metadata: { user_id: "capability-child-affinity" },
 		});
+		const firstChildResponse = await handleProxy(
+			firstChild,
+			new URL(firstChild.url),
+			harness.ctx,
+			"key-1",
+		);
+		expect(firstChildResponse.status).toBe(200);
+		expect(usageHandleStart.mock.calls[1]?.[0]).toMatchObject({
+			routeProvenance: {
+				fallbackRung: "profile_requested_model",
+				homeAction: "initial_commit",
+			},
+		});
 		expect(
-			(
-				await handleProxy(
-					firstChild,
-					new URL(firstChild.url),
-					harness.ctx,
-					"key-1",
-				)
-			).status,
-		).toBe(200);
+			firstChildResponse.headers.get("x-better-ccflare-route-fallback"),
+		).toBe("profile_requested_model");
 		const firstChildUrl = requests[1]?.url;
 		expect(firstChildUrl).toBeString();
 		if (firstChildUrl?.includes(`/${ROUTE_ACCOUNT_ID}/`)) {
@@ -2420,17 +2426,73 @@ describe("Claude Code gateway model route profiles", () => {
 		const nextChild = apiRequest("/v1/messages", CHILD_MODEL, childHeaders, {
 			metadata: { user_id: "capability-child-affinity" },
 		});
-		expect(
-			(
-				await handleProxy(
-					nextChild,
-					new URL(nextChild.url),
-					harness.ctx,
-					"key-1",
-				)
-			).status,
-		).toBe(200);
+		const nextChildResponse = await handleProxy(
+			nextChild,
+			new URL(nextChild.url),
+			harness.ctx,
+			"key-1",
+		);
+		expect(nextChildResponse.status).toBe(200);
+		expect(usageHandleStart.mock.calls[2]?.[0]).toMatchObject({
+			routeProvenance: {
+				fallbackRung: "profile_requested_model",
+				homeAction: "retained",
+			},
+		});
 		expect(requests[2]?.url).toBe(firstChildUrl);
+	});
+
+	it("does not make an unsuccessful terminal the descendant home", async () => {
+		const routed = makeAccount();
+		routed.model_mappings = JSON.stringify({
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+		});
+		const strategy = new SessionAffinityStrategy();
+		const harness = makeContext(makeCapabilityRegistry(), {
+			accounts: [routed],
+			strategy,
+		});
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return new Response(
+				JSON.stringify(
+					fetchCount === 1
+						? { id: "root-success", type: "message", content: [] }
+						: { type: "error", error: { type: "api_error" } },
+				),
+				{
+					status: fetchCount === 1 ? 200 : 500,
+					headers: { "content-type": "application/json" },
+				},
+			);
+		}) as unknown as typeof fetch;
+		const session = {
+			"x-claude-code-session-id": "capability-child-failed-home-session",
+		};
+		const root = apiRequest("/v1/messages", CAPABILITY_PROFILE_MODEL, session);
+		expect(
+			(await handleProxy(root, new URL(root.url), harness.ctx, "key-1")).status,
+		).toBe(200);
+		const affinityEntriesAfterRoot = strategy.affinityEntries;
+
+		const child = apiRequest("/v1/messages", CHILD_MODEL, {
+			...session,
+			"x-claude-code-agent-id": "capability-child-failed-home-agent",
+		});
+		const failed = await handleProxy(
+			child,
+			new URL(child.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(failed.status).toBe(500);
+		expect(strategy.affinityEntries).toBe(affinityEntriesAfterRoot);
+		expect(usageHandleStart.mock.calls.at(-1)?.[0]).toMatchObject({
+			routeProvenance: { homeAction: "none" },
+		});
 	});
 
 	it("applies the exact route rewrite, account pin, and default effort to count_tokens", async () => {
