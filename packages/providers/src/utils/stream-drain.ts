@@ -172,12 +172,14 @@ export async function drainReaderWithDeadline(
 		});
 
 		if (beforeDrain) {
+			const beforeDrainPromise = beforeDrain();
 			const reconciled = await Promise.race([
-				beforeDrain().then(() => "settled" as const),
+				beforeDrainPromise.then(() => "settled" as const),
 				deadline,
 			]);
 			if (reconciled === "deadline") {
 				drainAbort?.abort(new Error("Drain deadline exceeded"));
+				await awaitPendingReadSettlement(beforeDrainPromise, deadlineMs);
 				return;
 			}
 		}

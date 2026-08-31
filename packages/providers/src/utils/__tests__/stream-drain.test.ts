@@ -108,14 +108,25 @@ function unabortableReader(
 async function captureHelperTimers(run: () => Promise<void>): Promise<{
 	delays: number[];
 	clearedDelays: number[];
+	firedDelays: number[];
 }> {
 	const originalSetTimeout = globalThis.setTimeout;
 	const originalClearTimeout = globalThis.clearTimeout;
 	const timerDelays = new Map<ReturnType<typeof setTimeout>, number>();
 	const clearedDelays: number[] = [];
+	const firedDelays: number[] = [];
 
-	globalThis.setTimeout = ((handler: TimerHandler, timeout?: number) => {
-		const handle = originalSetTimeout(handler, timeout);
+	globalThis.setTimeout = ((
+		handler: TimerHandler,
+		timeout?: number,
+		...args: unknown[]
+	) => {
+		let handle!: ReturnType<typeof setTimeout>;
+		handle = originalSetTimeout(() => {
+			const delay = timerDelays.get(handle);
+			if (delay !== undefined) firedDelays.push(delay);
+			if (typeof handler === "function") handler(...args);
+		}, timeout);
 		timerDelays.set(handle, timeout ?? 0);
 		return handle;
 	}) as typeof setTimeout;
@@ -130,6 +141,7 @@ async function captureHelperTimers(run: () => Promise<void>): Promise<{
 		return {
 			delays: [...timerDelays.values()],
 			clearedDelays,
+			firedDelays,
 		};
 	} finally {
 		globalThis.setTimeout = originalSetTimeout;
@@ -209,6 +221,47 @@ for (const variant of drainVariants) {
 			expect(events.indexOf("release")).toBeGreaterThan(
 				events.indexOf("read-rejection-observed"),
 			);
+		});
+
+		it("clears primary and grace timers after abort settles the pending read early", async () => {
+			const events: string[] = [];
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown) => unhandled.push(reason);
+			process.on("unhandledRejection", onUnhandled);
+			const transportAbort = new AbortController();
+			const { reader, rejectRead } = controlledPendingReader(events);
+			transportAbort.signal.addEventListener(
+				"abort",
+				() => {
+					events.push("abort");
+					queueMicrotask(() => {
+						rejectRead(new Error("transport aborted"));
+					});
+				},
+				{ once: true },
+			);
+			const deadlineMs = 7;
+
+			try {
+				const timers = await captureHelperTimers(() =>
+					variant.run(reader, deadlineMs, transportAbort),
+				);
+				expect(timers.delays).toEqual([deadlineMs, deadlineMs]);
+				expect(timers.clearedDelays).toEqual([deadlineMs, deadlineMs]);
+				expect(timers.firedDelays).toEqual([deadlineMs]);
+				expect(events.indexOf("read-rejection-observed")).toBeGreaterThan(
+					events.indexOf("abort"),
+				);
+				expect(events.indexOf("release")).toBeGreaterThan(
+					events.indexOf("read-rejection-observed"),
+				);
+
+				await Bun.sleep(deadlineMs * 2);
+				expect(timers.firedDelays).toEqual([deadlineMs]);
+				expect(unhandled).toEqual([]);
+			} finally {
+				process.off("unhandledRejection", onUnhandled);
+			}
 		});
 
 		it("uses the resolved drain deadline as one bounded settlement-grace window", async () => {
@@ -315,7 +368,48 @@ describe("drainReader best-effort cancellation", () => {
 });
 
 describe("drainReaderWithDeadline beforeDrain", () => {
-	it("does not start a reader read when beforeDrain loses to the deadline", async () => {
+	it("settles a retained pending read after abort before releasing its lock", async () => {
+		const events: string[] = [];
+		const drainAbort = new AbortController();
+		const { reader, rejectRead } = controlledPendingReader(events);
+		const retainedRead = reader.read().then(
+			() => undefined,
+			() => {
+				events.push("prestep-settled");
+			},
+		);
+		drainAbort.signal.addEventListener(
+			"abort",
+			() => {
+				events.push("abort");
+				setTimeout(() => {
+					rejectRead(new Error("transport aborted"));
+				}, 0);
+			},
+			{ once: true },
+		);
+
+		await drainReaderWithDeadline(reader, {
+			deadlineMs: 5,
+			drainAbort,
+			beforeDrain: () => {
+				events.push("prestep-started");
+				return retainedRead;
+			},
+		});
+
+		expect(events).toEqual([
+			"read-started",
+			"prestep-started",
+			"abort",
+			"read-rejected",
+			"read-rejection-observed",
+			"prestep-settled",
+			"release",
+		]);
+	});
+
+	it("gives an unabortable beforeDrain one equal bounded grace window", async () => {
 		const events: string[] = [];
 		let readCount = 0;
 		let releaseCount = 0;
@@ -333,15 +427,21 @@ describe("drainReaderWithDeadline beforeDrain", () => {
 		drainAbort.signal.addEventListener("abort", () => events.push("abort"), {
 			once: true,
 		});
+		const deadlineMs = 7;
 
-		await drainReaderWithDeadline(reader, {
-			deadlineMs: 5,
-			drainAbort,
-			beforeDrain: () => new Promise<void>(() => {}),
-		});
+		const timers = await captureHelperTimers(() =>
+			drainReaderWithDeadline(reader, {
+				deadlineMs,
+				drainAbort,
+				beforeDrain: () => new Promise<void>(() => {}),
+			}),
+		);
 
 		expect(readCount).toBe(0);
 		expect(releaseCount).toBe(1);
+		expect(timers.delays).toEqual([deadlineMs, deadlineMs]);
+		expect(timers.firedDelays).toEqual([deadlineMs, deadlineMs]);
+		expect(timers.clearedDelays).toEqual([deadlineMs, deadlineMs]);
 		expect(events).toEqual(["abort", "release"]);
 	});
 
