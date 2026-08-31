@@ -102,6 +102,15 @@ export class RequestBodyContext {
 	}
 
 	/**
+	 * Side-effect-free presence preview for route-profile inheritance. Exact
+	 * capability admission still uses finalizeServerToolRequirements after every
+	 * model/body mutation is complete.
+	 */
+	previewServerToolRequirements(): ServerToolRequirements | undefined {
+		return deriveServerToolRequirement(this.getParsedJson());
+	}
+
+	/**
 	 * Derive capability metadata once from this context's already-cached final
 	 * parsed body. Callers must invoke this only after all interception is done.
 	 */

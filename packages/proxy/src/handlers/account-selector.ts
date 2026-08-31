@@ -2577,6 +2577,31 @@ async function selectAccountsForRequestInternal(
 			);
 		}
 		const excludedProviders = getExcludedProviders(meta);
+		const selectGlobalHelperFallback = async (): Promise<Account[]> => {
+			const selected = await getOrderedAccounts(
+				meta,
+				ctx,
+				effectiveModel,
+				options.syntheticProbe === true,
+				allAccounts,
+				undefined,
+				[],
+				(accounts) =>
+					accounts.filter(
+						(account) =>
+							isAccountEligibleForRouteIntent(account, meta, ctx) &&
+							!isProviderExcludedForRequest(account, excludedProviders),
+					),
+				modelScopedCapacityRouting,
+			);
+			for (const candidate of meta.routingCandidateCatalog ?? []) {
+				candidate.routeConstraintMode = "ordinary";
+			}
+			for (const candidate of meta.routingCandidates ?? []) {
+				candidate.routeConstraintMode = "ordinary";
+			}
+			return selected.filter((account) => isAccountAvailable(account));
+		};
 		const matchingAccounts = allAccounts.filter(
 			(account) =>
 				isAccountEligibleForRouteIntent(account, meta, ctx) &&
@@ -2584,9 +2609,14 @@ async function selectAccountsForRequestInternal(
 				!isProviderExcludedForRequest(account, excludedProviders),
 		);
 		if (matchingAccounts.length === 0) {
+			if (meta.routeLineage?.kind === "helper") {
+				return selectGlobalHelperFallback();
+			}
 			throw capabilityRouteUnavailable(meta, matchingAccounts);
 		}
-		const selected = await getOrderedAccounts(
+		let selected: Account[];
+		try {
+			selected = await getOrderedAccounts(
 			meta,
 			ctx,
 			effectiveModel,
@@ -2602,7 +2632,17 @@ async function selectAccountsForRequestInternal(
 						!isProviderExcludedForRequest(account, excludedProviders),
 				),
 			modelScopedCapacityRouting,
-		);
+			);
+		} catch (error) {
+			if (
+				meta.routeLineage?.kind === "helper" &&
+				(error instanceof ServerToolRoutingError ||
+					error instanceof ForceRouteUnavailableError)
+			) {
+				return selectGlobalHelperFallback();
+			}
+			throw error;
+		}
 		// A custom strategy is allowed to return stale/unavailable candidates;
 		// dynamic profiles must not let those candidates turn into a passthrough
 		// or an unrelated normal-pool route.
@@ -2614,6 +2654,9 @@ async function selectAccountsForRequestInternal(
 				isAccountAvailable(account),
 		);
 		if (available.length === 0) {
+			if (meta.routeLineage?.kind === "helper") {
+				return selectGlobalHelperFallback();
+			}
 			throw capabilityRouteUnavailable(meta, matchingAccounts);
 		}
 		return available;

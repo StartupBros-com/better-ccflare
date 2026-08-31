@@ -373,6 +373,164 @@ afterEach(() => {
 });
 
 describe("server-tool routing integration", () => {
+	it("inherits an active capability profile for a same-session helper without child markers", async () => {
+		const physicalModel = "gpt-5.6-sol";
+		const account = makeAccount({
+			access_token: "test-token",
+			expires_at: Date.now() + 60 * 60_000,
+			model_mappings: JSON.stringify({
+				opus: physicalModel,
+				sonnet: MODEL,
+			}),
+		});
+		const tuples: ServerToolCapabilityTuple[] = [];
+		const { ctx } = makeContext(account, (provider) => {
+			provider.createServerToolCapabilityTuple = (context) => {
+				const tuple = makeTuple(context, provider.name);
+				tuples.push(tuple);
+				return tuple;
+			};
+			provider.resolveServerToolCapability = (_requirements, tuple) => ({
+				decision: "proven",
+				proof: makeProof(tuple, `profile-helper:${tuple.candidateId}`),
+			});
+		});
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "server-tool-sol",
+						displayName: "Server tool Sol",
+						selection: "capability",
+						logicalModel: "claude-opus-5",
+						expectedProvider: "capability-test",
+						expectedPhysicalModel: physicalModel,
+					},
+				]),
+			),
+		);
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ ok: true }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const root = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer server-tool-test-client",
+				"x-claude-code-session-id": "server-tool-test-session",
+			},
+			body: JSON.stringify({
+				model: "claude-bccf-route-server-tool-sol",
+				messages: [{ role: "user", content: "establish profile" }],
+				max_tokens: 16,
+			}),
+		});
+		expect((await handleProxy(root, new URL(root.url), ctx, "key-1")).status).toBe(
+			200,
+		);
+
+		const helper = makeServerToolRequest();
+		const response = await handleProxy(
+			helper,
+			new URL(helper.url),
+			ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+		expect(tuples.length).toBeGreaterThan(0);
+		expect(tuples.every((tuple) => tuple.model === physicalModel)).toBe(true);
+	});
+
+	it("falls from an unavailable capability profile to a global proven helper route", async () => {
+		const physicalModel = "gpt-5.6-sol";
+		const profileAccount = makeAccount({
+			id: "profile-helper-account",
+			name: "profile-helper-account",
+			access_token: "profile-token",
+			expires_at: Date.now() + 60 * 60_000,
+			model_mappings: JSON.stringify({ opus: physicalModel, sonnet: MODEL }),
+		});
+		const globalAccount = makeAccount({
+			id: "global-helper-account",
+			name: "global-helper-account",
+			access_token: "global-token",
+			expires_at: Date.now() + 60 * 60_000,
+			priority: 10,
+			model_mappings: JSON.stringify({
+				opus: "global-search-model",
+				sonnet: MODEL,
+			}),
+		});
+		const { ctx } = makeContext(
+			[profileAccount, globalAccount],
+			(provider) => {
+				provider.resolveServerToolCapability = (_requirements, tuple) => ({
+					decision: "proven",
+					proof: makeProof(tuple, `global-helper:${tuple.candidateId}`),
+				});
+			},
+		);
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "server-tool-soft-profile",
+						displayName: "Server tool soft profile",
+						selection: "capability",
+						logicalModel: "claude-opus-5",
+						expectedProvider: "capability-test",
+						expectedPhysicalModel: physicalModel,
+					},
+				]),
+			),
+		);
+		globalThis.fetch = mock(
+			async (input: RequestInfo | URL) => {
+				const request = input instanceof Request ? input : new Request(input);
+				return new Response(
+					JSON.stringify({ url: request.url }),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			},
+		);
+		const root = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer server-tool-test-client",
+				"x-claude-code-session-id": "server-tool-test-session",
+			},
+			body: JSON.stringify({
+				model: "claude-bccf-route-server-tool-soft-profile",
+				messages: [{ role: "user", content: "establish profile" }],
+				max_tokens: 16,
+			}),
+		});
+		expect((await handleProxy(root, new URL(root.url), ctx, "key-1")).status).toBe(
+			200,
+		);
+
+		profileAccount.paused = true;
+		const helper = makeServerToolRequest();
+		const response = await handleProxy(
+			helper,
+			new URL(helper.url),
+			ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			url: "https://capability.invalid/v1/responses",
+		});
+	});
+
 	it("validates server-tool requirements without an activation flag", async () => {
 		const account = makeAccount({
 			access_token: "test-token",

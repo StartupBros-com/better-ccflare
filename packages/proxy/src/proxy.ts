@@ -1074,6 +1074,17 @@ async function handleProxyCoreImpl(
 		effectiveModelAfterInterception !== null &&
 		modelRouteRegistry?.hasPublicModelId(effectiveModelAfterInterception) ===
 			true;
+	const serverToolPreview =
+		finalRequestBodyContext.previewServerToolRequirements();
+	const isServerToolHelper =
+		serverToolPreview !== undefined &&
+		!isSubagent &&
+		!configuredOriginalPicker &&
+		!configuredEffectivePicker;
+	const inheritsRouteProfile = isSubagent || isServerToolHelper;
+	if (isServerToolHelper) {
+		requestMeta.routeLineage = { kind: "helper", childHomeKey: null };
+	}
 	// A stale picker selected directly in /model is not a native clear. Children,
 	// however, are classified entirely by their post-interception effective model.
 	if (!isSubagent && originalReservedPicker && !configuredOriginalPicker) {
@@ -1084,14 +1095,14 @@ async function handleProxyCoreImpl(
 			effectiveModelAfterInterception ?? "unknown",
 		);
 	}
-	const modelRouteRequestModel = isSubagent
+	const modelRouteRequestModel = inheritsRouteProfile
 		? effectiveModelAfterInterception
 		: normalizedRequestModel;
 	const modelRouteResolutionInput = {
 		callerIdentity: routeCallerIdentity(req, apiKeyId),
 		requestModel: modelRouteRequestModel,
 		sessionId: req.headers.get("x-claude-code-session-id"),
-		isSubagent,
+		isSubagent: inheritsRouteProfile,
 	};
 	const modelRouteResolution = modelRouteRegistry?.resolve(
 		modelRouteResolutionInput,
@@ -1123,6 +1134,7 @@ async function handleProxyCoreImpl(
 		requestMeta.routeExpectedProvider = profile.expectedProvider;
 		const inheritedPickerModel =
 			source === "inherited" && configuredEffectivePicker;
+		const inheritedHelperModel = source === "inherited" && isServerToolHelper;
 		if (
 			inheritedPickerModel &&
 			(effectiveModelAfterInterception === null ||
@@ -1141,7 +1153,7 @@ async function handleProxyCoreImpl(
 			finalBodyBuffer = finalRequestBodyContext.getBuffer();
 			appliedModel = profile.logicalModel;
 			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
-		} else if (inheritedPickerModel) {
+		} else if (inheritedPickerModel || inheritedHelperModel) {
 			finalRequestBodyContext.setModel(profile.logicalModel);
 			finalBodyBuffer = finalRequestBodyContext.getBuffer();
 			appliedModel = profile.logicalModel;
