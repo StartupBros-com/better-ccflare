@@ -210,14 +210,18 @@ export function compareStrategyCandidates(
 }
 
 /**
- * Apply SessionStrategy's probe-backoff penalty before its immutable candidate
- * tier while preserving exact candidate identity and quota-pressure ordering.
+ * Preserve the descendant fallback ladder before applying SessionStrategy's
+ * probe-backoff penalty within one rung. A penalty can reorder accounts but
+ * must never grant a fallback route eligibility ahead of the requested route.
  */
 export function compareSessionStrategyCandidates(
 	a: StrategyCandidate,
 	b: StrategyCandidate,
 	meta?: RequestMeta,
 ): number {
+	const fallbackOrder =
+		routeFallbackRank(a.routing) - routeFallbackRank(b.routing);
+	if (fallbackOrder !== 0) return fallbackOrder;
 	const probePreference =
 		probeBackoffRank(a.account.id) - probeBackoffRank(b.account.id);
 	if (probePreference !== 0) return probePreference;
