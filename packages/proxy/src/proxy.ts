@@ -1060,6 +1060,7 @@ async function handleProxyCoreImpl(
 			: new RequestBodyContext(finalBodyBuffer);
 	const effectiveModelAfterInterception =
 		finalRequestBodyContext.getModel()?.trim() ?? null;
+	requestMeta.requestedLogicalModel = effectiveModelAfterInterception;
 	const originalReservedPicker =
 		normalizedRequestModel?.startsWith(MODEL_ROUTE_PROFILE_MODEL_PREFIX) ===
 		true;

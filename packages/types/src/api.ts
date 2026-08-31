@@ -7,6 +7,9 @@ import type {
 import type {
 	AgentAttributionSource,
 	ProjectAttributionSource,
+	RouteFallbackRung,
+	RouteHomeAction,
+	RouteRepinReason,
 } from "./request";
 
 /** Combo slot routing info indexed exactly like the returned account array. */
@@ -29,30 +32,8 @@ export type RouteLineageMetadata =
 			readonly childHomeKey: string | null;
 	  };
 
-/** Ordered capability-descendant fallback rung represented by one candidate. */
-export type RouteFallbackRung =
-	| "profile_requested_model"
-	| "profile_root_model"
-	| "global_requested_model";
-
 /** Candidate-local route-profile constraint policy. */
 export type RouteConstraintMode = "profile" | "ordinary";
-
-/** Success-conditioned mutation applied to a descendant's preferred home. */
-export type RouteHomeAction =
-	| "none"
-	| "retained"
-	| "initial_commit"
-	| "repinned";
-
-/** Bounded reason that permits an established descendant home to be replaced. */
-export type RouteRepinReason =
-	| "structural_removal"
-	| "hard_exclusion"
-	| "account_unavailable"
-	| "model_capacity"
-	| "credential_failure"
-	| "route_circuit_open";
 
 /**
  * Immutable routing identity for one configured candidate. Normal routes use

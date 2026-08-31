@@ -23,6 +23,8 @@ const expectedColumns = [
 	"route_suppressed",
 	"circuit_counted",
 	"upstream_evidence",
+	"route_fallback_rung",
+	"route_candidate_id",
 ];
 
 const expectedIndexes = [

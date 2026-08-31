@@ -113,6 +113,27 @@ describe("RoutingAttemptRepository", () => {
 		]);
 	});
 
+	it("round trips candidate fallback provenance", async () => {
+		await attempts.append(
+			attempt({
+				id: "with-route-provenance",
+				routeFallbackRung: "profile_root_model",
+				routeCandidateId: "candidate-root",
+			}),
+		);
+
+		expect(
+			db
+				.prepare(
+					"SELECT route_fallback_rung, route_candidate_id FROM routing_attempts WHERE id = ?",
+				)
+				.get("with-route-provenance"),
+		).toEqual({
+			route_fallback_rung: "profile_root_model",
+			route_candidate_id: "candidate-root",
+		});
+	});
+
 	it("rejects duplicate immutable attempt ids", async () => {
 		const data = attempt({ id: "duplicate" });
 		await attempts.append(data);
