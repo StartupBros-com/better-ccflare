@@ -859,6 +859,39 @@ async function handleProxyCoreImpl(
 		url,
 		ctx.guardCorrelationVerifier,
 	);
+	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
+	const routingAttemptLedger = new RoutingAttemptLedger();
+	const recordLocalRoutingTerminal = (
+		response: Response,
+		terminalKind: string,
+	): Response => {
+		void recordRoutingTerminalRequest({
+			collector: tryGetUsageCollector(),
+			requestMeta,
+			requestHeaders: req.headers,
+			response,
+			providerName: ctx.provider.name,
+			terminalKind,
+			upstreamAttempts: routingAttemptLedger.attemptedCount,
+			apiKeyId,
+			apiKeyName,
+			skip: trustedInternalAutoRefresh,
+			onError: (error) => {
+				log.error(
+					`handleEnd failed for ${terminalKind} request ${requestMeta.id}`,
+					error,
+				);
+			},
+		});
+		return response;
+	};
+	const createRecordedForceRouteResponse = (
+		error: ForceRouteUnavailableError,
+	): Response =>
+		recordLocalRoutingTerminal(
+			forceRouteUnavailableResponse(error, requestMeta.routeProfileId == null),
+			`force_route_${error.reason}`,
+		);
 	const createUnservedServerToolRoutingErrorResponse = (
 		error: ServerToolRoutingError,
 	): Response => {
@@ -867,18 +900,19 @@ async function handleProxyCoreImpl(
 			requestMeta,
 			error.accountId,
 		);
-		return createServerToolRoutingErrorResponse(
-			clientVisibleAccountId === error.accountId
-				? error
-				: new ServerToolRoutingError({
-						reason: error.reason,
-						accountId: clientVisibleAccountId,
-						capabilitySummary: error.capabilitySummary,
-					}),
+		return recordLocalRoutingTerminal(
+			createServerToolRoutingErrorResponse(
+				clientVisibleAccountId === error.accountId
+					? error
+					: new ServerToolRoutingError({
+							reason: error.reason,
+							accountId: clientVisibleAccountId,
+							capabilitySummary: error.capabilitySummary,
+						}),
+			),
+			`server_tool_${error.reason}`,
 		);
 	};
-	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
-	const routingAttemptLedger = new RoutingAttemptLedger();
 	activeAnthropicPreCommitRescue?.registerRequestLifecycle(
 		getRequestLifecycleCoordinator(requestMeta),
 	);
@@ -1559,10 +1593,7 @@ async function handleProxyCoreImpl(
 			);
 			return finishPacing(
 				pacingObservation?.slot ?? null,
-				forceRouteUnavailableResponse(
-					error,
-					requestMeta.routeProfileId == null,
-				),
+				createRecordedForceRouteResponse(error),
 			);
 		}
 		if (serverToolRequirements) {
@@ -1842,10 +1873,7 @@ async function handleProxyCoreImpl(
 				);
 				return finishPacing(
 					pacingObservation?.slot ?? null,
-					forceRouteUnavailableResponse(
-						error,
-						requestMeta.routeProfileId == null,
-					),
+					createRecordedForceRouteResponse(error),
 				);
 			}
 			if (serverToolRequirements) {
@@ -1886,10 +1914,7 @@ async function handleProxyCoreImpl(
 		if (!(error instanceof ForceRouteUnavailableError)) return null;
 		await routingAttemptLedger.discardTerminalResponse();
 		if (!isFinalCandidate) return null;
-		return finishPacing(
-			pacingSlot,
-			forceRouteUnavailableResponse(error, requestMeta.routeProfileId == null),
-		);
+		return finishPacing(pacingSlot, createRecordedForceRouteResponse(error));
 	};
 	routingAttemptLedger.bindPhysicalAttemptBudgetTerminal({
 		requestId: requestMeta.id,

@@ -49,6 +49,8 @@ const MODEL = "claude-sonnet-4-5";
 const originalFetch = globalThis.fetch;
 const originalPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 let restoreUsageCollectors = (): void => {};
+let usageHandleStart = mock(() => undefined);
+let usageHandleEnd = mock(async () => undefined);
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
 	return {
@@ -342,10 +344,12 @@ function makeServerToolRequest(
 
 beforeEach(() => {
 	process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+	usageHandleStart = mock(() => undefined);
+	usageHandleEnd = mock(async () => undefined);
 	const collector = {
-		handleStart: mock(() => undefined),
+		handleStart: usageHandleStart,
 		handleChunk: mock(() => undefined),
-		handleEnd: mock(async () => undefined),
+		handleEnd: usageHandleEnd,
 	};
 	const required = spyOn(
 		usageCollectorModule,
@@ -758,6 +762,17 @@ describe("server-tool routing integration", () => {
 		expect(mutations.reportFailure).toHaveBeenCalledTimes(0);
 		expect(response.headers.has("x-better-ccflare-pool-status")).toBeFalse();
 		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBeFalse();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(usageHandleStart).toHaveBeenCalledTimes(1);
+		expect(usageHandleStart.mock.calls[0]?.[0]).toMatchObject({
+			accountId: null,
+			responseStatus: 400,
+		});
+		expect(usageHandleEnd).toHaveBeenCalledTimes(1);
+		expect(usageHandleEnd.mock.calls[0]?.[0]).toMatchObject({
+			success: false,
+			error: "server_tool_no_implementation",
+		});
 	});
 
 	it("stops a writer-disabled replay runtime before capability work or provider I/O", async () => {

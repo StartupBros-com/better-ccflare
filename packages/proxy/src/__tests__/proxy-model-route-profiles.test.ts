@@ -68,6 +68,9 @@ let restoreUsageCollector = (): void => {};
 let usageHandleStart = mock(
 	(_event: Parameters<UsageCollector["handleStart"]>[0]) => undefined,
 );
+let usageHandleEnd = mock(
+	async (_event: Parameters<UsageCollector["handleEnd"]>[0]) => undefined,
+);
 
 beforeEach(() => {
 	useProfileTestCatalog = true;
@@ -75,10 +78,13 @@ beforeEach(() => {
 	usageHandleStart = mock(
 		(_event: Parameters<UsageCollector["handleStart"]>[0]) => undefined,
 	);
+	usageHandleEnd = mock(
+		async (_event: Parameters<UsageCollector["handleEnd"]>[0]) => undefined,
+	);
 	const collector = {
 		handleStart: usageHandleStart,
 		handleChunk: mock(() => undefined),
-		handleEnd: mock(async () => undefined),
+		handleEnd: usageHandleEnd,
 	} as unknown as UsageCollector;
 	const collectorSpy = spyOn(
 		usageCollectorModule,
@@ -2138,6 +2144,17 @@ describe("Claude Code gateway model route profiles", () => {
 		});
 		expect(harness.strategySelect).not.toHaveBeenCalled();
 		expect(fetchMock).not.toHaveBeenCalled();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(usageHandleStart).toHaveBeenCalledTimes(1);
+		expect(usageHandleStart.mock.calls[0]?.[0]).toMatchObject({
+			accountId: null,
+			responseStatus: 503,
+		});
+		expect(usageHandleEnd).toHaveBeenCalledTimes(1);
+		expect(usageHandleEnd.mock.calls[0]?.[0]).toMatchObject({
+			success: false,
+			error: "force_route_model_mapping_mismatch",
+		});
 	});
 
 	it("rejects a capability profile when a later configured physical fallback differs", async () => {
