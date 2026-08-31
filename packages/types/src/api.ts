@@ -35,6 +35,9 @@ export type RouteFallbackRung =
 	| "profile_root_model"
 	| "global_requested_model";
 
+/** Candidate-local route-profile constraint policy. */
+export type RouteConstraintMode = "profile" | "ordinary";
+
 /** Success-conditioned mutation applied to a descendant's preferred home. */
 export type RouteHomeAction =
 	| "none"
@@ -71,6 +74,8 @@ export interface RoutingCandidateMetadata {
 	routeFallbackRung?: RouteFallbackRung | null;
 	/** Logical model evaluated by this exact fallback candidate. */
 	effectiveLogicalModel?: string | null;
+	/** Whether this candidate keeps profile constraints or uses ordinary admission. */
+	routeConstraintMode?: RouteConstraintMode | null;
 	/**
 	 * Exact server-tool admission result for this candidate and physical model.
 	 * Absent for ordinary requests so legacy routing sidecars remain unchanged.

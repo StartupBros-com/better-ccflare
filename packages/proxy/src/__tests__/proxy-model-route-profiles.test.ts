@@ -8,6 +8,7 @@ import {
 	spyOn,
 } from "bun:test";
 import { agentRegistry } from "@better-ccflare/agents";
+import { usageCache } from "@better-ccflare/providers";
 import type { Account, Agent } from "@better-ccflare/types";
 import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
 import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
@@ -69,6 +70,7 @@ let usageHandleStart = mock(
 
 beforeEach(() => {
 	useProfileTestCatalog = true;
+	usageCache.clear();
 	usageHandleStart = mock(
 		(_event: Parameters<UsageCollector["handleStart"]>[0]) => undefined,
 	);
@@ -93,6 +95,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	useProfileTestCatalog = false;
+	usageCache.clear();
 	restoreUsageCollector();
 	restoreUsageCollector = (): void => {};
 	globalThis.fetch = originalFetch;
@@ -2161,7 +2164,7 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
-	it("fails closed when an inherited capability child maps outside the root physical model", async () => {
+	it("lets an inherited capability child use its family mapping inside the root-capable pool", async () => {
 		const routed = makeAccount();
 		routed.model_mappings = JSON.stringify({
 			opus: "gpt-5.6-sol",
@@ -2172,7 +2175,7 @@ describe("Claude Code gateway model route profiles", () => {
 		});
 		const { fetchMock, requests } = installJsonUpstream();
 		const session = {
-			"x-claude-code-session-id": "capability-child-physical-mismatch",
+			"x-claude-code-session-id": "capability-child-family-mapping",
 		};
 		const root = apiRequest("/v1/messages", CAPABILITY_PROFILE_MODEL, session);
 		expect(
@@ -2187,7 +2190,7 @@ describe("Claude Code gateway model route profiles", () => {
 
 		const child = apiRequest("/v1/messages", CHILD_MODEL, {
 			...session,
-			"x-claude-code-agent-id": "capability-child-physical-mismatch",
+			"x-claude-code-agent-id": "capability-child-family-mapping",
 		});
 		const response = await handleProxy(
 			child,
@@ -2196,29 +2199,18 @@ describe("Claude Code gateway model route profiles", () => {
 			"key-1",
 		);
 
-		expect(response.status).toBe(503);
-		const payload = (await response.json()) as {
-			error: Record<string, unknown>;
-		};
-		expect(payload.error).toMatchObject({
-			type: "force_route_unavailable",
-			reason: "model_mapping_mismatch",
-		});
-		expect(payload.error).not.toHaveProperty("account_id");
-		expect(JSON.stringify(payload)).not.toContain(ROUTE_ACCOUNT_ID);
-		expect(fetchMock).toHaveBeenCalledTimes(1);
-		expect(requests).toHaveLength(1);
+		expect(response.status).toBe(200);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(requests).toHaveLength(2);
+		expect((await fetchedJson(requests[1])).model).toBe(CHILD_MODEL);
 	});
 
-	it("advances past a candidate whose inherited child mapping diverges to a compliant sibling candidate", async () => {
-		// Regression for issue #284: a ForceRouteUnavailableError raised by the
-		// pre-transport route-profile constraint check inside a single
-		// candidate's attempt plan is that candidate's failure alone. With two
-		// capability-matching accounts, the first candidate's divergent child
-		// mapping must not short-circuit the whole request into a 503 — the
-		// second, compliant candidate must still be attempted and win.
-		const mismatched = makeAccount();
-		mismatched.model_mappings = JSON.stringify({
+	it("keeps an inherited child on the first root-capable account despite a different family mapping", async () => {
+		// A capability profile constrains pool membership through the root model.
+		// The child family mapping is then an executable lane inside that pool, not
+		// a reason to skip to a sibling whose child happens to map back to root Sol.
+		const terraMapped = makeAccount();
+		terraMapped.model_mappings = JSON.stringify({
 			opus: "gpt-5.6-sol",
 			sonnet: "gpt-5.6-terra",
 		});
@@ -2228,7 +2220,7 @@ describe("Claude Code gateway model route profiles", () => {
 			sonnet: "gpt-5.6-sol",
 		});
 		const harness = makeContext(makeCapabilityRegistry(), {
-			accounts: [mismatched, compliant],
+			accounts: [terraMapped, compliant],
 		});
 		harness.strategySelect.mockImplementation(
 			(accounts: Account[]) => accounts,
@@ -2260,14 +2252,97 @@ describe("Claude Code gateway model route profiles", () => {
 		);
 
 		expect(response.status).toBe(200);
-		// The mismatched candidate must never reach transport (0 requests for
-		// it), yet the request as a whole must still succeed via the second,
-		// compliant candidate — proving both candidates were considered.
 		expect(fetchMock).toHaveBeenCalledTimes(2);
 		expect(requests).toHaveLength(2);
 		expect(requests[0]?.url).toContain(`/${ROUTE_ACCOUNT_ID}/v1/messages`);
-		expect(requests[1]?.url).toContain(
-			"/capability-child-compliant-secondary/v1/messages",
+		expect(requests[1]?.url).toContain(`/${ROUTE_ACCOUNT_ID}/v1/messages`);
+	});
+
+	it("falls from an exhausted child model to the root model inside the profile pool", async () => {
+		const routed = makeAccount();
+		routed.model_mappings = JSON.stringify({
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+		});
+		const harness = makeContext(makeCapabilityRegistry(), {
+			accounts: [routed],
+		});
+		harness.strategySelect.mockImplementation((accounts: Account[]) => accounts);
+		const { requests } = installJsonUpstream();
+		const session = {
+			"x-claude-code-session-id": "capability-child-root-fallback",
+		};
+		const root = apiRequest("/v1/messages", CAPABILITY_PROFILE_MODEL, session);
+		expect(
+			(await handleProxy(root, new URL(root.url), harness.ctx, "key-1")).status,
+		).toBe(200);
+
+		usageCache.markModelScopedExhausted(
+			routed.id,
+			CHILD_MODEL,
+			"",
+			Date.now() + 60_000,
+		);
+		const child = apiRequest("/v1/messages", CHILD_MODEL, {
+			...session,
+			"x-claude-code-agent-id": "capability-child-root-fallback",
+		});
+		const response = await handleProxy(
+			child,
+			new URL(child.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		expect(requests).toHaveLength(2);
+		expect((await fetchedJson(requests[1])).model).toBe(LOGICAL_MODEL);
+	});
+
+	it("falls from an unavailable profile pool to native global same-model routing", async () => {
+		const routed = makeAccount();
+		routed.model_mappings = JSON.stringify({
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+		});
+		const mappedGlobal = makeAccount("mapped-global-must-stay-fenced");
+		mappedGlobal.provider = "xai";
+		mappedGlobal.priority = -1;
+		mappedGlobal.model_mappings = JSON.stringify({ sonnet: "grok-4.6" });
+		const nativeGlobal = makeAccount("native-global-sonnet");
+		nativeGlobal.provider = "anthropic";
+		nativeGlobal.priority = 20;
+		const harness = makeContext(makeCapabilityRegistry(), {
+			accounts: [routed, mappedGlobal, nativeGlobal],
+		});
+		harness.strategySelect.mockImplementation((accounts: Account[]) => accounts);
+		const { requests } = installJsonUpstream();
+		const session = {
+			"x-claude-code-session-id": "capability-child-global-fallback",
+		};
+		const root = apiRequest("/v1/messages", CAPABILITY_PROFILE_MODEL, session);
+		expect(
+			(await handleProxy(root, new URL(root.url), harness.ctx, "key-1")).status,
+		).toBe(200);
+
+		routed.paused = true;
+		const child = apiRequest("/v1/messages", CHILD_MODEL, {
+			...session,
+			"x-claude-code-agent-id": "capability-child-global-fallback",
+		});
+		const response = await handleProxy(
+			child,
+			new URL(child.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		expect(requests).toHaveLength(2);
+		expect(requests[1]?.url).toBe("https://api.anthropic.com/v1/messages");
+		expect((await fetchedJson(requests[1])).model).toBe(CHILD_MODEL);
+		expect(requests.some((request) => request.url.includes(mappedGlobal.id))).toBe(
+			false,
 		);
 	});
 

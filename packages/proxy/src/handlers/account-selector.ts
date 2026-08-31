@@ -110,12 +110,7 @@ export function getRouteProfileConstraintViolation(
 		return "provider_mismatch";
 	}
 
-	const expectedPhysicalModel = (
-		meta.routeExpectedPhysicalModel ??
-		(meta.routeProfileSelection === "capability"
-			? meta.routeProfileExpectedPhysicalModel
-			: null)
-	)?.trim();
+	const expectedPhysicalModel = meta.routeExpectedPhysicalModel?.trim();
 	if (!expectedPhysicalModel) return null;
 
 	const candidates =
@@ -1906,7 +1901,14 @@ function matchesCapabilityRouteProfile(
 		return false;
 	}
 	return (
-		getRouteProfileConstraintViolation(account, meta, logicalModel) === null
+		getRouteProfileConstraintViolation(
+			account,
+			{
+				...meta,
+				routeExpectedPhysicalModel: expectedPhysicalModel,
+			},
+			logicalModel,
+		) === null
 	);
 }
 
@@ -1936,6 +1938,191 @@ function capabilityRouteUnavailable(
 		accountId,
 		"rate_limited_or_unavailable",
 	);
+}
+
+function capabilityDescendantCandidateId(
+	profileId: string,
+	rung: NonNullable<RoutingCandidateMetadata["routeFallbackRung"]>,
+	accountId: string,
+	model: string,
+): string {
+	return `profile:${encodeURIComponent(profileId)}:${rung}:${encodeURIComponent(
+		accountId,
+	)}:${encodeURIComponent(model.trim().toLowerCase())}`;
+}
+
+function alignCapabilityCandidates(
+	accounts: readonly Account[],
+	candidates: readonly RoutingCandidateMetadata[],
+): RoutingCandidateMetadata[] {
+	const used = new Set<number>();
+	return accounts.flatMap((account, index) => {
+		const positional = candidates[index];
+		if (positional?.accountId === account.id && !used.has(index)) {
+			used.add(index);
+			return [positional];
+		}
+		const matchedIndex = candidates.findIndex(
+			(candidate, candidateIndex) =>
+				candidate.accountId === account.id && !used.has(candidateIndex),
+		);
+		if (matchedIndex < 0) return [];
+		used.add(matchedIndex);
+		return [candidates[matchedIndex] as RoutingCandidateMetadata];
+	});
+}
+
+async function selectCapabilityDescendantAccounts(
+	meta: RequestMeta,
+	ctx: ProxyContext,
+	allAccounts: Account[],
+	effectiveModel: string,
+	syntheticProbe: boolean,
+	modelScopedCapacityRouting: ModelScopedCapacityRoutingMode,
+): Promise<Account[]> {
+	const profileId = meta.routeProfileId?.trim() || "capability-route";
+	const rootModel = meta.routeProfileLogicalModel?.trim();
+	if (!rootModel) throw capabilityRouteUnavailable(meta, []);
+	const excludedProviders = getExcludedProviders(meta);
+	const rootPool = allAccounts.filter(
+		(account) =>
+			isAccountEligibleForRouteIntent(account, meta, ctx) &&
+			matchesCapabilityRouteProfile(account, meta) &&
+			!isProviderExcludedForRequest(account, excludedProviders),
+	);
+	if (rootPool.length === 0) throw capabilityRouteUnavailable(meta, rootPool);
+
+	const globalPool = applyImplicitFallbackPolicy(
+		allAccounts.filter(
+			(account) =>
+				isAccountEligibleForRouteIntent(account, meta, ctx) &&
+				!isProviderExcludedForRequest(account, excludedProviders) &&
+				isOrdinaryStockModelAccountEligible(account, effectiveModel),
+		),
+		ctx,
+		"normal",
+		meta,
+	);
+	const specifications = [
+		...rootPool.map((account) => ({
+			account,
+			model: effectiveModel,
+			rung: "profile_requested_model" as const,
+			constraint: "profile" as const,
+		})),
+		...rootPool.map((account) => ({
+			account,
+			model: rootModel,
+			rung: "profile_root_model" as const,
+			constraint: "profile" as const,
+		})),
+		...globalPool.map((account) => ({
+			account,
+			model: effectiveModel,
+			rung: "global_requested_model" as const,
+			constraint: "ordinary" as const,
+		})),
+	];
+	const seenRoutes = new Set<string>();
+	const catalog: RoutingCandidateMetadata[] = [];
+	const eligibleCandidates: RoutingCandidateMetadata[] = [];
+	const candidateAccounts: Account[] = [];
+	const exclusions: RoutingCapacityCandidateExclusion[] = [];
+	const now = Date.now();
+	const beta = canonicalizeBetaSignature(meta.headers?.get("anthropic-beta"));
+	for (const specification of specifications) {
+		const configured = getConfiguredModelMapping(
+			specification.model,
+			specification.account,
+		);
+		const physicalModel = configured?.models[0]?.trim() || specification.model;
+		const routeKey = JSON.stringify([
+			specification.account.id,
+			physicalModel.toLowerCase(),
+		]);
+		if (seenRoutes.has(routeKey)) continue;
+		seenRoutes.add(routeKey);
+		const routing: RoutingCandidateMetadata = {
+			...normalCandidateMetadata(
+				specification.account,
+				catalog.length,
+				specification.model,
+			),
+			candidateId: capabilityDescendantCandidateId(
+				profileId,
+				specification.rung,
+				specification.account.id,
+				specification.model,
+			),
+			routeFallbackRung: specification.rung,
+			effectiveLogicalModel: specification.model,
+			routeConstraintMode: specification.constraint,
+		};
+		catalog.push(routing);
+		const evaluation = evaluateCandidateCapacity(
+			specification.account,
+			specification.model,
+			beta,
+			now,
+			{
+				modelScopedCapacityRouting,
+				routeIntent:
+					specification.constraint === "profile" ? "capability" : "ordinary",
+				syntheticProbe,
+			},
+		);
+		routing.quotaPressure = evaluation.quotaPressure;
+		if (evaluation.blockers.length > 0) {
+			exclusions.push(
+				candidateExclusion(
+					specification.account,
+					specification.model,
+					evaluation,
+					"normal",
+				),
+			);
+			continue;
+		}
+		candidateAccounts.push(specification.account);
+		eligibleCandidates.push(routing);
+	}
+
+	meta.affinityLaneKey = deriveAffinityLaneKey(meta, effectiveModel);
+	meta.hardExcludedAccountIds = null;
+	meta.quotaPressureByAccountId = null;
+	meta.routingCandidateCatalog = catalog;
+	meta.routingCandidates = eligibleCandidates;
+	capacityDeferredModelRoutesMap.set(meta, []);
+	saveCapacityContext(meta, effectiveModel, exclusions, {
+		before: catalog.length,
+		after: meta.routingCandidates.length,
+	});
+	if (candidateAccounts.length === 0) {
+		throw capabilityRouteUnavailable(meta, rootPool);
+	}
+	const eligibleCandidateIds = new Set(
+		meta.routingCandidates.map((candidate) => candidate.candidateId),
+	);
+	const strategyOrdered = await ctx.strategy.select(candidateAccounts, meta);
+	const aligned = alignCapabilityCandidates(
+		strategyOrdered,
+		meta.routingCandidates,
+	).filter((candidate) => eligibleCandidateIds.has(candidate.candidateId));
+	const accountsById = new Map(allAccounts.map((account) => [account.id, account]));
+	const finalCandidates = aligned.filter((candidate) => {
+		const account = accountsById.get(candidate.accountId);
+		return account !== undefined && isAccountAvailable(account);
+	});
+	meta.routingCandidates = finalCandidates;
+	const finalAccounts = finalCandidates.flatMap((candidate) => {
+		const account = accountsById.get(candidate.accountId);
+		return account ? [account] : [];
+	});
+	finalizeSelectionDiagnostics(meta, finalAccounts.length);
+	if (finalAccounts.length === 0) {
+		throw capabilityRouteUnavailable(meta, rootPool);
+	}
+	return finalAccounts;
 }
 
 function reportAccountDatabaseError(error: unknown): void {
@@ -2373,6 +2560,20 @@ async function selectAccountsForRequestInternal(
 			throw new ForceRouteUnavailableError(
 				meta.routeProfileId?.trim() || "capability-route",
 				"lookup_failed",
+			);
+		}
+		if (
+			meta.routeLineage?.kind === "descendant" &&
+			effectiveModel &&
+			!meta.serverToolRequirements
+		) {
+			return selectCapabilityDescendantAccounts(
+				meta,
+				ctx,
+				allAccounts,
+				effectiveModel,
+				options.syntheticProbe === true,
+				modelScopedCapacityRouting,
 			);
 		}
 		const excludedProviders = getExcludedProviders(meta);

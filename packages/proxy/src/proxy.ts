@@ -26,6 +26,7 @@ import {
 import type {
 	Account,
 	RequestMeta,
+	RoutingCandidateMetadata,
 	RoutingSelectionDiagnostics,
 	RoutingSelectionZeroAttemptReason,
 } from "@better-ccflare/types";
@@ -59,7 +60,10 @@ import {
 import { warnOnLookbackRisk } from "./cache-telemetry";
 import { CACHE_REPLAY_MODEL_HEADER } from "./cache-transport-staging";
 import { adaptAnthropicSsePingsForClaudeCode } from "./claude-code-ping-compat";
-import { isClaudeCodeSubagent } from "./claude-code-request";
+import {
+	deriveClaudeCodeRouteLineage,
+	isClaudeCodeSubagent,
+} from "./claude-code-request";
 import {
 	type AgentInterceptResult,
 	createContextAdmissionTracker,
@@ -325,13 +329,10 @@ export function isReactivelyModelDepleted(
  * routing-candidate sidecar. Matching is occurrence-safe: repeated combo slots
  * backed by one account consume distinct candidate IDs in their source order.
  */
-export function alignRouteCandidateIds(
+export function alignRouteCandidates(
 	accounts: readonly Account[],
-	candidates:
-		| readonly { readonly accountId: string; readonly candidateId: string }[]
-		| null
-		| undefined,
-): string[] {
+	candidates: readonly RoutingCandidateMetadata[] | null | undefined,
+): Array<RoutingCandidateMetadata | undefined> {
 	const usedCandidateIndexes = new Set<number>();
 	return accounts.map((account, accountIndex) => {
 		const indexedCandidate = candidates?.[accountIndex];
@@ -340,7 +341,7 @@ export function alignRouteCandidateIds(
 			!usedCandidateIndexes.has(accountIndex)
 		) {
 			usedCandidateIndexes.add(accountIndex);
-			return indexedCandidate.candidateId;
+			return indexedCandidate;
 		}
 
 		const matchedIndex =
@@ -349,12 +350,20 @@ export function alignRouteCandidateIds(
 					candidate.accountId === account.id &&
 					!usedCandidateIndexes.has(candidateIndex),
 			) ?? -1;
-		if (matchedIndex >= 0 && candidates) {
-			usedCandidateIndexes.add(matchedIndex);
-			return candidates[matchedIndex].candidateId;
-		}
-		return `account:${account.id}`;
+		if (matchedIndex < 0 || !candidates) return undefined;
+		usedCandidateIndexes.add(matchedIndex);
+		return candidates[matchedIndex];
 	});
+}
+
+export function alignRouteCandidateIds(
+	accounts: readonly Account[],
+	candidates: readonly RoutingCandidateMetadata[] | null | undefined,
+): string[] {
+	return alignRouteCandidates(accounts, candidates).map(
+		(candidate, index) =>
+			candidate?.candidateId ?? `account:${accounts[index]?.id ?? "unknown"}`,
+	);
 }
 
 const log = new Logger("Proxy");
@@ -926,6 +935,10 @@ async function handleProxyCoreImpl(
 	const normalizedRequestModel = requestModel?.trim() ?? null;
 	const modelRouteRegistry = ctx.modelRouteSessionRegistry;
 	const isSubagent = isClaudeCodeSubagent(req.headers);
+	requestMeta.routeLineage = deriveClaudeCodeRouteLineage(req.headers, {
+		callerIdentity: routeCallerIdentity(req, apiKeyId),
+		sessionId,
+	});
 	const { project, projectAttributionSource } =
 		extractProjectAttributionFromRequest(req.headers, parsedBody);
 
@@ -1608,8 +1621,13 @@ async function handleProxyCoreImpl(
 
 		const now = Date.now();
 		const available: Account[] = [];
+		const availableRoutingCandidates: RoutingCandidateMetadata[] = [];
 		const predictivelyThrottled: Account[] = [];
 		const reactivelyDepletedAccounts: Account[] = [];
+		const alignedCandidates = alignRouteCandidates(
+			accounts,
+			requestMeta.routingCandidates,
+		);
 
 		// Model-aware throttling: a per-model weekly cap should only throttle
 		// requests for that model. Use the effective (post-intercept) request
@@ -1622,8 +1640,10 @@ async function handleProxyCoreImpl(
 		const comboRouted = requestMeta.comboName != null;
 		const effectiveModel = appliedModel ?? requestModel ?? null;
 
-		for (const account of accounts) {
-			const candidateModel = comboRouted ? null : effectiveModel;
+		for (const [index, account] of accounts.entries()) {
+			const candidateModel = comboRouted
+				? null
+				: (alignedCandidates[index]?.effectiveLogicalModel ?? effectiveModel);
 			const throttleUntil = getPredictiveThrottleUntil(
 				account,
 				candidateModel,
@@ -1647,6 +1667,11 @@ async function handleProxyCoreImpl(
 				continue;
 			}
 			available.push(account);
+			const alignedCandidate = alignedCandidates[index];
+			if (alignedCandidate) availableRoutingCandidates.push(alignedCandidate);
+		}
+		if (alignedCandidates.every((candidate) => candidate !== undefined)) {
+			requestMeta.routingCandidates = availableRoutingCandidates;
 		}
 
 		if (predictivelyThrottled.length > 0) {
@@ -2236,9 +2261,13 @@ async function handleProxyCoreImpl(
 			sequence: deferredModelRoutes.length,
 		});
 	};
-	const selectedRouteCandidateIds = alignRouteCandidateIds(
+	const selectedRouteCandidates = alignRouteCandidates(
 		accounts,
 		requestMeta.routingCandidates,
+	);
+	const selectedRouteCandidateIds = selectedRouteCandidates.map(
+		(candidate, index) =>
+			candidate?.candidateId ?? `account:${accounts[index]?.id ?? "unknown"}`,
 	);
 	for (const route of selectedCapacityDeferredRoutes) {
 		deferModelRoute(
@@ -2261,11 +2290,13 @@ async function handleProxyCoreImpl(
 		// caller (default), so the combo-vs-implicit-fallback distinction is
 		// never inferred from modelOverride alone.
 		comboModelOverrideFrom: string | null = null,
+		routeConstraintMode: RoutingCandidateMetadata["routeConstraintMode"] = null,
 	): ModelFallbackExecutionPolicy => {
 		const comboName = requestMeta.comboName ?? null;
 		const comboSlotIndex = requestMeta.comboSlotIndex ?? null;
 		return {
 			routeCandidateId: candidateId,
+			routeConstraintMode: routeConstraintMode ?? undefined,
 			prepareFinalResponse: true,
 			forwardModelUnavailableResponse,
 			comboModelOverrideFrom,
@@ -2752,7 +2783,9 @@ async function handleProxyCoreImpl(
 			pacingBypassed = false;
 			requestMeta.codexPacingAction = "crossover-paced";
 		}
-		// For combo routing: enrich metadata with slot index and look up model override
+		// Candidate metadata is the general execution sidecar. Combo slot state
+		// remains the attribution source for combo-specific observability.
+		const selectedCandidate = selectedRouteCandidates[i];
 		let modelOverride: string | null = null;
 		if (filteredComboInfo?.slots[i]) {
 			const slot = filteredComboInfo.slots[i];
@@ -2767,9 +2800,15 @@ async function handleProxyCoreImpl(
 			log.debug(
 				`Attempting combo slot ${i}/${accounts.length - 1} on account ${accounts[i].name} with model "${modelOverride}"`,
 			);
+		} else if (
+			selectedCandidate?.modelOverride &&
+			selectedCandidate.modelOverride !== effectiveModel
+		) {
+			modelOverride = selectedCandidate.modelOverride;
 		}
 
-		const attemptModel = modelOverride ?? effectiveModel;
+		const attemptModel =
+			selectedCandidate?.effectiveLogicalModel ?? modelOverride ?? effectiveModel;
 		// Normal routes were filtered above. Combo slots need this attempt-level
 		// check because each slot may override the model independently.
 		if (
@@ -2844,7 +2883,8 @@ async function handleProxyCoreImpl(
 					// Only a genuine combo slot carries a pre-override baseline;
 					// the desync edge case above leaves modelOverride null so no
 					// override is attributed there either.
-					modelOverride ? effectiveModel : null,
+					filteredComboInfo && modelOverride ? effectiveModel : null,
+					selectedCandidate?.routeConstraintMode,
 				),
 				anthropicDegradedSendState,
 			);
@@ -2938,9 +2978,15 @@ async function handleProxyCoreImpl(
 	// 503 against what may be a perfectly healthy account.
 	if (!anyAccountAttempted && accounts.length > 0) {
 		const i = 0;
+		const selectedCandidate = selectedRouteCandidates[i];
 		let modelOverride: string | null = null;
 		if (filteredComboInfo?.slots[i]?.accountId === accounts[i].id) {
 			modelOverride = filteredComboInfo.slots[i].modelOverride;
+		} else if (
+			selectedCandidate?.modelOverride &&
+			selectedCandidate.modelOverride !== effectiveModel
+		) {
+			modelOverride = selectedCandidate.modelOverride;
 		}
 		log.info(
 			`All ${accounts.length} candidate account(s) were probe-gate suppressed; retrying account ${accounts[i].name} ungated`,
@@ -2987,7 +3033,8 @@ async function handleProxyCoreImpl(
 					// null, which recorded a real slot-level rewrite as "no
 					// override" and hid it from comboModelOverride attribution
 					// and from the model-routing drift alert.
-					modelOverride ? effectiveModel : null,
+					filteredComboInfo && modelOverride ? effectiveModel : null,
+					selectedCandidate?.routeConstraintMode,
 				),
 				anthropicDegradedSendState,
 			);
