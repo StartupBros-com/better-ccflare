@@ -215,8 +215,9 @@ export interface RequestMeta {
 	/** Frozen content-minimal server-tool constraints derived from the final request body. */
 	serverToolRequirements?: ServerToolRequirements;
 	/**
-	 * Request-local endpoint fact used by capability selection. Raw query text is
-	 * intentionally never copied into routing metadata.
+	 * Whether the endpoint carries a semantically significant server-tool query.
+	 * Raw query text is never copied into routing metadata; the exact Claude SDK
+	 * `/v1/messages?beta=true` namespace alias is classified as absent.
 	 */
 	serverToolQueryPresent?: boolean;
 	/** Aggregate capability/admission evidence for the structural candidate pool. */

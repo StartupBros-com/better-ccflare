@@ -2990,7 +2990,12 @@ export async function proxyWithAccount(
 					candidateId: routeCandidateId,
 					account,
 					path: url.pathname,
-					query: url.search,
+					query:
+						requestMeta.serverToolQueryPresent === undefined
+							? url.search
+							: requestMeta.serverToolQueryPresent
+								? "present"
+								: "",
 					physicalModel,
 					requirements: serverToolRequirements,
 				});
