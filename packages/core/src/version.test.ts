@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
 	isTrustedDistributionProvenance,
 	parseDistributionIdentity,
@@ -13,6 +15,20 @@ import {
 } from "./version";
 
 describe("release lineage", () => {
+	it("keeps root and CLI package lineage at exact v3.5.70 parity", () => {
+		const repositoryRoot = resolve(import.meta.dir, "../../..");
+		const rootPackage = JSON.parse(
+			readFileSync(resolve(repositoryRoot, "package.json"), "utf8"),
+		) as { version?: unknown };
+		const cliPackage = JSON.parse(
+			readFileSync(resolve(repositoryRoot, "apps/cli/package.json"), "utf8"),
+		) as { version?: unknown };
+
+		expect(rootPackage.version).toBe("3.5.70");
+		expect(cliPackage.version).toBe("3.5.70");
+		expect(rootPackage.version).toBe(cliPackage.version);
+	});
+
 	it("uses the exact upstream Claude CLI fallback version", () => {
 		expect(CLAUDE_CLI_VERSION).toBe("2.1.250");
 	});

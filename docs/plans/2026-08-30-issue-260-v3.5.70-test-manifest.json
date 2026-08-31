@@ -93,6 +93,33 @@
         "assertions": 4
       },
       "purpose": "Prove account-selected models remain authoritative while omitted or blank on-demand usage probes fall back to the fork/upstream-known valid gpt-5.6-sol model, never gpt-5-codex."
+    },
+    {
+      "unit": "final-audit",
+      "requirements": [
+        "review-finding-2",
+        "review-finding-5"
+      ],
+      "path": "scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "command": "bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "beforeSourceChange": {
+        "status": "expected-failure",
+        "exitCode": 1,
+        "passes": 34,
+        "failures": 9,
+        "skips": 0,
+        "assertions": 78,
+        "observed": "Schema v2 was unsupported; generation remained v1; lightweight tags, wrong tag objects, and invalid committed integration topologies were not rejected by the required contracts."
+      },
+      "afterSourceChange": {
+        "status": "passed",
+        "exitCode": 0,
+        "passes": 43,
+        "failures": 0,
+        "skips": 0,
+        "assertions": 96
+      },
+      "purpose": "Prove schema-v2 annotated-tag identity and exact committed two-parent integration topology before implementing the generic validator contract."
     }
   ],
   "isolatedTests": [
@@ -112,11 +139,11 @@
       "command": "bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts",
       "status": "passed",
       "exitCode": 0,
-      "passes": 34,
+      "passes": 43,
       "failures": 0,
       "skips": 0,
-      "assertions": 81,
-      "purpose": "Validate generic inventory derivation, exact item accounting, final evidence requirements, and rerere-capture enforcement."
+      "assertions": 96,
+      "purpose": "Validate schema-v1 compatibility plus schema-v2 annotated-tag identity, exact item accounting, committed integration topology, final evidence requirements, and rerere-capture enforcement."
     },
     {
       "units": [
@@ -308,11 +335,11 @@
       "command": "bun test packages/providers/src/utils/__tests__/stream-drain.test.ts",
       "status": "passed",
       "exitCode": 0,
-      "passes": 15,
+      "passes": 18,
       "failures": 0,
       "skips": 0,
-      "assertions": 46,
-      "purpose": "Prove deterministic abort-before-release ordering, bounded pending-read settlement, timer cleanup, exact transport ownership, and clone isolation for both shared drain helpers."
+      "assertions": 64,
+      "purpose": "Prove deterministic abort-before-release ordering, including Codex beforeDrain handoff settlement, bounded pending-read grace, early timer cleanup, exact transport ownership, and clone isolation for both shared drain helpers."
     },
     {
       "units": [
@@ -469,19 +496,19 @@
       "command": "bun test packages/core/src/version.test.ts",
       "status": "passed",
       "exitCode": 0,
-      "passes": 24,
+      "passes": 25,
       "failures": 0,
       "skips": 0,
-      "assertions": 115,
-      "purpose": "Prove exact Claude 2.1.250 fallback identity, runtime Git-SHA fallback/unknown behavior, client-version tracking, and existing distribution provenance behavior."
+      "assertions": 118,
+      "purpose": "Prove exact root/CLI 3.5.70 parity, Claude 2.1.250 fallback identity, runtime Git-SHA fallback/unknown behavior, client-version tracking, and distribution provenance behavior."
     }
   ],
   "totals": {
     "files": 19,
-    "passes": 625,
+    "passes": 638,
     "failures": 0,
     "skips": 0,
-    "assertions": 1753
+    "assertions": 1789
   },
   "finalGates": [
     {
@@ -496,28 +523,28 @@
       "purpose": "R1-R4/R15: validate phase final inventory against Git and the authoritative rerere capture.",
       "command": "bun scripts/verify-upstream-sync-ledger.ts check --repo . --inventory docs/plans/2026-08-30-issue-260-v3.5.70-resolution-inventory.json --ledger docs/plans/2026-08-30-issue-260-v3.5.70-resolution-ledger.md --rerere-capture docs/plans/2026-08-30-issue-260-v3.5.70-rerere-capture.json",
       "exitCode": 0,
-      "details": "Validated 13 derived inventory items with 0 pending in phase final after inventory-first ledger regeneration. Git derivation used exact fork parent d24a3757da1a1643d00d2487a99e2e422fe85afa, exact target 09cf070533de989a255cb2fcbd49580d794ed6f0, merge base 4d27cb226f383a39e12aea530e83d2f9896999ce, raw 825/5, patch-equivalent 825/5, and the authoritative empty rerere application capture."
+      "details": "Validated 13 schema-v2 inventory items with 0 pending in phase final. Git evidence included exact annotated tag object e0fa06882167e0462041df141b4c8aad89342be2 peeling to target 09cf070533de989a255cb2fcbd49580d794ed6f0, integration commit 60005baa99086e893e2673ce83554fd7655553cd with exact ordered parents d24a3757da1a1643d00d2487a99e2e422fe85afa then target, and authoritative empty rerere capture."
     },
     {
       "name": "lint",
       "command": "bun run lint",
       "status": "passed",
       "exitCode": 0,
-      "details": "Checked 1,169 files, applied no fixes, and reported 8 pre-existing warnings outside U4 changed files."
+      "details": "Checked 1,169 files, applied no fixes, and reported 8 pre-existing warnings outside changed audit/package-lineage files."
     },
     {
       "name": "typecheck",
-      "command": "node --max-old-space-size=2048 /home/will/SITES/better-ccflare/node_modules/typescript/bin/tsc --noEmit",
+      "command": "bun run typecheck",
       "status": "passed",
       "exitCode": 0,
-      "details": "The equivalent repository TypeScript compiler passed under a 2 GiB heap cap after the `bun run typecheck` wrapper was deferred by the 8 GiB heavy-job admission floor; isolated Bun tests cover test files excluded from tsconfig."
+      "details": "The exact repository command exited 0 and invoked `bunx tsc --noEmit`. This exact command is the final typecheck evidence; the earlier absolute direct-tsc invocation is historical only."
     },
     {
       "name": "format",
       "command": "bun run format",
       "status": "passed",
       "exitCode": 0,
-      "details": "Formatted 1,167 files and applied no fixes, so no formatter-triggered test rerun was required."
+      "details": "Formatted 1,167 files and applied no fixes."
     },
     {
       "name": "diff-checks",
@@ -530,15 +557,123 @@
       "status": "passed",
       "purpose": "R3/R4/R15: review the fork-parent delta, target-parent delta, and staged combined conflict resolution for every target path.",
       "details": "Reviewed cached and final-tree deltas against HEAD and MERGE_HEAD plus the staged combined diff. All nine target paths are accounted for; provider.ts changes exactly CODEX_VERSION and CODEX_PING_MODEL against HEAD, matches MERGE_HEAD on both values, and retains the remaining first-parent provider behavior recorded in the final inventory."
+    },
+    {
+      "name": "schema-v2-validator-tests",
+      "command": "bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "details": "43 passes, 0 failures, and 96 expectations after a proof-first red run with 34 passes and 9 expected failures."
+    },
+    {
+      "name": "package-lineage-parity",
+      "command": "bun test packages/core/src/version.test.ts --test-name-pattern 'release lineage' && bun test packages/core/src/version.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "details": "Focused release lineage passed 3/3 with 8 expectations; the full file passed 25/25 with 118 expectations."
+    },
+    {
+      "name": "canonical-tag-fetch-prerequisite",
+      "command": "git fetch --no-tags https://github.com/tombii/better-ccflare.git refs/tags/v3.5.70:refs/tags/v3.5.70",
+      "status": "passed",
+      "exitCode": 0,
+      "details": "In the clean clone this fetched only v3.5.70; the ref resolved to annotated tag object e0fa06882167e0462041df141b4c8aad89342be2 and peeled to 09cf070533de989a255cb2fcbd49580d794ed6f0."
+    },
+    {
+      "name": "clean-clone-validator-replay",
+      "status": "passed",
+      "exitCode": 0,
+      "commands": [
+        "git clone --no-local --no-tags --branch worktree-plan-upstream-v3.5.70-sync /home/will/SITES/better-ccflare/.claude/worktrees/plan-upstream-v3.5.70-sync /tmp/ccflare-v3570-clean-replay-20260831-b84e7d/repo",
+        "git -C /tmp/ccflare-v3570-clean-replay-20260831-b84e7d/repo apply /tmp/ccflare-v3570-clean-replay-20260831-b84e7d/audit.patch",
+        "git fetch --no-tags https://github.com/tombii/better-ccflare.git refs/tags/v3.5.70:refs/tags/v3.5.70",
+        "bun scripts/verify-upstream-sync-ledger.ts check --repo . --inventory docs/plans/2026-08-30-issue-260-v3.5.70-resolution-inventory.json --ledger docs/plans/2026-08-30-issue-260-v3.5.70-resolution-ledger.md --rerere-capture docs/plans/2026-08-30-issue-260-v3.5.70-rerere-capture.json"
+      ],
+      "details": "Observed from /tmp/ccflare-v3570-clean-replay-20260831-b84e7d/repo: exact tag fetch exited 0 and fetched only v3.5.70; validator exited 0 with `validated 13 inventory items`."
     }
   ],
   "artifactTracking": {
-    "status": "ignored-untracked",
-    "reason": "The repository's existing `.gitignore` rule ignores docs/plans/ for new files.",
-    "hostAction": "Stage both requested new JSON artifacts explicitly with `git add -f`; this U4 session intentionally did not stage them.",
+    "status": "tracked-modified",
+    "reason": "Both JSON audit artifacts are already tracked; the rerere capture remains the authoritative empty array and the manifest carries the reviewed final-gate updates.",
+    "hostAction": "Review the six unstaged changed files; this session intentionally did not stage any file.",
     "paths": [
       "docs/plans/2026-08-30-issue-260-v3.5.70-rerere-capture.json",
       "docs/plans/2026-08-30-issue-260-v3.5.70-test-manifest.json"
     ]
-  }
+  },
+  "auditBaseline": {
+    "schemaVersion": 2,
+    "canonicalTag": "refs/tags/v3.5.70",
+    "tagObject": "e0fa06882167e0462041df141b4c8aad89342be2",
+    "peeledTarget": "09cf070533de989a255cb2fcbd49580d794ed6f0",
+    "forkParent": "d24a3757da1a1643d00d2487a99e2e422fe85afa",
+    "integrationCommit": "60005baa99086e893e2673ce83554fd7655553cd",
+    "integrationParents": [
+      "d24a3757da1a1643d00d2487a99e2e422fe85afa",
+      "09cf070533de989a255cb2fcbd49580d794ed6f0"
+    ],
+    "phase": "final",
+    "rerereCapture": []
+  },
+  "replayPrerequisite": {
+    "purpose": "Materialize the exact annotated tag object required by read-only schema-v2 derivation; the validator never fetches.",
+    "remote": "https://github.com/tombii/better-ccflare.git",
+    "command": "git fetch --no-tags https://github.com/tombii/better-ccflare.git refs/tags/v3.5.70:refs/tags/v3.5.70",
+    "observed": {
+      "status": "passed",
+      "exitCode": 0,
+      "fetchedRefs": [
+        "refs/tags/v3.5.70"
+      ],
+      "tagObject": "e0fa06882167e0462041df141b4c8aad89342be2",
+      "objectType": "tag",
+      "peeledTarget": "09cf070533de989a255cb2fcbd49580d794ed6f0"
+    }
+  },
+  "reviewFindingVerification": [
+    {
+      "finding": 2,
+      "status": "passed",
+      "evidence": "Schema-v2 final inventory records integrationCommit 60005baa99086e893e2673ce83554fd7655553cd; focused validator tests reject absent/null, one-parent, reversed, extra, wrong-first, and wrong-target topology and accept the real ordered two-parent integration commit."
+    },
+    {
+      "finding": 5,
+      "status": "passed",
+      "evidence": "Schema-v2 baseline records tagObject e0fa06882167e0462041df141b4c8aad89342be2; hermetic tests reject lightweight and wrong-object cases, and clean-clone replay fetched the exact ref before read-only validation."
+    },
+    {
+      "finding": 6,
+      "status": "passed",
+      "evidence": "Exact command `bun run typecheck` exited 0 and invoked `bunx tsc --noEmit`; the absolute direct-tsc substitute is no longer final gate evidence."
+    },
+    {
+      "finding": 7,
+      "status": "passed",
+      "evidence": "The import.meta.dir-resolved release-lineage test asserts root and CLI package versions are both exactly 3.5.70 and equal; focused lineage passed 3/3 and the full version suite passed 25/25."
+    }
+  ],
+  "focusedReviewTests": [
+    {
+      "finding": 7,
+      "path": "packages/core/src/version.test.ts",
+      "command": "bun test packages/core/src/version.test.ts --test-name-pattern 'release lineage'",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 3,
+      "failures": 0,
+      "filtered": 22,
+      "assertions": 8
+    },
+    {
+      "finding": 7,
+      "path": "packages/core/src/version.test.ts",
+      "command": "bun test packages/core/src/version.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 25,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 118
+    }
+  ]
 }

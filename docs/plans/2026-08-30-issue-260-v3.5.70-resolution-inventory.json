@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "phase": "final",
   "baseline": {
     "forkParent": "d24a3757da1a1643d00d2487a99e2e422fe85afa",
@@ -8,7 +8,9 @@
     ],
     "target": "09cf070533de989a255cb2fcbd49580d794ed6f0",
     "canonicalTag": "refs/tags/v3.5.70",
+    "tagObject": "e0fa06882167e0462041df141b4c8aad89342be2",
     "peeledTag": "09cf070533de989a255cb2fcbd49580d794ed6f0",
+    "integrationCommit": "60005baa99086e893e2673ce83554fd7655553cd",
     "mergeBase": "4d27cb226f383a39e12aea530e83d2f9896999ce",
     "rawCounts": {
       "left": 825,
@@ -30,7 +32,7 @@
     }
   },
   "derivation": {
-    "algorithmVersion": "upstream-sync-ledger/v1",
+    "algorithmVersion": "upstream-sync-ledger/v2",
     "upstreamCommitOrder": "git rev-list --topo-order --reverse <merge-base>..<target>",
     "pathSemantics": "git diff --name-status -z --find-renames; rename destinations and current repo-relative paths",
     "conflictMechanism": "git merge-tree --write-tree --name-only with a temporary alternate object directory under OS tmpdir"
@@ -233,7 +235,7 @@
     "u3-stream-drain-green": {
       "type": "test",
       "summary": "Both shared helpers passed deterministic abort, settlement, release, and ownership tests",
-      "details": "Final post-format `bun test packages/providers/src/utils/__tests__/stream-drain.test.ts` exited 0 with 15 passes, 0 failures, 0 skips, and 46 assertions. Coverage proves exact abort before release, abort-settled rejection observation before release, equal bounded grace for unabortable reads, no post-return unhandled rejection, one finite-drain release, live clone-sibling isolation, drainReader cancel fallback, and beforeDrain read/error ownership."
+      "details": "Final post-review `bun test packages/providers/src/utils/__tests__/stream-drain.test.ts` exited 0 with 18 passes, 0 failures, 0 skips, and 64 assertions. Coverage proves exact abort before release, Codex beforeDrain handoff settlement, equal bounded grace for unabortable reads, early timer cleanup, no post-return unhandled rejection, one finite-drain release, live clone-sibling isolation, drainReader cancel fallback, and beforeDrain read/error ownership."
     },
     "u3-existing-deadline-helper-pass": {
       "type": "test",
@@ -322,8 +324,8 @@
     },
     "u4-core-version-pass": {
       "type": "test",
-      "summary": "Complete core version and distribution provenance suite passed",
-      "details": "`bun test packages/core/src/version.test.ts` exited 0 with 24 passes, 0 failures, 0 skips, and 115 assertions. Exact Claude 2.1.250 identity, runtime Git-SHA fallback/unknown behavior, client-version tracking, and distribution provenance all passed."
+      "summary": "Complete core version, package lineage, and distribution provenance suite passed",
+      "details": "`bun test packages/core/src/version.test.ts` exited 0 with 25 passes, 0 failures, 0 skips, and 118 expectations. Exact root/CLI 3.5.70 parity, Claude 2.1.250 identity, runtime Git-SHA fallback/unknown behavior, client-version tracking, and distribution provenance all passed."
     },
     "u4-codex-provider-pass": {
       "type": "test",
@@ -336,9 +338,9 @@
       "details": "`bun test packages/providers/src/providers/codex/provider.test.ts --test-name-pattern 'fetchCodexUsageOnDemand'` exited 0 with 10 passes, 0 failures, 312 filtered tests, and 50 assertions. Local mocked-fetch coverage proves account-selected models remain authoritative, blank/default callers use gpt-5.6-sol, request identity and subscription rules remain intact, and no provider traffic was issued."
     },
     "u4-isolated-test-manifest": {
-      "type": "test",
-      "summary": "All required U1-U4 files passed in isolated Bun processes",
-      "details": "`docs/plans/2026-08-30-issue-260-v3.5.70-test-manifest.json` records the exact command, unit/requirement purpose, and pass/fail/skip/assertion count for each of 19 isolated files. The observed results are 625 passes, 0 failures, 0 skips, and 1,753 assertions after the provider fallback assertions were added and the complete provider file was rerun; no broad `bun test` batch or live provider traffic was used."
+      "type": "document",
+      "summary": "Final isolated test manifest records 19 files and 638 passing tests",
+      "details": "docs/plans/2026-08-30-issue-260-v3.5.70-test-manifest.json records 19 isolated files, 638 passes, 0 failures, 0 skips, and 1,789 expectations after the Codex beforeDrain review fix, schema-v2 validator, and package-lineage coverage. It also records the 34-pass/9-expected-failure validator red proof, clean-clone fetch/replay, exact `bun run typecheck`, lint, format, and final validator gates."
     },
     "u4-lineage-source-check": {
       "type": "command",
@@ -363,17 +365,17 @@
     "u4-lint": {
       "type": "command",
       "summary": "Repository lint passed without rewrites",
-      "details": "`bun run lint` exited 0 after checking 1,169 files, applied no fixes, and reported the same 8 pre-existing warnings outside U4 changed files."
+      "details": "`bun run lint` exited 0, checked 1,169 files, applied no fixes, and reported 8 pre-existing warnings outside the changed audit and package-lineage files."
     },
     "u4-typecheck": {
       "type": "command",
-      "summary": "Repository TypeScript typecheck passed under a bounded heap",
-      "details": "The write-free `bun run typecheck` wrapper was deferred before execution by the 8 GiB heavy-job admission floor, which remained unmet after a 10-minute wait. The wrapper resolves to `bunx tsc --noEmit`; invoking the same installed compiler as `node --max-old-space-size=2048 /home/will/SITES/better-ccflare/node_modules/typescript/bin/tsc --noEmit` exited 0 under an explicit 2 GiB heap cap. Because tests are excluded from the root tsconfig, the affected provider test file also ran in focused, direct on-demand, and complete isolated Bun processes."
+      "summary": "Exact required repository typecheck command passed",
+      "details": "`bun run typecheck` exited 0 and ran the repository script `bunx tsc --noEmit`. This is the final typecheck gate; the earlier absolute direct-tsc invocation remains historical only and is not final evidence."
     },
     "u4-format": {
       "type": "command",
       "summary": "Repository formatter passed without rewrites",
-      "details": "`bun run format` exited 0 after formatting 1,167 files and applied no fixes, so no formatter-triggered test rerun was required."
+      "details": "`bun run format` exited 0, formatted 1,167 files, and applied no fixes."
     },
     "u4-rerere-capture": {
       "type": "capture",
@@ -382,8 +384,8 @@
     },
     "u4-open-merge-topology": {
       "type": "command",
-      "summary": "Final audit derivation uses the exact open-merge first and second parents",
-      "details": "The exact first-parent candidate is HEAD d24a3757da1a1643d00d2487a99e2e422fe85afa and the exact second-parent candidate is MERGE_HEAD 09cf070533de989a255cb2fcbd49580d794ed6f0. Regenerating with scripts/verify-upstream-sync-ledger.ts against those parents, required ancestor 20c3e1930b701df5fdf923abbe3a4936bdacacc9, and refs/tags/v3.5.70 derived merge base 4d27cb226f383a39e12aea530e83d2f9896999ce, raw 825/5, and patch-equivalent 825/5. The U1 docs-only commit raises only the left counts by one: the five upstream commits, five content conflicts, and three clean shared paths are unchanged. MERGE_HEAD remains open and `git ls-files -u` is empty."
+      "summary": "Final audit records and validates the committed integration topology",
+      "details": "`git cat-file -t 60005baa99086e893e2673ce83554fd7655553cd` returned `commit`; `git show -s --format='%H%n%P' 60005baa99086e893e2673ce83554fd7655553cd` returned the exact integration SHA followed by exactly two ordered parents: d24a3757da1a1643d00d2487a99e2e422fe85afa then 09cf070533de989a255cb2fcbd49580d794ed6f0. Schema-v2 final validation re-reads the commit object and rejects any different parent count, order, first parent, or target parent."
     },
     "u4-staged-combined-review": {
       "type": "combined-diff",
@@ -447,13 +449,38 @@
     },
     "u4-final-ledger-validation": {
       "type": "command",
-      "summary": "Generic validator accepted the exact-parent final inventory and authoritative rerere capture",
-      "details": "`bun scripts/verify-upstream-sync-ledger.ts check --repo . --inventory docs/plans/2026-08-30-issue-260-v3.5.70-resolution-inventory.json --ledger docs/plans/2026-08-30-issue-260-v3.5.70-resolution-ledger.md --rerere-capture docs/plans/2026-08-30-issue-260-v3.5.70-rerere-capture.json` exited 0 and validated 13 derived items with 0 pending in phase final. Git derivation used exact fork parent d24a3757da1a1643d00d2487a99e2e422fe85afa, exact target 09cf070533de989a255cb2fcbd49580d794ed6f0, raw 825/5, patch-equivalent 825/5, and the authoritative empty rerere application capture."
+      "summary": "Generic schema-v2 validator accepted final Git, tag, topology, and rerere evidence",
+      "details": "`bun scripts/verify-upstream-sync-ledger.ts check --repo . --inventory docs/plans/2026-08-30-issue-260-v3.5.70-resolution-inventory.json --ledger docs/plans/2026-08-30-issue-260-v3.5.70-resolution-ledger.md --rerere-capture docs/plans/2026-08-30-issue-260-v3.5.70-rerere-capture.json` exited 0 with `validated 13 inventory items`. Schema v2 verified tag object e0fa06882167e0462041df141b4c8aad89342be2 is an annotated tag peeling to target 09cf070533de989a255cb2fcbd49580d794ed6f0 and integration commit 60005baa99086e893e2673ce83554fd7655553cd has exact ordered parents d24a3757da1a1643d00d2487a99e2e422fe85afa then the target. The authoritative rerere capture is complete and empty."
     },
     "u4-diff-hygiene": {
       "type": "command",
       "summary": "Final working, staged, marker, unmerged, and path-boundary checks passed",
       "details": "`git diff --check` and `git diff --cached --check` exited 0; the explicit changed-source marker scan returned no conflict markers; `git ls-files -u` returned no entries. Status contains only staged U2/U3/merge paths plus unstaged U3/U4/evidence paths. The two requested new docs/plans JSON artifacts are ignored by the repository's existing docs/plans/ rule and were deliberately left unstaged for the host to add explicitly with force; no excluded/generated/historical/secret/unrelated path appears in status."
+    },
+    "u4-ledger-validator-v2-red": {
+      "type": "test",
+      "summary": "Schema-v2 topology and tag proof-first tests failed before implementation",
+      "details": "`bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts` exited 1 before validator implementation with 34 passes, 9 expected failures, and 78 expectations. The failures showed schema v2 was rejected wholesale, generated inventories remained v1, lightweight tags were accepted, wrong recorded tag objects were not checked, and one-parent/reversed/extra/wrong-parent integration commits were accepted."
+    },
+    "u4-ledger-validator-v2-pass": {
+      "type": "test",
+      "summary": "Schema-v2 topology and annotated-tag validator suite passed",
+      "details": "`bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts` exited 0 with 43 passes, 0 failures, and 96 expectations. Coverage includes schema-v1 compatibility, schema-v2 annotated tag identity, lightweight/wrong tag rejection, required final integration SHA, a real ordered two-parent merge, and one-parent/reversed/extra/wrong-first/wrong-target rejection."
+    },
+    "u4-tag-object-identity": {
+      "type": "command",
+      "summary": "Exact annotated v3.5.70 tag object identity was recorded",
+      "details": "The reproducible prerequisite `git fetch --no-tags https://github.com/tombii/better-ccflare.git refs/tags/v3.5.70:refs/tags/v3.5.70` fetched only v3.5.70 in the clean clone and exited 0. `git rev-parse --verify refs/tags/v3.5.70` returned e0fa06882167e0462041df141b4c8aad89342be2; `git cat-file -t refs/tags/v3.5.70` returned `tag`; `git rev-parse --verify 'refs/tags/v3.5.70^{}'` returned target 09cf070533de989a255cb2fcbd49580d794ed6f0. Validation remains read-only and never fetches."
+    },
+    "u4-package-lineage-parity": {
+      "type": "test",
+      "summary": "Root and CLI package lineage has an executable exact-parity assertion",
+      "details": "`bun test packages/core/src/version.test.ts --test-name-pattern 'release lineage'` exited 0 with 3 passes, 22 filtered, and 8 expectations. `bun test packages/core/src/version.test.ts` exited 0 with 25 passes and 118 expectations. The new import.meta.dir-resolved test reads repository root package.json and apps/cli/package.json, asserts each exact version is 3.5.70, and asserts equality."
+    },
+    "u4-clean-clone-replay": {
+      "type": "command",
+      "summary": "Clean clone replay passed after explicit exact upstream tag fetch",
+      "details": "A clean `git clone --no-local --no-tags --branch worktree-plan-upstream-v3.5.70-sync` of current HEAD was created at /tmp/ccflare-v3570-clean-replay-20260831-b84e7d/repo, then the five validator-relevant unstaged audit files and authoritative rerere capture were applied/copied. Inside that clone, `git fetch --no-tags https://github.com/tombii/better-ccflare.git refs/tags/v3.5.70:refs/tags/v3.5.70` exited 0 and fetched only v3.5.70. The exact final validator command exited 0 with `validated 13 inventory items`."
     }
   },
   "items": [
@@ -479,7 +506,11 @@
             "u4-codex-provider-pass",
             "u4-codex-on-demand-pass",
             "u4-lineage-source-check",
-            "u4-version-caller-sweep"
+            "u4-version-caller-sweep",
+            "u4-ledger-validator-v2-red",
+            "u4-ledger-validator-v2-pass",
+            "u4-tag-object-identity",
+            "u4-clean-clone-replay"
           ]
         },
         "acceptanceComplete": {
@@ -508,7 +539,11 @@
             "u4-format",
             "u4-operational-boundary",
             "u4-final-ledger-validation",
-            "u4-diff-hygiene"
+            "u4-diff-hygiene",
+            "u4-ledger-validator-v2-red",
+            "u4-ledger-validator-v2-pass",
+            "u4-tag-object-identity",
+            "u4-clean-clone-replay"
           ]
         },
         "combinedDiff": {
@@ -519,7 +554,7 @@
       "reviewer": {
         "status": "accepted",
         "identity": "Claude U4 implementer (local semantic self-review)",
-        "notes": "Accepted locally: all four upstream lineage scalars and the gpt-5.6-sol Codex usage-probe fallback are exact, all other first-parent provenance/provider behavior is retained, and the host-owned merge commit/CI remain outside this disposition."
+        "notes": "Accepted locally: all four upstream lineage scalars and the gpt-5.6-sol fallback are exact; annotated tag object e0fa06882167e0462041df141b4c8aad89342be2 peels to this target, and committed integration 60005baa99086e893e2673ce83554fd7655553cd has exact ordered parents d24a3757da1a1643d00d2487a99e2e422fe85afa then this target."
       },
       "dependencies": [
         "u1-immutable-inputs",
@@ -537,7 +572,11 @@
         "u4-lineage-source-check",
         "u4-version-caller-sweep",
         "u4-open-merge-topology",
-        "u4-rerere-capture"
+        "u4-rerere-capture",
+        "u4-ledger-validator-v2-red",
+        "u4-ledger-validator-v2-pass",
+        "u4-tag-object-identity",
+        "u4-clean-clone-replay"
       ],
       "rationale": "The four release-lineage scalars and the target/fork-known valid Codex fallback are required integration values, while the surrounding first-parent manifests/core/provider code carries product-fork provenance and behavior absent from the target.",
       "refreshedMainEvidence": [
@@ -752,7 +791,11 @@
           "status": "passed",
           "references": [
             "u1-immutable-inputs",
-            "u4-open-merge-topology"
+            "u4-open-merge-topology",
+            "u4-ledger-validator-v2-red",
+            "u4-ledger-validator-v2-pass",
+            "u4-tag-object-identity",
+            "u4-clean-clone-replay"
           ]
         },
         "acceptanceComplete": {
@@ -774,7 +817,11 @@
             "u4-format",
             "u4-operational-boundary",
             "u4-final-ledger-validation",
-            "u4-diff-hygiene"
+            "u4-diff-hygiene",
+            "u4-ledger-validator-v2-red",
+            "u4-ledger-validator-v2-pass",
+            "u4-tag-object-identity",
+            "u4-clean-clone-replay"
           ]
         },
         "combinedDiff": {
@@ -785,14 +832,18 @@
       "reviewer": {
         "status": "accepted",
         "identity": "Claude U4 implementer (local semantic self-review)",
-        "notes": "Accepted locally: upstream PR merge topology remains reachable through the exact target; the open merge still has d24a3757 as first-parent candidate and 09cf0705 as MERGE_HEAD."
+        "notes": "Accepted locally: upstream PR merge topology remains reachable through the exact target, and final integration commit 60005baa99086e893e2673ce83554fd7655553cd is validated as a genuine two-parent commit with exact first parent d24a3757da1a1643d00d2487a99e2e422fe85afa and exact second parent 09cf070533de989a255cb2fcbd49580d794ed6f0."
       },
       "dependencies": [
         "u1-immutable-inputs",
         "u1-refreshed-main-staleness",
         "u1-premerge-inventory-validation",
         "u4-open-merge-topology",
-        "u4-rerere-capture"
+        "u4-rerere-capture",
+        "u4-ledger-validator-v2-red",
+        "u4-ledger-validator-v2-pass",
+        "u4-tag-object-identity",
+        "u4-clean-clone-replay"
       ],
       "rationale": "The commit is a two-parent upstream merge whose first parent is 4d27cb226f383a39e12aea530e83d2f9896999ce and second parent is 8bb74ed0a3f16bcc276201f73430ee485e729559; retaining it preserves complete upstream lineage.",
       "refreshedMainEvidence": [
@@ -1366,7 +1417,8 @@
           "status": "passed",
           "references": [
             "u4-build-cli",
-            "u4-lineage-source-check"
+            "u4-lineage-source-check",
+            "u4-package-lineage-parity"
           ]
         },
         "acceptanceComplete": {
@@ -1391,7 +1443,8 @@
             "u4-parent-delta-review",
             "u4-combined-cli-manifest",
             "u4-final-ledger-validation",
-            "u4-diff-hygiene"
+            "u4-diff-hygiene",
+            "u4-package-lineage-parity"
           ]
         },
         "combinedDiff": {
@@ -1405,7 +1458,7 @@
       "reviewer": {
         "status": "accepted",
         "identity": "Claude U4 implementer (local semantic self-review)",
-        "notes": "Accepted after both-parent review: 3.5.70 is adopted and fork build/multi-arch/npm provenance scripts are retained."
+        "notes": "Accepted after both-parent review and executable parity coverage: apps/cli/package.json is exactly 3.5.70, equals root package.json, and retains fork build/multi-arch/npm provenance scripts."
       },
       "dependencies": [
         "u1-immutable-inputs",
@@ -1413,7 +1466,8 @@
         "u1-premerge-inventory-validation",
         "u2-merge-open-capture",
         "u4-build-cli",
-        "u4-lineage-source-check"
+        "u4-lineage-source-check",
+        "u4-package-lineage-parity"
       ],
       "rationale": "The clean version hunk is upstream-owned lineage; the target-side script set lacks the fork's current provenance and multi-architecture build workflow.",
       "refreshedMainEvidence": [
@@ -1438,7 +1492,8 @@
             "u4-lineage-source-check",
             "u4-lint",
             "u4-typecheck",
-            "u4-format"
+            "u4-format",
+            "u4-package-lineage-parity"
           ]
         },
         "acceptanceComplete": {
@@ -1463,7 +1518,8 @@
             "u4-parent-delta-review",
             "u4-combined-root-manifest",
             "u4-final-ledger-validation",
-            "u4-diff-hygiene"
+            "u4-diff-hygiene",
+            "u4-package-lineage-parity"
           ]
         },
         "combinedDiff": {
@@ -1477,7 +1533,7 @@
       "reviewer": {
         "status": "accepted",
         "identity": "Claude U4 implementer (local semantic self-review)",
-        "notes": "Accepted after both-parent review: 3.5.70 is adopted and all fork compatibility/build scripts are retained."
+        "notes": "Accepted after both-parent review and executable parity coverage: root package.json is exactly 3.5.70, equals apps/cli/package.json, and retains all fork compatibility/build scripts."
       },
       "dependencies": [
         "u1-immutable-inputs",
@@ -1487,7 +1543,8 @@
         "u4-lineage-source-check",
         "u4-lint",
         "u4-typecheck",
-        "u4-format"
+        "u4-format",
+        "u4-package-lineage-parity"
       ],
       "rationale": "The clean version hunk is upstream-owned lineage; the four compatibility commands are fork behavior absent from the target and remain unchanged.",
       "refreshedMainEvidence": [

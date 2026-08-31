@@ -132,8 +132,7 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
-function completeFinalInventory(): SyncInventory {
-  const inventory = validInventory();
+function completeInventory(inventory: SyncInventory): SyncInventory {
   inventory.phase = "final";
   inventory.expected.rerereCapture.state = "complete";
   inventory.evidenceCatalog = {
@@ -180,6 +179,10 @@ function completeFinalInventory(): SyncInventory {
   return inventory;
 }
 
+function completeFinalInventory(): SyncInventory {
+  return completeInventory(validInventory());
+}
+
 describe("upstream sync inventory structural validation", () => {
   test("accepts an explicit empty pre-merge rerere capture", () => {
     expect(() => validateFixture(validInventory())).not.toThrow();
@@ -196,7 +199,7 @@ describe("upstream sync inventory structural validation", () => {
 
   test("rejects unknown schema versions, phases, kinds, and dispositions", () => {
     for (const mutate of [
-      (value: SyncInventory) => (value.schemaVersion = 2),
+      (value: SyncInventory) => (value.schemaVersion = 3),
       (value: SyncInventory) =>
         (value.phase = "after-party" as SyncInventory["phase"]),
       (value: SyncInventory) =>
@@ -210,6 +213,26 @@ describe("upstream sync inventory structural validation", () => {
       mutate(inventory);
       expect(() => validateFixture(inventory)).toThrow();
     }
+  });
+
+  test("schema v2 final inventories require a recorded integration commit", () => {
+    const inventory = completeFinalInventory();
+    inventory.schemaVersion = 2;
+    inventory.derivation.algorithmVersion = "upstream-sync-ledger/v2";
+    Object.assign(inventory.baseline, {
+      tagObject: SHA_C,
+      integrationCommit: null,
+    });
+
+    expect(() => validateFixture(inventory)).toThrow(
+      /final schema-v2 inventory requires baseline.integrationCommit/,
+    );
+
+    delete (inventory.baseline as unknown as Record<string, unknown>)
+      .integrationCommit;
+    expect(() => validateFixture(inventory)).toThrow(
+      /final schema-v2 inventory requires baseline.integrationCommit/,
+    );
   });
 
   test("rejects abbreviated or malformed object ids", () => {
@@ -505,6 +528,7 @@ function createMergeFixture(): {
   fork: string;
   target: string;
   tag: string;
+  tagObject: string;
 } {
   const repo = tempDir("ccflare-upstream-sync-git-");
   git(repo, "init", "-b", "main");
@@ -548,8 +572,79 @@ function createMergeFixture(): {
   );
   const target = commitAll(repo, "upstream changes");
   git(repo, "tag", "-a", "v-test", "-m", "annotated target", target);
+  const tag = "refs/tags/v-test";
+  const tagObject = git(repo, "rev-parse", tag);
   git(repo, "checkout", "main");
-  return { repo, base, fork, target, tag: "refs/tags/v-test" };
+  return { repo, base, fork, target, tag, tagObject };
+}
+
+function createTopologyFixture(): {
+  repo: string;
+  base: string;
+  fork: string;
+  target: string;
+  tag: string;
+  tagObject: string;
+  integrationCommit: string;
+} {
+  const repo = tempDir("ccflare-upstream-sync-topology-");
+  git(repo, "init", "-b", "main");
+  git(repo, "config", "user.name", "Upstream Sync Test");
+  git(repo, "config", "user.email", "sync-test@example.invalid");
+  write(repo, "package.json", '{"version":"1.0.0"}\n');
+  write(repo, "apps/cli/package.json", '{"version":"1.0.0"}\n');
+  write(repo, "base.txt", "base\n");
+  const base = commitAll(repo, "base");
+  git(repo, "branch", "upstream");
+
+  write(repo, "fork.txt", "fork\n");
+  const fork = commitAll(repo, "fork changes");
+
+  git(repo, "checkout", "upstream");
+  write(repo, "package.json", '{"version":"2.0.0"}\n');
+  write(repo, "apps/cli/package.json", '{"version":"2.0.0"}\n');
+  write(repo, "upstream.txt", "upstream\n");
+  const target = commitAll(repo, "upstream changes");
+  git(repo, "tag", "-a", "v-topology", "-m", "annotated target", target);
+  const tag = "refs/tags/v-topology";
+  const tagObject = git(repo, "rev-parse", tag);
+
+  git(repo, "checkout", "main");
+  git(repo, "merge", "--no-ff", "upstream", "-m", "integrate upstream");
+  const integrationCommit = git(repo, "rev-parse", "HEAD");
+  return { repo, base, fork, target, tag, tagObject, integrationCommit };
+}
+
+function commitWithParents(
+  repo: string,
+  treeCommit: string,
+  parents: string[],
+): string {
+  const tree = git(repo, "rev-parse", `${treeCommit}^{tree}`);
+  return git(
+    repo,
+    "commit-tree",
+    tree,
+    ...parents.flatMap((parent) => ["-p", parent]),
+    "-m",
+    "alternate integration topology",
+  );
+}
+
+function finalTopologyInventory(
+  fixture: ReturnType<typeof createTopologyFixture>,
+): SyncInventory {
+  const inventory = generateSyncInventory({
+    repo: fixture.repo,
+    forkParent: fixture.fork,
+    requiredAncestors: [fixture.base],
+    target: fixture.target,
+    canonicalTag: fixture.tag,
+  });
+  Object.assign(inventory.baseline, {
+    integrationCommit: fixture.integrationCommit,
+  });
+  return completeInventory(inventory);
 }
 
 describe("hermetic derivation and CLI", () => {
@@ -600,6 +695,17 @@ describe("hermetic derivation and CLI", () => {
       repo: fixture.repo,
     });
 
+    expect(inventory.schemaVersion).toBe(2);
+    expect(inventory.derivation.algorithmVersion).toBe(
+      "upstream-sync-ledger/v2",
+    );
+    expect(
+      (inventory.baseline as unknown as Record<string, unknown>).tagObject,
+    ).toBe(fixture.tagObject);
+    expect(
+      (inventory.baseline as unknown as Record<string, unknown>)
+        .integrationCommit,
+    ).toBeNull();
     expect(inventory.baseline.peeledTag).toBe(fixture.target);
     expect(inventory.baseline.requiredAncestors).toEqual([fixture.base]);
     expect(inventory.baseline.rawCounts).toEqual({ left: 1, right: 1 });
@@ -678,5 +784,118 @@ describe("hermetic derivation and CLI", () => {
         repo: fixture.repo,
       }),
     ).toThrow(/Qwen comparison trigger/);
+  }, 30_000);
+
+  test("schema v2 rejects lightweight tags while schema v1 retains its old tag contract", () => {
+    const fixture = createMergeFixture();
+    const lightweightTag = "refs/tags/v-lightweight";
+    git(fixture.repo, "tag", "v-lightweight", fixture.target);
+
+    expect(() =>
+      generateSyncInventory({
+        repo: fixture.repo,
+        forkParent: fixture.fork,
+        requiredAncestors: [fixture.base],
+        target: fixture.target,
+        canonicalTag: lightweightTag,
+      }),
+    ).toThrow(/annotated tag/);
+
+    const v1 = generateSyncInventory({
+      repo: fixture.repo,
+      forkParent: fixture.fork,
+      requiredAncestors: [fixture.base],
+      target: fixture.target,
+      canonicalTag: fixture.tag,
+    });
+    v1.schemaVersion = 1;
+    v1.derivation.algorithmVersion = "upstream-sync-ledger/v1";
+    v1.baseline.canonicalTag = lightweightTag;
+    delete (v1.baseline as unknown as Record<string, unknown>).tagObject;
+    delete (v1.baseline as unknown as Record<string, unknown>).integrationCommit;
+
+    expect(() =>
+      validateSyncInventory(v1, renderLedger(v1), { repo: fixture.repo }),
+    ).not.toThrow();
+  }, 30_000);
+
+  test("schema v2 rejects a recorded tag object that differs from the canonical ref", () => {
+    const fixture = createMergeFixture();
+    const inventory = generateSyncInventory({
+      repo: fixture.repo,
+      forkParent: fixture.fork,
+      requiredAncestors: [fixture.base],
+      target: fixture.target,
+      canonicalTag: fixture.tag,
+    });
+    Object.assign(inventory.baseline, { tagObject: fixture.target });
+
+    expect(() =>
+      validateSyncInventory(inventory, renderLedger(inventory), {
+        repo: fixture.repo,
+      }),
+    ).toThrow(/recorded tag object/);
+  }, 30_000);
+
+  test("schema v2 final validation accepts the real ordered two-parent integration merge", () => {
+    const fixture = createTopologyFixture();
+    const inventory = finalTopologyInventory(fixture);
+
+    expect(() =>
+      validateSyncInventory(inventory, renderLedger(inventory), {
+        repo: fixture.repo,
+        observedRerereApplications: [],
+      }),
+    ).not.toThrow();
+  }, 30_000);
+
+  test.each([
+    ["one-parent commit", (fixture: ReturnType<typeof createTopologyFixture>) => fixture.fork],
+    [
+      "reversed parents",
+      (fixture: ReturnType<typeof createTopologyFixture>) =>
+        commitWithParents(fixture.repo, fixture.target, [
+          fixture.target,
+          fixture.fork,
+        ]),
+    ],
+    [
+      "extra parent",
+      (fixture: ReturnType<typeof createTopologyFixture>) =>
+        commitWithParents(fixture.repo, fixture.target, [
+          fixture.fork,
+          fixture.target,
+          fixture.base,
+        ]),
+    ],
+    [
+      "wrong first parent",
+      (fixture: ReturnType<typeof createTopologyFixture>) =>
+        commitWithParents(fixture.repo, fixture.target, [
+          fixture.base,
+          fixture.target,
+        ]),
+    ],
+    [
+      "wrong target parent",
+      (fixture: ReturnType<typeof createTopologyFixture>) =>
+        commitWithParents(fixture.repo, fixture.target, [
+          fixture.fork,
+          fixture.base,
+        ]),
+    ],
+  ])("schema v2 final validation rejects %s", (_label, integrationCommit) => {
+    const fixture = createTopologyFixture();
+    const inventory = finalTopologyInventory(fixture);
+    Object.assign(inventory.baseline, {
+      integrationCommit: integrationCommit(fixture),
+    });
+
+    expect(() =>
+      validateSyncInventory(inventory, renderLedger(inventory), {
+        repo: fixture.repo,
+        observedRerereApplications: [],
+      }),
+    ).toThrow(/exact ordered parents.*forkParent.*target/);
   }, 30_000);
 });
