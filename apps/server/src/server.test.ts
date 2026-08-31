@@ -918,36 +918,89 @@ describe("resolveDashboardRoute", () => {
 		);
 	});
 
-	it("falls back to the SPA index for GET/HEAD dashboard navigations", () => {
-		expect(resolveDashboardRoute("/", "GET", false)).toBe("spa-index");
-		expect(resolveDashboardRoute("/dashboard", "GET", false)).toBe("spa-index");
-		expect(resolveDashboardRoute("/dashboard/accounts", "HEAD", false)).toBe(
-			"spa-index",
-		);
+	it("falls back to the SPA index for safe dashboard navigations", () => {
+		for (const [pathname, method] of [
+			["/", "GET"],
+			["/dashboard", "GET"],
+			["/dashboard/accounts", "HEAD"],
+			["/healthz", "GET"],
+		] as const) {
+			expect(resolveDashboardRoute(pathname, method, false)).toBe("spa-index");
+		}
 	});
 
-	it("never shadows /api, /v1, /messages, or /health", () => {
+	it("passes through exact bare /api and /messages roots", () => {
+		for (const pathname of ["/api", "/messages"]) {
+			for (const method of ["GET", "HEAD"]) {
+				expect(resolveDashboardRoute(pathname, method, false)).toBe(
+					"pass-through",
+				);
+			}
+		}
+	});
+
+	it("passes through exact bare /v1", () => {
+		for (const method of ["GET", "HEAD"]) {
+			expect(resolveDashboardRoute("/v1", method, false)).toBe("pass-through");
+		}
+	});
+
+	it("passes through API and proxy family prefixes", () => {
 		for (const pathname of [
 			"/api/stats",
-			"/api",
 			"/v1/messages",
-			"/messages",
-			"/health",
+			"/messages/count_tokens",
+			"/apiary",
+			"/v1beta",
+			"/messages-legacy",
 		]) {
-			expect(resolveDashboardRoute(pathname, "GET", false)).toBe(
+			for (const method of ["GET", "HEAD"]) {
+				expect(resolveDashboardRoute(pathname, method, false)).toBe(
+					"pass-through",
+				);
+			}
+		}
+	});
+
+	it("passes through exact /health without claiming health lookalikes", () => {
+		for (const method of ["GET", "HEAD"]) {
+			expect(resolveDashboardRoute("/health", method, false)).toBe(
+				"pass-through",
+			);
+		}
+		expect(resolveDashboardRoute("/healthz", "GET", false)).toBe("spa-index");
+	});
+
+	it("passes through unknown non-navigation methods", () => {
+		// POST/PUT/DELETE to an arbitrary path must stay authenticated (fall
+		// through to the router/proxy) rather than being treated as a
+		// dashboard SPA navigation.
+		for (const [pathname, method] of [
+			["/foo", "POST"],
+			["/anything/else", "PUT"],
+			["/another/path", "DELETE"],
+		] as const) {
+			expect(resolveDashboardRoute(pathname, method, false)).toBe(
 				"pass-through",
 			);
 		}
 	});
 
-	it("passes through non-navigation methods on unknown paths", () => {
-		// POST/PUT/DELETE to an arbitrary path must stay authenticated (fall
-		// through to the router/proxy) rather than being treated as a
-		// dashboard SPA navigation.
-		expect(resolveDashboardRoute("/foo", "POST", false)).toBe("pass-through");
-		expect(resolveDashboardRoute("/anything/else", "DELETE", false)).toBe(
-			"pass-through",
+	it("is called only inside the dashboard-enabled manifest gate", () => {
+		const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+		const gateStart = src.indexOf("if (withDashboard && dashboardManifest) {");
+		const apiRoutesStart = src.indexOf(
+			"const apiResponse = await apiRouter.handleRequest(url, req);",
+			gateStart,
 		);
+		expect(gateStart).toBeGreaterThanOrEqual(0);
+		expect(apiRoutesStart).toBeGreaterThan(gateStart);
+
+		const dashboardCall = "const decision = resolveDashboardRoute(";
+		const gatedDashboardBlock = src.slice(gateStart, apiRoutesStart);
+		expect(gatedDashboardBlock).toContain(dashboardCall);
+		expect(src.slice(0, gateStart)).not.toContain(dashboardCall);
+		expect(src.slice(apiRoutesStart)).not.toContain(dashboardCall);
 	});
 });
 

@@ -1,0 +1,726 @@
+{
+  "schemaVersion": 1,
+  "issue": 260,
+  "release": "v3.5.70",
+  "mergeTarget": "09cf070533de989a255cb2fcbd49580d794ed6f0",
+  "executionPolicy": "Each listed test file ran in its own Bun process after the CLI build; no live provider traffic was used.",
+  "buildPrerequisite": {
+    "command": "bun run build:cli",
+    "status": "passed",
+    "exitCode": 0,
+    "purpose": "R15: generate fresh-worktree CLI and ignored inline worker build outputs before Bun tests while retaining build-time version and Git-SHA injection."
+  },
+  "proofFirst": [
+    {
+      "unit": "U4",
+      "requirements": [
+        "R13",
+        "R15"
+      ],
+      "path": "packages/core/src/version.test.ts",
+      "command": "bun test packages/core/src/version.test.ts --test-name-pattern 'release lineage'",
+      "beforeSourceChange": {
+        "status": "expected-failure",
+        "exitCode": 1,
+        "passes": 1,
+        "failures": 1,
+        "skips": 0,
+        "assertions": 5,
+        "observed": "Expected 2.1.250 but received 2.1.245; the separate runtime Git-SHA fallback case passed."
+      },
+      "afterSourceChange": {
+        "status": "passed",
+        "exitCode": 0,
+        "passes": 2,
+        "failures": 0,
+        "skips": 0,
+        "assertions": 5
+      },
+      "purpose": "Prove the Claude lineage scalar changes from the first-parent value and that runtime Git-SHA fallback remains intact."
+    },
+    {
+      "unit": "U4",
+      "requirements": [
+        "R14",
+        "R15"
+      ],
+      "path": "packages/providers/src/providers/codex/provider.test.ts",
+      "command": "bun test packages/providers/src/providers/codex/provider.test.ts --test-name-pattern 'CodexProvider release identity'",
+      "beforeSourceChange": {
+        "status": "expected-failure",
+        "exitCode": 1,
+        "passes": 0,
+        "failures": 1,
+        "skips": 0,
+        "assertions": 1,
+        "observed": "Expected 0.150.1 but received 0.147.0."
+      },
+      "afterSourceChange": {
+        "status": "passed",
+        "exitCode": 0,
+        "passes": 1,
+        "failures": 0,
+        "skips": 0,
+        "assertions": 4
+      },
+      "purpose": "Prove the Codex lineage scalar changes from the first-parent value and drives the exact model URL, Version header, and User-Agent."
+    },
+    {
+      "unit": "U4",
+      "requirements": [
+        "R14",
+        "R15"
+      ],
+      "path": "packages/providers/src/providers/codex/provider.test.ts",
+      "command": "bun test packages/providers/src/providers/codex/provider.test.ts --test-name-pattern 'uses the account-selected model and falls back on blank input'",
+      "beforeSourceChange": {
+        "status": "expected-failure",
+        "exitCode": 1,
+        "passes": 0,
+        "failures": 1,
+        "skips": 0,
+        "filtered": 321,
+        "assertions": 1,
+        "observed": "Expected gpt-5.6-sol but received unsupported gpt-5-codex."
+      },
+      "afterSourceChange": {
+        "status": "passed",
+        "exitCode": 0,
+        "passes": 1,
+        "failures": 0,
+        "skips": 0,
+        "filtered": 321,
+        "assertions": 4
+      },
+      "purpose": "Prove account-selected models remain authoritative while omitted or blank on-demand usage probes fall back to the fork/upstream-known valid gpt-5.6-sol model, never gpt-5-codex."
+    },
+    {
+      "unit": "final-audit",
+      "requirements": [
+        "review-finding-2",
+        "review-finding-5"
+      ],
+      "path": "scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "command": "bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "beforeSourceChange": {
+        "status": "expected-failure",
+        "exitCode": 1,
+        "passes": 34,
+        "failures": 9,
+        "skips": 0,
+        "assertions": 78,
+        "observed": "Schema v2 was unsupported; generation remained v1; lightweight tags, wrong tag objects, and invalid committed integration topologies were not rejected by the required contracts."
+      },
+      "afterSourceChange": {
+        "status": "passed",
+        "exitCode": 0,
+        "passes": 43,
+        "failures": 0,
+        "skips": 0,
+        "assertions": 96
+      },
+      "purpose": "Prove schema-v2 annotated-tag identity and exact committed two-parent integration topology before implementing the generic validator contract."
+    },
+    {
+      "unit": "final-review",
+      "requirements": [
+        "review-finding-parent-spoof",
+        "review-finding-integration-reachability"
+      ],
+      "path": "scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "command": "bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "beforeSourceChange": {
+        "status": "expected-failure",
+        "exitCode": 1,
+        "passes": 44,
+        "failures": 2,
+        "skips": 0,
+        "assertions": 99,
+        "observed": "A valid merge whose message body began `parent ` was misparsed as having an extra parent, and an exact valid two-parent integration object on another ref was accepted despite not being reachable from reviewed HEAD."
+      },
+      "afterSourceChange": {
+        "status": "passed",
+        "exitCode": 0,
+        "passes": 46,
+        "failures": 0,
+        "skips": 0,
+        "assertions": 99
+      },
+      "purpose": "Prove topology reads only Git's actual ordered parent list and requires the recorded integration commit to be reachable from reviewed HEAD while accepting later descendants."
+    }
+  ],
+  "isolatedTests": [
+    {
+      "units": [
+        "U1",
+        "U4"
+      ],
+      "requirements": [
+        "R1",
+        "R2",
+        "R3",
+        "R4",
+        "R15"
+      ],
+      "path": "scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "command": "bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 46,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 99,
+      "purpose": "Validate schema-v1 compatibility plus schema-v2 annotated-tag identity, exact item accounting, committed integration topology and reviewed-HEAD reachability, parent-header parsing, final evidence requirements, and rerere-capture enforcement."
+    },
+    {
+      "units": [
+        "U1",
+        "U2"
+      ],
+      "requirements": [
+        "R5",
+        "R8",
+        "R15"
+      ],
+      "path": "__tests__/api-auth.test.ts",
+      "command": "bun test __tests__/api-auth.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 49,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 149,
+      "purpose": "Prove integrated API-key bootstrap, OAuth/status boundaries, proxy authorization, and fork management/security behavior."
+    },
+    {
+      "units": [
+        "U1",
+        "U2"
+      ],
+      "requirements": [
+        "R6",
+        "R7",
+        "R15"
+      ],
+      "path": "apps/server/src/server.test.ts",
+      "command": "bun test apps/server/src/server.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 50,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 150,
+      "purpose": "Prove exact protected path-family roots and prefixes pass through while safe SPA navigation and manifest assets retain their fork behavior."
+    },
+    {
+      "units": [
+        "U1",
+        "U2"
+      ],
+      "requirements": [
+        "R6",
+        "R7",
+        "R15"
+      ],
+      "path": "apps/server/src/device-setup-lifecycle.test.ts",
+      "command": "bun test apps/server/src/device-setup-lifecycle.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 6,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 25,
+      "purpose": "Verify the hand-built http-api mock barrel includes classifyAuthPath and server lifecycle helpers still load."
+    },
+    {
+      "units": [
+        "U2"
+      ],
+      "requirements": [
+        "R5",
+        "R6",
+        "R7",
+        "R8",
+        "R15"
+      ],
+      "path": "packages/http-api/src/services/__tests__/auth-service-static-exemption-bypass.test.ts",
+      "command": "bun test packages/http-api/src/services/__tests__/auth-service-static-exemption-bypass.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 10,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 28,
+      "purpose": "Retain the upstream-derived auth-bypass oracle with the fork's stricter exact GET-only status and health expectations."
+    },
+    {
+      "units": [
+        "U1",
+        "U2"
+      ],
+      "requirements": [
+        "R8",
+        "R15"
+      ],
+      "path": "packages/http-api/src/services/__tests__/auth-service-session-account-exemption.test.ts",
+      "command": "bun test packages/http-api/src/services/__tests__/auth-service-session-account-exemption.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 8,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 8,
+      "purpose": "Preserve exact GET-only session-account exemption shape and encoded-ID boundaries."
+    },
+    {
+      "units": [
+        "U1",
+        "U2"
+      ],
+      "requirements": [
+        "R7",
+        "R8",
+        "R15"
+      ],
+      "path": "packages/http-api/src/services/__tests__/auth-service-internal-probe.test.ts",
+      "command": "bun test packages/http-api/src/services/__tests__/auth-service-internal-probe.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 15,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 18,
+      "purpose": "Preserve internal-probe and local-control secret gates while consuming the shared path-family classifier."
+    },
+    {
+      "units": [
+        "U2"
+      ],
+      "requirements": [
+        "R8",
+        "R15"
+      ],
+      "path": "packages/http-api/src/services/__tests__/auth-service-logs-stream-token.test.ts",
+      "command": "bun test packages/http-api/src/services/__tests__/auth-service-logs-stream-token.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 11,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 15,
+      "purpose": "Preserve the single-use logs-stream token exemption without widening other routes."
+    },
+    {
+      "units": [
+        "U2"
+      ],
+      "requirements": [
+        "R8",
+        "R15"
+      ],
+      "path": "packages/http-api/src/services/__tests__/cache-debug-auth.test.ts",
+      "command": "bun test packages/http-api/src/services/__tests__/cache-debug-auth.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 3,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 10,
+      "purpose": "Preserve cache-debug authentication behavior."
+    },
+    {
+      "units": [
+        "U2"
+      ],
+      "requirements": [
+        "R5",
+        "R6",
+        "R7",
+        "R8",
+        "R15"
+      ],
+      "path": "packages/http-api/src/services/__tests__/auth-service.test.ts",
+      "command": "bun test packages/http-api/src/services/__tests__/auth-service.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 18,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 37,
+      "purpose": "Prove core AuthService bootstrap, API-key, exemption, and authorization behavior after semantic resolution."
+    },
+    {
+      "units": [
+        "U2"
+      ],
+      "requirements": [
+        "R8",
+        "R15"
+      ],
+      "path": "packages/http-api/src/handlers/__tests__/sessions.test.ts",
+      "command": "bun test packages/http-api/src/handlers/__tests__/sessions.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 15,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 55,
+      "purpose": "Verify the session handler remains compatible with the exact session-account exemption discovered by the binary-safe caller sweep."
+    },
+    {
+      "units": [
+        "U1",
+        "U3"
+      ],
+      "requirements": [
+        "R9",
+        "R10",
+        "R11",
+        "R15"
+      ],
+      "path": "packages/providers/src/utils/__tests__/stream-drain.test.ts",
+      "command": "bun test packages/providers/src/utils/__tests__/stream-drain.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 18,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 64,
+      "purpose": "Prove deterministic abort-before-release ordering, including Codex beforeDrain handoff settlement, bounded pending-read grace, early timer cleanup, exact transport ownership, and clone isolation for both shared drain helpers."
+    },
+    {
+      "units": [
+        "U3"
+      ],
+      "requirements": [
+        "R9",
+        "R10",
+        "R11",
+        "R15"
+      ],
+      "path": "packages/providers/src/utils/stream-drain.test.ts",
+      "command": "bun test packages/providers/src/utils/stream-drain.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 8,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 14,
+      "purpose": "Preserve the existing deadline helper's beforeDrain, propagation, swallowing, timeout, and finite-drain contracts."
+    },
+    {
+      "units": [
+        "U3"
+      ],
+      "requirements": [
+        "R9",
+        "R10",
+        "R11",
+        "R15"
+      ],
+      "path": "packages/providers/src/providers/codex/provider-stream-abandonment.test.ts",
+      "command": "bun test packages/providers/src/providers/codex/provider-stream-abandonment.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 3,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 11,
+      "purpose": "Prove Codex abandoned-stream cleanup remains bounded and exact-owner."
+    },
+    {
+      "units": [
+        "U3",
+        "U4"
+      ],
+      "requirements": [
+        "R9",
+        "R10",
+        "R11",
+        "R14",
+        "R15"
+      ],
+      "path": "packages/providers/src/providers/codex/provider.test.ts",
+      "command": "bun test packages/providers/src/providers/codex/provider.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 322,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 916,
+      "purpose": "Prove exact Codex 0.150.1 identity, the gpt-5.6-sol on-demand usage-probe fallback, and retained endpoint, catalog, cache, routing, turn-state, orchestration, usage, server-tool, response, and stream behavior."
+    },
+    {
+      "units": [
+        "U3"
+      ],
+      "requirements": [
+        "R9",
+        "R10",
+        "R11",
+        "R15"
+      ],
+      "path": "packages/proxy/src/__tests__/anthropic-terminal-recovery.test.ts",
+      "command": "bun test packages/proxy/src/__tests__/anthropic-terminal-recovery.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 25,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 69,
+      "purpose": "Preserve Anthropic terminal-recovery drain ownership and exactly-once completion using local deterministic fixtures only."
+    },
+    {
+      "units": [
+        "U3"
+      ],
+      "requirements": [
+        "R9",
+        "R10",
+        "R11",
+        "R15"
+      ],
+      "path": "packages/proxy/src/__tests__/stream-reader-lock-release-382.test.ts",
+      "command": "bun test packages/proxy/src/__tests__/stream-reader-lock-release-382.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 2,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 2,
+      "purpose": "Preserve stream reader lock-release regression coverage."
+    },
+    {
+      "units": [
+        "U3"
+      ],
+      "requirements": [
+        "R9",
+        "R10",
+        "R11",
+        "R15"
+      ],
+      "path": "packages/proxy/src/__tests__/response-handler-anthropic-terminal-recovery.test.ts",
+      "command": "bun test packages/proxy/src/__tests__/response-handler-anthropic-terminal-recovery.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 9,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 22,
+      "purpose": "Preserve response-handler terminal recovery and exact cleanup ownership."
+    },
+    {
+      "units": [
+        "U3"
+      ],
+      "requirements": [
+        "R9",
+        "R10",
+        "R11",
+        "R15"
+      ],
+      "path": "packages/proxy/src/handlers/__tests__/proxy-operations-529-retry-clone-regression.test.ts",
+      "command": "bun test packages/proxy/src/handlers/__tests__/proxy-operations-529-retry-clone-regression.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 4,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 7,
+      "purpose": "Prove discarded retry-clone cleanup cannot abort or consume the selected live sibling."
+    },
+    {
+      "units": [
+        "U4"
+      ],
+      "requirements": [
+        "R12",
+        "R13",
+        "R15"
+      ],
+      "path": "packages/core/src/version.test.ts",
+      "command": "bun test packages/core/src/version.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 25,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 118,
+      "purpose": "Prove exact root/CLI 3.5.70 parity, Claude 2.1.250 fallback identity, runtime Git-SHA fallback/unknown behavior, client-version tracking, and distribution provenance behavior."
+    }
+  ],
+  "totals": {
+    "files": 20,
+    "passes": 647,
+    "failures": 0,
+    "skips": 0,
+    "assertions": 1817
+  },
+  "finalGates": [
+    {
+      "name": "shared-caller-sweep",
+      "status": "passed",
+      "purpose": "R15: enumerate classifier, drain, Claude/Codex identity, and Codex fallback callers with binary-safe searches.",
+      "details": "Binary-safe explicit-path sweeps enumerated every shared auth classifier/route seam, drain/transport owner, CLAUDE_CLI_VERSION, CODEX_VERSION, and CODEX_PING_MODEL caller without reading prohibited files. server.ts starts with the fallback, prefers the account's lowest-tier catalog model, and passes the result to fetchCodexUsageOnDemand; the fetcher itself uses the fallback for omitted/blank model input. provider.test.ts contains the direct 10-test on-demand block; device-setup-lifecycle.test.ts mocks the exports and its isolated 6-test suite proves the complete http-api mock barrel, including classifyAuthPath, still loads the server lifecycle helpers."
+    },
+    {
+      "name": "final-ledger-validator",
+      "status": "passed",
+      "purpose": "R1-R4/R15: validate phase final inventory against Git and the authoritative rerere capture.",
+      "command": "bun scripts/verify-upstream-sync-ledger.ts check --repo . --inventory docs/plans/2026-08-30-issue-260-v3.5.70-resolution-inventory.json --ledger docs/plans/2026-08-30-issue-260-v3.5.70-resolution-ledger.md --rerere-capture docs/plans/2026-08-30-issue-260-v3.5.70-rerere-capture.json",
+      "exitCode": 0,
+      "details": "Validated 13 schema-v2 inventory items with 0 pending in phase final. Git evidence included exact annotated tag object e0fa06882167e0462041df141b4c8aad89342be2 peeling to target 09cf070533de989a255cb2fcbd49580d794ed6f0, integration commit 60005baa99086e893e2673ce83554fd7655553cd with exact ordered parents d24a3757da1a1643d00d2487a99e2e422fe85afa then target and reachable from reviewed HEAD, and authoritative empty rerere capture."
+    },
+    {
+      "name": "lint",
+      "command": "bun run lint",
+      "status": "passed",
+      "exitCode": 0,
+      "details": "Checked 1,169 files, applied no fixes, and reported 8 pre-existing warnings outside changed audit/package-lineage files."
+    },
+    {
+      "name": "typecheck",
+      "command": "bun run typecheck",
+      "status": "passed",
+      "exitCode": 0,
+      "details": "The exact repository command exited 0 and invoked `bunx tsc --noEmit`. This exact command is the final typecheck evidence; the earlier absolute direct-tsc invocation is historical only."
+    },
+    {
+      "name": "format",
+      "command": "bun run format",
+      "status": "passed",
+      "exitCode": 0,
+      "details": "Formatted 1,167 files and applied no fixes."
+    },
+    {
+      "name": "diff-checks",
+      "status": "passed",
+      "purpose": "R15/R18: run working-tree and cached whitespace checks and inspect formatter rewrites.",
+      "details": "Both `git diff --check` and `git diff --cached --check` passed; explicit changed-source conflict-marker scan and `git ls-files -u` returned no entries."
+    },
+    {
+      "name": "parent-delta-review",
+      "status": "passed",
+      "purpose": "R3/R4/R15: review the fork-parent delta, target-parent delta, and staged combined conflict resolution for every target path.",
+      "details": "Reviewed cached and final-tree deltas against HEAD and MERGE_HEAD plus the staged combined diff. All nine target paths are accounted for; provider.ts changes exactly CODEX_VERSION and CODEX_PING_MODEL against HEAD, matches MERGE_HEAD on both values, and retains the remaining first-parent provider behavior recorded in the final inventory."
+    },
+    {
+      "name": "schema-v2-validator-tests",
+      "command": "bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "details": "46 passes, 0 failures, and 99 expectations. The original schema-v2 proof-first run had 34 passes and 9 expected failures; the final-review hardening red run had 44 passes and 2 expected failures for commit-message parent spoofing and detached integration reachability."
+    },
+    {
+      "name": "package-lineage-parity",
+      "command": "bun test packages/core/src/version.test.ts --test-name-pattern 'release lineage' && bun test packages/core/src/version.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "details": "Focused release lineage passed 3/3 with 8 expectations; the full file passed 25/25 with 118 expectations."
+    },
+    {
+      "name": "canonical-tag-fetch-prerequisite",
+      "command": "git fetch --no-tags https://github.com/tombii/better-ccflare.git refs/tags/v3.5.70:refs/tags/v3.5.70",
+      "status": "passed",
+      "exitCode": 0,
+      "details": "In the clean clone this fetched only v3.5.70; the ref resolved to annotated tag object e0fa06882167e0462041df141b4c8aad89342be2 and peeled to 09cf070533de989a255cb2fcbd49580d794ed6f0."
+    },
+    {
+      "name": "clean-clone-validator-replay",
+      "status": "passed",
+      "exitCode": 0,
+      "commands": [
+        "git clone --no-local --no-tags --branch worktree-plan-upstream-v3.5.70-sync /home/will/SITES/better-ccflare/.claude/worktrees/plan-upstream-v3.5.70-sync /tmp/ccflare-v3570-clean-replay-20260831-b84e7d/repo",
+        "git -C /tmp/ccflare-v3570-clean-replay-20260831-b84e7d/repo apply /tmp/ccflare-v3570-clean-replay-20260831-b84e7d/audit.patch",
+        "git fetch --no-tags https://github.com/tombii/better-ccflare.git refs/tags/v3.5.70:refs/tags/v3.5.70",
+        "bun scripts/verify-upstream-sync-ledger.ts check --repo . --inventory docs/plans/2026-08-30-issue-260-v3.5.70-resolution-inventory.json --ledger docs/plans/2026-08-30-issue-260-v3.5.70-resolution-ledger.md --rerere-capture docs/plans/2026-08-30-issue-260-v3.5.70-rerere-capture.json"
+      ],
+      "details": "Observed from /tmp/ccflare-v3570-clean-replay-20260831-b84e7d/repo: exact tag fetch exited 0 and fetched only v3.5.70; validator exited 0 with `validated 13 inventory items`."
+    }
+  ],
+  "artifactTracking": {
+    "status": "tracked-modified",
+    "reason": "Both JSON audit artifacts are already tracked; the rerere capture remains the authoritative empty array and the manifest carries the reviewed final-gate updates.",
+    "hostAction": "Review the six unstaged changed files; this session intentionally did not stage any file.",
+    "paths": [
+      "docs/plans/2026-08-30-issue-260-v3.5.70-rerere-capture.json",
+      "docs/plans/2026-08-30-issue-260-v3.5.70-test-manifest.json"
+    ]
+  },
+  "auditBaseline": {
+    "schemaVersion": 2,
+    "canonicalTag": "refs/tags/v3.5.70",
+    "tagObject": "e0fa06882167e0462041df141b4c8aad89342be2",
+    "peeledTarget": "09cf070533de989a255cb2fcbd49580d794ed6f0",
+    "forkParent": "d24a3757da1a1643d00d2487a99e2e422fe85afa",
+    "integrationCommit": "60005baa99086e893e2673ce83554fd7655553cd",
+    "integrationParents": [
+      "d24a3757da1a1643d00d2487a99e2e422fe85afa",
+      "09cf070533de989a255cb2fcbd49580d794ed6f0"
+    ],
+    "phase": "final",
+    "rerereCapture": []
+  },
+  "replayPrerequisite": {
+    "purpose": "Materialize the exact annotated tag object required by read-only schema-v2 derivation; the validator never fetches.",
+    "remote": "https://github.com/tombii/better-ccflare.git",
+    "command": "git fetch --no-tags https://github.com/tombii/better-ccflare.git refs/tags/v3.5.70:refs/tags/v3.5.70",
+    "observed": {
+      "status": "passed",
+      "exitCode": 0,
+      "fetchedRefs": [
+        "refs/tags/v3.5.70"
+      ],
+      "tagObject": "e0fa06882167e0462041df141b4c8aad89342be2",
+      "objectType": "tag",
+      "peeledTarget": "09cf070533de989a255cb2fcbd49580d794ed6f0"
+    }
+  },
+  "reviewFindingVerification": [
+    {
+      "finding": 2,
+      "status": "passed",
+      "evidence": "Schema-v2 final inventory records integrationCommit 60005baa99086e893e2673ce83554fd7655553cd; focused validator tests read exact ordered parents through `%P`, ignore parent-prefixed commit message lines, reject absent/null, one-parent, reversed, extra, wrong-first, wrong-target, and detached valid integration objects, and accept the real merge plus later reviewed-HEAD descendants."
+    },
+    {
+      "finding": 5,
+      "status": "passed",
+      "evidence": "Schema-v2 baseline records tagObject e0fa06882167e0462041df141b4c8aad89342be2; hermetic tests reject lightweight and wrong-object cases, and clean-clone replay fetched the exact ref before read-only validation."
+    },
+    {
+      "finding": 6,
+      "status": "passed",
+      "evidence": "Exact command `bun run typecheck` exited 0 and invoked `bunx tsc --noEmit`; the absolute direct-tsc substitute is no longer final gate evidence."
+    },
+    {
+      "finding": 7,
+      "status": "passed",
+      "evidence": "The import.meta.dir-resolved release-lineage test asserts root and CLI package versions are both exactly 3.5.70 and equal; focused lineage passed 3/3 and the full version suite passed 25/25."
+    }
+  ],
+  "focusedReviewTests": [
+    {
+      "finding": 7,
+      "path": "packages/core/src/version.test.ts",
+      "command": "bun test packages/core/src/version.test.ts --test-name-pattern 'release lineage'",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 3,
+      "failures": 0,
+      "filtered": 22,
+      "assertions": 8
+    },
+    {
+      "finding": 7,
+      "path": "packages/core/src/version.test.ts",
+      "command": "bun test packages/core/src/version.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 25,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 118
+    }
+  ]
+}

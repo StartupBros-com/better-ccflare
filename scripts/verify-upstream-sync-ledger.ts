@@ -11,8 +11,12 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join, normalize, relative, resolve } from "node:path";
 
-const SCHEMA_VERSION = 1;
-const ALGORITHM_VERSION = "upstream-sync-ledger/v1";
+const SCHEMA_VERSION = 2;
+const SUPPORTED_SCHEMA_VERSIONS = [1, 2] as const;
+const ALGORITHM_VERSIONS = {
+  1: "upstream-sync-ledger/v1",
+  2: "upstream-sync-ledger/v2",
+} as const;
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const KINDS = ["upstream-commit", "conflict", "shared-path", "rerere"] as const;
@@ -34,6 +38,7 @@ const EVIDENCE_TYPES = [
   "document",
 ] as const;
 
+type SchemaVersion = (typeof SUPPORTED_SCHEMA_VERSIONS)[number];
 type Kind = (typeof KINDS)[number];
 type Disposition = (typeof DISPOSITIONS)[number];
 type Phase = (typeof PHASES)[number];
@@ -101,7 +106,9 @@ export interface SyncInventory {
     requiredAncestors: string[];
     target: string;
     canonicalTag: string;
+    tagObject?: string;
     peeledTag: string;
+    integrationCommit?: string | null;
     mergeBase: string;
     rawCounts: { left: number; right: number };
     cherryPickCounts: { left: number; right: number };
@@ -143,6 +150,7 @@ export interface GenerateOptions {
 
 export interface ValidationOptions {
   repo?: string;
+  reviewedRef?: string;
   skipGitDerivation?: boolean;
   observedRerereApplications?: RerereApplication[];
 }
@@ -377,6 +385,7 @@ function deriveConflicts(
 
 function deriveGitState(
   options: GenerateOptions,
+  schemaVersion: SchemaVersion = SCHEMA_VERSION,
 ): Omit<SyncInventory, "items" | "evidenceCatalog"> {
   const repo = realpathSync(options.repo);
   const forkParent = resolveCommit(repo, options.forkParent, "fork parent");
@@ -400,6 +409,18 @@ function deriveGitState(
     }
   }
   const target = resolveCommit(repo, options.target, "target");
+  const tagObject = gitText(repo, [
+    "rev-parse",
+    "--verify",
+    options.canonicalTag,
+  ]);
+  assertSha(tagObject, "canonical tag object");
+  if (
+    schemaVersion === 2 &&
+    gitText(repo, ["cat-file", "-t", tagObject]) !== "tag"
+  ) {
+    fail(`${options.canonicalTag} must resolve to an annotated tag object`);
+  }
   const peeledTag = gitText(repo, [
     "rev-parse",
     "--verify",
@@ -435,13 +456,16 @@ function deriveGitState(
   );
 
   return {
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion,
     phase: "pre-merge",
     baseline: {
       forkParent,
       requiredAncestors,
       target,
       canonicalTag: options.canonicalTag,
+      ...(schemaVersion === 2
+        ? { tagObject, integrationCommit: null }
+        : {}),
       peeledTag,
       mergeBase,
       rawCounts: parseCounts(
@@ -475,7 +499,7 @@ function deriveGitState(
       },
     },
     derivation: {
-      algorithmVersion: ALGORITHM_VERSION,
+      algorithmVersion: ALGORITHM_VERSIONS[schemaVersion],
       upstreamCommitOrder:
         "git rev-list --topo-order --reverse <merge-base>..<target>",
       pathSemantics:
@@ -637,6 +661,12 @@ export function renderLedger(inventory: SyncInventory): string {
     `- Required fork-parent ancestors: \`${stableJson(inventory.baseline.requiredAncestors)}\``,
     `- Target: \`${inventory.baseline.target}\``,
     `- Canonical tag: \`${inventory.baseline.canonicalTag}\``,
+    ...(inventory.schemaVersion === 2
+      ? [
+          `- Annotated tag object: \`${inventory.baseline.tagObject}\``,
+          `- Integration commit: \`${stableJson(inventory.baseline.integrationCommit)}\``,
+        ]
+      : []),
     `- Merge base: \`${inventory.baseline.mergeBase}\``,
     `- Qwen comparison trigger: \`${stableJson(inventory.expected.qwenComparisonTrigger)}\``,
     "",
@@ -1025,6 +1055,12 @@ function validateExpected(inventory: SyncInventory): void {
 function validateLedger(inventory: SyncInventory, ledger: string): void {
   for (const expectedHeader of [
     `- Required fork-parent ancestors: \`${stableJson(inventory.baseline.requiredAncestors)}\``,
+    ...(inventory.schemaVersion === 2
+      ? [
+          `- Annotated tag object: \`${inventory.baseline.tagObject}\``,
+          `- Integration commit: \`${stableJson(inventory.baseline.integrationCommit)}\``,
+        ]
+      : []),
     `- Qwen comparison trigger: \`${stableJson(inventory.expected.qwenComparisonTrigger)}\``,
   ]) {
     if (ledger.split(expectedHeader).length !== 2) {
@@ -1087,14 +1123,62 @@ function sameJson(left: unknown, right: unknown): boolean {
   return stableJson(left) === stableJson(right);
 }
 
-function validateGitDerivation(inventory: SyncInventory, repo: string): void {
-  const regenerated = deriveGitState({
+function validateIntegrationTopology(
+  inventory: SyncInventory,
+  repo: string,
+  reviewedRef: string,
+): void {
+  if (inventory.schemaVersion !== 2 || inventory.phase !== "final") return;
+  const integrationCommit = inventory.baseline.integrationCommit;
+  assertSha(integrationCommit, "baseline.integrationCommit");
+  if (gitText(repo, ["cat-file", "-t", integrationCommit]) !== "commit") {
+    fail(`baseline.integrationCommit ${integrationCommit} must be a commit object`);
+  }
+  const parents = gitText(repo, [
+    "show",
+    "-s",
+    "--format=%P",
+    integrationCommit,
+  ])
+    .split(/\s+/)
+    .filter(Boolean);
+  const expectedParents = [
+    inventory.baseline.forkParent,
+    inventory.baseline.target,
+  ];
+  if (!sameJson(parents, expectedParents)) {
+    fail(
+      `baseline.integrationCommit ${integrationCommit} must have exact ordered parents [forkParent ${inventory.baseline.forkParent}, target ${inventory.baseline.target}], received ${stableJson(parents)}`,
+    );
+  }
+  const reviewedCommit = resolveCommit(repo, reviewedRef, "reviewed ref");
+  const reachability = git(
     repo,
-    forkParent: inventory.baseline.forkParent,
-    requiredAncestors: inventory.baseline.requiredAncestors,
-    target: inventory.baseline.target,
-    canonicalTag: inventory.baseline.canonicalTag,
-  });
+    ["merge-base", "--is-ancestor", integrationCommit, reviewedCommit],
+    { allowConflictExit: true },
+  );
+  if (reachability.exitCode === 1) {
+    fail(
+      `baseline.integrationCommit ${integrationCommit} is not an ancestor of reviewed ref ${reviewedRef} (${reviewedCommit})`,
+    );
+  }
+}
+
+function validateGitDerivation(
+  inventory: SyncInventory,
+  repo: string,
+  reviewedRef: string,
+): void {
+  const regenerated = deriveGitState(
+    {
+      repo,
+      forkParent: inventory.baseline.forkParent,
+      requiredAncestors: inventory.baseline.requiredAncestors,
+      target: inventory.baseline.target,
+      canonicalTag: inventory.baseline.canonicalTag,
+    },
+    inventory.schemaVersion as SchemaVersion,
+  );
   for (const field of [
     "forkParent",
     "requiredAncestors",
@@ -1110,6 +1194,12 @@ function validateGitDerivation(inventory: SyncInventory, repo: string): void {
       fail(`recorded baseline.${field} diverges from regenerated Git evidence`);
     }
   }
+  if (
+    inventory.schemaVersion === 2 &&
+    inventory.baseline.tagObject !== regenerated.baseline.tagObject
+  ) {
+    fail("recorded tag object diverges from canonical tag ref Git evidence");
+  }
   if (!sameJson(inventory.derivation, regenerated.derivation)) {
     fail("recorded derivation contract diverges from the algorithm version");
   }
@@ -1123,6 +1213,7 @@ function validateGitDerivation(inventory: SyncInventory, repo: string): void {
       fail(`recorded expected.${field} diverges from regenerated Git evidence`);
     }
   }
+  validateIntegrationTopology(inventory, repo, reviewedRef);
 }
 
 function validateBaseline(inventory: SyncInventory): void {
@@ -1167,6 +1258,33 @@ function validateBaseline(inventory: SyncInventory): void {
   ) {
     fail("baseline.canonicalTag must be an explicit safe refs/tags ref");
   }
+  if (inventory.schemaVersion === 2) {
+    assertSha(inventory.baseline.tagObject, "baseline.tagObject");
+    if (!("integrationCommit" in inventory.baseline)) {
+      if (inventory.phase === "final") {
+        fail(
+          "final schema-v2 inventory requires baseline.integrationCommit to record the integration SHA",
+        );
+      }
+      fail(
+        "schema-v2 baseline.integrationCommit must be recorded as null or a full commit SHA",
+      );
+    }
+    if (
+      inventory.phase === "final" &&
+      inventory.baseline.integrationCommit === null
+    ) {
+      fail(
+        "final schema-v2 inventory requires baseline.integrationCommit to record the integration SHA",
+      );
+    }
+    if (inventory.baseline.integrationCommit !== null) {
+      assertSha(
+        inventory.baseline.integrationCommit,
+        "baseline.integrationCommit",
+      );
+    }
+  }
   for (const [label, counts] of [
     ["rawCounts", inventory.baseline.rawCounts],
     ["cherryPickCounts", inventory.baseline.cherryPickCounts],
@@ -1205,7 +1323,10 @@ function validateBaseline(inventory: SyncInventory): void {
   ] as const) {
     assertNonEmpty(inventory.derivation[field], `derivation.${field}`);
   }
-  if (inventory.derivation.algorithmVersion !== ALGORITHM_VERSION) {
+  if (
+    inventory.derivation.algorithmVersion !==
+    ALGORITHM_VERSIONS[inventory.schemaVersion as SchemaVersion]
+  ) {
     fail(
       `unknown derivation algorithm version ${inventory.derivation.algorithmVersion}`,
     );
@@ -1228,8 +1349,8 @@ export function validateSyncInventory(
   options: ValidationOptions = {},
 ): void {
   assertRecord(inventory, "inventory");
-  if (inventory.schemaVersion !== SCHEMA_VERSION) {
-    fail(`schemaVersion must be ${SCHEMA_VERSION}`);
+  if (!SUPPORTED_SCHEMA_VERSIONS.includes(inventory.schemaVersion as never)) {
+    fail(`schemaVersion must be one of ${SUPPORTED_SCHEMA_VERSIONS.join(", ")}`);
   }
   if (!PHASES.includes(inventory.phase as never))
     fail(`unknown phase: ${String(inventory.phase)}`);
@@ -1279,7 +1400,11 @@ export function validateSyncInventory(
   compareExpectedItems(inventory);
   validateLedger(inventory, ledger);
   if (!options.skipGitDerivation) {
-    validateGitDerivation(inventory, options.repo ?? process.cwd());
+    validateGitDerivation(
+      inventory,
+      options.repo ?? process.cwd(),
+      options.reviewedRef ?? "HEAD",
+    );
   }
 }
 

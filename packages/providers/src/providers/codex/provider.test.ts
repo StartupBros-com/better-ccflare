@@ -83,6 +83,23 @@ const CODEX_TURN_STATE_ENV_KEYS = [
 	CODEX_TURN_STATE_OBSERVE_ONLY_ENV,
 ] as const;
 
+describe("CodexProvider release identity", () => {
+	it("uses the exact upstream version in model URLs and request headers", () => {
+		expect(CODEX_VERSION).toBe("0.150.1");
+
+		const provider = new CodexProvider();
+		expect(provider.buildUrl("/v1/models", "")).toBe(
+			"https://chatgpt.com/backend-api/codex/models?client_version=0.150.1",
+		);
+
+		const headers = provider.prepareHeaders(new Headers(), "test-token");
+		expect(headers.get("Version")).toBe("0.150.1");
+		expect(headers.get("User-Agent")).toBe(
+			"codex-cli/0.150.1 (Windows 10.0.26100; x64)",
+		);
+	});
+});
+
 afterEach(() => {
 	delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
 	delete process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV];
@@ -9985,6 +10002,9 @@ describe("fetchCodexUsageOnDemand", () => {
 	});
 
 	it("uses the account-selected model and falls back on blank input", async () => {
+		expect(CODEX_PING_MODEL).toBe("gpt-5.6-sol");
+		expect(CODEX_PING_MODEL).not.toBe("gpt-5-codex");
+
 		globalThis.fetch = makeMockFetch(
 			new Response("event: ignored\n\n", { status: 200 }),
 		) as unknown as typeof fetch;

@@ -5,6 +5,7 @@ import {
 	type ApiKeyRole,
 	NodeCryptoUtils,
 } from "@better-ccflare/types/api-key";
+import { classifyAuthPath } from "./auth-paths";
 import { extractApiKey } from "./extract-api-key";
 
 /**
@@ -317,8 +318,9 @@ export class AuthService {
 	 * (does not require async DB check)
 	 */
 	isStaticPathExempt(path: string, method?: string): boolean {
-		// Health endpoint is always exempt
-		if (path === "/health") {
+		// Health endpoint is always exempt. The shared classifier keeps this exact
+		// so dashboard routing cannot silently claim a broader health prefix.
+		if (classifyAuthPath(path) === "health") {
 			return true;
 		}
 
@@ -402,6 +404,7 @@ export class AuthService {
 		if (this.isStaticPathExempt(path, method)) {
 			return true;
 		}
+		const pathFamily = classifyAuthPath(path);
 
 		// OAuth setup endpoints are intentionally not exempt. When no API keys
 		// exist authenticateRequest() still permits bootstrap below. Once auth is
@@ -422,9 +425,9 @@ export class AuthService {
 			return false;
 		}
 
-		// Proxy endpoints (/v1/*, /messages/*, etc.) require authentication if
-		// enabled, except for correctly-marked internal probes (#216).
-		if (path.startsWith("/v1") || path.startsWith("/messages")) {
+		// Proxy endpoints (/v1 and /messages) require authentication if enabled,
+		// except for correctly-marked internal probes (#216).
+		if (pathFamily === "v1" || pathFamily === "messages") {
 			if (headers && this.isInternalProbeRequest(headers)) {
 				return true;
 			}
@@ -433,7 +436,7 @@ export class AuthService {
 
 		// API endpoints require authentication if enabled, except for
 		// correctly-marked local-control CLI-notify requests (#216).
-		if (path.startsWith("/api")) {
+		if (pathFamily === "api") {
 			if (headers && this.isLocalControlRequest(headers, path)) {
 				return true;
 			}

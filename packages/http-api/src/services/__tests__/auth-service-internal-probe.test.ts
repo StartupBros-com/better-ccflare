@@ -90,6 +90,19 @@ describe("AuthService — internal probe exemption (#216)", () => {
 
 			expect(result.isAuthenticated).toBe(true);
 		});
+
+		it("uses the shared proxy-family prefixes for bare and lookalike paths", async () => {
+			const auth = new AuthService(makeDbOpsWithApiKeys(), SECRET);
+			for (const path of ["/v1", "/messages", "/v1beta", "/messages-legacy"]) {
+				const req = makeRequest(path, {
+					[INTERNAL_PROBE_SECRET_HEADER]: SECRET,
+					"x-better-ccflare-keepalive": "true",
+				});
+				expect(
+					(await auth.authenticateRequest(req, path, "POST")).isAuthenticated,
+				).toBe(true);
+			}
+		});
 	});
 
 	describe("fail-closed behavior", () => {

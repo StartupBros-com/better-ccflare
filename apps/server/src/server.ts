@@ -36,6 +36,7 @@ import {
 	AlertService,
 	APIRouter,
 	AuthService,
+	classifyAuthPath,
 	createServerDeviceSetupCoordinator,
 	UsageWindowLedger,
 } from "@better-ccflare/http-api";
@@ -286,20 +287,12 @@ export function resolveDashboardRoute(
 	}
 
 	// Client-side routing: only fall back to index.html for safe,
-	// body-less navigation methods, and never for a path that is actually
-	// an API route, the health endpoint, or a proxy request. Those must
-	// stay authenticated below.
-	const isApiOrProxyPath =
-		pathname.startsWith("/api/") ||
-		pathname === "/api" ||
-		pathname.startsWith("/v1/") ||
-		pathname.startsWith("/messages") ||
-		pathname === "/health";
-	if ((method === "GET" || method === "HEAD") && !isApiOrProxyPath) {
-		return "spa-index";
-	}
+	// body-less navigation methods, and never for a path owned by the API,
+	// health endpoint, or proxy. AuthService consumes the same classifier so
+	// the dashboard fallback cannot drift from authentication boundaries.
+	if (method !== "GET" && method !== "HEAD") return "pass-through";
 
-	return "pass-through";
+	return classifyAuthPath(pathname) === null ? "spa-index" : "pass-through";
 }
 
 /**

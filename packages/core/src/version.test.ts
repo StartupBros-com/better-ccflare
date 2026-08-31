@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
 	isTrustedDistributionProvenance,
 	parseDistributionIdentity,
@@ -6,10 +8,55 @@ import {
 	resolveBuildProvenance,
 } from "./build-provenance";
 import {
+	CLAUDE_CLI_VERSION,
 	extractClaudeVersion,
 	getClientVersion,
 	trackClientVersion,
 } from "./version";
+
+describe("release lineage", () => {
+	it("keeps root and CLI package lineage at exact v3.5.70 parity", () => {
+		const repositoryRoot = resolve(import.meta.dir, "../../..");
+		const rootPackage = JSON.parse(
+			readFileSync(resolve(repositoryRoot, "package.json"), "utf8"),
+		) as { version?: unknown };
+		const cliPackage = JSON.parse(
+			readFileSync(resolve(repositoryRoot, "apps/cli/package.json"), "utf8"),
+		) as { version?: unknown };
+
+		expect(rootPackage.version).toBe("3.5.70");
+		expect(cliPackage.version).toBe("3.5.70");
+		expect(rootPackage.version).toBe(cliPackage.version);
+	});
+
+	it("uses the exact upstream Claude CLI fallback version", () => {
+		expect(CLAUDE_CLI_VERSION).toBe("2.1.250");
+	});
+
+	it("preserves runtime Git SHA fallback and explicit unknown behavior", () => {
+		const script =
+			'const { getGitSha } = await import("./version.ts"); process.stdout.write(String(getGitSha()));';
+		const known = Bun.spawnSync([process.execPath, "-e", script], {
+			cwd: import.meta.dir,
+			env: { ...process.env, BETTER_CCFLARE_GIT_SHA: "abc1234" },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(known.exitCode).toBe(0);
+		expect(known.stdout.toString()).toBe("abc1234");
+
+		const unknownEnv = { ...process.env };
+		delete unknownEnv.BETTER_CCFLARE_GIT_SHA;
+		const unknown = Bun.spawnSync([process.execPath, "-e", script], {
+			cwd: import.meta.dir,
+			env: unknownEnv,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(unknown.exitCode).toBe(0);
+		expect(unknown.stdout.toString()).toBe("null");
+	});
+});
 
 describe("extractClaudeVersion", () => {
 	it("should extract version from standard claude-cli user-agent", () => {
