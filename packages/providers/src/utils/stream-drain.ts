@@ -4,7 +4,10 @@ const DRAIN_DEADLINE = Symbol("drain-deadline");
 const responseDrainTransports = new WeakMap<Response, AbortController>();
 
 export interface DrainReaderOptions {
-	/** Total time allowed for this best-effort drain. */
+	/**
+	 * Time allowed for this best-effort drain before deadline cleanup starts.
+	 * A pending read then receives one additional, equal settlement-grace window.
+	 */
 	deadlineMs?: number;
 	/** Controller for the exact fetch transport that owns this reader. */
 	transportAbort?: AbortController;
@@ -16,6 +19,21 @@ function resolveDeadlineMs(deadlineMs: number | undefined): number {
 		deadlineMs >= 0
 		? deadlineMs
 		: TIME_CONSTANTS.STREAM_OPERATION_TIMEOUT_MS;
+}
+
+async function awaitPendingReadSettlement(
+	observedPendingRead: Promise<void>,
+	graceMs: number,
+): Promise<void> {
+	let graceTimer: ReturnType<typeof setTimeout> | undefined;
+	const grace = new Promise<void>((resolve) => {
+		graceTimer = setTimeout(resolve, graceMs);
+	});
+	try {
+		await Promise.race([observedPendingRead, grace]);
+	} finally {
+		if (graceTimer !== undefined) clearTimeout(graceTimer);
+	}
 }
 
 /** Associate a fetch response with the controller dedicated to that fetch. */
@@ -81,8 +99,17 @@ export async function drainReader<T>(
 
 	try {
 		while (true) {
-			const result = await Promise.race([reader.read(), deadline]);
-			if (result === DRAIN_DEADLINE || result.done) return;
+			const pendingRead = reader.read();
+			const observedPendingRead = pendingRead.then(
+				() => undefined,
+				() => undefined,
+			);
+			const result = await Promise.race([pendingRead, deadline]);
+			if (result === DRAIN_DEADLINE) {
+				await awaitPendingReadSettlement(observedPendingRead, deadlineMs);
+				return;
+			}
+			if (result.done) return;
 		}
 	} catch {
 		// Swallow — draining must not throw during cleanup.
@@ -95,11 +122,11 @@ export async function drainReader<T>(
 export interface DrainReaderWithDeadlineOptions {
 	/**
 	 * Upper bound on how long the drain will wait for `beforeDrain` (if
-	 * supplied) and then for `reader.read()` to settle — one deadline shared
-	 * across both phases, not a fresh one per phase. On expiry, `drainAbort`
-	 * (when supplied) is aborted so the underlying fetch's connection is
-	 * actually torn down — `reader.releaseLock()` alone only frees the reader
-	 * object, it does not touch the connection.
+	 * supplied) and then for `reader.read()` before deadline cleanup starts —
+	 * one deadline shared across both phases, not a fresh one per phase. On
+	 * expiry, `drainAbort` (when supplied) is aborted so the underlying fetch's
+	 * connection is actually torn down, then a pending read receives one
+	 * additional, equal settlement-grace window before lock release.
 	 */
 	deadlineMs: number;
 	drainAbort?: AbortController;
@@ -156,9 +183,25 @@ export async function drainReaderWithDeadline(
 		}
 
 		while (true) {
-			const outcome = await Promise.race([reader.read(), deadline]);
+			const pendingRead = reader.read();
+			const observedPendingRead = pendingRead.then(
+				() => undefined,
+				() => undefined,
+			);
+			const outcome = await Promise.race([pendingRead, deadline]);
 			if (outcome === "deadline") {
+				// `pendingRead` is still outstanding here. Releasing the lock
+				// while a read is in flight only rejects that promise
+				// (WHATWG Streams §4.5) — it does not tell the underlying
+				// source the stream is abandoned, which is exactly the
+				// "touched then abandoned" shape Bun's native fetch can
+				// buffer without bound (oven-sh/bun#39590, #382). Abort
+				// first so the losing read has a chance to actually settle
+				// (reject) via the torn-down connection, then give it a
+				// bounded grace window before releasing the lock regardless
+				// — a stuck-but-unabortable source must not hang the drain.
 				drainAbort?.abort(new Error("Drain deadline exceeded"));
+				await awaitPendingReadSettlement(observedPendingRead, deadlineMs);
 				return;
 			}
 			if (outcome.done) return;

@@ -5,6 +5,10 @@ export * from "./handlers/storage";
 export { APIRouter, type APIRouterOptions } from "./router";
 export { createServerOwnedAccountRoutingFinalizer } from "./services/account-routing-operations";
 export { AlertService } from "./services/alerts";
+export {
+	type AuthPathFamily,
+	classifyAuthPath,
+} from "./services/auth-paths";
 // Export services
 export { AuthService } from "./services/auth-service";
 export {
