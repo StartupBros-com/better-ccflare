@@ -698,7 +698,7 @@ describe("deriveServerToolRequirement", () => {
 		expect(serialized).not.toContain("private_query");
 	});
 
-	test("admits absent or auto tool choice and rejects forced choice or explicit incompatible parallelism", () => {
+	test("admits Claude Code's forced WebSearch choice without widening other forced choices", () => {
 		const absent = deriveServerToolRequirement({
 			tools: [{ type: "web_search_20250305", name: "web_search" }],
 		});
@@ -706,25 +706,111 @@ describe("deriveServerToolRequirement", () => {
 			tools: [{ type: "web_search_20250305", name: "web_search" }],
 			tool_choice: { type: "auto" },
 		});
-		expect(absent?.profileId).toBe(automatic?.profileId);
-		expect(typeof absent?.profileId).toBe("string");
+		const legacyProfileId =
+			"web-search-20250305-v1:domains-none:max-none:location-absent:client-no";
+		expect(absent?.profileId).toBe(legacyProfileId);
+		expect(automatic?.profileId).toBe(legacyProfileId);
 
-		expect(
-			deriveServerToolRequirement({
-				tools: [{ type: "web_search_20250305", name: "web_search" }],
-				tool_choice: { type: "tool", name: "web_search" },
-			}),
-		).toMatchObject({
-			invalid: [{ type: "web_search_20250305", reason: "invalid_options" }],
+		const forced = deriveServerToolRequirement({
+			model: "claude-opus-5",
+			messages: [
+				{
+					role: "user",
+					content: "Perform a web search for the query: test",
+				},
+			],
+			stream: true,
+			tools: [
+				{
+					type: "web_search_20250305",
+					name: "web_search",
+					max_uses: 8,
+				},
+			],
+			tool_choice: { type: "tool", name: "web_search" },
 		});
-		expect(
-			deriveServerToolRequirement({
+		expect(forced).toMatchObject({
+			revision: 2,
+			profileId: expect.stringContaining(":choice-forced"),
+			responseMode: "streaming",
+			mixedToolMode: "server_only",
+			replay: {
+				input: [],
+				output: [],
+				requiresOutputReplay: true,
+			},
+			declarations: [{ type: "web_search_20250305", maxUses: 8 }],
+		});
+		expect(forced?.profileId).not.toBe(legacyProfileId);
+		expect(forced?.invalid).toBeUndefined();
+
+		for (const [filter, expected] of [
+			[
+				{ allowed_domains: ["docs.example"] },
+				{ allowedDomains: ["docs.example"] },
+			],
+			[
+				{ blocked_domains: ["blocked.example"] },
+				{ blockedDomains: ["blocked.example"] },
+			],
+		] as const) {
+			const filtered = deriveServerToolRequirement({
+				stream: true,
+				tools: [
+					{
+						type: "web_search_20250305",
+						name: "web_search",
+						max_uses: 8,
+						...filter,
+					},
+				],
+				tool_choice: { type: "tool", name: "web_search" },
+			});
+			expect(filtered?.profileId).toContain(":choice-forced");
+			expect(filtered?.declarations?.[0]).toMatchObject(expected);
+		}
+
+		for (const body of [
+			{
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+				tool_choice: { type: "any" },
+			},
+			{
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+				tool_choice: { type: "none" },
+			},
+			{
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+				tool_choice: { type: "auto", name: "web_search" },
+			},
+			{
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+				tool_choice: { type: "tool", name: "other_tool" },
+			},
+			{
+				tools: [
+					{ type: "web_search_20250305", name: "web_search" },
+					{ name: "lookup", input_schema: { type: "object" } },
+				],
+				tool_choice: { type: "tool", name: "web_search" },
+			},
+			{
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+				tool_choice: {
+					type: "tool",
+					name: "web_search",
+					disable_parallel_tool_use: false,
+				},
+			},
+			{
 				tools: [{ type: "web_search_20250305", name: "web_search" }],
 				tool_choice: { type: "auto", disable_parallel_tool_use: true },
-			}),
-		).toMatchObject({
-			invalid: [{ type: "web_search_20250305", reason: "invalid_options" }],
-		});
+			},
+		]) {
+			expect(deriveServerToolRequirement(body)).toMatchObject({
+				invalid: [{ type: "web_search_20250305", reason: "invalid_options" }],
+			});
+		}
 	});
 
 	test("uses stable low-cardinality profiles and distinct native versus proxy replay modes", () => {
