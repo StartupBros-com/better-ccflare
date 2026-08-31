@@ -477,7 +477,9 @@ async function ensureRoutingAttemptsSchemaPg(
 			account_benched INTEGER NOT NULL CHECK (account_benched IN (0, 1)),
 			route_suppressed INTEGER NOT NULL CHECK (route_suppressed IN (0, 1)),
 			circuit_counted INTEGER NOT NULL CHECK (circuit_counted IN (0, 1)),
-			upstream_evidence TEXT CHECK (upstream_evidence IS NULL OR length(upstream_evidence) <= 2048)
+			upstream_evidence TEXT CHECK (upstream_evidence IS NULL OR length(upstream_evidence) <= 2048),
+			route_fallback_rung TEXT,
+			route_candidate_id TEXT
 		)
 	`);
 	await adapter.unsafe(
@@ -576,7 +578,15 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			project_attribution_source TEXT,
 			agent_attribution_source TEXT,
 			stream_terminal_state TEXT,
-			client_session_id TEXT
+			client_session_id TEXT,
+			route_profile_id TEXT,
+			requested_route_model TEXT,
+			routed_provider TEXT,
+			routed_model TEXT,
+			route_fallback_rung TEXT,
+			route_home_action TEXT,
+			route_repin_reason TEXT,
+			route_candidate_id TEXT
 		)
 	`);
 
@@ -1620,6 +1630,20 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			column: "client_session_id",
 			definition: "ALTER TABLE requests ADD COLUMN client_session_id TEXT",
 		},
+		...[
+			"route_profile_id",
+			"requested_route_model",
+			"routed_provider",
+			"routed_model",
+			"route_fallback_rung",
+			"route_home_action",
+			"route_repin_reason",
+			"route_candidate_id",
+		].map((column) => ({
+			table: "requests",
+			column,
+			definition: `ALTER TABLE requests ADD COLUMN ${column} TEXT`,
+		})),
 		{
 			// Real SSE termination state for Anthropic-Messages-shaped
 			// streaming responses — see packages/proxy/src/anthropic-terminal-recovery.ts
@@ -1676,6 +1700,18 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			column: "upstream_evidence",
 			definition:
 				"ALTER TABLE routing_attempts ADD COLUMN upstream_evidence TEXT CHECK (upstream_evidence IS NULL OR length(upstream_evidence) <= 2048)",
+		},
+		{
+			table: "routing_attempts",
+			column: "route_fallback_rung",
+			definition:
+				"ALTER TABLE routing_attempts ADD COLUMN route_fallback_rung TEXT",
+		},
+		{
+			table: "routing_attempts",
+			column: "route_candidate_id",
+			definition:
+				"ALTER TABLE routing_attempts ADD COLUMN route_candidate_id TEXT",
 		},
 	];
 

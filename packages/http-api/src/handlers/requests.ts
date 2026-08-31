@@ -9,6 +9,7 @@ import { jsonResponse } from "@better-ccflare/http-common";
 import {
 	toAgentAttributionSource,
 	toProjectAttributionSource,
+	toRouteProvenance,
 	toStreamTerminalState,
 } from "@better-ccflare/types/request";
 import type { RequestResponse } from "../types";
@@ -77,6 +78,14 @@ export function createRequestsSummaryHandler(db: BunSqlAdapter) {
 			agent_attribution_source: string | null;
 			client_session_id: string | null;
 			stream_terminal_state: string | null;
+			route_profile_id: string | null;
+			requested_route_model: string | null;
+			routed_provider: string | null;
+			routed_model: string | null;
+			route_fallback_rung: string | null;
+			route_home_action: string | null;
+			route_repin_reason: string | null;
+			route_candidate_id: string | null;
 		}>(
 			`
 			SELECT r.*, a.name as account_name
@@ -134,6 +143,7 @@ export function createRequestsSummaryHandler(db: BunSqlAdapter) {
 			// into the same `undefined` a non-streaming request produces.
 			streamTerminalState: toStreamTerminalState(request.stream_terminal_state),
 			clientSessionId: request.client_session_id || undefined,
+			routeProvenance: toRouteProvenance(request),
 			rateLimited: request.status_code === 429,
 		}));
 

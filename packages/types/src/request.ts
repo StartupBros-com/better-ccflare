@@ -27,6 +27,68 @@ export const AGENT_ATTRIBUTION_SOURCES = [
 
 export type AgentAttributionSource = (typeof AGENT_ATTRIBUTION_SOURCES)[number];
 
+export const ROUTE_FALLBACK_RUNGS = [
+	"profile_requested_model",
+	"profile_root_model",
+	"global_requested_model",
+] as const;
+export type RouteFallbackRung = (typeof ROUTE_FALLBACK_RUNGS)[number];
+
+export const ROUTE_HOME_ACTIONS = [
+	"none",
+	"retained",
+	"initial_commit",
+	"repinned",
+] as const;
+export type RouteHomeAction = (typeof ROUTE_HOME_ACTIONS)[number];
+
+export const ROUTE_REPIN_REASONS = [
+	"structural_removal",
+	"hard_exclusion",
+	"account_unavailable",
+	"model_capacity",
+	"credential_failure",
+	"route_circuit_open",
+] as const;
+export type RouteRepinReason = (typeof ROUTE_REPIN_REASONS)[number];
+
+/** Final winner or typed-terminal route facts carried across operator surfaces. */
+export interface RouteProvenance {
+	readonly profileId: string | null;
+	readonly requestedModel: string | null;
+	readonly routedProvider: string | null;
+	readonly routedModel: string | null;
+	readonly fallbackRung: RouteFallbackRung | null;
+	readonly homeAction: RouteHomeAction;
+	readonly repinReason: RouteRepinReason | null;
+	readonly candidateId: string | null;
+}
+
+function narrowStringUnion<T extends string>(
+	value: unknown,
+	allowed: readonly T[],
+): T | undefined {
+	return typeof value === "string" && allowed.includes(value as T)
+		? (value as T)
+		: undefined;
+}
+
+export function toRouteFallbackRung(
+	value: unknown,
+): RouteFallbackRung | undefined {
+	return narrowStringUnion(value, ROUTE_FALLBACK_RUNGS);
+}
+
+export function toRouteHomeAction(value: unknown): RouteHomeAction | undefined {
+	return narrowStringUnion(value, ROUTE_HOME_ACTIONS);
+}
+
+export function toRouteRepinReason(
+	value: unknown,
+): RouteRepinReason | undefined {
+	return narrowStringUnion(value, ROUTE_REPIN_REASONS);
+}
+
 /**
  * Narrow a raw `project_attribution_source` column value. Like every
  * provenance column this is TEXT with no database-side constraint, so a bare
@@ -143,6 +205,14 @@ export interface RequestRow {
 	agent_attribution_source: string | null;
 	client_session_id: string | null;
 	stream_terminal_state: string | null;
+	route_profile_id?: string | null;
+	requested_route_model?: string | null;
+	routed_provider?: string | null;
+	routed_model?: string | null;
+	route_fallback_rung?: string | null;
+	route_home_action?: string | null;
+	route_repin_reason?: string | null;
+	route_candidate_id?: string | null;
 }
 
 // Domain model
@@ -179,6 +249,7 @@ export interface Request {
 	agentAttributionSource?: AgentAttributionSource;
 	clientSessionId?: string;
 	streamTerminalState?: ReportedStreamTerminalState;
+	routeProvenance?: RouteProvenance;
 }
 
 // API response type
@@ -238,6 +309,7 @@ export interface RequestResponse {
 	 */
 	clientSessionId?: string;
 	streamTerminalState?: ReportedStreamTerminalState;
+	routeProvenance?: RouteProvenance;
 }
 
 // Detailed request with payload
@@ -280,6 +352,44 @@ export interface RequestPayload {
 		// the "Rate Limited" badge from a summary-only payload (no body
 		// hydration required).
 		rateLimited?: boolean;
+	};
+}
+
+export type RouteProvenanceRow = Pick<
+	RequestRow,
+	| "route_profile_id"
+	| "requested_route_model"
+	| "routed_provider"
+	| "routed_model"
+	| "route_fallback_rung"
+	| "route_home_action"
+	| "route_repin_reason"
+	| "route_candidate_id"
+>;
+
+export function toRouteProvenance(
+	row: RouteProvenanceRow,
+): RouteProvenance | undefined {
+	const hasRouteProvenance = [
+		row.route_profile_id,
+		row.requested_route_model,
+		row.routed_provider,
+		row.routed_model,
+		row.route_fallback_rung,
+		row.route_home_action,
+		row.route_repin_reason,
+		row.route_candidate_id,
+	].some((value) => typeof value === "string" && value.length > 0);
+	if (!hasRouteProvenance) return undefined;
+	return {
+		profileId: row.route_profile_id || null,
+		requestedModel: row.requested_route_model || null,
+		routedProvider: row.routed_provider || null,
+		routedModel: row.routed_model || null,
+		fallbackRung: toRouteFallbackRung(row.route_fallback_rung) ?? null,
+		homeAction: toRouteHomeAction(row.route_home_action) ?? "none",
+		repinReason: toRouteRepinReason(row.route_repin_reason) ?? null,
+		candidateId: row.route_candidate_id || null,
 	};
 }
 
@@ -337,6 +447,7 @@ export function toRequest(row: RequestRow): Request {
 		),
 		clientSessionId: row.client_session_id || undefined,
 		streamTerminalState: toStreamTerminalState(row.stream_terminal_state),
+		routeProvenance: toRouteProvenance(row),
 	};
 }
 
@@ -375,6 +486,7 @@ export function toRequestResponse(request: Request): RequestResponse {
 		agentAttributionSource: request.agentAttributionSource,
 		clientSessionId: request.clientSessionId,
 		streamTerminalState: request.streamTerminalState,
+		routeProvenance: request.routeProvenance,
 	};
 }
 

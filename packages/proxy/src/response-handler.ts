@@ -17,6 +17,7 @@ import type {
 	ProjectAttributionSource,
 	RateLimitReason,
 	RequestMeta,
+	RouteProvenance,
 } from "@better-ccflare/types";
 import type { AnthropicDegradedResponseLifecycle } from "./anthropic-degraded-response-lifecycle";
 import { createAnthropicSemanticLivenessStream } from "./anthropic-semantic-liveness";
@@ -258,6 +259,8 @@ export function handleAnthropicSseRateLimit(
 const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024;
 
 const MODEL_REWRITE_HEADER = "x-better-ccflare-model-rewrite";
+const ROUTE_FALLBACK_HEADER = "x-better-ccflare-route-fallback";
+const ROUTED_MODEL_HEADER = "x-better-ccflare-routed-model";
 const CACHE_FLIGHT_RECORDER_HEADER =
 	"x-better-ccflare-cache-flight-recorder-id";
 
@@ -273,6 +276,7 @@ function withResponseMetadataHeaders(
 		appliedModel?: string | null;
 		cacheFlightRecorderConversationId?: string | null;
 		cacheFlightRecorderEligible?: boolean;
+		routeProvenance?: RouteProvenance | null;
 	},
 ): Headers {
 	const result = new Headers(headers);
@@ -281,6 +285,12 @@ function withResponseMetadataHeaders(
 			MODEL_REWRITE_HEADER,
 			`${options.originalModel}->${options.appliedModel}`,
 		);
+	}
+	if (options.routeProvenance?.fallbackRung) {
+		result.set(ROUTE_FALLBACK_HEADER, options.routeProvenance.fallbackRung);
+	}
+	if (options.routeProvenance?.routedModel) {
+		result.set(ROUTED_MODEL_HEADER, options.routeProvenance.routedModel);
 	}
 	if (
 		options.cacheFlightRecorderEligible === true &&
@@ -809,6 +819,25 @@ export async function forwardToClient(
 		drainAbort,
 		anthropicDegradedLifecycle,
 	} = options;
+	const winningCandidate = routeCandidateId
+		? routingMeta?.routingCandidateCatalog?.find(
+				(candidate) => candidate.candidateId === routeCandidateId,
+			)
+		: undefined;
+	const routeProvenance: RouteProvenance | null =
+		routingMeta?.routeProfileId || winningCandidate?.routeFallbackRung
+			? {
+					profileId: routingMeta?.routeProfileId ?? null,
+					requestedModel:
+						routingMeta?.requestedLogicalModel ?? originalModel ?? null,
+					routedProvider: account?.provider ?? null,
+					routedModel: attemptedModel ?? null,
+					fallbackRung: winningCandidate?.routeFallbackRung ?? null,
+					homeAction: routingMeta?.routeHomeAction ?? "none",
+					repinReason: routingMeta?.routeRepinReason ?? null,
+					candidateId: routeCandidateId,
+				}
+			: null;
 
 	// Record which account actually served this session's request, keyed on the
 	// Claude Code session id header, for the status-line account badge (R1, R2).
@@ -935,6 +964,7 @@ export async function forwardToClient(
 			accountName: account?.name ?? null,
 			agentUsed: agentUsed || null,
 			clientSessionId: clientSessionId ?? null,
+			routeProvenance,
 			// Persist the pair only for an actual swap — an agent-detected but
 			// unmodified request would otherwise record two equal values that
 			// downstream cannot distinguish from a real rewrite.
@@ -1424,6 +1454,7 @@ export async function forwardToClient(
 				appliedModel,
 				cacheFlightRecorderConversationId,
 				cacheFlightRecorderEligible,
+				routeProvenance,
 			}),
 		});
 		anthropicDegradedLifecycle?.transferToResponse();
@@ -1466,6 +1497,7 @@ export async function forwardToClient(
 		let clientResponse = response;
 		if (
 			isModelRewrite(originalModel, appliedModel) ||
+			routeProvenance !== null ||
 			(cacheFlightRecorderEligible === true &&
 				Boolean(cacheFlightRecorderConversationId))
 		) {
@@ -1477,6 +1509,7 @@ export async function forwardToClient(
 					appliedModel,
 					cacheFlightRecorderConversationId,
 					cacheFlightRecorderEligible,
+					routeProvenance,
 				}),
 			});
 		}
@@ -1599,6 +1632,7 @@ export async function forwardToClient(
 			appliedModel,
 			cacheFlightRecorderConversationId,
 			cacheFlightRecorderEligible,
+			routeProvenance,
 		}),
 	});
 	anthropicDegradedLifecycle?.transferToResponse();

@@ -351,7 +351,9 @@ function ensureRoutingAttemptsSchema(db: Database): void {
 			account_benched INTEGER NOT NULL CHECK (account_benched IN (0, 1)),
 			route_suppressed INTEGER NOT NULL CHECK (route_suppressed IN (0, 1)),
 			circuit_counted INTEGER NOT NULL CHECK (circuit_counted IN (0, 1)),
-			upstream_evidence TEXT CHECK (upstream_evidence IS NULL OR length(upstream_evidence) <= 2048)
+			upstream_evidence TEXT CHECK (upstream_evidence IS NULL OR length(upstream_evidence) <= 2048),
+			route_fallback_rung TEXT,
+			route_candidate_id TEXT
 		)
 	`);
 	db.run(
@@ -445,7 +447,15 @@ export function ensureSchema(db: Database): void {
 			project_attribution_source TEXT,
 			agent_attribution_source TEXT,
 			stream_terminal_state TEXT,
-			client_session_id TEXT
+			client_session_id TEXT,
+			route_profile_id TEXT,
+			requested_route_model TEXT,
+			routed_provider TEXT,
+			routed_model TEXT,
+			route_fallback_rung TEXT,
+			route_home_action TEXT,
+			route_repin_reason TEXT,
+			route_candidate_id TEXT
 		)
 	`);
 
@@ -1512,6 +1522,11 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		).run();
 		log.info("Added bounded upstream evidence to routing attempts");
 	}
+	for (const column of ["route_fallback_rung", "route_candidate_id"]) {
+		if (tableHasColumn(db, "routing_attempts", column)) continue;
+		db.prepare(`ALTER TABLE routing_attempts ADD COLUMN ${column} TEXT`).run();
+		log.info(`Added ${column} to routing attempts`);
+	}
 
 	// Check if columns exist before adding them
 	const accountsInfo = db
@@ -2305,6 +2320,21 @@ export function runMigrations(db: Database, dbPath?: string): void {
 				"ALTER TABLE requests ADD COLUMN stream_terminal_state TEXT",
 			).run();
 			log.info("Added stream_terminal_state column to requests table");
+		}
+
+		for (const column of [
+			"route_profile_id",
+			"requested_route_model",
+			"routed_provider",
+			"routed_model",
+			"route_fallback_rung",
+			"route_home_action",
+			"route_repin_reason",
+			"route_candidate_id",
+		]) {
+			if (requestsColumnNames.includes(column)) continue;
+			db.prepare(`ALTER TABLE requests ADD COLUMN ${column} TEXT`).run();
+			log.info(`Added ${column} column to requests table`);
 		}
 
 		// Add timestamp column to request_payloads if it doesn't exist

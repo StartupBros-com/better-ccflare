@@ -33,6 +33,7 @@ import type {
 	IntegrityStatus,
 	ProjectAttributionSource,
 	RateLimitReason,
+	RouteProvenance,
 	StrategyStore,
 } from "@better-ccflare/types";
 import {
@@ -1455,6 +1456,7 @@ OAuth tokens will need to be re-authenticated.
 			| "client_cancelled"
 			| null,
 		clientSessionId?: string | null,
+		routeProvenance?: RouteProvenance | null,
 	): Promise<void> {
 		await withDatabaseRetry(
 			() =>
@@ -1481,6 +1483,7 @@ OAuth tokens will need to be re-authenticated.
 					agentAttributionSource,
 					streamTerminalState,
 					clientSessionId,
+					routeProvenance,
 				}),
 			this.retryConfig,
 			"saveRequest",
