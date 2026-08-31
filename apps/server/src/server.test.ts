@@ -990,7 +990,7 @@ describe("resolveDashboardRoute", () => {
 		const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
 		const gateStart = src.indexOf("if (withDashboard && dashboardManifest) {");
 		const apiRoutesStart = src.indexOf(
-			"// API routes (authenticated inside the router)",
+			"const apiResponse = await apiRouter.handleRequest(url, req);",
 			gateStart,
 		);
 		expect(gateStart).toBeGreaterThanOrEqual(0);

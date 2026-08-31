@@ -290,12 +290,9 @@ export function resolveDashboardRoute(
 	// body-less navigation methods, and never for a path owned by the API,
 	// health endpoint, or proxy. AuthService consumes the same classifier so
 	// the dashboard fallback cannot drift from authentication boundaries.
-	const pathFamily = classifyAuthPath(pathname);
-	if ((method === "GET" || method === "HEAD") && pathFamily === null) {
-		return "spa-index";
-	}
+	if (method !== "GET" && method !== "HEAD") return "pass-through";
 
-	return "pass-through";
+	return classifyAuthPath(pathname) === null ? "spa-index" : "pass-through";
 }
 
 /**

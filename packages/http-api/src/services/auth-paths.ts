@@ -1,4 +1,4 @@
-export type AuthPathFamily = "api" | "v1" | "messages" | "health";
+type AuthPathFamily = "api" | "v1" | "messages" | "health";
 
 /**
  * Classify path families shared by the dashboard router and AuthService.

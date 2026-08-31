@@ -22,9 +22,13 @@ function resolveDeadlineMs(deadlineMs: number | undefined): number {
 }
 
 async function awaitPendingReadSettlement(
-	observedPendingRead: Promise<void>,
+	pendingRead: Promise<unknown>,
 	graceMs: number,
 ): Promise<void> {
+	const observedPendingRead = pendingRead.then(
+		() => undefined,
+		() => undefined,
+	);
 	let graceTimer: ReturnType<typeof setTimeout> | undefined;
 	const grace = new Promise<void>((resolve) => {
 		graceTimer = setTimeout(resolve, graceMs);
@@ -100,13 +104,9 @@ export async function drainReader<T>(
 	try {
 		while (true) {
 			const pendingRead = reader.read();
-			const observedPendingRead = pendingRead.then(
-				() => undefined,
-				() => undefined,
-			);
 			const result = await Promise.race([pendingRead, deadline]);
 			if (result === DRAIN_DEADLINE) {
-				await awaitPendingReadSettlement(observedPendingRead, deadlineMs);
+				await awaitPendingReadSettlement(pendingRead, deadlineMs);
 				return;
 			}
 			if (result.done) return;
@@ -184,10 +184,6 @@ export async function drainReaderWithDeadline(
 
 		while (true) {
 			const pendingRead = reader.read();
-			const observedPendingRead = pendingRead.then(
-				() => undefined,
-				() => undefined,
-			);
 			const outcome = await Promise.race([pendingRead, deadline]);
 			if (outcome === "deadline") {
 				// `pendingRead` is still outstanding here. Releasing the lock
@@ -201,7 +197,7 @@ export async function drainReaderWithDeadline(
 				// bounded grace window before releasing the lock regardless
 				// — a stuck-but-unabortable source must not hang the drain.
 				drainAbort?.abort(new Error("Drain deadline exceeded"));
-				await awaitPendingReadSettlement(observedPendingRead, deadlineMs);
+				await awaitPendingReadSettlement(pendingRead, deadlineMs);
 				return;
 			}
 			if (outcome.done) return;
