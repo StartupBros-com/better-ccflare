@@ -1,0 +1,648 @@
+{
+  "schemaVersion": 1,
+  "phase": "pre-merge",
+  "baseline": {
+    "forkParent": "c5f7816e476f479fbbf5ea9efd14202146452c71",
+    "requiredAncestors": [
+      "20c3e1930b701df5fdf923abbe3a4936bdacacc9"
+    ],
+    "target": "09cf070533de989a255cb2fcbd49580d794ed6f0",
+    "canonicalTag": "refs/tags/v3.5.70",
+    "peeledTag": "09cf070533de989a255cb2fcbd49580d794ed6f0",
+    "mergeBase": "4d27cb226f383a39e12aea530e83d2f9896999ce",
+    "rawCounts": {
+      "left": 824,
+      "right": 5
+    },
+    "cherryPickCounts": {
+      "left": 824,
+      "right": 5
+    },
+    "versions": {
+      "fork": {
+        "root": "3.5.69",
+        "cli": "3.5.69"
+      },
+      "target": {
+        "root": "3.5.70",
+        "cli": "3.5.70"
+      }
+    }
+  },
+  "derivation": {
+    "algorithmVersion": "upstream-sync-ledger/v1",
+    "upstreamCommitOrder": "git rev-list --topo-order --reverse <merge-base>..<target>",
+    "pathSemantics": "git diff --name-status -z --find-renames; rename destinations and current repo-relative paths",
+    "conflictMechanism": "git merge-tree --write-tree --name-only with a temporary alternate object directory under OS tmpdir"
+  },
+  "expected": {
+    "upstreamCommits": [
+      "f3a5c498ca1b557708b4a7242cb78231f1aaad12",
+      "8bb74ed0a3f16bcc276201f73430ee485e729559",
+      "a6b84e4b575b0cb62693926820fab562625d7588",
+      "1e343ddd8e60d1bef743d0a008ba1d5050ccb963",
+      "09cf070533de989a255cb2fcbd49580d794ed6f0"
+    ],
+    "conflicts": [
+      {
+        "path": "__tests__/api-auth.test.ts",
+        "conflictClass": "content"
+      },
+      {
+        "path": "apps/server/src/server.ts",
+        "conflictClass": "content"
+      },
+      {
+        "path": "packages/core/src/version.ts",
+        "conflictClass": "content"
+      },
+      {
+        "path": "packages/http-api/src/services/auth-service.ts",
+        "conflictClass": "content"
+      },
+      {
+        "path": "packages/providers/src/providers/codex/provider.ts",
+        "conflictClass": "content"
+      }
+    ],
+    "sharedPaths": [
+      "apps/cli/package.json",
+      "package.json",
+      "packages/providers/src/utils/stream-drain.ts"
+    ],
+    "qwenComparisonTrigger": {
+      "active": false,
+      "triggeringPaths": []
+    },
+    "rerereCapture": {
+      "state": "pre-merge-empty",
+      "applications": []
+    }
+  },
+  "evidenceCatalog": {
+    "u1-immutable-inputs": {
+      "type": "command",
+      "summary": "Refreshed v3.5.70 tag, target, merge base, and prior integration ancestry match the pinned inputs",
+      "details": "After refreshing origin/main, upstream/main, and refs/tags/v3.5.70: HEAD/fork parent is c5f7816e476f479fbbf5ea9efd14202146452c71; annotated tag object e0fa06882167e0462041df141b4c8aad89342be2 peels to 09cf070533de989a255cb2fcbd49580d794ed6f0; upstream/main equals that target; merge base is 4d27cb226f383a39e12aea530e83d2f9896999ce; required integration 20c3e1930b701df5fdf923abbe3a4936bdacacc9 is an ancestor of the fork parent and its second parent is 4d27cb226f383a39e12aea530e83d2f9896999ce. Generated baseline counts are raw 824/5 and patch-equivalent 824/5; fork versions are 3.5.69/3.5.69 and target versions are 3.5.70/3.5.70."
+    },
+    "u1-refreshed-main-staleness": {
+      "type": "refreshed-main",
+      "summary": "Post-2026-08-26 target-path history was reviewed and issue #260 remains applicable",
+      "details": "`git log origin/main --since='2026-08-26' --oneline --no-merges -- <nine target paths>` returned 90e59d9441284fc33a22d441bcdb70be2cf9d91c and 6e106a78566703202a09c1ab669f06b255e74c66. Both touch apps/server/src/server.ts only in unrelated native-memory telemetry and retention-cleanup regions, not dashboard/auth path classification. The operator cleared the repository staleness gate and confirmed issue #260 still applies."
+    },
+    "u1-build-cli": {
+      "type": "command",
+      "summary": "Fresh-worktree CLI build completed before Bun tests",
+      "details": "`bun run build:cli` exited 0 before every U1 Bun test process; no provider request or live canary was run."
+    },
+    "u1-ledger-validator-tests": {
+      "type": "test",
+      "summary": "Generic inventory and ledger validator regression suite passed",
+      "details": "`bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts` exited 0 with 34 passes, 0 failures, 0 skips, and 81 assertions in one isolated process."
+    },
+    "u1-auth-integration-characterization": {
+      "type": "test",
+      "summary": "Current API authentication boundaries passed pre-merge characterization",
+      "details": "`bun test __tests__/api-auth.test.ts` exited 0 with 49 passes, 0 failures, 0 skips, and 149 assertions in one isolated process after the CLI build."
+    },
+    "u1-server-route-characterization": {
+      "type": "test",
+      "summary": "Current dashboard and protected server-route behavior passed pre-merge characterization",
+      "details": "`bun test apps/server/src/server.test.ts` exited 0 with 46 passes, 0 failures, 0 skips, and 127 assertions in one isolated process after the CLI build."
+    },
+    "u1-bare-v1-source-characterization": {
+      "type": "document",
+      "summary": "Source inspection records bare /v1 as the U2 proof-first gap",
+      "details": "apps/server/src/server.ts:292-297 classifies `/v1/` prefixes but not exact `/v1`; apps/server/src/server.test.ts:929-941 names `/v1` in the invariant but exercises only `/v1/messages`. Therefore exact bare `/v1` is the expected failing test-first case U2 must add before changing classification."
+    },
+    "u1-session-account-characterization": {
+      "type": "test",
+      "summary": "Exact session-account exemption behavior passed pre-merge characterization",
+      "details": "`bun test packages/http-api/src/services/__tests__/auth-service-session-account-exemption.test.ts` exited 0 with 8 passes, 0 failures, 0 skips, and 8 assertions in one isolated process after the CLI build."
+    },
+    "u1-internal-probe-characterization": {
+      "type": "test",
+      "summary": "Internal-probe secret exemption behavior passed pre-merge characterization",
+      "details": "`bun test packages/http-api/src/services/__tests__/auth-service-internal-probe.test.ts` exited 0 with 14 passes, 0 failures, 0 skips, and 14 assertions in one isolated process after the CLI build."
+    },
+    "u1-stream-drain-characterization": {
+      "type": "test",
+      "summary": "Current stream-drain ownership and finite completion behavior passed pre-merge characterization",
+      "details": "`bun test packages/providers/src/utils/__tests__/stream-drain.test.ts` exited 0 with 5 passes, 0 failures, 0 skips, and 13 assertions in one isolated process after the CLI build; the suite covers finite drains, exact owning-transport abort, and live-sibling clone isolation."
+    },
+    "u1-premerge-inventory-validation": {
+      "type": "command",
+      "summary": "Generated v3.5.70 pre-merge packet validates against refreshed Git evidence",
+      "details": "`bun scripts/verify-upstream-sync-ledger.ts check --repo . --inventory docs/plans/2026-08-30-issue-260-v3.5.70-resolution-inventory.json --ledger docs/plans/2026-08-30-issue-260-v3.5.70-resolution-ledger.md` validated all 13 items derived from five upstream commits, five content conflicts, three clean shared paths, and an inactive Qwen comparison trigger."
+    }
+  },
+  "items": [
+    {
+      "id": "commit:09cf070533de989a255cb2fcbd49580d794ed6f0",
+      "kind": "upstream-commit",
+      "source": {
+        "sha": "09cf070533de989a255cb2fcbd49580d794ed6f0"
+      },
+      "ledgerAnchor": "#sync-commit-f5f02143fddc0d9a61ca2123",
+      "disposition": "semantically-remapped",
+      "upstreamIntent": "Advance upstream root and CLI package release lineage from 3.5.69 to 3.5.70.",
+      "protectedForkBehavior": "Preserve fork-only scripts, package surfaces, distribution and build provenance, Git-SHA runtime identity, and the fork's Claude and Codex provider behavior around the scalar lineage values.",
+      "selectedResolution": "Semantically remap the release commit as scalar v3.5.70 lineage updates inside the first-parent files during U4, without selecting whole target files.",
+      "evidence": {
+        "focusedPacket": {
+          "status": "passed",
+          "references": [
+            "u1-immutable-inputs"
+          ]
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [
+        "u1-immutable-inputs",
+        "u1-refreshed-main-staleness",
+        "u1-premerge-inventory-validation"
+      ],
+      "rationale": "The target manifests truthfully report 3.5.70, while surrounding fork provenance and provider implementation remain first-parent-owned and require semantic conflict resolution later.",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "commit:1e343ddd8e60d1bef743d0a008ba1d5050ccb963",
+      "kind": "upstream-commit",
+      "source": {
+        "sha": "1e343ddd8e60d1bef743d0a008ba1d5050ccb963"
+      },
+      "ledgerAnchor": "#sync-commit-95cded822659ee47773f4e40",
+      "disposition": "semantically-remapped",
+      "upstreamIntent": "Prevent releaseLock() from racing an outstanding reader.read() after a stream-drain deadline wins.",
+      "protectedForkBehavior": "Preserve exact owning-transport abort authority, finite drain completion, best-effort and propagating error distinctions, and clone isolation so cleanup never aborts or consumes a live sibling response.",
+      "selectedResolution": "Semantically remap and extend the upstream ordering fix across both shared drain helpers in U3: abort the exact transport, await bounded pending-read settlement, then release the lock.",
+      "evidence": {
+        "focusedPacket": {
+          "status": "passed",
+          "references": [
+            "u1-stream-drain-characterization"
+          ]
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [
+        "u1-immutable-inputs",
+        "u1-refreshed-main-staleness",
+        "u1-premerge-inventory-validation"
+      ],
+      "rationale": "The upstream fix addresses the right race but only one helper; the fork has the same defect shape in the sibling helper and must preserve its stricter transport-ownership contracts while extending the ordering repair.",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "commit:8bb74ed0a3f16bcc276201f73430ee485e729559",
+      "kind": "upstream-commit",
+      "source": {
+        "sha": "8bb74ed0a3f16bcc276201f73430ee485e729559"
+      },
+      "ledgerAnchor": "#sync-commit-bc120ce712973b5ca821825f",
+      "disposition": "semantically-remapped",
+      "upstreamIntent": "Align dashboard SPA path filtering with AuthService API and proxy path-family prefixes so protected routes are not shadowed by the SPA fallback.",
+      "protectedForkBehavior": "Preserve resolveDashboardRoute as the server seam, safe dashboard navigation and manifest-asset behavior, and the stricter AuthService decision surface; share only path-family classification.",
+      "selectedResolution": "Semantically remap prefix alignment through the shared classifier planned for U2. The current first parent protects prefixed routes, while exact bare /v1 remains the recorded proof-first gap.",
+      "evidence": {
+        "focusedPacket": {
+          "status": "passed",
+          "references": [
+            "u1-server-route-characterization",
+            "u1-bare-v1-source-characterization"
+          ]
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [
+        "u1-immutable-inputs",
+        "u1-refreshed-main-staleness",
+        "u1-premerge-inventory-validation"
+      ],
+      "rationale": "One shared family classifier preserves upstream's no-drift intent without moving authentication authority into the server; U2 must add exact bare-root coverage before the classifier changes.",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "commit:a6b84e4b575b0cb62693926820fab562625d7588",
+      "kind": "upstream-commit",
+      "source": {
+        "sha": "a6b84e4b575b0cb62693926820fab562625d7588"
+      },
+      "ledgerAnchor": "#sync-commit-47dfda1aa0462c216a87d519",
+      "disposition": "retained",
+      "upstreamIntent": "Retain PR #442's genuine merge topology joining the two upstream auth-hardening commits into the v3.5.70 lineage.",
+      "protectedForkBehavior": "Preserve the fork's prior v3.5.69 integration ancestry and require the final v3.5.70 integration to remain one genuine two-parent merge with the exact peeled target as second parent.",
+      "selectedResolution": "Retain this topology commit through the exact target lineage; it introduces no separate first-parent file resolution beyond the auth commits it joins.",
+      "evidence": {
+        "focusedPacket": {
+          "status": "passed",
+          "references": [
+            "u1-immutable-inputs"
+          ]
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [
+        "u1-immutable-inputs",
+        "u1-refreshed-main-staleness",
+        "u1-premerge-inventory-validation"
+      ],
+      "rationale": "The commit is a two-parent upstream merge whose first parent is 4d27cb226f383a39e12aea530e83d2f9896999ce and second parent is 8bb74ed0a3f16bcc276201f73430ee485e729559; retaining it preserves complete upstream lineage.",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "commit:f3a5c498ca1b557708b4a7242cb78231f1aaad12",
+      "kind": "upstream-commit",
+      "source": {
+        "sha": "f3a5c498ca1b557708b4a7242cb78231f1aaad12"
+      },
+      "ledgerAnchor": "#sync-commit-cc09d8b49fef255c64d85ced",
+      "disposition": "semantically-remapped",
+      "upstreamIntent": "Close unauthenticated OAuth token-mutation and arbitrary-path proxy bypasses.",
+      "protectedForkBehavior": "Preserve the fork's stricter exact OAuth policy: only documented read-only GET status polling bypasses normal API-key authentication, while session-account, internal-probe, local-control, logs-token, cache-debug, and ordinary API authorization contracts remain narrow.",
+      "selectedResolution": "Semantically remap the upstream auth hardening to the stricter current fork policy; U2 will retain upstream-derived regression evidence without widening any exemption.",
+      "evidence": {
+        "focusedPacket": {
+          "status": "passed",
+          "references": [
+            "u1-auth-integration-characterization",
+            "u1-session-account-characterization",
+            "u1-internal-probe-characterization"
+          ]
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [
+        "u1-immutable-inputs",
+        "u1-refreshed-main-staleness",
+        "u1-premerge-inventory-validation"
+      ],
+      "rationale": "Current fork auth hardening subsumes the upstream security intent while enforcing narrower exemptions; the passing first-parent characterization freezes that policy before merge resolution.",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "conflict:__tests__/api-auth.test.ts",
+      "kind": "conflict",
+      "source": {
+        "path": "__tests__/api-auth.test.ts",
+        "conflictClass": "content"
+      },
+      "ledgerAnchor": "#sync-conflict-e6d68e3da17c1d15e0e3fcc0",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "passed",
+          "references": [
+            "u1-auth-integration-characterization"
+          ]
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [
+        "u1-immutable-inputs",
+        "u1-refreshed-main-staleness",
+        "u1-premerge-inventory-validation"
+      ],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "conflict:apps/server/src/server.ts",
+      "kind": "conflict",
+      "source": {
+        "path": "apps/server/src/server.ts",
+        "conflictClass": "content"
+      },
+      "ledgerAnchor": "#sync-conflict-c1cf0f83af2ecb4673150d75",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "passed",
+          "references": [
+            "u1-server-route-characterization",
+            "u1-bare-v1-source-characterization"
+          ]
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [
+        "u1-immutable-inputs",
+        "u1-refreshed-main-staleness",
+        "u1-premerge-inventory-validation"
+      ],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "conflict:packages/core/src/version.ts",
+      "kind": "conflict",
+      "source": {
+        "path": "packages/core/src/version.ts",
+        "conflictClass": "content"
+      },
+      "ledgerAnchor": "#sync-conflict-522abf3f7e6527c667c373fd",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "conflict:packages/http-api/src/services/auth-service.ts",
+      "kind": "conflict",
+      "source": {
+        "path": "packages/http-api/src/services/auth-service.ts",
+        "conflictClass": "content"
+      },
+      "ledgerAnchor": "#sync-conflict-285e96370218047877f9a9cf",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "passed",
+          "references": [
+            "u1-auth-integration-characterization",
+            "u1-session-account-characterization",
+            "u1-internal-probe-characterization"
+          ]
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [
+        "u1-immutable-inputs",
+        "u1-refreshed-main-staleness",
+        "u1-premerge-inventory-validation"
+      ],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "conflict:packages/providers/src/providers/codex/provider.ts",
+      "kind": "conflict",
+      "source": {
+        "path": "packages/providers/src/providers/codex/provider.ts",
+        "conflictClass": "content"
+      },
+      "ledgerAnchor": "#sync-conflict-9182ac207e45b58d2635a204",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "shared-path:apps/cli/package.json",
+      "kind": "shared-path",
+      "source": {
+        "path": "apps/cli/package.json"
+      },
+      "ledgerAnchor": "#sync-shared-path-9a1eea0e0a5c872e3fe5b5a8",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "shared-path:package.json",
+      "kind": "shared-path",
+      "source": {
+        "path": "package.json"
+      },
+      "ledgerAnchor": "#sync-shared-path-92dfd1b04fa00cb270b121e2",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "pending",
+          "references": []
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    },
+    {
+      "id": "shared-path:packages/providers/src/utils/stream-drain.ts",
+      "kind": "shared-path",
+      "source": {
+        "path": "packages/providers/src/utils/stream-drain.ts"
+      },
+      "ledgerAnchor": "#sync-shared-path-2f33b28342c7a64f5b66a7e2",
+      "disposition": "pending",
+      "upstreamIntent": "pending",
+      "protectedForkBehavior": "pending",
+      "selectedResolution": "pending",
+      "evidence": {
+        "focusedPacket": {
+          "status": "passed",
+          "references": [
+            "u1-stream-drain-characterization"
+          ]
+        },
+        "acceptanceComplete": {
+          "status": "pending",
+          "references": []
+        },
+        "combinedDiff": {
+          "status": "pending",
+          "references": []
+        }
+      },
+      "reviewer": {
+        "status": "pending",
+        "identity": null,
+        "notes": "pending"
+      },
+      "dependencies": [
+        "u1-immutable-inputs",
+        "u1-refreshed-main-staleness",
+        "u1-premerge-inventory-validation"
+      ],
+      "rationale": "pending",
+      "refreshedMainEvidence": []
+    }
+  ]
+}
