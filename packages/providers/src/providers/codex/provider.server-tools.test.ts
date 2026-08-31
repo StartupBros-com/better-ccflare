@@ -388,7 +388,7 @@ describe("Codex exact hosted-search capability", () => {
 							: "server_only",
 						inputReplay: continuation ? ["native-Anthropic"] : [],
 						outputReplay: ["proxy-evidence-v1"],
-						providerContractRevision: "codex-responses-web-search-v1",
+						providerContractRevision: "codex-responses-web-search-v2",
 						replayDecoderRevision: "server-tool-replay-v1",
 						requestTransport: "openai_responses",
 						responseTransport: "openai_responses_sse",
@@ -782,7 +782,6 @@ describe("Codex strict hosted-search request mapper", () => {
 
 		expect(mapping).toEqual({
 			include: ["web_search_call.action.sources"],
-			max_tool_calls: 3,
 			tools: [
 				{
 					type: "function",
@@ -985,10 +984,10 @@ describe("Codex exact hosted-search attempt plan", () => {
 			model: "gpt-5.6-sol",
 			stream: true,
 			store: false,
-			max_tool_calls: 8,
 			tools: [{ type: "web_search" }],
 			tool_choice: { type: "web_search" },
 		});
+		expect(mapped).not.toHaveProperty("max_tool_calls");
 		expect(mapped.include).toEqual(
 			expect.arrayContaining(["web_search_call.action.sources"]),
 		);
@@ -1104,7 +1103,6 @@ describe("Codex exact hosted-search attempt plan", () => {
 				"reasoning.encrypted_content",
 				"web_search_call.action.sources",
 			],
-			max_tool_calls: 2,
 			tools: [
 				{
 					type: "web_search",
@@ -1120,6 +1118,7 @@ describe("Codex exact hosted-search attempt plan", () => {
 				},
 			],
 		});
+		expect(mapped).not.toHaveProperty("max_tool_calls");
 		expect(mapped.input).toEqual([
 			{
 				role: "user",

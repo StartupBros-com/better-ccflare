@@ -669,8 +669,10 @@ async function transformHostedRequest(
 			...mapping.include,
 		]),
 	];
-	if (mapping.max_tool_calls === undefined) delete converted.max_tool_calls;
-	else converted.max_tool_calls = mapping.max_tool_calls;
+	// The ChatGPT Codex subscription endpoint rejects Responses API
+	// `max_tool_calls`. Preserve Anthropic max_uses in the capability/option
+	// profile, but never emit the unsupported field on this reviewed wire path.
+	delete converted.max_tool_calls;
 	if (
 		isRecord(converted.tool_choice) &&
 		converted.tool_choice.type === "function" &&
