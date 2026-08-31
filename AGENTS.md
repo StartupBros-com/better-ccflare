@@ -124,6 +124,8 @@ grep its call sites yourself (`grep -a`, not plain `grep` — see the doc) and r
 affected suites, including any gated behind `DATABASE_URL`. Details:
 [docs/solutions/workflow-issues/typecheck-does-not-cover-test-call-sites.md](docs/solutions/workflow-issues/typecheck-does-not-cover-test-call-sites.md)
 
+`docs/solutions/` is the searchable store for documented bugs, practices, and workflow patterns, organized by category and YAML frontmatter (`module`, `tags`, `problem_type`); `CONCEPTS.md` defines shared domain vocabulary. Both are relevant when implementing or debugging in documented areas.
+
 ## Git Commits
 - **Before making any changes, run `git status` to check for pre-existing uncommitted changes.** Note which files were already modified so you can distinguish your changes from theirs throughout the session.
 - Use `git add <specific-files>` (not `git add .`) to avoid committing inline-worker.ts
