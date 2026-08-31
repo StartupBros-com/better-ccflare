@@ -3,7 +3,7 @@
 - **Upstream:** https://github.com/tombii/better-ccflare
 - **Fork type:** Product fork with intentional hard divergence
 - **Sync cadence:** Manual, pinned source integration when an upstream release is worth adopting; targeted cherry-picks otherwise
-- **Current sync record:** [issue #260](https://github.com/StartupBros-com/better-ccflare/issues/260) and its [v3.5.67 resolution inventory](docs/plans/2026-08-24-issue-260-v3.5.67-resolution-inventory.json)
+- **Current sync record:** [PR #288](https://github.com/StartupBros-com/better-ccflare/pull/288), the [v3.5.70 resolution inventory](docs/plans/2026-08-30-issue-260-v3.5.70-resolution-inventory.json), and its [generated ledger](docs/plans/2026-08-30-issue-260-v3.5.70-resolution-ledger.md)
 
 This repository is not a mirror. It substantially rewrites routing, provider,
 persistence, provenance, and operator behavior for StartupBros. Default-branch
@@ -25,9 +25,10 @@ A release sync must preserve, at minimum:
 - fork build/update provenance, runtime Git-SHA identity, deployment source gates,
   observability, and operator controls.
 
-The issue #260 inventory and generated human ledger record the protected behavior,
+The v3.5.70 inventory and generated human ledger record the protected behavior,
 selected resolution, evidence, and review state for every upstream-only commit,
-textual conflict, and clean two-sided path in the v3.5.67 integration.
+textual conflict, and clean two-sided path in the current integration. Earlier
+issue #260 artifacts remain immutable historical checkpoints.
 
 ## Release synchronization protocol
 
