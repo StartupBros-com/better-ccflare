@@ -2410,6 +2410,16 @@ async function handleProxyCoreImpl(
 		await candidate.discard("superseded by retained upstream terminal");
 		return { response: retainedTerminalResponse, candidateWon: false };
 	};
+	const commitDescendantRouteHome = (
+		account: Account,
+		candidateId: string,
+	): void => {
+		requestMeta.routeHomeAction =
+			ctx.strategy.commitDescendantAffinityOwner?.(requestMeta, {
+				candidateId,
+				accountId: account.id,
+			}) ?? "none";
+	};
 	const recordServerToolCandidateCapabilityFailure = (
 		error: ServerToolCandidateCapabilityError,
 		attemptedBefore: number,
@@ -2644,6 +2654,7 @@ async function handleProxyCoreImpl(
 		const settled = await settleRoutedResponse(response);
 		if (!settled) return null;
 		if (settled.candidateWon) {
+			commitDescendantRouteHome(route.account, route.candidateId);
 			recordXaiAffinityIfServed(
 				settled.response,
 				route.account,
@@ -2936,6 +2947,7 @@ async function handleProxyCoreImpl(
 			const settled = await settleRoutedResponse(response);
 			if (settled) {
 				if (settled.candidateWon) {
+					commitDescendantRouteHome(accounts[i], candidateId);
 					recordXaiAffinityIfServed(settled.response, accounts[i], candidateId);
 					recordCachePacingRoute(
 						pacingObservation,
@@ -3073,6 +3085,7 @@ async function handleProxyCoreImpl(
 			const settled = await settleRoutedResponse(response);
 			if (settled) {
 				if (settled.candidateWon) {
+					commitDescendantRouteHome(accounts[i], candidateId);
 					recordXaiAffinityIfServed(settled.response, accounts[i], candidateId);
 					recordCachePacingRoute(
 						pacingObservation,
@@ -3324,6 +3337,7 @@ async function handleProxyCoreImpl(
 					const settled = await settleRoutedResponse(response);
 					if (settled) {
 						if (settled.candidateWon) {
+							commitDescendantRouteHome(fallbackAccounts[i], candidateId);
 							recordXaiAffinityIfServed(
 								settled.response,
 								fallbackAccounts[i],
@@ -3432,6 +3446,7 @@ async function handleProxyCoreImpl(
 					const settled = await settleRoutedResponse(response);
 					if (settled) {
 						if (settled.candidateWon) {
+							commitDescendantRouteHome(fallbackAccounts[i], candidateId);
 							recordXaiAffinityIfServed(
 								settled.response,
 								fallbackAccounts[i],

@@ -211,6 +211,10 @@ export interface RequestMeta {
 	requestedLogicalModel?: string | null;
 	/** Outcome of success-conditioned descendant-home handling for this request. */
 	routeHomeAction?: RouteHomeAction | null;
+	/** Candidate observed as the live home before descendant selection. */
+	routeHomeExpectedCandidateId?: string | null;
+	/** Selection proved that the expected home could not serve this request. */
+	routeHomeReplacementAllowed?: boolean;
 	/** Why an established descendant home was replaced, if one was replaced. */
 	routeRepinReason?: RouteRepinReason | null;
 	/** Restart-scoped model route profile that produced the server-derived route. */

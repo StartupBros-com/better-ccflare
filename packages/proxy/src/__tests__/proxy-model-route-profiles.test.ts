@@ -8,6 +8,7 @@ import {
 	spyOn,
 } from "bun:test";
 import { agentRegistry } from "@better-ccflare/agents";
+import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
 import { usageCache } from "@better-ccflare/providers";
 import type { Account, Agent } from "@better-ccflare/types";
 import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
@@ -222,6 +223,7 @@ function makeContext(
 	options: {
 		accounts?: Account[];
 		normalAccountId?: string;
+		strategy?: ProxyContext["strategy"];
 	} = {},
 ) {
 	const accounts = options.accounts ?? [makeAccount()];
@@ -260,7 +262,7 @@ function makeContext(
 		},
 	});
 	const ctx = {
-		strategy: { select: strategySelect },
+		strategy: options.strategy ?? { select: strategySelect },
 		anthropicDegradedMode,
 		degradedOwnerOverlay: new DegradedOwnerOverlay({
 			evidenceWindowMs: anthropicDegradedMode.config.evidenceWindowMs,
@@ -2344,6 +2346,70 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(requests.some((request) => request.url.includes(mappedGlobal.id))).toBe(
 			false,
 		);
+	});
+
+	it("commits the first winning child candidate and retains it across priority changes", async () => {
+		const first = makeAccount();
+		first.model_mappings = JSON.stringify({
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+		});
+		const challenger = makeAccount("capability-child-priority-challenger");
+		challenger.model_mappings = first.model_mappings;
+		const strategy = new SessionAffinityStrategy();
+		const harness = makeContext(makeCapabilityRegistry(), {
+			accounts: [first, challenger],
+			strategy,
+		});
+		const { requests } = installJsonUpstream();
+		const session = {
+			"x-claude-code-session-id": "capability-child-sticky-session",
+		};
+		const root = apiRequest("/v1/messages", CAPABILITY_PROFILE_MODEL, session, {
+			metadata: { user_id: "capability-root-affinity" },
+		});
+		expect(
+			(await handleProxy(root, new URL(root.url), harness.ctx, "key-1")).status,
+		).toBe(200);
+
+		const childHeaders = {
+			...session,
+			"x-claude-code-agent-id": "capability-child-sticky-agent",
+		};
+		const firstChild = apiRequest("/v1/messages", CHILD_MODEL, childHeaders, {
+			metadata: { user_id: "capability-child-affinity" },
+		});
+		expect(
+			(
+				await handleProxy(
+					firstChild,
+					new URL(firstChild.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+		const firstChildUrl = requests[1]?.url;
+		expect(firstChildUrl).toBeString();
+		if (firstChildUrl?.includes(`/${ROUTE_ACCOUNT_ID}/`)) {
+			challenger.priority = -100;
+		} else {
+			first.priority = -100;
+		}
+		const nextChild = apiRequest("/v1/messages", CHILD_MODEL, childHeaders, {
+			metadata: { user_id: "capability-child-affinity" },
+		});
+		expect(
+			(
+				await handleProxy(
+					nextChild,
+					new URL(nextChild.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+		expect(requests[2]?.url).toBe(firstChildUrl);
 	});
 
 	it("applies the exact route rewrite, account pin, and default effort to count_tokens", async () => {

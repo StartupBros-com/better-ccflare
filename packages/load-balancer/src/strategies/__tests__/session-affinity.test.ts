@@ -94,6 +94,133 @@ describe("SessionAffinityStrategy", () => {
 		strategy.initialize(store);
 	});
 
+	describe("success-conditioned descendant homes", () => {
+		const descendantMeta = (
+			lane: string,
+			candidates: Array<{ id: string; priority?: number }>,
+		): RequestMeta =>
+			({
+				...metaFor(`client-${lane}`),
+				affinityLaneKey: lane,
+				routeLineage: { kind: "descendant", childHomeKey: `opaque-${lane}` },
+				routingCandidates: candidates.map(({ id, priority = 0 }, ordinal) => ({
+					candidateId: `candidate:${id}`,
+					accountId: id,
+					tier: priority,
+					ordinal,
+					comboSlotId: null,
+					modelOverride: "claude-sonnet-5",
+					quotaPressure: null,
+					routeFallbackRung: "profile_requested_model",
+				})),
+			}) as RequestMeta;
+
+		it("defers a new descendant home until the winning candidate commits", async () => {
+			const account = makeAccount({ id: "descendant-a" });
+			const meta = descendantMeta("descendant-new", [{ id: account.id }]);
+
+			expect((await strategy.select([account], meta))[0]?.id).toBe(account.id);
+			expect(strategy.affinityEntries).toBe(0);
+			expect(
+				strategy.commitDescendantAffinityOwner(meta, {
+					candidateId: `candidate:${account.id}`,
+					accountId: account.id,
+				}),
+			).toBe("initial_commit");
+			expect(strategy.affinityEntries).toBe(1);
+		});
+
+		it("retains a healthy descendant home despite a recovered better rung", async () => {
+			const home = makeAccount({ id: "descendant-home", priority: 20 });
+			const recovered = makeAccount({ id: "descendant-recovered", priority: 0 });
+			const initial = descendantMeta("descendant-retain", [{ id: home.id, priority: 20 }]);
+			await strategy.select([home], initial);
+			strategy.commitDescendantAffinityOwner(initial, {
+				candidateId: `candidate:${home.id}`,
+				accountId: home.id,
+			});
+
+			const next = descendantMeta("descendant-retain", [
+				{ id: recovered.id, priority: 0 },
+				{ id: home.id, priority: 20 },
+			]);
+			expect((await strategy.select([recovered, home], next))[0]?.id).toBe(
+				home.id,
+			);
+			expect(next.routeHomeAction).toBe("retained");
+		});
+
+		it("uses compare-and-set so the first concurrent winner owns the home", async () => {
+			const first = makeAccount({ id: "descendant-first" });
+			const second = makeAccount({ id: "descendant-second" });
+			const firstMeta = descendantMeta("descendant-race", [{ id: first.id }]);
+			const secondMeta = descendantMeta("descendant-race", [{ id: second.id }]);
+			await strategy.select([first], firstMeta);
+			await strategy.select([second], secondMeta);
+
+			expect(
+				strategy.commitDescendantAffinityOwner(firstMeta, {
+					candidateId: `candidate:${first.id}`,
+					accountId: first.id,
+				}),
+			).toBe("initial_commit");
+			expect(
+				strategy.commitDescendantAffinityOwner(secondMeta, {
+					candidateId: `candidate:${second.id}`,
+					accountId: second.id,
+				}),
+			).toBe("none");
+			expect(strategy.snapshotAffinityOwner(firstMeta)).toEqual({
+				candidateId: `candidate:${first.id}`,
+				accountId: first.id,
+			});
+		});
+
+		it("re-pins only when selection proved the prior home unavailable", async () => {
+			const home = makeAccount({ id: "descendant-old" });
+			const replacement = makeAccount({ id: "descendant-new" });
+			const initial = descendantMeta("descendant-repin", [{ id: home.id }]);
+			await strategy.select([home], initial);
+			strategy.commitDescendantAffinityOwner(initial, {
+				candidateId: `candidate:${home.id}`,
+				accountId: home.id,
+			});
+
+			const fallback = descendantMeta("descendant-repin", [
+				{ id: replacement.id },
+			]);
+			expect((await strategy.select([replacement], fallback))[0]?.id).toBe(
+				replacement.id,
+			);
+			expect(
+				strategy.commitDescendantAffinityOwner(fallback, {
+					candidateId: `candidate:${replacement.id}`,
+					accountId: replacement.id,
+				}),
+			).toBe("repinned");
+		});
+
+		it("keeps sibling descendant lanes independent", async () => {
+			const first = makeAccount({ id: "sibling-first" });
+			const second = makeAccount({ id: "sibling-second" });
+			const firstMeta = descendantMeta("sibling-a", [{ id: first.id }]);
+			const secondMeta = descendantMeta("sibling-b", [{ id: second.id }]);
+			await strategy.select([first], firstMeta);
+			await strategy.select([second], secondMeta);
+			strategy.commitDescendantAffinityOwner(firstMeta, {
+				candidateId: `candidate:${first.id}`,
+				accountId: first.id,
+			});
+			strategy.commitDescendantAffinityOwner(secondMeta, {
+				candidateId: `candidate:${second.id}`,
+				accountId: second.id,
+			});
+
+			expect(strategy.snapshotAffinityOwner(firstMeta)?.accountId).toBe(first.id);
+			expect(strategy.snapshotAffinityOwner(secondMeta)?.accountId).toBe(second.id);
+		});
+	});
+
 	describe("routing health", () => {
 		it("preserves transition counters across strategy replacement without sharing gauges", async () => {
 			const recorder = new RoutingTransitionRecorder();

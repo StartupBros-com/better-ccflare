@@ -6,7 +6,11 @@ import type {
 import type { CircuitBreaker } from "@better-ccflare/proxy";
 import type { Account } from "./account";
 import type { AlertEvent } from "./alerts";
-import type { AffinityOwnerSnapshot, RequestMeta } from "./api";
+import type {
+	AffinityOwnerSnapshot,
+	RequestMeta,
+	RouteHomeAction,
+} from "./api";
 import type { ApiKey } from "./api-key";
 import type {
 	AnthropicDegradedRuntimeHealth,
@@ -221,6 +225,15 @@ export interface LoadBalancingStrategy {
 		meta: RequestMeta,
 		owner: AffinityOwnerSnapshot,
 	): boolean;
+
+	/**
+	 * Compare-and-set a descendant route home only after its candidate wins.
+	 * Ordinary affinity implementations may omit this hook.
+	 */
+	commitDescendantAffinityOwner?(
+		meta: RequestMeta,
+		owner: AffinityOwnerSnapshot,
+	): RouteHomeAction;
 
 	/**
 	 * Optionally suppress one exact routing candidate for the request's affinity
