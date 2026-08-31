@@ -2953,6 +2953,18 @@ export async function proxyWithAccount(
 			replay: RequestPrivateServerToolReplay;
 		}>;
 		const serverToolRequirements = requestMeta.serverToolRequirements;
+		// Proof binds only query presence, while provider planning keeps the raw query
+		// unless admission already classified the exact Claude beta alias as absent.
+		const serverToolCapabilityQuery =
+			serverToolRequirements && requestMeta.serverToolQueryPresent !== undefined
+				? requestMeta.serverToolQueryPresent
+					? "present"
+					: ""
+				: url.search;
+		const serverToolAttemptPlanQuery =
+			serverToolRequirements && requestMeta.serverToolQueryPresent === false
+				? ""
+				: url.search;
 		const candidateCapabilityError = (
 			reason: ConstructorParameters<
 				typeof ServerToolCandidateCapabilityError
@@ -2990,12 +3002,7 @@ export async function proxyWithAccount(
 					candidateId: routeCandidateId,
 					account,
 					path: url.pathname,
-					query:
-						requestMeta.serverToolQueryPresent === undefined
-							? url.search
-							: requestMeta.serverToolQueryPresent
-								? "present"
-								: "",
+					query: serverToolCapabilityQuery,
 					physicalModel,
 					requirements: serverToolRequirements,
 				});
@@ -3118,7 +3125,7 @@ export async function proxyWithAccount(
 				requestBodyBuffer: bodyBuffer,
 				account,
 				path: url.pathname,
-				query: url.search,
+				query: serverToolAttemptPlanQuery,
 				physicalModel,
 				capabilityProofKey: capability?.proofKey ?? null,
 				inputReplayMode: capability?.inputReplayMode ?? [],
