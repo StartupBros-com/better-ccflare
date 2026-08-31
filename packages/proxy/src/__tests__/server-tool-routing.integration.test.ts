@@ -20,6 +20,7 @@ import type {
 	ServerToolCapabilityProof,
 	ServerToolCapabilityTuple,
 } from "@better-ccflare/types";
+import officialSearchStream from "../../../providers/src/providers/codex/__fixtures__/server-tools/official-search-stream.sanitized.json";
 import type { ProxyContext } from "../handlers";
 import {
 	ModelRouteSessionRegistry,
@@ -27,9 +28,8 @@ import {
 } from "../model-route-profiles";
 
 // Focused proxy tests must not load ignored embedded worker artifacts.
-const { buildServerToolCapabilityProofKey, usageCache } = await import(
-	"@better-ccflare/providers"
-);
+const { buildServerToolCapabilityProofKey, getProvider, usageCache } =
+	await import("@better-ccflare/providers");
 const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");
 const { codexWebSocketTransport } = await import(
@@ -1520,5 +1520,93 @@ describe("server-tool routing integration", () => {
 			})),
 		);
 		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps a real Codex hosted-tool profile on its proven physical model", async () => {
+		const originalContextAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		try {
+			const physicalModel = "gpt-5.6-sol";
+			const account = makeAccount({
+				id: "real-codex-profile-account",
+				name: "real-codex-profile-account",
+				provider: "codex",
+				api_key: null,
+				refresh_token: "refresh-token",
+				access_token: "access-token",
+				expires_at: Date.now() + 60 * 60_000,
+				custom_endpoint: null,
+				model_mappings: JSON.stringify({
+					opus: physicalModel,
+					sonnet: "gpt-5.6-terra",
+				}),
+			});
+			const { ctx } = makeContext(account);
+			const codexProvider = getProvider("codex");
+			if (!codexProvider) throw new Error("expected registered Codex provider");
+			ctx.provider = codexProvider;
+			ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+				parseModelRouteProfiles(
+					JSON.stringify([
+						{
+							id: "real-codex-sol",
+							displayName: "Real Codex Sol",
+							selection: "capability",
+							logicalModel: "claude-opus-5",
+							expectedProvider: "codex",
+							expectedPhysicalModel: physicalModel,
+						},
+					]),
+				),
+			);
+			const outboundBodies: Array<Record<string, unknown>> = [];
+			globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+				const outbound = input instanceof Request ? input : new Request(input);
+				outboundBodies.push(
+					(await outbound.clone().json()) as Record<string, unknown>,
+				);
+				return new Response(
+					officialSearchStream
+						.map((event) => {
+							const type = (event as { type: string }).type;
+							return `event: ${type}\ndata: ${JSON.stringify(event)}\n\n`;
+						})
+						.join(""),
+					{
+						headers: {
+							"content-type": "text/event-stream",
+							"x-better-ccflare-final-model": physicalModel,
+						},
+					},
+				);
+			});
+			const request = makeServerToolRequest({
+				model: "claude-bccf-route-real-codex-sol",
+				query: "beta=true",
+				claudeCodeForcedChoice: true,
+			});
+
+			const response = await handleProxy(
+				request,
+				new URL(request.url),
+				ctx,
+				"key-1",
+			);
+
+			expect(response.status).toBe(200);
+			expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+			expect(outboundBodies).toHaveLength(1);
+			expect(outboundBodies[0]).toMatchObject({
+				model: physicalModel,
+				tools: [{ type: "web_search" }],
+				tool_choice: { type: "web_search" },
+			});
+		} finally {
+			if (originalContextAdmission === undefined) {
+				delete process.env.CCFLARE_CONTEXT_ADMISSION;
+			} else {
+				process.env.CCFLARE_CONTEXT_ADMISSION = originalContextAdmission;
+			}
+		}
 	});
 });
