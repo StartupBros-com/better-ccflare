@@ -132,8 +132,13 @@ describe("SessionAffinityStrategy", () => {
 
 		it("retains a healthy descendant home despite a recovered better rung", async () => {
 			const home = makeAccount({ id: "descendant-home", priority: 20 });
-			const recovered = makeAccount({ id: "descendant-recovered", priority: 0 });
-			const initial = descendantMeta("descendant-retain", [{ id: home.id, priority: 20 }]);
+			const recovered = makeAccount({
+				id: "descendant-recovered",
+				priority: 0,
+			});
+			const initial = descendantMeta("descendant-retain", [
+				{ id: home.id, priority: 20 },
+			]);
 			await strategy.select([home], initial);
 			strategy.commitDescendantAffinityOwner(initial, {
 				candidateId: `candidate:${home.id}`,
@@ -216,8 +221,12 @@ describe("SessionAffinityStrategy", () => {
 				accountId: second.id,
 			});
 
-			expect(strategy.snapshotAffinityOwner(firstMeta)?.accountId).toBe(first.id);
-			expect(strategy.snapshotAffinityOwner(secondMeta)?.accountId).toBe(second.id);
+			expect(strategy.snapshotAffinityOwner(firstMeta)?.accountId).toBe(
+				first.id,
+			);
+			expect(strategy.snapshotAffinityOwner(secondMeta)?.accountId).toBe(
+				second.id,
+			);
 		});
 	});
 

@@ -2857,7 +2857,9 @@ async function handleProxyCoreImpl(
 		}
 
 		const attemptModel =
-			selectedCandidate?.effectiveLogicalModel ?? modelOverride ?? effectiveModel;
+			selectedCandidate?.effectiveLogicalModel ??
+			modelOverride ??
+			effectiveModel;
 		// Normal routes were filtered above. Combo slots need this attempt-level
 		// check because each slot may override the model independently.
 		if (

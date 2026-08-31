@@ -3090,12 +3090,12 @@ export async function proxyWithAccount(
 			const routeConstraintMeta =
 				modelFallbackPolicy?.routeConstraintMode === "ordinary"
 					? {
-						routeProfileId: null,
-						routeProfileSelection: null,
-						routeExpectedProvider: null,
-						routeExpectedPhysicalModel: null,
-						routeProfileExpectedPhysicalModel: null,
-					}
+							routeProfileId: null,
+							routeProfileSelection: null,
+							routeExpectedProvider: null,
+							routeExpectedPhysicalModel: null,
+							routeProfileExpectedPhysicalModel: null,
+						}
 					: requestMeta;
 			const constraintViolation = getRouteProfileConstraintViolation(
 				account,

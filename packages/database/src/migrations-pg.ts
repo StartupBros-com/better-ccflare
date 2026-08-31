@@ -1710,7 +1710,8 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 		{
 			table: "routing_attempts",
 			column: "route_candidate_id",
-			definition: "ALTER TABLE routing_attempts ADD COLUMN route_candidate_id TEXT",
+			definition:
+				"ALTER TABLE routing_attempts ADD COLUMN route_candidate_id TEXT",
 		},
 	];
 

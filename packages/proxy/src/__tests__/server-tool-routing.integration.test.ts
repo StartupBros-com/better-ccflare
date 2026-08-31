@@ -433,9 +433,9 @@ describe("server-tool routing integration", () => {
 				max_tokens: 16,
 			}),
 		});
-		expect((await handleProxy(root, new URL(root.url), ctx, "key-1")).status).toBe(
-			200,
-		);
+		expect(
+			(await handleProxy(root, new URL(root.url), ctx, "key-1")).status,
+		).toBe(200);
 
 		const helper = makeServerToolRequest();
 		const response = await handleProxy(
@@ -471,15 +471,12 @@ describe("server-tool routing integration", () => {
 				sonnet: MODEL,
 			}),
 		});
-		const { ctx } = makeContext(
-			[profileAccount, globalAccount],
-			(provider) => {
-				provider.resolveServerToolCapability = (_requirements, tuple) => ({
-					decision: "proven",
-					proof: makeProof(tuple, `global-helper:${tuple.candidateId}`),
-				});
-			},
-		);
+		const { ctx } = makeContext([profileAccount, globalAccount], (provider) => {
+			provider.resolveServerToolCapability = (_requirements, tuple) => ({
+				decision: "proven",
+				proof: makeProof(tuple, `global-helper:${tuple.candidateId}`),
+			});
+		});
 		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
 			parseModelRouteProfiles(
 				JSON.stringify([
@@ -494,15 +491,13 @@ describe("server-tool routing integration", () => {
 				]),
 			),
 		);
-		globalThis.fetch = mock(
-			async (input: RequestInfo | URL) => {
-				const request = input instanceof Request ? input : new Request(input);
-				return new Response(
-					JSON.stringify({ url: request.url }),
-					{ status: 200, headers: { "content-type": "application/json" } },
-				);
-			},
-		);
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ url: request.url }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
 		const root = new Request("https://proxy.local/v1/messages", {
 			method: "POST",
 			headers: {
@@ -516,9 +511,9 @@ describe("server-tool routing integration", () => {
 				max_tokens: 16,
 			}),
 		});
-		expect((await handleProxy(root, new URL(root.url), ctx, "key-1")).status).toBe(
-			200,
-		);
+		expect(
+			(await handleProxy(root, new URL(root.url), ctx, "key-1")).status,
+		).toBe(200);
 
 		profileAccount.paused = true;
 		const helper = makeServerToolRequest();

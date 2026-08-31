@@ -257,7 +257,9 @@ export function isSameStrategyCandidateClass(
 	best: StrategyCandidate,
 	meta?: RequestMeta,
 ): boolean {
-	if (routeFallbackRank(candidate.routing) !== routeFallbackRank(best.routing)) {
+	if (
+		routeFallbackRank(candidate.routing) !== routeFallbackRank(best.routing)
+	) {
 		return false;
 	}
 	if (candidate.routing.tier !== best.routing.tier) return false;

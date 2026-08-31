@@ -73,7 +73,9 @@ function narrowStringUnion<T extends string>(
 		: undefined;
 }
 
-export function toRouteFallbackRung(value: unknown): RouteFallbackRung | undefined {
+export function toRouteFallbackRung(
+	value: unknown,
+): RouteFallbackRung | undefined {
 	return narrowStringUnion(value, ROUTE_FALLBACK_RUNGS);
 }
 
@@ -81,7 +83,9 @@ export function toRouteHomeAction(value: unknown): RouteHomeAction | undefined {
 	return narrowStringUnion(value, ROUTE_HOME_ACTIONS);
 }
 
-export function toRouteRepinReason(value: unknown): RouteRepinReason | undefined {
+export function toRouteRepinReason(
+	value: unknown,
+): RouteRepinReason | undefined {
 	return narrowStringUnion(value, ROUTE_REPIN_REASONS);
 }
 
@@ -351,9 +355,7 @@ export interface RequestPayload {
 	};
 }
 
-function routeProvenanceFromRow(
-	row: RequestRow,
-): RouteProvenance | undefined {
+function routeProvenanceFromRow(row: RequestRow): RouteProvenance | undefined {
 	const hasRouteProvenance = [
 		row.route_profile_id,
 		row.requested_route_model,

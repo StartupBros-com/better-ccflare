@@ -1023,26 +1023,17 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			});
 			const closedCandidates = otherwiseAvailable.filter(
 				(candidate) =>
-					this.routeFailureState(
-						affinityKey,
-						candidate.routing.candidateId,
-					) === undefined,
+					this.routeFailureState(affinityKey, candidate.routing.candidateId) ===
+					undefined,
 			);
 			const circuitCandidates = otherwiseAvailable.filter(
 				(candidate) =>
-					this.routeFailureState(
-						affinityKey,
-						candidate.routing.candidateId,
-					) !== undefined,
+					this.routeFailureState(affinityKey, candidate.routing.candidateId) !==
+					undefined,
 			);
 			const allOpenProbe =
 				closedCandidates.length === 0
-					? this.acquireHalfOpenProbe(
-							circuitCandidates,
-							affinityKey,
-							now,
-							true,
-						)
+					? this.acquireHalfOpenProbe(circuitCandidates, affinityKey, now, true)
 					: null;
 			const ranked = allOpenProbe
 				? [allOpenProbe]

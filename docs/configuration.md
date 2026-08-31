@@ -389,15 +389,13 @@ CCFLARE_MODEL_ROUTE_PROFILES_JSON='[
 ]'
 ```
 
-Capability profiles are evaluated against the live account catalog on every
-request. An account joins when its provider matches `expectedProvider` and the
-first physical model produced by its mapping for `logicalModel` matches
-`expectedPhysicalModel`. The normal strategy, availability checks, and model or
-account capacity checks then order and filter that matching set. Paused,
-rate-limited, or exhausted candidates are skipped; an empty set fails closed
-with a route-unavailable response and never falls back to an unrelated account.
-Adding a new account later therefore requires no profile edit, provided its
-provider and mapping satisfy the same capability predicate.
+Capability profiles are evaluated against the live account catalog on every request. An account joins the root-capable pool when its provider matches `expectedProvider` and the first physical model produced by its mapping for the root `logicalModel` matches `expectedPhysicalModel`. The normal strategy, availability checks, and model or account capacity checks then order and filter that matching set.
+
+An explicit root selection remains exact to that capability and fails closed if the root-capable pool cannot serve it. Descendant agents are availability-oriented before dispatch: they try their requested logical model inside the root-capable pool, then the profile root model inside that pool, then the requested stock Claude model through ordinary same-model routing. A mapped provider cannot enter the global rung merely because it is available. The first successful descendant route becomes that child/model lane's process-local home and remains sticky until it is unavailable; priority edits and preferred-route recovery do not move a healthy child.
+
+A same-session provider-owned WebSearch helper without a child marker inherits the active capability profile and uses its exact proven server-tool route first. If that soft capability pool is unavailable before hosted dispatch, the helper may use the global proven capability lane. Exact-account, public force-routed, and bounded routes never escape their hard boundary. Once a hosted tool is dispatched, better-ccflare does not replay it through another lane within that inbound request.
+
+Adding a new account later therefore requires no profile edit, provided its provider and root mapping satisfy the same capability predicate. Route fallback, served model, and re-pin provenance is exposed through response metadata and authenticated request history; account and candidate identifiers remain operator-only.
 
 To migrate an existing single-account Sol picker without changing the public
 model ID that Claude Code has saved, keep its `id` and replace `accountId` with

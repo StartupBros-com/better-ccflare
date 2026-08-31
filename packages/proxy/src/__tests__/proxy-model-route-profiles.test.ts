@@ -2286,7 +2286,9 @@ describe("Claude Code gateway model route profiles", () => {
 		const harness = makeContext(makeCapabilityRegistry(), {
 			accounts: [routed],
 		});
-		harness.strategySelect.mockImplementation((accounts: Account[]) => accounts);
+		harness.strategySelect.mockImplementation(
+			(accounts: Account[]) => accounts,
+		);
 		const { requests } = installJsonUpstream();
 		const session = {
 			"x-claude-code-session-id": "capability-child-root-fallback",
@@ -2334,7 +2336,9 @@ describe("Claude Code gateway model route profiles", () => {
 		const harness = makeContext(makeCapabilityRegistry(), {
 			accounts: [routed, mappedGlobal, nativeGlobal],
 		});
-		harness.strategySelect.mockImplementation((accounts: Account[]) => accounts);
+		harness.strategySelect.mockImplementation(
+			(accounts: Account[]) => accounts,
+		);
 		const { requests } = installJsonUpstream();
 		const session = {
 			"x-claude-code-session-id": "capability-child-global-fallback",
@@ -2360,9 +2364,9 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(requests).toHaveLength(2);
 		expect(requests[1]?.url).toBe("https://api.anthropic.com/v1/messages");
 		expect((await fetchedJson(requests[1])).model).toBe(CHILD_MODEL);
-		expect(requests.some((request) => request.url.includes(mappedGlobal.id))).toBe(
-			false,
-		);
+		expect(
+			requests.some((request) => request.url.includes(mappedGlobal.id)),
+		).toBe(false);
 	});
 
 	it("commits the first winning child candidate and retains it across priority changes", async () => {

@@ -2108,7 +2108,9 @@ async function selectCapabilityDescendantAccounts(
 		strategyOrdered,
 		meta.routingCandidates,
 	).filter((candidate) => eligibleCandidateIds.has(candidate.candidateId));
-	const accountsById = new Map(allAccounts.map((account) => [account.id, account]));
+	const accountsById = new Map(
+		allAccounts.map((account) => [account.id, account]),
+	);
 	const finalCandidates = aligned.filter((candidate) => {
 		const account = accountsById.get(candidate.accountId);
 		return account !== undefined && isAccountAvailable(account);
@@ -2617,21 +2619,21 @@ async function selectAccountsForRequestInternal(
 		let selected: Account[];
 		try {
 			selected = await getOrderedAccounts(
-			meta,
-			ctx,
-			effectiveModel,
-			options.syntheticProbe === true,
-			allAccounts,
-			undefined,
-			[],
-			(accounts) =>
-				accounts.filter(
-					(account) =>
-						isAccountEligibleForRouteIntent(account, meta, ctx) &&
-						matchesCapabilityRouteProfile(account, meta) &&
-						!isProviderExcludedForRequest(account, excludedProviders),
-				),
-			modelScopedCapacityRouting,
+				meta,
+				ctx,
+				effectiveModel,
+				options.syntheticProbe === true,
+				allAccounts,
+				undefined,
+				[],
+				(accounts) =>
+					accounts.filter(
+						(account) =>
+							isAccountEligibleForRouteIntent(account, meta, ctx) &&
+							matchesCapabilityRouteProfile(account, meta) &&
+							!isProviderExcludedForRequest(account, excludedProviders),
+					),
+				modelScopedCapacityRouting,
 			);
 		} catch (error) {
 			if (
