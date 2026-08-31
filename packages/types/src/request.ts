@@ -355,7 +355,21 @@ export interface RequestPayload {
 	};
 }
 
-function routeProvenanceFromRow(row: RequestRow): RouteProvenance | undefined {
+export type RouteProvenanceRow = Pick<
+	RequestRow,
+	| "route_profile_id"
+	| "requested_route_model"
+	| "routed_provider"
+	| "routed_model"
+	| "route_fallback_rung"
+	| "route_home_action"
+	| "route_repin_reason"
+	| "route_candidate_id"
+>;
+
+export function toRouteProvenance(
+	row: RouteProvenanceRow,
+): RouteProvenance | undefined {
 	const hasRouteProvenance = [
 		row.route_profile_id,
 		row.requested_route_model,
@@ -433,7 +447,7 @@ export function toRequest(row: RequestRow): Request {
 		),
 		clientSessionId: row.client_session_id || undefined,
 		streamTerminalState: toStreamTerminalState(row.stream_terminal_state),
-		routeProvenance: routeProvenanceFromRow(row),
+		routeProvenance: toRouteProvenance(row),
 	};
 }
 

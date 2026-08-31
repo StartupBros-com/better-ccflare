@@ -9,9 +9,7 @@ import { jsonResponse } from "@better-ccflare/http-common";
 import {
 	toAgentAttributionSource,
 	toProjectAttributionSource,
-	toRouteFallbackRung,
-	toRouteHomeAction,
-	toRouteRepinReason,
+	toRouteProvenance,
 	toStreamTerminalState,
 } from "@better-ccflare/types/request";
 import type { RequestResponse } from "../types";
@@ -145,29 +143,7 @@ export function createRequestsSummaryHandler(db: BunSqlAdapter) {
 			// into the same `undefined` a non-streaming request produces.
 			streamTerminalState: toStreamTerminalState(request.stream_terminal_state),
 			clientSessionId: request.client_session_id || undefined,
-			routeProvenance:
-				request.route_profile_id ||
-				request.requested_route_model ||
-				request.routed_provider ||
-				request.routed_model ||
-				request.route_fallback_rung ||
-				request.route_home_action ||
-				request.route_repin_reason ||
-				request.route_candidate_id
-					? {
-							profileId: request.route_profile_id || null,
-							requestedModel: request.requested_route_model || null,
-							routedProvider: request.routed_provider || null,
-							routedModel: request.routed_model || null,
-							fallbackRung:
-								toRouteFallbackRung(request.route_fallback_rung) ?? null,
-							homeAction:
-								toRouteHomeAction(request.route_home_action) ?? "none",
-							repinReason:
-								toRouteRepinReason(request.route_repin_reason) ?? null,
-							candidateId: request.route_candidate_id || null,
-						}
-					: undefined,
+			routeProvenance: toRouteProvenance(request),
 			rateLimited: request.status_code === 429,
 		}));
 

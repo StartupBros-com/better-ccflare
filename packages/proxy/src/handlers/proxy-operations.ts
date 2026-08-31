@@ -824,8 +824,6 @@ export interface ContextAdmissionEstimate {
 export interface ModelFallbackExecutionPolicy {
 	/** Immutable ID of the exact route candidate being executed. */
 	readonly routeCandidateId: string;
-	/** Candidate-local profile constraint policy. Global rungs use ordinary admission. */
-	readonly routeConstraintMode?: "profile" | "ordinary";
 	/** Defer final forwarding until the request scheduler chooses the winner. */
 	readonly prepareFinalResponse?: boolean;
 	/** A scheduler-promoted/deferred miss must resume its untouched queue tail. */
@@ -3088,7 +3086,7 @@ export async function proxyWithAccount(
 			requireSelectedCandidateBinding = false,
 		): ProviderAttemptPlan => {
 			const routeConstraintMeta =
-				modelFallbackPolicy?.routeConstraintMode === "ordinary"
+				routeCandidateMetadata?.routeConstraintMode === "ordinary"
 					? {
 							routeProfileId: null,
 							routeProfileSelection: null,

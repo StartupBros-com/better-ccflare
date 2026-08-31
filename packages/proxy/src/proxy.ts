@@ -2328,13 +2328,11 @@ async function handleProxyCoreImpl(
 		// caller (default), so the combo-vs-implicit-fallback distinction is
 		// never inferred from modelOverride alone.
 		comboModelOverrideFrom: string | null = null,
-		routeConstraintMode: RoutingCandidateMetadata["routeConstraintMode"] = null,
 	): ModelFallbackExecutionPolicy => {
 		const comboName = requestMeta.comboName ?? null;
 		const comboSlotIndex = requestMeta.comboSlotIndex ?? null;
 		return {
 			routeCandidateId: candidateId,
-			routeConstraintMode: routeConstraintMode ?? undefined,
 			prepareFinalResponse: true,
 			forwardModelUnavailableResponse,
 			comboModelOverrideFrom,
@@ -2935,7 +2933,6 @@ async function handleProxyCoreImpl(
 					// the desync edge case above leaves modelOverride null so no
 					// override is attributed there either.
 					filteredComboInfo && modelOverride ? effectiveModel : null,
-					selectedCandidate?.routeConstraintMode,
 				),
 				anthropicDegradedSendState,
 			);
@@ -3086,7 +3083,6 @@ async function handleProxyCoreImpl(
 					// override" and hid it from comboModelOverride attribution
 					// and from the model-routing drift alert.
 					filteredComboInfo && modelOverride ? effectiveModel : null,
-					selectedCandidate?.routeConstraintMode,
 				),
 				anthropicDegradedSendState,
 			);
