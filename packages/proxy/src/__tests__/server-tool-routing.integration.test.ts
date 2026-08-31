@@ -297,6 +297,7 @@ function makeServerToolRequest(
 		forcedAccountId?: string;
 		model?: string;
 		query?: string;
+		claudeCodeForcedChoice?: boolean;
 		replayIdentity?: "valid" | "missing" | "ambiguous";
 	} = {},
 ): Request {
@@ -325,11 +326,12 @@ function makeServerToolRequest(
 			model: options.model ?? MODEL,
 			messages: [{ role: "user", content: "hello" }],
 			max_tokens: 16,
-			stream: false,
+			stream: options.claudeCodeForcedChoice === true,
 			tools: [
 				{
 					type: "web_search_20250305",
 					name: "web_search",
+					...(options.claudeCodeForcedChoice ? { max_uses: 8 } : {}),
 					...(options.invalid
 						? {
 								allowed_domains: ["example.com"],
@@ -338,6 +340,9 @@ function makeServerToolRequest(
 						: {}),
 				},
 			],
+			...(options.claudeCodeForcedChoice
+				? { tool_choice: { type: "tool", name: "web_search" } }
+				: {}),
 		}),
 	});
 }
@@ -437,7 +442,7 @@ describe("server-tool routing integration", () => {
 			(await handleProxy(root, new URL(root.url), ctx, "key-1")).status,
 		).toBe(200);
 
-		const helper = makeServerToolRequest();
+		const helper = makeServerToolRequest({ claudeCodeForcedChoice: true });
 		const response = await handleProxy(
 			helper,
 			new URL(helper.url),
@@ -1309,7 +1314,7 @@ describe("server-tool routing integration", () => {
 		const previousOverloadRetry = process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
 		process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = "false";
 		try {
-			const request = makeServerToolRequest();
+			const request = makeServerToolRequest({ claudeCodeForcedChoice: true });
 			const response = await handleProxy(request, new URL(request.url), ctx);
 
 			expect(fetchCount).toBe(1);

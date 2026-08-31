@@ -271,6 +271,7 @@ function normalizeExactDeclaration(
 function buildWebSearchProfileId(
 	declaration: WebSearchServerToolDeclaration,
 	hasClientFunctions: boolean,
+	forcedWebSearchChoice: boolean,
 ): string {
 	const domainShape = declaration.allowedDomains
 		? "allow"
@@ -290,7 +291,7 @@ function buildWebSearchProfileId(
 		locationShape = `fields-${bitset}`;
 	}
 
-	return `${WEB_SEARCH_PROFILE_PREFIX}:domains-${domainShape}:max-${maxUsesShape}:location-${locationShape}:client-${hasClientFunctions ? "yes" : "no"}`;
+	return `${WEB_SEARCH_PROFILE_PREFIX}:domains-${domainShape}:max-${maxUsesShape}:location-${locationShape}:client-${hasClientFunctions ? "yes" : "no"}${forcedWebSearchChoice ? ":choice-forced" : ""}`;
 }
 
 function buildWebSearchOptionProfileId(
@@ -453,6 +454,7 @@ export function deriveServerToolRequirement(
 	const unsupported: { type: string }[] = [];
 	let hasClientFunctions = false;
 	let exactDeclarationCount = 0;
+	let forcedWebSearchChoice = false;
 
 	const tools = body.tools;
 	if (Array.isArray(tools)) {
@@ -530,7 +532,15 @@ export function deriveServerToolRequirement(
 			toolChoice.type === "auto" &&
 			(toolChoice.disable_parallel_tool_use === undefined ||
 				toolChoice.disable_parallel_tool_use === false);
-		if (!isAdmittedAutoChoice) {
+		const isAdmittedForcedWebSearchChoice =
+			isRecord(toolChoice) &&
+			!hasClientFunctions &&
+			hasOnlyKeys(toolChoice, new Set(["type", "name"])) &&
+			toolChoice.type === "tool" &&
+			toolChoice.name === "web_search";
+		if (isAdmittedForcedWebSearchChoice) {
+			forcedWebSearchChoice = true;
+		} else if (!isAdmittedAutoChoice) {
 			declarations.length = 0;
 			if (!invalid.some((entry) => entry.type === EXACT_WEB_SEARCH_TYPE)) {
 				pushBoundedIssue(
@@ -599,6 +609,7 @@ export function deriveServerToolRequirement(
 		requirement.profileId = buildWebSearchProfileId(
 			declaration,
 			hasClientFunctions,
+			forcedWebSearchChoice,
 		);
 		requirement.optionProfileId = buildWebSearchOptionProfileId(declaration);
 		requirement.responseMode = body.stream === true ? "streaming" : "json";

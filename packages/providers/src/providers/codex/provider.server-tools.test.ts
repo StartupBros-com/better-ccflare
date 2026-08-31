@@ -32,6 +32,28 @@ function requestBodyBuffer(value: unknown): ArrayBuffer {
 	) as ArrayBuffer;
 }
 
+function claudeCodeForcedSearchBody(): Record<string, unknown> {
+	return {
+		model: "claude-opus-5",
+		max_tokens: 512,
+		stream: true,
+		messages: [
+			{
+				role: "user",
+				content: "Perform a web search for the query: test",
+			},
+		],
+		tools: [
+			{
+				type: "web_search_20250305",
+				name: "web_search",
+				max_uses: 8,
+			},
+		],
+		tool_choice: { type: "tool", name: "web_search" },
+	};
+}
+
 function hostedRequestBody(stream = true): Record<string, unknown> {
 	return {
 		model: "claude-opus-4-1-20250805",
@@ -309,6 +331,35 @@ function materializeCodexTuple(
 }
 
 describe("Codex exact hosted-search capability", () => {
+	test("proves Claude Code's forced WebSearch side-query contract", () => {
+		const requirements = deriveServerToolRequirement(
+			claudeCodeForcedSearchBody(),
+		);
+		if (!requirements) throw new Error("expected forced WebSearch requirement");
+		const tuple = materializeCodexTuple(requirements);
+		if (!tuple) throw new Error("expected forced WebSearch tuple");
+		const decision = materializeProviderServerToolCapabilityDecision(
+			new CodexProvider(),
+			requirements,
+			tuple,
+		);
+
+		expect(requirements.profileId).toContain(":choice-forced");
+		expect(requirements.responseMode).toBe("streaming");
+		expect(requirements.mixedToolMode).toBe("server_only");
+		expect(requirements.declarations).toEqual([
+			{ type: "web_search_20250305", maxUses: 8 },
+		]);
+		expect(tuple).toMatchObject({
+			model: "gpt-5.6-sol",
+			toolType: "web_search_20250305",
+			profile: requirements.profileId,
+			inputReplay: [],
+			outputReplay: ["proxy-evidence-v1"],
+		});
+		expect(decision).toMatchObject({ decision: "proven" });
+	});
+
 	test("admits the complete response, mixed-tool, and continuation matrix", () => {
 		let admittedContracts = 0;
 
@@ -918,6 +969,31 @@ describe("Codex strict hosted-search request mapper", () => {
 });
 
 describe("Codex exact hosted-search attempt plan", () => {
+	test("maps Claude Code's forced WebSearch choice to native Codex fields", async () => {
+		const body = claudeCodeForcedSearchBody();
+		const plan = materializeHostedPlan(body);
+		const sourceRequest = new Request(CODEX_DEFAULT_ENDPOINT, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+
+		const transformed = await plan.transformRequestBody(sourceRequest);
+		const mapped = (await transformed.json()) as Record<string, unknown>;
+
+		expect(mapped).toMatchObject({
+			model: "gpt-5.6-sol",
+			stream: true,
+			store: false,
+			max_tool_calls: 8,
+			tools: [{ type: "web_search" }],
+			tool_choice: { type: "web_search" },
+		});
+		expect(mapped.include).toEqual(
+			expect.arrayContaining(["web_search_call.action.sources"]),
+		);
+	});
+
 	test("materializes only the exact hosted transport and delegates stable policy", async () => {
 		const plan = materializeHostedPlan(hostedRequestBody());
 		expect(plan).toMatchObject({

@@ -17,6 +17,9 @@
 		"types": ["bun-types"],
 		"jsx": "react-jsx",
 		"paths": {
+			"@better-ccflare/providers/server-tool-capabilities": [
+				"./packages/providers/src/server-tool-capabilities.ts"
+			],
 			"@better-ccflare/types/combo": ["./packages/types/src/combo.ts"],
 			"@better-ccflare/types/request": ["./packages/types/src/request.ts"],
 			"@better-ccflare/*": ["./packages/*/src"],
