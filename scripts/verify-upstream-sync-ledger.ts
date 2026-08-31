@@ -150,6 +150,7 @@ export interface GenerateOptions {
 
 export interface ValidationOptions {
   repo?: string;
+  reviewedRef?: string;
   skipGitDerivation?: boolean;
   observedRerereApplications?: RerereApplication[];
 }
@@ -1125,6 +1126,7 @@ function sameJson(left: unknown, right: unknown): boolean {
 function validateIntegrationTopology(
   inventory: SyncInventory,
   repo: string,
+  reviewedRef: string,
 ): void {
   if (inventory.schemaVersion !== 2 || inventory.phase !== "final") return;
   const integrationCommit = inventory.baseline.integrationCommit;
@@ -1132,10 +1134,14 @@ function validateIntegrationTopology(
   if (gitText(repo, ["cat-file", "-t", integrationCommit]) !== "commit") {
     fail(`baseline.integrationCommit ${integrationCommit} must be a commit object`);
   }
-  const parents = git(repo, ["cat-file", "-p", integrationCommit])
-    .stdout.split("\n")
-    .filter((line) => line.startsWith("parent "))
-    .map((line) => line.slice("parent ".length));
+  const parents = gitText(repo, [
+    "show",
+    "-s",
+    "--format=%P",
+    integrationCommit,
+  ])
+    .split(/\s+/)
+    .filter(Boolean);
   const expectedParents = [
     inventory.baseline.forkParent,
     inventory.baseline.target,
@@ -1145,9 +1151,24 @@ function validateIntegrationTopology(
       `baseline.integrationCommit ${integrationCommit} must have exact ordered parents [forkParent ${inventory.baseline.forkParent}, target ${inventory.baseline.target}], received ${stableJson(parents)}`,
     );
   }
+  const reviewedCommit = resolveCommit(repo, reviewedRef, "reviewed ref");
+  const reachability = git(
+    repo,
+    ["merge-base", "--is-ancestor", integrationCommit, reviewedCommit],
+    { allowConflictExit: true },
+  );
+  if (reachability.exitCode === 1) {
+    fail(
+      `baseline.integrationCommit ${integrationCommit} is not an ancestor of reviewed ref ${reviewedRef} (${reviewedCommit})`,
+    );
+  }
 }
 
-function validateGitDerivation(inventory: SyncInventory, repo: string): void {
+function validateGitDerivation(
+  inventory: SyncInventory,
+  repo: string,
+  reviewedRef: string,
+): void {
   const regenerated = deriveGitState(
     {
       repo,
@@ -1192,7 +1213,7 @@ function validateGitDerivation(inventory: SyncInventory, repo: string): void {
       fail(`recorded expected.${field} diverges from regenerated Git evidence`);
     }
   }
-  validateIntegrationTopology(inventory, repo);
+  validateIntegrationTopology(inventory, repo, reviewedRef);
 }
 
 function validateBaseline(inventory: SyncInventory): void {
@@ -1379,7 +1400,11 @@ export function validateSyncInventory(
   compareExpectedItems(inventory);
   validateLedger(inventory, ledger);
   if (!options.skipGitDerivation) {
-    validateGitDerivation(inventory, options.repo ?? process.cwd());
+    validateGitDerivation(
+      inventory,
+      options.repo ?? process.cwd(),
+      options.reviewedRef ?? "HEAD",
+    );
   }
 }
 

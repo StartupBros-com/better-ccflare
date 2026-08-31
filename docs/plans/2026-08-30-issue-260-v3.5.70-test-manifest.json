@@ -120,6 +120,33 @@
         "assertions": 96
       },
       "purpose": "Prove schema-v2 annotated-tag identity and exact committed two-parent integration topology before implementing the generic validator contract."
+    },
+    {
+      "unit": "final-review",
+      "requirements": [
+        "review-finding-parent-spoof",
+        "review-finding-integration-reachability"
+      ],
+      "path": "scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "command": "bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "beforeSourceChange": {
+        "status": "expected-failure",
+        "exitCode": 1,
+        "passes": 44,
+        "failures": 2,
+        "skips": 0,
+        "assertions": 99,
+        "observed": "A valid merge whose message body began `parent ` was misparsed as having an extra parent, and an exact valid two-parent integration object on another ref was accepted despite not being reachable from reviewed HEAD."
+      },
+      "afterSourceChange": {
+        "status": "passed",
+        "exitCode": 0,
+        "passes": 46,
+        "failures": 0,
+        "skips": 0,
+        "assertions": 99
+      },
+      "purpose": "Prove topology reads only Git's actual ordered parent list and requires the recorded integration commit to be reachable from reviewed HEAD while accepting later descendants."
     }
   ],
   "isolatedTests": [
@@ -139,11 +166,11 @@
       "command": "bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts",
       "status": "passed",
       "exitCode": 0,
-      "passes": 43,
+      "passes": 46,
       "failures": 0,
       "skips": 0,
-      "assertions": 96,
-      "purpose": "Validate schema-v1 compatibility plus schema-v2 annotated-tag identity, exact item accounting, committed integration topology, final evidence requirements, and rerere-capture enforcement."
+      "assertions": 99,
+      "purpose": "Validate schema-v1 compatibility plus schema-v2 annotated-tag identity, exact item accounting, committed integration topology and reviewed-HEAD reachability, parent-header parsing, final evidence requirements, and rerere-capture enforcement."
     },
     {
       "units": [
@@ -184,6 +211,26 @@
       "skips": 0,
       "assertions": 150,
       "purpose": "Prove exact protected path-family roots and prefixes pass through while safe SPA navigation and manifest assets retain their fork behavior."
+    },
+    {
+      "units": [
+        "U1",
+        "U2"
+      ],
+      "requirements": [
+        "R6",
+        "R7",
+        "R15"
+      ],
+      "path": "apps/server/src/device-setup-lifecycle.test.ts",
+      "command": "bun test apps/server/src/device-setup-lifecycle.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 6,
+      "failures": 0,
+      "skips": 0,
+      "assertions": 25,
+      "purpose": "Verify the hand-built http-api mock barrel includes classifyAuthPath and server lifecycle helpers still load."
     },
     {
       "units": [
@@ -504,18 +551,18 @@
     }
   ],
   "totals": {
-    "files": 19,
-    "passes": 638,
+    "files": 20,
+    "passes": 647,
     "failures": 0,
     "skips": 0,
-    "assertions": 1789
+    "assertions": 1817
   },
   "finalGates": [
     {
       "name": "shared-caller-sweep",
       "status": "passed",
       "purpose": "R15: enumerate classifier, drain, Claude/Codex identity, and Codex fallback callers with binary-safe searches.",
-      "details": "Binary-safe explicit-path sweeps enumerated every shared auth classifier/route seam, drain/transport owner, CLAUDE_CLI_VERSION, CODEX_VERSION, and CODEX_PING_MODEL caller without reading prohibited files. server.ts starts with the fallback, prefers the account's lowest-tier catalog model, and passes the result to fetchCodexUsageOnDemand; the fetcher itself uses the fallback for omitted/blank model input. provider.test.ts contains the direct 10-test on-demand block, while device-setup-lifecycle.test.ts only mocks the exports."
+      "details": "Binary-safe explicit-path sweeps enumerated every shared auth classifier/route seam, drain/transport owner, CLAUDE_CLI_VERSION, CODEX_VERSION, and CODEX_PING_MODEL caller without reading prohibited files. server.ts starts with the fallback, prefers the account's lowest-tier catalog model, and passes the result to fetchCodexUsageOnDemand; the fetcher itself uses the fallback for omitted/blank model input. provider.test.ts contains the direct 10-test on-demand block; device-setup-lifecycle.test.ts mocks the exports and its isolated 6-test suite proves the complete http-api mock barrel, including classifyAuthPath, still loads the server lifecycle helpers."
     },
     {
       "name": "final-ledger-validator",
@@ -523,7 +570,7 @@
       "purpose": "R1-R4/R15: validate phase final inventory against Git and the authoritative rerere capture.",
       "command": "bun scripts/verify-upstream-sync-ledger.ts check --repo . --inventory docs/plans/2026-08-30-issue-260-v3.5.70-resolution-inventory.json --ledger docs/plans/2026-08-30-issue-260-v3.5.70-resolution-ledger.md --rerere-capture docs/plans/2026-08-30-issue-260-v3.5.70-rerere-capture.json",
       "exitCode": 0,
-      "details": "Validated 13 schema-v2 inventory items with 0 pending in phase final. Git evidence included exact annotated tag object e0fa06882167e0462041df141b4c8aad89342be2 peeling to target 09cf070533de989a255cb2fcbd49580d794ed6f0, integration commit 60005baa99086e893e2673ce83554fd7655553cd with exact ordered parents d24a3757da1a1643d00d2487a99e2e422fe85afa then target, and authoritative empty rerere capture."
+      "details": "Validated 13 schema-v2 inventory items with 0 pending in phase final. Git evidence included exact annotated tag object e0fa06882167e0462041df141b4c8aad89342be2 peeling to target 09cf070533de989a255cb2fcbd49580d794ed6f0, integration commit 60005baa99086e893e2673ce83554fd7655553cd with exact ordered parents d24a3757da1a1643d00d2487a99e2e422fe85afa then target and reachable from reviewed HEAD, and authoritative empty rerere capture."
     },
     {
       "name": "lint",
@@ -563,7 +610,7 @@
       "command": "bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts",
       "status": "passed",
       "exitCode": 0,
-      "details": "43 passes, 0 failures, and 96 expectations after a proof-first red run with 34 passes and 9 expected failures."
+      "details": "46 passes, 0 failures, and 99 expectations. The original schema-v2 proof-first run had 34 passes and 9 expected failures; the final-review hardening red run had 44 passes and 2 expected failures for commit-message parent spoofing and detached integration reachability."
     },
     {
       "name": "package-lineage-parity",
@@ -634,7 +681,7 @@
     {
       "finding": 2,
       "status": "passed",
-      "evidence": "Schema-v2 final inventory records integrationCommit 60005baa99086e893e2673ce83554fd7655553cd; focused validator tests reject absent/null, one-parent, reversed, extra, wrong-first, and wrong-target topology and accept the real ordered two-parent integration commit."
+      "evidence": "Schema-v2 final inventory records integrationCommit 60005baa99086e893e2673ce83554fd7655553cd; focused validator tests read exact ordered parents through `%P`, ignore parent-prefixed commit message lines, reject absent/null, one-parent, reversed, extra, wrong-first, wrong-target, and detached valid integration objects, and accept the real merge plus later reviewed-HEAD descendants."
     },
     {
       "finding": 5,

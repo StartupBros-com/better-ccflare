@@ -339,8 +339,13 @@
     },
     "u4-isolated-test-manifest": {
       "type": "document",
-      "summary": "Final isolated test manifest records 19 files and 638 passing tests",
-      "details": "docs/plans/2026-08-30-issue-260-v3.5.70-test-manifest.json records 19 isolated files, 638 passes, 0 failures, 0 skips, and 1,789 expectations after the Codex beforeDrain review fix, schema-v2 validator, and package-lineage coverage. It also records the 34-pass/9-expected-failure validator red proof, clean-clone fetch/replay, exact `bun run typecheck`, lint, format, and final validator gates."
+      "summary": "Final isolated test manifest records 20 files and 647 passing tests",
+      "details": "docs/plans/2026-08-30-issue-260-v3.5.70-test-manifest.json records 20 isolated files, 647 passes, 0 failures, 0 skips, and 1,817 assertions after the Codex beforeDrain review fix, schema-v2 validator and reviewed-HEAD reachability coverage, package-lineage coverage, and server device-setup lifecycle CI fix. It also records both validator proof-first red passes, clean-clone fetch/replay, exact `bun run typecheck`, lint, format, and final validator gates."
+    },
+    "u4-device-setup-lifecycle-pass": {
+      "type": "test",
+      "summary": "Server device-setup lifecycle suite passed with the complete HTTP API mock surface",
+      "details": "`bun test apps/server/src/device-setup-lifecycle.test.ts` exited 0 with 6 passes, 0 failures, 0 skips, and 25 assertions. Its hand-built `@better-ccflare/http-api` mock barrel includes `classifyAuthPath`, so the server module and device-setup lifecycle helpers load and retain their startup, overlap-prevention, shutdown-drain, and idempotent-stop behavior."
     },
     "u4-lineage-source-check": {
       "type": "command",
@@ -385,7 +390,7 @@
     "u4-open-merge-topology": {
       "type": "command",
       "summary": "Final audit records and validates the committed integration topology",
-      "details": "`git cat-file -t 60005baa99086e893e2673ce83554fd7655553cd` returned `commit`; `git show -s --format='%H%n%P' 60005baa99086e893e2673ce83554fd7655553cd` returned the exact integration SHA followed by exactly two ordered parents: d24a3757da1a1643d00d2487a99e2e422fe85afa then 09cf070533de989a255cb2fcbd49580d794ed6f0. Schema-v2 final validation re-reads the commit object and rejects any different parent count, order, first parent, or target parent."
+      "details": "`git cat-file -t 60005baa99086e893e2673ce83554fd7655553cd` returned `commit`; `git show -s --format='%H%n%P' 60005baa99086e893e2673ce83554fd7655553cd` returned the exact integration SHA followed by exactly two ordered parents: d24a3757da1a1643d00d2487a99e2e422fe85afa then 09cf070533de989a255cb2fcbd49580d794ed6f0. Schema-v2 final validation reads only Git's `%P` parent format, so commit-message lines beginning `parent ` cannot spoof topology; it rejects any different parent count, order, first parent, or target parent, then requires the integration commit to be reachable from the reviewed ref (default `HEAD`) via `merge-base --is-ancestor`."
     },
     "u4-staged-combined-review": {
       "type": "combined-diff",
@@ -450,7 +455,7 @@
     "u4-final-ledger-validation": {
       "type": "command",
       "summary": "Generic schema-v2 validator accepted final Git, tag, topology, and rerere evidence",
-      "details": "`bun scripts/verify-upstream-sync-ledger.ts check --repo . --inventory docs/plans/2026-08-30-issue-260-v3.5.70-resolution-inventory.json --ledger docs/plans/2026-08-30-issue-260-v3.5.70-resolution-ledger.md --rerere-capture docs/plans/2026-08-30-issue-260-v3.5.70-rerere-capture.json` exited 0 with `validated 13 inventory items`. Schema v2 verified tag object e0fa06882167e0462041df141b4c8aad89342be2 is an annotated tag peeling to target 09cf070533de989a255cb2fcbd49580d794ed6f0 and integration commit 60005baa99086e893e2673ce83554fd7655553cd has exact ordered parents d24a3757da1a1643d00d2487a99e2e422fe85afa then the target. The authoritative rerere capture is complete and empty."
+      "details": "`bun scripts/verify-upstream-sync-ledger.ts check --repo . --inventory docs/plans/2026-08-30-issue-260-v3.5.70-resolution-inventory.json --ledger docs/plans/2026-08-30-issue-260-v3.5.70-resolution-ledger.md --rerere-capture docs/plans/2026-08-30-issue-260-v3.5.70-rerere-capture.json` exited 0 with `validated 13 inventory items`. Schema v2 verified tag object e0fa06882167e0462041df141b4c8aad89342be2 is an annotated tag peeling to target 09cf070533de989a255cb2fcbd49580d794ed6f0; integration commit 60005baa99086e893e2673ce83554fd7655553cd has exact ordered parents d24a3757da1a1643d00d2487a99e2e422fe85afa then the target and is an ancestor of reviewed `HEAD`. The authoritative rerere capture is complete and empty."
     },
     "u4-diff-hygiene": {
       "type": "command",
@@ -460,12 +465,12 @@
     "u4-ledger-validator-v2-red": {
       "type": "test",
       "summary": "Schema-v2 topology and tag proof-first tests failed before implementation",
-      "details": "`bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts` exited 1 before validator implementation with 34 passes, 9 expected failures, and 78 expectations. The failures showed schema v2 was rejected wholesale, generated inventories remained v1, lightweight tags were accepted, wrong recorded tag objects were not checked, and one-parent/reversed/extra/wrong-parent integration commits were accepted."
+      "details": "The original proof-first `bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts` run exited 1 before schema-v2 implementation with 34 passes, 9 expected failures, and 78 expectations. The final-review hardening red run exited 1 with 44 passes, 2 expected failures, and 99 expectations: a valid merge whose message body began `parent ` was misparsed as having an extra parent, and an exact valid two-parent integration object on another ref was accepted despite not being reachable from reviewed `HEAD`."
     },
     "u4-ledger-validator-v2-pass": {
       "type": "test",
-      "summary": "Schema-v2 topology and annotated-tag validator suite passed",
-      "details": "`bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts` exited 0 with 43 passes, 0 failures, and 96 expectations. Coverage includes schema-v1 compatibility, schema-v2 annotated tag identity, lightweight/wrong tag rejection, required final integration SHA, a real ordered two-parent merge, and one-parent/reversed/extra/wrong-first/wrong-target rejection."
+      "summary": "Schema-v2 topology, reachability, and annotated-tag validator suite passed",
+      "details": "`bun test scripts/__tests__/verify-upstream-sync-ledger.test.ts` exited 0 with 46 passes, 0 failures, and 99 expectations. Coverage includes schema-v1 compatibility, schema-v2 annotated tag identity, lightweight/wrong tag rejection, required final integration SHA, exact ordered parents read through `%P`, commit-message spoof resistance, detached valid-merge rejection, and acceptance when reviewed `HEAD` is the integration commit or a later descendant."
     },
     "u4-tag-object-identity": {
       "type": "command",
@@ -741,7 +746,8 @@
             "u4-open-merge-topology",
             "u4-operational-boundary",
             "u4-final-ledger-validation",
-            "u4-diff-hygiene"
+            "u4-diff-hygiene",
+            "u4-device-setup-lifecycle-pass"
           ]
         },
         "combinedDiff": {
@@ -912,7 +918,8 @@
             "u4-open-merge-topology",
             "u4-operational-boundary",
             "u4-final-ledger-validation",
-            "u4-diff-hygiene"
+            "u4-diff-hygiene",
+            "u4-device-setup-lifecycle-pass"
           ]
         },
         "combinedDiff": {
@@ -1089,7 +1096,8 @@
             "u4-parent-delta-review",
             "u4-combined-server",
             "u4-final-ledger-validation",
-            "u4-diff-hygiene"
+            "u4-diff-hygiene",
+            "u4-device-setup-lifecycle-pass"
           ]
         },
         "combinedDiff": {
@@ -1272,7 +1280,8 @@
             "u4-parent-delta-review",
             "u4-combined-auth-service",
             "u4-final-ledger-validation",
-            "u4-diff-hygiene"
+            "u4-diff-hygiene",
+            "u4-device-setup-lifecycle-pass"
           ]
         },
         "combinedDiff": {

@@ -619,6 +619,7 @@ function commitWithParents(
   repo: string,
   treeCommit: string,
   parents: string[],
+  message = "alternate integration topology",
 ): string {
   const tree = git(repo, "rev-parse", `${treeCommit}^{tree}`);
   return git(
@@ -627,7 +628,7 @@ function commitWithParents(
     tree,
     ...parents.flatMap((parent) => ["-p", parent]),
     "-m",
-    "alternate integration topology",
+    message,
   );
 }
 
@@ -840,6 +841,59 @@ describe("hermetic derivation and CLI", () => {
   test("schema v2 final validation accepts the real ordered two-parent integration merge", () => {
     const fixture = createTopologyFixture();
     const inventory = finalTopologyInventory(fixture);
+
+    expect(() =>
+      validateSyncInventory(inventory, renderLedger(inventory), {
+        repo: fixture.repo,
+        observedRerereApplications: [],
+      }),
+    ).not.toThrow();
+  }, 30_000);
+
+  test("schema v2 final validation ignores parent-prefixed commit message lines", () => {
+    const fixture = createTopologyFixture();
+    const inventory = finalTopologyInventory(fixture);
+    const integrationCommit = commitWithParents(
+      fixture.repo,
+      fixture.integrationCommit,
+      [fixture.fork, fixture.target],
+      `integrate upstream\n\nparent ${fixture.base}`,
+    );
+    Object.assign(inventory.baseline, { integrationCommit });
+
+    expect(() =>
+      validateSyncInventory(inventory, renderLedger(inventory), {
+        repo: fixture.repo,
+        observedRerereApplications: [],
+        reviewedRef: integrationCommit,
+      }),
+    ).not.toThrow();
+  }, 30_000);
+
+  test("schema v2 final validation rejects a detached valid integration merge", () => {
+    const fixture = createTopologyFixture();
+    const inventory = finalTopologyInventory(fixture);
+    const integrationCommit = commitWithParents(
+      fixture.repo,
+      fixture.integrationCommit,
+      [fixture.fork, fixture.target],
+    );
+    git(fixture.repo, "branch", "detached-integration", integrationCommit);
+    Object.assign(inventory.baseline, { integrationCommit });
+
+    expect(() =>
+      validateSyncInventory(inventory, renderLedger(inventory), {
+        repo: fixture.repo,
+        observedRerereApplications: [],
+      }),
+    ).toThrow(/not an ancestor of reviewed ref HEAD/);
+  }, 30_000);
+
+  test("schema v2 final validation accepts a reviewed descendant after follow-up commits", () => {
+    const fixture = createTopologyFixture();
+    const inventory = finalTopologyInventory(fixture);
+    write(fixture.repo, "follow-up.txt", "follow-up\n");
+    commitAll(fixture.repo, "follow-up");
 
     expect(() =>
       validateSyncInventory(inventory, renderLedger(inventory), {
