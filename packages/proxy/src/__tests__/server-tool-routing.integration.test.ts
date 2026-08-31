@@ -960,6 +960,65 @@ describe("server-tool routing integration", () => {
 		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBeFalse();
 	});
 
+	it("keeps mixed structural and temporary failures retryable", async () => {
+		const provenPaused = makeAccount({
+			id: "mixed-proven-paused",
+			name: "mixed-proven-paused",
+			paused: true,
+			pause_reason: "manual",
+		});
+		const structurallyUnknown = makeAccount({
+			id: "mixed-structurally-unknown",
+			name: "mixed-structurally-unknown",
+			priority: 1,
+		});
+		const { ctx, refreshCalls, mutations } = makeContext(
+			[provenPaused, structurallyUnknown],
+			(provider) => {
+				provider.resolveServerToolCapability = (_requirements, tuple) =>
+					tuple.candidateId === `account:${provenPaused.id}`
+						? {
+								decision: "proven",
+								proof: makeProof(tuple, "mixed-proven-proof"),
+							}
+						: { decision: "unknown", reason: "no_exact_proof" };
+			},
+		);
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ unexpected: true }), { status: 500 }),
+		);
+		const request = makeServerToolRequest();
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = (await response.json()) as {
+			error: {
+				code: string;
+				reason: string;
+				capability: Record<string, number>;
+			};
+		};
+
+		expect(response.status).toBe(503);
+		expect(body.error).toMatchObject({
+			code: "route_unavailable",
+			reason: "temporary_unavailable",
+			capability: {
+				structuralCandidateCount: 2,
+				provenCandidateCount: 1,
+				unknownCandidateCount: 1,
+				temporarilyUnavailableProvenCandidateCount: 1,
+				eligibleCandidateCount: 0,
+			},
+		});
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+		expect(mutations.updateAccountUsage).toHaveBeenCalledTimes(0);
+		expect(mutations.reportFailure).toHaveBeenCalledTimes(0);
+	});
+
 	it("does not substitute another account when a force-routed proof drifts", async () => {
 		const forced = makeAccount({
 			id: "capability-forced",
