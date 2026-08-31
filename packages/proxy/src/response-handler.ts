@@ -1497,6 +1497,7 @@ export async function forwardToClient(
 		let clientResponse = response;
 		if (
 			isModelRewrite(originalModel, appliedModel) ||
+			routeProvenance !== null ||
 			(cacheFlightRecorderEligible === true &&
 				Boolean(cacheFlightRecorderConversationId))
 		) {
@@ -1508,6 +1509,7 @@ export async function forwardToClient(
 					appliedModel,
 					cacheFlightRecorderConversationId,
 					cacheFlightRecorderEligible,
+					routeProvenance,
 				}),
 			});
 		}
@@ -1630,6 +1632,7 @@ export async function forwardToClient(
 			appliedModel,
 			cacheFlightRecorderConversationId,
 			cacheFlightRecorderEligible,
+			routeProvenance,
 		}),
 	});
 	anthropicDegradedLifecycle?.transferToResponse();
