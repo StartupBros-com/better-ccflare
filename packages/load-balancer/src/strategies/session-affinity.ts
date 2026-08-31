@@ -11,6 +11,7 @@ import type {
 	LoadBalancingStrategy,
 	RequestMeta,
 	RouteCircuitRecoveryHint,
+	RouteHomeAction,
 	RoutingCandidateFailureReport,
 	RoutingCandidateSuccessReport,
 	RoutingHealth,
@@ -314,6 +315,13 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		return this.affinityKey(meta);
 	}
 
+	private isDescendantHomeRequest(meta: RequestMeta): boolean {
+		return (
+			meta.routeLineage?.kind === "descendant" &&
+			Boolean(meta.routeLineage.childHomeKey)
+		);
+	}
+
 	/** The minimum tier in a set, or null for an empty input. */
 	private minimumConfiguredTier(tiers: Iterable<number>): number | null {
 		let min: number | null = null;
@@ -449,6 +457,65 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			crossTierProtectionLogged: false,
 		});
 		return true;
+	}
+
+	commitDescendantAffinityOwner(
+		meta: RequestMeta,
+		owner: AffinityOwnerSnapshot,
+	): RouteHomeAction {
+		const affinityKey = this.affinityKey(meta);
+		if (
+			affinityKey === null ||
+			!this.isDescendantHomeRequest(meta) ||
+			owner.candidateId.length === 0 ||
+			owner.accountId.length === 0 ||
+			meta.hardExcludedAccountIds?.has(owner.accountId)
+		) {
+			meta.routeHomeAction = "none";
+			return "none";
+		}
+
+		const now = this.now();
+		let existing = this.affinity.get(affinityKey);
+		if (existing && now - existing.assignedAt >= this.affinityTtlMs) {
+			this.affinity.delete(affinityKey);
+			existing = undefined;
+		}
+		if (existing) {
+			if (
+				existing.candidateId === owner.candidateId &&
+				existing.accountId === owner.accountId
+			) {
+				existing.assignedAt = now;
+				meta.routeHomeAction = "retained";
+				return "retained";
+			}
+			if (
+				meta.routeHomeReplacementAllowed !== true ||
+				meta.routeHomeExpectedCandidateId !== existing.candidateId
+			) {
+				meta.routeHomeAction = "none";
+				return "none";
+			}
+		} else if (meta.routeHomeExpectedCandidateId !== null) {
+			meta.routeHomeAction = "none";
+			return "none";
+		}
+
+		if (!existing) this.evictOldestIfFull();
+		const action: RouteHomeAction = existing ? "repinned" : "initial_commit";
+		this.affinity.set(affinityKey, {
+			candidateId: owner.candidateId,
+			accountId: owner.accountId,
+			fallbackCandidateId: null,
+			assignedAt: now,
+			upgradedAt: null,
+			suppressUpgradesUntil: null,
+			installedBelowBestConfiguredTier: false,
+			crossTierProtectionLogged: false,
+		});
+		meta.routeHomeAction = action;
+		return action;
 	}
 
 	private routeSuppressionKey(
@@ -888,6 +955,90 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			if (now - entry.assignedAt >= this.affinityTtlMs) {
 				this.affinity.delete(clientId);
 			}
+		}
+
+		if (affinityKey !== null && this.isDescendantHomeRequest(meta)) {
+			meta.routeHomeAction = "none";
+			meta.routeHomeExpectedCandidateId = null;
+			meta.routeHomeReplacementAllowed = false;
+			meta.routeRepinReason = null;
+			const mapping = this.affinity.get(affinityKey);
+			if (mapping) {
+				meta.routeHomeExpectedCandidateId = mapping.candidateId;
+				const availableOwner = otherwiseAvailable.find(
+					(candidate) =>
+						candidate.routing.candidateId === mapping.candidateId &&
+						candidate.account.id === mapping.accountId,
+				);
+				const ownerCircuit = availableOwner
+					? this.routeFailureState(affinityKey, mapping.candidateId)
+					: undefined;
+				if (
+					availableOwner &&
+					ownerCircuit === undefined &&
+					this.canRetainAffinityOwner(availableOwner, now, meta)
+				) {
+					mapping.assignedAt = now;
+					mapping.fallbackCandidateId = null;
+					meta.routeHomeAction = "retained";
+					const others = this.rankByLeastUsed(
+						otherwiseAvailable.filter(
+							(candidate) =>
+								candidate.routing.candidateId !== mapping.candidateId,
+						),
+						now,
+						meta,
+					);
+					return commitStrategyCandidateOrder(
+						[availableOwner, ...others],
+						meta,
+					);
+				}
+
+				meta.routeHomeReplacementAllowed = true;
+				if (ownerCircuit !== undefined) {
+					meta.routeRepinReason = "route_circuit_open";
+				} else if (meta.hardExcludedAccountIds?.has(mapping.accountId)) {
+					meta.routeRepinReason = "hard_exclusion";
+				} else if (
+					configuredCandidates.some(
+						(candidate) =>
+							candidate.routing.candidateId === mapping.candidateId,
+					)
+				) {
+					meta.routeRepinReason = "account_unavailable";
+				} else {
+					meta.routeRepinReason = "structural_removal";
+				}
+			}
+
+			this.routeCircuitSelections.set(meta, {
+				candidateIds: [
+					...new Set(
+						otherwiseAvailable.map(
+							(candidate) => candidate.routing.candidateId,
+						),
+					),
+				],
+			});
+			const closedCandidates = otherwiseAvailable.filter(
+				(candidate) =>
+					this.routeFailureState(affinityKey, candidate.routing.candidateId) ===
+					undefined,
+			);
+			const circuitCandidates = otherwiseAvailable.filter(
+				(candidate) =>
+					this.routeFailureState(affinityKey, candidate.routing.candidateId) !==
+					undefined,
+			);
+			const allOpenProbe =
+				closedCandidates.length === 0
+					? this.acquireHalfOpenProbe(circuitCandidates, affinityKey, now, true)
+					: null;
+			const ranked = allOpenProbe
+				? [allOpenProbe]
+				: this.pickAndMark(closedCandidates, now, meta, true);
+			return commitStrategyCandidateOrder(ranked, meta);
 		}
 
 		const ownerDirective =

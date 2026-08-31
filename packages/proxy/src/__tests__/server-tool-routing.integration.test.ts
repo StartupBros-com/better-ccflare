@@ -49,6 +49,8 @@ const MODEL = "claude-sonnet-4-5";
 const originalFetch = globalThis.fetch;
 const originalPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 let restoreUsageCollectors = (): void => {};
+let usageHandleStart = mock(() => undefined);
+let usageHandleEnd = mock(async () => undefined);
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
 	return {
@@ -342,10 +344,12 @@ function makeServerToolRequest(
 
 beforeEach(() => {
 	process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+	usageHandleStart = mock(() => undefined);
+	usageHandleEnd = mock(async () => undefined);
 	const collector = {
-		handleStart: mock(() => undefined),
+		handleStart: usageHandleStart,
 		handleChunk: mock(() => undefined),
-		handleEnd: mock(async () => undefined),
+		handleEnd: usageHandleEnd,
 	};
 	const required = spyOn(
 		usageCollectorModule,
@@ -373,6 +377,159 @@ afterEach(() => {
 });
 
 describe("server-tool routing integration", () => {
+	it("inherits an active capability profile for a same-session helper without child markers", async () => {
+		const physicalModel = "gpt-5.6-sol";
+		const account = makeAccount({
+			access_token: "test-token",
+			expires_at: Date.now() + 60 * 60_000,
+			model_mappings: JSON.stringify({
+				opus: physicalModel,
+				sonnet: MODEL,
+			}),
+		});
+		const tuples: ServerToolCapabilityTuple[] = [];
+		const { ctx } = makeContext(account, (provider) => {
+			provider.createServerToolCapabilityTuple = (context) => {
+				const tuple = makeTuple(context, provider.name);
+				tuples.push(tuple);
+				return tuple;
+			};
+			provider.resolveServerToolCapability = (_requirements, tuple) => ({
+				decision: "proven",
+				proof: makeProof(tuple, `profile-helper:${tuple.candidateId}`),
+			});
+		});
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "server-tool-sol",
+						displayName: "Server tool Sol",
+						selection: "capability",
+						logicalModel: "claude-opus-5",
+						expectedProvider: "capability-test",
+						expectedPhysicalModel: physicalModel,
+					},
+				]),
+			),
+		);
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ ok: true }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const root = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer server-tool-test-client",
+				"x-claude-code-session-id": "server-tool-test-session",
+			},
+			body: JSON.stringify({
+				model: "claude-bccf-route-server-tool-sol",
+				messages: [{ role: "user", content: "establish profile" }],
+				max_tokens: 16,
+			}),
+		});
+		expect(
+			(await handleProxy(root, new URL(root.url), ctx, "key-1")).status,
+		).toBe(200);
+
+		const helper = makeServerToolRequest();
+		const response = await handleProxy(
+			helper,
+			new URL(helper.url),
+			ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+		expect(tuples.length).toBeGreaterThan(0);
+		expect(tuples.every((tuple) => tuple.model === physicalModel)).toBe(true);
+	});
+
+	it("falls from an unavailable capability profile to a global proven helper route", async () => {
+		const physicalModel = "gpt-5.6-sol";
+		const profileAccount = makeAccount({
+			id: "profile-helper-account",
+			name: "profile-helper-account",
+			access_token: "profile-token",
+			expires_at: Date.now() + 60 * 60_000,
+			model_mappings: JSON.stringify({ opus: physicalModel, sonnet: MODEL }),
+		});
+		const globalAccount = makeAccount({
+			id: "global-helper-account",
+			name: "global-helper-account",
+			access_token: "global-token",
+			expires_at: Date.now() + 60 * 60_000,
+			priority: 10,
+			model_mappings: JSON.stringify({
+				opus: "global-search-model",
+				sonnet: MODEL,
+			}),
+		});
+		const { ctx } = makeContext([profileAccount, globalAccount], (provider) => {
+			provider.resolveServerToolCapability = (_requirements, tuple) => ({
+				decision: "proven",
+				proof: makeProof(tuple, `global-helper:${tuple.candidateId}`),
+			});
+		});
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "server-tool-soft-profile",
+						displayName: "Server tool soft profile",
+						selection: "capability",
+						logicalModel: "claude-opus-5",
+						expectedProvider: "capability-test",
+						expectedPhysicalModel: physicalModel,
+					},
+				]),
+			),
+		);
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ url: request.url }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const root = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer server-tool-test-client",
+				"x-claude-code-session-id": "server-tool-test-session",
+			},
+			body: JSON.stringify({
+				model: "claude-bccf-route-server-tool-soft-profile",
+				messages: [{ role: "user", content: "establish profile" }],
+				max_tokens: 16,
+			}),
+		});
+		expect(
+			(await handleProxy(root, new URL(root.url), ctx, "key-1")).status,
+		).toBe(200);
+
+		profileAccount.paused = true;
+		const helper = makeServerToolRequest();
+		const response = await handleProxy(
+			helper,
+			new URL(helper.url),
+			ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			url: "https://capability.invalid/v1/responses",
+		});
+	});
+
 	it("validates server-tool requirements without an activation flag", async () => {
 		const account = makeAccount({
 			access_token: "test-token",
@@ -600,6 +757,17 @@ describe("server-tool routing integration", () => {
 		expect(mutations.reportFailure).toHaveBeenCalledTimes(0);
 		expect(response.headers.has("x-better-ccflare-pool-status")).toBeFalse();
 		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBeFalse();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(usageHandleStart).toHaveBeenCalledTimes(1);
+		expect(usageHandleStart.mock.calls[0]?.[0]).toMatchObject({
+			accountId: null,
+			responseStatus: 400,
+		});
+		expect(usageHandleEnd).toHaveBeenCalledTimes(1);
+		expect(usageHandleEnd.mock.calls[0]?.[0]).toMatchObject({
+			success: false,
+			error: "server_tool_no_implementation",
+		});
 	});
 
 	it("stops a writer-disabled replay runtime before capability work or provider I/O", async () => {
@@ -790,6 +958,65 @@ describe("server-tool routing integration", () => {
 		expect(mutations.reportFailure).toHaveBeenCalledTimes(0);
 		expect(response.headers.has("x-better-ccflare-pool-status")).toBeFalse();
 		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBeFalse();
+	});
+
+	it("keeps mixed structural and temporary failures retryable", async () => {
+		const provenPaused = makeAccount({
+			id: "mixed-proven-paused",
+			name: "mixed-proven-paused",
+			paused: true,
+			pause_reason: "manual",
+		});
+		const structurallyUnknown = makeAccount({
+			id: "mixed-structurally-unknown",
+			name: "mixed-structurally-unknown",
+			priority: 1,
+		});
+		const { ctx, refreshCalls, mutations } = makeContext(
+			[provenPaused, structurallyUnknown],
+			(provider) => {
+				provider.resolveServerToolCapability = (_requirements, tuple) =>
+					tuple.candidateId === `account:${provenPaused.id}`
+						? {
+								decision: "proven",
+								proof: makeProof(tuple, "mixed-proven-proof"),
+							}
+						: { decision: "unknown", reason: "no_exact_proof" };
+			},
+		);
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ unexpected: true }), { status: 500 }),
+		);
+		const request = makeServerToolRequest();
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = (await response.json()) as {
+			error: {
+				code: string;
+				reason: string;
+				capability: Record<string, number>;
+			};
+		};
+
+		expect(response.status).toBe(503);
+		expect(body.error).toMatchObject({
+			code: "route_unavailable",
+			reason: "temporary_unavailable",
+			capability: {
+				structuralCandidateCount: 2,
+				provenCandidateCount: 1,
+				unknownCandidateCount: 1,
+				temporarilyUnavailableProvenCandidateCount: 1,
+				eligibleCandidateCount: 0,
+			},
+		});
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+		expect(mutations.updateAccountUsage).toHaveBeenCalledTimes(0);
+		expect(mutations.reportFailure).toHaveBeenCalledTimes(0);
 	});
 
 	it("does not substitute another account when a force-routed proof drifts", async () => {

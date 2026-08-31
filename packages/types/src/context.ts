@@ -8,6 +8,7 @@ import type { Account } from "./account";
 import type { AlertEvent } from "./alerts";
 import type { AffinityOwnerSnapshot, RequestMeta } from "./api";
 import type { ApiKey } from "./api-key";
+import type { RouteHomeAction } from "./request";
 import type {
 	AnthropicDegradedRuntimeHealth,
 	IntegrityStatus,
@@ -221,6 +222,15 @@ export interface LoadBalancingStrategy {
 		meta: RequestMeta,
 		owner: AffinityOwnerSnapshot,
 	): boolean;
+
+	/**
+	 * Compare-and-set a descendant route home only after its candidate wins.
+	 * Ordinary affinity implementations may omit this hook.
+	 */
+	commitDescendantAffinityOwner?(
+		meta: RequestMeta,
+		owner: AffinityOwnerSnapshot,
+	): RouteHomeAction;
 
 	/**
 	 * Optionally suppress one exact routing candidate for the request's affinity

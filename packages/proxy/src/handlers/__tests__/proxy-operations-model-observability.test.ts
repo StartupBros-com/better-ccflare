@@ -459,6 +459,119 @@ describe("proxyWithAccount — combo override success-conditioning / observabili
 		);
 	});
 
+	it("returns route provenance headers on non-streaming responses", async () => {
+		installUsageCollector();
+		globalThis.fetch = mock(async () =>
+			jsonResponse(
+				{
+					id: "msg_route_provenance",
+					type: "message",
+					role: "assistant",
+					content: [{ type: "text", text: "hi" }],
+					model: "gpt-5.6-terra",
+					stop_reason: "end_turn",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+				200,
+			),
+		);
+		const account = makeTransportMappingAccount();
+		const bodyBuffer = makeRequestBody("claude-sonnet-5");
+		const requestMeta = makeRequestMeta({
+			routeProfileId: "profile-sol",
+			requestedLogicalModel: "claude-sonnet-5",
+			routingCandidateCatalog: [
+				{
+					candidateId: "route-candidate-root",
+					accountId: account.id,
+					tier: 0,
+					ordinal: 0,
+					comboSlotId: null,
+					modelOverride: "gpt-5.6-terra",
+					quotaPressure: null,
+					routeFallbackRung: "profile_root_model",
+				},
+			],
+		});
+
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			requestMeta,
+			bodyBuffer,
+			() => undefined,
+			1,
+			makeTransportMappingContext("gpt-5.6-terra"),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			undefined,
+			{ routeCandidateId: "route-candidate-root" },
+		);
+
+		expect(result?.headers.get("x-better-ccflare-route-fallback")).toBe(
+			"profile_root_model",
+		);
+		expect(result?.headers.get("x-better-ccflare-routed-model")).toBe(
+			"gpt-5.6-terra",
+		);
+		expect(await result?.json()).toMatchObject({ id: "msg_route_provenance" });
+	});
+
+	it("returns route provenance headers on empty non-streaming responses", async () => {
+		installUsageCollector();
+		globalThis.fetch = mock(async () => new Response(null, { status: 204 }));
+		const account = makeTransportMappingAccount();
+		const bodyBuffer = makeRequestBody("claude-sonnet-5");
+		const requestMeta = makeRequestMeta({
+			routeProfileId: "profile-sol",
+			requestedLogicalModel: "claude-sonnet-5",
+			routingCandidateCatalog: [
+				{
+					candidateId: "route-candidate-global",
+					accountId: account.id,
+					tier: 0,
+					ordinal: 0,
+					comboSlotId: null,
+					modelOverride: "gpt-5.6-terra",
+					quotaPressure: null,
+					routeFallbackRung: "global_requested_model",
+				},
+			],
+		});
+
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			requestMeta,
+			bodyBuffer,
+			() => undefined,
+			2,
+			makeTransportMappingContext("gpt-5.6-terra"),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			undefined,
+			{ routeCandidateId: "route-candidate-global" },
+		);
+
+		expect(result?.status).toBe(204);
+		expect(result?.headers.get("x-better-ccflare-route-fallback")).toBe(
+			"global_requested_model",
+		);
+		expect(result?.headers.get("x-better-ccflare-routed-model")).toBe(
+			"gpt-5.6-terra",
+		);
+	});
+
 	it("leaves model provenance null when successful physical transport matches the client model", async () => {
 		const handleStart = installUsageCollector();
 		globalThis.fetch = mock(async () =>

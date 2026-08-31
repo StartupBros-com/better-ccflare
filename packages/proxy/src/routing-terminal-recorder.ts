@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { sanitizeRequestHeaders } from "@better-ccflare/http-common";
-import type { RequestMeta } from "@better-ccflare/types";
+import type { RequestMeta, RouteProvenance } from "@better-ccflare/types";
 import {
 	type EndMessage,
 	isModelRewrite,
@@ -167,6 +167,21 @@ export function recordRoutingTerminalRequest(
 				0,
 				Math.floor(options.upstreamAttempts) - 1,
 			);
+			const terminalCandidate =
+				requestMeta.routingCandidates?.at(-1) ??
+				requestMeta.routingCandidateCatalog?.at(-1);
+			const routeProvenance: RouteProvenance | null = requestMeta.routeProfileId
+				? {
+						profileId: requestMeta.routeProfileId,
+						requestedModel: requestMeta.requestedLogicalModel ?? null,
+						routedProvider: null,
+						routedModel: null,
+						fallbackRung: terminalCandidate?.routeFallbackRung ?? null,
+						homeAction: requestMeta.routeHomeAction ?? "none",
+						repinReason: requestMeta.routeRepinReason ?? null,
+						candidateId: null,
+					}
+				: null;
 
 			coordinator.start({
 				collector,
@@ -186,6 +201,7 @@ export function recordRoutingTerminalRequest(
 						requestMeta.projectAttributionSource ?? "none",
 					agentAttributionSource: requestMeta.agentAttributionSource ?? "none",
 					clientSessionId: requestMeta.clientSessionId ?? null,
+					routeProvenance,
 					responseStatus: options.response.status,
 					responseHeaders: Object.fromEntries(
 						options.response.headers.entries(),

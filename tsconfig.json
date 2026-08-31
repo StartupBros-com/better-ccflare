@@ -18,6 +18,7 @@
 		"jsx": "react-jsx",
 		"paths": {
 			"@better-ccflare/types/combo": ["./packages/types/src/combo.ts"],
+			"@better-ccflare/types/request": ["./packages/types/src/request.ts"],
 			"@better-ccflare/*": ["./packages/*/src"],
 			"@better-ccflare/server": ["./apps/server/src/server.ts"],
 			"@better-ccflare/dashboard-web/dist/*": ["./packages/dashboard-web/dist/*"]

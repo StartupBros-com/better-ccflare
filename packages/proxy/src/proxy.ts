@@ -26,6 +26,7 @@ import {
 import type {
 	Account,
 	RequestMeta,
+	RoutingCandidateMetadata,
 	RoutingSelectionDiagnostics,
 	RoutingSelectionZeroAttemptReason,
 } from "@better-ccflare/types";
@@ -59,7 +60,10 @@ import {
 import { warnOnLookbackRisk } from "./cache-telemetry";
 import { CACHE_REPLAY_MODEL_HEADER } from "./cache-transport-staging";
 import { adaptAnthropicSsePingsForClaudeCode } from "./claude-code-ping-compat";
-import { isClaudeCodeSubagent } from "./claude-code-request";
+import {
+	deriveClaudeCodeRouteLineage,
+	isClaudeCodeSubagent,
+} from "./claude-code-request";
 import {
 	type AgentInterceptResult,
 	createContextAdmissionTracker,
@@ -325,13 +329,10 @@ export function isReactivelyModelDepleted(
  * routing-candidate sidecar. Matching is occurrence-safe: repeated combo slots
  * backed by one account consume distinct candidate IDs in their source order.
  */
-export function alignRouteCandidateIds(
+export function alignRouteCandidates(
 	accounts: readonly Account[],
-	candidates:
-		| readonly { readonly accountId: string; readonly candidateId: string }[]
-		| null
-		| undefined,
-): string[] {
+	candidates: readonly RoutingCandidateMetadata[] | null | undefined,
+): Array<RoutingCandidateMetadata | undefined> {
 	const usedCandidateIndexes = new Set<number>();
 	return accounts.map((account, accountIndex) => {
 		const indexedCandidate = candidates?.[accountIndex];
@@ -340,7 +341,7 @@ export function alignRouteCandidateIds(
 			!usedCandidateIndexes.has(accountIndex)
 		) {
 			usedCandidateIndexes.add(accountIndex);
-			return indexedCandidate.candidateId;
+			return indexedCandidate;
 		}
 
 		const matchedIndex =
@@ -349,12 +350,20 @@ export function alignRouteCandidateIds(
 					candidate.accountId === account.id &&
 					!usedCandidateIndexes.has(candidateIndex),
 			) ?? -1;
-		if (matchedIndex >= 0 && candidates) {
-			usedCandidateIndexes.add(matchedIndex);
-			return candidates[matchedIndex].candidateId;
-		}
-		return `account:${account.id}`;
+		if (matchedIndex < 0 || !candidates) return undefined;
+		usedCandidateIndexes.add(matchedIndex);
+		return candidates[matchedIndex];
 	});
+}
+
+export function alignRouteCandidateIds(
+	accounts: readonly Account[],
+	candidates: readonly RoutingCandidateMetadata[] | null | undefined,
+): string[] {
+	return alignRouteCandidates(accounts, candidates).map(
+		(candidate, index) =>
+			candidate?.candidateId ?? `account:${accounts[index]?.id ?? "unknown"}`,
+	);
 }
 
 const log = new Logger("Proxy");
@@ -850,6 +859,39 @@ async function handleProxyCoreImpl(
 		url,
 		ctx.guardCorrelationVerifier,
 	);
+	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
+	const routingAttemptLedger = new RoutingAttemptLedger();
+	const recordLocalRoutingTerminal = (
+		response: Response,
+		terminalKind: string,
+	): Response => {
+		void recordRoutingTerminalRequest({
+			collector: tryGetUsageCollector(),
+			requestMeta,
+			requestHeaders: req.headers,
+			response,
+			providerName: ctx.provider.name,
+			terminalKind,
+			upstreamAttempts: routingAttemptLedger.attemptedCount,
+			apiKeyId,
+			apiKeyName,
+			skip: trustedInternalAutoRefresh,
+			onError: (error) => {
+				log.error(
+					`handleEnd failed for ${terminalKind} request ${requestMeta.id}`,
+					error,
+				);
+			},
+		});
+		return response;
+	};
+	const createRecordedForceRouteResponse = (
+		error: ForceRouteUnavailableError,
+	): Response =>
+		recordLocalRoutingTerminal(
+			forceRouteUnavailableResponse(error, requestMeta.routeProfileId == null),
+			`force_route_${error.reason}`,
+		);
 	const createUnservedServerToolRoutingErrorResponse = (
 		error: ServerToolRoutingError,
 	): Response => {
@@ -858,18 +900,19 @@ async function handleProxyCoreImpl(
 			requestMeta,
 			error.accountId,
 		);
-		return createServerToolRoutingErrorResponse(
-			clientVisibleAccountId === error.accountId
-				? error
-				: new ServerToolRoutingError({
-						reason: error.reason,
-						accountId: clientVisibleAccountId,
-						capabilitySummary: error.capabilitySummary,
-					}),
+		return recordLocalRoutingTerminal(
+			createServerToolRoutingErrorResponse(
+				clientVisibleAccountId === error.accountId
+					? error
+					: new ServerToolRoutingError({
+							reason: error.reason,
+							accountId: clientVisibleAccountId,
+							capabilitySummary: error.capabilitySummary,
+						}),
+			),
+			`server_tool_${error.reason}`,
 		);
 	};
-	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
-	const routingAttemptLedger = new RoutingAttemptLedger();
 	activeAnthropicPreCommitRescue?.registerRequestLifecycle(
 		getRequestLifecycleCoordinator(requestMeta),
 	);
@@ -926,6 +969,10 @@ async function handleProxyCoreImpl(
 	const normalizedRequestModel = requestModel?.trim() ?? null;
 	const modelRouteRegistry = ctx.modelRouteSessionRegistry;
 	const isSubagent = isClaudeCodeSubagent(req.headers);
+	requestMeta.routeLineage = deriveClaudeCodeRouteLineage(req.headers, {
+		callerIdentity: routeCallerIdentity(req, apiKeyId),
+		sessionId,
+	});
 	const { project, projectAttributionSource } =
 		extractProjectAttributionFromRequest(req.headers, parsedBody);
 
@@ -1047,6 +1094,7 @@ async function handleProxyCoreImpl(
 			: new RequestBodyContext(finalBodyBuffer);
 	const effectiveModelAfterInterception =
 		finalRequestBodyContext.getModel()?.trim() ?? null;
+	requestMeta.requestedLogicalModel = effectiveModelAfterInterception;
 	const originalReservedPicker =
 		normalizedRequestModel?.startsWith(MODEL_ROUTE_PROFILE_MODEL_PREFIX) ===
 		true;
@@ -1061,6 +1109,17 @@ async function handleProxyCoreImpl(
 		effectiveModelAfterInterception !== null &&
 		modelRouteRegistry?.hasPublicModelId(effectiveModelAfterInterception) ===
 			true;
+	const serverToolPreview =
+		finalRequestBodyContext.previewServerToolRequirements();
+	const isServerToolHelper =
+		serverToolPreview !== undefined &&
+		!isSubagent &&
+		!configuredOriginalPicker &&
+		!configuredEffectivePicker;
+	const inheritsRouteProfile = isSubagent || isServerToolHelper;
+	if (isServerToolHelper) {
+		requestMeta.routeLineage = { kind: "helper", childHomeKey: null };
+	}
 	// A stale picker selected directly in /model is not a native clear. Children,
 	// however, are classified entirely by their post-interception effective model.
 	if (!isSubagent && originalReservedPicker && !configuredOriginalPicker) {
@@ -1071,14 +1130,14 @@ async function handleProxyCoreImpl(
 			effectiveModelAfterInterception ?? "unknown",
 		);
 	}
-	const modelRouteRequestModel = isSubagent
+	const modelRouteRequestModel = inheritsRouteProfile
 		? effectiveModelAfterInterception
 		: normalizedRequestModel;
 	const modelRouteResolutionInput = {
 		callerIdentity: routeCallerIdentity(req, apiKeyId),
 		requestModel: modelRouteRequestModel,
 		sessionId: req.headers.get("x-claude-code-session-id"),
-		isSubagent,
+		isSubagent: inheritsRouteProfile,
 	};
 	const modelRouteResolution = modelRouteRegistry?.resolve(
 		modelRouteResolutionInput,
@@ -1110,6 +1169,7 @@ async function handleProxyCoreImpl(
 		requestMeta.routeExpectedProvider = profile.expectedProvider;
 		const inheritedPickerModel =
 			source === "inherited" && configuredEffectivePicker;
+		const inheritedHelperModel = source === "inherited" && isServerToolHelper;
 		if (
 			inheritedPickerModel &&
 			(effectiveModelAfterInterception === null ||
@@ -1128,7 +1188,7 @@ async function handleProxyCoreImpl(
 			finalBodyBuffer = finalRequestBodyContext.getBuffer();
 			appliedModel = profile.logicalModel;
 			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
-		} else if (inheritedPickerModel) {
+		} else if (inheritedPickerModel || inheritedHelperModel) {
 			finalRequestBodyContext.setModel(profile.logicalModel);
 			finalBodyBuffer = finalRequestBodyContext.getBuffer();
 			appliedModel = profile.logicalModel;
@@ -1533,10 +1593,7 @@ async function handleProxyCoreImpl(
 			);
 			return finishPacing(
 				pacingObservation?.slot ?? null,
-				forceRouteUnavailableResponse(
-					error,
-					requestMeta.routeProfileId == null,
-				),
+				createRecordedForceRouteResponse(error),
 			);
 		}
 		if (serverToolRequirements) {
@@ -1608,8 +1665,13 @@ async function handleProxyCoreImpl(
 
 		const now = Date.now();
 		const available: Account[] = [];
+		const availableRoutingCandidates: RoutingCandidateMetadata[] = [];
 		const predictivelyThrottled: Account[] = [];
 		const reactivelyDepletedAccounts: Account[] = [];
+		const alignedCandidates = alignRouteCandidates(
+			accounts,
+			requestMeta.routingCandidates,
+		);
 
 		// Model-aware throttling: a per-model weekly cap should only throttle
 		// requests for that model. Use the effective (post-intercept) request
@@ -1622,8 +1684,10 @@ async function handleProxyCoreImpl(
 		const comboRouted = requestMeta.comboName != null;
 		const effectiveModel = appliedModel ?? requestModel ?? null;
 
-		for (const account of accounts) {
-			const candidateModel = comboRouted ? null : effectiveModel;
+		for (const [index, account] of accounts.entries()) {
+			const candidateModel = comboRouted
+				? null
+				: (alignedCandidates[index]?.effectiveLogicalModel ?? effectiveModel);
 			const throttleUntil = getPredictiveThrottleUntil(
 				account,
 				candidateModel,
@@ -1647,6 +1711,11 @@ async function handleProxyCoreImpl(
 				continue;
 			}
 			available.push(account);
+			const alignedCandidate = alignedCandidates[index];
+			if (alignedCandidate) availableRoutingCandidates.push(alignedCandidate);
+		}
+		if (alignedCandidates.every((candidate) => candidate !== undefined)) {
+			requestMeta.routingCandidates = availableRoutingCandidates;
 		}
 
 		if (predictivelyThrottled.length > 0) {
@@ -1804,10 +1873,7 @@ async function handleProxyCoreImpl(
 				);
 				return finishPacing(
 					pacingObservation?.slot ?? null,
-					forceRouteUnavailableResponse(
-						error,
-						requestMeta.routeProfileId == null,
-					),
+					createRecordedForceRouteResponse(error),
 				);
 			}
 			if (serverToolRequirements) {
@@ -1848,10 +1914,7 @@ async function handleProxyCoreImpl(
 		if (!(error instanceof ForceRouteUnavailableError)) return null;
 		await routingAttemptLedger.discardTerminalResponse();
 		if (!isFinalCandidate) return null;
-		return finishPacing(
-			pacingSlot,
-			forceRouteUnavailableResponse(error, requestMeta.routeProfileId == null),
-		);
+		return finishPacing(pacingSlot, createRecordedForceRouteResponse(error));
 	};
 	routingAttemptLedger.bindPhysicalAttemptBudgetTerminal({
 		requestId: requestMeta.id,
@@ -2236,9 +2299,13 @@ async function handleProxyCoreImpl(
 			sequence: deferredModelRoutes.length,
 		});
 	};
-	const selectedRouteCandidateIds = alignRouteCandidateIds(
+	const selectedRouteCandidates = alignRouteCandidates(
 		accounts,
 		requestMeta.routingCandidates,
+	);
+	const selectedRouteCandidateIds = selectedRouteCandidates.map(
+		(candidate, index) =>
+			candidate?.candidateId ?? `account:${accounts[index]?.id ?? "unknown"}`,
 	);
 	for (const route of selectedCapacityDeferredRoutes) {
 		deferModelRoute(
@@ -2329,6 +2396,7 @@ async function handleProxyCoreImpl(
 	};
 	const settleRoutedResponse = async (
 		candidate: PreparedProxyAccountResponse | Response,
+		commitSuccessfulCandidateHome: () => void,
 	): Promise<SettledRouteResponse | null> => {
 		if (req.signal.aborted) {
 			try {
@@ -2352,6 +2420,7 @@ async function handleProxyCoreImpl(
 		}
 		if (!isPreparedProxyAccountResponse(candidate)) {
 			await routingAttemptLedger.discardTerminalResponse();
+			if (candidate.ok) commitSuccessfulCandidateHome();
 			return { response: candidate, candidateWon: true };
 		}
 		// Caller cancellation owns the terminal even when an earlier route left a
@@ -2359,10 +2428,14 @@ async function handleProxyCoreImpl(
 		// HTTP status: an upstream provider is allowed to return its own 499.
 		if (candidate.disposition === "irreversible_no_replay") {
 			await routingAttemptLedger.discardTerminalResponse();
+			if (candidate.response.ok) commitSuccessfulCandidateHome();
 			return { response: await candidate.commit(), candidateWon: true };
 		}
 		if (candidate.response.ok && candidate.canSupersedeRetainedTerminal()) {
 			await routingAttemptLedger.discardTerminalResponse();
+			// Commit after arbitration but before forwardToClient captures route-home
+			// provenance in durable request history and response metadata.
+			commitSuccessfulCandidateHome();
 			return { response: await candidate.commit(), candidateWon: true };
 		}
 		// A failed or rescue-incompatible non-final candidate is only one queue
@@ -2374,10 +2447,22 @@ async function handleProxyCoreImpl(
 		}
 		const retainedTerminalResponse = await deliverRetainedTerminalResponse();
 		if (!retainedTerminalResponse) {
+			// A failed terminal may win delivery, but only a successful lane can own
+			// a descendant home.
 			return { response: await candidate.commit(), candidateWon: true };
 		}
 		await candidate.discard("superseded by retained upstream terminal");
 		return { response: retainedTerminalResponse, candidateWon: false };
+	};
+	const commitDescendantRouteHome = (
+		account: Account,
+		candidateId: string,
+	): void => {
+		requestMeta.routeHomeAction =
+			ctx.strategy.commitDescendantAffinityOwner?.(requestMeta, {
+				candidateId,
+				accountId: account.id,
+			}) ?? "none";
 	};
 	const recordServerToolCandidateCapabilityFailure = (
 		error: ServerToolCandidateCapabilityError,
@@ -2610,7 +2695,9 @@ async function handleProxyCoreImpl(
 		}
 		if (!response) return null;
 
-		const settled = await settleRoutedResponse(response);
+		const settled = await settleRoutedResponse(response, () =>
+			commitDescendantRouteHome(route.account, route.candidateId),
+		);
 		if (!settled) return null;
 		if (settled.candidateWon) {
 			recordXaiAffinityIfServed(
@@ -2752,7 +2839,9 @@ async function handleProxyCoreImpl(
 			pacingBypassed = false;
 			requestMeta.codexPacingAction = "crossover-paced";
 		}
-		// For combo routing: enrich metadata with slot index and look up model override
+		// Candidate metadata is the general execution sidecar. Combo slot state
+		// remains the attribution source for combo-specific observability.
+		const selectedCandidate = selectedRouteCandidates[i];
 		let modelOverride: string | null = null;
 		if (filteredComboInfo?.slots[i]) {
 			const slot = filteredComboInfo.slots[i];
@@ -2767,9 +2856,17 @@ async function handleProxyCoreImpl(
 			log.debug(
 				`Attempting combo slot ${i}/${accounts.length - 1} on account ${accounts[i].name} with model "${modelOverride}"`,
 			);
+		} else if (
+			selectedCandidate?.modelOverride &&
+			selectedCandidate.modelOverride !== effectiveModel
+		) {
+			modelOverride = selectedCandidate.modelOverride;
 		}
 
-		const attemptModel = modelOverride ?? effectiveModel;
+		const attemptModel =
+			selectedCandidate?.effectiveLogicalModel ??
+			modelOverride ??
+			effectiveModel;
 		// Normal routes were filtered above. Combo slots need this attempt-level
 		// check because each slot may override the model independently.
 		if (
@@ -2844,7 +2941,7 @@ async function handleProxyCoreImpl(
 					// Only a genuine combo slot carries a pre-override baseline;
 					// the desync edge case above leaves modelOverride null so no
 					// override is attributed there either.
-					modelOverride ? effectiveModel : null,
+					filteredComboInfo && modelOverride ? effectiveModel : null,
 				),
 				anthropicDegradedSendState,
 			);
@@ -2893,7 +2990,9 @@ async function handleProxyCoreImpl(
 			);
 		}
 		if (response) {
-			const settled = await settleRoutedResponse(response);
+			const settled = await settleRoutedResponse(response, () =>
+				commitDescendantRouteHome(accounts[i], candidateId),
+			);
 			if (settled) {
 				if (settled.candidateWon) {
 					recordXaiAffinityIfServed(settled.response, accounts[i], candidateId);
@@ -2938,9 +3037,15 @@ async function handleProxyCoreImpl(
 	// 503 against what may be a perfectly healthy account.
 	if (!anyAccountAttempted && accounts.length > 0) {
 		const i = 0;
+		const selectedCandidate = selectedRouteCandidates[i];
 		let modelOverride: string | null = null;
 		if (filteredComboInfo?.slots[i]?.accountId === accounts[i].id) {
 			modelOverride = filteredComboInfo.slots[i].modelOverride;
+		} else if (
+			selectedCandidate?.modelOverride &&
+			selectedCandidate.modelOverride !== effectiveModel
+		) {
+			modelOverride = selectedCandidate.modelOverride;
 		}
 		log.info(
 			`All ${accounts.length} candidate account(s) were probe-gate suppressed; retrying account ${accounts[i].name} ungated`,
@@ -2987,7 +3092,7 @@ async function handleProxyCoreImpl(
 					// null, which recorded a real slot-level rewrite as "no
 					// override" and hid it from comboModelOverride attribution
 					// and from the model-routing drift alert.
-					modelOverride ? effectiveModel : null,
+					filteredComboInfo && modelOverride ? effectiveModel : null,
 				),
 				anthropicDegradedSendState,
 			);
@@ -3023,7 +3128,9 @@ async function handleProxyCoreImpl(
 			);
 		}
 		if (response) {
-			const settled = await settleRoutedResponse(response);
+			const settled = await settleRoutedResponse(response, () =>
+				commitDescendantRouteHome(accounts[i], candidateId),
+			);
 			if (settled) {
 				if (settled.candidateWon) {
 					recordXaiAffinityIfServed(settled.response, accounts[i], candidateId);
@@ -3274,20 +3381,26 @@ async function handleProxyCoreImpl(
 					);
 				}
 				if (response) {
-					const settled = await settleRoutedResponse(response);
+					const fallbackAccount = fallbackAccounts[i];
+					if (!fallbackAccount) {
+						throw new Error("fallback candidate alignment lost");
+					}
+					const settled = await settleRoutedResponse(response, () =>
+						commitDescendantRouteHome(fallbackAccount, candidateId),
+					);
 					if (settled) {
 						if (settled.candidateWon) {
 							recordXaiAffinityIfServed(
 								settled.response,
-								fallbackAccounts[i],
+								fallbackAccount,
 								candidateId,
 							);
 							recordCachePacingRoute(
 								pacingObservation,
 								{
-									accountId: fallbackAccounts[i].id,
-									accountName: fallbackAccounts[i].name,
-									provider: fallbackAccounts[i].provider,
+									accountId: fallbackAccount.id,
+									accountName: fallbackAccount.name,
+									provider: fallbackAccount.provider,
 								},
 								{
 									candidate: pacingEligible,
@@ -3382,20 +3495,26 @@ async function handleProxyCoreImpl(
 					);
 				}
 				if (response) {
-					const settled = await settleRoutedResponse(response);
+					const fallbackAccount = fallbackAccounts[i];
+					if (!fallbackAccount) {
+						throw new Error("fallback candidate alignment lost");
+					}
+					const settled = await settleRoutedResponse(response, () =>
+						commitDescendantRouteHome(fallbackAccount, candidateId),
+					);
 					if (settled) {
 						if (settled.candidateWon) {
 							recordXaiAffinityIfServed(
 								settled.response,
-								fallbackAccounts[i],
+								fallbackAccount,
 								candidateId,
 							);
 							recordCachePacingRoute(
 								pacingObservation,
 								{
-									accountId: fallbackAccounts[i].id,
-									accountName: fallbackAccounts[i].name,
-									provider: fallbackAccounts[i].provider,
+									accountId: fallbackAccount.id,
+									accountName: fallbackAccount.name,
+									provider: fallbackAccount.provider,
 								},
 								{
 									candidate: pacingEligible,

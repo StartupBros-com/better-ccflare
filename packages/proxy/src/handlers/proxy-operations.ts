@@ -2534,6 +2534,20 @@ export async function proxyWithAccount(
 				? { admission: anthropicDegraded, lifecycle: null, tracker: null }
 				: undefined;
 	const preCommitRescue = modelFallbackPolicy?.anthropicPreCommitRescue;
+	const routeCandidateId =
+		modelFallbackPolicy?.routeCandidateId ?? `account:${account.id}`;
+	const routeCandidateMetadata = routeCandidateId
+		? requestMeta.routingCandidateCatalog?.find(
+				(candidate) => candidate.candidateId === routeCandidateId,
+			)
+		: undefined;
+	const recordRoutingAttempt = (attempt: RoutingAttemptWrite): void => {
+		enqueueRoutingAttempt(ctx, {
+			...attempt,
+			routeFallbackRung: routeCandidateMetadata?.routeFallbackRung ?? null,
+			routeCandidateId,
+		});
+	};
 	let preparedResponseOwnsLifecycle = false;
 	const canPreparedResponseSupersedeRetainedTerminal = (
 		candidate: Response,
@@ -2939,8 +2953,6 @@ export async function proxyWithAccount(
 			replay: RequestPrivateServerToolReplay;
 		}>;
 		const serverToolRequirements = requestMeta.serverToolRequirements;
-		const routeCandidateId =
-			modelFallbackPolicy?.routeCandidateId ?? `account:${account.id}`;
 		const candidateCapabilityError = (
 			reason: ConstructorParameters<
 				typeof ServerToolCandidateCapabilityError
@@ -3073,9 +3085,19 @@ export async function proxyWithAccount(
 			physicalModel: string | null,
 			requireSelectedCandidateBinding = false,
 		): ProviderAttemptPlan => {
+			const routeConstraintMeta =
+				routeCandidateMetadata?.routeConstraintMode === "ordinary"
+					? {
+							routeProfileId: null,
+							routeProfileSelection: null,
+							routeExpectedProvider: null,
+							routeExpectedPhysicalModel: null,
+							routeProfileExpectedPhysicalModel: null,
+						}
+					: requestMeta;
 			const constraintViolation = getRouteProfileConstraintViolation(
 				account,
-				requestMeta,
+				routeConstraintMeta,
 				admittedRequestModel,
 				physicalModel,
 			);
@@ -5054,7 +5076,7 @@ export async function proxyWithAccount(
 				`Account ${account.name} returned payment required (402${attemptedModel ? `, model=${attemptedModel}` : ""}) — ` +
 					"applying bounded account probe cooldown and failing over without model fallback",
 			);
-			enqueueRoutingAttempt(ctx, {
+			recordRoutingAttempt({
 				parentRequestId: requestMeta.id,
 				timestamp: Date.now(),
 				provider: account.provider,
@@ -5114,7 +5136,7 @@ export async function proxyWithAccount(
 				`Account ${account.name} extra_usage_exhausted (400${attemptedModel ? `, model=${attemptedModel}` : ""}) — ` +
 					"retaining the original response and continuing request-local failover without a global cooldown",
 			);
-			enqueueRoutingAttempt(ctx, {
+			recordRoutingAttempt({
 				parentRequestId: requestMeta.id,
 				timestamp: Date.now(),
 				provider: account.provider,
@@ -5205,7 +5227,7 @@ export async function proxyWithAccount(
 					}x-should-retry with no rate-limit window) — request-scoped, ` +
 						`NOT benching account; failing over to next account`,
 				);
-				enqueueRoutingAttempt(ctx, {
+				recordRoutingAttempt({
 					parentRequestId: requestMeta.id,
 					timestamp: Date.now(),
 					provider: account.provider,
@@ -5299,7 +5321,7 @@ export async function proxyWithAccount(
 						`(model=${attemptedModel ?? "unknown"}, family=${decision.family ?? "unknown"}, reason=${decision.reason}) — ` +
 						"benching account and stopping same-account model fallback",
 				);
-				enqueueRoutingAttempt(ctx, {
+				recordRoutingAttempt({
 					parentRequestId: requestMeta.id,
 					timestamp: Date.now(),
 					provider: account.provider,
@@ -5388,7 +5410,7 @@ export async function proxyWithAccount(
 					`(model=${attemptedModel}, family=${decision.family}, evidence_age_ms=${decision.snapshotAgeMs ?? "unknown"}) — ` +
 					"NOT benching account; pruning only the evidenced route scope",
 			);
-			enqueueRoutingAttempt(ctx, {
+			recordRoutingAttempt({
 				parentRequestId: requestMeta.id,
 				timestamp: Date.now(),
 				provider: account.provider,
@@ -5490,7 +5512,7 @@ export async function proxyWithAccount(
 				`Account ${account.name} out_of_credits (429${attemptedModel ? `, model=${attemptedModel}` : ""}) — ` +
 					"model/beta-scoped, NOT benching account; pruning this exact model from request-local routing",
 			);
-			enqueueRoutingAttempt(ctx, {
+			recordRoutingAttempt({
 				parentRequestId: requestMeta.id,
 				timestamp: Date.now(),
 				provider: account.provider,
@@ -5701,7 +5723,7 @@ export async function proxyWithAccount(
 						const routeSuppressed = routingAttemptLedger !== undefined;
 						const attemptedModel = currentTransportModel ?? requestedModel;
 						routingAttemptLedger?.blockAccount(account.id);
-						enqueueRoutingAttempt(ctx, {
+						recordRoutingAttempt({
 							parentRequestId: requestMeta.id,
 							timestamp: Date.now(),
 							provider: account.provider,
@@ -5802,7 +5824,7 @@ export async function proxyWithAccount(
 							const accountBenched = appliedCooldown(account, cooldownBefore);
 							const routeSuppressed = routingAttemptLedger !== undefined;
 							routingAttemptLedger?.blockAccount(account.id);
-							enqueueRoutingAttempt(ctx, {
+							recordRoutingAttempt({
 								parentRequestId: requestMeta.id,
 								timestamp: Date.now(),
 								provider: account.provider,
@@ -6275,7 +6297,7 @@ export async function proxyWithAccount(
 							const accountBenched = appliedCooldown(account, cooldownBefore);
 							const routeSuppressed = routingAttemptLedger !== undefined;
 							routingAttemptLedger?.blockAccount(account.id);
-							enqueueRoutingAttempt(ctx, {
+							recordRoutingAttempt({
 								parentRequestId: requestMeta.id,
 								timestamp: Date.now(),
 								provider: account.provider,
@@ -7175,7 +7197,7 @@ export async function proxyWithAccount(
 			): Promise<void> => {
 				if (!rateLimitObservation) return;
 				const attemptedModel = currentTransportModel ?? null;
-				enqueueRoutingAttempt(ctx, {
+				recordRoutingAttempt({
 					parentRequestId: requestMeta.id,
 					timestamp: Date.now(),
 					provider: account.provider,

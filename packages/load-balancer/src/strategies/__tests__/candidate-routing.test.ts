@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import {
+	clearAllProbeBackoff,
+	PROBE_BACKOFF_PENALTY_THRESHOLD_MS,
+	setProbeBackoff,
+} from "@better-ccflare/core";
+import {
 	LeastUsedStrategy,
 	SessionAffinityStrategy,
 	SessionStrategy,
@@ -54,6 +59,7 @@ function candidate(
 	tier: number,
 	ordinal: number,
 	band?: "cold" | "critical",
+	routeFallbackRung?: RoutingCandidateMetadata["routeFallbackRung"],
 ): RoutingCandidateMetadata {
 	return {
 		candidateId,
@@ -65,6 +71,7 @@ function candidate(
 		quotaPressure: band
 			? { band, comparisonKey: "same-subscription-window" }
 			: null,
+		routeFallbackRung,
 	};
 }
 
@@ -132,6 +139,98 @@ describe("atomic strategy candidates", () => {
 		expect(
 			requestMeta.routingCandidates?.map((item) => item.candidateId),
 		).toEqual(["slot-a", "slot-b"]);
+	});
+
+	it("orders descendant fallback rungs before account priority", async () => {
+		const strategy = new SessionStrategy();
+		strategy.initialize(store);
+		const requested = account("requested", 50);
+		const rootFallback = account("root-fallback", 0);
+		const globalFallback = account("global-fallback", -10);
+		const requestMeta = meta([
+			candidate(
+				"requested-slot",
+				requested.id,
+				requested.priority,
+				0,
+				undefined,
+				"profile_requested_model",
+			),
+			candidate(
+				"root-slot",
+				rootFallback.id,
+				rootFallback.priority,
+				1,
+				undefined,
+				"profile_root_model",
+			),
+			candidate(
+				"global-slot",
+				globalFallback.id,
+				globalFallback.priority,
+				2,
+				undefined,
+				"global_requested_model",
+			),
+		]);
+
+		const ordered = await strategy.select(
+			[requested, rootFallback, globalFallback],
+			requestMeta,
+		);
+
+		expect(ordered.map((item) => item.id)).toEqual([
+			"requested",
+			"root-fallback",
+			"global-fallback",
+		]);
+		expect(
+			requestMeta.routingCandidates?.map((item) => item.candidateId),
+		).toEqual(["requested-slot", "root-slot", "global-slot"]);
+	});
+
+	it("keeps descendant fallback rungs ahead of probe-backoff penalties", async () => {
+		const strategy = new SessionStrategy();
+		strategy.initialize(store);
+		const requested = account("requested-backed-off", 50);
+		const rootFallback = account("root-healthy", 0);
+		setProbeBackoff(
+			requested.id,
+			Date.now() + PROBE_BACKOFF_PENALTY_THRESHOLD_MS,
+		);
+
+		try {
+			const requestMeta = meta([
+				candidate(
+					"requested-backed-off-slot",
+					requested.id,
+					requested.priority,
+					0,
+					undefined,
+					"profile_requested_model",
+				),
+				candidate(
+					"root-healthy-slot",
+					rootFallback.id,
+					rootFallback.priority,
+					1,
+					undefined,
+					"profile_root_model",
+				),
+			]);
+
+			const ordered = await strategy.select(
+				[requested, rootFallback],
+				requestMeta,
+			);
+
+			expect(ordered.map((item) => item.id)).toEqual([
+				requested.id,
+				rootFallback.id,
+			]);
+		} finally {
+			clearAllProbeBackoff();
+		}
 	});
 
 	it("SessionAffinityStrategy sticks to candidate identity for duplicate-account slots", async () => {

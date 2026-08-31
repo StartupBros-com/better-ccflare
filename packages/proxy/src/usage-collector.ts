@@ -1653,6 +1653,7 @@ export class UsageCollector {
 					state.agentAttributionSource ?? null,
 					msg.streamTerminalState ?? null,
 					startMessage.clientSessionId ?? null,
+					startMessage.routeProvenance ?? null,
 				);
 			} catch (error) {
 				log.error(
@@ -1810,6 +1811,7 @@ export class UsageCollector {
 			projectAttributionSource: state.projectAttributionSource ?? undefined,
 			agentAttributionSource: state.agentAttributionSource ?? undefined,
 			clientSessionId: startMessage.clientSessionId ?? undefined,
+			routeProvenance: startMessage.routeProvenance ?? undefined,
 			// Same value handed to saveRequest above, so a dashboard does not have
 			// to reload before a request shows its terminal state. Note this is
 			// the value as REPORTED, not as persisted: the save is an

@@ -7,6 +7,9 @@ import type {
 import type {
 	AgentAttributionSource,
 	ProjectAttributionSource,
+	RouteFallbackRung,
+	RouteHomeAction,
+	RouteRepinReason,
 } from "./request";
 
 /** Combo slot routing info indexed exactly like the returned account array. */
@@ -16,6 +19,21 @@ export interface ComboSlotInfo {
 	/** Account/model pairs, indexed by position in the returned accounts array. */
 	slots: Array<{ accountId: string; modelOverride: string }>;
 }
+
+/** Server-derived request lineage used only by internal routing state. */
+export type RouteLineageMetadata =
+	| {
+			readonly kind: "root" | "helper";
+			readonly childHomeKey: null;
+	  }
+	| {
+			readonly kind: "descendant";
+			/** Restart-scoped opaque key; never the raw Claude Code agent id. */
+			readonly childHomeKey: string | null;
+	  };
+
+/** Candidate-local route-profile constraint policy. */
+export type RouteConstraintMode = "profile" | "ordinary";
 
 /**
  * Immutable routing identity for one configured candidate. Normal routes use
@@ -33,6 +51,12 @@ export interface RoutingCandidateMetadata {
 	modelOverride: string | null;
 	/** Model-lane pressure for this exact candidate, when safely comparable. */
 	quotaPressure: AccountQuotaPressure | null;
+	/** Fallback position represented by this candidate, when descendant routing applies. */
+	routeFallbackRung?: RouteFallbackRung | null;
+	/** Logical model evaluated by this exact fallback candidate. */
+	effectiveLogicalModel?: string | null;
+	/** Whether this candidate keeps profile constraints or uses ordinary admission. */
+	routeConstraintMode?: RouteConstraintMode | null;
 	/**
 	 * Exact server-tool admission result for this candidate and physical model.
 	 * Absent for ordinary requests so legacy routing sidecars remain unchanged.
@@ -162,6 +186,18 @@ export interface RequestMeta {
 	headers?: Headers;
 	/** Server-derived exact-account route. Never populated directly from a public header. */
 	forcedAccountId?: string | null;
+	/** Internal trusted lineage; raw child-agent identity is never retained here. */
+	routeLineage?: RouteLineageMetadata | null;
+	/** Client-requested logical model used to compile a descendant route plan. */
+	requestedLogicalModel?: string | null;
+	/** Outcome of success-conditioned descendant-home handling for this request. */
+	routeHomeAction?: RouteHomeAction | null;
+	/** Candidate observed as the live home before descendant selection. */
+	routeHomeExpectedCandidateId?: string | null;
+	/** Selection proved that the expected home could not serve this request. */
+	routeHomeReplacementAllowed?: boolean;
+	/** Why an established descendant home was replaced, if one was replaced. */
+	routeRepinReason?: RouteRepinReason | null;
 	/** Restart-scoped model route profile that produced the server-derived route. */
 	routeProfileId?: string | null;
 	/** Selection mode of the route profile; capability profiles use a live account pool. */

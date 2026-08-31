@@ -86,6 +86,53 @@ describe("RequestRepository.save - original_model/applied_model", () => {
 		expect(row.applied_model).toBeNull();
 	});
 
+	it("persists accepted route provenance without changing rewrite columns", async () => {
+		await repo.save({
+			id: "req-route-provenance",
+			method: "POST",
+			path: "/v1/messages",
+			accountUsed: "account-a",
+			statusCode: 200,
+			success: true,
+			errorMessage: null,
+			responseTime: 100,
+			failoverAttempts: 1,
+			routeProvenance: {
+				profileId: "sol-capability",
+				requestedModel: "claude-sonnet-5",
+				routedProvider: "codex",
+				routedModel: "gpt-5.6-sol",
+				fallbackRung: "profile_root_model",
+				homeAction: "repinned",
+				repinReason: "route_circuit_open",
+				candidateId: "candidate-a",
+			},
+		});
+
+		const row = db
+			.prepare(
+				`SELECT route_profile_id, requested_route_model, routed_provider,
+					routed_model, route_fallback_rung, route_home_action,
+					route_repin_reason, route_candidate_id,
+					original_model, applied_model
+				 FROM requests WHERE id = ?`,
+			)
+			.get("req-route-provenance") as Record<string, string | null>;
+
+		expect(row).toMatchObject({
+			route_profile_id: "sol-capability",
+			requested_route_model: "claude-sonnet-5",
+			routed_provider: "codex",
+			routed_model: "gpt-5.6-sol",
+			route_fallback_rung: "profile_root_model",
+			route_home_action: "repinned",
+			route_repin_reason: "route_circuit_open",
+			route_candidate_id: "candidate-a",
+			original_model: null,
+			applied_model: null,
+		});
+	});
+
 	it("ON CONFLICT upsert preserves previously-set values via COALESCE when the second write omits them", async () => {
 		await repo.save({
 			id: "req-upsert",

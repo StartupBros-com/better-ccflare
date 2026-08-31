@@ -7,6 +7,7 @@ import type { CacheFlightCohortSealReceipt } from "@better-ccflare/core";
 import type {
 	AgentAttributionSource,
 	ProjectAttributionSource,
+	RouteProvenance,
 } from "@better-ccflare/types";
 
 // ===== MAIN THREAD → WORKER =====
@@ -87,6 +88,9 @@ export interface StartMessage {
 	cacheFlightRecorderEligible?: boolean;
 	cacheFlightRecorderNativeActive?: boolean;
 	cacheFlightCohortSealReceipt?: CacheFlightCohortSealReceipt | null;
+
+	// Winner or typed-terminal route provenance. Optional for legacy producers.
+	routeProvenance?: RouteProvenance | null;
 
 	// Retry info
 	retryAttempt: number;

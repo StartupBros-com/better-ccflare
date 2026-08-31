@@ -14,6 +14,18 @@ const PRESSURE_RANK = {
 	critical: 5,
 } as const;
 
+const ROUTE_FALLBACK_RANK = {
+	profile_requested_model: 0,
+	profile_root_model: 1,
+	global_requested_model: 2,
+} as const;
+
+function routeFallbackRank(candidate: RoutingCandidateMetadata): number {
+	return candidate.routeFallbackRung
+		? ROUTE_FALLBACK_RANK[candidate.routeFallbackRung]
+		: 0;
+}
+
 /** One account and the immutable route candidate it represents. */
 export interface StrategyCandidate {
 	account: Account;
@@ -170,6 +182,10 @@ export function compareStrategyCandidates(
 	b: StrategyCandidate,
 	meta?: RequestMeta,
 ): number {
+	const fallbackOrder =
+		routeFallbackRank(a.routing) - routeFallbackRank(b.routing);
+	if (fallbackOrder !== 0) return fallbackOrder;
+
 	if (a.routing.tier !== b.routing.tier) {
 		return a.routing.tier - b.routing.tier;
 	}
@@ -194,14 +210,18 @@ export function compareStrategyCandidates(
 }
 
 /**
- * Apply SessionStrategy's probe-backoff penalty before its immutable candidate
- * tier while preserving exact candidate identity and quota-pressure ordering.
+ * Preserve the descendant fallback ladder before applying SessionStrategy's
+ * probe-backoff penalty within one rung. A penalty can reorder accounts but
+ * must never grant a fallback route eligibility ahead of the requested route.
  */
 export function compareSessionStrategyCandidates(
 	a: StrategyCandidate,
 	b: StrategyCandidate,
 	meta?: RequestMeta,
 ): number {
+	const fallbackOrder =
+		routeFallbackRank(a.routing) - routeFallbackRank(b.routing);
+	if (fallbackOrder !== 0) return fallbackOrder;
 	const probePreference =
 		probeBackoffRank(a.account.id) - probeBackoffRank(b.account.id);
 	if (probePreference !== 0) return probePreference;
@@ -241,6 +261,11 @@ export function isSameStrategyCandidateClass(
 	best: StrategyCandidate,
 	meta?: RequestMeta,
 ): boolean {
+	if (
+		routeFallbackRank(candidate.routing) !== routeFallbackRank(best.routing)
+	) {
+		return false;
+	}
 	if (candidate.routing.tier !== best.routing.tier) return false;
 
 	const candidatePressure =
