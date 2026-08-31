@@ -20,7 +20,7 @@ export const CODEX_SERVER_TOOL_ENDPOINT =
 	"https://chatgpt.com/backend-api/codex/responses" as const;
 export const CODEX_SERVER_TOOL_ENDPOINT_CLASS = "codex_responses" as const;
 export const CODEX_SERVER_TOOL_PROVIDER_CONTRACT_REVISION =
-	"codex-responses-web-search-v1" as const;
+	"codex-responses-web-search-v2" as const;
 export const CODEX_SERVER_TOOL_REPLAY_DECODER_REVISION =
 	"server-tool-replay-v1" as const;
 export const CODEX_SERVER_TOOL_REQUEST_TRANSPORT = "openai_responses" as const;
@@ -300,7 +300,7 @@ export function resolveCodexServerToolCapability(
 		owner: "providers/codex",
 		verifiedAt: "2026-07-29T00:00:00.000Z",
 		revalidateAfter: "9999-12-31T23:59:59.999Z",
-		fixtureRevision: "codex-official-responses-web-search-v1",
+		fixtureRevision: "codex-official-responses-web-search-v2",
 		contractRevision: CODEX_SERVER_TOOL_PROVIDER_CONTRACT_REVISION,
 		revalidationTriggers: REVALIDATION_TRIGGERS,
 	});
@@ -339,7 +339,6 @@ export interface CodexWebSearchTool {
 export interface CodexServerToolRequestMapping {
 	readonly tools: readonly (CodexFunctionTool | CodexWebSearchTool)[];
 	readonly include: readonly [typeof SOURCE_INCLUDE];
-	readonly max_tool_calls?: number;
 }
 
 export interface CodexServerToolRequestMappingPolicy {
@@ -664,9 +663,6 @@ export function mapCodexServerToolRequest(
 		return deepFreeze({
 			tools: mappedTools,
 			include: [SOURCE_INCLUDE] as [typeof SOURCE_INCLUDE],
-			...(declaration.maxUses === undefined
-				? {}
-				: { max_tool_calls: declaration.maxUses }),
 		});
 	} catch {
 		throw rejected();

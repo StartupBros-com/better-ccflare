@@ -1601,6 +1601,7 @@ describe("server-tool routing integration", () => {
 				tools: [{ type: "web_search" }],
 				tool_choice: { type: "web_search" },
 			});
+			expect(outboundBodies[0]).not.toHaveProperty("max_tool_calls");
 		} finally {
 			if (originalContextAdmission === undefined) {
 				delete process.env.CCFLARE_CONTEXT_ADMISSION;
