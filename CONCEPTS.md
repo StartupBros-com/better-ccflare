@@ -25,6 +25,12 @@ The first successful provider, account class, and physical-model lane selected f
 conversation. Later turns prefer that home for cache and turn continuity; a genuine
 availability failure may establish a new home without remapping the parent or siblings.
 
+### Fallback rung
+
+A semantically ordered tier of authorized routes in a capability descendant's candidate plan.
+Ranking may reorder accounts within one rung but cannot move a lower-authority rung ahead of a
+higher-authority rung or add a route that authorization did not admit.
+
 ### Trusted internal helper
 
 A Claude Code side request, such as WebSearch, whose authenticated caller and session lineage

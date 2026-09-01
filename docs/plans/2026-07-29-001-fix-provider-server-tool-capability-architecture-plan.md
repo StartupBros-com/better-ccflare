@@ -5,13 +5,24 @@ date: 2026-07-29
 reconciled: 2026-08-08
 topic: provider-server-tool-capabilities
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: implementation-ready
+artifact_readiness: historical
 product_contract_source: ce-plan-bootstrap
 execution: code
 planning_base_sha: 93fc8e17f36e83de529ba785ba7676fe85467eef
+implementation_status: shipped
+operational_status: deployed-and-verified
+closed: 2026-09-01
+shipped_prs:
+  foundation: 129
+  forced_choice_compatibility: 287
+  live_contract_corrections: "290-306"
 ---
 
 # Codex Native Hosted Web Search on Current Main - Implementation Plan
+
+> **Closed implementation record (2026-09-01).** The native Codex Hosted WebSearch foundation shipped in [PR #129](https://github.com/StartupBros-com/better-ccflare/pull/129) (`77c82ca40`). Live Claude Code compatibility and current ChatGPT Codex response semantics were completed by [PR #287](https://github.com/StartupBros-com/better-ccflare/pull/287) and PRs [#290](https://github.com/StartupBros-com/better-ccflare/pull/290)–[#306](https://github.com/StartupBros-com/better-ccflare/pull/306): beta-query semantic aliasing and attempt-plan parity (#290–#291), removal of unsupported request fields (#292–#293), forced-choice mapping (#294), bounded privacy-safe diagnostics (#295–#302), multi-query/source-less search decoding (#303), auxiliary open/find actions (#304), authoritative completed-action handling (#305), and latest source-less-search citation attribution (#306). The final contract ran on `refs/heads/main` as version 3.5.70 / runtime `a1ae9169`; naturally initiated Claude Code WebSearch completed with one physical attempt and valid citations. The qualified post-success observation is recorded in the descendant-routing plan and did not use scripted subscription traffic.
+
+The requirements and implementation units below are retained as historical design authority. The former pair-canary/proof-control machinery remains superseded and must not be reintroduced. Current behavior is canonical in [Hosted WebSearch routing contract](../routing-architecture.md#hosted-websearch-routing-contract), and the cross-cutting authorization/ownership rule is captured in [Authorization-Before-Ranking and Success-Conditioned Route Ownership](../solutions/architecture-patterns/commit-bound-routing.md).
 
 ## Goal Capsule
 

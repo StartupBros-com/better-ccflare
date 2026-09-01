@@ -4,13 +4,23 @@ type: fix
 date: 2026-08-30
 topic: route-profile-descendant-routing
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: implementation-ready
+artifact_readiness: historical
 product_contract_source: ce-brainstorm
 deepened: 2026-08-30
 execution: code
+implementation_status: shipped
+operational_status: deployed-and-verified
+closed: 2026-09-01
+shipped_prs:
+  primary: 286
+  hosted_search_followups: "287, 290-306"
 ---
 
 # Commit-Bound Capability Profile Descendant Routing - Plan
+
+> **Closed implementation record (2026-09-01).** The route-profile contract shipped in [PR #286](https://github.com/StartupBros-com/better-ccflare/pull/286) (`30158015`) and the Hosted WebSearch compatibility tail shipped through [PR #287](https://github.com/StartupBros-com/better-ccflare/pull/287) and PRs [#290](https://github.com/StartupBros-com/better-ccflare/pull/290)–[#306](https://github.com/StartupBros-com/better-ccflare/pull/306). The merged implementation was deployed from `refs/heads/main` as version 3.5.70 / runtime `a1ae9169`, and naturally initiated Claude Code WebSearch completed on the exact Codex/Sol proof route. Natural route-profile observation covered about 23.9 hours and 26,526 requests across every fallback rung and home action; the operator elected a qualified early close rather than wait for the remaining interval. The final 48-minute post-success report recorded 424 successful `pro-primary-sol` Codex/Sol requests, zero persisted matching server-tool/Anthropic request errors, and 12 pre-dispatch overload warnings absorbed by routing. The operator report was reviewed locally and intentionally not committed because its bounded warning samples contain private account topology. Issue #279 remains open for its separate seven-day telemetry and reporter-confirmation condition; it is not a blocker on this plan's implementation status.
+
+The requirements, decisions, implementation units, and verification contract below are retained as historical design authority. Current runtime guidance lives in [Account Routing Architecture](../routing-architecture.md#claude-code-model-route-profiles), and the reusable invariant is captured in [Authorization-Before-Ranking and Success-Conditioned Route Ownership](../solutions/architecture-patterns/commit-bound-routing.md).
 
 ## Goal Capsule
 
