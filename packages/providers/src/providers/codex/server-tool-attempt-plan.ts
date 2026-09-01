@@ -9,6 +9,7 @@ import {
 } from "../../server-tools/anthropic-server-tool-encoder";
 import {
 	createHostedSearchLifecycleReducer,
+	type HostedSearchLifecycleInput,
 	type HostedSearchLifecycleReducer,
 } from "../../server-tools/hosted-search-lifecycle";
 import type {
@@ -53,6 +54,29 @@ export interface CodexHostedErrorDiagnostic {
 	readonly errorParameter: string | null;
 	readonly unsupportedParameter: string | null;
 	readonly category: CodexHostedErrorCategory;
+}
+
+export interface CodexHostedDecoderRejectionShape {
+	readonly eventType: string | null;
+	readonly itemType: string | null;
+	readonly outputIndex: number | null;
+}
+
+export function classifyCodexHostedDecoderRejectionShape(
+	value: unknown,
+): CodexHostedDecoderRejectionShape {
+	const event = isRecord(value) ? value : {};
+	const item = isRecord(event.item) ? event.item : {};
+	return Object.freeze({
+		eventType: safeIdentifier(event.type),
+		itemType: safeIdentifier(item.type),
+		outputIndex:
+			typeof event.output_index === "number" &&
+			Number.isSafeInteger(event.output_index) &&
+			event.output_index >= 0
+				? event.output_index
+				: null,
+	});
 }
 
 export interface CodexHostedTerminalShapeDiagnostic {
@@ -409,7 +433,16 @@ class HostedResponsePipeline<
 		const encoder = this.encoder;
 		if (encoder === null) throw rejected();
 
-		const lifecycleInputs = this.decoder.acceptSseEvent(data);
+		let lifecycleInputs: readonly HostedSearchLifecycleInput[];
+		try {
+			lifecycleInputs = this.decoder.acceptSseEvent(data);
+		} catch (error) {
+			log.warn(
+				"codex_hosted_search_decoder_rejection",
+				classifyCodexHostedDecoderRejectionShape(data),
+			);
+			throw error;
+		}
 		for (const input of lifecycleInputs) {
 			const event = this.lifecycle.accept(input);
 			await encoder.accept(event);
