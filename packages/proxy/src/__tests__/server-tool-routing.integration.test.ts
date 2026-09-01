@@ -1602,6 +1602,9 @@ describe("server-tool routing integration", () => {
 				tool_choice: { type: "web_search" },
 			});
 			expect(outboundBodies[0]).not.toHaveProperty("max_tool_calls");
+			expect(outboundBodies[0].include).toEqual([
+				"reasoning.encrypted_content",
+			]);
 		} finally {
 			if (originalContextAdmission === undefined) {
 				delete process.env.CCFLARE_CONTEXT_ADMISSION;

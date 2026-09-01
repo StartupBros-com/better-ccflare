@@ -388,7 +388,7 @@ describe("Codex exact hosted-search capability", () => {
 							: "server_only",
 						inputReplay: continuation ? ["native-Anthropic"] : [],
 						outputReplay: ["proxy-evidence-v1"],
-						providerContractRevision: "codex-responses-web-search-v2",
+						providerContractRevision: "codex-responses-web-search-v3",
 						replayDecoderRevision: "server-tool-replay-v1",
 						requestTransport: "openai_responses",
 						responseTransport: "openai_responses_sse",
@@ -781,7 +781,6 @@ describe("Codex strict hosted-search request mapper", () => {
 		);
 
 		expect(mapping).toEqual({
-			include: ["web_search_call.action.sources"],
 			tools: [
 				{
 					type: "function",
@@ -830,7 +829,6 @@ describe("Codex strict hosted-search request mapper", () => {
 				],
 			}),
 		).toEqual({
-			include: ["web_search_call.action.sources"],
 			tools: [
 				{
 					type: "web_search",
@@ -988,9 +986,8 @@ describe("Codex exact hosted-search attempt plan", () => {
 			tool_choice: { type: "web_search" },
 		});
 		expect(mapped).not.toHaveProperty("max_tool_calls");
-		expect(mapped.include).toEqual(
-			expect.arrayContaining(["web_search_call.action.sources"]),
-		);
+		expect(mapped.include).toEqual(["reasoning.encrypted_content"]);
+		expect(mapped.include).not.toContain("web_search_call.action.sources");
 	});
 
 	test("materializes only the exact hosted transport and delegates stable policy", async () => {
@@ -1018,7 +1015,7 @@ describe("Codex exact hosted-search attempt plan", () => {
 		).toEqual({ decision: "executing_or_ambiguous" });
 	});
 
-	test("unions hosted-search includes with existing converted includes without duplicates", async () => {
+	test("removes the non-official sources include while preserving ordinary includes", async () => {
 		const body = hostedRequestBody();
 		const sourceRequest = new Request(CODEX_DEFAULT_ENDPOINT, {
 			method: "POST",
@@ -1064,10 +1061,8 @@ describe("Codex exact hosted-search attempt plan", () => {
 		const transformed = await plan.transformRequestBody(sourceRequest);
 		const mapped = (await transformed.json()) as { include: string[] };
 
-		expect(mapped.include).toEqual([
-			"reasoning.encrypted_content",
-			"web_search_call.action.sources",
-		]);
+		expect(mapped.include).toEqual(["reasoning.encrypted_content"]);
+		expect(mapped.include).not.toContain("web_search_call.action.sources");
 		expect(new Set(mapped.include).size).toBe(mapped.include.length);
 	});
 
@@ -1099,10 +1094,7 @@ describe("Codex exact hosted-search attempt plan", () => {
 			model: "gpt-5.6-sol",
 			stream: true,
 			store: false,
-			include: [
-				"reasoning.encrypted_content",
-				"web_search_call.action.sources",
-			],
+			include: ["reasoning.encrypted_content"],
 			tools: [
 				{
 					type: "web_search",
