@@ -1,5 +1,7 @@
 const MAX_SAFE_ERROR_TYPE_LENGTH = 64;
 const SAFE_ERROR_TYPE = /^[A-Za-z0-9._:-]+$/;
+const SAFE_UNSUPPORTED_PARAMETER = /^[A-Za-z][A-Za-z0-9._-]*$/;
+const UNSUPPORTED_PARAMETER_PREFIX = "Unsupported parameter:";
 
 export const ANTHROPIC_TRANSIENT_SSE_ERROR_TYPES = [
 	"overloaded_error",
@@ -57,6 +59,8 @@ export interface AnthropicSseFrameClassification {
 	/** Sanitized nested `error.type`; upstream messages are never retained. */
 	errorType?: string;
 	transientErrorType?: AnthropicTransientSseErrorType;
+	/** Allowlisted unsupported field identifier; arbitrary error text is discarded. */
+	unsupportedParameter?: string;
 	/** Sanitized boolean only; no upstream error text leaves the classifier. */
 	contextOverflow?: true;
 	/** True only for the canonical nested context-length error code. */
@@ -77,6 +81,30 @@ function safeErrorType(value: unknown): string | undefined {
 		return undefined;
 	}
 	return value;
+}
+
+function safeUnsupportedParameter(value: unknown): string | undefined {
+	if (
+		typeof value !== "string" ||
+		!value.startsWith(UNSUPPORTED_PARAMETER_PREFIX)
+	) {
+		return undefined;
+	}
+	let parameter = value.slice(UNSUPPORTED_PARAMETER_PREFIX.length).trim();
+	if (parameter.endsWith(".")) parameter = parameter.slice(0, -1).trim();
+	const first = parameter[0];
+	const last = parameter.at(-1);
+	if ((first === '"' || first === "'" || first === "`") && last === first) {
+		parameter = parameter.slice(1, -1);
+	}
+	if (
+		parameter.length === 0 ||
+		parameter.length > MAX_SAFE_ERROR_TYPE_LENGTH ||
+		!SAFE_UNSUPPORTED_PARAMETER.test(parameter)
+	) {
+		return undefined;
+	}
+	return parameter;
 }
 
 function classifyContentDelta(
@@ -231,6 +259,9 @@ export function classifyAnthropicSseFrame(
 					? (errorType as AnthropicTransientSseErrorType)
 					: undefined;
 			const errorCode = safeErrorType(nestedError.code);
+			const unsupportedParameter = safeUnsupportedParameter(
+				nestedError.message,
+			);
 			const authoritativeContextOverflow =
 				errorCode === "context_length_exceeded";
 			const contextOverflow =
@@ -242,6 +273,7 @@ export function classifyAnthropicSseFrame(
 				validProtocolActivity: true,
 				...(errorType ? { errorType } : {}),
 				...(transientErrorType ? { transientErrorType } : {}),
+				...(unsupportedParameter ? { unsupportedParameter } : {}),
 				...(contextOverflow ? { contextOverflow: true as const } : {}),
 				...(authoritativeContextOverflow
 					? { authoritativeContextOverflow: true as const }
