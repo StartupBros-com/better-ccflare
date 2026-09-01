@@ -18,20 +18,108 @@
  *     when maintenance contends.
  */
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { DatabaseOperations } from "../database-operations";
+import type { DatabaseOperations as DatabaseOperationsType } from "../database-operations";
+
+// Fresh worktrees intentionally do not contain the generated embedded worker
+// modules. Keep this focused suite on the source-worker fallback without
+// generating or reading those excluded build artifacts.
+mock.module("../inline-incremental-vacuum-worker", () => ({
+	EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE: "",
+}));
+mock.module("../inline-vacuum-worker", () => ({
+	EMBEDDED_VACUUM_WORKER_CODE: "",
+}));
+
+const { DatabaseOperations } = await import("../database-operations");
 
 function makeTempDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "ccflare-optimize-test-"));
 }
 
+type MaintenanceResponse =
+	| { ok: true; skipped: boolean }
+	| { ok: true; mode: number }
+	| { ok: false; error: string };
+
+class FakeMaintenanceWorker {
+	onmessage: ((event: MessageEvent) => void) | null = null;
+	onerror: ((event: ErrorEvent) => void) | null = null;
+	readonly messages: unknown[] = [];
+	terminateCount = 0;
+	activeMessages = 0;
+	maxActiveMessages = 0;
+
+	constructor(
+		private readonly respond: (
+			worker: FakeMaintenanceWorker,
+			message: unknown,
+		) => void = (worker) => {
+			worker.reply({ ok: true, skipped: false });
+		},
+	) {}
+
+	postMessage(message: unknown): void {
+		this.messages.push(message);
+		this.activeMessages += 1;
+		this.maxActiveMessages = Math.max(
+			this.maxActiveMessages,
+			this.activeMessages,
+		);
+		this.respond(this, message);
+	}
+
+	reply(result: MaintenanceResponse): void {
+		queueMicrotask(() => {
+			this.activeMessages -= 1;
+			this.onmessage?.({ data: result } as MessageEvent);
+		});
+	}
+
+	fail(message: string): void {
+		queueMicrotask(() => {
+			this.activeMessages -= 1;
+			this.onerror?.({ message } as ErrorEvent);
+		});
+	}
+
+	terminate(): void {
+		this.terminateCount += 1;
+	}
+}
+
+function createLifecycleFactory(
+	createWorker: (index: number) => FakeMaintenanceWorker = () =>
+		new FakeMaintenanceWorker(),
+) {
+	const workers: FakeMaintenanceWorker[] = [];
+	let revokeCount = 0;
+	const factory = () => {
+		const worker = createWorker(workers.length);
+		workers.push(worker);
+		return {
+			worker,
+			revokeObjectUrl: () => {
+				revokeCount += 1;
+			},
+		};
+	};
+	return {
+		factory,
+		workers,
+		get revokeCount() {
+			return revokeCount;
+		},
+	};
+}
+
 describe("DatabaseOperations.optimizeAsync", () => {
 	let tmpDir: string;
 	let dbPath: string;
-	let dbOps: DatabaseOperations;
+	let dbOps: DatabaseOperationsType;
 
 	beforeEach(() => {
 		tmpDir = makeTempDir();
@@ -132,6 +220,147 @@ describe("DatabaseOperations.optimizeAsync", () => {
 			(dbOps as unknown as Record<string, unknown>).optimize,
 		).toBeUndefined();
 	});
+
+	it("keeps the process FD count flat across repeated real worker ticks", async () => {
+		const fdDirectory = "/proc/self/fd";
+		if (!fs.existsSync(fdDirectory)) return;
+
+		// Warm up first so the persistent Worker's own descriptors are part of
+		// the baseline. Subsequent ticks should reuse them, not add one
+		// epoll/eventfd/timerfd group per cycle.
+		expect((await dbOps.optimizeAsync()).ok).toBe(true);
+		const before = fs.readdirSync(fdDirectory).length;
+		for (let tick = 0; tick < 200; tick += 1) {
+			expect((await dbOps.optimizeAsync()).ok).toBe(true);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const after = fs.readdirSync(fdDirectory).length;
+
+		expect(after).toBeLessThanOrEqual(before + 2);
+	});
+});
+
+describe("DatabaseOperations maintenance worker lifecycle", () => {
+	let tmpDir: string;
+	let dbOps: DatabaseOperationsType | undefined;
+
+	beforeEach(() => {
+		tmpDir = makeTempDir();
+	});
+
+	afterEach(async () => {
+		await dbOps?.close();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	function createOps(
+		factory: () => {
+			worker: FakeMaintenanceWorker;
+			revokeObjectUrl?: () => void;
+		},
+	): DatabaseOperationsType {
+		dbOps = new DatabaseOperations(
+			path.join(tmpDir, "test.db"),
+			undefined,
+			undefined,
+			factory,
+		);
+		return dbOps;
+	}
+
+	it("uses an injected worker factory lazily", async () => {
+		const lifecycle = createLifecycleFactory();
+		const ops = createOps(lifecycle.factory);
+
+		expect(lifecycle.workers).toHaveLength(0);
+		expect((await ops.optimizeAsync()).ok).toBe(true);
+		expect(lifecycle.workers).toHaveLength(1);
+	});
+
+	it("reuses one worker for hundreds of calls and never overlaps requests", async () => {
+		const lifecycle = createLifecycleFactory();
+		const ops = createOps(lifecycle.factory);
+
+		const results = await Promise.all(
+			Array.from({ length: 250 }, () => ops.optimizeAsync()),
+		);
+
+		expect(results.every((result) => result.ok)).toBe(true);
+		expect(lifecycle.workers).toHaveLength(1);
+		expect(lifecycle.workers[0]?.messages).toHaveLength(250);
+		expect(lifecycle.workers[0]?.maxActiveMessages).toBe(1);
+	});
+
+	it("shares the same serialized worker with incremental vacuum", async () => {
+		const lifecycle = createLifecycleFactory();
+		const ops = createOps(lifecycle.factory);
+
+		await ops.incrementalVacuum(1);
+		await ops.optimizeAsync();
+
+		expect(lifecycle.workers).toHaveLength(1);
+		expect(lifecycle.workers[0]?.messages).toEqual([
+			expect.objectContaining({ kind: "vacuum", pages: 1 }),
+			expect.objectContaining({ kind: "optimize" }),
+		]);
+	});
+
+	it("close terminates the persistent worker and revokes its URL exactly once", async () => {
+		const lifecycle = createLifecycleFactory();
+		const ops = createOps(lifecycle.factory);
+		await ops.optimizeAsync();
+
+		await ops.close();
+		await ops.close();
+
+		expect(lifecycle.workers[0]?.terminateCount).toBe(1);
+		expect(lifecycle.revokeCount).toBe(1);
+	});
+
+	it("close settles an active call before terminating its worker", async () => {
+		const lifecycle = createLifecycleFactory(
+			() => new FakeMaintenanceWorker(() => undefined),
+		);
+		const ops = createOps(lifecycle.factory);
+		const pending = ops.optimizeAsync();
+		await Promise.resolve();
+		expect(lifecycle.workers).toHaveLength(1);
+
+		await ops.close();
+		const result = await pending;
+
+		expect(result).toMatchObject({
+			ok: false,
+			skipped: false,
+			error: "DatabaseOperations closed during maintenance",
+		});
+		expect(lifecycle.workers[0]?.terminateCount).toBe(1);
+		expect(lifecycle.revokeCount).toBe(1);
+	});
+
+	it("replaces a worker after a transport failure and keeps later calls healthy", async () => {
+		const lifecycle = createLifecycleFactory((index) =>
+			index === 0
+				? new FakeMaintenanceWorker((worker) =>
+						worker.fail("simulated worker crash"),
+					)
+				: new FakeMaintenanceWorker(),
+		);
+		const ops = createOps(lifecycle.factory);
+
+		const failed = await ops.optimizeAsync();
+		const recovered = await ops.optimizeAsync();
+
+		expect(failed).toMatchObject({
+			ok: false,
+			skipped: false,
+			error: "simulated worker crash",
+		});
+		expect(recovered.ok).toBe(true);
+		expect(lifecycle.workers).toHaveLength(2);
+		expect(lifecycle.workers[0]?.terminateCount).toBe(1);
+		expect(lifecycle.revokeCount).toBe(1);
+	});
 });
 
 describe("incremental-vacuum worker protocol: kind discriminator", () => {
@@ -207,6 +436,65 @@ describe("incremental-vacuum worker protocol: kind discriminator", () => {
 			expect(result.skipped).toBe(false);
 		} finally {
 			worker.terminate();
+		}
+	});
+});
+
+describe("DatabaseOperations embedded maintenance worker lifecycle", () => {
+	it("creates and revokes the production Blob URL exactly once on close", async () => {
+		const embeddedWorkerCode = Buffer.from(
+			"self.onmessage = () => undefined;",
+		).toString("base64");
+		mock.module("../inline-incremental-vacuum-worker", () => ({
+			EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE: embeddedWorkerCode,
+		}));
+		const { DatabaseOperations: EmbeddedDatabaseOperations } = await import(
+			"../database-operations?embedded-worker-url-lifecycle-test"
+		);
+
+		const tmpDir = makeTempDir();
+		const worker = new FakeMaintenanceWorker();
+		const workerUrls: Array<string | URL> = [];
+		// biome-ignore lint/complexity/useArrowFunction: the Worker stub must be constructable.
+		const WorkerStub = function (url: string | URL) {
+			workerUrls.push(url);
+			return worker;
+		};
+		const createObjectUrl = mock(
+			(_blob: Blob) => "blob:ccflare-maintenance-worker-test",
+		);
+		const revokeObjectUrl = mock((_url: string) => undefined);
+		const originalWorker = globalThis.Worker;
+		const originalCreateObjectUrl = URL.createObjectURL;
+		const originalRevokeObjectUrl = URL.revokeObjectURL;
+		let ops: DatabaseOperationsType | undefined;
+
+		try {
+			globalThis.Worker = WorkerStub as unknown as typeof Worker;
+			URL.createObjectURL = createObjectUrl;
+			URL.revokeObjectURL = revokeObjectUrl;
+			ops = new EmbeddedDatabaseOperations(path.join(tmpDir, "test.db"));
+
+			expect((await ops.optimizeAsync()).ok).toBe(true);
+			await ops.close();
+			await ops.close();
+
+			expect(createObjectUrl).toHaveBeenCalledTimes(1);
+			expect(workerUrls).toEqual(["blob:ccflare-maintenance-worker-test"]);
+			expect(worker.terminateCount).toBe(1);
+			expect(revokeObjectUrl).toHaveBeenCalledTimes(1);
+			expect(revokeObjectUrl).toHaveBeenCalledWith(
+				"blob:ccflare-maintenance-worker-test",
+			);
+		} finally {
+			await ops?.close();
+			globalThis.Worker = originalWorker;
+			URL.createObjectURL = originalCreateObjectUrl;
+			URL.revokeObjectURL = originalRevokeObjectUrl;
+			mock.module("../inline-incremental-vacuum-worker", () => ({
+				EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE: "",
+			}));
+			fs.rmSync(tmpDir, { recursive: true, force: true });
 		}
 	});
 });
