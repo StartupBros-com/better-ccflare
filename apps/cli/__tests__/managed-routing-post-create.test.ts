@@ -45,11 +45,13 @@ function preview(
 	previewId: string,
 ): ComboRoutingPreviewResult {
 	const view = effective(family);
+	const policyManagedModel = `model-${family}`;
 	return {
 		preview_id: previewId,
 		scope: "account",
 		family,
 		managed_model: `model-${family}`,
+		policy_managed_model: policyManagedModel,
 		effective: view,
 		proposals: [
 			{
@@ -60,6 +62,7 @@ function preview(
 				route_class: "oauth-subscription",
 				existing_rule_id: null,
 				managed_model: `model-${family}`,
+				policy_managed_model: policyManagedModel,
 				tier_source: "account_priority",
 				high_confidence: true,
 				selected_by_default: true,
@@ -283,11 +286,14 @@ describe("packaged CLI post-create managed-routing handoff", () => {
 			async ({
 				family,
 				previewId,
+				policyManagedModel,
 			}: {
 				family: ComboFamily;
 				previewId: string;
+				policyManagedModel: string;
 			}) => {
 				events.push(`apply:${family}:${previewId}`);
+				expect(policyManagedModel).toBe(`model-${family}`);
 				if (family === "fable" && previewId !== "rev2-fable") {
 					throw new Error("stale preview should never be submitted");
 				}
