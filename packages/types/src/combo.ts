@@ -223,10 +223,25 @@ export interface FamilyAliasPolicySkipped {
 	reason: "alias_slot_collision";
 }
 
+/** A reviewed stale concrete policy pin explicitly included for one family. */
+export interface FamilyAliasPolicyPinnedCandidate
+	extends FamilyAliasPolicyCandidate {
+	candidate_kind: "stale_pinned_family_value";
+	reason: "same_family_stale_pin";
+}
+
+/** Optional, family-scoped stale-pin inclusion for a local conversion preview. */
+export interface FamilyAliasPolicyPreviewInput {
+	include_pinned_family?: ComboFamily;
+}
+
 /** A coherent candidate read; revision must be echoed verbatim to apply. */
 export interface FamilyAliasPolicyPreview {
 	revision: number;
+	/** Current-latest concrete values. In stale-pin mode these are family scoped. */
 	candidates: FamilyAliasPolicyCandidate[];
+	/** Present only for explicit stale-pin mode; never populated by safe mode. */
+	pinned_candidates?: FamilyAliasPolicyPinnedCandidate[];
 	/** Concrete slot conversions excluded to preserve a coexisting alias slot. */
 	skipped: FamilyAliasPolicySkipped[];
 }
@@ -240,6 +255,8 @@ export interface FamilyAliasPolicySelection {
 
 export interface FamilyAliasPolicyApplyInput {
 	expected_revision: number;
+	/** Must echo the preview's family scope when stale pins were included. */
+	include_pinned_family?: ComboFamily;
 	selections: FamilyAliasPolicySelection[];
 }
 

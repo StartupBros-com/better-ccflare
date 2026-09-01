@@ -184,7 +184,10 @@ ${getManagedRoutingHelpText()}
                        their currently-resolved concrete models (run before rolling back
                        to a pre-alias-feature binary)
   --convert-family-policy-aliases  Convert current-LATEST policy pins to family aliases
-    --all --yes         Required in noninteractive mode
+    --all --yes         Required in noninteractive safe mode
+    --family <family> --include-pins [--yes]
+                       Explicitly review/convert stale pins for one family;
+                       --yes is required only outside an interactive terminal
   --cache-flight-recorder-report <id>  Report a retained recorder timeline
     --json             Emit exactly one structured JSON object
   --cache-flight-recorder-health       Show minimal recorder health
@@ -291,6 +294,8 @@ interface ParsedArgs {
 	resolveFamilyPolicyAliases: boolean;
 	convertFamilyPolicyAliases: boolean;
 	all: boolean;
+	family: string[];
+	includePins: boolean;
 	yes: boolean;
 }
 
@@ -666,6 +671,8 @@ function parseArgs(args: string[]): ParsedArgs {
 		resolveFamilyPolicyAliases: false,
 		convertFamilyPolicyAliases: false,
 		all: false,
+		family: [],
+		includePins: false,
 		yes: false,
 	};
 
@@ -884,6 +891,16 @@ function parseArgs(args: string[]): ParsedArgs {
 			case "--all":
 				parsed.all = true;
 				break;
+			case "--family":
+				if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
+					console.error("❌ --family requires a family name");
+					fastExit(2);
+				}
+				parsed.family.push(args[++i]);
+				break;
+			case "--include-pins":
+				parsed.includePins = true;
+				break;
 			case "--yes":
 				parsed.yes = true;
 				break;
@@ -1095,15 +1112,58 @@ export async function resolveFamilyPolicyAliases(
 	}
 }
 
+export function validateFamilyPolicyAliasConversionOptions(options: {
+	all: boolean;
+	family?: string;
+	familyProvided?: boolean;
+	familyCount?: number;
+	includePins?: boolean;
+	yes: boolean;
+	interactive: boolean;
+}): void {
+	const familyProvided = options.familyProvided ?? options.family !== undefined;
+	const familyCount = options.familyCount ?? (familyProvided ? 1 : 0);
+	const hasExactlyOneValidFamily =
+		familyCount === 1 &&
+		options.family !== undefined &&
+		COMBO_FAMILIES.includes(options.family as ComboFamily);
+
+	if (options.includePins) {
+		if (options.all || !hasExactlyOneValidFamily) {
+			throw new Error(
+				"--include-pins requires exactly one valid --family and cannot be combined with --all.",
+			);
+		}
+		if (!options.interactive && !options.yes) {
+			throw new Error(
+				"Noninteractive stale-pin conversion requires --family, --include-pins, and --yes.",
+			);
+		}
+		return;
+	}
+	if (familyProvided) {
+		throw new Error("--family is valid only with --include-pins.");
+	}
+	if (!options.interactive && (!options.all || !options.yes)) {
+		throw new Error("Noninteractive conversion requires --all --yes.");
+	}
+}
+
 export async function convertFamilyPolicyAliasesViaLocalControl(options: {
 	baseUrl: string;
 	localControlSecret: string;
 	all: boolean;
+	family?: string;
+	familyProvided?: boolean;
+	familyCount?: number;
+	includePins?: boolean;
 	yes: boolean;
 	interactive: boolean;
 	confirm?: (prompt: string) => Promise<boolean>;
 	fetch?: typeof globalThis.fetch;
 }): Promise<FamilyAliasPolicyApplyResult> {
+	validateFamilyPolicyAliasConversionOptions(options);
+	const family = options.family as ComboFamily | undefined;
 	let base: URL;
 	try {
 		base = new URL(options.baseUrl);
@@ -1136,17 +1196,26 @@ export async function convertFamilyPolicyAliasesViaLocalControl(options: {
 			throw new Error(`Local conversion failed (HTTP ${response.status}).`);
 		return (await response.json()) as { success: true; data: unknown };
 	};
-	const preview = (await request("/api/routing/family-aliases/preview"))
-		.data as FamilyAliasPolicyPreview;
-	if (!options.interactive && (!options.all || !options.yes)) {
-		throw new Error("Noninteractive conversion requires --all --yes.");
-	}
+	const preview = (
+		await request(
+			"/api/routing/family-aliases/preview",
+			options.includePins ? { include_pinned_family: family } : undefined,
+		)
+	).data as FamilyAliasPolicyPreview;
+	const pinnedCandidates = preview.pinned_candidates ?? [];
 	console.log(
-		`Found ${preview.candidates.length} policy candidate(s) at revision ${preview.revision}.`,
+		options.includePins
+			? `Found ${preview.candidates.length} safe policy candidate(s) and ${pinnedCandidates.length} stale pinned candidate(s) at revision ${preview.revision}.`
+			: `Found ${preview.candidates.length} policy candidate(s) at revision ${preview.revision}.`,
 	);
 	for (const candidate of preview.candidates) {
 		console.log(
-			`  ${candidate.identity.kind}:${candidate.identity.kind === "combo_slot" ? candidate.identity.slot_id : candidate.identity.family} ${candidate.current_value} -> ${candidate.alias} (resolves to ${candidate.latest_target})`,
+			`  ${options.includePins ? "safe " : ""}${candidate.identity.kind}:${candidate.identity.kind === "combo_slot" ? candidate.identity.slot_id : candidate.identity.family} ${candidate.current_value} -> ${candidate.alias} (resolves to ${candidate.latest_target})`,
+		);
+	}
+	for (const candidate of pinnedCandidates) {
+		console.log(
+			`  stale pinned candidate ${candidate.identity.kind}:${candidate.identity.kind === "combo_slot" ? candidate.identity.slot_id : candidate.identity.family} ${candidate.current_value} -> ${candidate.alias} (current target ${candidate.latest_target}; ${candidate.reason})`,
 		);
 	}
 	for (const skipped of preview.skipped ?? []) {
@@ -1154,14 +1223,18 @@ export async function convertFamilyPolicyAliasesViaLocalControl(options: {
 			`  skipped ${skipped.identity.kind}:${skipped.identity.kind === "combo_slot" ? skipped.identity.slot_id : skipped.identity.family} ${skipped.current_value} -> ${skipped.alias}: ${skipped.reason}`,
 		);
 	}
-	if (preview.candidates.length === 0)
+	const reviewedCandidates = [...preview.candidates, ...pinnedCandidates];
+	if (reviewedCandidates.length === 0)
 		return { revision: preview.revision, converted: 0 };
 	if (
 		options.interactive &&
 		!options.yes &&
 		!(
-			(await options.confirm?.("Convert all listed policy candidates?")) ??
-			false
+			(await options.confirm?.(
+				options.includePins
+					? "Convert all listed safe and stale pinned policy candidates?"
+					: "Convert all listed policy candidates?",
+			)) ?? false
 		)
 	) {
 		throw new Error("Conversion cancelled.");
@@ -1169,7 +1242,8 @@ export async function convertFamilyPolicyAliasesViaLocalControl(options: {
 	return (
 		await request("/api/routing/family-aliases/apply", {
 			expected_revision: preview.revision,
-			selections: preview.candidates.map((candidate) => ({
+			...(options.includePins ? { include_pinned_family: family } : {}),
+			selections: reviewedCandidates.map((candidate) => ({
 				identity: candidate.identity,
 				family: candidate.family,
 				expected_old_value: candidate.current_value,
@@ -1304,6 +1378,16 @@ async function main() {
 
 	if (parsed.convertFamilyPolicyAliases) {
 		try {
+			validateFamilyPolicyAliasConversionOptions({
+				all: parsed.all,
+				family: parsed.family[0],
+				familyProvided: parsed.family.length > 0,
+				familyCount: parsed.family.length,
+				includePins: parsed.includePins,
+				yes: parsed.yes,
+				interactive,
+			});
+			const family = parsed.family[0] as ComboFamily | undefined;
 			const config = new Config();
 			const runtime = config.getRuntime();
 			const baseUrl =
@@ -1326,6 +1410,10 @@ async function main() {
 				baseUrl,
 				localControlSecret: config.getLocalControlSecret(),
 				all: parsed.all,
+				family,
+				familyProvided: parsed.family.length > 0,
+				familyCount: parsed.family.length,
+				includePins: parsed.includePins,
 				yes: parsed.yes,
 				interactive,
 				confirm,

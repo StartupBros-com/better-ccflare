@@ -10,6 +10,8 @@ import { createServerOwnedAccountRoutingFinalizer } from "../../services/account
 import {
 	createAccountRoutingOverviewHandler,
 	createEffectiveRoutingHandler,
+	createFamilyAliasApplyHandler,
+	createFamilyAliasPreviewHandler,
 	createFamilyAssignHandler,
 	createMembershipExclusionCreateHandler,
 	createMembershipExclusionRestoreHandler,
@@ -1998,5 +2000,93 @@ describe("managed routing HTTP control plane", () => {
 				assignment: { managed_model: "opus" },
 			},
 		);
+	});
+
+	it("passes an explicit stale-pin family scope through local-control preview and apply", async () => {
+		const previewFamilyAliasPolicy = mock(async (input?: unknown) => ({
+			revision: 11,
+			candidates: [],
+			pinned_candidates: [],
+			skipped: [],
+			input,
+		}));
+		const applyFamilyAliasPolicy = mock(async (input: unknown) => ({
+			revision: 12,
+			converted: 1,
+			input,
+		}));
+		const dbOps = {
+			previewFamilyAliasPolicy,
+			applyFamilyAliasPolicy,
+		} as unknown as DatabaseOperations;
+		const preview = await createFamilyAliasPreviewHandler(dbOps)(
+			request("/api/routing/family-aliases/preview", {
+				include_pinned_family: "fable",
+			}),
+		);
+		expect(preview.status).toBe(200);
+		expect(previewFamilyAliasPolicy).toHaveBeenCalledWith({
+			include_pinned_family: "fable",
+		});
+
+		const apply = await createFamilyAliasApplyHandler(dbOps)(
+			request("/api/routing/family-aliases/apply", {
+				expected_revision: 11,
+				include_pinned_family: "fable",
+				selections: [
+					{
+						identity: { kind: "family_assignment", family: "fable" },
+						family: "fable",
+						expected_old_value: "claude-fable-5",
+					},
+				],
+			}),
+		);
+		expect(apply.status).toBe(200);
+		expect(applyFamilyAliasPolicy).toHaveBeenCalledWith({
+			expected_revision: 11,
+			include_pinned_family: "fable",
+			selections: [
+				{
+					identity: { kind: "family_assignment", family: "fable" },
+					family: "fable",
+					expected_old_value: "claude-fable-5",
+				},
+			],
+		});
+	});
+
+	it("keeps an empty preview request in safe mode and rejects malformed stale-pin scopes", async () => {
+		const previewFamilyAliasPolicy = mock(async (input?: unknown) => ({
+			revision: 11,
+			candidates: [],
+			skipped: [],
+			input,
+		}));
+		const dbOps = {
+			previewFamilyAliasPolicy,
+		} as unknown as DatabaseOperations;
+		const handler = createFamilyAliasPreviewHandler(dbOps);
+
+		const safePreview = await handler(
+			new Request("http://localhost/api/routing/family-aliases/preview", {
+				method: "POST",
+			}),
+		);
+		expect(safePreview.status).toBe(200);
+		expect(previewFamilyAliasPolicy).toHaveBeenLastCalledWith({});
+
+		for (const body of [
+			"{",
+			"[]",
+			'{"include_pinned_family":42}',
+			'{"include_pinned_family":"not-a-family"}',
+		]) {
+			const response = await handler(
+				rawRequest("/api/routing/family-aliases/preview", body),
+			);
+			expect(response.status).toBe(400);
+		}
+		expect(previewFamilyAliasPolicy).toHaveBeenCalledTimes(1);
 	});
 });

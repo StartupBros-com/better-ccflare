@@ -652,6 +652,142 @@ describePostgres("managed routing PostgreSQL integration", () => {
 		});
 	});
 
+	it("converts a reviewed Fable stale-pin scope without touching other PostgreSQL policy", async () => {
+		await withDisposableDatabase(async (adapter) => {
+			await ensureSchemaPg(adapter);
+			await runMigrationsPg(adapter);
+			await seedPolicyBase(adapter);
+			await adapter.run(
+				"INSERT INTO accounts (id, name, provider, created_at) VALUES (?, ?, ?, ?), (?, ?, ?, ?)",
+				["codex", "codex", "codex", 1, "grok", "grok", "xai", 1],
+			);
+			const repo = new ComboRepository(adapter);
+			await repo.updateFamilyPolicy("fable", {
+				managed_model: "claude-fable-5",
+			});
+			await repo.updateFamilyPolicy("opus", {
+				managed_model: LATEST_MODEL_BY_FAMILY.opus,
+			});
+			await adapter.run(
+				"INSERT INTO combo_slots (id, combo_id, account_id, model, priority, enabled) VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)",
+				[
+					"fable-native",
+					"combo-1",
+					"account-1",
+					"claude-fable-5",
+					1,
+					1,
+					"fable-codex",
+					"combo-1",
+					"codex",
+					"claude-fable-5",
+					2,
+					1,
+					"fable-grok",
+					"combo-1",
+					"grok",
+					"claude-fable-5",
+					3,
+					1,
+				],
+			);
+			const safePreview = await repo.previewFamilyAliasPolicy();
+			expect(
+				safePreview.candidates.some(
+					(candidate) => candidate.family === "fable",
+				),
+			).toBeFalse();
+			const preview = await repo.previewFamilyAliasPolicy({
+				include_pinned_family: "fable",
+			});
+			expect(preview.candidates).toEqual([]);
+			expect(preview.pinned_candidates).toHaveLength(4);
+			expect(
+				await repo.applyFamilyAliasPolicy({
+					expected_revision: preview.revision,
+					include_pinned_family: "fable",
+					selections: (preview.pinned_candidates ?? []).map((candidate) => ({
+						identity: candidate.identity,
+						family: candidate.family,
+						expected_old_value: candidate.current_value,
+					})),
+				}),
+			).toEqual({ revision: preview.revision + 1, converted: 4 });
+			expect(
+				(await repo.getRoutingPolicySnapshot("fable")).assignment.managed_model,
+			).toBe("fable");
+			for (const id of ["fable-native", "fable-codex", "fable-grok"]) {
+				expect(
+					(await repo.getSlots("combo-1")).find((slot) => slot.id === id)
+						?.model,
+				).toBe("fable");
+			}
+			expect(
+				(await repo.getRoutingPolicySnapshot("opus")).assignment.managed_model,
+			).toBe(LATEST_MODEL_BY_FAMILY.opus);
+		});
+	});
+
+	it("excludes noncanonical family-word values from PostgreSQL stale previews and applies without writes", async () => {
+		await withDisposableDatabase(async (adapter) => {
+			await ensureSchemaPg(adapter);
+			await runMigrationsPg(adapter);
+			await seedPolicyBase(adapter);
+			const repo = new ComboRepository(adapter);
+			const customModels = [
+				"my-opus-experiment",
+				"provider/claude-opus-5",
+				"anthropic.claude-opus-5",
+				"opus-custom",
+				"an-arbitrary-opus-containing-string",
+			];
+			await repo.updateFamilyPolicy("opus", { managed_model: customModels[0] });
+			for (const [index, model] of customModels.slice(1).entries()) {
+				await adapter.run(
+					"INSERT INTO combo_slots (id, combo_id, account_id, model, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+					[`custom-opus-${index}`, "combo-1", "account-1", model, index + 2, 1],
+				);
+			}
+
+			const revision = await repo.getRoutingPolicyRevision();
+			const preview = await repo.previewFamilyAliasPolicy({
+				include_pinned_family: "opus",
+			});
+			const previewedValues = [
+				...preview.candidates,
+				...(preview.pinned_candidates ?? []),
+			].map((candidate) => candidate.current_value);
+			for (const model of customModels) {
+				expect(previewedValues).not.toContain(model);
+			}
+
+			await expect(
+				repo.applyFamilyAliasPolicy({
+					expected_revision: revision,
+					include_pinned_family: "opus",
+					selections: [
+						{
+							identity: { kind: "family_assignment", family: "opus" },
+							family: "opus",
+							expected_old_value: customModels[0],
+						},
+					],
+				}),
+			).rejects.toThrow("selected value is not");
+			expect(await repo.getRoutingPolicyRevision()).toBe(revision);
+			expect(
+				(await repo.getRoutingPolicySnapshot("opus")).assignment.managed_model,
+			).toBe(customModels[0]);
+			for (const [index, model] of customModels.slice(1).entries()) {
+				expect(
+					(await repo.getSlots("combo-1")).find(
+						(slot) => slot.id === `custom-opus-${index}`,
+					)?.model,
+				).toBe(model);
+			}
+		});
+	});
+
 	it("tracks legacy-mirrored credential shape without secret-rotation churn", async () => {
 		await withDisposableDatabase(async (adapter) => {
 			await ensureSchemaPg(adapter);

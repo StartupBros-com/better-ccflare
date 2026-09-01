@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { LATEST_MODEL_BY_FAMILY } from "@better-ccflare/core";
+import {
+	getStrictClaudeModelFamily,
+	isFamilyAliasModel,
+	LATEST_MODEL_BY_FAMILY,
+} from "@better-ccflare/core";
 import {
 	type Combo,
 	type ComboEnrollmentRule,
@@ -23,7 +27,9 @@ import {
 	type FamilyAliasPolicyApplyInput,
 	type FamilyAliasPolicyApplyResult,
 	type FamilyAliasPolicyCandidate,
+	type FamilyAliasPolicyPinnedCandidate,
 	type FamilyAliasPolicyPreview,
+	type FamilyAliasPolicyPreviewInput,
 	type FamilyAliasPolicySkipped,
 	toCombo,
 	toComboEnrollmentRule,
@@ -622,8 +628,21 @@ export class ComboRepository extends BaseRepository<Combo> {
 		return Number(row.revision);
 	}
 
-	/** Read only concrete policy values which exactly track a family's current latest model. */
-	async previewFamilyAliasPolicy(): Promise<FamilyAliasPolicyPreview> {
+	/**
+	 * Read current-latest concrete values by default. An explicit family scope
+	 * additionally returns stale concrete pins for that one family; omission keeps
+	 * the safe-mode response shape and candidate set unchanged.
+	 */
+	async previewFamilyAliasPolicy(
+		input: FamilyAliasPolicyPreviewInput = {},
+	): Promise<FamilyAliasPolicyPreview> {
+		const includedFamily = input.include_pinned_family;
+		if (
+			includedFamily !== undefined &&
+			!Object.hasOwn(LATEST_MODEL_BY_FAMILY, includedFamily)
+		) {
+			throw new Error("invalid pinned-family preview scope");
+		}
 		const [revision, assignments, slots] = await Promise.all([
 			this.getRoutingPolicyRevision(),
 			this.getFamilyAssignments(),
@@ -632,48 +651,89 @@ export class ComboRepository extends BaseRepository<Combo> {
 			),
 		]);
 		const candidates: FamilyAliasPolicyCandidate[] = [];
+		const pinnedCandidates: FamilyAliasPolicyPinnedCandidate[] = [];
 		const skipped: FamilyAliasPolicySkipped[] = [];
+		const families = includedFamily
+			? [includedFamily]
+			: (Object.keys(LATEST_MODEL_BY_FAMILY) as ComboFamily[]);
+		const includeCandidate = (
+			value: FamilyAliasPolicyCandidate,
+			isPinned: boolean,
+		) => {
+			let selectedSlot: ComboSlotRow | undefined;
+			if (value.identity.kind === "combo_slot") {
+				const slotId = value.identity.slot_id;
+				selectedSlot = slots.find((slot) => slot.id === slotId);
+			}
+			const aliasExists =
+				selectedSlot !== undefined &&
+				slots.some(
+					(aliasSlot) =>
+						aliasSlot.id !== selectedSlot.id &&
+						aliasSlot.combo_id === selectedSlot.combo_id &&
+						aliasSlot.account_id === selectedSlot.account_id &&
+						aliasSlot.model === value.family,
+				);
+			if (aliasExists) {
+				skipped.push({ ...value, reason: "alias_slot_collision" });
+			} else if (isPinned) {
+				pinnedCandidates.push({
+					...value,
+					candidate_kind: "stale_pinned_family_value",
+					reason: "same_family_stale_pin",
+				});
+			} else {
+				candidates.push(value);
+			}
+		};
 		for (const assignment of assignments) {
-			if (
-				assignment.managed_model === LATEST_MODEL_BY_FAMILY[assignment.family]
+			if (!families.includes(assignment.family) || !assignment.managed_model)
+				continue;
+			const value: FamilyAliasPolicyCandidate = {
+				identity: { kind: "family_assignment", family: assignment.family },
+				family: assignment.family,
+				current_value: assignment.managed_model,
+				alias: assignment.family,
+				latest_target: LATEST_MODEL_BY_FAMILY[assignment.family],
+			};
+			if (assignment.managed_model === value.latest_target) {
+				candidates.push(value);
+			} else if (
+				includedFamily === assignment.family &&
+				getStrictClaudeModelFamily(assignment.managed_model) ===
+					assignment.family &&
+				!isFamilyAliasModel(assignment.managed_model, assignment.family)
 			) {
-				candidates.push({
-					identity: { kind: "family_assignment", family: assignment.family },
-					family: assignment.family,
-					current_value: assignment.managed_model,
-					alias: assignment.family,
-					latest_target: LATEST_MODEL_BY_FAMILY[assignment.family],
+				pinnedCandidates.push({
+					...value,
+					candidate_kind: "stale_pinned_family_value",
+					reason: "same_family_stale_pin",
 				});
 			}
 		}
 		for (const slot of slots) {
-			for (const family of Object.keys(
-				LATEST_MODEL_BY_FAMILY,
-			) as ComboFamily[]) {
-				if (slot.model !== LATEST_MODEL_BY_FAMILY[family]) continue;
-				const aliasExists = slots.some(
-					(aliasSlot) =>
-						aliasSlot.id !== slot.id &&
-						aliasSlot.combo_id === slot.combo_id &&
-						aliasSlot.account_id === slot.account_id &&
-						aliasSlot.model === family,
-				);
-				const value = {
-					identity: { kind: "combo_slot" as const, slot_id: slot.id },
+			for (const family of families) {
+				const value: FamilyAliasPolicyCandidate = {
+					identity: { kind: "combo_slot", slot_id: slot.id },
 					family,
 					current_value: slot.model,
 					alias: family,
 					latest_target: LATEST_MODEL_BY_FAMILY[family],
 				};
-				if (aliasExists) {
-					skipped.push({ ...value, reason: "alias_slot_collision" });
-				} else {
-					candidates.push(value);
+				if (slot.model === value.latest_target) {
+					includeCandidate(value, false);
+				} else if (
+					includedFamily === family &&
+					getStrictClaudeModelFamily(slot.model) === family &&
+					!isFamilyAliasModel(slot.model, family)
+				) {
+					includeCandidate(value, true);
 				}
-				break;
 			}
 		}
-		return { revision, candidates, skipped };
+		return includedFamily
+			? { revision, candidates, pinned_candidates: pinnedCandidates, skipped }
+			: { revision, candidates, skipped };
 	}
 
 	/**
@@ -689,6 +749,13 @@ export class ComboRepository extends BaseRepository<Combo> {
 			input.expected_revision < 0
 		) {
 			throw new Error("expected_revision must be a non-negative safe integer");
+		}
+		const includedFamily = input.include_pinned_family;
+		if (
+			includedFamily !== undefined &&
+			!Object.hasOwn(LATEST_MODEL_BY_FAMILY, includedFamily)
+		) {
+			throw new Error("invalid pinned-family apply scope");
 		}
 		const seen = new Set<string>();
 		const statements: BatchStatement[] = [
@@ -709,16 +776,23 @@ export class ComboRepository extends BaseRepository<Combo> {
 			if (
 				!Object.hasOwn(LATEST_MODEL_BY_FAMILY, selection.family) ||
 				(selection.identity.kind === "family_assignment" &&
-					selection.identity.family !== selection.family)
+					selection.identity.family !== selection.family) ||
+				(includedFamily !== undefined && selection.family !== includedFamily)
 			) {
 				throw new Error("invalid policy selection family");
 			}
 			const latest = LATEST_MODEL_BY_FAMILY[selection.family];
-			const isConcrete = selection.expected_old_value === latest;
+			const isLatestConcrete = selection.expected_old_value === latest;
 			const isAlias = selection.expected_old_value === selection.family;
+			const isIncludedStalePin =
+				includedFamily === selection.family &&
+				!isFamilyAliasModel(selection.expected_old_value, selection.family) &&
+				getStrictClaudeModelFamily(selection.expected_old_value) ===
+					selection.family;
+			const isConcrete = isLatestConcrete || isIncludedStalePin;
 			if (!isConcrete && !isAlias) {
 				throw new Error(
-					"selected value is not the family's latest model or alias",
+					"selected value is not the family's latest model, included stale pin, or alias",
 				);
 			}
 			if (selection.identity.kind === "family_assignment") {
@@ -726,7 +800,11 @@ export class ComboRepository extends BaseRepository<Combo> {
 					isConcrete
 						? {
 								sql: "UPDATE combo_family_assignments SET managed_model = ? WHERE family = ? AND managed_model = ?",
-								params: [selection.family, selection.family, latest],
+								params: [
+									selection.family,
+									selection.family,
+									selection.expected_old_value,
+								],
 								expectedChanges: 1,
 							}
 						: {
@@ -747,7 +825,7 @@ export class ComboRepository extends BaseRepository<Combo> {
 								params: [
 									selection.family,
 									selection.identity.slot_id,
-									latest,
+									selection.expected_old_value,
 									selection.family,
 								],
 								expectedChanges: 1,

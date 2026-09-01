@@ -38,6 +38,18 @@ export function getModelFamily(
 }
 
 /**
+ * Recognize only canonical logical Claude model IDs for policy-pin conversion.
+ * Unlike getModelFamily(), this deliberately rejects provider-qualified and
+ * arbitrary custom model names that merely contain a family word.
+ */
+export function getStrictClaudeModelFamily(
+	modelId: string,
+): ComboFamily | null {
+	const match = /^claude-(fable|opus|haiku|sonnet)(?:-|$)/i.exec(modelId);
+	return (match?.[1]?.toLowerCase() as ComboFamily | undefined) ?? null;
+}
+
+/**
  * Check whether a stored value is a bare "family alias" — the literal family
  * name itself (e.g. "opus") used as a placeholder meaning "resolve to the
  * latest model in this family at read time", instead of a concrete model ID.
