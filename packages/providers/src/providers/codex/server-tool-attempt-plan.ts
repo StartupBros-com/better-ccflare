@@ -64,8 +64,13 @@ function safeIdentifier(value: unknown): string | null {
 export function classifyCodexHostedError(
 	value: unknown,
 ): CodexHostedErrorDiagnostic | null {
-	if (!isRecord(value) || value.type !== "error") return null;
-	const error = isRecord(value.error) ? value.error : {};
+	if (!isRecord(value)) return null;
+	let error: JsonRecord;
+	if (value.type === "error") error = isRecord(value.error) ? value.error : {};
+	else if (value.type === "response.failed") {
+		const response = isRecord(value.response) ? value.response : {};
+		error = isRecord(response.error) ? response.error : {};
+	} else return null;
 	const message = typeof error.message === "string" ? error.message : "";
 	const unsupportedMatch = message.match(UNSUPPORTED_PARAMETER);
 	const unsupportedParameter = unsupportedMatch?.[1] ?? null;
