@@ -101,6 +101,32 @@ function upstreamSse(events: readonly unknown[]): Response {
 	);
 }
 
+function liveSourceLessSearchStream(): unknown[] {
+	const events = structuredClone(officialSearchStream) as Array<
+		Record<string, unknown>
+	>;
+	const patchItem = (value: unknown): void => {
+		if (
+			typeof value !== "object" ||
+			value === null ||
+			(value as { type?: unknown }).type !== "web_search_call"
+		) {
+			return;
+		}
+		const item = value as { action?: Record<string, unknown> };
+		const action = item.action;
+		if (!action || typeof action.query !== "string") return;
+		action.queries = [action.query, `${action.query} refinement`];
+		delete action.sources;
+	};
+	for (const event of events) {
+		patchItem(event.item);
+		const response = event.response as { output?: unknown[] } | undefined;
+		for (const item of response?.output ?? []) patchItem(item);
+	}
+	return events;
+}
+
 function mixedFunctionStream(): unknown[] {
 	const events = structuredClone(officialSearchStream) as Array<
 		Record<string, unknown>
@@ -521,7 +547,7 @@ describe("Codex exact hosted-search capability", () => {
 						inputReplay: continuation ? ["native-Anthropic"] : [],
 						outputReplay: ["proxy-evidence-v1"],
 						providerContractRevision: "codex-responses-web-search-v4",
-						replayDecoderRevision: "server-tool-replay-v1",
+						replayDecoderRevision: "server-tool-replay-v2",
 						requestTransport: "openai_responses",
 						responseTransport: "openai_responses_sse",
 					});
@@ -840,7 +866,7 @@ describe("Codex exact hosted-search capability", () => {
 			{ inputReplay: ["native-Anthropic"] },
 			{ outputReplay: [] },
 			{ providerContractRevision: "codex-responses-v2" },
-			{ replayDecoderRevision: "server-tool-replay-v2" },
+			{ replayDecoderRevision: "server-tool-replay-v3" },
 			{ requestTransport: "openai_chat_completions" },
 			{ responseTransport: "openai_responses_json" },
 		];
@@ -1379,6 +1405,18 @@ describe("Codex exact hosted-search attempt plan", () => {
 		expect(wire).toContain('"type":"web_search_tool_result"');
 		expect(wire).toContain('"type":"citations_delta"');
 		expect(wire).toContain('"web_search_requests":1');
+		expect(wire).toContain("event: message_stop");
+	});
+
+	test("synthesizes source results from citations for live source-less search actions", async () => {
+		const plan = materializeHostedPlan(hostedRequestBody(true));
+		const response = await plan.processResponse(
+			upstreamSse(liveSourceLessSearchStream()),
+		);
+		const wire = await response.text();
+		expect(wire).toContain('"type":"web_search_tool_result"');
+		expect(wire).toContain('"type":"citations_delta"');
+		expect(wire).toContain("https://docs.example.test/launch");
 		expect(wire).toContain("event: message_stop");
 	});
 

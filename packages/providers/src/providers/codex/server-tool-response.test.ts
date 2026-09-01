@@ -204,12 +204,7 @@ describe("Codex native hosted-search response decoder", () => {
 			"dispatched",
 			"searching",
 			"query_known",
-			"result",
 		]);
-		expect(
-			(doneEvents[4] as Extract<HostedSearchLifecycleInput, { type: "result" }>)
-				.sources,
-		).toEqual([]);
 		const terminal = instance.acceptSseEvent({
 			type: "response.completed",
 			sequence_number: 8,
@@ -218,6 +213,11 @@ describe("Codex native hosted-search response decoder", () => {
 			]),
 		});
 		expect(terminal).toEqual([
+			{
+				type: "result",
+				callId: expect.stringMatching(/^srvtoolu_/),
+				sources: [],
+			},
 			{ type: "usage_observation", webSearchRequests: 1 },
 			{ type: "terminal", reason: "end_turn" },
 		]);
@@ -1012,17 +1012,7 @@ describe("Codex native hosted-search response decoder", () => {
 				pattern: "fixture",
 			},
 		],
-		[
-			"multiple queries",
-			{
-				type: "search",
-				query: "first",
-				queries: ["first", "second"],
-				sources: [],
-			},
-		],
 		["missing query", { type: "search", sources: [] }],
-		["missing sources", { type: "search", query: "fixture" }],
 		[
 			"malformed source",
 			{

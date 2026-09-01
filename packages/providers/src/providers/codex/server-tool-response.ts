@@ -13,6 +13,7 @@ const MAX_URL_BYTES = 8 * 1024;
 const MAX_TITLE_BYTES = 2 * 1024;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_ARRAY_ITEMS = 1024;
+const MAX_SEARCH_QUERIES = 8;
 const OPAQUE_RANDOM_BYTES = 18;
 const BASE64URL =
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -466,6 +467,7 @@ type SearchCallState = {
 	searchingSeen: boolean;
 	completedProgressSeen: boolean;
 	done: boolean;
+	resultEmitted: boolean;
 	sourceRefsByUrl: ReadonlyMap<string, string>;
 	signature: string | null;
 };
@@ -597,11 +599,24 @@ function parseCompleteSearchItem(value: unknown): Readonly<{
 		nonEmpty: true,
 	});
 	const queriesValue = optionalOwn(action, "queries");
+	const queries: string[] = [];
 	if (queriesValue !== undefined && queriesValue !== null) {
-		const queries = arraySnapshot(queriesValue);
-		if (queries.length !== 1 || queries[0] !== query) fail();
-	}
-	const sourceValues = arraySnapshot(own(action, "sources"));
+		const queryValues = arraySnapshot(queriesValue);
+		if (queryValues.length === 0 || queryValues.length > MAX_SEARCH_QUERIES) {
+			fail();
+		}
+		for (const candidate of queryValues) {
+			queries.push(
+				boundedString(candidate, MAX_QUERY_BYTES, { nonEmpty: true }),
+			);
+		}
+		if (!queries.includes(query)) fail();
+	} else queries.push(query);
+	const sourcesValue = optionalOwn(action, "sources");
+	const sourceValues =
+		sourcesValue === undefined || sourcesValue === null
+			? []
+			: arraySnapshot(sourcesValue);
 	const sources: HostedSearchSourceInput[] = [];
 	const urls = new Set<string>();
 	const sourceRefsByUrl = new Map<string, string>();
@@ -631,7 +646,7 @@ function parseCompleteSearchItem(value: unknown): Readonly<{
 		query,
 		sources: Object.freeze(sources),
 		sourceRefsByUrl,
-		signature: identityDigest("search", [query, ...urls]),
+		signature: identityDigest("search", [query, ...queries, ...urls]),
 	});
 }
 
@@ -1039,6 +1054,7 @@ export class CodexServerToolResponseDecoder {
 				searchingSeen: false,
 				completedProgressSeen: false,
 				done: false,
+				resultEmitted: false,
 				sourceRefsByUrl: new Map(),
 				signature: null,
 			});
@@ -1145,6 +1161,7 @@ export class CodexServerToolResponseDecoder {
 				searchingSeen: false,
 				completedProgressSeen: false,
 				done: false,
+				resultEmitted: false,
 				sourceRefsByUrl: new Map(),
 				signature: null,
 			};
@@ -1182,13 +1199,18 @@ export class CodexServerToolResponseDecoder {
 			queryOrdinal: 0 as const,
 			query: parsed.query,
 		});
-		const result = Object.freeze({
-			type: "result" as const,
-			callId: call.publicId,
-			queryOrdinal: 0 as const,
-			sources: parsed.sources,
-		});
-		events.push(queryKnown, result);
+		events.push(queryKnown);
+		if (parsed.sources.length > 0) {
+			call.resultEmitted = true;
+			events.push(
+				Object.freeze({
+					type: "result" as const,
+					callId: call.publicId,
+					queryOrdinal: 0 as const,
+					sources: parsed.sources,
+				}),
+			);
+		}
 		return events;
 	}
 
@@ -1266,6 +1288,59 @@ export class CodexServerToolResponseDecoder {
 			return [];
 		}
 
+		const prelude: HostedSearchLifecycleInput[] = [];
+		const urlAnnotations = annotations.filter(
+			(annotation): annotation is ParsedUrlAnnotation =>
+				annotation.kind === "url",
+		);
+		const completedCalls = [...this.calls.values()].filter((call) => call.done);
+		if (
+			urlAnnotations.length > 0 &&
+			completedCalls.length === 1 &&
+			completedCalls[0]?.resultEmitted === false &&
+			completedCalls[0].sourceRefsByUrl.size === 0
+		) {
+			const call = completedCalls[0];
+			const sourceByUrl = new Map<string, HostedSearchSourceInput>();
+			for (const annotation of urlAnnotations) {
+				const existing = sourceByUrl.get(annotation.url);
+				if (existing) {
+					if (existing.title !== annotation.title) fail();
+					continue;
+				}
+				if (
+					sourceByUrl.size >= CODEX_SERVER_TOOL_RESPONSE_LIMITS.sourcesPerCall
+				) {
+					fail();
+				}
+				const sourceRef = `source_${sourceByUrl.size.toString(36)}`;
+				sourceByUrl.set(
+					annotation.url,
+					Object.freeze({
+						sourceRef,
+						url: annotation.url,
+						title: annotation.title,
+						pageAge: null,
+					}),
+				);
+			}
+			call.sourceRefsByUrl = new Map(
+				[...sourceByUrl.values()].map((source) => [
+					source.url,
+					source.sourceRef,
+				]),
+			);
+			call.resultEmitted = true;
+			this.enforceAggregateBounds();
+			prelude.push(
+				Object.freeze({
+					type: "result" as const,
+					callId: call.publicId,
+					sources: Object.freeze([...sourceByUrl.values()]),
+				}),
+			);
+		}
+
 		const citations: Omit<HostedSearchCitationInput, "blockId">[] = [];
 		for (
 			let originalIndex = 0;
@@ -1309,10 +1384,11 @@ export class CodexServerToolResponseDecoder {
 		state.signature = signature;
 		state.annotations.splice(0);
 		this.enforceAggregateBounds();
-		if (citations.length === 0) return [];
+		if (citations.length === 0) return prelude;
 		const blockId = this.newOpaqueId("srvtext_");
 		this.enforceAggregateBounds();
 		return [
+			...prelude,
 			Object.freeze({ type: "answer_text_started", blockId, text }),
 			...citations.map((citation) =>
 				Object.freeze({
@@ -1573,6 +1649,17 @@ export class CodexServerToolResponseDecoder {
 			)
 		) {
 			fail();
+		}
+		for (const call of this.calls.values()) {
+			if (!call.done || call.resultEmitted) continue;
+			call.resultEmitted = true;
+			events.push(
+				Object.freeze({
+					type: "result" as const,
+					callId: call.publicId,
+					sources: Object.freeze([]),
+				}),
+			);
 		}
 		events.push(
 			Object.freeze({
