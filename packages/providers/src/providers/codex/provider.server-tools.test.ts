@@ -388,7 +388,7 @@ describe("Codex exact hosted-search capability", () => {
 							: "server_only",
 						inputReplay: continuation ? ["native-Anthropic"] : [],
 						outputReplay: ["proxy-evidence-v1"],
-						providerContractRevision: "codex-responses-web-search-v3",
+						providerContractRevision: "codex-responses-web-search-v4",
 						replayDecoderRevision: "server-tool-replay-v1",
 						requestTransport: "openai_responses",
 						responseTransport: "openai_responses_sse",
@@ -983,7 +983,7 @@ describe("Codex exact hosted-search attempt plan", () => {
 			stream: true,
 			store: false,
 			tools: [{ type: "web_search" }],
-			tool_choice: { type: "web_search" },
+			tool_choice: "required",
 		});
 		expect(mapped).not.toHaveProperty("max_tool_calls");
 		expect(mapped.include).toEqual(["reasoning.encrypted_content"]);

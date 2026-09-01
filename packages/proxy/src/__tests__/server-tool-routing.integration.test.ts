@@ -1599,7 +1599,7 @@ describe("server-tool routing integration", () => {
 			expect(outboundBodies[0]).toMatchObject({
 				model: physicalModel,
 				tools: [{ type: "web_search" }],
-				tool_choice: { type: "web_search" },
+				tool_choice: "required",
 			});
 			expect(outboundBodies[0]).not.toHaveProperty("max_tool_calls");
 			expect(outboundBodies[0].include).toEqual([
