@@ -148,6 +148,7 @@ function preview(): ComboRoutingPreviewResult {
 		scope: "family",
 		family: "opus",
 		managed_model: "claude-opus-4-8",
+		policy_managed_model: "opus",
 		effective: current,
 		proposals: [
 			{
@@ -158,6 +159,7 @@ function preview(): ComboRoutingPreviewResult {
 				route_class: "oauth-subscription",
 				existing_rule_id: null,
 				managed_model: "claude-opus-4-8",
+				policy_managed_model: "opus",
 				tier_source: "account_priority",
 				high_confidence: true,
 				selected_by_default: true,
@@ -203,7 +205,7 @@ function accountFamilyPreview(
 			assignment: {
 				...base.effective.policy.assignment,
 				family,
-				managed_model: managedModel,
+				managed_model: family,
 			},
 		},
 		resolution: {
@@ -219,6 +221,7 @@ function accountFamilyPreview(
 		scope: "account",
 		family,
 		managed_model: managedModel,
+		policy_managed_model: family,
 		effective,
 		proposals: [
 			{
@@ -226,6 +229,7 @@ function accountFamilyPreview(
 				proposal_id: `proposal-${family}`,
 				family,
 				managed_model: managedModel,
+				policy_managed_model: family,
 				proposed_effective: effective,
 				member_delta: proposal.member_delta.map((delta) => ({
 					...delta,
@@ -451,6 +455,7 @@ describe("managed routing mutation safety", () => {
 			previewId: "preview-1",
 			proposalId: "proposal-1",
 			managedModel: "claude-opus-4-8",
+			policyManagedModel: "opus",
 		});
 		expect(report.status).toBe("applied");
 	});
@@ -610,6 +615,7 @@ describe("managed routing mutation safety", () => {
 			}: {
 				family: ComboFamily;
 				previewId: string;
+				policyManagedModel: string;
 			}) => {
 				events.push(`apply:${family}:${previewId}`);
 				expect(previewId).toBe(`rev${revision}-${family}`);

@@ -13,6 +13,7 @@ import {
 	proposeComboEnrollmentRules,
 	proposeComboFamilyConversionRules,
 	resolveComboProposalManagedModel,
+	resolveComboProposalPolicyModel,
 	resolveEffectiveComboMembership,
 } from "./combo-membership-resolver";
 import { LATEST_MODEL_BY_FAMILY } from "./models";
@@ -328,7 +329,7 @@ describe("resolveEffectiveComboMembership", () => {
 			dependencies(),
 		);
 		expect(result.members[0]).toMatchObject({
-			logical_model: "claude-fable-5",
+			logical_model: LATEST_MODEL_BY_FAMILY.fable,
 			source: "managed",
 		});
 	});
@@ -549,6 +550,18 @@ describe("resolveEffectiveComboMembership", () => {
 });
 
 describe("resolveComboProposalManagedModel", () => {
+	it("keeps a bare family alias as the generated policy value while resolving it for routing", () => {
+		for (const family of ["fable", "opus", "sonnet", "haiku"] as const) {
+			const policy = snapshot(family, {
+				assignment: { ...snapshot(family).assignment, managed_model: null },
+			});
+			expect(resolveComboProposalPolicyModel(policy)).toBe(family);
+			expect(resolveComboProposalManagedModel(policy)).toBe(
+				LATEST_MODEL_BY_FAMILY[family],
+			);
+		}
+	});
+
 	it("resolves a bare family alias passed as reviewedOverride to the latest concrete model", () => {
 		expect(resolveComboProposalManagedModel(snapshot("opus"), "opus")).toBe(
 			LATEST_MODEL_BY_FAMILY.opus,

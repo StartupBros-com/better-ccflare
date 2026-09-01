@@ -314,6 +314,7 @@ export interface ApplyFamilyRoutingProposalVariables {
 	previewId: string;
 	proposalId: string;
 	managedModel: string;
+	policyManagedModel: string;
 }
 
 export const getApplyFamilyRoutingProposalMutationOptions = (

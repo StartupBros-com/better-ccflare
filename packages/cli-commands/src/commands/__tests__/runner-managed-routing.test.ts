@@ -245,6 +245,7 @@ describe("shared managed-routing CLI executor", () => {
 					scope: "family",
 					family: "opus",
 					managed_model: "claude-opus-4-8",
+					policy_managed_model: "opus",
 					effective: view,
 					proposals: [
 						{
@@ -255,6 +256,7 @@ describe("shared managed-routing CLI executor", () => {
 							route_class: "oauth-subscription",
 							existing_rule_id: null,
 							managed_model: "claude-opus-4-8",
+							policy_managed_model: "opus",
 							tier_source: "account_priority",
 							high_confidence: true,
 							selected_by_default: true,
@@ -292,7 +294,9 @@ describe("shared managed-routing CLI executor", () => {
 			interactive: true,
 			prompt: adapter,
 			onReviewOutput: async (output) => {
-				expect(output).toContain("preview=preview-opus");
+				expect(output).toContain(
+					"preview=preview-opus scope=family family=opus model=claude-opus-4-8 policy_model=opus",
+				);
 				events.push("display");
 			},
 		});

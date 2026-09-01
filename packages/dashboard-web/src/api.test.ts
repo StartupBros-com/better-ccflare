@@ -174,6 +174,7 @@ describe("managed-routing dashboard API contracts", () => {
 			proposalId: "proposal:reviewed",
 			accountId: "account/created",
 			managedModel: "claude-opus-4-7",
+			policyManagedModel: "claude-opus-4-7",
 		});
 		await api.excludeAccountFromFamily("opus", "account/created");
 		await api.restoreAccountToFamily("opus", "account/created");
@@ -200,6 +201,7 @@ describe("managed-routing dashboard API contracts", () => {
 			preview_id: "preview:reviewed",
 			proposal_id: "proposal:reviewed",
 			managed_model: "claude-opus-4-7",
+			policy_managed_model: "claude-opus-4-7",
 			subject: { account_id: "account/created" },
 		});
 
@@ -273,6 +275,7 @@ describe("managed-routing dashboard API contracts", () => {
 			previewId: "preview:family",
 			proposalId: "proposal:family",
 			managedModel: "claude-opus-4-7",
+			policyManagedModel: "claude-opus-4-7",
 		});
 
 		const preview = callFor("/api/routing/preview")[1];
@@ -287,6 +290,7 @@ describe("managed-routing dashboard API contracts", () => {
 			preview_id: "preview:family",
 			proposal_id: "proposal:family",
 			managed_model: "claude-opus-4-7",
+			policy_managed_model: "claude-opus-4-7",
 		});
 	});
 });

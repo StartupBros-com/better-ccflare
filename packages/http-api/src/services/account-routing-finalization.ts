@@ -45,6 +45,7 @@ export interface PersistedAccountRoutingFinalizationDependencies {
 		previewId: string;
 		proposalId: string;
 		managedModel: string;
+		policyManagedModel: string;
 	}): Promise<EffectiveComboRoutingView>;
 }
 
@@ -67,7 +68,7 @@ function proposalWasAlreadyEffective(
 	const { policy } = preview.effective;
 	if (
 		policy.assignment.membership_mode !== "managed" ||
-		policy.assignment.managed_model !== proposal.managed_model ||
+		policy.assignment.managed_model !== proposal.policy_managed_model ||
 		!policy.rules.some(
 			(rule) => rule.id === proposal.existing_rule_id && rule.enabled,
 		)
@@ -184,6 +185,7 @@ export function createPersistedAccountRoutingFinalizer(
 					previewId: preview.preview_id,
 					proposalId: selection.proposalId,
 					managedModel: proposal.managed_model,
+					policyManagedModel: proposal.policy_managed_model,
 				});
 			} catch (error) {
 				outcomes.push(actionRequired(selection, failedReason("apply", error)));

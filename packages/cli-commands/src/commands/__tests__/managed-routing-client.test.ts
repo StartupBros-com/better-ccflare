@@ -152,6 +152,7 @@ describe("managed routing live HTTP client", () => {
 			preview_id: "preview-1",
 			family: "opus",
 			managed_model: "claude-opus-4-8",
+			policy_managed_model: "opus",
 			proposals: [],
 			effective: effectiveView(),
 		};
@@ -175,6 +176,7 @@ describe("managed routing live HTTP client", () => {
 			previewId: "preview-1",
 			proposalId: "proposal-1",
 			managedModel: "claude-opus-4-8",
+			policyManagedModel: "opus",
 		});
 
 		expect(new URL(calls[0]?.url ?? "").pathname).toBe("/api/routing/preview");
@@ -193,6 +195,7 @@ describe("managed routing live HTTP client", () => {
 			preview_id: "preview-1",
 			proposal_id: "proposal-1",
 			managed_model: "claude-opus-4-8",
+			policy_managed_model: "opus",
 		});
 	});
 
@@ -227,6 +230,7 @@ describe("managed routing live HTTP client", () => {
 			previewId: "preview-1",
 			proposalId: "proposal-1",
 			managedModel: "claude-opus-4-8",
+			policyManagedModel: "opus",
 		});
 
 		expect(calls.map(({ url }) => new URL(url).pathname)).toEqual([
@@ -249,6 +253,7 @@ describe("managed routing live HTTP client", () => {
 			preview_id: "preview-1",
 			proposal_id: "proposal-1",
 			managed_model: "claude-opus-4-8",
+			policy_managed_model: "opus",
 			subject: { account_id: "account/created" },
 		});
 	});
@@ -320,6 +325,7 @@ describe("managed routing live HTTP client", () => {
 					previewId: "preview-1",
 					proposalId: "proposal-1",
 					managedModel: "claude-opus-4-8",
+					policyManagedModel: "opus",
 				});
 				throw new Error("expected managed routing error");
 			} catch (error) {
@@ -365,6 +371,7 @@ function previewResult() {
 		scope: "account" as const,
 		family: "opus" as const,
 		managed_model: "claude-opus-4-8",
+		policy_managed_model: "opus",
 		proposals: [],
 		effective: effectiveView(),
 	};

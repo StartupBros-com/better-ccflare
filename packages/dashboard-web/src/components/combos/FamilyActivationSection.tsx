@@ -143,9 +143,9 @@ export function getManagedModelOptions(
 
 export function resolveAuthoritativeManagedModel(
 	assignment: ComboFamilyAssignment | undefined,
-	liveOptions: readonly FamilyRoutingModelOption[],
+	family: ComboFamily,
 ): string {
-	return assignment?.managed_model ?? liveOptions[0]?.id ?? "";
+	return assignment?.managed_model ?? family;
 }
 
 export function previewMatchesPendingConversion(
@@ -425,7 +425,7 @@ export function FamilyActivationSection() {
 							);
 							const managedModel = resolveAuthoritativeManagedModel(
 								assignment,
-								modelOptions,
+								family,
 							);
 							const policyPending =
 								familyPolicyWritePending && policyMutationFamily === family;

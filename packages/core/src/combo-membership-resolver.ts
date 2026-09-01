@@ -10,7 +10,11 @@ import type {
 	EffectiveComboMember,
 	LogicalModelCapability,
 } from "@better-ccflare/types";
-import { getModelFamily, resolveFamilyAliasModel } from "./model-mappings";
+import {
+	getModelFamily,
+	isFamilyAliasModel,
+	resolveFamilyAliasModel,
+} from "./model-mappings";
 import { LATEST_MODEL_BY_FAMILY } from "./models";
 
 export interface ComboResolverDependencies {
@@ -352,6 +356,7 @@ function blockedProposal(
 	provider: string,
 	routeClass: ComboRouteClass,
 	managedModel: string,
+	policyManagedModel: string,
 	reason: ComboMembershipReasonCode,
 	existingRuleId: string | null = null,
 ): ComboEnrollmentRuleProposal {
@@ -369,6 +374,7 @@ function blockedProposal(
 		route_class: routeClass,
 		existing_rule_id: existingRuleId,
 		managed_model: managedModel,
+		policy_managed_model: policyManagedModel,
 		tier_source: "account_priority",
 		high_confidence: false,
 		selected_by_default: false,
@@ -393,7 +399,7 @@ export function createComboEnrollmentRuleProposalId(input: {
 	].join(":");
 }
 
-export function resolveComboProposalManagedModel(
+export function resolveComboProposalPolicyModel(
 	snapshot: ComboRoutingPolicySnapshot,
 	reviewedOverride?: string,
 ): string {
@@ -406,11 +412,22 @@ export function resolveComboProposalManagedModel(
 			candidate,
 			snapshot.assignment.family,
 		);
-		if (getModelFamily(resolved) === snapshot.assignment.family) {
-			return resolved;
-		}
+		if (getModelFamily(resolved) !== snapshot.assignment.family) continue;
+		return isFamilyAliasModel(candidate, snapshot.assignment.family)
+			? snapshot.assignment.family
+			: candidate;
 	}
-	return LATEST_MODEL_BY_FAMILY[snapshot.assignment.family];
+	return snapshot.assignment.family;
+}
+
+export function resolveComboProposalManagedModel(
+	snapshot: ComboRoutingPolicySnapshot,
+	reviewedOverride?: string,
+): string {
+	return resolveFamilyAliasModel(
+		resolveComboProposalPolicyModel(snapshot, reviewedOverride),
+		snapshot.assignment.family,
+	);
 }
 
 export function proposeComboEnrollmentRules(
@@ -435,6 +452,10 @@ export function proposeComboEnrollmentRules(
 		snapshot,
 		options.managedModel,
 	);
+	const policyManagedModel = resolveComboProposalPolicyModel(
+		snapshot,
+		options.managedModel,
+	);
 	const base = (
 		reason: ComboMembershipReasonCode,
 		existingRuleId: string | null = null,
@@ -444,6 +465,7 @@ export function proposeComboEnrollmentRules(
 			draftAccount.provider,
 			routeClass,
 			managedModel,
+			policyManagedModel,
 			reason,
 			existingRuleId,
 		);
@@ -577,6 +599,10 @@ export function proposeComboFamilyConversionRules(
 		snapshot,
 		options.managedModel,
 	);
+	const policyManagedModel = resolveComboProposalPolicyModel(
+		snapshot,
+		options.managedModel,
+	);
 	const proposals = new Map<string, ComboEnrollmentRuleProposal>();
 	const accountById = new Map(accounts.map((current) => [current.id, current]));
 	const currentRules = snapshot.rules
@@ -688,6 +714,7 @@ export function proposeComboFamilyConversionRules(
 				rule.provider,
 				rule.route_class,
 				managedModel,
+				policyManagedModel,
 				hasPeerEvidence ? "ambiguous" : rule.enabled ? "included" : "disabled",
 				rule.id,
 			),

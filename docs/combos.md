@@ -164,6 +164,8 @@ Do not replace the whole assignment when rolling back. The partial update immedi
 
 A family's `managed_model`, and an individual Manual slot's `model`, can hold either a concrete logical model ID or a bare family-alias literal — the family's own name (`opus`, `sonnet`, `haiku`, or `fable`, case-insensitive). An alias means "track the latest model in this family": it is resolved to the current concrete model at read and request time, and is never rewritten to a concrete value by that resolution. Shipping a new latest model for a family only requires the latest-model mapping bump in `models.ts` plus a deploy; it does not require a policy migration, a new preview, or an apply step against existing alias-valued assignments or slots.
 
+Generated Managed-routing defaults and reviewed proposals persist the canonical bare family alias. Their previews and effective routing views separately expose the concrete model currently resolved from that alias. An explicitly selected concrete `managed_model` remains an exact pin and is persisted verbatim. The dashboard labels its default choice as **Latest family**; every concrete catalog choice is an explicit pin.
+
 The dashboard and CLI always show what an alias currently resolves to alongside the stored literal (for example, `opus → claude-opus-5`) instead of displaying the bare word unexplained.
 
 **Rollback caveat:** a binary built before family-alias support does not know how to resolve the alias literal — it would treat the stored word as a real (and nonsensical) model ID. Before rolling production back to a pre-alias-feature binary, run:

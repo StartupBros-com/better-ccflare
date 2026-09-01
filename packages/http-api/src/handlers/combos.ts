@@ -5,6 +5,7 @@ import {
 	getModelFamily,
 	isFamilyAliasModel,
 	resolveEffectiveComboMembership,
+	resolveFamilyAliasModel,
 } from "@better-ccflare/core/managed-routing";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import {
@@ -26,6 +27,8 @@ import type {
 	ComboRoutingPreviewSubject,
 	ComboWithSlots,
 	EffectiveComboRoutingView,
+	FamilyAliasPolicyApplyInput,
+	FamilyAliasPolicySelection,
 } from "@better-ccflare/types";
 import {
 	COMBO_SLOT_PRIORITY_MAX,
@@ -793,6 +796,37 @@ function parseManagedModel(
 	return value.trim();
 }
 
+/**
+ * New clients echo both the resolved preview value and its exact persistence
+ * intent. Older clients can only apply a concrete value, where those values
+ * are necessarily identical; accepting an omitted alias here would turn it
+ * into a concrete pin.
+ */
+function parsePolicyManagedModel(
+	value: unknown,
+	family: ComboFamily,
+	managedModel: string,
+): string {
+	if (value === undefined) {
+		if (resolveFamilyAliasModel(managedModel, family) !== managedModel) {
+			throw BadRequest(
+				"policy_managed_model is required when managed_model is an alias",
+			);
+		}
+		return managedModel;
+	}
+	const policyManagedModel = parseManagedModel(value, family, true);
+	if (
+		policyManagedModel === undefined ||
+		resolveFamilyAliasModel(policyManagedModel, family) !== managedModel
+	) {
+		throw BadRequest(
+			"policy_managed_model must resolve to the reviewed managed_model",
+		);
+	}
+	return policyManagedModel;
+}
+
 /** GET /api/routing/effective and GET /api/routing/effective/:family. */
 export function createEffectiveRoutingHandler(
 	dbOps: DatabaseOperations,
@@ -1052,6 +1086,11 @@ export function createRoutingApplyHandler(
 			if (managedModel === undefined) {
 				throw BadRequest("managed_model is required");
 			}
+			const policyManagedModel = parsePolicyManagedModel(
+				body.policy_managed_model,
+				family,
+				managedModel,
+			);
 			const scope = parsePreviewScope(body.scope);
 			let subject: ComboRoutingPreviewSubject | undefined;
 			if (scope === "family") {
@@ -1075,6 +1114,7 @@ export function createRoutingApplyHandler(
 				previewId: body.preview_id,
 				proposalId: body.proposal_id,
 				managedModel,
+				policyManagedModel,
 				scope,
 				subject,
 			});
@@ -1174,6 +1214,94 @@ export function createMembershipExclusionRestoreHandler(
 				success: true,
 				data: await readEffectiveRouting(dbOps, family, dependencies),
 			});
+		} catch (error) {
+			return errorResponse(error);
+		}
+	};
+}
+
+/** POST /api/routing/family-aliases/preview — local-control candidate read. */
+export function createFamilyAliasPreviewHandler(dbOps: DatabaseOperations) {
+	return async (): Promise<Response> => {
+		try {
+			return Response.json({
+				success: true,
+				data: await dbOps.previewFamilyAliasPolicy(),
+			});
+		} catch (error) {
+			return errorResponse(error);
+		}
+	};
+}
+
+function parseFamilyAliasApplyInput(
+	body: Record<string, unknown>,
+): FamilyAliasPolicyApplyInput {
+	if (
+		!Number.isSafeInteger(body.expected_revision) ||
+		(body.expected_revision as number) < 0
+	) {
+		throw BadRequest("expected_revision must be a non-negative safe integer");
+	}
+	if (!Array.isArray(body.selections))
+		throw BadRequest("selections must be an array");
+	const selections: FamilyAliasPolicySelection[] = body.selections.map(
+		(value) => {
+			if (!value || typeof value !== "object")
+				throw BadRequest("invalid policy selection");
+			const selection = value as Record<string, unknown>;
+			if (
+				typeof selection.family !== "string" ||
+				typeof selection.expected_old_value !== "string"
+			) {
+				throw BadRequest(
+					"selection family and expected_old_value are required",
+				);
+			}
+			const family = parseFamily(selection.family);
+			const identity = selection.identity;
+			if (!identity || typeof identity !== "object")
+				throw BadRequest("selection identity is required");
+			const rawIdentity = identity as Record<string, unknown>;
+			if (
+				rawIdentity.kind === "family_assignment" &&
+				typeof rawIdentity.family === "string"
+			) {
+				return {
+					identity: {
+						kind: "family_assignment",
+						family: parseFamily(rawIdentity.family),
+					},
+					family,
+					expected_old_value: selection.expected_old_value,
+				};
+			}
+			if (
+				rawIdentity.kind === "combo_slot" &&
+				typeof rawIdentity.slot_id === "string" &&
+				rawIdentity.slot_id
+			) {
+				return {
+					identity: { kind: "combo_slot", slot_id: rawIdentity.slot_id },
+					family,
+					expected_old_value: selection.expected_old_value,
+				};
+			}
+			throw BadRequest("invalid policy selection identity");
+		},
+	);
+	return { expected_revision: body.expected_revision as number, selections };
+}
+
+/** POST /api/routing/family-aliases/apply — atomic local-control conversion. */
+export function createFamilyAliasApplyHandler(dbOps: DatabaseOperations) {
+	return async (req: Request): Promise<Response> => {
+		try {
+			const body = await parseObjectBody(req);
+			const result = await dbOps.applyFamilyAliasPolicy(
+				parseFamilyAliasApplyInput(body),
+			);
+			return Response.json({ success: true, data: result });
 		} catch (error) {
 			return errorResponse(error);
 		}

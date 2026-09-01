@@ -172,6 +172,10 @@ export function familyModelOptions(
 	const latest = LATEST_MODEL_BY_FAMILY[family];
 	const latestFromCatalog = modelOptions.find(({ id }) => id === latest);
 	const candidates = [
+		{
+			id: family,
+			displayName: `Latest ${family} (tracks ${getModelDisplayName(latest)})`,
+		},
 		latestFromCatalog ?? {
 			id: latest,
 			displayName: getModelDisplayName(latest),
@@ -180,7 +184,8 @@ export function familyModelOptions(
 	];
 	const seen = new Set<string>();
 	return candidates.filter(({ id }) => {
-		if (seen.has(id) || getModelFamily(id) !== family) return false;
+		if (seen.has(id) || (id !== family && getModelFamily(id) !== family))
+			return false;
 		seen.add(id);
 		return true;
 	});

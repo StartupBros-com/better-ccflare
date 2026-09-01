@@ -30,6 +30,9 @@ import type {
 	ComboRoutingPolicySnapshot,
 	ComboSlot,
 	ComboWithSlots,
+	FamilyAliasPolicyApplyInput,
+	FamilyAliasPolicyApplyResult,
+	FamilyAliasPolicyPreview,
 	IntegrityStatus,
 	ProjectAttributionSource,
 	RateLimitReason,
@@ -2570,6 +2573,16 @@ OAuth tokens will need to be re-authenticated.
 
 	async getRoutingPolicyRevision(): Promise<number> {
 		return this.combo.getRoutingPolicyRevision();
+	}
+
+	async previewFamilyAliasPolicy(): Promise<FamilyAliasPolicyPreview> {
+		return this.combo.previewFamilyAliasPolicy();
+	}
+
+	async applyFamilyAliasPolicy(
+		input: FamilyAliasPolicyApplyInput,
+	): Promise<FamilyAliasPolicyApplyResult> {
+		return this.combo.applyFamilyAliasPolicy(input);
 	}
 
 	async applyFamilyPolicyChanges(

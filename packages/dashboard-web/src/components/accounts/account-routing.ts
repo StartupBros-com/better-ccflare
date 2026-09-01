@@ -259,6 +259,7 @@ export interface AccountRoutingReconcileClient {
 		proposalId: string;
 		accountId: string;
 		managedModel: string;
+		policyManagedModel: string;
 	}): Promise<EffectiveComboRoutingView>;
 }
 
@@ -302,7 +303,7 @@ function proposalIsAlreadyEffective(
 	const { policy } = preview.effective;
 	if (
 		policy.assignment.membership_mode !== "managed" ||
-		policy.assignment.managed_model !== proposal.managed_model ||
+		policy.assignment.managed_model !== proposal.policy_managed_model ||
 		!policy.rules.some(
 			(rule) => rule.id === proposal.existing_rule_id && rule.enabled,
 		)
@@ -431,6 +432,7 @@ export async function reconcileAccountRoutingSelections(params: {
 				proposalId: selection.proposalId,
 				accountId: params.accountId,
 				managedModel: proposal.managed_model,
+				policyManagedModel: proposal.policy_managed_model,
 			});
 			const member = memberForAccount(effective, params.accountId);
 			outcomes.push(

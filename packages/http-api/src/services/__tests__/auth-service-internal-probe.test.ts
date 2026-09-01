@@ -246,6 +246,44 @@ describe("AuthService — internal probe exemption (#216)", () => {
 			expect(result.isAuthenticated).toBe(false);
 		});
 
+		it("limits family-alias conversion to the two POST endpoints with a matching secret", async () => {
+			const auth = new AuthService(
+				makeDbOpsWithApiKeys(),
+				SECRET,
+				CONTROL_SECRET,
+			);
+			for (const path of [
+				"/api/routing/family-aliases/preview",
+				"/api/routing/family-aliases/apply",
+			]) {
+				const valid = makeRequest(path, {
+					[LOCAL_CONTROL_SECRET_HEADER]: CONTROL_SECRET,
+				});
+				expect(
+					(await auth.authenticateRequest(valid, path, "POST")).isAuthenticated,
+				).toBe(true);
+
+				for (const headers of [
+					{},
+					{ [LOCAL_CONTROL_SECRET_HEADER]: "wrong" },
+				]) {
+					const invalid = makeRequest(path, headers);
+					expect(
+						(await auth.authenticateRequest(invalid, path, "POST"))
+							.isAuthenticated,
+					).toBe(false);
+				}
+
+				const wrongMethod = makeRequest(path, {
+					[LOCAL_CONTROL_SECRET_HEADER]: CONTROL_SECRET,
+				});
+				expect(
+					(await auth.authenticateRequest(wrongMethod, path, "GET"))
+						.isAuthenticated,
+				).toBe(false);
+			}
+		});
+
 		it("does not leak the local-control-secret exemption to unrelated /api routes", async () => {
 			const auth = new AuthService(
 				makeDbOpsWithApiKeys(),
