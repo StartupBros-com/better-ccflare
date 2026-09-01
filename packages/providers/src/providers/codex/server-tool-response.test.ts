@@ -183,10 +183,7 @@ describe("Codex native hosted-search response decoder", () => {
 		const instance = decoder();
 		expect(instance.acceptSseEvent(stream[0])).toEqual([]);
 		const added = instance.acceptSseEvent(stream[1]);
-		expect(added.map((event) => event.type)).toEqual([
-			"declared",
-			"dispatched",
-		]);
+		expect(added).toEqual([]);
 		expect(JSON.stringify(added)).not.toContain("not-authoritative");
 		expect(JSON.stringify(added)).not.toContain("not-evidence");
 	});

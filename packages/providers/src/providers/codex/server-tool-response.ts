@@ -465,7 +465,9 @@ type SearchCallState = {
 	readonly nativeId: string;
 	readonly outputIndex: number;
 	readonly publicId: string;
-	readonly kind: "search" | "auxiliary";
+	kind: "search" | "auxiliary";
+	lifecycleStarted: boolean;
+	lifecycleSearchingEmitted: boolean;
 	inProgressSeen: boolean;
 	searchingSeen: boolean;
 	completedProgressSeen: boolean;
@@ -1094,6 +1096,8 @@ export class CodexServerToolResponseDecoder {
 				outputIndex,
 				publicId,
 				kind,
+				lifecycleStarted: false,
+				lifecycleSearchingEmitted: false,
 				inProgressSeen: false,
 				searchingSeen: false,
 				completedProgressSeen: false,
@@ -1103,12 +1107,7 @@ export class CodexServerToolResponseDecoder {
 				signature: null,
 			});
 			this.enforceAggregateBounds();
-			return kind === "auxiliary"
-				? []
-				: [
-						Object.freeze({ type: "declared", callId: publicId }),
-						Object.freeze({ type: "dispatched", callId: publicId }),
-					];
+			return [];
 		}
 		if (type === "message") {
 			const id = nativeId(own(item, "id"));
@@ -1178,9 +1177,7 @@ export class CodexServerToolResponseDecoder {
 				fail();
 			}
 			call.searchingSeen = true;
-			return call.kind === "auxiliary"
-				? []
-				: [Object.freeze({ type: "searching", callId: call.publicId })];
+			return [];
 		}
 		if (!call.searchingSeen || call.completedProgressSeen) fail();
 		call.completedProgressSeen = true;
@@ -1206,6 +1203,8 @@ export class CodexServerToolResponseDecoder {
 				outputIndex,
 				publicId,
 				kind: parsed.kind,
+				lifecycleStarted: false,
+				lifecycleSearchingEmitted: false,
 				inProgressSeen: false,
 				searchingSeen: false,
 				completedProgressSeen: false,
@@ -1216,19 +1215,15 @@ export class CodexServerToolResponseDecoder {
 			};
 			this.calls.set(parsed.nativeId, call);
 			this.enforceAggregateBounds();
-			if (parsed.kind === "search") {
-				events.push(
-					Object.freeze({ type: "declared", callId: publicId }),
-					Object.freeze({ type: "dispatched", callId: publicId }),
-				);
-			}
 		} else {
 			this.assertOutputIdentity(
 				outputIndex,
 				"web_search_call",
 				parsed.nativeId,
 			);
-			if (call.outputIndex !== outputIndex || call.kind !== parsed.kind) fail();
+			if (call.outputIndex !== outputIndex) fail();
+			if (call.done && call.kind !== parsed.kind) fail();
+			if (!call.done) call.kind = parsed.kind;
 		}
 		if (call.done) {
 			if (!allowExisting || call.signature !== parsed.signature) fail();
@@ -1242,10 +1237,18 @@ export class CodexServerToolResponseDecoder {
 			this.enforceAggregateBounds();
 			return events;
 		}
-		if (!call.searchingSeen) {
-			call.searchingSeen = true;
+		if (!call.lifecycleStarted) {
+			call.lifecycleStarted = true;
+			events.push(
+				Object.freeze({ type: "declared", callId: call.publicId }),
+				Object.freeze({ type: "dispatched", callId: call.publicId }),
+			);
+		}
+		if (!call.lifecycleSearchingEmitted) {
+			call.lifecycleSearchingEmitted = true;
 			events.push(Object.freeze({ type: "searching", callId: call.publicId }));
 		}
+		if (!call.searchingSeen) call.searchingSeen = true;
 		call.done = true;
 		call.sourceRefsByUrl = parsed.sourceRefsByUrl;
 		call.signature = parsed.signature;
