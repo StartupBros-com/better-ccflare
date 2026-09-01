@@ -46,4 +46,33 @@ describe("classifyAnthropicSseFrame protocol activity", () => {
 			validProtocolActivity: true,
 		});
 	});
+
+	it("retains only allowlisted unsupported-parameter identifiers", () => {
+		for (const [message, unsupportedParameter] of [
+			["Unsupported parameter: max_tool_calls", "max_tool_calls"],
+			["Unsupported parameter: 'tool_choice'.", "tool_choice"],
+			['Unsupported parameter: "include.0"', "include.0"],
+		] as const) {
+			const frame = `event: error\ndata: ${JSON.stringify({
+				type: "error",
+				error: { type: "api_error", message },
+			})}\n\n`;
+			expect(classifyAnthropicSseFrame(frame)).toEqual({
+				kind: "error",
+				validProtocolActivity: true,
+				errorType: "api_error",
+				transientErrorType: "api_error",
+				unsupportedParameter,
+			});
+		}
+
+		const privateMessage = "private prompt text must not escape";
+		const privateFrame = `event: error\ndata: ${JSON.stringify({
+			type: "error",
+			error: { type: "api_error", message: privateMessage },
+		})}\n\n`;
+		const classification = classifyAnthropicSseFrame(privateFrame);
+		expect(classification).not.toHaveProperty("unsupportedParameter");
+		expect(JSON.stringify(classification)).not.toContain(privateMessage);
+	});
 });

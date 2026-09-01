@@ -491,6 +491,38 @@ describe("gateAnthropicSsePreCommit", () => {
 		}
 	});
 
+	it("propagates only a bounded unsupported-parameter identifier", async () => {
+		const privateSuffix = "private text must not escape";
+		const frame = `event: error\ndata: ${JSON.stringify({
+			type: "error",
+			error: {
+				type: "api_error",
+				message: "Unsupported parameter: tool_choice",
+				privateSuffix,
+			},
+		})}\n\n`;
+		const result = gateAnthropicSsePreCommit(
+			immediateStream([bytes(`${messageStart}${frame}`)]),
+			{
+				semanticTimeoutMs: 100,
+				terminalGraceMs: 20,
+				maxBufferedBytes: 2048,
+			},
+		);
+
+		let caught: unknown;
+		try {
+			await result;
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(AnthropicPreCommitTransientError);
+		expect(
+			(caught as AnthropicPreCommitTransientError).unsupportedParameter,
+		).toBe("tool_choice");
+		expect(JSON.stringify(caught)).not.toContain(privateSuffix);
+	});
+
 	it("conservatively commits valid unknown extensions and nonretryable error events unchanged", async () => {
 		for (const frame of [
 			'id: extension-1\nevent: future_event\ndata: {"type":"future_event"}\n\n',
