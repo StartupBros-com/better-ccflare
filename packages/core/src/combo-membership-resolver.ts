@@ -14,6 +14,7 @@ import {
 	getModelFamily,
 	isFamilyAliasModel,
 	resolveFamilyAliasModel,
+	resolveStoredPolicyAliasModel,
 } from "./model-mappings";
 import { LATEST_MODEL_BY_FAMILY } from "./models";
 
@@ -55,10 +56,7 @@ function createManualMember(
 		combo_id: slot.combo_id,
 		family: snapshot.assignment.family,
 		included: true,
-		logical_model: resolveFamilyAliasModel(
-			slot.model,
-			snapshot.assignment.family,
-		),
+		logical_model: resolveStoredPolicyAliasModel(slot.model),
 		tier: slot.priority,
 		source: "manual",
 		reason: "included",

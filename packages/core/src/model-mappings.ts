@@ -80,6 +80,20 @@ export function resolveFamilyAliasModel(
 }
 
 /**
+ * Resolve a stored policy or slot model that is exactly a supported bare family
+ * alias. Unlike resolveFamilyAliasModel(), this derives the alias family from
+ * the stored value itself so a manual combo slot may intentionally target a
+ * different family than its combo assignment.
+ */
+export function resolveStoredPolicyAliasModel(value: string): string {
+	const trimmed = value.trim();
+	const family = KNOWN_PATTERNS.find(
+		(candidate) => candidate === trimmed.toLowerCase(),
+	);
+	return family ? LATEST_MODEL_BY_FAMILY[family] : trimmed;
+}
+
+/**
  * Internal window key for a per-model weekly (weekly_scoped) limit, derived from
  * the model display name. Kept byte-identical between the dashboard usage rows
  * and the proxy throttle snapshots so the two match (throttle-window match /
