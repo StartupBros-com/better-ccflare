@@ -19,6 +19,7 @@ import officialSearchStream from "./__fixtures__/server-tools/official-search-st
 import { CODEX_DEFAULT_ENDPOINT, CodexProvider } from "./provider";
 import {
 	classifyCodexHostedError,
+	classifyCodexHostedTerminalShape,
 	createCodexHostedSearchAttemptPlan,
 } from "./server-tool-attempt-plan";
 import {
@@ -334,6 +335,30 @@ function materializeCodexTuple(
 }
 
 describe("Codex hosted-search upstream error diagnostics", () => {
+	test("classifies only non-success terminal shape fields", () => {
+		expect(
+			classifyCodexHostedTerminalShape({
+				type: "response.incomplete",
+				response: {
+					status: "incomplete",
+					incomplete_details: { reason: "max_output_tokens" },
+					error: { message: "private" },
+				},
+			}),
+		).toEqual({
+			eventType: "response.incomplete",
+			responseStatus: "incomplete",
+			incompleteReason: "max_output_tokens",
+			hasError: true,
+		});
+		expect(
+			classifyCodexHostedTerminalShape({
+				type: "response.completed",
+				response: { status: "completed" },
+			}),
+		).toBeNull();
+	});
+
 	test("retains only bounded identifiers and an allowlisted category", () => {
 		const privateMessage = "private backend detail must not escape";
 		const diagnostic = classifyCodexHostedError({
