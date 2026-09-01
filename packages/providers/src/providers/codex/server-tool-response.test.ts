@@ -242,6 +242,52 @@ describe("Codex native hosted-search response decoder", () => {
 		]);
 	});
 
+	it("attributes source-less citations to the latest completed search", () => {
+		const first = searchItem("ws_source_less_first", "first query", []);
+		first.action.queries = ["first query", "first refinement"];
+		delete first.action.sources;
+		const second = searchItem("ws_source_less_second", "second query", []);
+		second.action.queries = ["second query", "second refinement"];
+		delete second.action.sources;
+		const message = messageItem("msg_source_less", "See latest", [
+			{
+				type: "url_citation",
+				start_index: 4,
+				end_index: 10,
+				title: "Latest",
+				url: "https://latest.example.test/page",
+			},
+		]);
+
+		const events = decoder().acceptResponse(
+			completedResponse([first, second, message]),
+		);
+		const results = events.filter(
+			(
+				event,
+			): event is Extract<HostedSearchLifecycleInput, { type: "result" }> =>
+				event.type === "result",
+		);
+		expect(results).toHaveLength(2);
+		const sourced = results.find((result) => result.sources.length === 1);
+		const empty = results.find((result) => result.sources.length === 0);
+		expect(sourced).toBeDefined();
+		expect(empty).toBeDefined();
+		const citation = events.find(
+			(
+				event,
+			): event is Extract<HostedSearchLifecycleInput, { type: "citation" }> =>
+				event.type === "citation",
+		);
+		expect(citation?.callId).toBe(sourced?.callId);
+		expect(empty?.callId).not.toBe(sourced?.callId);
+		expect(events).toContainEqual({
+			type: "usage_observation",
+			webSearchRequests: 2,
+		});
+		assertLifecycleAccepts(events);
+	});
+
 	it("keeps multiple searches distinct and preserves annotation original indices", () => {
 		const response = completedResponse([
 			searchItem("ws_first", "first", ["https://one.example.test/a"]),
