@@ -357,6 +357,20 @@ describe("Codex hosted-search upstream error diagnostics", () => {
 				response: { status: "completed" },
 			}),
 		).toBeNull();
+		expect(
+			classifyCodexHostedTerminalShape({
+				type: "response.completed",
+				response: {
+					status: "failed",
+					error: { message: "private" },
+				},
+			}),
+		).toEqual({
+			eventType: "response.completed",
+			responseStatus: "failed",
+			incompleteReason: null,
+			hasError: true,
+		});
 	});
 
 	test("retains only bounded identifiers and an allowlisted category", () => {
