@@ -678,7 +678,10 @@ async function transformHostedRequest(
 		converted.tool_choice.type === "function" &&
 		converted.tool_choice.name === "web_search"
 	) {
-		converted.tool_choice = { type: "web_search" };
+		// Claude's forced WebSearch request offers exactly one retained tool. Use
+		// the standard Responses required form instead of a backend-specific hosted
+		// tool selector; the result still cannot select anything except WebSearch.
+		converted.tool_choice = "required";
 	}
 	const headers = new Headers(ordinary.headers);
 	headers.delete("content-length");
