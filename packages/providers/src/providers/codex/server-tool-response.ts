@@ -38,6 +38,8 @@ const CONTAINER_FILE_CITATION_FIELDS = new Set([
 const FILE_PATH_FIELDS = new Set(["type", "file_id", "index"]);
 const SEARCH_ITEM_FIELDS = new Set(["id", "type", "status", "action"]);
 const SEARCH_ACTION_FIELDS = new Set(["type", "query", "queries", "sources"]);
+const OPEN_PAGE_ACTION_FIELDS = new Set(["type", "url"]);
+const FIND_IN_PAGE_ACTION_FIELDS = new Set(["type", "url", "pattern"]);
 const SEARCH_SOURCE_FIELDS = new Set(["type", "url"]);
 const MESSAGE_ITEM_FIELDS = new Set([
 	"id",
@@ -463,6 +465,7 @@ type SearchCallState = {
 	readonly nativeId: string;
 	readonly outputIndex: number;
 	readonly publicId: string;
+	readonly kind: "search" | "auxiliary";
 	inProgressSeen: boolean;
 	searchingSeen: boolean;
 	completedProgressSeen: boolean;
@@ -582,6 +585,7 @@ function parsedAnnotation(value: unknown): ParsedAnnotation {
 
 function parseCompleteSearchItem(value: unknown): Readonly<{
 	nativeId: string;
+	kind: "search" | "auxiliary";
 	query: string;
 	sources: readonly HostedSearchSourceInput[];
 	sourceRefsByUrl: ReadonlyMap<string, string>;
@@ -593,7 +597,35 @@ function parseCompleteSearchItem(value: unknown): Readonly<{
 	const id = nativeId(own(item, "id"));
 	if (own(item, "status") !== "completed") fail();
 	const action = asRecord(own(item, "action"));
-	if (eventType(action) !== "search") fail();
+	const actionType = eventType(action);
+	if (actionType === "open_page") {
+		allowOnlyOwnFields(action, OPEN_PAGE_ACTION_FIELDS);
+		const url = canonicalUrl(own(action, "url"));
+		return Object.freeze({
+			nativeId: id,
+			kind: "auxiliary" as const,
+			query: "",
+			sources: Object.freeze([]),
+			sourceRefsByUrl: new Map(),
+			signature: identityDigest("open-page", [url]),
+		});
+	}
+	if (actionType === "find_in_page") {
+		allowOnlyOwnFields(action, FIND_IN_PAGE_ACTION_FIELDS);
+		const url = canonicalUrl(own(action, "url"));
+		const pattern = boundedString(own(action, "pattern"), MAX_QUERY_BYTES, {
+			nonEmpty: true,
+		});
+		return Object.freeze({
+			nativeId: id,
+			kind: "auxiliary" as const,
+			query: "",
+			sources: Object.freeze([]),
+			sourceRefsByUrl: new Map(),
+			signature: identityDigest("find-in-page", [url, pattern]),
+		});
+	}
+	if (actionType !== "search") fail();
 	allowOnlyOwnFields(action, SEARCH_ACTION_FIELDS);
 	const query = boundedString(own(action, "query"), MAX_QUERY_BYTES, {
 		nonEmpty: true,
@@ -643,6 +675,7 @@ function parseCompleteSearchItem(value: unknown): Readonly<{
 	}
 	return Object.freeze({
 		nativeId: id,
+		kind: "search" as const,
 		query,
 		sources: Object.freeze(sources),
 		sourceRefsByUrl,
@@ -1046,10 +1079,21 @@ export class CodexServerToolResponseDecoder {
 			}
 			this.reserveOutput(outputIndex, type, id);
 			const publicId = this.newOpaqueId("srvtoolu_");
+			const actionValue = optionalOwn(item, "action");
+			const actionType = isRecord(actionValue)
+				? eventType(actionValue)
+				: "search";
+			const kind =
+				actionType === "open_page" || actionType === "find_in_page"
+					? "auxiliary"
+					: actionType === "search"
+						? "search"
+						: fail();
 			this.calls.set(id, {
 				nativeId: id,
 				outputIndex,
 				publicId,
+				kind,
 				inProgressSeen: false,
 				searchingSeen: false,
 				completedProgressSeen: false,
@@ -1059,10 +1103,12 @@ export class CodexServerToolResponseDecoder {
 				signature: null,
 			});
 			this.enforceAggregateBounds();
-			return [
-				Object.freeze({ type: "declared", callId: publicId }),
-				Object.freeze({ type: "dispatched", callId: publicId }),
-			];
+			return kind === "auxiliary"
+				? []
+				: [
+						Object.freeze({ type: "declared", callId: publicId }),
+						Object.freeze({ type: "dispatched", callId: publicId }),
+					];
 		}
 		if (type === "message") {
 			const id = nativeId(own(item, "id"));
@@ -1132,7 +1178,9 @@ export class CodexServerToolResponseDecoder {
 				fail();
 			}
 			call.searchingSeen = true;
-			return [Object.freeze({ type: "searching", callId: call.publicId })];
+			return call.kind === "auxiliary"
+				? []
+				: [Object.freeze({ type: "searching", callId: call.publicId })];
 		}
 		if (!call.searchingSeen || call.completedProgressSeen) fail();
 		call.completedProgressSeen = true;
@@ -1157,6 +1205,7 @@ export class CodexServerToolResponseDecoder {
 				nativeId: parsed.nativeId,
 				outputIndex,
 				publicId,
+				kind: parsed.kind,
 				inProgressSeen: false,
 				searchingSeen: false,
 				completedProgressSeen: false,
@@ -1167,20 +1216,30 @@ export class CodexServerToolResponseDecoder {
 			};
 			this.calls.set(parsed.nativeId, call);
 			this.enforceAggregateBounds();
-			events.push(
-				Object.freeze({ type: "declared", callId: publicId }),
-				Object.freeze({ type: "dispatched", callId: publicId }),
-			);
+			if (parsed.kind === "search") {
+				events.push(
+					Object.freeze({ type: "declared", callId: publicId }),
+					Object.freeze({ type: "dispatched", callId: publicId }),
+				);
+			}
 		} else {
 			this.assertOutputIdentity(
 				outputIndex,
 				"web_search_call",
 				parsed.nativeId,
 			);
-			if (call.outputIndex !== outputIndex) fail();
+			if (call.outputIndex !== outputIndex || call.kind !== parsed.kind) fail();
 		}
 		if (call.done) {
 			if (!allowExisting || call.signature !== parsed.signature) fail();
+			return events;
+		}
+		if (parsed.kind === "auxiliary") {
+			call.done = true;
+			call.resultEmitted = true;
+			call.signature = parsed.signature;
+			this.resolveOutput(outputIndex);
+			this.enforceAggregateBounds();
 			return events;
 		}
 		if (!call.searchingSeen) {
@@ -1293,7 +1352,9 @@ export class CodexServerToolResponseDecoder {
 			(annotation): annotation is ParsedUrlAnnotation =>
 				annotation.kind === "url",
 		);
-		const completedCalls = [...this.calls.values()].filter((call) => call.done);
+		const completedCalls = [...this.calls.values()].filter(
+			(call) => call.done && call.kind === "search",
+		);
 		if (
 			urlAnnotations.length > 0 &&
 			completedCalls.length === 1 &&
