@@ -13,6 +13,7 @@
  * requests.applied_model and exposes on the live summary event.
  */
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { LATEST_OPUS_MODEL } from "@better-ccflare/core";
 import { usageCache } from "@better-ccflare/providers";
 import type {
 	Account,
@@ -174,6 +175,74 @@ function makeProxyRequest(
 }
 
 describe("combo-override model observability", () => {
+	for (const { name, probeSuppressed } of [
+		{ name: "normal route", probeSuppressed: false },
+		{ name: "all-probe-suppressed ungated retry", probeSuppressed: true },
+	]) {
+		it(`resolves a fable combo's bare opus slot on the ${name}`, async () => {
+			const handleStart = installUsageCollector();
+			const comboAccount = makeAccount(
+				`fable-opus-${probeSuppressed ? "suppressed" : "normal"}`,
+				{
+					rate_limited_until: probeSuppressed ? Date.now() - 1 : null,
+					rate_limited_reason: probeSuppressed
+						? "upstream_529_overloaded_no_reset"
+						: null,
+				},
+			);
+			if (probeSuppressed) {
+				expect(getRateLimitProbeAdmission(comboAccount)).toBe("admitted");
+			}
+			const combo: ComboWithSlots = {
+				id: `combo-fable-opus-${probeSuppressed ? "suppressed" : "normal"}`,
+				name: "Fable with Opus slot",
+				description: null,
+				enabled: true,
+				created_at: 0,
+				updated_at: 0,
+				slots: [
+					{
+						id: "slot-bare-opus",
+						combo_id: `combo-fable-opus-${probeSuppressed ? "suppressed" : "normal"}`,
+						account_id: comboAccount.id,
+						model: "opus",
+						priority: 10,
+						enabled: true,
+					},
+				],
+			};
+			const strategySelect = mock((accounts: Account[]) => accounts);
+			const ctx = makeContext([comboAccount], combo, strategySelect);
+			const outgoingModels: string[] = [];
+			globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+				const request = input instanceof Request ? input : new Request(input);
+				outgoingModels.push((await request.json()).model);
+				return new Response('{"type":"message","content":[]}', {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}) as unknown as typeof fetch;
+
+			const request = makeProxyRequest("claude-fable-5");
+			const response = await handleProxy(request, new URL(request.url), ctx);
+
+			expect(response.status).toBe(200);
+			const selectorMeta = strategySelect.mock.calls[0]?.[1] as {
+				routingCandidates?: Array<{ modelOverride?: string | null }>;
+			};
+			expect(
+				selectorMeta.routingCandidates?.map(
+					(candidate) => candidate.modelOverride,
+				),
+			).toEqual([LATEST_OPUS_MODEL]);
+			expect(outgoingModels).toEqual([LATEST_OPUS_MODEL]);
+			expect(outgoingModels).not.toContain("opus");
+			const startMessage = handleStart.mock.calls[0]?.[0] as StartMessage;
+			expect(startMessage.appliedModel).toBe(LATEST_OPUS_MODEL);
+			expect(startMessage.comboModelOverrideTo).toBe(LATEST_OPUS_MODEL);
+		});
+	}
+
 	it("persists original_model and applied_model for a pure combo rewrite (no agent involved)", async () => {
 		const handleStart = installUsageCollector();
 		const comboAccount = makeAccount("pure-combo-account");

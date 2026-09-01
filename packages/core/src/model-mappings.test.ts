@@ -21,6 +21,7 @@ import {
 	parseModelMappings,
 	resolveCompatibleEndpoint,
 	resolveFamilyAliasModel,
+	resolveStoredPolicyAliasModel,
 	ValidationError,
 	validatePriority,
 } from "@better-ccflare/core";
@@ -550,6 +551,28 @@ describe("Family alias helpers", () => {
 		);
 		// A different family's bare word is not an alias for this family — passed through trimmed.
 		expect(resolveFamilyAliasModel("sonnet", "opus")).toBe("sonnet");
+	});
+
+	test("resolveStoredPolicyAliasModel resolves only exact bare supported aliases", () => {
+		expect(resolveStoredPolicyAliasModel("  OPUS  ")).toBe(
+			LATEST_MODEL_BY_FAMILY.opus,
+		);
+		expect(resolveStoredPolicyAliasModel("sonnet")).toBe(
+			LATEST_MODEL_BY_FAMILY.sonnet,
+		);
+		expect(resolveStoredPolicyAliasModel("haiku")).toBe(
+			LATEST_MODEL_BY_FAMILY.haiku,
+		);
+		expect(resolveStoredPolicyAliasModel("fable")).toBe(
+			LATEST_MODEL_BY_FAMILY.fable,
+		);
+		for (const value of [
+			"my-opus-experiment",
+			"provider/claude-opus-5",
+			"claude-opus-4-8",
+		]) {
+			expect(resolveStoredPolicyAliasModel(value)).toBe(value);
+		}
 	});
 });
 

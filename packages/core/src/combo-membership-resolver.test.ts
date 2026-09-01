@@ -429,6 +429,75 @@ describe("resolveEffectiveComboMembership", () => {
 		});
 	});
 
+	it("resolves bare manual slot aliases by their own family in a fable assignment", () => {
+		const policy = snapshot("fable", {
+			assignment: {
+				...snapshot("fable").assignment,
+				membership_mode: "manual",
+			},
+			slots: [
+				{
+					id: "slot-opus",
+					combo_id: "combo-1",
+					account_id: "account-opus",
+					model: "  OPUS  ",
+					priority: 10,
+					enabled: true,
+				},
+				{
+					id: "slot-sonnet",
+					combo_id: "combo-1",
+					account_id: "account-sonnet",
+					model: "sonnet",
+					priority: 20,
+					enabled: true,
+				},
+				{
+					id: "slot-haiku",
+					combo_id: "combo-1",
+					account_id: "account-haiku",
+					model: "haiku",
+					priority: 30,
+					enabled: true,
+				},
+				{
+					id: "slot-fable",
+					combo_id: "combo-1",
+					account_id: "account-fable",
+					model: "fable",
+					priority: 40,
+					enabled: true,
+				},
+				{
+					id: "slot-older-pin",
+					combo_id: "combo-1",
+					account_id: "account-older",
+					model: "claude-opus-4-8",
+					priority: 50,
+					enabled: true,
+				},
+				{
+					id: "slot-custom",
+					combo_id: "combo-1",
+					account_id: "account-custom",
+					model: "my-opus-experiment",
+					priority: 60,
+					enabled: true,
+				},
+			],
+		});
+		const result = resolveEffectiveComboMembership(policy, [], dependencies());
+
+		expect(result.members.map((member) => member.logical_model)).toEqual([
+			LATEST_MODEL_BY_FAMILY.opus,
+			LATEST_MODEL_BY_FAMILY.sonnet,
+			LATEST_MODEL_BY_FAMILY.haiku,
+			LATEST_MODEL_BY_FAMILY.fable,
+			"claude-opus-4-8",
+			"my-opus-experiment",
+		]);
+	});
+
 	it("resolves a bare family alias stored on the managed_model policy to the latest concrete model", () => {
 		const policy = snapshot("opus", {
 			assignment: {

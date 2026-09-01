@@ -87,6 +87,7 @@ export {
 	providerAcceptsClientModel,
 	resolveCompatibleEndpoint,
 	resolveFamilyAliasModel,
+	resolveStoredPolicyAliasModel,
 	validateAndSanitizeModelFallbacks,
 	validateAndSanitizeModelMappings,
 	weeklyScopedWindowKey,
