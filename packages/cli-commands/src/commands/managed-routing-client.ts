@@ -40,7 +40,10 @@ export interface ApplyFamilyRoutingProposalInput {
 	family: ComboFamily;
 	previewId: string;
 	proposalId: string;
+	/** Concrete reviewed resolution. */
 	managedModel: string;
+	/** Exact reviewed policy value, which may be a family alias. */
+	policyManagedModel: string;
 }
 
 export interface ApplyAccountRoutingProposalInput
@@ -296,6 +299,7 @@ export function createManagedRoutingClient(
 			previewId,
 			proposalId,
 			managedModel,
+			policyManagedModel,
 		}) {
 			return envelopeData<EffectiveComboRoutingView>(
 				await request(`/api/routing/apply/${family}`, {
@@ -305,6 +309,7 @@ export function createManagedRoutingClient(
 						preview_id: previewId,
 						proposal_id: proposalId,
 						managed_model: managedModel,
+						policy_managed_model: policyManagedModel,
 						subject: { account_id: accountId },
 					}),
 				}),
@@ -315,6 +320,7 @@ export function createManagedRoutingClient(
 			previewId,
 			proposalId,
 			managedModel,
+			policyManagedModel,
 		}) {
 			return envelopeData<EffectiveComboRoutingView>(
 				await request(`/api/routing/apply/${family}`, {
@@ -324,6 +330,7 @@ export function createManagedRoutingClient(
 						preview_id: previewId,
 						proposal_id: proposalId,
 						managed_model: managedModel,
+						policy_managed_model: policyManagedModel,
 					}),
 				}),
 			);

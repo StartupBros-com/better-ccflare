@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { LATEST_MODEL_BY_FAMILY } from "@better-ccflare/core";
 import { SQL } from "bun";
-import "@better-ccflare/core";
 import { BunSqlAdapter } from "../adapters/bun-sql-adapter";
 import { ensureSchemaPg, runMigrationsPg } from "../migrations-pg";
 import { ComboRepository } from "../repositories/combo.repository";
@@ -418,6 +418,237 @@ describePostgres("managed routing PostgreSQL integration", () => {
 			const aggregate = await requests.aggregateStats(24 * 60 * 60 * 1000);
 			expect(aggregate.totalRequests).toBe(3);
 			expect(aggregate.successfulRequests).toBe(1);
+		});
+	});
+
+	it("converts family aliases atomically while preserving pins, collisions, and unrelated PostgreSQL rows", async () => {
+		await withDisposableDatabase(async (adapter) => {
+			await ensureSchemaPg(adapter);
+			await runMigrationsPg(adapter);
+			await seedPolicyBase(adapter);
+			await adapter.run(
+				"INSERT INTO accounts (id, name, provider, model_mappings, created_at) VALUES (?, ?, ?, ?, ?)",
+				[
+					"account-2",
+					"two",
+					"anthropic",
+					JSON.stringify({ preserve: "account-2" }),
+					1,
+				],
+			);
+			await adapter.run("UPDATE accounts SET model_mappings = ? WHERE id = ?", [
+				JSON.stringify({ preserve: "account-1" }),
+				"account-1",
+			]);
+			const repo = new ComboRepository(adapter);
+			await repo.updateFamilyPolicy("opus", {
+				managed_model: LATEST_MODEL_BY_FAMILY.opus,
+			});
+			await repo.updateFamilyPolicy("fable", { managed_model: "fable" });
+			await repo.updateFamilyPolicy("haiku", {
+				managed_model: LATEST_MODEL_BY_FAMILY.haiku,
+			});
+			await repo.updateFamilyPolicy("sonnet", {
+				managed_model: LATEST_MODEL_BY_FAMILY.sonnet,
+			});
+			await adapter.run(
+				"INSERT INTO combo_slots (id, combo_id, account_id, model, priority, enabled) VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)",
+				[
+					"slot-safe-opus",
+					"combo-1",
+					"account-1",
+					LATEST_MODEL_BY_FAMILY.opus,
+					1,
+					1,
+					"slot-haiku-concrete",
+					"combo-1",
+					"account-1",
+					LATEST_MODEL_BY_FAMILY.haiku,
+					2,
+					1,
+					"slot-haiku-alias",
+					"combo-1",
+					"account-1",
+					"haiku",
+					3,
+					1,
+					"slot-fable-alias",
+					"combo-1",
+					"account-1",
+					"fable",
+					4,
+					1,
+					"slot-rollback-fable",
+					"combo-1",
+					"account-2",
+					LATEST_MODEL_BY_FAMILY.fable,
+					5,
+					1,
+				],
+			);
+			const mappingsBefore = await adapter.query<{
+				id: string;
+				model_mappings: string | null;
+			}>("SELECT id, model_mappings FROM accounts ORDER BY id");
+			const unrelatedSlotBefore = await adapter.get<{
+				id: string;
+				model: string;
+				priority: number;
+			}>("SELECT id, model, priority FROM combo_slots WHERE id = ?", [
+				"slot-1",
+			]);
+
+			const preview = await repo.previewFamilyAliasPolicy();
+			const safeAssignment = preview.candidates.find(
+				(candidate) =>
+					candidate.identity.kind === "family_assignment" &&
+					candidate.family === "opus",
+			);
+			const safeSlot = preview.candidates.find(
+				(candidate) =>
+					candidate.identity.kind === "combo_slot" &&
+					candidate.identity.slot_id === "slot-safe-opus",
+			);
+			expect(safeAssignment).toBeDefined();
+			expect(safeSlot).toBeDefined();
+			if (!safeAssignment || !safeSlot) {
+				throw new Error("expected safe PostgreSQL alias conversion candidates");
+			}
+			expect(preview.skipped).toContainEqual({
+				identity: { kind: "combo_slot", slot_id: "slot-haiku-concrete" },
+				family: "haiku",
+				current_value: LATEST_MODEL_BY_FAMILY.haiku,
+				alias: "haiku",
+				latest_target: LATEST_MODEL_BY_FAMILY.haiku,
+				reason: "alias_slot_collision",
+			});
+
+			expect(
+				await repo.applyFamilyAliasPolicy({
+					expected_revision: preview.revision,
+					selections: [
+						{
+							identity: safeAssignment.identity,
+							family: safeAssignment.family,
+							expected_old_value: safeAssignment.current_value,
+						},
+						{
+							identity: safeSlot.identity,
+							family: safeSlot.family,
+							expected_old_value: safeSlot.current_value,
+						},
+					],
+				}),
+			).toEqual({ revision: preview.revision + 1, converted: 2 });
+			expect(await repo.getRoutingPolicyRevision()).toBe(preview.revision + 1);
+			expect(
+				(await repo.getRoutingPolicySnapshot("opus")).assignment.managed_model,
+			).toBe("opus");
+			expect(
+				(await repo.getSlots("combo-1")).find(
+					(slot) => slot.id === "slot-safe-opus",
+				)?.model,
+			).toBe("opus");
+
+			const noOpRevision = await repo.getRoutingPolicyRevision();
+			expect(
+				await repo.applyFamilyAliasPolicy({
+					expected_revision: noOpRevision,
+					selections: [
+						{
+							identity: { kind: "family_assignment", family: "fable" },
+							family: "fable",
+							expected_old_value: "fable",
+						},
+						{
+							identity: { kind: "combo_slot", slot_id: "slot-fable-alias" },
+							family: "fable",
+							expected_old_value: "fable",
+						},
+					],
+				}),
+			).toEqual({ revision: noOpRevision, converted: 0 });
+			expect(await repo.getRoutingPolicyRevision()).toBe(noOpRevision);
+
+			const stalePreview = await repo.previewFamilyAliasPolicy();
+			await repo.updateFamilyPolicy("sonnet", { managed_model: "sonnet" });
+			await expect(
+				repo.applyFamilyAliasPolicy({
+					expected_revision: stalePreview.revision,
+					selections: [
+						{
+							identity: { kind: "family_assignment", family: "sonnet" },
+							family: "sonnet",
+							expected_old_value: LATEST_MODEL_BY_FAMILY.sonnet,
+						},
+					],
+				}),
+			).rejects.toThrow("Routing policy revision changed");
+			expect(
+				(await repo.getRoutingPolicySnapshot("sonnet")).assignment
+					.managed_model,
+			).toBe("sonnet");
+
+			await adapter.run("UPDATE combo_slots SET model = ? WHERE id = ?", [
+				"manual-rollback-pin",
+				"slot-rollback-fable",
+			]);
+			const mismatchRevision = await repo.getRoutingPolicyRevision();
+			await expect(
+				repo.applyFamilyAliasPolicy({
+					expected_revision: mismatchRevision,
+					selections: [
+						{
+							identity: { kind: "family_assignment", family: "haiku" },
+							family: "haiku",
+							expected_old_value: LATEST_MODEL_BY_FAMILY.haiku,
+						},
+						{
+							identity: {
+								kind: "combo_slot",
+								slot_id: "slot-rollback-fable",
+							},
+							family: "fable",
+							expected_old_value: LATEST_MODEL_BY_FAMILY.fable,
+						},
+					],
+				}),
+			).rejects.toThrow("Batch statement 3 expected 1 change(s), got 0");
+			expect(await repo.getRoutingPolicyRevision()).toBe(mismatchRevision);
+			expect(
+				(await repo.getRoutingPolicySnapshot("haiku")).assignment.managed_model,
+			).toBe(LATEST_MODEL_BY_FAMILY.haiku);
+			expect(
+				(await repo.getSlots("combo-1")).find(
+					(slot) => slot.id === "slot-rollback-fable",
+				)?.model,
+			).toBe("manual-rollback-pin");
+			expect(
+				(await repo.getSlots("combo-1")).find(
+					(slot) => slot.id === "slot-haiku-concrete",
+				)?.model,
+			).toBe(LATEST_MODEL_BY_FAMILY.haiku);
+			expect(
+				(await repo.getSlots("combo-1")).find(
+					(slot) => slot.id === "slot-haiku-alias",
+				)?.model,
+			).toBe("haiku");
+			expect(
+				(await repo.getSlots("combo-1")).find((slot) => slot.id === "slot-1")
+					?.model,
+			).toBe("manual-model");
+			expect(
+				await adapter.query<{
+					id: string;
+					model_mappings: string | null;
+				}>("SELECT id, model_mappings FROM accounts ORDER BY id"),
+			).toEqual(mappingsBefore);
+			expect(
+				await adapter.get<{ id: string; model: string; priority: number }>(
+					"SELECT id, model, priority FROM combo_slots WHERE id = ?",
+					["slot-1"],
+				),
+			).toEqual(unrelatedSlotBefore);
 		});
 	});
 

@@ -665,6 +665,7 @@ describe("managed routing HTTP control plane", () => {
 				preview_id: preview.preview_id,
 				proposal_id: preview.proposals[0].proposal_id,
 				managed_model: preview.managed_model,
+				policy_managed_model: preview.policy_managed_model,
 				subject: {
 					draft: {
 						provider: "anthropic",
@@ -795,6 +796,7 @@ describe("managed routing HTTP control plane", () => {
 				preview_id: preview.preview_id,
 				proposal_id: proposal.proposal_id,
 				managed_model: preview.managed_model,
+				policy_managed_model: preview.policy_managed_model,
 				subject: { account_id: "new" },
 			}),
 			"opus",
@@ -886,6 +888,7 @@ describe("managed routing HTTP control plane", () => {
 				preview_id: preview.preview_id,
 				proposal_id: preview.proposals[0].proposal_id,
 				managed_model: preview.managed_model,
+				policy_managed_model: preview.policy_managed_model,
 				subject: { account_id: "new" },
 			}),
 			"opus",
@@ -916,6 +919,7 @@ describe("managed routing HTTP control plane", () => {
 				preview_id: preview.preview_id,
 				proposal_id: preview.proposals[0].proposal_id,
 				managed_model: preview.managed_model,
+				policy_managed_model: preview.policy_managed_model,
 				subject: { account_id: "new" },
 			}),
 			"opus",
@@ -971,6 +975,7 @@ describe("managed routing HTTP control plane", () => {
 				preview_id: preview.preview_id,
 				proposal_id: preview.proposals[0].proposal_id,
 				managed_model: preview.managed_model,
+				policy_managed_model: preview.policy_managed_model,
 				subject: {
 					draft: {
 						provider: "anthropic",
@@ -1104,6 +1109,7 @@ describe("managed routing HTTP control plane", () => {
 				preview_id: preview.preview_id,
 				proposal_id: proposal.proposal_id,
 				managed_model: preview.managed_model,
+				policy_managed_model: preview.policy_managed_model,
 			}),
 			"opus",
 		);
@@ -1137,7 +1143,7 @@ describe("managed routing HTTP control plane", () => {
 			family: "opus",
 			assignment: {
 				membership_mode: "managed",
-				managed_model: preview.managed_model,
+				managed_model: preview.policy_managed_model,
 			},
 			create_rules: [
 				{
@@ -1196,6 +1202,7 @@ describe("managed routing HTTP control plane", () => {
 				preview_id: preview.preview_id,
 				proposal_id: preview.proposals[0].proposal_id,
 				managed_model: preview.managed_model,
+				policy_managed_model: preview.policy_managed_model,
 			}),
 			"opus",
 		);
@@ -1300,6 +1307,7 @@ describe("managed routing HTTP control plane", () => {
 				preview_id: preview.preview_id,
 				proposal_id: preview.proposals[0].proposal_id,
 				managed_model: preview.managed_model,
+				policy_managed_model: preview.policy_managed_model,
 			}),
 			"opus",
 		);
@@ -1327,6 +1335,7 @@ describe("managed routing HTTP control plane", () => {
 				preview_id: preview.preview_id,
 				proposal_id: preview.proposals[0].proposal_id,
 				managed_model: preview.managed_model,
+				policy_managed_model: preview.policy_managed_model,
 				subject: { account_id: "new" },
 			}),
 			"opus",
@@ -1362,6 +1371,7 @@ describe("managed routing HTTP control plane", () => {
 				preview_id: preview.preview_id,
 				proposal_id: preview.proposals[0].proposal_id,
 				managed_model: preview.managed_model,
+				policy_managed_model: preview.policy_managed_model,
 				subject: { account_id: "new" },
 			}),
 			"opus",
@@ -1499,6 +1509,7 @@ describe("managed routing HTTP control plane", () => {
 				preview_id: preview.preview_id,
 				proposal_id: preview.proposals[0].proposal_id,
 				managed_model: preview.managed_model,
+				policy_managed_model: preview.policy_managed_model,
 			}),
 			"opus",
 		);
@@ -1940,5 +1951,52 @@ describe("managed routing HTTP control plane", () => {
 			)(rawRequest("/api/routing/exclusions/opus", body), "opus");
 			expect(exclusion.status).toBe(400);
 		}
+	});
+
+	it("keeps generated defaults as aliases while explicit concrete selections remain pins", async () => {
+		const generated = statefulDb();
+		const generatedPreviewResponse = await createRoutingPreviewHandler(
+			generated.dbOps,
+			dependencies,
+		)(request("/api/routing/preview", { scope: "family", family: "opus" }));
+		const generatedPreview = (await generatedPreviewResponse.json()).data;
+		const pinned = statefulDb();
+		const pinnedPreviewResponse = await createRoutingPreviewHandler(
+			pinned.dbOps,
+			dependencies,
+		)(
+			request("/api/routing/preview", {
+				scope: "family",
+				family: "opus",
+				managed_model: generatedPreview.managed_model,
+			}),
+		);
+		const pinnedPreview = (await pinnedPreviewResponse.json()).data;
+
+		expect(generatedPreview.policy_managed_model).toBe("opus");
+		expect(pinnedPreview.policy_managed_model).toBe(
+			generatedPreview.managed_model,
+		);
+		expect(generatedPreview.preview_id).not.toBe(pinnedPreview.preview_id);
+
+		const apply = await createRoutingApplyHandler(
+			generated.dbOps,
+			dependencies,
+		)(
+			request("/api/routing/apply/opus", {
+				scope: "family",
+				preview_id: generatedPreview.preview_id,
+				proposal_id: generatedPreview.proposals[0].proposal_id,
+				managed_model: generatedPreview.managed_model,
+				policy_managed_model: generatedPreview.policy_managed_model,
+			}),
+			"opus",
+		);
+		expect(apply.status).toBe(200);
+		expect(generated.applyFamilyPolicyChanges.mock.calls[0]?.[0]).toMatchObject(
+			{
+				assignment: { managed_model: "opus" },
+			},
+		);
 	});
 });

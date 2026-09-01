@@ -144,6 +144,7 @@ function preview(
 		route_class: "oauth-subscription",
 		existing_rule_id: options.existingRuleId ?? null,
 		managed_model: `claude-${family}-latest`,
+		policy_managed_model: `claude-${family}-latest`,
 		tier_source: "account_priority",
 		high_confidence: options.highConfidence ?? true,
 		selected_by_default: options.selectedByDefault ?? true,
@@ -156,6 +157,7 @@ function preview(
 		scope: "account",
 		family,
 		managed_model: proposal.managed_model,
+		policy_managed_model: proposal.policy_managed_model,
 		proposals: [proposal],
 		effective,
 	};
@@ -403,6 +405,7 @@ describe("persisted account routing reconciliation", () => {
 				proposalId: string;
 				accountId: string;
 				managedModel: string;
+				policyManagedModel: string;
 			}) => {
 				events.push(`apply:${params.family}:${params.previewId}`);
 				return routingView(params.family, {
@@ -433,6 +436,7 @@ describe("persisted account routing reconciliation", () => {
 				proposalId: "proposal-opus",
 				accountId: "persisted-account",
 				managedModel: "claude-opus-latest",
+				policyManagedModel: "claude-opus-latest",
 			},
 			{
 				family: "fable",
@@ -440,6 +444,7 @@ describe("persisted account routing reconciliation", () => {
 				proposalId: "proposal-fable",
 				accountId: "persisted-account",
 				managedModel: "claude-fable-latest",
+				policyManagedModel: "claude-fable-latest",
 			},
 		]);
 		expect(outcomes.map(({ status, reason }) => ({ status, reason }))).toEqual([

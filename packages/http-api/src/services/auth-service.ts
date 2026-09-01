@@ -68,13 +68,17 @@ const INTERNAL_PROBE_SECRET_HEADER = "x-better-ccflare-internal-probe-secret";
 const LOCAL_CONTROL_SECRET_HEADER = "x-better-ccflare-local-control-secret";
 
 /** Paths where a valid local-control-secret is honored. Intentionally a small,
- * explicit allowlist — these are idempotent, non-sensitive internal signals
- * (clear an in-process cache / re-poll usage) triggered by the user's own CLI
- * against their own locally-running server, not a general auth bypass. */
-function isLocalControlNotifyPath(path: string): boolean {
+ * explicit allowlist — these are exact authenticated local routing mutations
+ * and idempotent internal signals triggered by the user's own CLI against their
+ * own locally-running server, not a general auth bypass. */
+function isLocalControlNotifyPath(path: string, method: string): boolean {
 	return (
-		path.startsWith("/api/accounts/") &&
-		(path.endsWith("/reload") || path.endsWith("/force-reset-rate-limit"))
+		(method === "POST" &&
+			path.startsWith("/api/accounts/") &&
+			(path.endsWith("/reload") || path.endsWith("/force-reset-rate-limit"))) ||
+		(method === "POST" &&
+			(path === "/api/routing/family-aliases/preview" ||
+				path === "/api/routing/family-aliases/apply"))
 	);
 }
 
@@ -134,9 +138,13 @@ export class AuthService {
 	 * one of the small allowlisted CLI-notify paths. Fails closed if the
 	 * secret is missing/unset or doesn't match.
 	 */
-	private isLocalControlRequest(headers: Headers, path: string): boolean {
+	private isLocalControlRequest(
+		headers: Headers,
+		path: string,
+		method: string,
+	): boolean {
 		if (!this.localControlSecret) return false;
-		if (!isLocalControlNotifyPath(path)) return false;
+		if (!isLocalControlNotifyPath(path, method)) return false;
 		const provided = headers.get(LOCAL_CONTROL_SECRET_HEADER);
 		if (!provided) return false;
 		return timingSafeStringEqual(provided, this.localControlSecret);
@@ -437,7 +445,7 @@ export class AuthService {
 		// API endpoints require authentication if enabled, except for
 		// correctly-marked local-control CLI-notify requests (#216).
 		if (pathFamily === "api") {
-			if (headers && this.isLocalControlRequest(headers, path)) {
+			if (headers && this.isLocalControlRequest(headers, path, method)) {
 				return true;
 			}
 			return false;

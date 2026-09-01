@@ -5,6 +5,7 @@ import {
 	proposeComboEnrollmentRules,
 	proposeComboFamilyConversionRules,
 	resolveComboProposalManagedModel,
+	resolveComboProposalPolicyModel,
 	resolveEffectiveComboMembership,
 } from "@better-ccflare/core/managed-routing";
 import type { DatabaseOperations } from "@better-ccflare/database";
@@ -350,7 +351,7 @@ function hypotheticalSnapshot(
 		assignment: {
 			...snapshot.assignment,
 			membership_mode: "managed",
-			managed_model: proposal.managed_model,
+			managed_model: proposal.policy_managed_model,
 		},
 		rules,
 	};
@@ -488,22 +489,30 @@ export function computeRoutingPreview(
 		snapshot,
 		options.managedModel,
 	);
+	const policyManagedModel = resolveComboProposalPolicyModel(
+		snapshot,
+		options.managedModel,
+	);
 	const previewAccount =
 		input.scope === "account"
 			? (options.draftAccount ?? resolvePreviewSubject(input.subject, accounts))
 			: null;
-	const baseProposals =
+	const rawProposals =
 		input.scope === "account"
 			? proposeComboEnrollmentRules(
 					snapshot,
 					accounts,
 					previewAccount as Account,
 					dependencies,
-					{ managedModel },
+					{ managedModel: options.managedModel },
 				)
 			: proposeComboFamilyConversionRules(snapshot, accounts, dependencies, {
-					managedModel,
+					managedModel: options.managedModel,
 				});
+	const baseProposals = rawProposals.map((proposal) => ({
+		...proposal,
+		policy_managed_model: policyManagedModel,
+	}));
 	const currentResolution = resolveEffectiveComboMembership(
 		snapshot,
 		accounts,
@@ -565,6 +574,7 @@ export function computeRoutingPreview(
 		family,
 		managed_model: managedModel,
 		subject: safeSubject,
+		policy_managed_model: policyManagedModel,
 		policy: snapshot,
 		proposals: baseProposals,
 		current: currentResolution,
@@ -575,6 +585,7 @@ export function computeRoutingPreview(
 		scope: input.scope,
 		family,
 		managed_model: managedModel,
+		policy_managed_model: policyManagedModel,
 		proposals: proposed.map((entry) => entry.proposal),
 		effective,
 	};
@@ -622,7 +633,10 @@ export interface RoutingApplyCommand {
 	family: ComboFamily;
 	previewId: string;
 	proposalId: string;
+	/** Concrete model shown in the reviewed preview. */
 	managedModel: string;
+	/** Exact policy value reviewed alongside managedModel. */
+	policyManagedModel: string;
 	scope: ComboRoutingPreviewScope;
 	subject?: ComboRoutingPreviewSubject;
 }
@@ -649,7 +663,7 @@ export async function applyRoutingProposal(
 			command.family,
 			{ scope: "family" },
 			dependencies,
-			{ managedModel: command.managedModel },
+			{ managedModel: command.policyManagedModel },
 		);
 	} else {
 		if (!command.subject) throw BadRequest("subject is required");
@@ -667,7 +681,7 @@ export async function applyRoutingProposal(
 			{ scope: "account", subject: command.subject },
 			dependencies,
 			{
-				managedModel: command.managedModel,
+				managedModel: command.policyManagedModel,
 				draftAccount: persistedAccount,
 			},
 		);
@@ -701,7 +715,7 @@ export async function applyRoutingProposal(
 		: null;
 	if (
 		snapshot.assignment.membership_mode === "managed" &&
-		snapshot.assignment.managed_model === proposal.managed_model &&
+		snapshot.assignment.managed_model === proposal.policy_managed_model &&
 		existingRule?.enabled === true
 	) {
 		if ((await dbOps.getRoutingPolicyRevision()) !== inputs.revision) {
@@ -717,7 +731,7 @@ export async function applyRoutingProposal(
 		expected_revision: inputs.revision,
 		assignment: {
 			membership_mode: "managed",
-			managed_model: proposal.managed_model,
+			managed_model: proposal.policy_managed_model,
 		},
 		...(proposal.existing_rule_id
 			? {
@@ -766,12 +780,20 @@ export function createServerOwnedAccountRoutingFinalizer(
 				family,
 				subject: { account_id: accountId },
 			}),
-		apply: ({ accountId, family, previewId, proposalId, managedModel }) =>
+		apply: ({
+			accountId,
+			family,
+			previewId,
+			proposalId,
+			managedModel,
+			policyManagedModel,
+		}) =>
 			applyRoutingProposal(dbOps, dependencies, {
 				family,
 				previewId,
 				proposalId,
 				managedModel,
+				policyManagedModel,
 				scope: "account",
 				subject: { account_id: accountId },
 			}),

@@ -52,7 +52,11 @@ import {
 import { container, SERVICE_KEYS } from "@better-ccflare/core-di";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
-import type { ComboFamily } from "@better-ccflare/types";
+import type {
+	ComboFamily,
+	FamilyAliasPolicyApplyResult,
+	FamilyAliasPolicyPreview,
+} from "@better-ccflare/types";
 
 /**
  * Single source of truth for the account modes accepted by
@@ -179,6 +183,8 @@ ${getManagedRoutingHelpText()}
   --resolve-family-policy-aliases  Rewrite stored family-alias values (e.g. "opus") to
                        their currently-resolved concrete models (run before rolling back
                        to a pre-alias-feature binary)
+  --convert-family-policy-aliases  Convert current-LATEST policy pins to family aliases
+    --all --yes         Required in noninteractive mode
   --cache-flight-recorder-report <id>  Report a retained recorder timeline
     --json             Emit exactly one structured JSON object
   --cache-flight-recorder-health       Show minimal recorder health
@@ -283,6 +289,9 @@ interface ParsedArgs {
 	admin: boolean;
 	apiUrl: string | null;
 	resolveFamilyPolicyAliases: boolean;
+	convertFamilyPolicyAliases: boolean;
+	all: boolean;
+	yes: boolean;
 }
 
 // When the long-running server starts, its own SIGINT/SIGTERM handlers
@@ -655,6 +664,9 @@ function parseArgs(args: string[]): ParsedArgs {
 		admin: false,
 		apiUrl: null,
 		resolveFamilyPolicyAliases: false,
+		convertFamilyPolicyAliases: false,
+		all: false,
+		yes: false,
 	};
 
 	for (let i = 0; i < args.length; i++) {
@@ -866,6 +878,15 @@ function parseArgs(args: string[]): ParsedArgs {
 			case "--resolve-family-policy-aliases":
 				parsed.resolveFamilyPolicyAliases = true;
 				break;
+			case "--convert-family-policy-aliases":
+				parsed.convertFamilyPolicyAliases = true;
+				break;
+			case "--all":
+				parsed.all = true;
+				break;
+			case "--yes":
+				parsed.yes = true;
+				break;
 			case "--cache-flight-recorder-report":
 				if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
 					parsed.cacheFlightRecorderReport = "";
@@ -1074,6 +1095,89 @@ export async function resolveFamilyPolicyAliases(
 	}
 }
 
+export async function convertFamilyPolicyAliasesViaLocalControl(options: {
+	baseUrl: string;
+	localControlSecret: string;
+	all: boolean;
+	yes: boolean;
+	interactive: boolean;
+	confirm?: (prompt: string) => Promise<boolean>;
+	fetch?: typeof globalThis.fetch;
+}): Promise<FamilyAliasPolicyApplyResult> {
+	let base: URL;
+	try {
+		base = new URL(options.baseUrl);
+	} catch {
+		throw new Error("Local control URL must be a valid loopback URL.");
+	}
+	if (
+		!new Set(["localhost", "127.0.0.1", "[::1]", "::1"]).has(base.hostname) ||
+		(base.protocol !== "http:" && base.protocol !== "https:") ||
+		base.username ||
+		base.password ||
+		(base.pathname !== "/" && base.pathname !== "") ||
+		base.search ||
+		base.hash
+	) {
+		throw new Error("Local control URL must be an origin-only loopback URL.");
+	}
+	const fetchImpl = options.fetch ?? globalThis.fetch;
+	const request = async (path: string, body?: unknown) => {
+		const response = await fetchImpl(new URL(path, base), {
+			method: "POST",
+			redirect: "error",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-local-control-secret": options.localControlSecret,
+			},
+			...(body === undefined ? {} : { body: JSON.stringify(body) }),
+		});
+		if (!response.ok)
+			throw new Error(`Local conversion failed (HTTP ${response.status}).`);
+		return (await response.json()) as { success: true; data: unknown };
+	};
+	const preview = (await request("/api/routing/family-aliases/preview"))
+		.data as FamilyAliasPolicyPreview;
+	if (!options.interactive && (!options.all || !options.yes)) {
+		throw new Error("Noninteractive conversion requires --all --yes.");
+	}
+	console.log(
+		`Found ${preview.candidates.length} policy candidate(s) at revision ${preview.revision}.`,
+	);
+	for (const candidate of preview.candidates) {
+		console.log(
+			`  ${candidate.identity.kind}:${candidate.identity.kind === "combo_slot" ? candidate.identity.slot_id : candidate.identity.family} ${candidate.current_value} -> ${candidate.alias} (resolves to ${candidate.latest_target})`,
+		);
+	}
+	for (const skipped of preview.skipped ?? []) {
+		console.log(
+			`  skipped ${skipped.identity.kind}:${skipped.identity.kind === "combo_slot" ? skipped.identity.slot_id : skipped.identity.family} ${skipped.current_value} -> ${skipped.alias}: ${skipped.reason}`,
+		);
+	}
+	if (preview.candidates.length === 0)
+		return { revision: preview.revision, converted: 0 };
+	if (
+		options.interactive &&
+		!options.yes &&
+		!(
+			(await options.confirm?.("Convert all listed policy candidates?")) ??
+			false
+		)
+	) {
+		throw new Error("Conversion cancelled.");
+	}
+	return (
+		await request("/api/routing/family-aliases/apply", {
+			expected_revision: preview.revision,
+			selections: preview.candidates.map((candidate) => ({
+				identity: candidate.identity,
+				family: candidate.family,
+				expected_old_value: candidate.current_value,
+			})),
+		})
+	).data as FamilyAliasPolicyApplyResult;
+}
+
 async function main() {
 	const args = process.argv.slice(2);
 	// Used by Docker release verification; emit no decoration or fallback value
@@ -1198,9 +1302,52 @@ async function main() {
 		return;
 	}
 
+	if (parsed.convertFamilyPolicyAliases) {
+		try {
+			const config = new Config();
+			const runtime = config.getRuntime();
+			const baseUrl =
+				parsed.apiUrl ??
+				`http://localhost:${parsed.port ?? runtime.port ?? NETWORK.DEFAULT_PORT}`;
+			let closePrompt: (() => void) | undefined;
+			let confirm: ((prompt: string) => Promise<boolean>) | undefined;
+			if (interactive && !parsed.yes) {
+				const module = await import("node:readline/promises");
+				const readline = module.createInterface({
+					input: process.stdin,
+					output: process.stdout,
+				});
+				closePrompt = () => readline.close();
+				confirm = async (prompt) =>
+					(await readline.question(`${prompt} [y/N] `)).trim().toLowerCase() ===
+					"y";
+			}
+			const result = await convertFamilyPolicyAliasesViaLocalControl({
+				baseUrl,
+				localControlSecret: config.getLocalControlSecret(),
+				all: parsed.all,
+				yes: parsed.yes,
+				interactive,
+				confirm,
+			});
+			closePrompt?.();
+			console.log(
+				`Converted ${result.converted} policy value(s); revision ${result.revision}.`,
+			);
+			fastExit(0);
+		} catch (error) {
+			console.error(
+				error instanceof Error
+					? error.message
+					: "Family policy conversion failed.",
+			);
+			fastExit(2);
+		}
+	}
+
 	if (parsed.apiUrl && !parsed.addAccount) {
 		console.error(
-			"--api-url is valid only with a routing command or --add-account.",
+			"--api-url is valid only with a routing command, --add-account, or --convert-family-policy-aliases.",
 		);
 		fastExit(2);
 	}

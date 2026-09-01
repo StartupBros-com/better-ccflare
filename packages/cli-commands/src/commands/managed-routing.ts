@@ -141,6 +141,7 @@ export interface ManagedRoutingProposalProjection {
 	route_class: string;
 	existing_rule_id: string | null;
 	managed_model: string;
+	policy_managed_model: string;
 	tier_source: "account_priority";
 	high_confidence: boolean;
 	selected_by_default: boolean;
@@ -154,6 +155,7 @@ export interface ManagedRoutingPreviewProjection {
 	scope: "account" | "family";
 	family: ComboFamily;
 	managed_model: string;
+	policy_managed_model: string;
 	effective: ManagedRoutingEffectiveProjection;
 	proposals: ManagedRoutingProposalProjection[];
 }
@@ -381,6 +383,7 @@ export function projectManagedRoutingPreview(
 		scope: preview.scope,
 		family: preview.family,
 		managed_model: preview.managed_model,
+		policy_managed_model: preview.policy_managed_model,
 		effective: projectEffectiveRouting(preview.effective),
 		proposals: preview.proposals.map((proposal) => ({
 			proposal_id: proposal.proposal_id,
@@ -390,6 +393,7 @@ export function projectManagedRoutingPreview(
 			route_class: proposal.route_class,
 			existing_rule_id: proposal.existing_rule_id,
 			managed_model: proposal.managed_model,
+			policy_managed_model: proposal.policy_managed_model,
 			tier_source: proposal.tier_source,
 			high_confidence: proposal.high_confidence,
 			selected_by_default: proposal.selected_by_default,
@@ -512,6 +516,7 @@ export interface ManagedRoutingApplyOptions {
 	previewId?: string;
 	proposalId?: string;
 	managedModel?: string;
+	policyManagedModel?: string;
 	confirmed?: boolean;
 	nonInteractive?: boolean;
 	json?: boolean;
@@ -555,6 +560,7 @@ export async function runManagedRoutingApply(
 	let previewId = requiredText(options.previewId);
 	let proposalId = requiredText(options.proposalId);
 	let managedModel = requiredText(options.managedModel);
+	let policyManagedModel = requiredText(options.policyManagedModel);
 	const hasPreviewId = previewId !== undefined;
 	const hasProposalId = proposalId !== undefined;
 	const hasExplicitTuple = hasPreviewId && hasProposalId && !!managedModel;
@@ -570,6 +576,7 @@ export async function runManagedRoutingApply(
 		previewId = options.previewId;
 		proposalId = options.proposalId;
 		managedModel = options.managedModel;
+		policyManagedModel = options.policyManagedModel ?? options.managedModel;
 	} else if (!hasExplicitTuple) {
 		if (!options.prompt) {
 			throw new ManagedRoutingSafetyError(
@@ -591,6 +598,7 @@ export async function runManagedRoutingApply(
 		});
 		previewId = preview.preview_id;
 		managedModel = preview.managed_model;
+		policyManagedModel = preview.policy_managed_model;
 		if (preview.proposals.length === 0) {
 			throw new ManagedRoutingSafetyError(
 				"The live server returned no routing proposal to review.",
@@ -612,9 +620,9 @@ export async function runManagedRoutingApply(
 		}
 	}
 
-	if (!previewId || !proposalId || !managedModel) {
+	if (!previewId || !proposalId || !managedModel || !policyManagedModel) {
 		throw new ManagedRoutingSafetyError(
-			"Apply requires explicit previewId, proposalId, and managedModel values.",
+			"Apply requires explicit previewId, proposalId, managedModel, and policyManagedModel values.",
 		);
 	}
 
@@ -636,6 +644,7 @@ export async function runManagedRoutingApply(
 		previewId,
 		proposalId,
 		managedModel,
+		policyManagedModel,
 	});
 	return {
 		kind: "apply",
@@ -650,6 +659,7 @@ export interface ManagedAccountRoutingReviewedSelection {
 	previewId: string;
 	proposalId: string;
 	managedModel: string;
+	policyManagedModel: string;
 	reviewedProposal: ManagedRoutingProposalProjection;
 }
 
@@ -683,6 +693,7 @@ export function createManagedAccountRoutingReviewedSelection(
 		previewId: preview.preview_id,
 		proposalId: proposal.proposal_id,
 		managedModel: proposal.managed_model,
+		policyManagedModel: proposal.policy_managed_model,
 		reviewedProposal: proposal,
 	};
 }
@@ -701,6 +712,7 @@ function validateAccountSelections(
 			!requiredText(selection.previewId) ||
 			!requiredText(selection.proposalId) ||
 			!requiredText(selection.managedModel) ||
+			!requiredText(selection.policyManagedModel) ||
 			!selection.reviewedProposal
 		) {
 			throw new ManagedRoutingSafetyError(
@@ -710,7 +722,9 @@ function validateAccountSelections(
 		if (
 			selection.reviewedProposal.proposal_id !== selection.proposalId ||
 			selection.reviewedProposal.family !== selection.family ||
-			selection.reviewedProposal.managed_model !== selection.managedModel
+			selection.reviewedProposal.managed_model !== selection.managedModel ||
+			selection.reviewedProposal.policy_managed_model !==
+				selection.policyManagedModel
 		) {
 			throw new ManagedRoutingSafetyError(
 				"The reviewed account proposal does not match its explicit family, proposalId, and managedModel selection.",
@@ -737,6 +751,7 @@ function proposalReviewMaterial(
 		route_class: proposal.route_class,
 		existing_rule_id: proposal.existing_rule_id,
 		managed_model: proposal.managed_model,
+		policy_managed_model: proposal.policy_managed_model,
 		tier_source: proposal.tier_source,
 		high_confidence: proposal.high_confidence,
 		reason: proposal.reason,
@@ -810,7 +825,7 @@ export async function runManagedAccountRoutingApply(
 			response = await client.previewAccountRouting({
 				accountId: options.accountId,
 				family: selection.family,
-				managedModel: selection.managedModel,
+				managedModel: selection.policyManagedModel,
 			});
 		} catch {
 			return accountApplyStopped(
@@ -909,6 +924,7 @@ export async function runManagedAccountRoutingApply(
 				previewId: projected.preview_id,
 				proposalId: proposal.proposal_id,
 				managedModel: proposal.managed_model,
+				policyManagedModel: proposal.policy_managed_model,
 			});
 		} catch {
 			return accountApplyStopped(
@@ -1023,7 +1039,7 @@ function renderEffective(
 
 function renderPreview(preview: ManagedRoutingPreviewProjection): string[] {
 	const lines = [
-		`preview=${preview.preview_id} scope=${preview.scope} family=${preview.family} model=${preview.managed_model}`,
+		`preview=${preview.preview_id} scope=${preview.scope} family=${preview.family} model=${preview.managed_model} policy_model=${preview.policy_managed_model}`,
 		...renderEffective(preview.effective),
 	];
 	for (const proposal of preview.proposals) {

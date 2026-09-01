@@ -202,6 +202,52 @@ export interface ComboFamilyPolicyApplyResult {
 	mutation_count: number;
 }
 
+/** A concrete policy field eligible to resume tracking its family's latest model. */
+export interface FamilyAliasPolicyCandidate {
+	identity:
+		| { kind: "family_assignment"; family: ComboFamily }
+		| { kind: "combo_slot"; slot_id: string };
+	family: ComboFamily;
+	current_value: string;
+	alias: ComboFamily;
+	latest_target: string;
+}
+
+/** A coherent candidate read; revision must be echoed verbatim to apply. */
+export interface FamilyAliasPolicySkipped {
+	identity: FamilyAliasPolicyCandidate["identity"];
+	family: ComboFamily;
+	current_value: string;
+	alias: ComboFamily;
+	latest_target: string;
+	reason: "alias_slot_collision";
+}
+
+/** A coherent candidate read; revision must be echoed verbatim to apply. */
+export interface FamilyAliasPolicyPreview {
+	revision: number;
+	candidates: FamilyAliasPolicyCandidate[];
+	/** Concrete slot conversions excluded to preserve a coexisting alias slot. */
+	skipped: FamilyAliasPolicySkipped[];
+}
+
+/** Compare-and-swap selection accepted by the local conversion endpoint. */
+export interface FamilyAliasPolicySelection {
+	identity: FamilyAliasPolicyCandidate["identity"];
+	family: ComboFamily;
+	expected_old_value: string;
+}
+
+export interface FamilyAliasPolicyApplyInput {
+	expected_revision: number;
+	selections: FamilyAliasPolicySelection[];
+}
+
+export interface FamilyAliasPolicyApplyResult {
+	revision: number;
+	converted: number;
+}
+
 export interface ComboRoutingPolicySnapshot {
 	assignment: ComboFamilyAssignment;
 	combo: Combo | null;
@@ -253,7 +299,10 @@ export interface ComboEnrollmentRuleProposal {
 	route_class: ComboRouteClass;
 	/** Existing rule to reuse or reactivate instead of creating a duplicate. */
 	existing_rule_id: string | null;
+	/** Concrete model used by the preview and effective resolver. */
 	managed_model: string;
+	/** Exact policy value to persist after review; aliases intentionally track latest. */
+	policy_managed_model: string;
 	tier_source: "account_priority";
 	high_confidence: boolean;
 	selected_by_default: boolean;
@@ -347,8 +396,10 @@ export interface ComboRoutingPreviewResult {
 	preview_id: string;
 	scope: ComboRoutingPreviewScope;
 	family: ComboFamily;
-	/** Resolved reviewed model: override, valid assignment model, then latest. */
+	/** Resolved reviewed model used by preview and effective routing. */
 	managed_model: string;
+	/** Exact managed_model policy value that a reviewed proposal will persist. */
+	policy_managed_model: string;
 	proposals: ComboRoutingProposalPreview[];
 	effective: EffectiveComboRoutingView;
 }

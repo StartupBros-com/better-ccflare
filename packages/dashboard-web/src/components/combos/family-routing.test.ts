@@ -275,7 +275,7 @@ describe("family conversion preview projection", () => {
 });
 
 describe("family model options", () => {
-	it("uses canonical family detection and always offers the latest model for all families", () => {
+	it("offers the tracking alias then an explicit latest pin for every family", () => {
 		const options = [
 			{ id: "vendor/claude-fable-preview", displayName: "Fable preview" },
 			{ id: "vendor/claude-opus-preview", displayName: "Opus preview" },
@@ -283,10 +283,24 @@ describe("family model options", () => {
 			{ id: "vendor/claude-haiku-preview", displayName: "Haiku preview" },
 			{ id: "provider-unclassified-model", displayName: "Other" },
 		];
+		const latestDisplayNames: Record<ComboFamily, string> = {
+			fable: "Claude Fable 5.1",
+			opus: "Claude Opus 5",
+			sonnet: "Claude Sonnet 5",
+			haiku: "Claude Haiku 4.5",
+		};
 
 		for (const family of FAMILIES) {
+			const latest = LATEST_MODEL_BY_FAMILY[family];
 			const choices = familyModelOptions(family, options);
-			expect(choices[0]?.id).toBe(LATEST_MODEL_BY_FAMILY[family]);
+			expect(choices[0]).toEqual({
+				id: family,
+				displayName: `Latest ${family} (tracks ${latestDisplayNames[family]})`,
+			});
+			expect(choices[1]).toEqual({
+				id: latest,
+				displayName: latestDisplayNames[family],
+			});
 			expect(choices.map(({ id }) => getModelFamily(id))).toEqual(
 				choices.map(() => family),
 			);
@@ -296,13 +310,19 @@ describe("family model options", () => {
 		}
 	});
 
-	it("does not duplicate the latest model already supplied by useModelOptions", () => {
+	it("keeps the alias and dedupes an explicitly catalogued latest pin", () => {
 		const latest = LATEST_MODEL_BY_FAMILY.opus;
 		expect(
 			familyModelOptions("opus", [
 				{ id: latest, displayName: "Live latest" },
 				{ id: latest, displayName: "Duplicate" },
 			]),
-		).toEqual([{ id: latest, displayName: "Live latest" }]);
+		).toEqual([
+			{
+				id: "opus",
+				displayName: "Latest opus (tracks Claude Opus 5)",
+			},
+			{ id: latest, displayName: "Live latest" },
+		]);
 	});
 });

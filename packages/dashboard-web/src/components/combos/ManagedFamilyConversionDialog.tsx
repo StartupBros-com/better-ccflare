@@ -26,6 +26,7 @@ export interface ManagedFamilyApplyCommand {
 	previewId: string;
 	proposalId: string;
 	managedModel: string;
+	policyManagedModel: string;
 }
 
 export interface ManagedFamilyConversionErrorView {
@@ -176,6 +177,7 @@ export function buildManagedFamilyApplyCommand(
 		previewId: preview.preview_id,
 		proposalId: proposal.proposal_id,
 		managedModel: preview.managed_model,
+		policyManagedModel: preview.policy_managed_model,
 	};
 }
 

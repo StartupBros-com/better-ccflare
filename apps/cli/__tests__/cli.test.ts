@@ -493,6 +493,7 @@ describe("CLI Integration Tests", () => {
 							preview_id: "preview-opus",
 							proposal_id: "proposal-opus",
 							managed_model: "claude-opus-4-8",
+							policy_managed_model: "claude-opus-4-8",
 						},
 					},
 					{

@@ -2386,6 +2386,7 @@ class API extends HttpClient {
 		proposalId: string;
 		accountId: string;
 		managedModel: string;
+		policyManagedModel: string;
 	}): Promise<EffectiveComboRoutingView> {
 		const response = await this.post<{
 			success: true;
@@ -2394,6 +2395,7 @@ class API extends HttpClient {
 			preview_id: params.previewId,
 			proposal_id: params.proposalId,
 			managed_model: params.managedModel,
+			policy_managed_model: params.policyManagedModel,
 			subject: { account_id: params.accountId },
 		});
 		return response.data;
@@ -2404,6 +2406,7 @@ class API extends HttpClient {
 		previewId: string;
 		proposalId: string;
 		managedModel: string;
+		policyManagedModel: string;
 	}): Promise<EffectiveComboRoutingView> {
 		const response = await this.post<{
 			success: true;
@@ -2413,6 +2416,7 @@ class API extends HttpClient {
 			preview_id: params.previewId,
 			proposal_id: params.proposalId,
 			managed_model: params.managedModel,
+			policy_managed_model: params.policyManagedModel,
 		});
 		return response.data;
 	}

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { LATEST_MODEL_BY_FAMILY } from "@better-ccflare/core";
 import {
 	type Combo,
 	type ComboEnrollmentRule,
@@ -19,6 +20,11 @@ import {
 	type ComboSlot,
 	type ComboSlotRow,
 	type ComboWithSlots,
+	type FamilyAliasPolicyApplyInput,
+	type FamilyAliasPolicyApplyResult,
+	type FamilyAliasPolicyCandidate,
+	type FamilyAliasPolicyPreview,
+	type FamilyAliasPolicySkipped,
 	toCombo,
 	toComboEnrollmentRule,
 	toComboFamilyAssignment,
@@ -614,6 +620,176 @@ export class ComboRepository extends BaseRepository<Combo> {
 		);
 		if (!row) throw new Error("Routing policy revision row is missing");
 		return Number(row.revision);
+	}
+
+	/** Read only concrete policy values which exactly track a family's current latest model. */
+	async previewFamilyAliasPolicy(): Promise<FamilyAliasPolicyPreview> {
+		const [revision, assignments, slots] = await Promise.all([
+			this.getRoutingPolicyRevision(),
+			this.getFamilyAssignments(),
+			this.query<ComboSlotRow>(
+				"SELECT id, combo_id, account_id, model, priority, enabled FROM combo_slots",
+			),
+		]);
+		const candidates: FamilyAliasPolicyCandidate[] = [];
+		const skipped: FamilyAliasPolicySkipped[] = [];
+		for (const assignment of assignments) {
+			if (
+				assignment.managed_model === LATEST_MODEL_BY_FAMILY[assignment.family]
+			) {
+				candidates.push({
+					identity: { kind: "family_assignment", family: assignment.family },
+					family: assignment.family,
+					current_value: assignment.managed_model,
+					alias: assignment.family,
+					latest_target: LATEST_MODEL_BY_FAMILY[assignment.family],
+				});
+			}
+		}
+		for (const slot of slots) {
+			for (const family of Object.keys(
+				LATEST_MODEL_BY_FAMILY,
+			) as ComboFamily[]) {
+				if (slot.model !== LATEST_MODEL_BY_FAMILY[family]) continue;
+				const aliasExists = slots.some(
+					(aliasSlot) =>
+						aliasSlot.id !== slot.id &&
+						aliasSlot.combo_id === slot.combo_id &&
+						aliasSlot.account_id === slot.account_id &&
+						aliasSlot.model === family,
+				);
+				const value = {
+					identity: { kind: "combo_slot" as const, slot_id: slot.id },
+					family,
+					current_value: slot.model,
+					alias: family,
+					latest_target: LATEST_MODEL_BY_FAMILY[family],
+				};
+				if (aliasExists) {
+					skipped.push({ ...value, reason: "alias_slot_collision" });
+				} else {
+					candidates.push(value);
+				}
+				break;
+			}
+		}
+		return { revision, candidates, skipped };
+	}
+
+	/**
+	 * Compare all selected identities/old values and convert them in one adapter
+	 * batch. Every statement is checked inside the transaction, so a stale or
+	 * malformed selection rolls back all preceding work on both backends.
+	 */
+	async applyFamilyAliasPolicy(
+		input: FamilyAliasPolicyApplyInput,
+	): Promise<FamilyAliasPolicyApplyResult> {
+		if (
+			!Number.isSafeInteger(input.expected_revision) ||
+			input.expected_revision < 0
+		) {
+			throw new Error("expected_revision must be a non-negative safe integer");
+		}
+		const seen = new Set<string>();
+		const statements: BatchStatement[] = [
+			{
+				sql: "UPDATE routing_policy_revision SET revision = revision WHERE scope = 'global' AND revision = ?",
+				params: [input.expected_revision],
+				expectedChanges: 1,
+			},
+		];
+		let converted = 0;
+		for (const selection of input.selections) {
+			const identityKey =
+				selection.identity.kind === "family_assignment"
+					? `assignment:${selection.identity.family}`
+					: `slot:${selection.identity.slot_id}`;
+			if (seen.has(identityKey)) throw new Error("duplicate policy selection");
+			seen.add(identityKey);
+			if (
+				!Object.hasOwn(LATEST_MODEL_BY_FAMILY, selection.family) ||
+				(selection.identity.kind === "family_assignment" &&
+					selection.identity.family !== selection.family)
+			) {
+				throw new Error("invalid policy selection family");
+			}
+			const latest = LATEST_MODEL_BY_FAMILY[selection.family];
+			const isConcrete = selection.expected_old_value === latest;
+			const isAlias = selection.expected_old_value === selection.family;
+			if (!isConcrete && !isAlias) {
+				throw new Error(
+					"selected value is not the family's latest model or alias",
+				);
+			}
+			if (selection.identity.kind === "family_assignment") {
+				statements.push(
+					isConcrete
+						? {
+								sql: "UPDATE combo_family_assignments SET managed_model = ? WHERE family = ? AND managed_model = ?",
+								params: [selection.family, selection.family, latest],
+								expectedChanges: 1,
+							}
+						: {
+								sql: "UPDATE routing_policy_revision SET revision = revision WHERE scope = 'global' AND revision >= ? AND EXISTS (SELECT 1 FROM combo_family_assignments WHERE family = ? AND managed_model = ?)",
+								params: [
+									input.expected_revision,
+									selection.family,
+									selection.expected_old_value,
+								],
+								expectedChanges: 1,
+							},
+				);
+			} else {
+				statements.push(
+					isConcrete
+						? {
+								sql: "UPDATE combo_slots SET model = ? WHERE id = ? AND model = ? AND NOT EXISTS (SELECT 1 FROM combo_slots AS alias_slot WHERE alias_slot.combo_id = combo_slots.combo_id AND alias_slot.account_id = combo_slots.account_id AND alias_slot.id <> combo_slots.id AND alias_slot.model = ?)",
+								params: [
+									selection.family,
+									selection.identity.slot_id,
+									latest,
+									selection.family,
+								],
+								expectedChanges: 1,
+							}
+						: {
+								sql: "UPDATE routing_policy_revision SET revision = revision WHERE scope = 'global' AND revision >= ? AND EXISTS (SELECT 1 FROM combo_slots WHERE id = ? AND model = ?)",
+								params: [
+									input.expected_revision,
+									selection.identity.slot_id,
+									selection.expected_old_value,
+								],
+								expectedChanges: 1,
+							},
+				);
+			}
+			if (isConcrete) converted++;
+		}
+		if (converted > 0) {
+			// Policy-table update triggers bump the revision once per row. Normalize
+			// their intermediate value inside this same transaction so a successful
+			// multi-row conversion has one externally-visible revision advance.
+			statements.push({
+				sql: "UPDATE routing_policy_revision SET revision = ? WHERE scope = 'global' AND revision >= ?",
+				params: [input.expected_revision + 1, input.expected_revision],
+				expectedChanges: 1,
+			});
+		}
+		try {
+			await this.adapter.runBatchWithChanges(statements);
+		} catch (error) {
+			if (
+				error instanceof BatchExpectedChangesError &&
+				error.statementIndex === 0
+			) {
+				throw new RoutingPolicyRevisionConflictError();
+			}
+			throw error;
+		}
+		return {
+			revision: input.expected_revision + (converted > 0 ? 1 : 0),
+			converted,
+		};
 	}
 
 	/** Apply a fixed set of policy mutations atomically on SQLite and PostgreSQL. */
