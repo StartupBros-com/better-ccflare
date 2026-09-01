@@ -55,10 +55,40 @@ export interface CodexHostedErrorDiagnostic {
 	readonly category: CodexHostedErrorCategory;
 }
 
+export interface CodexHostedTerminalShapeDiagnostic {
+	readonly eventType: "error" | "response.failed" | "response.incomplete";
+	readonly responseStatus: string | null;
+	readonly incompleteReason: string | null;
+	readonly hasError: boolean;
+}
+
 function safeIdentifier(value: unknown): string | null {
 	return typeof value === "string" && SAFE_ERROR_IDENTIFIER.test(value)
 		? value
 		: null;
+}
+
+export function classifyCodexHostedTerminalShape(
+	value: unknown,
+): CodexHostedTerminalShapeDiagnostic | null {
+	if (!isRecord(value)) return null;
+	if (
+		value.type !== "error" &&
+		value.type !== "response.failed" &&
+		value.type !== "response.incomplete"
+	) {
+		return null;
+	}
+	const response = isRecord(value.response) ? value.response : {};
+	const incompleteDetails = isRecord(response.incomplete_details)
+		? response.incomplete_details
+		: {};
+	return Object.freeze({
+		eventType: value.type,
+		responseStatus: safeIdentifier(response.status),
+		incompleteReason: safeIdentifier(incompleteDetails.reason),
+		hasError: isRecord(value.error) || isRecord(response.error),
+	});
 }
 
 export function classifyCodexHostedError(
@@ -336,6 +366,9 @@ class HostedResponsePipeline<
 
 	async accept(data: JsonRecord): Promise<TCompletion | null> {
 		if (this.sawTerminal) throw rejected();
+		const terminalShape = classifyCodexHostedTerminalShape(data);
+		if (terminalShape)
+			log.warn("codex_hosted_search_terminal_shape", terminalShape);
 		const diagnostic = classifyCodexHostedError(data);
 		if (diagnostic) log.warn("codex_hosted_search_upstream_error", diagnostic);
 		if (!this.sawCreated) {
