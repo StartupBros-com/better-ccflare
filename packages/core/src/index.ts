@@ -76,6 +76,7 @@ export {
 	getModelFamily,
 	getModelList,
 	getModelMappings,
+	getStrictClaudeModelFamily,
 	isFamilyAliasModel,
 	isValidClaudeModel,
 	KNOWN_PATTERNS,

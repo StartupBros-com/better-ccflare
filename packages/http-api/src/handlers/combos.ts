@@ -1220,13 +1220,37 @@ export function createMembershipExclusionRestoreHandler(
 	};
 }
 
+async function parseFamilyAliasPreviewInput(
+	req: Request,
+): Promise<{ include_pinned_family?: ComboFamily }> {
+	const text = await req.text();
+	if (!text) return {};
+	let body: unknown;
+	try {
+		body = JSON.parse(text);
+	} catch {
+		throw BadRequest("request body must contain valid JSON");
+	}
+	if (body === null || typeof body !== "object" || Array.isArray(body)) {
+		throw BadRequest("request body must be a JSON object");
+	}
+	const value = (body as Record<string, unknown>).include_pinned_family;
+	if (value === undefined) return {};
+	if (typeof value !== "string") {
+		throw BadRequest("include_pinned_family must be a family");
+	}
+	return { include_pinned_family: parseFamily(value) };
+}
+
 /** POST /api/routing/family-aliases/preview — local-control candidate read. */
 export function createFamilyAliasPreviewHandler(dbOps: DatabaseOperations) {
-	return async (): Promise<Response> => {
+	return async (req: Request): Promise<Response> => {
 		try {
 			return Response.json({
 				success: true,
-				data: await dbOps.previewFamilyAliasPolicy(),
+				data: await dbOps.previewFamilyAliasPolicy(
+					await parseFamilyAliasPreviewInput(req),
+				),
 			});
 		} catch (error) {
 			return errorResponse(error);
@@ -1245,6 +1269,14 @@ function parseFamilyAliasApplyInput(
 	}
 	if (!Array.isArray(body.selections))
 		throw BadRequest("selections must be an array");
+	const includePinnedFamily =
+		body.include_pinned_family === undefined
+			? undefined
+			: typeof body.include_pinned_family === "string"
+				? parseFamily(body.include_pinned_family)
+				: (() => {
+						throw BadRequest("include_pinned_family must be a family");
+					})();
 	const selections: FamilyAliasPolicySelection[] = body.selections.map(
 		(value) => {
 			if (!value || typeof value !== "object")
@@ -1290,7 +1322,13 @@ function parseFamilyAliasApplyInput(
 			throw BadRequest("invalid policy selection identity");
 		},
 	);
-	return { expected_revision: body.expected_revision as number, selections };
+	return {
+		expected_revision: body.expected_revision as number,
+		...(includePinnedFamily === undefined
+			? {}
+			: { include_pinned_family: includePinnedFamily }),
+		selections,
+	};
 }
 
 /** POST /api/routing/family-aliases/apply — atomic local-control conversion. */

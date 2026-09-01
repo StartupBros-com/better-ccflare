@@ -33,6 +33,7 @@ import type {
 	FamilyAliasPolicyApplyInput,
 	FamilyAliasPolicyApplyResult,
 	FamilyAliasPolicyPreview,
+	FamilyAliasPolicyPreviewInput,
 	IntegrityStatus,
 	ProjectAttributionSource,
 	RateLimitReason,
@@ -2575,8 +2576,10 @@ OAuth tokens will need to be re-authenticated.
 		return this.combo.getRoutingPolicyRevision();
 	}
 
-	async previewFamilyAliasPolicy(): Promise<FamilyAliasPolicyPreview> {
-		return this.combo.previewFamilyAliasPolicy();
+	async previewFamilyAliasPolicy(
+		input?: FamilyAliasPolicyPreviewInput,
+	): Promise<FamilyAliasPolicyPreview> {
+		return this.combo.previewFamilyAliasPolicy(input);
 	}
 
 	async applyFamilyAliasPolicy(

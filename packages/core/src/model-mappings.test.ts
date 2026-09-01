@@ -10,6 +10,7 @@ import {
 	getModelList,
 	getModelMappings,
 	getModelShortName,
+	getStrictClaudeModelFamily,
 	isFamilyAliasModel,
 	isValidClaudeModel,
 	LATEST_FABLE_MODEL,
@@ -445,6 +446,22 @@ describe("Model Validation Utilities", () => {
 		expect(getModelFamily("gpt-4")).toBeNull();
 		expect(getModelFamily("invalid-model")).toBeNull();
 		expect(getModelFamily("")).toBeNull();
+	});
+
+	test("getStrictClaudeModelFamily accepts only canonical logical Claude IDs", () => {
+		expect(getStrictClaudeModelFamily("claude-fable-5")).toBe("fable");
+		expect(getStrictClaudeModelFamily("CLAUDE-OPUS")).toBe("opus");
+		expect(getStrictClaudeModelFamily("claude-haiku-4-5")).toBe("haiku");
+		expect(getStrictClaudeModelFamily("claude-sonnet-5")).toBe("sonnet");
+		for (const model of [
+			"my-opus-experiment",
+			"provider/claude-opus-5",
+			"anthropic.claude-opus-5",
+			"opus-custom",
+			"an-arbitrary-opus-containing-string",
+		]) {
+			expect(getStrictClaudeModelFamily(model)).toBeNull();
+		}
 	});
 
 	test("isValidClaudeModel accepts valid patterns", () => {

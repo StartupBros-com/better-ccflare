@@ -615,8 +615,8 @@ export class APIRouter {
 		this.handlers.set("POST:/api/routing/preview", (req) =>
 			createRoutingPreviewHandler(dbOps)(req),
 		);
-		this.handlers.set("POST:/api/routing/family-aliases/preview", () =>
-			createFamilyAliasPreviewHandler(dbOps)(),
+		this.handlers.set("POST:/api/routing/family-aliases/preview", (req) =>
+			createFamilyAliasPreviewHandler(dbOps)(req),
 		);
 		this.handlers.set("POST:/api/routing/family-aliases/apply", (req) =>
 			createFamilyAliasApplyHandler(dbOps)(req),
