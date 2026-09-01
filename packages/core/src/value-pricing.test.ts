@@ -34,9 +34,8 @@ const testEras: ListPriceEra[] = [
 ];
 
 describe("priceTokensAtListPrice", () => {
-	it("exports a non-empty VALUE_PRICING_VERSION string", () => {
-		expect(typeof VALUE_PRICING_VERSION).toBe("string");
-		expect(VALUE_PRICING_VERSION.length).toBeGreaterThan(0);
+	it("advances VALUE_PRICING_VERSION for the Fable 5.1 price table", () => {
+		expect(VALUE_PRICING_VERSION).toBe("2026-09-01.1");
 	});
 
 	describe("with a synthetic two-era model", () => {
@@ -219,6 +218,20 @@ describe("priceTokensAtListPrice", () => {
 				},
 			);
 			expect(result).toBeCloseTo(3 + 15 + 0.3 + 3.75, 10);
+		});
+
+		it("estimates Fable 5.1 aggregate cache creation at its published 5-minute write rate", () => {
+			const result = priceTokensAtListPrice(
+				CLAUDE_MODEL_IDS.FABLE_5_1,
+				AFTER_FLOOR_MS,
+				{
+					inputTokens: 1_000_000,
+					outputTokens: 1_000_000,
+					cacheReadInputTokens: 1_000_000,
+					cacheCreationInputTokens: 1_000_000,
+				},
+			);
+			expect(result).toBeCloseTo(10 + 50 + 0.25 + 12.5, 10);
 		});
 	});
 });

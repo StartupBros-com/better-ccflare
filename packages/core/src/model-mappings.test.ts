@@ -1,13 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import {
+	BUNDLED_MODELS_AS_OF,
+	CLAUDE_MODEL_IDS,
 	getAllowedModelsMessage,
 	getConfiguredModelMapping,
 	getEndpointUrl,
+	getModelDisplayName,
 	getModelFamily,
 	getModelList,
 	getModelMappings,
+	getModelShortName,
 	isFamilyAliasModel,
 	isValidClaudeModel,
+	LATEST_FABLE_MODEL,
 	LATEST_MODEL_BY_FAMILY,
 	MAX_MODEL_MAPPING_CANDIDATES,
 	mapModelName,
@@ -23,6 +28,31 @@ import { validateModelMappings } from "./validation";
 
 const candidateModels = (count: number) =>
 	Array.from({ length: count }, (_, index) => `physical-model-${index + 1}`);
+
+describe("Fable 5.1 registry metadata", () => {
+	test("registers Fable 5.1 while preserving the explicit Fable 5 legacy pin", () => {
+		expect(CLAUDE_MODEL_IDS.FABLE_5_1).toBe("claude-fable-5-1");
+		expect(CLAUDE_MODEL_IDS.FABLE_5).toBe("claude-fable-5");
+		expect(getModelDisplayName(CLAUDE_MODEL_IDS.FABLE_5_1)).toBe(
+			"Claude Fable 5.1",
+		);
+		expect(getModelShortName(CLAUDE_MODEL_IDS.FABLE_5_1)).toBe(
+			"claude-fable-5.1",
+		);
+		expect(BUNDLED_MODELS_AS_OF).toBe("2026-09-01");
+	});
+
+	test("advances bare Fable aliases without rewriting concrete legacy pins", () => {
+		expect(LATEST_FABLE_MODEL).toBe(CLAUDE_MODEL_IDS.FABLE_5_1);
+		expect(LATEST_MODEL_BY_FAMILY.fable).toBe(CLAUDE_MODEL_IDS.FABLE_5_1);
+		expect(resolveFamilyAliasModel("fable", "fable")).toBe(
+			CLAUDE_MODEL_IDS.FABLE_5_1,
+		);
+		expect(resolveFamilyAliasModel(CLAUDE_MODEL_IDS.FABLE_5, "fable")).toBe(
+			CLAUDE_MODEL_IDS.FABLE_5,
+		);
+	});
+});
 
 describe("Model Mapping", () => {
 	test("distinguishes an explicit mapping from ordinary pass-through", () => {

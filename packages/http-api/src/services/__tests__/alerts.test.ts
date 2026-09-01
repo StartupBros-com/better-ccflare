@@ -437,6 +437,10 @@ describe("model_routing_drift: unknown_model (day-0 catalog gap)", () => {
 		expect(
 			buildUnknownModelDriftAlert(request2, CONFIG, DRIFT_TIMESTAMP),
 		).toBeNull();
+		const request3 = baseRequest({ model: "claude-fable-5-1" });
+		expect(
+			buildUnknownModelDriftAlert(request3, CONFIG, DRIFT_TIMESTAMP),
+		).toBeNull();
 	});
 
 	test("never fires for a garbage string that merely contains a family substring", () => {

@@ -524,6 +524,28 @@ describe("getModelRates", () => {
 		});
 	});
 
+	it("returns the Fable 5.1 compatibility rates, applying its published 5-minute write rate to aggregate cache creation", async () => {
+		const rates = await getModelRates("claude-fable-5-1");
+
+		expect(rates).toEqual({
+			input: 10,
+			output: 50,
+			cacheRead: 0.25,
+			cacheWrite: 12.5,
+		});
+	});
+
+	it("estimates Fable 5.1 aggregate cache creation at its published 5-minute write rate", async () => {
+		const cost = await estimateCostUSD("claude-fable-5-1", {
+			inputTokens: 1_000_000,
+			outputTokens: 1_000_000,
+			cacheReadInputTokens: 1_000_000,
+			cacheCreationInputTokens: 1_000_000,
+		});
+
+		expect(cost).toBeCloseTo(10 + 50 + 0.25 + 12.5, 10);
+	});
+
 	it("returns peak DeepSeek fallback rates including cache reads", async () => {
 		expect(await getModelRates("deepseek-v4-flash")).toEqual({
 			input: 0.44,
