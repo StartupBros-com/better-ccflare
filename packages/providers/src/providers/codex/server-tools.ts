@@ -22,7 +22,7 @@ export const CODEX_SERVER_TOOL_ENDPOINT_CLASS = "codex_responses" as const;
 export const CODEX_SERVER_TOOL_PROVIDER_CONTRACT_REVISION =
 	"codex-responses-web-search-v4" as const;
 export const CODEX_SERVER_TOOL_REPLAY_DECODER_REVISION =
-	"server-tool-replay-v2" as const;
+	"server-tool-replay-v3" as const;
 export const CODEX_SERVER_TOOL_REQUEST_TRANSPORT = "openai_responses" as const;
 export const CODEX_SERVER_TOOL_RESPONSE_TRANSPORT =
 	"openai_responses_sse" as const;

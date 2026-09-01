@@ -223,6 +223,28 @@ describe("Codex native hosted-search response decoder", () => {
 		]);
 	});
 
+	it("consumes open-page and find-in-page actions without extra hosted calls", () => {
+		const openPage = searchItem("ws_open", "unused", []);
+		openPage.action = {
+			type: "open_page",
+			url: "https://docs.example.test/page",
+		};
+		const findInPage = searchItem("ws_find", "unused", []);
+		findInPage.action = {
+			type: "find_in_page",
+			url: "https://docs.example.test/page",
+			pattern: "bounded fixture",
+		};
+
+		const events = decoder().acceptResponse(
+			completedResponse([openPage, findInPage]),
+		);
+		expect(events).toEqual([
+			{ type: "usage_observation", webSearchRequests: 0 },
+			{ type: "terminal", reason: "end_turn" },
+		]);
+	});
+
 	it("keeps multiple searches distinct and preserves annotation original indices", () => {
 		const response = completedResponse([
 			searchItem("ws_first", "first", ["https://one.example.test/a"]),
@@ -1003,14 +1025,10 @@ describe("Codex native hosted-search response decoder", () => {
 	});
 
 	it.each([
-		["open_page", { type: "open_page", url: "https://one.example.test/a" }],
+		["open_page missing URL", { type: "open_page" }],
 		[
-			"find_in_page",
-			{
-				type: "find_in_page",
-				url: "https://one.example.test/a",
-				pattern: "fixture",
-			},
+			"find_in_page missing pattern",
+			{ type: "find_in_page", url: "https://one.example.test/a" },
 		],
 		["missing query", { type: "search", sources: [] }],
 		[
