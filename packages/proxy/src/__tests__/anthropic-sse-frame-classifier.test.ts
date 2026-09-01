@@ -75,4 +75,24 @@ describe("classifyAnthropicSseFrame protocol activity", () => {
 		expect(classification).not.toHaveProperty("unsupportedParameter");
 		expect(JSON.stringify(classification)).not.toContain(privateMessage);
 	});
+
+	it("retains only bounded error code and parameter identifiers", () => {
+		const privateMessage = "private backend details must not escape";
+		const frame = `event: error\ndata: ${JSON.stringify({
+			type: "error",
+			error: {
+				type: "api_error",
+				code: "invalid_tool_choice",
+				param: "tool_choice",
+				message: privateMessage,
+			},
+		})}\n\n`;
+
+		const classification = classifyAnthropicSseFrame(frame);
+		expect(classification).toMatchObject({
+			errorCode: "invalid_tool_choice",
+			errorParameter: "tool_choice",
+		});
+		expect(JSON.stringify(classification)).not.toContain(privateMessage);
+	});
 });

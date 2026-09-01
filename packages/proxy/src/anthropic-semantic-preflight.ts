@@ -217,6 +217,8 @@ export interface AnthropicPreCommitStallMetadata {
 	terminalEvidenceSeen: boolean;
 	limitBytes?: number;
 	errorType?: AnthropicTransientSseErrorType;
+	errorCode?: string;
+	errorParameter?: string;
 	unsupportedParameter?: string;
 	contextOverflowAuthoritative?: boolean;
 }
@@ -237,6 +239,8 @@ export class AnthropicPreCommitStallError extends Error {
 	readonly terminalEvidenceSeen: boolean;
 	readonly limitBytes?: number;
 	readonly errorType?: AnthropicTransientSseErrorType;
+	readonly errorCode?: string;
+	readonly errorParameter?: string;
 	readonly unsupportedParameter?: string;
 	readonly contextOverflowAuthoritative?: boolean;
 
@@ -255,6 +259,8 @@ export class AnthropicPreCommitStallError extends Error {
 		this.terminalEvidenceSeen = metadata.terminalEvidenceSeen;
 		this.limitBytes = metadata.limitBytes;
 		this.errorType = metadata.errorType;
+		this.errorCode = metadata.errorCode;
+		this.errorParameter = metadata.errorParameter;
 		this.unsupportedParameter = metadata.unsupportedParameter;
 		this.contextOverflowAuthoritative = metadata.contextOverflowAuthoritative;
 	}
@@ -593,6 +599,8 @@ export async function gateAnthropicSsePreCommit(
 
 	const failTransient = (
 		errorType: AnthropicTransientSseErrorType,
+		errorCode?: string,
+		errorParameter?: string,
 		unsupportedParameter?: string,
 	): never => {
 		const error = new AnthropicPreCommitTransientError(
@@ -605,6 +613,8 @@ export async function gateAnthropicSsePreCommit(
 					lastValidProtocolActivityAt,
 				),
 				terminalEvidenceSeen,
+				...(errorCode ? { errorCode } : {}),
+				...(errorParameter ? { errorParameter } : {}),
 				...(unsupportedParameter ? { unsupportedParameter } : {}),
 			},
 			errorType,
@@ -630,6 +640,8 @@ export async function gateAnthropicSsePreCommit(
 		if (classification.transientErrorType) {
 			return failTransient(
 				classification.transientErrorType,
+				classification.errorCode,
+				classification.errorParameter,
 				classification.unsupportedParameter,
 			);
 		}
