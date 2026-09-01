@@ -96,6 +96,7 @@ export const COMMON_MODELS = [
 	CLAUDE_MODEL_IDS.SONNET_4_6,
 	CLAUDE_MODEL_IDS.SONNET_5,
 	CLAUDE_MODEL_IDS.FABLE_5,
+	CLAUDE_MODEL_IDS.FABLE_5_1,
 ] as const;
 
 /** A single model entry in the live Anthropic model catalog. */

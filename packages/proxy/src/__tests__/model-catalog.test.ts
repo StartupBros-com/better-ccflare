@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BUNDLED_MODELS_AS_OF, CLAUDE_MODEL_IDS } from "@better-ccflare/core";
 import { getProvider } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers/proxy-types";
@@ -366,6 +367,18 @@ describe("model-catalog", () => {
 			const catalog = await getModelCatalog();
 			expect(catalog.source).toBe("fallback");
 			expect(catalog.models.length).toBeGreaterThan(0);
+		});
+
+		it("derives Fable 5.1 from the bundled registry for offline fallback", async () => {
+			const catalog = await getModelCatalog();
+
+			expect(catalog.source).toBe("fallback");
+			expect(catalog.fetchedAt).toBe(Date.parse(BUNDLED_MODELS_AS_OF));
+			expect(catalog.models).toContainEqual({
+				id: CLAUDE_MODEL_IDS.FABLE_5_1,
+				displayName: "Claude Fable 5.1",
+				createdAt: null,
+			});
 		});
 
 		it("stores a live catalog after a successful refresh", async () => {
