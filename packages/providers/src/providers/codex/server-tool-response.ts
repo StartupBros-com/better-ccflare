@@ -1358,13 +1358,18 @@ export class CodexServerToolResponseDecoder {
 		const completedCalls = [...this.calls.values()].filter(
 			(call) => call.done && call.kind === "search",
 		);
+		const hasAuthoritativeSourceMatch = urlAnnotations.some((annotation) =>
+			completedCalls.some((call) => call.sourceRefsByUrl.has(annotation.url)),
+		);
+		const citationOwner = completedCalls
+			.filter((call) => !call.resultEmitted && call.sourceRefsByUrl.size === 0)
+			.sort((left, right) => right.outputIndex - left.outputIndex)[0];
 		if (
 			urlAnnotations.length > 0 &&
-			completedCalls.length === 1 &&
-			completedCalls[0]?.resultEmitted === false &&
-			completedCalls[0].sourceRefsByUrl.size === 0
+			!hasAuthoritativeSourceMatch &&
+			citationOwner
 		) {
-			const call = completedCalls[0];
+			const call = citationOwner;
 			const sourceByUrl = new Map<string, HostedSearchSourceInput>();
 			for (const annotation of urlAnnotations) {
 				const existing = sourceByUrl.get(annotation.url);

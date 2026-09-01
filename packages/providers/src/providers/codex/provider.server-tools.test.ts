@@ -547,7 +547,7 @@ describe("Codex exact hosted-search capability", () => {
 						inputReplay: continuation ? ["native-Anthropic"] : [],
 						outputReplay: ["proxy-evidence-v1"],
 						providerContractRevision: "codex-responses-web-search-v4",
-						replayDecoderRevision: "server-tool-replay-v4",
+						replayDecoderRevision: "server-tool-replay-v5",
 						requestTransport: "openai_responses",
 						responseTransport: "openai_responses_sse",
 					});
@@ -866,7 +866,7 @@ describe("Codex exact hosted-search capability", () => {
 			{ inputReplay: ["native-Anthropic"] },
 			{ outputReplay: [] },
 			{ providerContractRevision: "codex-responses-v2" },
-			{ replayDecoderRevision: "server-tool-replay-v5" },
+			{ replayDecoderRevision: "server-tool-replay-v6" },
 			{ requestTransport: "openai_chat_completions" },
 			{ responseTransport: "openai_responses_json" },
 		];
