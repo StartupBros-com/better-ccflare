@@ -1,4 +1,5 @@
 import { BUFFER_SIZES, SseFrameBuffer } from "@better-ccflare/core";
+import { Logger } from "@better-ccflare/logger";
 import {
 	type AnthropicServerToolEncoder,
 	type AnthropicServerToolJsonCompletion,
@@ -30,6 +31,76 @@ import {
 import { normalizeCodexResponseInputUsage } from "./usage";
 
 type JsonRecord = Record<string, unknown>;
+
+const log = new Logger("CodexHostedSearch");
+const SAFE_ERROR_IDENTIFIER = /^[A-Za-z][A-Za-z0-9._:-]{0,63}$/;
+const UNSUPPORTED_PARAMETER =
+	/^Unsupported parameter:\s*["'`]?([A-Za-z][A-Za-z0-9._-]{0,63})["'`]?\.?$/;
+
+export type CodexHostedErrorCategory =
+	| "unsupported_parameter"
+	| "web_search_unavailable"
+	| "tool_choice_invalid"
+	| "model_unavailable"
+	| "entitlement"
+	| "policy"
+	| "internal"
+	| "other";
+
+export interface CodexHostedErrorDiagnostic {
+	readonly errorType: string | null;
+	readonly errorCode: string | null;
+	readonly errorParameter: string | null;
+	readonly unsupportedParameter: string | null;
+	readonly category: CodexHostedErrorCategory;
+}
+
+function safeIdentifier(value: unknown): string | null {
+	return typeof value === "string" && SAFE_ERROR_IDENTIFIER.test(value)
+		? value
+		: null;
+}
+
+export function classifyCodexHostedError(
+	value: unknown,
+): CodexHostedErrorDiagnostic | null {
+	if (!isRecord(value) || value.type !== "error") return null;
+	const error = isRecord(value.error) ? value.error : {};
+	const message = typeof error.message === "string" ? error.message : "";
+	const unsupportedMatch = message.match(UNSUPPORTED_PARAMETER);
+	const unsupportedParameter = unsupportedMatch?.[1] ?? null;
+	let category: CodexHostedErrorCategory;
+	if (unsupportedParameter) category = "unsupported_parameter";
+	else if (
+		/web.?search.*(?:not supported|unavailable|not enabled|access)/iu.test(
+			message,
+		)
+	)
+		category = "web_search_unavailable";
+	else if (
+		/tool.?choice.*(?:invalid|not supported|unsupported)/iu.test(message)
+	)
+		category = "tool_choice_invalid";
+	else if (/model.*(?:not supported|unavailable|unsupported)/iu.test(message))
+		category = "model_unavailable";
+	else if (
+		/(?:not authorized|not entitled|does not have access|do not have access|permission)/iu.test(
+			message,
+		)
+	)
+		category = "entitlement";
+	else if (/(?:policy|safety|cyber)/iu.test(message)) category = "policy";
+	else if (/(?:internal|server error|something went wrong)/iu.test(message))
+		category = "internal";
+	else category = "other";
+	return Object.freeze({
+		errorType: safeIdentifier(error.type),
+		errorCode: safeIdentifier(error.code),
+		errorParameter: safeIdentifier(error.param ?? error.parameter),
+		unsupportedParameter,
+		category,
+	});
+}
 
 const NO_DATA_RETRY = Object.freeze({
 	mode: "none" as const,
@@ -260,6 +331,8 @@ class HostedResponsePipeline<
 
 	async accept(data: JsonRecord): Promise<TCompletion | null> {
 		if (this.sawTerminal) throw rejected();
+		const diagnostic = classifyCodexHostedError(data);
+		if (diagnostic) log.warn("codex_hosted_search_upstream_error", diagnostic);
 		if (!this.sawCreated) {
 			if (data.type !== "response.created") throw rejected();
 			const response = isRecord(data.response) ? data.response : {};
