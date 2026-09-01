@@ -17,7 +17,10 @@ import {
 import type { ServerToolHistoryReplacement } from "../../server-tools/history-projection";
 import officialSearchStream from "./__fixtures__/server-tools/official-search-stream.sanitized.json";
 import { CODEX_DEFAULT_ENDPOINT, CodexProvider } from "./provider";
-import { createCodexHostedSearchAttemptPlan } from "./server-tool-attempt-plan";
+import {
+	classifyCodexHostedError,
+	createCodexHostedSearchAttemptPlan,
+} from "./server-tool-attempt-plan";
 import {
 	CodexServerToolConversionError,
 	hasCodexServerToolDeclaration,
@@ -329,6 +332,46 @@ function materializeCodexTuple(
 		requirements,
 	});
 }
+
+describe("Codex hosted-search upstream error diagnostics", () => {
+	test("retains only bounded identifiers and an allowlisted category", () => {
+		const privateMessage = "private backend detail must not escape";
+		const diagnostic = classifyCodexHostedError({
+			type: "error",
+			error: {
+				type: "api_error",
+				code: "invalid_tool_choice",
+				param: "tool_choice",
+				message: privateMessage,
+			},
+		});
+		expect(diagnostic).toEqual({
+			errorType: "api_error",
+			errorCode: "invalid_tool_choice",
+			errorParameter: "tool_choice",
+			unsupportedParameter: null,
+			category: "other",
+		});
+		expect(JSON.stringify(diagnostic)).not.toContain(privateMessage);
+	});
+
+	test.each([
+		["Unsupported parameter: max_tool_calls", "unsupported_parameter"],
+		["Web search is not enabled for this account", "web_search_unavailable"],
+		["tool_choice is unsupported", "tool_choice_invalid"],
+		["model is unavailable", "model_unavailable"],
+		["You do not have access to this feature", "entitlement"],
+		["Blocked by safety policy", "policy"],
+		["Internal server error", "internal"],
+	] as const)("classifies %s", (message, category) => {
+		expect(
+			classifyCodexHostedError({
+				type: "error",
+				error: { type: "api_error", message },
+			})?.category,
+		).toBe(category);
+	});
+});
 
 describe("Codex exact hosted-search capability", () => {
 	test("proves Claude Code's forced WebSearch side-query contract", () => {
