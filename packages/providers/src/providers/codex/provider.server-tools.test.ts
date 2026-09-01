@@ -355,6 +355,26 @@ describe("Codex hosted-search upstream error diagnostics", () => {
 		expect(JSON.stringify(diagnostic)).not.toContain(privateMessage);
 	});
 
+	test("classifies response.failed machine errors before translation", () => {
+		const privateMessage = "private response failure must not escape";
+		const diagnostic = classifyCodexHostedError({
+			type: "response.failed",
+			response: {
+				error: {
+					type: "api_error",
+					code: "web_search_unavailable",
+					message: privateMessage,
+				},
+			},
+		});
+		expect(diagnostic).toMatchObject({
+			errorType: "api_error",
+			errorCode: "web_search_unavailable",
+			category: "other",
+		});
+		expect(JSON.stringify(diagnostic)).not.toContain(privateMessage);
+	});
+
 	test.each([
 		["Unsupported parameter: max_tool_calls", "unsupported_parameter"],
 		["Web search is not enabled for this account", "web_search_unavailable"],
