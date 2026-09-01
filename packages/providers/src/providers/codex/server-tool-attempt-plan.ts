@@ -23,6 +23,7 @@ import {
 import {
 	CODEX_SERVER_TOOL_ENDPOINT,
 	CODEX_SERVER_TOOL_MODEL,
+	CODEX_UNSUPPORTED_WEB_SEARCH_SOURCES_INCLUDE,
 	CodexServerToolConversionError,
 	mapCodexServerToolRequest,
 } from "./server-tools";
@@ -663,12 +664,11 @@ async function transformHostedRequest(
 	});
 	if (mapping === undefined) throw rejected();
 	converted.tools = mapping.tools;
-	converted.include = [
-		...new Set([
-			...(Array.isArray(converted.include) ? converted.include : []),
-			...mapping.include,
-		]),
-	];
+	const retainedIncludes = [
+		...new Set(Array.isArray(converted.include) ? converted.include : []),
+	].filter((value) => value !== CODEX_UNSUPPORTED_WEB_SEARCH_SOURCES_INCLUDE);
+	if (retainedIncludes.length === 0) delete converted.include;
+	else converted.include = retainedIncludes;
 	// The ChatGPT Codex subscription endpoint rejects Responses API
 	// `max_tool_calls`. Preserve Anthropic max_uses in the capability/option
 	// profile, but never emit the unsupported field on this reviewed wire path.

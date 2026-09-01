@@ -20,7 +20,7 @@ export const CODEX_SERVER_TOOL_ENDPOINT =
 	"https://chatgpt.com/backend-api/codex/responses" as const;
 export const CODEX_SERVER_TOOL_ENDPOINT_CLASS = "codex_responses" as const;
 export const CODEX_SERVER_TOOL_PROVIDER_CONTRACT_REVISION =
-	"codex-responses-web-search-v2" as const;
+	"codex-responses-web-search-v3" as const;
 export const CODEX_SERVER_TOOL_REPLAY_DECODER_REVISION =
 	"server-tool-replay-v1" as const;
 export const CODEX_SERVER_TOOL_REQUEST_TRANSPORT = "openai_responses" as const;
@@ -300,14 +300,15 @@ export function resolveCodexServerToolCapability(
 		owner: "providers/codex",
 		verifiedAt: "2026-07-29T00:00:00.000Z",
 		revalidateAfter: "9999-12-31T23:59:59.999Z",
-		fixtureRevision: "codex-official-responses-web-search-v2",
+		fixtureRevision: "codex-official-responses-web-search-v3",
 		contractRevision: CODEX_SERVER_TOOL_PROVIDER_CONTRACT_REVISION,
 		revalidationTriggers: REVALIDATION_TRIGGERS,
 	});
 	return Object.freeze({ decision: "proven", proof });
 }
 
-const SOURCE_INCLUDE = "web_search_call.action.sources" as const;
+export const CODEX_UNSUPPORTED_WEB_SEARCH_SOURCES_INCLUDE =
+	"web_search_call.action.sources" as const;
 const ORCHESTRATION_TOOL_NAMES = new Set(["Agent", "Task"]);
 const MAX_SCHEMA_DEPTH = 64;
 const MAX_SCHEMA_NODES = 16_384;
@@ -338,7 +339,6 @@ export interface CodexWebSearchTool {
 
 export interface CodexServerToolRequestMapping {
 	readonly tools: readonly (CodexFunctionTool | CodexWebSearchTool)[];
-	readonly include: readonly [typeof SOURCE_INCLUDE];
 }
 
 export interface CodexServerToolRequestMappingPolicy {
@@ -660,10 +660,7 @@ export function mapCodexServerToolRequest(
 		const declaration = requirement.declarations[0];
 		if (!declaration) throw rejected();
 		mappedTools[mappedServerToolIndex] = mapWebSearch(declaration);
-		return deepFreeze({
-			tools: mappedTools,
-			include: [SOURCE_INCLUDE] as [typeof SOURCE_INCLUDE],
-		});
+		return deepFreeze({ tools: mappedTools });
 	} catch {
 		throw rejected();
 	}
