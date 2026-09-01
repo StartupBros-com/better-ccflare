@@ -56,7 +56,11 @@ export interface CodexHostedErrorDiagnostic {
 }
 
 export interface CodexHostedTerminalShapeDiagnostic {
-	readonly eventType: "error" | "response.failed" | "response.incomplete";
+	readonly eventType:
+		| "error"
+		| "response.failed"
+		| "response.incomplete"
+		| "response.completed";
 	readonly responseStatus: string | null;
 	readonly incompleteReason: string | null;
 	readonly hasError: boolean;
@@ -75,7 +79,8 @@ export function classifyCodexHostedTerminalShape(
 	if (
 		value.type !== "error" &&
 		value.type !== "response.failed" &&
-		value.type !== "response.incomplete"
+		value.type !== "response.incomplete" &&
+		value.type !== "response.completed"
 	) {
 		return null;
 	}
@@ -83,11 +88,22 @@ export function classifyCodexHostedTerminalShape(
 	const incompleteDetails = isRecord(response.incomplete_details)
 		? response.incomplete_details
 		: {};
+	const responseStatus = safeIdentifier(response.status);
+	const incompleteReason = safeIdentifier(incompleteDetails.reason);
+	const hasError = isRecord(value.error) || isRecord(response.error);
+	if (
+		value.type === "response.completed" &&
+		responseStatus === "completed" &&
+		incompleteReason === null &&
+		!hasError
+	) {
+		return null;
+	}
 	return Object.freeze({
 		eventType: value.type,
-		responseStatus: safeIdentifier(response.status),
-		incompleteReason: safeIdentifier(incompleteDetails.reason),
-		hasError: isRecord(value.error) || isRecord(response.error),
+		responseStatus,
+		incompleteReason,
+		hasError,
 	});
 }
 
