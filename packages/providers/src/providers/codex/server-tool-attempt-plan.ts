@@ -60,6 +60,11 @@ export interface CodexHostedDecoderRejectionShape {
 	readonly eventType: string | null;
 	readonly itemType: string | null;
 	readonly outputIndex: number | null;
+	readonly actionType: string | null;
+	readonly hasQuery: boolean;
+	readonly queriesCount: number | null;
+	readonly hasSources: boolean;
+	readonly sourcesCount: number | null;
 }
 
 export function classifyCodexHostedDecoderRejectionShape(
@@ -67,6 +72,7 @@ export function classifyCodexHostedDecoderRejectionShape(
 ): CodexHostedDecoderRejectionShape {
 	const event = isRecord(value) ? value : {};
 	const item = isRecord(event.item) ? event.item : {};
+	const action = isRecord(item.action) ? item.action : {};
 	return Object.freeze({
 		eventType: safeIdentifier(event.type),
 		itemType: safeIdentifier(item.type),
@@ -76,6 +82,11 @@ export function classifyCodexHostedDecoderRejectionShape(
 			event.output_index >= 0
 				? event.output_index
 				: null,
+		actionType: safeIdentifier(action.type),
+		hasQuery: typeof action.query === "string",
+		queriesCount: Array.isArray(action.queries) ? action.queries.length : null,
+		hasSources: Object.hasOwn(action, "sources"),
+		sourcesCount: Array.isArray(action.sources) ? action.sources.length : null,
 	});
 }
 

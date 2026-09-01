@@ -341,13 +341,26 @@ describe("Codex hosted-search upstream error diagnostics", () => {
 		const shape = classifyCodexHostedDecoderRejectionShape({
 			type: "response.output_item.added",
 			output_index: 1,
-			item: { type: "computer_call", content: privateValue },
+			item: {
+				type: "computer_call",
+				content: privateValue,
+				action: {
+					type: "search",
+					queries: [privateValue],
+					sources: [{ url: privateValue }],
+				},
+			},
 			privateValue,
 		});
 		expect(shape).toEqual({
 			eventType: "response.output_item.added",
 			itemType: "computer_call",
 			outputIndex: 1,
+			actionType: "search",
+			hasQuery: false,
+			queriesCount: 1,
+			hasSources: true,
+			sourcesCount: 1,
 		});
 		expect(JSON.stringify(shape)).not.toContain(privateValue);
 	});
