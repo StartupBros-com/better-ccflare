@@ -18,6 +18,7 @@ import type { ServerToolHistoryReplacement } from "../../server-tools/history-pr
 import officialSearchStream from "./__fixtures__/server-tools/official-search-stream.sanitized.json";
 import { CODEX_DEFAULT_ENDPOINT, CodexProvider } from "./provider";
 import {
+	classifyCodexHostedDecoderRejectionShape,
 	classifyCodexHostedError,
 	classifyCodexHostedTerminalShape,
 	createCodexHostedSearchAttemptPlan,
@@ -335,6 +336,22 @@ function materializeCodexTuple(
 }
 
 describe("Codex hosted-search upstream error diagnostics", () => {
+	test("retains only bounded decoder rejection shape", () => {
+		const privateValue = "private item content must not escape";
+		const shape = classifyCodexHostedDecoderRejectionShape({
+			type: "response.output_item.added",
+			output_index: 1,
+			item: { type: "computer_call", content: privateValue },
+			privateValue,
+		});
+		expect(shape).toEqual({
+			eventType: "response.output_item.added",
+			itemType: "computer_call",
+			outputIndex: 1,
+		});
+		expect(JSON.stringify(shape)).not.toContain(privateValue);
+	});
+
 	test("classifies only non-success terminal shape fields", () => {
 		expect(
 			classifyCodexHostedTerminalShape({
