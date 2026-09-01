@@ -58,6 +58,9 @@ export interface AnthropicSseFrameClassification {
 	validProtocolActivity?: true;
 	/** Sanitized nested `error.type`; upstream messages are never retained. */
 	errorType?: string;
+	/** Sanitized nested machine identifiers; arbitrary values are discarded. */
+	errorCode?: string;
+	errorParameter?: string;
 	transientErrorType?: AnthropicTransientSseErrorType;
 	/** Allowlisted unsupported field identifier; arbitrary error text is discarded. */
 	unsupportedParameter?: string;
@@ -81,6 +84,15 @@ function safeErrorType(value: unknown): string | undefined {
 		return undefined;
 	}
 	return value;
+}
+
+function safeParameterIdentifier(value: unknown): string | undefined {
+	return typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= MAX_SAFE_ERROR_TYPE_LENGTH &&
+		SAFE_UNSUPPORTED_PARAMETER.test(value)
+		? value
+		: undefined;
 }
 
 function safeUnsupportedParameter(value: unknown): string | undefined {
@@ -259,6 +271,9 @@ export function classifyAnthropicSseFrame(
 					? (errorType as AnthropicTransientSseErrorType)
 					: undefined;
 			const errorCode = safeErrorType(nestedError.code);
+			const errorParameter = safeParameterIdentifier(
+				nestedError.param ?? nestedError.parameter,
+			);
 			const unsupportedParameter = safeUnsupportedParameter(
 				nestedError.message,
 			);
@@ -272,6 +287,8 @@ export function classifyAnthropicSseFrame(
 				kind: "error",
 				validProtocolActivity: true,
 				...(errorType ? { errorType } : {}),
+				...(errorCode ? { errorCode } : {}),
+				...(errorParameter ? { errorParameter } : {}),
 				...(transientErrorType ? { transientErrorType } : {}),
 				...(unsupportedParameter ? { unsupportedParameter } : {}),
 				...(contextOverflow ? { contextOverflow: true as const } : {}),

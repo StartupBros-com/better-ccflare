@@ -497,6 +497,8 @@ describe("gateAnthropicSsePreCommit", () => {
 			type: "error",
 			error: {
 				type: "api_error",
+				code: "invalid_tool_choice",
+				param: "tool_choice",
 				message: "Unsupported parameter: tool_choice",
 				privateSuffix,
 			},
@@ -517,9 +519,11 @@ describe("gateAnthropicSsePreCommit", () => {
 			caught = error;
 		}
 		expect(caught).toBeInstanceOf(AnthropicPreCommitTransientError);
-		expect(
-			(caught as AnthropicPreCommitTransientError).unsupportedParameter,
-		).toBe("tool_choice");
+		expect(caught).toMatchObject({
+			errorCode: "invalid_tool_choice",
+			errorParameter: "tool_choice",
+			unsupportedParameter: "tool_choice",
+		});
 		expect(JSON.stringify(caught)).not.toContain(privateSuffix);
 	});
 

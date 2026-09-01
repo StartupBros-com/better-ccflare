@@ -7078,6 +7078,8 @@ export async function proxyWithAccount(
 					affinityLanePresent: requestMeta.affinityLaneKey != null,
 					reason: error.reason,
 					errorType: error.errorType ?? null,
+					errorCode: error.errorCode ?? null,
+					errorParameter: error.errorParameter ?? null,
 					unsupportedParameter: error.unsupportedParameter ?? null,
 					bufferedBytes: error.bufferedBytes,
 					framesSeen: error.framesSeen,
