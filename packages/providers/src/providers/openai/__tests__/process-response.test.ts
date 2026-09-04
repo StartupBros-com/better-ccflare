@@ -146,30 +146,37 @@ describe("processResponse – JSON (application/json)", () => {
 			usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
 		});
 		if (!upstream.body) throw new Error("expected upstream body");
-		const body = upstream.body;
-		const originalCancel = body.cancel.bind(body);
-		const originalGetReader = body.getReader.bind(body);
-		let cancelCalls = 0;
-		let getReaderCalls = 0;
-		Object.defineProperty(body, "cancel", {
-			configurable: true,
-			value: (...args: Parameters<typeof body.cancel>) => {
-				cancelCalls += 1;
-				return originalCancel(...args);
-			},
-		});
-		Object.defineProperty(body, "getReader", {
-			configurable: true,
-			value: () => {
-				getReaderCalls += 1;
-				return originalGetReader();
-			},
-		});
 
-		await provider.processResponse(upstream, makeAccount());
+		// `clone()` tees the body: per WHATWG Fetch the original response then
+		// exposes a fresh tee branch, so a spy installed on the pre-clone stream
+		// instance never sees the drain (Bun >= 1.4.0 follows the spec; Bun 1.3.x
+		// kept the same object). Observe the prototype instead and record which
+		// stream each call targeted.
+		const proto = ReadableStream.prototype;
+		const originalCancel = proto.cancel;
+		const originalGetReader = proto.getReader;
+		const cancelTargets: ReadableStream[] = [];
+		const getReaderTargets: ReadableStream[] = [];
+		proto.cancel = function (this: ReadableStream, ...args) {
+			cancelTargets.push(this);
+			return originalCancel.apply(this, args);
+		};
+		proto.getReader = function (this: ReadableStream, ...args) {
+			getReaderTargets.push(this);
+			return originalGetReader.apply(this, args as []);
+		} as typeof originalGetReader;
 
-		expect(cancelCalls).toBe(0);
-		expect(getReaderCalls).toBe(1);
+		try {
+			await provider.processResponse(upstream, makeAccount());
+		} finally {
+			proto.cancel = originalCancel;
+			proto.getReader = originalGetReader;
+		}
+
+		expect(cancelTargets).toHaveLength(0);
+		expect(getReaderTargets).toHaveLength(1);
+		// The reader was taken on the discarded original branch, not the clone.
+		expect(getReaderTargets[0]).toBe(upstream.body);
 	});
 
 	it("tool call response converts to Anthropic tool_use shape", async () => {
