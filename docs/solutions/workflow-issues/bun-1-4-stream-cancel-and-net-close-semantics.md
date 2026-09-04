@@ -75,9 +75,10 @@ waits for that connection until the test times out. Measured on the same script:
 | Bun 1.4.0 | hangs | end, close | end, close |
 
 So this is Node parity, not a regression. Bun 1.3.x auto-resumed accepted sockets; Bun 1.4.0
-stopped doing that (breaking-changes tracker oven-sh/bun#28792, PR #36332: "an accepted socket
-with buffered payload + peer FIN now stays open until the app reads or destroys it, matching
-Node"). The fixture never reads curl's request bytes, so the paused socket holds them and the
+stopped doing that (breaking-changes tracker oven-sh/bun#28792, PR #36332: "An accepted socket
+with buffered payload + peer FIN now stays open until the app reads (then 'end' fires and the
+normal allowHalfOpen / autoDestroy path closes it) or destroys it, matching Node."). The
+fixture never reads curl's request bytes, so the paused socket holds them and the
 FIN is never observed. `closeAllConnections()` is an `http.Server` method and does not exist
 on `net.Server`. In-process `node:http` fixtures in this repo already track and destroy their
 sockets, and the runner fixtures execute under a child Node/Bun process, so nothing else moved.

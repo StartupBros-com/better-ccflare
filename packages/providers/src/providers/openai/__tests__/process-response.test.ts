@@ -157,13 +157,19 @@ describe("processResponse – JSON (application/json)", () => {
 		const originalGetReader = proto.getReader;
 		const cancelTargets: ReadableStream[] = [];
 		const getReaderTargets: ReadableStream[] = [];
-		proto.cancel = function (this: ReadableStream, ...args) {
+		proto.cancel = function (
+			this: ReadableStream,
+			...args: Parameters<typeof originalCancel>
+		) {
 			cancelTargets.push(this);
 			return originalCancel.apply(this, args);
 		};
-		proto.getReader = function (this: ReadableStream, ...args) {
+		proto.getReader = function (
+			this: ReadableStream,
+			...args: Parameters<typeof originalGetReader>
+		) {
 			getReaderTargets.push(this);
-			return originalGetReader.apply(this, args as []);
+			return originalGetReader.apply(this, args);
 		} as typeof originalGetReader;
 
 		try {
