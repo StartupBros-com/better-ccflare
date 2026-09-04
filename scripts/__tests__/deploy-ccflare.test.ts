@@ -206,7 +206,14 @@ async function startGatewayFixture(rawResponse: string): Promise<{
 	close: () => Promise<void>;
 }> {
 	const server = createServer((socket) => {
-		socket.end(rawResponse);
+		// Respond once and hang up, matching the fixture's `Connection: close`.
+		// This fixture never reads the request bytes, so the accepted socket
+		// stays paused with buffered input and the peer's FIN is never observed:
+		// no `end`, no `close`, and `server.close()` in the teardown waits for
+		// this connection until the test times out. That is Node's behaviour and,
+		// since Bun 1.4.0 stopped auto-resuming accepted sockets, Bun's too.
+		// Destroy in the flush callback instead of relying on the read side.
+		socket.end(rawResponse, () => socket.destroy());
 	});
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);

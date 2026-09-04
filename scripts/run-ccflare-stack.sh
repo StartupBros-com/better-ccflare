@@ -300,6 +300,11 @@ rss_watchdog() {
 		((now - generation_started_ms >= RUNNER_RSS_MIN_UPTIME_MS)) || continue
 		((rss_last_recycle_ms == 0 || now - rss_last_recycle_ms >= RUNNER_RSS_RECYCLE_COOLDOWN_MS)) || continue
 		rss="$(proc_rss_bytes "$pid" 2>/dev/null)" || continue
+		# Re-check the start-time identity after the RSS read: the two reads are
+		# not atomic, so a PID that was replaced in between would otherwise be
+		# charged with another process's RSS. Discard the sample instead.
+		current_identity="$(proc_start_time "$pid" 2>/dev/null)" || continue
+		[[ "$current_identity" == "$identity" ]] || continue
 		if ((rss >= RUNNER_RSS_THRESHOLD_BYTES)); then
 			((streak += 1))
 		else

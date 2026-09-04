@@ -37,6 +37,23 @@ function sseResponse(body: BodyInit): Response {
 	});
 }
 
+async function settledWithin<T>(promise: Promise<T>, ms: number): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error(`promise did not settle within ${ms}ms`)),
+					ms,
+				);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 function chunkedStream(
 	chunks: readonly Uint8Array[],
 ): ReadableStream<Uint8Array> {
@@ -398,12 +415,17 @@ describe("Claude Code custom-base ping compatibility", () => {
 
 	it("propagates downstream cancellation to the upstream stream", async () => {
 		const cancelled = mock((_reason?: unknown) => undefined);
+		let resolveUpstreamCancelled: (reason: unknown) => void = () => undefined;
+		const upstreamCancelled = new Promise<unknown>((resolve) => {
+			resolveUpstreamCancelled = resolve;
+		});
 		const upstream = new ReadableStream<Uint8Array>({
 			pull(controller) {
 				controller.enqueue(encoder.encode("event: pi"));
 			},
 			cancel(reason) {
 				cancelled(reason);
+				resolveUpstreamCancelled(reason);
 			},
 		});
 		const wrapped = adaptAnthropicSsePingsForClaudeCode(
@@ -414,6 +436,15 @@ describe("Claude Code custom-base ping compatibility", () => {
 		const reader = wrapped.body?.getReader();
 		await reader?.cancel("client gone");
 
+		// The adapter pipes the upstream through a TransformStream. Per WHATWG
+		// Streams, cancelling the transform's readable side errors its writable
+		// side only after the transform's own cancel algorithm settles, and the
+		// pipe then cancels the source asynchronously. `reader.cancel()` therefore
+		// resolves before the upstream cancel hook runs on spec-conformant engines
+		// (Bun >= 1.4.0, Node); Bun 1.3.x happened to run the hook synchronously.
+		// Await the propagation itself instead of assuming that ordering.
+		expect(await settledWithin(upstreamCancelled, 1_000)).toBe("client gone");
+		expect(cancelled).toHaveBeenCalledTimes(1);
 		expect(cancelled).toHaveBeenCalledWith("client gone");
 	});
 });
