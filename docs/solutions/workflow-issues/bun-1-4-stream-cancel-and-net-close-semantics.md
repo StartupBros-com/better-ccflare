@@ -1,5 +1,5 @@
 ---
-title: Bun 1.4.0 made streams spec-conformant and broke tests that relied on 1.3 quirks
+title: Bun 1.4.0 matched the streams spec and Node socket semantics, breaking tests that relied on 1.3 quirks
 date: 2026-09-04
 category: workflow-issues
 module: test-suite
@@ -14,7 +14,7 @@ applies_when:
   - A fixture carries a hard-coded `verifiedAt` / `revalidateAfter` window
 symptoms:
   - "claude-code-ping-compat: expect(cancelled).toHaveBeenCalledWith('client gone') fails only on Bun 1.4.0"
-  - "deploy-ccflare gateway probes time out at 5s/15s on Bun 1.4.0; server.close() never calls back"
+  - "deploy-ccflare gateway probes time out at 5s/15s on Bun 1.4.0 (and Node); server.close() never calls back"
   - "process-response: getReaderCalls is 0 on Bun 1.4.0, 1 on Bun 1.3.14"
   - "server-tool-capabilities throws 'Invalid provider server-tool capability decision' on every Bun version from 2026-09-04"
   - "run-ccflare-stack 'never triggers from a stale PID' logs 'RSS recycle trigger' in CI but passes locally"
@@ -35,13 +35,13 @@ tags:
   - toctou
 ---
 
-# Bun 1.4.0 made streams spec-conformant and broke tests that relied on 1.3 quirks
+# Bun 1.4.0 matched the streams spec and Node socket semantics, breaking tests that relied on 1.3 quirks
 
 ## Context
 
 Issue #231: `bun-version: latest` on the managed-routing gate silently moved to Bun 1.4.0,
 which reimplemented web streams natively ("pass 100% of the Web Platform Tests") and rewrote
-`node:net` / `node:http`. Three suites that no PR had touched went red, and the gate was
+`node:net` / `node:http` for Node parity. Three suites that no PR had touched went red, and the gate was
 pinned to 1.3.14 in PR #230 to stay usable. PR #319 removed the pin after fixing the root
 causes below. Every finding was reproduced on an unchanged tree with both
 `~/.local/share/mise/installs/bun/1.3.14/bin/bun` and `.../1.4.0/bin/bun`.
@@ -62,15 +62,25 @@ is mandatory, so no engine may run the source hook synchronously. Bun 1.3.x was 
 Production code is unaffected: the proxy only needs eventual propagation. A test that asserts
 the hook *immediately* after `await cancel()` is asserting a non-guarantee.
 
-### 2. `node:net` server sockets never emit `end`/`close` after `socket.end(data)` on Bun 1.4.0
+### 2. A `node:net` server socket that never reads its input stays open after `socket.end(data)`
 
 A `net.createServer((socket) => socket.end(raw))` fixture answers curl correctly, but the
 server-side socket never surfaces the peer's FIN: no `end`, no `close`, and `server.close(cb)`
-waits for that connection until the test times out. `server.closeAllConnections()` does not
-help. Only an explicit `socket.destroy()` produces the events. This one *is* a Bun 1.4.0
-regression in the `node:net` rewrite. `node:http` fixtures that the *client* closes were not
-affected in this repo's suites, and every in-process `node:http` fixture already tracks and
-destroys its sockets or runs under real Node in a child process.
+waits for that connection until the test times out. Measured on the same script:
+
+| runtime | `end(raw)`, never read | `on("data")` or `resume()` first | `end(raw, () => destroy())` |
+|---|---|---|---|
+| Node 24.12 | hangs | end, close | close |
+| Bun 1.3.14 | end, close | end, close | end, close |
+| Bun 1.4.0 | hangs | end, close | end, close |
+
+So this is Node parity, not a regression. Bun 1.3.x auto-resumed accepted sockets; Bun 1.4.0
+stopped doing that (breaking-changes tracker oven-sh/bun#28792, PR #36332: "an accepted socket
+with buffered payload + peer FIN now stays open until the app reads or destroys it, matching
+Node"). The fixture never reads curl's request bytes, so the paused socket holds them and the
+FIN is never observed. `closeAllConnections()` is an `http.Server` method and does not exist
+on `net.Server`. In-process `node:http` fixtures in this repo already track and destroy their
+sockets, and the runner fixtures execute under a child Node/Bun process, so nothing else moved.
 
 ### 3. `Response.clone()` now swaps in a tee branch, per spec
 
@@ -102,7 +112,9 @@ passing `{ preventCancel: true }` to the pipe must make it fail with the deadlin
 
 **2. `node:net` fixtures hang up explicitly.** `socket.end(raw, () => socket.destroy())`.
 The flush callback fires after the data reached the kernel, so the peer still receives the
-full response on both Bun versions. Do not rely on the peer's FIN to release `server.close()`.
+full response on Node and both Bun versions. A fixture that never reads its input cannot rely
+on the peer's FIN to release `server.close()`; reading (`resume()`) would also work, but
+destroying is the honest expression of `Connection: close`.
 
 **3. Spy on `ReadableStream.prototype`, not on a body instance you captured before `clone()`.**
 Record `this` per call and assert the reader was taken on `response.body` (the discarded
