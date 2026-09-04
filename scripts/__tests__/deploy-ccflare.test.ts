@@ -206,7 +206,12 @@ async function startGatewayFixture(rawResponse: string): Promise<{
 	close: () => Promise<void>;
 }> {
 	const server = createServer((socket) => {
-		socket.end(rawResponse);
+		// Respond once and hang up, matching the fixture's `Connection: close`.
+		// Destroy in the flush callback rather than waiting for the peer's FIN:
+		// Bun 1.4.0's node:net never surfaces the passive close on a server
+		// socket after `end(data)`, so `server.close()` in the teardown would
+		// wait for this connection until the test timed out.
+		socket.end(rawResponse, () => socket.destroy());
 	});
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
