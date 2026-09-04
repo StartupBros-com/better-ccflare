@@ -149,6 +149,9 @@ for v in 1.3.14 1.4.0; do B=~/.local/share/mise/installs/bun/$v/bin/bun
 done
 ```
 
-All five suites pass on both versions after PR #319; `proxy-operations-failover` had already
-been fixed for 1.4.0 by `1e343ddd` (drain deadline no longer releases the lock ahead of the
-outstanding read).
+All five suites pass on both versions after PR #319. `proxy-operations-failover` had already
+been fixed for 1.4.0 by `7bcf6329` ("rebuild Codex retries from replay bytes", 2026-08-26):
+bisected with `git archive` snapshots built and run under Bun 1.4.0, the issue's last green
+main `b89c2848` fails the two 529 in-place retry cases exactly as reported and `7bcf6329`
+passes 72/72. The first commit on PR #319 credits `1e343ddd`; that was wrong, the two tests
+did not exist on that commit's branch line.
