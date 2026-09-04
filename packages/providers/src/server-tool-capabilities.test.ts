@@ -2514,7 +2514,15 @@ describe("provider-owned server-tool decision materialization", () => {
 				return { decision: "proven", proof };
 			},
 		});
-		const decision = materializeDecision(provider, requirement, tuple);
+		// Pin `now` inside the fixture's [verifiedAt, revalidateAfter) window.
+		// The default is the wall clock, which crossed the fixture's
+		// 2026-09-04 revalidation boundary and turned this into a time bomb.
+		const decision = materializeDecision(
+			provider,
+			requirement,
+			tuple,
+			"2026-08-05T00:00:00.000Z",
+		);
 
 		expect(decision).toMatchObject({ decision: "proven" });
 		expect(decision).not.toBe(proof);
