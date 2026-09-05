@@ -137,6 +137,8 @@ Only `codex` accounts qualify. An account's own primed catalog is authoritative;
 
 The proxy writes the requested physical ID into both the outgoing model and the route's expected physical model, so an account's family mapping cannot replace it. Implicit routes register no profiles or session bindings, and `/v1/models` discovery remains unchanged. Set `CCFLARE_CODEX_IMPLICIT_ROUTE=0` to disable this admission path; it is enabled by default. The `implicit-codex:` namespace is reserved and rejected in operator profile configuration.
 
+Account pinning with `x-better-ccflare-account-id` is unavailable for implicit Codex routes; such a request returns a force-route conflict.
+
 *Source: `packages/proxy/src/codex-implicit-route.ts`, `packages/proxy/src/proxy.ts`, and `packages/proxy/src/handlers/account-selector.ts`.*
 
 ## Anthropic Degraded Mode

@@ -164,6 +164,28 @@ describe("accountServesPhysicalModel evidence", () => {
 		);
 	});
 
+	it("rejects global environment mappings as proof for an unprimed account", async () => {
+		const previous = process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS;
+		process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS = JSON.stringify({
+			sonnet: PHYSICAL_MODEL,
+		});
+		try {
+			const account = makeAccount();
+			expect(await accountServesPhysicalModel(account, PHYSICAL_MODEL)).toBe(
+				false,
+			);
+			expect(
+				await resolveImplicitCodexRoute(carrier(PHYSICAL_MODEL), [account]),
+			).toBeNull();
+		} finally {
+			if (previous === undefined) {
+				delete process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS;
+			} else {
+				process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS = previous;
+			}
+		}
+	});
+
 	it("resolves only independently proven codex accounts and returns null when none match", async () => {
 		const matching = makeAccount({
 			model_mappings: JSON.stringify({ sonnet: PHYSICAL_MODEL }),

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type { ImplicitFallbackPolicyConfig } from "@better-ccflare/config";
+import * as core from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { Provider } from "@better-ccflare/providers";
 import type {
@@ -20,6 +21,11 @@ import type {
 } from "../../anthropic-degraded-mode";
 import { CacheAffinityOrderer } from "../../cache-affinity-orderer";
 import { deriveClaudeCodeRouteLineage } from "../../claude-code-request";
+import {
+	clearCodexModelCacheForTests,
+	getCodexModels,
+	getKnownCodexModels,
+} from "../../codex-model-catalog";
 import { DegradedOwnerOverlay } from "../../degraded-owner-overlay";
 import {
 	ModelRouteSessionRegistry,
@@ -27,9 +33,12 @@ import {
 } from "../../model-route-profiles";
 import type { ProxyContext } from "../proxy-types";
 
-const { getProvider, registerProvider, usageCache } = await import(
-	"@better-ccflare/providers"
-);
+const {
+	clearDerivedProviderModelDefaults,
+	getProvider,
+	registerProvider,
+	usageCache,
+} = await import("@better-ccflare/providers");
 const { SessionStrategy } = await import("@better-ccflare/load-balancer");
 const {
 	ForceRouteUnavailableError,
@@ -1232,6 +1241,22 @@ describe("selectAccountsForRequest — implicit Codex route", () => {
 		expect(ctx.dbOps.getComboRoutingPolicy).not.toHaveBeenCalled();
 	});
 
+	it("reuses the account list already fetched during implicit admission", async () => {
+		const matching = makeAccount({
+			id: "implicit-preloaded-sol",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: rawModel }),
+		});
+		const ctx = makeCtx({ accounts: [] });
+
+		await expect(
+			selectAccountsForRequest(implicitMeta(), ctx, rawModel, {
+				preloadedAccounts: [matching],
+			}),
+		).resolves.toEqual([matching]);
+		expect(ctx.dbOps.getAllAccounts).not.toHaveBeenCalled();
+	});
+
 	it("never admits Anthropic OAuth when routeExpectedProvider is mis-set", async () => {
 		const oauth = makeAccount({
 			id: "implicit-spoofed-oauth",
@@ -1333,14 +1358,15 @@ describe("selectAccountsForRequest — implicit Codex route", () => {
 			provider: "codex",
 		});
 		const ctx = makeCtx({ accounts: [mapped, unrelated] });
-		ctx.strategy.select = mock(() => [unrelated, mapped]);
+		const unknown = { ...mapped, id: "implicit-strategy-unknown" };
+		ctx.strategy.select = mock(() => [unknown, unrelated, mapped]);
 
 		await expect(
 			selectAccountsForRequest(implicitMeta(), ctx, rawModel),
 		).resolves.toEqual([mapped]);
 	});
 
-	it("accepts a strategy's account clone when its physical-model evidence still holds", async () => {
+	it("reuses physical-model proof when a strategy returns an unchanged account clone", async () => {
 		const mapped = makeAccount({
 			id: "implicit-strategy-cloned",
 			provider: "codex",
@@ -1349,15 +1375,20 @@ describe("selectAccountsForRequest — implicit Codex route", () => {
 		const cloned = { ...mapped };
 		const ctx = makeCtx({ accounts: [mapped] });
 		ctx.strategy.select = mock(() => [cloned]);
+		const ownedMappingReads = spyOn(core, "getAccountOwnedModelMappings");
+		try {
+			const selected = await selectAccountsForRequest(
+				implicitMeta(),
+				ctx,
+				rawModel,
+			);
 
-		const selected = await selectAccountsForRequest(
-			implicitMeta(),
-			ctx,
-			rawModel,
-		);
-
-		expect(selected).toEqual([cloned]);
-		expect(selected[0]).toBe(cloned);
+			expect(selected).toEqual([cloned]);
+			expect(selected[0]).toBe(cloned);
+			expect(ownedMappingReads).toHaveBeenCalledTimes(1);
+		} finally {
+			ownedMappingReads.mockRestore();
+		}
 	});
 
 	it("rejects an account whose static evidence was removed during strategy selection", async () => {
@@ -1376,6 +1407,45 @@ describe("selectAccountsForRequest — implicit Codex route", () => {
 			selectAccountsForRequest(implicitMeta(), ctx, rawModel),
 		).rejects.toMatchObject({ name: "ForceRouteUnavailableError" });
 	});
+
+	for (const change of ["cleared", "replaced"] as const) {
+		it(`rejects a stale proof when its catalog is ${change} during strategy selection`, async () => {
+			const account = makeAccount({
+				id: `implicit-strategy-catalog-${change}`,
+				provider: "codex",
+			});
+			const ctx = makeCtx({ accounts: [account] });
+			ctx.dbOps.getAccount = mock(async () => account);
+			const originalFetch = globalThis.fetch;
+			let catalogModel = rawModel;
+			globalThis.fetch = mock(async () =>
+				Response.json({
+					models: [{ slug: catalogModel, visibility: "list", priority: 1 }],
+				}),
+			) as unknown as typeof fetch;
+			try {
+				await getCodexModels(account.id, ctx);
+				ctx.strategy.select = mock(async () => {
+					if (change === "cleared") {
+						clearCodexModelCacheForTests();
+						expect(getKnownCodexModels(account.id)).toBeNull();
+					} else {
+						catalogModel = "gpt-5.6-terra";
+						await getCodexModels(account.id, ctx);
+					}
+					return [{ ...account }];
+				});
+
+				await expect(
+					selectAccountsForRequest(implicitMeta(), ctx, rawModel),
+				).rejects.toMatchObject({ name: "ForceRouteUnavailableError" });
+			} finally {
+				globalThis.fetch = originalFetch;
+				clearCodexModelCacheForTests();
+				clearDerivedProviderModelDefaults();
+			}
+		});
+	}
 });
 
 describe("selectAccountsForRequest — server-derived route profile", () => {

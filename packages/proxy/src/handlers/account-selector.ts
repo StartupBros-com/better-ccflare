@@ -679,6 +679,8 @@ export interface CapacityDeferredModelRoute {
 }
 
 export interface AccountSelectionOptions {
+	/** Request-local accounts already fetched by implicit route admission. */
+	readonly preloadedAccounts?: Account[];
 	/** Bypass active combo lookup for the explicit post-combo normal fallback. */
 	readonly skipCombo?: boolean;
 	/** Ignore request-reactive model/family markers for a trusted synthetic probe. */
@@ -2570,7 +2572,8 @@ async function selectAccountsForRequestInternal(
 		}
 		let allAccounts: Account[];
 		try {
-			allAccounts = await ctx.dbOps.getAllAccounts();
+			allAccounts =
+				options.preloadedAccounts ?? (await ctx.dbOps.getAllAccounts());
 		} catch (error) {
 			log.error(
 				"Failed to get accounts from database for capability route lookup:",
@@ -2605,23 +2608,53 @@ async function selectAccountsForRequestInternal(
 			// only consumes that evidence or explicit mappings; it never relies on
 			// the physical id's pass-through mapping as proof of support.
 			const physicalModel = meta.routeProfileExpectedPhysicalModel?.trim();
-			let provenAccounts = new Set<Account | null>();
+			const proofsByAccountId = new Map<
+				string,
+				{
+					provider: Account["provider"];
+					modelMappings: Account["model_mappings"];
+					modelFallbacks: Account["model_fallbacks"];
+					customEndpoint: Account["custom_endpoint"];
+					catalog: ReturnType<typeof getKnownCodexModels>;
+					serves: boolean;
+				}
+			>();
 			refreshImplicitAccountProofs = async (accounts) => {
-				const proofs = await Promise.all(
-					accounts.map(async (account) =>
-						physicalModel &&
-						(await accountServesPhysicalModel(account, physicalModel, {
-							prime: false,
-						}))
-							? account
-							: null,
-					),
+				await Promise.all(
+					accounts.map(async (account) => {
+						const previous = proofsByAccountId.get(account.id);
+						const catalog = getKnownCodexModels(account.id);
+						if (
+							previous &&
+							previous.provider === account.provider &&
+							previous.modelMappings === account.model_mappings &&
+							previous.modelFallbacks === account.model_fallbacks &&
+							previous.customEndpoint === account.custom_endpoint &&
+							previous.catalog?.models === catalog?.models
+						) {
+							return;
+						}
+						const proof = {
+							provider: account.provider,
+							modelMappings: account.model_mappings,
+							modelFallbacks: account.model_fallbacks,
+							customEndpoint: account.custom_endpoint,
+							catalog,
+							serves: false,
+						};
+						proof.serves = Boolean(
+							physicalModel &&
+								(await accountServesPhysicalModel(account, physicalModel, {
+									prime: false,
+								})),
+						);
+						proofsByAccountId.set(account.id, proof);
+					}),
 				);
-				provenAccounts = new Set(proofs);
 			};
 			await refreshImplicitAccountProofs(allAccounts);
 			matchesRoute = (account) =>
-				provenAccounts.has(account) &&
+				proofsByAccountId.get(account.id)?.serves === true &&
 				matchesCapabilityRouteProfile(account, meta);
 		} else {
 			matchesRoute = (account) => matchesCapabilityRouteProfile(account, meta);
@@ -2695,6 +2728,8 @@ async function selectAccountsForRequestInternal(
 		// A custom strategy is allowed to return stale/unavailable candidates;
 		// dynamic profiles must not let those candidates turn into a passthrough
 		// or an unrelated normal-pool route.
+		// Reuse proof by account id for unchanged objects and clones; only changed
+		// account-owned configuration or catalog evidence needs another derivation.
 		if (refreshImplicitAccountProofs) {
 			await refreshImplicitAccountProofs(selected);
 		}

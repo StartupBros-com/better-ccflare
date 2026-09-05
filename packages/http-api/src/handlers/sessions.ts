@@ -285,7 +285,8 @@ export function createSessionAccountHandler(
 		const data: SessionAccountData = {
 			status: "known",
 			account: {
-				...(routeProfileId === null
+				...(routeProfileId === null ||
+				routeProfileId.startsWith("implicit-codex:")
 					? { id: account.id }
 					: {
 							profileModelId: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}${routeProfileId}`,

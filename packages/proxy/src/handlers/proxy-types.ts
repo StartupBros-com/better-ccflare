@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import type {
 	Config,
 	ImplicitFallbackPolicyConfig,
@@ -76,6 +77,27 @@ export const HEADERS = {
 /** Header carrying the process-local secret that gates internal-probe markers */
 export const INTERNAL_PROBE_SECRET_HEADER =
 	"x-better-ccflare-internal-probe-secret";
+
+/** Process-local authentication for the Responses adapter's synthetic request. */
+export const RESPONSES_ADAPTER_SECRET_HEADER =
+	"x-better-ccflare-responses-adapter-secret";
+
+export function isResponsesAdapterRequest(
+	headers: Headers | null | undefined,
+	ctx: Pick<ProxyContext, "internalProbeSecret">,
+): boolean {
+	if (!headers || !ctx.internalProbeSecret) return false;
+	const provided = headers.get(RESPONSES_ADAPTER_SECRET_HEADER);
+	if (!provided) return false;
+	// Mirrors http-api auth-service's timingSafeStringEqual without introducing
+	// a proxy -> http-api dependency. Secret formats have a fixed public length.
+	const providedBytes = Buffer.from(provided, "utf8");
+	const expectedBytes = Buffer.from(ctx.internalProbeSecret, "utf8");
+	return (
+		providedBytes.length === expectedBytes.length &&
+		timingSafeEqual(providedBytes, expectedBytes)
+	);
+}
 
 /**
  * Determines whether a request is a legitimate internal probe (auto-refresh

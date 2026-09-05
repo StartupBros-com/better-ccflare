@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	BUNDLED_MODELS_AS_OF,
 	CLAUDE_MODEL_IDS,
+	getAccountOwnedModelMappings,
 	getAllowedModelsMessage,
 	getConfiguredModelMapping,
 	getEndpointUrl,
@@ -57,6 +58,59 @@ describe("Fable 5.1 registry metadata", () => {
 });
 
 describe("Model Mapping", () => {
+	test("account-owned mappings exclude environment mappings while preserving effective fallback order", () => {
+		const previous = process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS;
+		process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS = JSON.stringify({
+			fable: "env-only",
+			opus: "env-opus",
+			sonnet: "env-sonnet",
+			haiku: "env-haiku",
+		});
+		try {
+			const account = {
+				id: "account-owned-mappings",
+				name: "account-owned-mappings",
+				model_mappings: JSON.stringify({
+					opus: ["account-opus", "account-opus-backup"],
+					haiku: "account-haiku",
+				}),
+				custom_endpoint: JSON.stringify({
+					modelMappings: { haiku: "legacy-haiku" },
+				}),
+				model_fallbacks: JSON.stringify({
+					opus: "account-opus-fallback",
+					sonnet: "account-sonnet-fallback",
+					haiku: "account-haiku-fallback",
+				}),
+			} as Account;
+			const ownedMappings = {
+				opus: ["account-opus", "account-opus-backup", "account-opus-fallback"],
+				sonnet: "account-sonnet-fallback",
+				haiku: ["legacy-haiku", "account-haiku-fallback"],
+			};
+			expect(getAccountOwnedModelMappings(account)).toEqual(ownedMappings);
+			expect(getModelMappings(account)).toEqual({
+				...ownedMappings,
+				fable: "env-only",
+				sonnet: ["env-sonnet", "account-sonnet-fallback"],
+			});
+			expect(
+				getAccountOwnedModelMappings({
+					...account,
+					model_mappings: null,
+					model_fallbacks: null,
+					custom_endpoint: null,
+				}),
+			).toEqual({});
+		} finally {
+			if (previous === undefined) {
+				delete process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS;
+			} else {
+				process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS = previous;
+			}
+		}
+	});
+
 	test("distinguishes an explicit mapping from ordinary pass-through", () => {
 		const account = {
 			id: "test",

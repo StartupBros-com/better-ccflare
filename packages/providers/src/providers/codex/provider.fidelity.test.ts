@@ -304,22 +304,31 @@ describe("Codex transform, store field", () => {
 		expect(body.model).toBe("gpt-5.4-mini");
 	});
 
-	test("preserves the implicit route's raw wire model despite explicit family mappings", async () => {
+	test("preserves a raw Responses model over an unmapped Claude-family default when other families are mapped", async () => {
 		const provider = new CodexProvider();
 		const rawModel = "gpt-6-astra";
 		const request = makeRequest({
 			...base,
-			model: rawModel,
+			model: "claude-opus-4-8",
 			__better_ccflare_codex_passthrough: { model: rawModel },
 		});
-		request.headers.set("x-better-ccflare-final-model", rawModel);
 		const account = {
 			model_mappings: JSON.stringify({
-				opus: rawModel,
 				sonnet: "gpt-5.6-sol",
 				haiku: "gpt-5.6-terra",
 			}),
 		} as Parameters<typeof provider.transformRequestBody>[1];
+
+		// The same alias without the carrier resolves to the provider default.
+		// An explicit opus mapping would take precedence over the carrier, as
+		// covered by the adjacent account-mapping test.
+		const defaultRequest = await provider.transformRequestBody(
+			makeRequest(base),
+			account,
+		);
+		const defaultBody = (await defaultRequest.json()) as CodexBody;
+		expect(defaultBody.model).toBe("gpt-5.3-codex");
+		expect(defaultBody.model).not.toBe(rawModel);
 
 		const transformed = await provider.transformRequestBody(request, account);
 		const body = (await transformed.json()) as CodexBody;

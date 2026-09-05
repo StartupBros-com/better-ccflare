@@ -1,7 +1,6 @@
 import {
-	getConfiguredModelMapping,
+	getAccountOwnedModelMappings,
 	getModelFamily,
-	getModelMappings,
 	KNOWN_PATTERNS,
 } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
@@ -101,17 +100,13 @@ export async function accountServesPhysicalModel(
 	const known = getKnownCodexModels(account.id);
 	if (known) return known.models.some((model) => model.id === id);
 
-	// Include exact Claude-id keys as well as bare families. These reads expose
-	// only static configuration and never consult provider-derived defaults.
-	const logicalModels = new Set<string>([
-		...KNOWN_PATTERNS,
-		...Object.keys(getModelMappings(account)).filter(
-			(model) => getModelFamily(model) !== null,
-		),
-	]);
-	for (const logicalModel of logicalModels) {
-		const configured = getConfiguredModelMapping(logicalModel, account);
-		if (configured?.models.some((candidate) => candidate.trim() === id)) {
+	// Parse account-owned mappings once, including exact Claude-id keys and bare
+	// families. Global environment mappings and provider defaults are not proof.
+	const mappings = getAccountOwnedModelMappings(account);
+	for (const [logicalModel, configured] of Object.entries(mappings)) {
+		if (getModelFamily(logicalModel) === null) continue;
+		const candidates = Array.isArray(configured) ? configured : [configured];
+		if (candidates.some((candidate) => candidate.trim() === id)) {
 			return true;
 		}
 	}

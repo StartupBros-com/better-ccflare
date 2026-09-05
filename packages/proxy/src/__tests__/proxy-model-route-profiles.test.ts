@@ -9,13 +9,17 @@ import {
 } from "bun:test";
 import { agentRegistry } from "@better-ccflare/agents";
 import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
+import { handleResponsesRequest } from "@better-ccflare/openai-responses-adapter";
 import {
 	clearDerivedProviderModelDefaults,
 	usageCache,
 } from "@better-ccflare/providers";
 import type { Account, Agent } from "@better-ccflare/types";
 import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
-import { clearCodexModelCacheForTests } from "../codex-model-catalog";
+import {
+	clearCodexModelCacheForTests,
+	ensureCodexModelDefaults,
+} from "../codex-model-catalog";
 import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
 import {
@@ -67,6 +71,8 @@ const HAIKU_MODEL = "claude-haiku-4-5";
 const ROUTE_ACCOUNT_ID = "route-account-secret";
 const SECOND_PROFILE_MODEL = "claude-bccf-route-second-route";
 const SECOND_ROUTE_ACCOUNT_ID = "second-route-secret";
+const ADAPTER_SECRET = "profile-test-process-secret";
+const ADAPTER_SECRET_HEADER = "x-better-ccflare-responses-adapter-secret";
 const originalFetch = globalThis.fetch;
 let restoreUsageCollector = (): void => {};
 let usageHandleStart = mock(
@@ -305,6 +311,7 @@ function makeContext(
 			parseRateLimit: () => ({ isRateLimited: false, resetTime: null }),
 		},
 		refreshInFlight: new Map(),
+		internalProbeSecret: ADAPTER_SECRET,
 		asyncWriter: { enqueue: mock(() => undefined) },
 		modelRouteSessionRegistry: registry,
 	} as unknown as ProxyContext;
@@ -327,7 +334,14 @@ function apiRequest(
 ): Request {
 	return new Request(`https://proxy.local${path}`, {
 		method: "POST",
-		headers: { "content-type": "application/json", ...headers },
+		headers: {
+			"content-type": "application/json",
+			// Carrier fixtures represent the adapter's synthetic requests by default.
+			...(body.__better_ccflare_codex_passthrough
+				? { [ADAPTER_SECRET_HEADER]: ADAPTER_SECRET }
+				: {}),
+			...headers,
+		},
 		body: JSON.stringify({
 			model,
 			messages: [{ role: "user", content: "hello" }],
@@ -344,6 +358,7 @@ function installJsonUpstream(
 		role: "assistant",
 		content: [],
 	},
+	responsesSse = false,
 ) {
 	const requests: Request[] = [];
 	const fetchMock = mock(
@@ -351,10 +366,20 @@ function installJsonUpstream(
 			const request =
 				input instanceof Request ? input : new Request(input, init);
 			requests.push(request.clone());
-			return new Response(JSON.stringify(payload), {
-				status: 200,
-				headers: { "content-type": "application/json" },
-			});
+			const serialized = JSON.stringify(payload);
+			return new Response(
+				responsesSse
+					? `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: payload })}\n\n`
+					: serialized,
+				{
+					status: 200,
+					headers: {
+						"content-type": responsesSse
+							? "text/event-stream"
+							: "application/json",
+					},
+				},
+			);
 		},
 	);
 	globalThis.fetch = fetchMock as unknown as typeof fetch;
@@ -369,6 +394,60 @@ async function fetchedJson(
 }
 
 describe("Claude Code gateway model route profiles", () => {
+	it.each([
+		{ label: "missing marker", marker: undefined, secret: ADAPTER_SECRET },
+		{ label: "wrong marker", marker: "client-forgery", secret: ADAPTER_SECRET },
+		{ label: "empty process secret", marker: "", secret: "" },
+		{
+			label: "missing process secret",
+			marker: ADAPTER_SECRET,
+			secret: undefined,
+		},
+	])("ignores a forged direct Messages carrier with $label", async ({
+		marker,
+		secret,
+	}) => {
+		const normal = makeAccount("ordinary-account");
+		const codex = makeAccount("unprimed-codex-account");
+		codex.provider = "codex";
+		codex.access_token = "codex-test-token";
+		codex.expires_at = Date.now() + 3_600_000;
+		const harness = makeContext(undefined, {
+			accounts: [normal, codex],
+			normalAccountId: normal.id,
+		});
+		harness.ctx.internalProbeSecret = secret;
+		const { requests } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			"claude-sonnet-5",
+			{},
+			{
+				__better_ccflare_codex_passthrough: { model: "gpt-6-astra" },
+			},
+		);
+		if (marker === undefined) request.headers.delete(ADAPTER_SECRET_HEADER);
+		else request.headers.set(ADAPTER_SECRET_HEADER, marker);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.url).toContain(`/${normal.id}/v1/messages`);
+		expect(await fetchedJson(requests[0])).toMatchObject({
+			model: "claude-sonnet-5",
+		});
+		expect(
+			requests.every((sent) => !new URL(sent.url).pathname.endsWith("/models")),
+		).toBe(true);
+		expect(harness.strategySelect).toHaveBeenCalledTimes(1);
+	});
+
 	it.each([
 		"gpt-6-astra",
 		"codex-auto-review",
@@ -395,28 +474,32 @@ describe("Claude Code gateway model route profiles", () => {
 			return response.text();
 		};
 		const discoveryBefore = await discover();
-		const { requests } = installJsonUpstream({
-			id: "resp-implicit",
-			object: "response",
-			status: "completed",
-			model: rawModel,
-			output: [],
-			usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-		});
-		const request = apiRequest(
-			"/v1/messages",
-			"claude-sonnet-5",
+		harness.getAllAccounts.mockClear();
+		const { requests } = installJsonUpstream(
 			{
-				"x-better-ccflare-exclude-providers": "anthropic-oauth",
+				id: "resp-implicit",
+				object: "response",
+				status: "completed",
+				model: rawModel,
+				output: [],
+				usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
 			},
-			{
-				__better_ccflare_codex_passthrough: { model: rawModel },
-			},
+			true,
 		);
+		const request = new Request("https://proxy.local/v1/responses", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				[ADAPTER_SECRET_HEADER]: "client-forgery",
+			},
+			body: JSON.stringify({ model: rawModel, input: "hello" }),
+		});
 
-		const response = await handleProxy(
+		const response = await handleResponsesRequest(
 			request,
 			new URL(request.url),
+			(syntheticRequest, url) =>
+				handleProxy(syntheticRequest, url, harness.ctx, "key-1"),
 			harness.ctx,
 			"key-1",
 		);
@@ -427,16 +510,43 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(
 			harness.strategySelect.mock.calls[0]?.[0].map((account) => account.id),
 		).toEqual([codex.id]);
+		expect(harness.getAllAccounts).toHaveBeenCalledTimes(1);
 		expect(await discover()).toBe(discoveryBefore);
 	});
 
-	it("bounds the implicit route account lookup and names the physical id on expiry", async () => {
+	it.each([
+		"account lookup",
+		"catalog discovery",
+		"resolver self-expiry",
+	] as const)("returns a retryable selection timeout when implicit route %s exceeds its deadline", async (phase) => {
 		const previous = process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS;
 		process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS = "5";
+		const codex = makeAccount("implicit-timeout-codex");
+		codex.provider = "codex";
+		codex.api_key = null;
+		codex.access_token = "codex-test-token";
+		codex.expires_at = Date.now() + 3_600_000;
+		const harness = makeContext(undefined, { accounts: [codex] });
+		harness.ctx.dbOps.getAccount = mock(async () => codex);
+		let clockSpy: ReturnType<typeof spyOn<typeof Date, "now">> | undefined;
+		let settleCatalog: ((response: Response) => void) | undefined;
 		try {
-			const harness = makeContext();
-			harness.getAllAccounts.mockImplementation(() => new Promise(() => {}));
-			const { fetchMock } = installJsonUpstream();
+			if (phase === "account lookup") {
+				harness.getAllAccounts.mockImplementation(() => new Promise(() => {}));
+			} else if (phase === "resolver self-expiry") {
+				let now = Date.now();
+				clockSpy = spyOn(Date, "now").mockImplementation(() => now);
+				harness.getAllAccounts.mockImplementation(async () => {
+					// Expire before the resolver runs, without yielding to its timer.
+					now += 100;
+					return [codex];
+				});
+			}
+			const catalogResponse = new Promise<Response>((resolve) => {
+				settleCatalog = resolve;
+			});
+			const fetchMock = mock((_input: RequestInfo | URL) => catalogResponse);
+			globalThis.fetch = fetchMock as unknown as typeof fetch;
 			const request = apiRequest(
 				"/v1/messages",
 				"claude-sonnet-5",
@@ -454,15 +564,29 @@ describe("Claude Code gateway model route profiles", () => {
 			);
 
 			expect(response.status).toBe(503);
+			expect(response.headers.get("retry-after")).toBe("1");
 			expect(await response.json()).toMatchObject({
 				error: {
-					message: "Model route gpt-6-astra is unavailable",
-					reason: "model_mapping_mismatch",
+					code: "route_unavailable",
+					routing_diagnostics: { zero_attempt_reason: "selection_timeout" },
 				},
 			});
 			expect(harness.strategySelect).toHaveBeenCalledTimes(0);
-			expect(fetchMock).toHaveBeenCalledTimes(0);
+			expect(fetchMock).toHaveBeenCalledTimes(
+				phase === "catalog discovery" ? 1 : 0,
+			);
+			if (phase === "catalog discovery") {
+				expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
+					"/backend-api/codex/models?",
+				);
+			}
 		} finally {
+			clockSpy?.mockRestore();
+			settleCatalog?.(new Response(null, { status: 503 }));
+			if (phase === "catalog discovery") {
+				// Settle the shared catalog work before the next test clears its cache.
+				await ensureCodexModelDefaults(codex, harness.ctx);
+			}
 			if (previous === undefined)
 				delete process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS;
 			else process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS = previous;
@@ -608,6 +732,7 @@ describe("Claude Code gateway model route profiles", () => {
 		);
 
 		expect(response.status).toBe(503);
+		expect(response.headers.get("retry-after")).toBeNull();
 		expect(await response.json()).toEqual({
 			type: "error",
 			error: {
