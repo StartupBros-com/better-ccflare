@@ -129,6 +129,16 @@ The binding registry is process-local and capped at 10,000 session entries. Entr
 
 *Source: `packages/proxy/src/model-route-profiles.ts`, `packages/proxy/src/proxy.ts` (`routeCallerIdentity`, `applyExplicitModelRoute`, `handleProxy`), and `packages/proxy/src/handlers/account-selector.ts` (`selectAccountsForRequest`).*
 
+### Implicit Codex routes
+
+Physical Codex model IDs on `/v1/responses` have a fourth admission path alongside ordinary, combo, and manual capability routing. For a root request, the proxy reads the adapter's preserved physical model ID and derives an `implicit-codex:<id>` route for that request. An operator profile always takes precedence. Claude model IDs and family aliases keep their existing routing, and non-root requests cannot enter the implicit path.
+
+Only `codex` accounts qualify. An account's own primed catalog is authoritative; without one, an explicit Claude family or exact Claude model mapping can establish support. If neither proves support, the proxy may prime the account's catalog within the account-selection deadline. Shared provider defaults alone never establish support. The existing capability selection applies availability, exclusion, capacity, and model-identity checks while skipping combos. Missing evidence or an unavailable matching pool fails closed; Claude OAuth remains excluded.
+
+The proxy writes the requested physical ID into both the outgoing model and the route's expected physical model, so an account's family mapping cannot replace it. Implicit routes register no profiles or session bindings, and `/v1/models` discovery remains unchanged. Set `CCFLARE_CODEX_IMPLICIT_ROUTE=0` to disable this admission path; it is enabled by default. The `implicit-codex:` namespace is reserved and rejected in operator profile configuration.
+
+*Source: `packages/proxy/src/codex-implicit-route.ts`, `packages/proxy/src/proxy.ts`, and `packages/proxy/src/handlers/account-selector.ts`.*
+
 ## Anthropic Degraded Mode
 
 This restart-scoped feature protects large-context sessions after better-ccflare has evidence of a provider-cohort overload. It is `off` by default and does not replace the ordinary per-account cooldown or failover paths.

@@ -65,6 +65,10 @@ import {
 	isClaudeCodeSubagent,
 } from "./claude-code-request";
 import {
+	getCodexPassthroughPhysicalModel,
+	resolveImplicitCodexRoute,
+} from "./codex-implicit-route";
+import {
 	type AgentInterceptResult,
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
@@ -105,6 +109,7 @@ import {
 	getCapacityDeferredModelRoutes,
 	getClientVisibleServerToolAccountId,
 	getReactiveModelCapacityBlocker,
+	isCapabilityRouteSelection,
 	isComboSessionFallbackDisabled,
 	isForceAccountModelEnabled,
 } from "./handlers/account-selector";
@@ -170,7 +175,8 @@ function modelRouteUnavailableResponse(
 	reason:
 		| "unknown_profile"
 		| "unbound_child_profile"
-		| "conflicting_child_profile" = "unknown_profile",
+		| "conflicting_child_profile"
+		| "model_mapping_mismatch" = "unknown_profile",
 ): Response {
 	return new Response(
 		JSON.stringify({
@@ -1205,6 +1211,67 @@ async function handleProxyCoreImpl(
 			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
 		}
 	}
+	let implicitAccountSelectionBudgetMs: number | undefined;
+	const codexPhysicalModel = getCodexPassthroughPhysicalModel(
+		finalRequestBodyContext.getParsedJson(),
+	);
+	if (
+		modelRouteResolution?.kind !== "route" &&
+		codexPhysicalModel !== null &&
+		(ctx.config.getCodexImplicitRouteEnabled?.() ??
+			process.env.CCFLARE_CODEX_IMPLICIT_ROUTE !== "0")
+	) {
+		if (requestMeta.routeLineage?.kind !== "root") {
+			return modelRouteUnavailableResponse(
+				codexPhysicalModel,
+				"model_mapping_mismatch",
+			);
+		}
+		const implicitAccountSelectionDeadlineAt =
+			Date.now() + preTransportDeadlines.accountSelectionTimeoutMs;
+		let implicitRoute: Awaited<ReturnType<typeof resolveImplicitCodexRoute>>;
+		try {
+			implicitRoute = await runWithPreTransportDeadline({
+				phase: "account_selection",
+				timeoutMs: preTransportDeadlines.accountSelectionTimeoutMs,
+				signal: routingSignal,
+				operation: async () =>
+					resolveImplicitCodexRoute(
+						finalRequestBodyContext.getParsedJson(),
+						await ctx.dbOps.getAllAccounts(),
+						{
+							ctx,
+							deadlineAt: implicitAccountSelectionDeadlineAt,
+							signal: routingSignal,
+						},
+					),
+			});
+		} catch (error) {
+			if (!(error instanceof PreTransportPhaseTimeoutError)) throw error;
+			implicitRoute = null;
+		}
+		if (implicitRoute === null) {
+			return modelRouteUnavailableResponse(
+				codexPhysicalModel,
+				"model_mapping_mismatch",
+			);
+		}
+		// Catalog discovery and selection share one budget. Deliberate cache
+		// pacing between these phases does not spend account-selection time.
+		implicitAccountSelectionBudgetMs =
+			implicitAccountSelectionDeadlineAt - Date.now();
+		const { id } = implicitRoute;
+		requestMeta.routeProfileId = `implicit-codex:${id}`;
+		requestMeta.routeProfileSelection = "implicit-codex";
+		requestMeta.routeProfileLogicalModel = id;
+		requestMeta.routeProfileExpectedPhysicalModel = id;
+		requestMeta.routeExpectedProvider = "codex";
+		requestMeta.forcedAccountId = null;
+		finalRequestBodyContext.setModel(id);
+		finalBodyBuffer = finalRequestBodyContext.getBuffer();
+		appliedModel = id;
+		requestMeta.routeExpectedPhysicalModel = id;
+	}
 	if (
 		url.pathname === "/v1/messages" &&
 		modelRouteResolution?.kind === "route" &&
@@ -1444,10 +1511,22 @@ async function handleProxyCoreImpl(
 	const syntheticProbe = trustedInternalKeepalive;
 	const selectAccountsWithDeadline = (
 		options?: Parameters<typeof selectAccountsForRequest>[3],
-	) =>
-		runWithPreTransportDeadline({
+	) => {
+		const timeoutMs =
+			implicitAccountSelectionBudgetMs ??
+			preTransportDeadlines.accountSelectionTimeoutMs;
+		if (timeoutMs <= 0) {
+			return Promise.reject(
+				new PreTransportPhaseTimeoutError(
+					"account_selection",
+					preTransportDeadlines.accountSelectionTimeoutMs,
+				),
+			);
+		}
+		const startedAt = Date.now();
+		return runWithPreTransportDeadline({
 			phase: "account_selection",
-			timeoutMs: preTransportDeadlines.accountSelectionTimeoutMs,
+			timeoutMs,
 			signal: routingSignal,
 			operation: () =>
 				selectAccountsForRequest(
@@ -1460,7 +1539,12 @@ async function handleProxyCoreImpl(
 						degradedOwner: degradedOwnerSelection,
 					},
 				),
+		}).finally(() => {
+			if (implicitAccountSelectionBudgetMs !== undefined) {
+				implicitAccountSelectionBudgetMs -= Date.now() - startedAt;
+			}
 		});
+	};
 	const getRoutingSelectionDiagnostics = (
 		zeroAttemptReason?: RoutingSelectionZeroAttemptReason,
 		fallbackStructuralCandidateCount = 0,
@@ -1508,7 +1592,7 @@ async function handleProxyCoreImpl(
 			forcedRoute: existing?.forcedRoute ?? forcedRoute,
 			capabilityProfile:
 				existing?.capabilityProfile ??
-				requestMeta.routeProfileSelection === "capability",
+				isCapabilityRouteSelection(requestMeta.routeProfileSelection),
 			routeProfile:
 				existing?.routeProfile ?? requestMeta.routeProfileId != null,
 		};

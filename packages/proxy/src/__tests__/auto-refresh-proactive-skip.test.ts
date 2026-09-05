@@ -11,7 +11,15 @@
  * early return into an `if (accountsToRefresh.length > 0) { ... }` block so
  * the proactive refresh calls always run on every scheduler tick.
  */
-import { beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import {
+	afterAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { getProvider } from "@better-ccflare/providers";
 
 // Spy on the real, already-registered Codex provider instance instead of
@@ -122,6 +130,10 @@ function makeProxyContext() {
 }
 
 describe("AutoRefreshScheduler — proactive refresh must not be skipped", () => {
+	afterAll(() => {
+		refreshTokenMock.mockRestore();
+	});
+
 	beforeEach(() => {
 		refreshTokenMock.mockClear();
 	});

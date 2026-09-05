@@ -304,6 +304,29 @@ describe("Codex transform, store field", () => {
 		expect(body.model).toBe("gpt-5.4-mini");
 	});
 
+	test("preserves the implicit route's raw wire model despite explicit family mappings", async () => {
+		const provider = new CodexProvider();
+		const rawModel = "gpt-6-astra";
+		const request = makeRequest({
+			...base,
+			model: rawModel,
+			__better_ccflare_codex_passthrough: { model: rawModel },
+		});
+		request.headers.set("x-better-ccflare-final-model", rawModel);
+		const account = {
+			model_mappings: JSON.stringify({
+				opus: rawModel,
+				sonnet: "gpt-5.6-sol",
+				haiku: "gpt-5.6-terra",
+			}),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = (await transformed.json()) as CodexBody;
+
+		expect(body.model).toBe(rawModel);
+	});
+
 	test("lets a native Responses model refine a Claude-family default without an account mapping", async () => {
 		const body = await transform({
 			...base,

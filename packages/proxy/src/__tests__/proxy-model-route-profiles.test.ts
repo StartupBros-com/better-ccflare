@@ -9,9 +9,13 @@ import {
 } from "bun:test";
 import { agentRegistry } from "@better-ccflare/agents";
 import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
-import { usageCache } from "@better-ccflare/providers";
+import {
+	clearDerivedProviderModelDefaults,
+	usageCache,
+} from "@better-ccflare/providers";
 import type { Account, Agent } from "@better-ccflare/types";
 import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
+import { clearCodexModelCacheForTests } from "../codex-model-catalog";
 import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
 import {
@@ -75,6 +79,8 @@ let usageHandleEnd = mock(
 beforeEach(() => {
 	useProfileTestCatalog = true;
 	usageCache.clear();
+	clearCodexModelCacheForTests();
+	clearDerivedProviderModelDefaults();
 	usageHandleStart = mock(
 		(_event: Parameters<UsageCollector["handleStart"]>[0]) => undefined,
 	);
@@ -103,6 +109,8 @@ beforeEach(() => {
 afterEach(() => {
 	useProfileTestCatalog = false;
 	usageCache.clear();
+	clearCodexModelCacheForTests();
+	clearDerivedProviderModelDefaults();
 	restoreUsageCollector();
 	restoreUsageCollector = (): void => {};
 	globalThis.fetch = originalFetch;
@@ -280,6 +288,8 @@ function makeContext(
 		},
 		runtime: { port: 8080, clientId: "test" },
 		config: {
+			getCodexImplicitRouteEnabled: () =>
+				process.env.CCFLARE_CODEX_IMPLICIT_ROUTE !== "0",
 			getUsageThrottlingFiveHourEnabled: () => false,
 			getUsageThrottlingWeeklyEnabled: () => false,
 			getSystemPromptCacheTtl1h: () => false,
@@ -359,6 +369,256 @@ async function fetchedJson(
 }
 
 describe("Claude Code gateway model route profiles", () => {
+	it.each([
+		"gpt-6-astra",
+		"codex-auto-review",
+	])("routes the physical Responses model %s to Codex and preserves its wire model", async (rawModel) => {
+		const codex = makeAccount("implicit-codex-account");
+		codex.provider = "codex";
+		codex.access_token = "codex-test-token";
+		codex.expires_at = Date.now() + 3_600_000;
+		codex.model_mappings = JSON.stringify({
+			opus: rawModel,
+			sonnet: "gpt-5.6-sol",
+		});
+		const harness = makeContext(makeCapabilityRegistry(), {
+			accounts: [codex],
+		});
+		const discover = async () => {
+			const request = new Request("https://proxy.local/v1/models");
+			const response = await handleProxy(
+				request,
+				new URL(request.url),
+				harness.ctx,
+				"key-1",
+			);
+			return response.text();
+		};
+		const discoveryBefore = await discover();
+		const { requests } = installJsonUpstream({
+			id: "resp-implicit",
+			object: "response",
+			status: "completed",
+			model: rawModel,
+			output: [],
+			usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+		});
+		const request = apiRequest(
+			"/v1/messages",
+			"claude-sonnet-5",
+			{
+				"x-better-ccflare-exclude-providers": "anthropic-oauth",
+			},
+			{
+				__better_ccflare_codex_passthrough: { model: rawModel },
+			},
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		expect(requests).toHaveLength(1);
+		expect(await fetchedJson(requests[0])).toMatchObject({ model: rawModel });
+		expect(
+			harness.strategySelect.mock.calls[0]?.[0].map((account) => account.id),
+		).toEqual([codex.id]);
+		expect(await discover()).toBe(discoveryBefore);
+	});
+
+	it("bounds the implicit route account lookup and names the physical id on expiry", async () => {
+		const previous = process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS;
+		process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS = "5";
+		try {
+			const harness = makeContext();
+			harness.getAllAccounts.mockImplementation(() => new Promise(() => {}));
+			const { fetchMock } = installJsonUpstream();
+			const request = apiRequest(
+				"/v1/messages",
+				"claude-sonnet-5",
+				{},
+				{
+					__better_ccflare_codex_passthrough: { model: "gpt-6-astra" },
+				},
+			);
+
+			const response = await handleProxy(
+				request,
+				new URL(request.url),
+				harness.ctx,
+				"key-1",
+			);
+
+			expect(response.status).toBe(503);
+			expect(await response.json()).toMatchObject({
+				error: {
+					message: "Model route gpt-6-astra is unavailable",
+					reason: "model_mapping_mismatch",
+				},
+			});
+			expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+			expect(fetchMock).toHaveBeenCalledTimes(0);
+		} finally {
+			if (previous === undefined)
+				delete process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS;
+			else process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS = previous;
+		}
+	});
+
+	it("leaves ordinary routing active when the implicit route kill switch is off", async () => {
+		const previous = process.env.CCFLARE_CODEX_IMPLICIT_ROUTE;
+		process.env.CCFLARE_CODEX_IMPLICIT_ROUTE = "0";
+		try {
+			const harness = makeContext();
+			const { requests } = installJsonUpstream();
+			const request = apiRequest(
+				"/v1/messages",
+				"claude-sonnet-5",
+				{},
+				{
+					__better_ccflare_codex_passthrough: { model: "gpt-6-astra" },
+				},
+			);
+
+			const response = await handleProxy(
+				request,
+				new URL(request.url),
+				harness.ctx,
+				"key-1",
+			);
+
+			expect(response.status).toBe(200);
+			expect(await fetchedJson(requests[0])).toMatchObject({
+				model: "claude-sonnet-5",
+			});
+		} finally {
+			if (previous === undefined)
+				delete process.env.CCFLARE_CODEX_IMPLICIT_ROUTE;
+			else process.env.CCFLARE_CODEX_IMPLICIT_ROUTE = previous;
+		}
+	});
+
+	it("rejects physical Responses routing on a child lineage before account selection", async () => {
+		const harness = makeContext();
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			"claude-sonnet-5",
+			{
+				"x-claude-code-agent-id": "implicit-child",
+			},
+			{
+				__better_ccflare_codex_passthrough: { model: "gpt-6-astra" },
+			},
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({
+			error: {
+				type: "model_route_unavailable",
+				message: "Model route gpt-6-astra is unavailable",
+				reason: "model_mapping_mismatch",
+			},
+		});
+		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+		expect(fetchMock).toHaveBeenCalledTimes(0);
+	});
+
+	it("keeps an operator profile authoritative when a Responses carrier names a physical Codex model", async () => {
+		const harness = makeContext(makeRegistry());
+		const { requests } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			{},
+			{
+				__better_ccflare_codex_passthrough: { model: "gpt-6-astra" },
+			},
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		expect(requests[0]?.url).toContain(`/${ROUTE_ACCOUNT_ID}/v1/messages`);
+		expect(await fetchedJson(requests[0])).toMatchObject({
+			model: LOGICAL_MODEL,
+			output_config: { effort: "xhigh" },
+		});
+	});
+
+	it("leaves model discovery byte-identical with the implicit route enabled or disabled", async () => {
+		const previous = process.env.CCFLARE_CODEX_IMPLICIT_ROUTE;
+		try {
+			const harness = makeContext(makeCapabilityRegistry());
+			const { fetchMock } = installJsonUpstream();
+			const discover = async () => {
+				const request = new Request("https://proxy.local/v1/models");
+				return handleProxy(request, new URL(request.url), harness.ctx, "key-1");
+			};
+			process.env.CCFLARE_CODEX_IMPLICIT_ROUTE = "0";
+			const before = await discover();
+			process.env.CCFLARE_CODEX_IMPLICIT_ROUTE = "1";
+			const after = await discover();
+
+			expect(before.status).toBe(200);
+			expect(after.status).toBe(200);
+			expect(await after.text()).toBe(await before.text());
+			expect([...after.headers]).toEqual([...before.headers]);
+			expect(fetchMock).toHaveBeenCalledTimes(0);
+		} finally {
+			if (previous === undefined)
+				delete process.env.CCFLARE_CODEX_IMPLICIT_ROUTE;
+			else process.env.CCFLARE_CODEX_IMPLICIT_ROUTE = previous;
+		}
+	});
+
+	it("rejects an unsupported physical Responses model with its original id", async () => {
+		const harness = makeContext();
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			"claude-sonnet-5",
+			{},
+			{
+				__better_ccflare_codex_passthrough: { model: "gpt-unknown-physical" },
+			},
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(503);
+		expect(await response.json()).toEqual({
+			type: "error",
+			error: {
+				type: "model_route_unavailable",
+				message: "Model route gpt-unknown-physical is unavailable",
+				reason: "model_mapping_mismatch",
+			},
+		});
+		expect(fetchMock).toHaveBeenCalledTimes(0);
+	});
+
 	it("routes a capability profile through the currently available matching account", async () => {
 		const pausedPrimary = makeAccount("paused-primary");
 		pausedPrimary.paused = true;

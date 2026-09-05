@@ -1193,6 +1193,191 @@ describe("selectAccountsForRequest — profile-only account eligibility", () => 
 	});
 });
 
+describe("selectAccountsForRequest — implicit Codex route", () => {
+	const rawModel = "gpt-5.6-sol";
+	function implicitMeta(overrides: Partial<RequestMeta> = {}): RequestMeta {
+		return makeRequestMeta({
+			routeProfileId: `implicit-codex:${rawModel}`,
+			routeProfileSelection: "implicit-codex",
+			routeProfileLogicalModel: rawModel,
+			routeProfileExpectedPhysicalModel: rawModel,
+			routeExpectedPhysicalModel: rawModel,
+			routeExpectedProvider: "codex",
+			routeLineage: { kind: "root", childHomeKey: null },
+			...overrides,
+		});
+	}
+
+	it("admits only Codex accounts proven to serve the raw id by family mappings", async () => {
+		const matching = makeAccount({
+			id: "implicit-mapped-sol",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: rawModel }),
+		});
+		const unmatched = makeAccount({
+			id: "implicit-mapped-terra",
+			provider: "codex",
+			model_mappings: JSON.stringify({ sonnet: "gpt-5.6-terra" }),
+		});
+		const unknown = makeAccount({
+			id: "implicit-unprimed-unknown",
+			provider: "codex",
+		});
+		const oauth = makeAccount({ id: "implicit-oauth", provider: "anthropic" });
+		const ctx = makeCtx({ accounts: [unmatched, unknown, oauth, matching] });
+
+		await expect(
+			selectAccountsForRequest(implicitMeta(), ctx, rawModel),
+		).resolves.toEqual([matching]);
+		expect(ctx.dbOps.getComboRoutingPolicy).not.toHaveBeenCalled();
+	});
+
+	it("never admits Anthropic OAuth when routeExpectedProvider is mis-set", async () => {
+		const oauth = makeAccount({
+			id: "implicit-spoofed-oauth",
+			provider: "anthropic",
+			model_mappings: JSON.stringify({ opus: rawModel }),
+		});
+		const ctx = makeCtx({ accounts: [oauth] });
+
+		await expect(
+			selectAccountsForRequest(
+				implicitMeta({ routeExpectedProvider: "anthropic" }),
+				ctx,
+				rawModel,
+			),
+		).rejects.toMatchObject({
+			name: "ForceRouteUnavailableError",
+			reason: "model_mapping_mismatch",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("returns unavailable when every matching Codex account is paused", async () => {
+		const accounts = ["implicit-paused-one", "implicit-paused-two"].map((id) =>
+			makeAccount({
+				id,
+				provider: "codex",
+				paused: true,
+				model_mappings: JSON.stringify({ sonnet: rawModel }),
+			}),
+		);
+		const ctx = makeCtx({ accounts });
+
+		await expect(
+			selectAccountsForRequest(implicitMeta(), ctx, rawModel),
+		).rejects.toMatchObject({
+			name: "ForceRouteUnavailableError",
+			reason: "paused",
+		});
+	});
+
+	for (const kind of ["descendant", "helper", null] as const) {
+		it(`fails closed for ${kind ?? "missing"} lineage without ordinary fallback`, async () => {
+			const mapped = makeAccount({
+				id: `implicit-nonroot-${kind}`,
+				provider: "codex",
+				model_mappings: JSON.stringify({ opus: rawModel }),
+			});
+			const ctx = makeCtx({ accounts: [mapped, makeAccount()] });
+
+			await expect(
+				selectAccountsForRequest(
+					implicitMeta({
+						routeLineage: kind ? { kind, childHomeKey: null } : null,
+					}),
+					ctx,
+					rawModel,
+				),
+			).rejects.toMatchObject({
+				name: "ForceRouteUnavailableError",
+				reason: "model_mapping_mismatch",
+			});
+			expect(ctx.strategy.select).not.toHaveBeenCalled();
+			expect(ctx.dbOps.getComboRoutingPolicy).not.toHaveBeenCalled();
+		});
+	}
+
+	it("preserves the manual capability account set without implicit evidence requirements", async () => {
+		const mapped = makeAccount({
+			id: "implicit-comparison-mapped",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: rawModel }),
+		});
+		const unknown = makeAccount({
+			id: "implicit-comparison-unknown",
+			provider: "codex",
+		});
+		const accounts = [mapped, unknown];
+		const manualMeta = implicitMeta({
+			routeProfileId: "manual-physical-capability",
+			routeProfileSelection: "capability",
+		});
+
+		await expect(
+			selectAccountsForRequest(manualMeta, makeCtx({ accounts }), rawModel),
+		).resolves.toEqual(accounts);
+		await expect(
+			selectAccountsForRequest(implicitMeta(), makeCtx({ accounts }), rawModel),
+		).resolves.toEqual([mapped]);
+	});
+
+	it("revalidates custom strategy output against the proven account pool", async () => {
+		const mapped = makeAccount({
+			id: "implicit-strategy-mapped",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: rawModel }),
+		});
+		const unrelated = makeAccount({
+			id: "implicit-strategy-unproven",
+			provider: "codex",
+		});
+		const ctx = makeCtx({ accounts: [mapped, unrelated] });
+		ctx.strategy.select = mock(() => [unrelated, mapped]);
+
+		await expect(
+			selectAccountsForRequest(implicitMeta(), ctx, rawModel),
+		).resolves.toEqual([mapped]);
+	});
+
+	it("accepts a strategy's account clone when its physical-model evidence still holds", async () => {
+		const mapped = makeAccount({
+			id: "implicit-strategy-cloned",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: rawModel }),
+		});
+		const cloned = { ...mapped };
+		const ctx = makeCtx({ accounts: [mapped] });
+		ctx.strategy.select = mock(() => [cloned]);
+
+		const selected = await selectAccountsForRequest(
+			implicitMeta(),
+			ctx,
+			rawModel,
+		);
+
+		expect(selected).toEqual([cloned]);
+		expect(selected[0]).toBe(cloned);
+	});
+
+	it("rejects an account whose static evidence was removed during strategy selection", async () => {
+		const mapped = makeAccount({
+			id: "implicit-strategy-mutated",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: rawModel }),
+		});
+		const ctx = makeCtx({ accounts: [mapped] });
+		ctx.strategy.select = mock(() => {
+			mapped.model_mappings = null;
+			return [mapped];
+		});
+
+		await expect(
+			selectAccountsForRequest(implicitMeta(), ctx, rawModel),
+		).rejects.toMatchObject({ name: "ForceRouteUnavailableError" });
+	});
+});
+
 describe("selectAccountsForRequest — server-derived route profile", () => {
 	it("selects every currently eligible account in a capability pool", async () => {
 		const pausedPrimary = makeAccount({

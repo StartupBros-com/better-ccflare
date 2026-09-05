@@ -1,11 +1,15 @@
-import { describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { CLAUDE_MODEL_IDS } from "@better-ccflare/core";
+import { clearDerivedProviderModelDefaults } from "@better-ccflare/providers";
 import type {
 	Account,
 	ComboWithSlots,
 	RequestMeta,
 } from "@better-ccflare/types";
-import { clearCodexModelCacheForTests } from "../../codex-model-catalog";
+import {
+	clearCodexModelCacheForTests,
+	getCodexModels,
+} from "../../codex-model-catalog";
 import {
 	getComboSlotInfo,
 	selectAccountsForRequest,
@@ -91,9 +95,47 @@ const claudeAccount = makeAccount({ id: "claude-1", provider: "anthropic" });
 const codexAccount = makeAccount({ id: "codex-1", provider: "codex" });
 const deepseekAccount = makeAccount({ id: "deepseek-1", provider: "deepseek" });
 
+afterEach(() => {
+	clearCodexModelCacheForTests();
+	clearDerivedProviderModelDefaults();
+});
+
+async function primeCodexAccounts(accounts: Account[]): Promise<void> {
+	const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () =>
+		Response.json({
+			models: [{ slug: "gpt-5.6-sol", visibility: "list", priority: 1 }],
+		}),
+	);
+	try {
+		for (const account of accounts) {
+			await getCodexModels(account.id, {
+				dbOps: { getAccount: async () => account },
+				refreshInFlight: new Map(),
+			} as unknown as ProxyContext);
+		}
+	} finally {
+		fetchSpy.mockRestore();
+	}
+}
+
 describe("selectAccountsForRequest — force account model", () => {
+	it("fails closed for an unprimed Codex catalog even with a family mapping", async () => {
+		clearCodexModelCacheForTests();
+		const mapped = makeAccount({
+			id: "codex-unprimed-forced-model",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		const { ctx } = makeCtx({ accounts: [mapped], forceAccountModel: true });
+
+		await expect(
+			selectAccountsForRequest(makeRequestMeta(), ctx, "gpt-5.6-sol"),
+		).resolves.toEqual([]);
+	});
+
 	it("sends a provider model id only to accounts of that provider", async () => {
 		clearCodexModelCacheForTests();
+		await primeCodexAccounts([codexAccount]);
 		const { ctx } = makeCtx({
 			accounts: [claudeAccount, codexAccount],
 			forceAccountModel: true,
@@ -127,6 +169,7 @@ describe("selectAccountsForRequest — force account model", () => {
 	it("keeps every account that can serve the model, so failover still works", async () => {
 		clearCodexModelCacheForTests();
 		const second = makeAccount({ id: "codex-2", provider: "codex" });
+		await primeCodexAccounts([codexAccount, second]);
 		const { ctx } = makeCtx({
 			accounts: [codexAccount, second],
 			forceAccountModel: true,
@@ -229,6 +272,24 @@ describe("selectAccountsForRequest — force account model, forced-account heade
 		};
 	}
 
+	it("refuses a forced Codex account whose own catalog is unprimed", async () => {
+		clearCodexModelCacheForTests();
+		const other = makeAccount({ id: "codex-other-primed", provider: "codex" });
+		await primeCodexAccounts([other]);
+		const { ctx } = makeCtx({
+			accounts: [codexAccount, other],
+			forceAccountModel: true,
+		});
+
+		await expect(
+			selectAccountsForRequest(
+				metaForcing(codexAccount.id),
+				ctx,
+				"gpt-5.6-sol",
+			),
+		).resolves.toEqual([]);
+	});
+
 	it("refuses when the named account cannot serve the model as written", async () => {
 		clearCodexModelCacheForTests();
 		const { ctx } = makeCtx({
@@ -265,6 +326,7 @@ describe("selectAccountsForRequest — force account model, forced-account heade
 
 	it("still honours the header when the named account can serve the model", async () => {
 		clearCodexModelCacheForTests();
+		await primeCodexAccounts([codexAccount]);
 		const { ctx } = makeCtx({
 			accounts: [claudeAccount, codexAccount],
 			forceAccountModel: true,
