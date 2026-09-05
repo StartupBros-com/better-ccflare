@@ -20,6 +20,39 @@ const ANTHROPIC_MESSAGE_BODY = JSON.stringify({
 });
 
 describe("handleResponsesRequest", () => {
+	it.each([
+		"process-secret",
+		"",
+		undefined,
+	])("overwrites a client-supplied adapter marker with the process secret %s", async (internalProbeSecret) => {
+		const marker = "x-better-ccflare-responses-adapter-secret";
+		let forwardedHeaders: Headers | undefined;
+		const mockHandleProxy: HandleProxyFn = async (request) => {
+			forwardedHeaders = request.headers;
+			return new Response(ANTHROPIC_MESSAGE_BODY, {
+				headers: { "content-type": "application/json" },
+			});
+		};
+		const request = new Request("http://localhost/v1/responses", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				[marker]: "client-forgery",
+			},
+			body: JSON.stringify({ model: "gpt-6-astra", input: "hello" }),
+		});
+
+		const response = await handleResponsesRequest(
+			request,
+			new URL(request.url),
+			mockHandleProxy,
+			{ internalProbeSecret },
+		);
+
+		expect(response.status).toBe(200);
+		expect(forwardedHeaders?.get(marker)).toBe(internalProbeSecret ?? "");
+	});
+
 	test("Test 1: invalid request (no input field) → 400", async () => {
 		const mockHandleProxy: HandleProxyFn = async () =>
 			new Response("should not be called", { status: 200 });

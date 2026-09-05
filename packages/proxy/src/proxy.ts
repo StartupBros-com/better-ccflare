@@ -65,6 +65,10 @@ import {
 	isClaudeCodeSubagent,
 } from "./claude-code-request";
 import {
+	getCodexPassthroughPhysicalModel,
+	resolveImplicitCodexRoute,
+} from "./codex-implicit-route";
+import {
 	type AgentInterceptResult,
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
@@ -105,6 +109,7 @@ import {
 	getCapacityDeferredModelRoutes,
 	getClientVisibleServerToolAccountId,
 	getReactiveModelCapacityBlocker,
+	isCapabilityRouteSelection,
 	isComboSessionFallbackDisabled,
 	isForceAccountModelEnabled,
 } from "./handlers/account-selector";
@@ -118,6 +123,7 @@ import {
 	isAnthropicDegradedSendDenied,
 	type ProxyWithAccountResult,
 } from "./handlers/proxy-operations";
+import { isResponsesAdapterRequest } from "./handlers/proxy-types";
 import {
 	completeRateLimitProbe,
 	getRateLimitProbeAdmission,
@@ -170,7 +176,8 @@ function modelRouteUnavailableResponse(
 	reason:
 		| "unknown_profile"
 		| "unbound_child_profile"
-		| "conflicting_child_profile" = "unknown_profile",
+		| "conflicting_child_profile"
+		| "model_mapping_mismatch" = "unknown_profile",
 ): Response {
 	return new Response(
 		JSON.stringify({
@@ -1205,6 +1212,149 @@ async function handleProxyCoreImpl(
 			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
 		}
 	}
+	const getRoutingSelectionDiagnostics = (
+		zeroAttemptReason?: RoutingSelectionZeroAttemptReason,
+		fallbackStructuralCandidateCount = 0,
+	): RoutingSelectionDiagnostics => {
+		const existing = requestMeta.routingSelectionDiagnostics;
+		const structuralCandidateCount = Math.max(
+			existing?.structuralCandidateCount ?? 0,
+			requestMeta.routingCandidateCatalog?.length ?? 0,
+			requestMeta.routingCandidates?.length ?? 0,
+			fallbackStructuralCandidateCount,
+		);
+		const eligibleCandidateCount = Math.min(
+			structuralCandidateCount,
+			existing?.eligibleCandidateCount ??
+				requestMeta.routingCandidates?.length ??
+				0,
+		);
+		const excludedCandidateCount = Math.max(
+			0,
+			structuralCandidateCount - eligibleCandidateCount,
+		);
+		// A zero eligible count alone is not proof that the implicit policy
+		// excluded every candidate: all structurally known accounts may simply be
+		// paused, rate-limited, or capacity-blocked. The selector publishes an
+		// exact `policy_excluded` reason only when its policy filter observed that
+		// transition; otherwise classify conservatively as unavailable.
+		const inferredZeroAttemptReason =
+			structuralCandidateCount > 0
+				? "all_unavailable"
+				: "no_eligible_candidates";
+		const forcedRoute =
+			requestMeta.forcedAccountId != null ||
+			requestMeta.headers?.has("x-better-ccflare-account-id") === true;
+		return {
+			mode: existing?.mode ?? ctx.implicitFallbackPolicy?.mode ?? "off",
+			structuralCandidateCount,
+			eligibleCandidateCount,
+			excludedCandidateCount:
+				existing?.excludedCandidateCount ?? excludedCandidateCount,
+			selectedCandidateCount: existing?.selectedCandidateCount ?? 0,
+			zeroAttemptReason:
+				zeroAttemptReason ??
+				existing?.zeroAttemptReason ??
+				inferredZeroAttemptReason,
+			forcedRoute: existing?.forcedRoute ?? forcedRoute,
+			capabilityProfile:
+				existing?.capabilityProfile ??
+				isCapabilityRouteSelection(requestMeta.routeProfileSelection),
+			routeProfile:
+				existing?.routeProfile ?? requestMeta.routeProfileId != null,
+		};
+	};
+	const accountSelectionTimeoutResponse = (
+		pacingSlot: Parameters<typeof finishPacing>[0],
+	): Response => {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+		const routingSelectionDiagnostics =
+			getRoutingSelectionDiagnostics("selection_timeout");
+		logRoutingSelectionDiagnostics(routingSelectionDiagnostics);
+		const terminal = createRoutingTerminalResponse({
+			source: "selection",
+			accounts: [],
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 0,
+			routingSelectionDiagnostics,
+			hostedDispatchState: routingAttemptLedger.hostedDispatchState,
+		});
+		// A phase timeout is transient incomplete evidence, so keep the canonical
+		// route_unavailable body while explicitly inviting a bounded client retry.
+		terminal.response.headers.set("retry-after", "1");
+		return finishPacing(pacingSlot, terminal.response);
+	};
+	let implicitAccountSelectionBudgetMs: number | undefined;
+	let implicitRouteAccounts: Account[] | undefined;
+	const codexPhysicalModel = getCodexPassthroughPhysicalModel(
+		finalRequestBodyContext.getParsedJson(),
+	);
+	if (
+		modelRouteResolution?.kind !== "route" &&
+		isResponsesAdapterRequest(req.headers, ctx) &&
+		codexPhysicalModel !== null &&
+		(ctx.config.getCodexImplicitRouteEnabled?.() ??
+			process.env.CCFLARE_CODEX_IMPLICIT_ROUTE !== "0")
+	) {
+		if (requestMeta.routeLineage?.kind !== "root") {
+			return modelRouteUnavailableResponse(
+				codexPhysicalModel,
+				"model_mapping_mismatch",
+			);
+		}
+		const implicitAccountSelectionDeadlineAt =
+			Date.now() + preTransportDeadlines.accountSelectionTimeoutMs;
+		let implicitRoute: Awaited<ReturnType<typeof resolveImplicitCodexRoute>>;
+		try {
+			implicitRoute = await runWithPreTransportDeadline({
+				phase: "account_selection",
+				timeoutMs: preTransportDeadlines.accountSelectionTimeoutMs,
+				signal: routingSignal,
+				operation: async () => {
+					implicitRouteAccounts = await ctx.dbOps.getAllAccounts();
+					return resolveImplicitCodexRoute(
+						finalRequestBodyContext.getParsedJson(),
+						implicitRouteAccounts,
+						{
+							ctx,
+							deadlineAt: implicitAccountSelectionDeadlineAt,
+							signal: routingSignal,
+						},
+					);
+				},
+			});
+		} catch (error) {
+			if (!(error instanceof PreTransportPhaseTimeoutError)) throw error;
+			return accountSelectionTimeoutResponse(null);
+		}
+		// The resolver can exhaust its own deadline before the outer timer fires.
+		if (Date.now() >= implicitAccountSelectionDeadlineAt) {
+			return accountSelectionTimeoutResponse(null);
+		}
+		if (implicitRoute === null) {
+			return modelRouteUnavailableResponse(
+				codexPhysicalModel,
+				"model_mapping_mismatch",
+			);
+		}
+		// Catalog discovery and selection share one budget. Deliberate cache
+		// pacing between these phases does not spend account-selection time.
+		implicitAccountSelectionBudgetMs =
+			implicitAccountSelectionDeadlineAt - Date.now();
+		const { id } = implicitRoute;
+		requestMeta.routeProfileId = `implicit-codex:${id}`;
+		requestMeta.routeProfileSelection = "implicit-codex";
+		requestMeta.routeProfileLogicalModel = id;
+		requestMeta.routeProfileExpectedPhysicalModel = id;
+		requestMeta.routeExpectedProvider = "codex";
+		requestMeta.forcedAccountId = null;
+		finalRequestBodyContext.setModel(id);
+		finalBodyBuffer = finalRequestBodyContext.getBuffer();
+		appliedModel = id;
+		requestMeta.routeExpectedPhysicalModel = id;
+	}
 	if (
 		url.pathname === "/v1/messages" &&
 		modelRouteResolution?.kind === "route" &&
@@ -1444,10 +1594,22 @@ async function handleProxyCoreImpl(
 	const syntheticProbe = trustedInternalKeepalive;
 	const selectAccountsWithDeadline = (
 		options?: Parameters<typeof selectAccountsForRequest>[3],
-	) =>
-		runWithPreTransportDeadline({
+	) => {
+		const timeoutMs =
+			implicitAccountSelectionBudgetMs ??
+			preTransportDeadlines.accountSelectionTimeoutMs;
+		if (timeoutMs <= 0) {
+			return Promise.reject(
+				new PreTransportPhaseTimeoutError(
+					"account_selection",
+					preTransportDeadlines.accountSelectionTimeoutMs,
+				),
+			);
+		}
+		const startedAt = Date.now();
+		return runWithPreTransportDeadline({
 			phase: "account_selection",
-			timeoutMs: preTransportDeadlines.accountSelectionTimeoutMs,
+			timeoutMs,
 			signal: routingSignal,
 			operation: () =>
 				selectAccountsForRequest(
@@ -1456,62 +1618,16 @@ async function handleProxyCoreImpl(
 					effectiveModel ?? undefined,
 					{
 						...options,
+						preloadedAccounts: implicitRouteAccounts,
 						syntheticProbe,
 						degradedOwner: degradedOwnerSelection,
 					},
 				),
+		}).finally(() => {
+			if (implicitAccountSelectionBudgetMs !== undefined) {
+				implicitAccountSelectionBudgetMs -= Date.now() - startedAt;
+			}
 		});
-	const getRoutingSelectionDiagnostics = (
-		zeroAttemptReason?: RoutingSelectionZeroAttemptReason,
-		fallbackStructuralCandidateCount = 0,
-	): RoutingSelectionDiagnostics => {
-		const existing = requestMeta.routingSelectionDiagnostics;
-		const structuralCandidateCount = Math.max(
-			existing?.structuralCandidateCount ?? 0,
-			requestMeta.routingCandidateCatalog?.length ?? 0,
-			requestMeta.routingCandidates?.length ?? 0,
-			fallbackStructuralCandidateCount,
-		);
-		const eligibleCandidateCount = Math.min(
-			structuralCandidateCount,
-			existing?.eligibleCandidateCount ??
-				requestMeta.routingCandidates?.length ??
-				0,
-		);
-		const excludedCandidateCount = Math.max(
-			0,
-			structuralCandidateCount - eligibleCandidateCount,
-		);
-		// A zero eligible count alone is not proof that the implicit policy
-		// excluded every candidate: all structurally known accounts may simply be
-		// paused, rate-limited, or capacity-blocked. The selector publishes an
-		// exact `policy_excluded` reason only when its policy filter observed that
-		// transition; otherwise classify conservatively as unavailable.
-		const inferredZeroAttemptReason =
-			structuralCandidateCount > 0
-				? "all_unavailable"
-				: "no_eligible_candidates";
-		const forcedRoute =
-			requestMeta.forcedAccountId != null ||
-			requestMeta.headers?.has("x-better-ccflare-account-id") === true;
-		return {
-			mode: existing?.mode ?? ctx.implicitFallbackPolicy?.mode ?? "off",
-			structuralCandidateCount,
-			eligibleCandidateCount,
-			excludedCandidateCount:
-				existing?.excludedCandidateCount ?? excludedCandidateCount,
-			selectedCandidateCount: existing?.selectedCandidateCount ?? 0,
-			zeroAttemptReason:
-				zeroAttemptReason ??
-				existing?.zeroAttemptReason ??
-				inferredZeroAttemptReason,
-			forcedRoute: existing?.forcedRoute ?? forcedRoute,
-			capabilityProfile:
-				existing?.capabilityProfile ??
-				requestMeta.routeProfileSelection === "capability",
-			routeProfile:
-				existing?.routeProfile ?? requestMeta.routeProfileId != null,
-		};
 	};
 	const getRouteCircuitRecoveryHint = () => {
 		try {
@@ -1520,28 +1636,6 @@ async function handleProxyCoreImpl(
 			log.warn("Failed to read optional route-circuit recovery hint", error);
 			return null;
 		}
-	};
-	const accountSelectionTimeoutResponse = (
-		pacingSlot: Parameters<typeof finishPacing>[0],
-	): Response => {
-		cacheBodyStore.discardStaged(requestMeta.id);
-		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
-		const routingSelectionDiagnostics =
-			getRoutingSelectionDiagnostics("selection_timeout");
-		logRoutingSelectionDiagnostics(routingSelectionDiagnostics);
-		const terminal = createRoutingTerminalResponse({
-			source: "selection",
-			accounts: [],
-			capacityContext: null,
-			rateLimitOutcomes: [],
-			upstreamAttempts: 0,
-			routingSelectionDiagnostics,
-			hostedDispatchState: routingAttemptLedger.hostedDispatchState,
-		});
-		// A phase timeout is transient incomplete evidence, so keep the canonical
-		// route_unavailable body while explicitly inviting a bounded client retry.
-		terminal.response.headers.set("retry-after", "1");
-		return finishPacing(pacingSlot, terminal.response);
 	};
 	let pacingObservation: CachePacingObservation | null = null;
 	const observeAndRecordPacing =

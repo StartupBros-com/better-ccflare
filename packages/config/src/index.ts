@@ -845,6 +845,9 @@ export type ProviderModelDefaultOverrides = Record<
 export const PROVIDER_MODEL_DEFAULTS_ENV_VAR =
 	"CCFLARE_MODEL_DEFAULTS_PROVIDERS";
 
+/** Literal "0" disables request-time physical Codex model admission. */
+export const CODEX_IMPLICIT_ROUTE_ENV_VAR = "CCFLARE_CODEX_IMPLICIT_ROUTE";
+
 const _DEFAULT_PROVIDER_MODEL_DEFAULTS_PROVIDERS: readonly string[] = ["codex"];
 
 /**
@@ -1382,6 +1385,10 @@ export class Config extends EventEmitter {
 		return providers.length > 0
 			? providers
 			: [..._DEFAULT_PROVIDER_MODEL_DEFAULTS_PROVIDERS];
+	}
+
+	getCodexImplicitRouteEnabled(): boolean {
+		return process.env[CODEX_IMPLICIT_ROUTE_ENV_VAR] !== "0";
 	}
 
 	getOutboundProxy(): string | undefined {

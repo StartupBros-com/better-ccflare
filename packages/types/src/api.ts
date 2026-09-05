@@ -198,10 +198,10 @@ export interface RequestMeta {
 	routeHomeReplacementAllowed?: boolean;
 	/** Why an established descendant home was replaced, if one was replaced. */
 	routeRepinReason?: RouteRepinReason | null;
-	/** Restart-scoped model route profile that produced the server-derived route. */
+	/** Configured profile or request-time implicit route that produced the server-derived route. */
 	routeProfileId?: string | null;
-	/** Selection mode of the route profile; capability profiles use a live account pool. */
-	routeProfileSelection?: "capability" | null;
+	/** Selection mode of the route; capability and implicit Codex routes use a live account pool. */
+	routeProfileSelection?: "capability" | "implicit-codex" | null;
 	/** Logical model that defines a capability profile's root capability predicate. */
 	routeProfileLogicalModel?: string | null;
 	/** Physical model required by the capability profile's root predicate. */

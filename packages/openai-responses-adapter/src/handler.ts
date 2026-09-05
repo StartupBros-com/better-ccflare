@@ -29,6 +29,11 @@ import type { HandleProxyFn, ResponseItem, ResponsesRequest } from "./types";
 
 const log = new Logger("openai-responses-adapter");
 
+// Mirrors packages/proxy/src/handlers/proxy-types.ts to avoid an adapter ->
+// proxy dependency. Keep the dedicated header value in sync with that constant.
+const RESPONSES_ADAPTER_SECRET_HEADER =
+	"x-better-ccflare-responses-adapter-secret";
+
 const TERMINAL_RESPONSE_EVENT_TYPES = new Set([
 	"response.completed",
 	"response.incomplete",
@@ -523,6 +528,16 @@ export async function handleResponsesRequest(
 	// claude-oauth accounts use Claude's OAuth tokens — Anthropic bans them
 	// when used outside Claude CLI. Always exclude from Codex CLI traffic.
 	syntheticHeaders.set("x-better-ccflare-exclude-providers", "anthropic-oauth");
+	const adapterSecret =
+		typeof ctx === "object" &&
+		ctx !== null &&
+		"internalProbeSecret" in ctx &&
+		typeof ctx.internalProbeSecret === "string"
+			? ctx.internalProbeSecret
+			: "";
+	// Always overwrite the copied client header, including when no process
+	// secret is available: client input can never authenticate the carrier.
+	syntheticHeaders.set(RESPONSES_ADAPTER_SECRET_HEADER, adapterSecret);
 	const syntheticReq = new Request(messagesUrl.toString(), {
 		method: "POST",
 		headers: syntheticHeaders,

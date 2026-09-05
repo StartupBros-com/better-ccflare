@@ -13,7 +13,11 @@ import { registerResponseDrainTransport } from "@better-ccflare/providers/stream
 import type { RequestMeta } from "@better-ccflare/types";
 import { chatGptCloudflareCookieJar } from "../chatgpt-cloudflare-cookies";
 import type { GuardCorrelationVerifier } from "./guard-correlation-auth";
-import { ERROR_MESSAGES, INTERNAL_PROBE_SECRET_HEADER } from "./proxy-types";
+import {
+	ERROR_MESSAGES,
+	INTERNAL_PROBE_SECRET_HEADER,
+	RESPONSES_ADAPTER_SECRET_HEADER,
+} from "./proxy-types";
 
 /**
  * Internal proxy control headers that must NEVER be forwarded to the upstream
@@ -23,6 +27,7 @@ import { ERROR_MESSAGES, INTERNAL_PROBE_SECRET_HEADER } from "./proxy-types";
  */
 function stripInternalControlHeaders(headers: Headers): void {
 	headers.delete(INTERNAL_PROBE_SECRET_HEADER);
+	headers.delete(RESPONSES_ADAPTER_SECRET_HEADER);
 	headers.delete("x-better-ccflare-auto-refresh");
 	headers.delete("x-better-ccflare-keepalive");
 	headers.delete(GUARD_REQUEST_ID_HEADER);

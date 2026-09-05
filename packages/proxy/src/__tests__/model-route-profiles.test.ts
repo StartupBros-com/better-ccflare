@@ -68,6 +68,32 @@ function resolveRequest(
 }
 
 describe("parseModelRouteProfiles", () => {
+	it("rejects the reserved implicit-codex namespace with a specific error", () => {
+		const base = JSON.parse(PROFILE_JSON)[0];
+		for (const id of [
+			"implicit-codex:gpt-6-codex",
+			" implicit-codex:codex-auto-review ",
+			`implicit-codex:${"long-model-".repeat(8)}`,
+		]) {
+			expect(() =>
+				parseModelRouteProfiles(JSON.stringify([{ ...base, id }])),
+			).toThrow(
+				"id namespace implicit-codex: is reserved for request-time Codex routing",
+			);
+		}
+	});
+
+	it("allows codex-auto-review as an ordinary operator profile slug", () => {
+		const base = JSON.parse(PROFILE_JSON)[0];
+		const [configured] = parseModelRouteProfiles(
+			JSON.stringify([{ ...base, id: "codex-auto-review" }]),
+		);
+		expect(configured?.id).toBe("codex-auto-review");
+		expect(configured?.publicModelId).toBe(
+			"claude-bccf-route-codex-auto-review",
+		);
+	});
+
 	it("returns no profiles for absent or blank configuration", () => {
 		expect(parseModelRouteProfiles()).toEqual([]);
 		expect(parseModelRouteProfiles("   ")).toEqual([]);
