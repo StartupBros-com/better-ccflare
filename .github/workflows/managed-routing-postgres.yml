@@ -36,103 +36,17 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          # Tracks the current Bun release. This gate was pinned to 1.3.14 while
-          # Bun 1.4.0's spec-conformant stream cancel ordering and Node-parity
-          # node:net socket semantics broke three pre-existing suites (#231);
-          # the suites now hold on both 1.3.14 and 1.4.0, so the pin is gone.
-          bun-version: latest
+          # Exact version from .bun-version, the single source of truth for every
+          # workflow that installs Bun. `latest` moved underneath this gate once
+          # (#231/#232) and the unpin in #319 reopened that exposure (#321): the
+          # Bun Latest Canary workflow runs these same steps on `latest` and files
+          # an issue on drift, so a bump is a deliberate edit to .bun-version
+          # (procedure: docs/contributing.md, "Bumping the Bun toolchain").
+          bun-version-file: .bun-version
 
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+      - name: Verify the installed Bun matches .bun-version
+        # setup-bun only warns and falls back to `latest` if the file is missing.
+        run: test "$(bun --version)" = "$(tr -d '[:space:]' < .bun-version)"
 
-      - name: Build CLI generated modules
-        run: bun run build:cli
-
-      - name: Build dashboard generated modules
-        run: bun run build:dashboard
-
-      - name: Run focused managed-routing database tests
-        run: >-
-          bun test
-          packages/database/src/__tests__/managed-routing-migrations.test.ts
-          packages/database/src/adapters/__tests__/bun-sql-adapter-batch.test.ts
-          packages/database/src/repositories/__tests__/combo-managed-policy.test.ts
-          packages/database/src/repositories/__tests__/combo-priority.test.ts
-
-      - name: Run must-run PostgreSQL migration tests
-        env:
-          # This is the disposable loopback service above. The test name is part
-          # of the guard contract; do not replace with an ambient DATABASE_URL.
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/better_ccflare_test
-          CCFLARE_REQUIRE_LIVE_PG_MIGRATIONS: "true"
-        run: |
-          test "${DATABASE_URL#*://*:*@}" = "localhost:5432/better_ccflare_test"
-          bun test --timeout 15000 packages/database/src/migrations-pg.test.ts
-
-      - name: Run focused PostgreSQL integration tests
-        env:
-          BETTER_CCFLARE_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/better_ccflare_test
-        run: >-
-          bun test
-          packages/database/src/__tests__/managed-routing-postgres.integration.test.ts
-          packages/database/src/repositories/__tests__/server-tool-replay-issuance.repository.test.ts
-          packages/http-api/src/__tests__/pg-live-queries.test.ts
-
-      - name: Run full test suite
-        run: |
-          for root in apps packages scripts tests; do
-            if [[ ! -d "$root" ]]; then
-              echo "::error::Test root is missing: $root"
-              exit 1
-            fi
-          done
-
-          # pg-live-queries.test.ts already ran above against a live database
-          # (its live block is gated on BETTER_CCFLARE_TEST_POSTGRES_URL /
-          # DATABASE_URL and fails loudly in CI if neither is set — see the
-          # file's own guard). Excluded here so it isn't also run a second
-          # time in this loop's bare env, where it would have neither var and
-          # correctly abort the whole step.
-          mapfile -d '' -t test_files < <(
-            find apps packages scripts tests -type f \
-              \( -name '*.test.ts' -o -name '*.test.tsx' -o -name '*.spec.ts' -o -name '*.spec.tsx' \) \
-              -not -path '*/http-api/src/__tests__/pg-live-queries.test.ts' \
-              -print0 | LC_ALL=C sort -z
-          )
-
-          if (( ${#test_files[@]} == 0 )); then
-            echo "::error::No test files found"
-            exit 1
-          fi
-
-          echo "Running ${#test_files[@]} test files in isolated Bun processes"
-          failures=()
-          for test_file in "${test_files[@]}"; do
-            printf '\n==> %s\n' "$test_file"
-            if ! bun test --timeout 15000 "$test_file"; then
-              failures+=("$test_file")
-            fi
-          done
-
-          if (( ${#failures[@]} > 0 )); then
-            printf '\n::error::%d isolated test file(s) failed\n' "${#failures[@]}"
-            printf '  %q\n' "${failures[@]}"
-            exit 1
-          fi
-
-          printf '\nAll %d isolated test files passed\n' "${#test_files[@]}"
-
-      - name: Run lint
-        run: bun run lint
-
-      - name: Run typecheck
-        run: bun run typecheck
-
-      - name: Run format
-        run: bun run format
-
-      - name: Verify lint and format left the checkout clean
-        run: |
-          git diff --check
-          git diff --exit-code
-          test -z "$(git status --porcelain)"
+      - name: Run the managed-routing gate
+        uses: ./.github/actions/managed-routing-gate

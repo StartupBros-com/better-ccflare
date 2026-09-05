@@ -1,0 +1,109 @@
+name: Bun Latest Canary
+
+# Non-blocking drift detector for the Bun toolchain (#321). The merge gate
+# (managed-routing-postgres.yml) and every release/signing workflow install the
+# exact version in .bun-version. This workflow runs the gate's own steps
+# (.github/actions/managed-routing-gate) on Bun `latest` -- or a dispatch-
+# supplied candidate -- and, when that version differs from the pin, reports the
+# verdict through scripts/bun-latest-canary-report.sh: a failing gate files or
+# updates one tracking issue, a passing gate leaves a note. It has no
+# pull_request trigger, so it can never block a merge, and it never edits
+# .bun-version: an upgrade is a deliberate one-line change with this evidence
+# in hand (procedure: docs/contributing.md, "Bumping the Bun toolchain").
+
+on:
+  schedule:
+    # Daily, off the top of the hour.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      bun-version:
+        description: Bun version to canary (latest, canary, 1.5.x, or an exact version)
+        required: false
+        default: latest
+      run-when-pinned:
+        description: Run the gate even when the resolved version equals .bun-version
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches:
+      - main
+    paths:
+      - .bun-version
+      - .github/workflows/bun-latest-canary.yml
+      - .github/actions/managed-routing-gate/action.yml
+      - scripts/bun-latest-canary-report.sh
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: bun-latest-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: better_ccflare_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d better_ccflare_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Bun (latest or the dispatched candidate)
+        id: bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          # The only place in this repository where a Bun version may float.
+          bun-version: ${{ inputs.bun-version || 'latest' }}
+
+      - name: Compare the resolved Bun with .bun-version
+        id: drift
+        env:
+          RUN_WHEN_PINNED: ${{ inputs.run-when-pinned }}
+        run: |
+          pinned="$(tr -d '[:space:]' < .bun-version)"
+          resolved="$(bun --version)"
+          {
+            echo "pinned=${pinned}"
+            echo "resolved=${resolved}"
+          } >> "$GITHUB_OUTPUT"
+          if [[ "${resolved}" == "${pinned}" && "${RUN_WHEN_PINNED}" != "true" ]]; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Bun ${resolved} is already the pinned version in .bun-version; nothing to canary."
+          else
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Running the managed-routing gate on Bun ${resolved} (pinned: ${pinned})."
+          fi
+
+      - name: Run the managed-routing gate on the resolved Bun
+        id: gate
+        if: steps.drift.outputs.drift == 'true'
+        uses: ./.github/actions/managed-routing-gate
+
+      - name: Report the verdict
+        if: ${{ !cancelled() && steps.drift.outputs.drift == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANARY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CANARY_RESOLVED_BUN: ${{ steps.drift.outputs.resolved }}
+          CANARY_PINNED_BUN: ${{ steps.drift.outputs.pinned }}
+          CANARY_GATE_OUTCOME: ${{ steps.gate.outcome }}
+          CANARY_REQUESTED_BUN: ${{ inputs.bun-version || 'latest' }}
+        run: bash scripts/bun-latest-canary-report.sh

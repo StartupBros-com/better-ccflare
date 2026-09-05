@@ -23,8 +23,12 @@ jobs:
           # Workflows that build/sign/publish release artifacts must never be
           # auto-rerun: a rerun could re-trigger a duplicate publish/release
           # or re-run untrusted signing steps without human review.
+          # The Bun Latest Canary is excluded too: a scheduled toolchain verdict
+          # does not change on rerun, its report is deduplicated per version,
+          # and each rerun costs a full gate run.
           EXCLUDED_WORKFLOWS=(
             "Build and Publish Docker Images"
+            "Bun Latest Canary"
             "Manual Release"
             "Release Multi-Architecture Binaries"
             "SignPath Test Signing"

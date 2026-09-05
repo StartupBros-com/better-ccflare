@@ -126,6 +126,12 @@ affected suites, including any gated behind `DATABASE_URL`. Details:
 
 `docs/solutions/` is the searchable store for documented bugs, practices, and workflow patterns, organized by category and YAML frontmatter (`module`, `tags`, `problem_type`); `CONCEPTS.md` defines shared domain vocabulary. Both are relevant when implementing or debugging in documented areas.
 
+## CI Bun Toolchain
+`.bun-version` is the single source of truth every workflow reads via `bun-version-file`; never set
+`bun-version: latest` on the gate or a release/signing workflow. Drift is detected by the
+non-blocking "Bun Latest Canary" workflow, which files a `bug` issue instead of breaking merges.
+Bump procedure lives in `docs/contributing.md` ("Bumping the Bun toolchain").
+
 ## Git Commits
 - **Before making any changes, run `git status` to check for pre-existing uncommitted changes.** Note which files were already modified so you can distinguish your changes from theirs throughout the session.
 - Use `git add <specific-files>` (not `git add .`) to avoid committing inline-worker.ts

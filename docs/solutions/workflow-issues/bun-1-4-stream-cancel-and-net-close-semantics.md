@@ -7,7 +7,7 @@ problem_type: workflow_issue
 component: testing_framework
 severity: high
 applies_when:
-  - Bumping the Bun version the CI gate runs on (`bun-version:` in `.github/workflows/managed-routing-postgres.yml`)
+  - Bumping the Bun version CI runs on (`.bun-version`, read by every workflow via `bun-version-file`)
   - Asserting that an upstream `ReadableStream` cancel hook ran after cancelling a stream that goes through `pipeThrough` / `TransformStream` / `tee`
   - Spying on a `Response.body` instance captured before `response.clone()`
   - Writing a `node:net` server fixture whose teardown awaits `server.close()`
@@ -135,7 +135,9 @@ the repo reported ~1,600 failures under 1.4.0 that are batch-only `mock.module` 
 gate runs each file in its own process; mirror that (`for f in ...; bun test --timeout 15000 "$f"`)
 to get the real breakage list, then re-run each failure alone under both versions to separate
 deterministic regressions from load flakes (`incremental-vacuum-adaptive` needs ~16s per test
-on a loaded WSL2 box against a 15s timeout on either version).
+on a loaded WSL2 box against a 15s timeout on either version). In CI, dispatch the Bun Latest
+Canary with the candidate first (`gh workflow run bun-latest-canary.yml -f bun-version=<v>`); it
+runs this same per-file loop through the gate's composite action.
 
 ## Verification
 
