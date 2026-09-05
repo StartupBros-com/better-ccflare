@@ -187,6 +187,9 @@ export function familyPolicyMutationErrorMessage(
 ): string | null {
 	if (!error || mutationFamily !== family) return null;
 	const failure = managedFamilyConversionError(error);
+	if (failure?.code === "native_quota_invalid_route") {
+		return "Native quota wait was not enabled. Use native Anthropic subscription accounts with a primary family lane; Fable's optional Opus backups must use the same account pool after all primary tiers.";
+	}
 	if (
 		failure?.code === "managed_route_empty" ||
 		failure?.code === "stale_routing_preview"
@@ -559,6 +562,44 @@ export function FamilyActivationSection() {
 										</div>
 									</div>
 
+									<div className="space-y-1 border-t pt-3">
+										<div className="flex items-center gap-3">
+											<Switch
+												id={`${family}-exhaustion-policy`}
+												aria-label={`${FAMILY_LABELS[family]} exhaustion policy`}
+												checked={
+													assignment?.exhaustion_policy === "native_quota_wait"
+												}
+												disabled={familyPolicyWritePending || !activeComboId}
+												onCheckedChange={(checked) => {
+													void runSerializedFamilyPolicyUpdate(
+														familyPolicyWriteLock,
+														family,
+														{
+															family,
+															exhaustionPolicy: checked
+																? "native_quota_wait"
+																: "legacy",
+														},
+														updateFamilyPolicy.mutateAsync,
+														setPolicyMutationFamily,
+													);
+												}}
+											/>
+											<Label htmlFor={`${family}-exhaustion-policy`}>
+												Wait for native Claude quota
+											</Label>
+										</div>
+										<p className="text-xs text-muted-foreground">
+											Keep retries on this native Anthropic subscription combo.
+											Shared quota caps wait for reset.
+											{family === "fable"
+												? " Try usable Fable accounts first. Each Opus backup requires confirmed Fable exhaustion on its own account in the same account pool."
+												: " Only this Claude family is allowed in the account pool."}{" "}
+											Requires native destinations; legacy fallback behavior
+											applies when off.
+										</p>
+									</div>
 									{!managedAvailable && (
 										<p className="text-xs text-muted-foreground">
 											Enable this family and select an active combo before

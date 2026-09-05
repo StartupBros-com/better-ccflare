@@ -32,6 +32,7 @@ describe("ComboRepository priority tiers", () => {
 				combo_id TEXT,
 				enabled INTEGER NOT NULL,
 				membership_mode TEXT NOT NULL DEFAULT 'manual',
+				exhaustion_policy TEXT NOT NULL DEFAULT 'legacy',
 				managed_model TEXT
 			);
 		`);

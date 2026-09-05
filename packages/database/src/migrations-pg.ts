@@ -23,7 +23,7 @@ async function columnExists(
 	const result = await adapter.get<{ exists: number }>(
 		`SELECT COUNT(*) as exists
 		 FROM information_schema.columns
-		 WHERE table_name = ? AND column_name = ?`,
+		 WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
 		[table, column],
 	);
 	return (result?.exists ?? 0) > 0;
@@ -39,7 +39,7 @@ async function _tableExists(
 	const result = await adapter.get<{ exists: number }>(
 		`SELECT COUNT(*) as exists
 		 FROM information_schema.tables
-		 WHERE table_name = ?`,
+		 WHERE table_schema = current_schema() AND table_name = ?`,
 		[table],
 	);
 	return (result?.exists ?? 0) > 0;
@@ -450,7 +450,7 @@ async function columnDataType(
 	const result = await adapter.get<{ data_type: string }>(
 		`SELECT data_type
 		 FROM information_schema.columns
-		 WHERE table_name = ? AND column_name = ?`,
+		 WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
 		[table, column],
 	);
 	return result?.data_type ?? null;
@@ -753,6 +753,8 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			membership_mode TEXT NOT NULL DEFAULT 'manual'
 				CHECK (membership_mode IN ('manual', 'managed')),
 			managed_model TEXT DEFAULT NULL,
+			exhaustion_policy TEXT NOT NULL DEFAULT 'legacy'
+				CHECK (exhaustion_policy IN ('legacy', 'native_quota_wait')),
 			FOREIGN KEY (combo_id) REFERENCES combos(id) ON DELETE SET NULL
 		)
 	`);
@@ -1481,6 +1483,12 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 	// Add columns that might be missing from older schema versions
 	const columnsToAdd: ColumnToAdd[] = [
 		{
+			table: "combo_family_assignments",
+			column: "exhaustion_policy",
+			definition:
+				"ALTER TABLE combo_family_assignments ADD COLUMN exhaustion_policy TEXT NOT NULL DEFAULT 'legacy' CHECK (exhaustion_policy IN ('legacy', 'native_quota_wait'))",
+		},
+		{
 			table: "usage_snapshots",
 			column: "active",
 			definition:
@@ -2048,6 +2056,8 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			membership_mode TEXT NOT NULL DEFAULT 'manual'
 				CHECK (membership_mode IN ('manual', 'managed')),
 			managed_model TEXT DEFAULT NULL,
+			exhaustion_policy TEXT NOT NULL DEFAULT 'legacy'
+				CHECK (exhaustion_policy IN ('legacy', 'native_quota_wait')),
 			FOREIGN KEY (combo_id) REFERENCES combos(id) ON DELETE SET NULL
 		)
 	`);

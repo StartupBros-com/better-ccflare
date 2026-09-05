@@ -19,6 +19,7 @@ Combo routing is controlled by the config-file-only `combos_enabled` switch. It 
 11. [Management API](#management-api)
 12. [Controlled rollout](#controlled-rollout)
 13. [Upgrade and troubleshooting notes](#upgrade-and-troubleshooting-notes)
+14. [Native subscription quota waiting](#native-subscription-quota-waiting)
 
 ## Families and concepts
 
@@ -37,7 +38,7 @@ The main persisted objects are:
 
 - **Combo**: a named route shared by one or more family assignments.
 - **Manual slot**: an explicit account, logical model, and priority tier inside a combo.
-- **Family policy**: the assigned combo, enabled state, `membership_mode`, and family-compatible `managed_model`.
+- **Family policy**: the assigned combo, enabled state, `membership_mode`, family-compatible `managed_model`, and `exhaustion_policy`.
 - **Enrollment rule**: a Managed selector over provider plus route class.
 - **Exclusion**: an account-specific opt-out from a Managed family route.
 - **Effective member**: a server-resolved candidate admitted to the route, with source, model, tier, reason, and a separate availability state.
@@ -105,7 +106,7 @@ Membership describes who belongs to a route. Availability describes who can serv
 
 Pausing, cooldown, rate limiting, model exhaustion, or a reauthentication requirement makes an effective member temporarily unavailable; it does not delete its slot, enrollment rule, or exclusion and does not churn Managed membership. The router skips the unavailable member and tries the next eligible candidate. After reauthentication or reset, the same member can serve again without re-enrollment.
 
-If every effective combo candidate is unavailable or fails, the existing combo-to-session fallback path continues to handle the request as before.
+With the default `exhaustion_policy: "legacy"`, an exhausted combo continues to use the existing combo-to-session fallback setting. An opted-in native subscription route keeps the request inside its configured pool; see [Native subscription quota waiting](#native-subscription-quota-waiting).
 
 Removing an account is different: deletion removes the account and cascades its account-specific exclusions.
 
@@ -227,7 +228,7 @@ All routes operate on the running server and return secret-free routing views. E
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/families` | Read family assignments and modes |
-| `PUT` | `/api/families/:family` | Partially update assignment, enabled state, mode, or Managed model |
+| `PUT` | `/api/families/:family` | Partially update assignment, enabled state, mode, Managed model, or exhaustion policy |
 | `GET` | `/api/routing/effective` | Read all authoritative effective family routes |
 | `GET` | `/api/routing/effective/:family` | Read one authoritative effective route |
 | `GET` | `/api/routing/accounts` | Read one coherent, name-free account-routing overview plus opportunities |
@@ -332,3 +333,60 @@ Enable the next family only after the first family meets that evidence threshold
 - A stale preview must be regenerated rather than force-applied.
 
 For general account priority and server operation commands, see [CLI documentation](cli.md).
+
+## Native subscription quota waiting
+
+`exhaustion_policy` belongs to a **family assignment**, with allowed values `legacy` and `native_quota_wait`. New and upgraded installations default to `legacy`; a missing field has the same meaning. Only an enabled family assignment with an enabled combo, global combos enabled, and explicit `native_quota_wait` opt-in uses this policy. Other families and explicit force-account or route-profile requests keep their existing routing behavior.
+
+The policy supports native Anthropic subscription accounts with native Claude physical destinations. Its primary family lane must contain at least one configured account. Fable can have configured Opus backup slots on those same primary accounts, at tiers strictly after every primary tier. Opus, Sonnet, and Haiku assignments support only their own family. API-key, unrelated-provider, non-native mapping, empty, or incompatible routes cannot activate this policy. Runtime changes that invalidate the route fail closed with a structural failure. Legacy manual combos retain their existing cross-family support.
+
+### Fable admission and recovery
+
+The router tries every currently usable Fable candidate before admitting an Opus backup. Each Opus slot needs proof that **its own account's Fable allowance** is exhausted, and the account and Opus model must still have usable capacity. A different account's shared five-hour limit does not veto an eligible backup:
+
+| Account A                                       | Account B                                       | Route                                     |
+| ----------------------------------------------- | ----------------------------------------------- | ----------------------------------------- |
+| Fable usable                                    | Fable exhausted, Opus available                 | Fable on A first                          |
+| Five-hour limit reached, Fable below 100%       | Fable exhausted, shared headroom available      | Opus on B                                 |
+| Five-hour limit reached                         | Five-hour limit reached                         | Quota wait                                |
+| Generic Fable rejection without family evidence | Generic Fable rejection without family evidence | Same-family handling; Opus remains locked |
+
+Proactive proof requires fresh, active, complete matching family usage at 100% or more, a future reset, and explicitly unavailable overage. Actual affirmative family rejection can supply reactive proof when fresh family-cap data and positive shared headroom support it, even if overage availability is missing. Generic or windowless 429s, 400s, 404s, 529s, network failures, and exact-model markers alone do not prove family exhaustion. Future-dated observations, expired evidence, and newer recovered usage cannot authorize an Opus backup.
+
+Paused accounts remain configured members but are unavailable for routing. Cooldowns, rate limits, circuit state, and authentication failures do not create family exhaustion proof. An empty or entirely paused primary pool is a structural failure, not an indefinite quota wait. The policy never unpauses an account. The primary candidates and their tiers remain in the route catalog, so fresh Fable capacity becomes preferred again after reset, including for conversations that previously used Opus.
+
+### Retry responses
+
+Recoverable local quota evidence produces HTTP **429** with `type: "error"`, `error.type: "rate_limit_error"`, and stable `error.code: "native_quota_wait"`. The response identifies the requested model, family, and combo. `Retry-After` is a finite recheck delay between 1 and 60 seconds, with `x-should-retry: true`; reset time is separate metadata and can be hours away. Shared limits are reported as shared capacity, without claiming that Fable's allowance is exhausted.
+
+An authoritative temporary 429 or 529 can retain its existing meaning. A synthetic **529** with `overloaded_error` is appropriate only for proven temporary same-family pre-byte failures. Structural, authentication, billing, unsupported-model, and permanent failures do not become quota retries. The proxy does not hold an HTTP request until quota reset, add a background scheduler, or replay a response after commitment. Unattended waiting requires a client that keeps retrying capacity errors. In Claude Code, enable `CLAUDE_CODE_RETRY_WATCHDOG=1`; its capacity retry branch handles these repeated 429/529 responses. Without that watchdog, ordinary client retries remain finite. A running chat must already have the watchdog enabled; changing a setting is not proof that an existing process received it.
+
+Native 429/529 presentations carry no trusted `x-better-ccflare-pool-status` or `x-better-ccflare-recovery-scope` authorization. The guard forwards them to the client. Its existing special replay authorization and bounded waiting remain limited to qualified 503 responses, and legacy terminal classification is unchanged.
+
+### Activation and rollback
+
+First inspect `GET /api/families` and `GET /api/routing/effective/fable` to verify the assigned combo, primary accounts, native destination models, enabled state, and backup tiers. The dashboard's family policy selector updates the same management API. For an existing valid assignment, activation is exactly this partial update:
+
+```http
+PUT /api/families/fable
+Content-Type: application/json
+
+{
+  "exhaustion_policy": "native_quota_wait"
+}
+```
+
+Keep the existing `combo_id`, `enabled`, `membership_mode`, and `managed_model` by omitting them. Enable the global combo switch separately if necessary. Read the family and effective views again to verify the stored/effective policy and route. Policy changes advance the routing revision, so regenerate a stale Managed preview before applying it.
+
+Rollback uses the same endpoint and preserves the assignment, slots, rules, exclusions, and account states:
+
+```http
+PUT /api/families/fable
+Content-Type: application/json
+
+{
+  "exhaustion_policy": "legacy"
+}
+```
+
+Read the family policy again to confirm `legacy`. Subsequent requests resume the existing combo/session fallback configuration. Validate production behavior only through natural interactive Claude Code use; offline mocked tests cover scripted inference scenarios.

@@ -11,6 +11,7 @@ import {
 } from "@better-ccflare/types/routing-recovery";
 import { sanitizeAnthropicRetryAfterSeconds } from "../anthropic-degraded-mode";
 import type { RoutingCapacityContext } from "./account-selector";
+import type { NativeQuotaTerminalPresentation } from "./native-quota-policy";
 import type { RequestRateLimitOutcome } from "./rate-limit-scope";
 import type { HostedDispatchState } from "./routing-attempt-ledger";
 import { clampFiniteRoutingRecoveryRetryAfterSeconds } from "./routing-recovery-advice";
@@ -69,6 +70,50 @@ export interface RoutingTerminalOptions {
 	 * preserves the legacy ordinary-request contract for non-ledger callers.
 	 */
 	readonly hostedDispatchState?: HostedDispatchState;
+	/** Opt-in, positively evidenced native presentation; never inferred from a body. */
+	readonly nativeQuotaPresentation?: NativeQuotaTerminalPresentation | null;
+}
+
+function createNativeQuotaResponse(
+	presentation: NativeQuotaTerminalPresentation,
+	now: number,
+): Response {
+	const seconds = Number.isFinite(presentation.nextRecheckAt)
+		? Math.ceil((presentation.nextRecheckAt - now) / 1000)
+		: 60;
+	const retryAfter = Math.max(1, Math.min(60, seconds));
+	const quotaWait = presentation.kind === "quota_wait";
+	const resetAt = presentation.resetAt;
+	const resetDate =
+		typeof resetAt === "number" && resetAt > now ? new Date(resetAt) : null;
+	const error = {
+		type: quotaWait ? "rate_limit_error" : "overloaded_error",
+		code: quotaWait
+			? "native_quota_wait"
+			: "native_route_temporarily_unavailable",
+		message: quotaWait
+			? "The configured native account routes are waiting for quota capacity. Retry to recheck current usage."
+			: "The configured native account routes are temporarily unavailable. Retry shortly.",
+		model: presentation.requestedModel,
+		family: presentation.family,
+		combo_id: presentation.comboId,
+		...(presentation.comboName ? { combo_name: presentation.comboName } : {}),
+		...(quotaWait ? { reason: presentation.reason } : {}),
+		reset_at:
+			resetDate && Number.isFinite(resetDate.getTime())
+				? resetDate.toISOString()
+				: null,
+		next_recheck_at: new Date(now + retryAfter * 1000).toISOString(),
+	};
+	// Guard replay authorization intentionally remains exclusive to legacy 503s.
+	return new Response(JSON.stringify({ type: "error", error }), {
+		status: quotaWait ? 429 : 529,
+		headers: {
+			"content-type": "application/json",
+			"retry-after": String(retryAfter),
+			"x-should-retry": "true",
+		},
+	});
 }
 
 function serializeRoutingSelectionDiagnostics(
@@ -711,6 +756,24 @@ export function createRoutingTerminalResponse(
 		return {
 			kind: "route_unavailable",
 			response: createAuthenticationFailureResponse(options.message),
+		};
+	}
+	if (
+		options.nativeQuotaPresentation &&
+		!(options.authFailureCount ?? 0) &&
+		!options.rateLimitOutcomes.some(
+			(outcome) =>
+				outcome.status === 402 ||
+				outcome.reason === "out_of_credits" ||
+				outcome.reason === "upstream_402_payment_required",
+		)
+	) {
+		return {
+			kind:
+				options.nativeQuotaPresentation.kind === "quota_wait"
+					? "pool_exhausted"
+					: "route_unavailable",
+			response: createNativeQuotaResponse(options.nativeQuotaPresentation, now),
 		};
 	}
 	const modelExhausted =

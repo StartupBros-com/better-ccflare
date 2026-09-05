@@ -233,6 +233,25 @@ describe("managed-routing dashboard API contracts", () => {
 		});
 	});
 
+	it("sends the optional native quota policy alone and supports a legacy rollback", async () => {
+		await api.updateFamilyPolicy({
+			family: "fable",
+			exhaustionPolicy: "native_quota_wait",
+		});
+		await api.updateFamilyPolicy({
+			family: "fable",
+			exhaustionPolicy: "legacy",
+		});
+		expect(
+			calls()
+				.filter(([url]) => url === "/api/families/fable")
+				.map(([, options]) => JSON.parse(options.body as string)),
+		).toEqual([
+			{ exhaustion_policy: "native_quota_wait" },
+			{ exhaustion_policy: "legacy" },
+		]);
+	});
+
 	it("preserves omitted family policy fields while retaining explicit combo null", async () => {
 		await api.updateFamilyPolicy({ family: "opus", enabled: false });
 		await api.updateFamilyPolicy({

@@ -25,6 +25,7 @@ import type {
 	ComboRoutingPolicySnapshot,
 	ComboRoutingPreviewScope,
 	ComboRoutingPreviewSubject,
+	ComboSlot,
 	ComboWithSlots,
 	EffectiveComboRoutingView,
 	FamilyAliasPolicyApplyInput,
@@ -36,6 +37,7 @@ import {
 } from "@better-ccflare/types";
 import {
 	applyRoutingProposal,
+	assertNativeQuotaPolicyShape,
 	coherentSnapshot,
 	computeRoutingPreview,
 	defaultManagedRoutingDependencies,
@@ -271,26 +273,68 @@ async function normalizeSlotModelForCombo(
 	if (!trimmed) {
 		return { ok: false, message: "model must be a non-empty string" };
 	}
-	const assignments = await dbOps.getFamilyAssignments();
-	const assignedFamilies = assignments
-		.filter((assignment) => assignment.combo_id === comboId)
-		.map((assignment) => assignment.family);
+	const assignments = (await dbOps.getFamilyAssignments()).filter(
+		(assignment) => assignment.combo_id === comboId,
+	);
+	const assignedFamilies = assignments.map((assignment) => assignment.family);
 	if (assignedFamilies.length === 0) {
 		return { ok: true, model: trimmed };
 	}
+	const modelFamily = getModelFamily(trimmed);
 	const matchedFamily = assignedFamilies.find(
-		(family) => getModelFamily(trimmed) === family,
+		(family) => modelFamily === family,
 	);
-	if (!matchedFamily) {
+	if (matchedFamily) {
 		return {
-			ok: false,
-			message: `model must belong to a family assigned to this combo (${assignedFamilies.join(", ")}). ${getAllowedModelsMessage()}`,
+			ok: true,
+			model: normalizeManagedModelValue(trimmed, matchedFamily),
+		};
+	}
+	const permitsNativeFableBackup =
+		modelFamily === "opus" &&
+		assignments.some(
+			(assignment) =>
+				assignment.family === "fable" &&
+				assignment.enabled &&
+				assignment.exhaustion_policy === "native_quota_wait",
+		);
+	if (permitsNativeFableBackup) {
+		return {
+			ok: true,
+			model: normalizeManagedModelValue(trimmed, "opus"),
 		};
 	}
 	return {
-		ok: true,
-		model: normalizeManagedModelValue(trimmed, matchedFamily),
+		ok: false,
+		message: `model must belong to a family assigned to this combo (${assignedFamilies.join(", ")}). ${getAllowedModelsMessage()}`,
 	};
+}
+
+/** Validate a proposed add/update against every active native policy on the combo. */
+async function assertProposedNativeSlotShape(
+	dbOps: DatabaseOperations,
+	comboId: string,
+	proposedSlots: readonly ComboSlot[],
+): Promise<void> {
+	const nativeFamilies = (await dbOps.getFamilyAssignments())
+		.filter(
+			(assignment) =>
+				assignment.combo_id === comboId &&
+				assignment.enabled &&
+				assignment.exhaustion_policy === "native_quota_wait",
+		)
+		.map((assignment) => assignment.family);
+	if (nativeFamilies.length === 0) return;
+
+	const inputs = await readCoherentRoutingInputs(dbOps, nativeFamilies);
+	for (const family of nativeFamilies) {
+		const current = coherentSnapshot(inputs, family);
+		assertNativeQuotaPolicyShape(
+			{ ...current, slots: [...proposedSlots] },
+			inputs.accounts,
+			defaultManagedRoutingDependencies,
+		);
+	}
 }
 
 /**
@@ -338,6 +382,17 @@ export function createSlotAddHandler(dbOps: DatabaseOperations) {
 			const existingSlots = await dbOps.getComboSlots(comboId);
 			const nextPriority =
 				priority ?? Math.min(existingSlots.length, COMBO_SLOT_PRIORITY_MAX);
+			await assertProposedNativeSlotShape(dbOps, comboId, [
+				...existingSlots,
+				{
+					id: "pending-slot",
+					combo_id: comboId,
+					account_id,
+					model: normalizedModel,
+					priority: nextPriority,
+					enabled: true,
+				},
+			]);
 			const newSlot = await dbOps.addComboSlot(
 				comboId,
 				account_id,
@@ -405,6 +460,14 @@ export function createSlotUpdateHandler(dbOps: DatabaseOperations) {
 				fields.priority = priority;
 			}
 
+			const existingSlots = await dbOps.getComboSlots(comboId);
+			await assertProposedNativeSlotShape(
+				dbOps,
+				comboId,
+				existingSlots.map((slot) =>
+					slot.id === slotId ? { ...slot, ...fields } : slot,
+				),
+			);
 			const updatedSlot = await dbOps.updateComboSlot(slotId, fields);
 
 			return new Response(
@@ -481,7 +544,13 @@ export function createFamiliesListHandler(dbOps: DatabaseOperations) {
 				await dbOps.getFamilyAssignments();
 
 			return new Response(
-				JSON.stringify({ success: true, data: assignments }),
+				JSON.stringify({
+					success: true,
+					data: assignments.map((assignment) => ({
+						...assignment,
+						exhaustion_policy: assignment.exhaustion_policy ?? "legacy",
+					})),
+				}),
 				{
 					status: 200,
 					headers: { "Content-Type": "application/json" },
@@ -546,6 +615,7 @@ export function createFamilyAssignHandler(
 				enabled: bodyEnabled,
 				membership_mode: membershipMode,
 				managed_model: managedModel,
+				exhaustion_policy: exhaustionPolicy,
 			} = body;
 			const typedFamily = family as ComboFamily;
 			const hasComboId = Object.hasOwn(body, "combo_id");
@@ -553,10 +623,21 @@ export function createFamilyAssignHandler(
 				hasComboId ||
 				bodyEnabled !== undefined ||
 				membershipMode !== undefined ||
-				managedModel !== undefined;
+				managedModel !== undefined ||
+				exhaustionPolicy !== undefined;
 			if (!hasRecognizedField) {
 				return errorResponse(
 					BadRequest("at least one family policy field is required"),
+				);
+			}
+
+			if (
+				exhaustionPolicy !== undefined &&
+				exhaustionPolicy !== "legacy" &&
+				exhaustionPolicy !== "native_quota_wait"
+			) {
+				return errorResponse(
+					BadRequest("exhaustion_policy must be legacy or native_quota_wait"),
 				);
 			}
 
@@ -598,13 +679,17 @@ export function createFamilyAssignHandler(
 			const usePartialPolicyUpdate =
 				!hasComboId ||
 				membershipMode !== undefined ||
-				managedModel !== undefined;
+				managedModel !== undefined ||
+				exhaustionPolicy !== undefined;
 			if (usePartialPolicyUpdate) {
 				const inputs = await readCoherentRoutingInputs(dbOps, [typedFamily]);
 				const current = coherentSnapshot(inputs, typedFamily);
 				const fields: ComboFamilyPolicyUpdateInput = {
 					...(combo_id !== undefined ? { combo_id: safeComboId } : {}),
 					...(bodyEnabled !== undefined ? { enabled } : {}),
+					...(exhaustionPolicy !== undefined
+						? { exhaustion_policy: exhaustionPolicy }
+						: {}),
 					...(membershipMode !== undefined
 						? { membership_mode: membershipMode }
 						: {}),
@@ -652,6 +737,11 @@ export function createFamilyAssignHandler(
 						};
 					}
 				}
+				assertNativeQuotaPolicyShape(
+					proposedSnapshot,
+					inputs.accounts,
+					dependencies,
+				);
 				if (
 					proposedSnapshot.assignment.enabled &&
 					proposedSnapshot.assignment.combo_id !== null &&
@@ -682,7 +772,8 @@ export function createFamilyAssignHandler(
 				const inputs = await readCoherentRoutingInputs(dbOps, [typedFamily]);
 				const current = coherentSnapshot(inputs, typedFamily);
 				if (
-					current.assignment.membership_mode === "managed" &&
+					(current.assignment.membership_mode === "managed" ||
+						current.assignment.exhaustion_policy === "native_quota_wait") &&
 					enabled &&
 					safeComboId !== null
 				) {
@@ -710,6 +801,11 @@ export function createFamilyAssignHandler(
 							exclusions,
 						};
 					}
+					assertNativeQuotaPolicyShape(
+						proposedSnapshot,
+						inputs.accounts,
+						dependencies,
+					);
 					const resolution = resolveEffectiveComboMembership(
 						proposedSnapshot,
 						inputs.accounts,

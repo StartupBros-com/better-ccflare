@@ -1,6 +1,7 @@
 import {
 	formatXaiCacheCanary,
 	getModelFamily,
+	isAccountAvailable,
 	isForceAccountModelEnabled as isForceAccountModelRewriteEnabled,
 	MAX_REQUEST_BODY_BYTES,
 	RequestBodyTooLargeError,
@@ -102,11 +103,17 @@ import {
 	validateProviderPath,
 } from "./handlers";
 import {
+	evaluateNativeQuotaRequest,
 	getCapacityDeferredModelRoutes,
 	getClientVisibleServerToolAccountId,
+	getNativeQuotaCandidateModelUnavailableUntil,
+	getNativeQuotaContext,
 	getReactiveModelCapacityBlocker,
+	isComboFallbackDisabled,
 	isComboSessionFallbackDisabled,
 	isForceAccountModelEnabled,
+	isNativeQuotaRequestCandidateEligible,
+	isNativeQuotaRouteAllowed,
 } from "./handlers/account-selector";
 import {
 	type AnthropicDegradedRequestSendState,
@@ -2021,8 +2028,175 @@ async function handleProxyCoreImpl(
 				})()
 			: undefined;
 
+	const nativeTemporaryFailures = new Set<string>();
+	const nativeAttemptedCandidates = new Set<string>();
+	let nativePermanentFailure = false;
+	const observeNativeQuotaAttempt = (
+		accountId: string,
+		candidateId: string,
+		status: number | null,
+	): void => {
+		nativeAttemptedCandidates.add(candidateId);
+		if (
+			status === null ||
+			status === 429 ||
+			status === 529 ||
+			status === 502 ||
+			status === 503 ||
+			status === 504
+		)
+			nativeTemporaryFailures.add(accountId);
+		else if (status >= 400) nativePermanentFailure = true;
+	};
+	const nativeHasPermanentFailure = (): boolean => {
+		const context = getNativeQuotaContext(requestMeta);
+		if (!context) return false;
+		const evaluation = evaluateNativeQuotaRequest(requestMeta);
+		return (
+			nativePermanentFailure ||
+			routingAttemptLedger.authFailureCount > 0 ||
+			context.accounts.some(
+				(account) =>
+					evaluation?.primaryAccountIds.includes(account.id) &&
+					(account.requires_reauth ||
+						account.rate_limited_reason === "out_of_credits" ||
+						account.rate_limited_reason === "upstream_402_payment_required" ||
+						account.rate_limited_reason === "extra_usage_exhausted"),
+			)
+		);
+	};
+	const nativeQuotaTerminal = (
+		source: "selection" | "attempts",
+	): Response | null => {
+		const nativeContext = getNativeQuotaContext(requestMeta);
+		if (!nativeContext) return null;
+		const evaluation = evaluateNativeQuotaRequest(requestMeta);
+		const now = Date.now();
+		const authorizedMembers = nativeContext.members.filter((member) => {
+			const account = nativeContext.accounts.find(
+				(candidate) => candidate.id === member.account_id,
+			);
+			return (
+				account !== undefined &&
+				isNativeQuotaRequestCandidateEligible(requestMeta, account, member.id)
+			);
+		});
+		const requestAuthorityDenied = authorizedMembers.length === 0;
+		const nativeCandidates = authorizedMembers.filter((member) =>
+			evaluation?.admittedCandidateIds.includes(member.id),
+		);
+		const permanentAvailabilityFailure = nativeHasPermanentFailure();
+		const temporaryRecheckTimes: number[] = [];
+		const temporary =
+			!evaluation?.structuralError &&
+			nativeCandidates.length > 0 &&
+			nativeCandidates.every((member) => {
+				const account = nativeContext.accounts.find(
+					(candidate) => candidate.id === member.account_id,
+				);
+				if (!account || account.paused || account.requires_reauth) return false;
+				const modelUnavailableUntil = isAccountAvailable(account)
+					? getNativeQuotaCandidateModelUnavailableUntil(
+							requestMeta,
+							account,
+							member.id,
+							now,
+						)
+					: null;
+				if (modelUnavailableUntil !== null) {
+					temporaryRecheckTimes.push(modelUnavailableUntil);
+					return true;
+				}
+				if (!nativeTemporaryFailures.has(account.id)) return false;
+				temporaryRecheckTimes.push(now + 10_000);
+				return true;
+			});
+		const presentation =
+			!req.signal.aborted &&
+			!requestAuthorityDenied &&
+			!permanentAvailabilityFailure &&
+			!nativePermanentFailure &&
+			routingAttemptLedger.authFailureCount === 0 &&
+			!routingAttemptLedger.hasRetainedTerminalKind(
+				"authoritative_context_overflow",
+			) &&
+			!routingAttemptLedger.hasRetainedTerminalKind(
+				"legacy_context_overflow",
+			) &&
+			routingAttemptLedger.hostedDispatchState !== "hosted_dispatched"
+				? (evaluation?.wait ??
+					(temporary
+						? {
+								kind: "temporary_unavailable" as const,
+								requestedModel: nativeContext.requestedModel,
+								family: nativeContext.family,
+								comboId: nativeContext.comboId,
+								nextRecheckAt: Math.min(now + 60_000, ...temporaryRecheckTimes),
+							}
+						: null))
+				: null;
+		const terminal = createRoutingTerminalResponse({
+			source,
+			accounts:
+				evaluation?.structuralError ||
+				requestAuthorityDenied ||
+				permanentAvailabilityFailure ||
+				nativePermanentFailure
+					? []
+					: nativeContext.accounts.filter((account) =>
+							evaluation?.primaryAccountIds.includes(account.id),
+						),
+			capacityContext:
+				evaluation?.structuralError ||
+				requestAuthorityDenied ||
+				permanentAvailabilityFailure ||
+				nativePermanentFailure
+					? null
+					: getRoutingCapacityContext(requestMeta),
+			rateLimitOutcomes:
+				evaluation?.structuralError ||
+				requestAuthorityDenied ||
+				permanentAvailabilityFailure ||
+				nativePermanentFailure
+					? []
+					: getRequestRateLimitOutcomes(req),
+			upstreamAttempts: routingAttemptLedger.attemptedCount,
+			authFailureCount: routingAttemptLedger.authFailureCount,
+			hostedDispatchState: routingAttemptLedger.hostedDispatchState,
+			nativeQuotaPresentation: presentation,
+			message:
+				evaluation?.structuralError ??
+				(requestAuthorityDenied
+					? "Native quota routes are not authorized for this request."
+					: undefined),
+		});
+		return recordLocalRoutingTerminal(terminal.response, terminal.kind);
+	};
+
+	// A stale strategy can suppress every account while an authorized native
+	// lane remains usable. Preserve the configured deferred wave in that case.
+	const nativeDeferredContext = getNativeQuotaContext(requestMeta);
+	const hasUsableNativeDeferredRoute =
+		nativeDeferredContext?.members.some((member) => {
+			const account = nativeDeferredContext.accounts.find(
+				(candidate) => candidate.id === member.account_id,
+			);
+			return (
+				account !== undefined &&
+				isNativeQuotaRouteAllowed(
+					requestMeta,
+					account,
+					member.logical_model,
+					member.id,
+				)
+			);
+		}) ?? false;
 	// 7. Handle no accounts case
-	if (accounts.length === 0 && selectedCapacityDeferredRoutes.length === 0) {
+	if (
+		accounts.length === 0 &&
+		selectedCapacityDeferredRoutes.length === 0 &&
+		!hasUsableNativeDeferredRoute
+	) {
 		// No account will serve this request, whichever branch below fires. Clear
 		// the badge association up front — BEFORE the fallible getAllAccounts fetch,
 		// collector logging, and the passthrough (a thrown proxyUnauthenticated
@@ -2030,7 +2204,10 @@ async function handleProxyCoreImpl(
 		// throw below can leave a stale mapping (KTD-5).
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 
-		if (requestMeta.comboName && isComboSessionFallbackDisabled(ctx)) {
+		const nativeTerminal = nativeQuotaTerminal("selection");
+		if (nativeTerminal) return finishPacing(pacingSlot, nativeTerminal);
+
+		if (requestMeta.comboName && isComboFallbackDisabled(ctx, requestMeta)) {
 			return finishPacing(
 				pacingSlot,
 				await returnComboSessionFallbackDisabled(requestMeta.comboName, 0),
@@ -2328,6 +2505,72 @@ async function handleProxyCoreImpl(
 			route.familyOccurrence,
 		);
 	}
+	// Keep all configured native routes in the existing deferred queue so
+	// fresh primary recovery and reactive backup admission can resume routing.
+	// The physical transport fence rechecks each account's proof
+	// after reactive failures and immediately before a backup actually sends.
+	const nativeContext = getNativeQuotaContext(requestMeta);
+	if (nativeContext) {
+		for (const [ordinal, member] of nativeContext.members.entries()) {
+			const account = nativeContext.accounts.find(
+				(entry) => entry.id === member.account_id,
+			);
+			if (!account) continue;
+			deferModelRoute(
+				account,
+				member.logical_model,
+				member.id,
+				member.tier,
+				nativeContext.comboName ?? requestMeta.comboName ?? null,
+				ordinal,
+			);
+		}
+	}
+	const nativeRecoveredPrimaryIds = new Set<string>();
+	const nativeAdmissionFor =
+		(account: Account, candidateId: string, logicalModel: string | undefined) =>
+		(model: string | null, endpoint: string): boolean => {
+			if (req.signal.aborted) return false;
+			const admitted = isNativeQuotaRouteAllowed(
+				requestMeta,
+				account,
+				logicalModel,
+				candidateId,
+				model,
+				endpoint,
+			);
+			const context = getNativeQuotaContext(requestMeta);
+			if (
+				!context ||
+				context.structuralError ||
+				getModelFamily(logicalModel ?? "") === context.family
+			)
+				return admitted;
+			// A reset observed during async preparation returns the request to its
+			// primary lane before an Opus send. Already attempted primaries remain
+			// spent in this request; the ledger independently prevents replay.
+			const recovered = context.members.filter((member) => {
+				if (
+					getModelFamily(member.logical_model) !== context.family ||
+					nativeAttemptedCandidates.has(member.id)
+				)
+					return false;
+				const primary = context.accounts.find(
+					(candidate) => candidate.id === member.account_id,
+				);
+				return (
+					primary !== undefined &&
+					isNativeQuotaRouteAllowed(
+						requestMeta,
+						primary,
+						member.logical_model,
+						member.id,
+					)
+				);
+			});
+			for (const member of recovered) nativeRecoveredPrimaryIds.add(member.id);
+			return admitted && recovered.length === 0;
+		};
 	const modelFallbackPolicyFor = (
 		account: Account,
 		candidateId: string,
@@ -2344,6 +2587,18 @@ async function handleProxyCoreImpl(
 		return {
 			routeCandidateId: candidateId,
 			prepareFinalResponse: true,
+			implicitFallbacksEnabled: nativeContext === null,
+			nativeQuotaAdmission: nativeContext
+				? nativeAdmissionFor(
+						account,
+						candidateId,
+						nativeContext.members.find((member) => member.id === candidateId)
+							?.logical_model,
+					)
+				: undefined,
+			observeNativeQuotaAttempt: nativeContext
+				? (status) => observeNativeQuotaAttempt(account.id, candidateId, status)
+				: undefined,
 			forwardModelUnavailableResponse,
 			comboModelOverrideFrom,
 			// proxyWithAccount combines this currently-known queue finality with its
@@ -2354,9 +2609,10 @@ async function handleProxyCoreImpl(
 			canReplayContextOverflow: () =>
 				!currentlyFinalSemanticRoute ||
 				deferredModelRoutes.length > 0 ||
-				(comboName !== null && !isComboSessionFallbackDisabled(ctx)),
+				(comboName !== null && !isComboFallbackDisabled(ctx, requestMeta)),
 			anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
 			deferImplicitFallback: (model, fallbackRank) => {
+				if (nativeContext) return;
 				deferModelRoute(
 					account,
 					model,
@@ -2393,6 +2649,15 @@ async function handleProxyCoreImpl(
 		const delivered = await retainedTerminalResponse.deliver(
 			terminalFailoverAttempts,
 		);
+		if (
+			!retainedTerminalResponse.terminalKind &&
+			(delivered.status === 429 || delivered.status === 529) &&
+			(evaluateNativeQuotaRequest(requestMeta)?.structuralError ||
+				nativeHasPermanentFailure())
+		) {
+			await discardUpstreamBody(delivered);
+			return nativeQuotaTerminal("attempts");
+		}
 		if (
 			retainedTerminalResponse.terminalKind === "authoritative_context_overflow"
 		) {
@@ -2629,6 +2894,18 @@ async function handleProxyCoreImpl(
 		isFinalDeferredRoute: boolean,
 		probeAdmission: ReturnType<typeof getRateLimitProbeAdmission> | null,
 	): Promise<Response | null> => {
+		if (
+			!isNativeQuotaRouteAllowed(
+				requestMeta,
+				route.account,
+				route.model,
+				route.candidateId,
+			)
+		) {
+			if (probeAdmission === "admitted")
+				completeRateLimitProbe(route.account, "abandoned");
+			return null;
+		}
 		requestMeta.comboName = route.comboName;
 		requestMeta.comboSlotIndex = route.comboSlotIndex;
 		log.info(
@@ -2658,6 +2935,18 @@ async function handleProxyCoreImpl(
 					continueAfterPreparedFailure: !isFinalDeferredRoute,
 					recomputeServerToolCapability: true,
 					implicitFallbacksEnabled: false,
+					nativeQuotaAdmission: nativeContext
+						? nativeAdmissionFor(route.account, route.candidateId, route.model)
+						: undefined,
+					observeNativeQuotaAttempt: nativeContext
+						? (status) =>
+								observeNativeQuotaAttempt(
+									route.account.id,
+									route.candidateId,
+									status,
+								)
+						: undefined,
+					comboModelOverrideFrom: nativeContext ? effectiveModel : null,
 					forwardModelUnavailableResponse: isFinalDeferredRoute,
 					isFinalSemanticAttempt: () => isFinalDeferredRoute,
 					anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
@@ -2877,10 +3166,20 @@ async function handleProxyCoreImpl(
 			selectedCandidate?.effectiveLogicalModel ??
 			modelOverride ??
 			effectiveModel;
+		if (
+			!isNativeQuotaRouteAllowed(
+				requestMeta,
+				accounts[i],
+				attemptModel,
+				selectedRouteCandidateIds[i],
+			)
+		)
+			continue;
 		// Normal routes were filtered above. Combo slots need this attempt-level
 		// check because each slot may override the model independently.
 		if (
 			filteredComboInfo &&
+			!nativeContext &&
 			attemptModel &&
 			hasReactiveModelDepletion({
 				accountId: accounts[i].id,
@@ -3027,7 +3326,7 @@ async function handleProxyCoreImpl(
 				.slice(i + 1)
 				.some((candidate) => !wouldSuppressProbe(candidate)) ||
 				(filteredComboInfo?.comboName != null &&
-					!isComboSessionFallbackDisabled(ctx)),
+					!isComboFallbackDisabled(ctx, requestMeta)),
 		);
 		if (preferredResponse) return preferredResponse;
 
@@ -3045,7 +3344,16 @@ async function handleProxyCoreImpl(
 	// there is no other account to prefer: retry the highest-priority
 	// candidate once, bypassing the gate, instead of falling through to a hard
 	// 503 against what may be a perfectly healthy account.
-	if (!anyAccountAttempted && accounts.length > 0) {
+	if (
+		!anyAccountAttempted &&
+		accounts.length > 0 &&
+		isNativeQuotaRouteAllowed(
+			requestMeta,
+			accounts[0],
+			selectedRouteCandidates[0]?.modelOverride ?? effectiveModel,
+			selectedRouteCandidateIds[0],
+		)
+	) {
 		const i = 0;
 		const selectedCandidate = selectedRouteCandidates[i];
 		let modelOverride: string | null = null;
@@ -3162,7 +3470,7 @@ async function handleProxyCoreImpl(
 		}
 		const preferredResponse = await attemptPreferredContextOverflowRoute(
 			filteredComboInfo?.comboName != null &&
-				!isComboSessionFallbackDisabled(ctx),
+				!isComboFallbackDisabled(ctx, requestMeta),
 		);
 		if (preferredResponse) return preferredResponse;
 	}
@@ -3174,10 +3482,15 @@ async function handleProxyCoreImpl(
 	let throttledFallbackAccounts: Account[] = [];
 	let fallbackSelectionHadNoAvailable = false;
 	const disabledComboSessionFallbackName =
-		filteredComboInfo?.comboName && isComboSessionFallbackDisabled(ctx)
+		!nativeContext &&
+		filteredComboInfo?.comboName &&
+		isComboSessionFallbackDisabled(ctx)
 			? filteredComboInfo.comboName
 			: null;
-	if (filteredComboInfo?.comboName && !disabledComboSessionFallbackName) {
+	if (
+		filteredComboInfo?.comboName &&
+		!isComboFallbackDisabled(ctx, requestMeta)
+	) {
 		log.warn(
 			`All combo slots failed for combo "${filteredComboInfo.comboName}", falling back to SessionStrategy routing`,
 		);
@@ -3682,6 +3995,15 @@ async function handleProxyCoreImpl(
 		const deferredRouteWouldCrossTransport = (
 			route: DeferredModelRoute,
 		): boolean => {
+			if (
+				!isNativeQuotaRouteAllowed(
+					requestMeta,
+					route.account,
+					route.model,
+					route.candidateId,
+				)
+			)
+				return false;
 			const now = Date.now();
 			const predictiveThrottleUntil =
 				trustedInternalAutoRefresh || trustedInternalKeepalive
@@ -3691,6 +4013,7 @@ async function handleProxyCoreImpl(
 				return false;
 			}
 			if (
+				!nativeContext &&
 				hasReactiveModelDepletion({
 					accountId: route.account.id,
 					model: route.model,
@@ -3702,8 +4025,33 @@ async function handleProxyCoreImpl(
 			}
 			return !wouldSuppressProbe(route.account);
 		};
-		for (let i = 0; i < orderedDeferredModelRoutes.length; i++) {
+		const rescheduledNativePrimaries = new Set<string>();
+		const rescheduledNativeBackups = new Set<string>();
+		let nativeUngatedRouteKey: string | null = null;
+		for (let i = 0; i <= orderedDeferredModelRoutes.length; i++) {
+			if (i === orderedDeferredModelRoutes.length) {
+				if (
+					nativeContext &&
+					!anyDeferredRouteCrossedTransport &&
+					firstProbeSuppressedDeferredRoute &&
+					nativeUngatedRouteKey === null
+				) {
+					nativeUngatedRouteKey = firstProbeSuppressedDeferredRoute.routeKey;
+					orderedDeferredModelRoutes.push(firstProbeSuppressedDeferredRoute);
+					if (contextAdmissionTracker)
+						contextAdmissionTracker.nonCapacitySkipCount--;
+				} else break;
+			}
 			const route = orderedDeferredModelRoutes[i];
+			if (
+				!isNativeQuotaRouteAllowed(
+					requestMeta,
+					route.account,
+					route.model,
+					route.candidateId,
+				)
+			)
+				continue;
 			requestMeta.comboName = route.comboName;
 			requestMeta.comboSlotIndex = route.comboSlotIndex;
 			const now = Date.now();
@@ -3723,6 +4071,7 @@ async function handleProxyCoreImpl(
 			}
 
 			if (
+				!nativeContext &&
 				hasReactiveModelDepletion({
 					accountId: route.account.id,
 					model: route.model,
@@ -3762,7 +4111,10 @@ async function handleProxyCoreImpl(
 			const isFinalExecutableDeferredRoute = orderedDeferredModelRoutes
 				.slice(i + 1)
 				.every((candidate) => !deferredRouteWouldCrossTransport(candidate));
-			const probeAdmission = getRateLimitProbeAdmission(route.account);
+			const probeAdmission =
+				nativeUngatedRouteKey === route.routeKey
+					? null
+					: getRateLimitProbeAdmission(route.account);
 			if (probeAdmission === "suppressed") {
 				firstProbeSuppressedDeferredRoute ??= route;
 				if (contextAdmissionTracker) {
@@ -3781,8 +4133,39 @@ async function handleProxyCoreImpl(
 				anyDeferredRouteCrossedTransport = true;
 			}
 			if (finalResponse) return finalResponse;
+			// Recovery can happen after the primary wave has passed, while an
+			// Opus transform awaits. Resume each unsent primary once, then the
+			// unsent backup. The existing physical ledger still owns deduplication.
+			const recoveredRoutes = deferredModelRoutes.filter(
+				(candidate) =>
+					nativeRecoveredPrimaryIds.has(candidate.candidateId) &&
+					!nativeAttemptedCandidates.has(candidate.candidateId) &&
+					!rescheduledNativePrimaries.has(candidate.candidateId) &&
+					isNativeQuotaRouteAllowed(
+						requestMeta,
+						candidate.account,
+						candidate.model,
+						candidate.candidateId,
+					),
+			);
+			nativeRecoveredPrimaryIds.clear();
+			if (recoveredRoutes.length > 0) {
+				for (const candidate of recoveredRoutes)
+					rescheduledNativePrimaries.add(candidate.candidateId);
+				const resumeBackup =
+					!nativeAttemptedCandidates.has(route.candidateId) &&
+					!rescheduledNativeBackups.has(route.candidateId);
+				if (resumeBackup) rescheduledNativeBackups.add(route.candidateId);
+				orderedDeferredModelRoutes.splice(
+					i + 1,
+					0,
+					...recoveredRoutes,
+					...(resumeBackup ? [route] : []),
+				);
+			}
 		}
 		if (
+			!nativeContext &&
 			!anyDeferredRouteCrossedTransport &&
 			firstProbeSuppressedDeferredRoute
 		) {
@@ -3799,7 +4182,7 @@ async function handleProxyCoreImpl(
 			);
 			if (finalResponse) return finalResponse;
 		}
-		requestMeta.comboName = null;
+		requestMeta.comboName = nativeContext?.comboName ?? null;
 		requestMeta.comboSlotIndex = null;
 	}
 	if (disabledComboSessionFallbackName) {
@@ -3855,6 +4238,13 @@ async function handleProxyCoreImpl(
 				}),
 			),
 		);
+	}
+
+	const exhaustedNativeTerminal = nativeQuotaTerminal("attempts");
+	if (exhaustedNativeTerminal) {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+		return finishPacing(pacingSlot, exhaustedNativeTerminal);
 	}
 
 	if (

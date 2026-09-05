@@ -1,5 +1,6 @@
 import { getModelFamily } from "@better-ccflare/core";
 import {
+	type FamilyScopedRejectionEvidence,
 	MODEL_SCOPED_DEPLETION_TTL_MS,
 	parseAnthropicRateLimitResetAt,
 	type UsageSnapshot,
@@ -175,6 +176,52 @@ export function hasHardAnthropicAccountSignal(response: Response): boolean {
 		if (Number.isFinite(parsed) && parsed <= 0) return true;
 	}
 	return false;
+}
+
+/**
+ * Only explicit native limiter rejection can promote inferred scope to native
+ * proof. A reset bounds marker expiry elsewhere; allowed windows carry resets too.
+ */
+export function nativeFamilyRejectionEvidence(
+	response: Response,
+	decision: RateLimitScopeDecision,
+): FamilyScopedRejectionEvidence | undefined {
+	if (
+		response.status !== 429 ||
+		decision.scope !== "family" ||
+		decision.reason !== "matching_scoped_limit" ||
+		["allowed", "allowed_warning"].includes(
+			response.headers
+				.get("anthropic-ratelimit-unified-status")
+				?.trim()
+				.toLowerCase() ?? "",
+		)
+	)
+		return undefined;
+	let rejected = false;
+	let billingFailure = false;
+	response.headers.forEach((value, name) => {
+		if (!name.startsWith("anthropic-ratelimit-unified-")) return;
+		const status = value.trim().toLowerCase();
+		if (
+			status === "payment_required" ||
+			status === "out_of_credits" ||
+			(/(?:spend|credit|payment)/.test(name) &&
+				/(?:rejected|blocked|exhausted|insufficient)/.test(status))
+		)
+			billingFailure = true;
+		if (/(?:spend|credit|payment|overage)/.test(name)) return;
+		if (
+			name.endsWith("-status") &&
+			["rejected", "rate_limited", "blocked", "queueing_hard"].includes(status)
+		)
+			rejected = true;
+	});
+	if (billingFailure || !rejected) return undefined;
+	return {
+		reason: "matching_scoped_limit",
+		authoritativeNativeRejection: true,
+	};
 }
 
 /**

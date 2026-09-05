@@ -5,6 +5,7 @@ import type {
 	ComboFamily,
 	ComboRoutingPolicySnapshot,
 	ComboWithSlots,
+	RequestMeta,
 } from "@better-ccflare/types";
 import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
 import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
@@ -1438,6 +1439,1344 @@ describe("implicit fallback policy integration", () => {
 			} else {
 				process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = previousPassthrough;
 			}
+		}
+	});
+});
+
+describe("native quota wait execution", () => {
+	function nativePool() {
+		const accounts = ["native-a", "native-b"].map(
+			(id) =>
+				({
+					...makeAccount(id),
+					provider: "anthropic",
+					api_key: null,
+					access_token: "offline-token",
+					refresh_token: "offline-refresh",
+					expires_at: Date.now() + 3_600_000,
+				}) as Account,
+		);
+		const combo: ComboWithSlots = {
+			id: "native-combo",
+			name: "Native Fable",
+			description: null,
+			enabled: true,
+			created_at: 0,
+			updated_at: 0,
+			slots: accounts.flatMap((account, index) => [
+				{
+					id: `native-fable-${index}`,
+					combo_id: "native-combo",
+					account_id: account.id,
+					model: "claude-fable-5",
+					priority: 0,
+					enabled: true,
+				},
+				{
+					id: `native-opus-${index}`,
+					combo_id: "native-combo",
+					account_id: account.id,
+					model: "claude-opus-4-8",
+					priority: 10,
+					enabled: true,
+				},
+			]),
+		};
+		const ctx = makeContext(accounts, combo, (candidates) => candidates);
+		ctx.config.getModelScopedCapacityRouting = () => "exhausted";
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) => ({
+			...makeRoutingPolicy(combo, family),
+			assignment: {
+				...makeRoutingPolicy(combo, family).assignment,
+				exhaustion_policy: "native_quota_wait",
+			},
+		}));
+		const restore = installMockRoutingProviders(["anthropic"]);
+		registerProvider({
+			...makeMockRoutingProvider("anthropic"),
+			buildUrl: (_path, _search, account) =>
+				`https://api.anthropic.com/offline/${account?.id}`,
+		});
+		const handleStart = installUsageCollector();
+		const calls: Array<{ account: string; model: string }> = [];
+		return { accounts, combo, ctx, restore, calls, handleStart };
+	}
+
+	function putUsage(
+		account: Account,
+		familyPercent: number,
+		sharedPercent = 10,
+	) {
+		cachedUsageAccountIds.add(account.id);
+		usageCache.set(account.id, {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "session",
+					percent: sharedPercent,
+					is_active: true,
+					resets_at: new Date(Date.now() + 3_600_000).toISOString(),
+				},
+				{
+					kind: "weekly_all",
+					percent: 10,
+					is_active: true,
+					resets_at: new Date(Date.now() + 86_400_000).toISOString(),
+				},
+				{
+					kind: "weekly_scoped",
+					percent: familyPercent,
+					is_active: true,
+					resets_at: new Date(Date.now() + 86_400_000).toISOString(),
+					scope: { model: { id: null, display_name: "Fable" }, surface: null },
+				},
+			],
+		} as never);
+	}
+
+	it.each([
+		"anthropic-oauth",
+		"anthropic",
+		"implicit",
+	])("never restores request-denied native routes from the structural pool: %s", async (denial) => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) putUsage(account, 100);
+		ctx.config.getComboSessionFallback = () => true;
+		ctx.config.getAgentFrontmatterModelFallback = () => true;
+		if (denial === "implicit") {
+			ctx.implicitFallbackPolicy = {
+				mode: "enforce",
+				allowedClasses: [],
+				deniedClasses: ["oauth-subscription"],
+			};
+		}
+		const previous = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			if (denial !== "implicit")
+				request.headers.set("x-better-ccflare-exclude-providers", denial);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.status).toBe(503);
+			expect(response.headers.get("retry-after")).toBeNull();
+			expect(response.headers.get("x-should-retry")).toBeNull();
+		} finally {
+			restore();
+			if (previous === undefined)
+				delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+			else process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = previous;
+		}
+	});
+
+	it.each([
+		"provider",
+		"implicit",
+		"route-intent",
+	])("rechecks native request authority after asynchronous preparation: %s", async (denial) => {
+		const { ModelRouteSessionRegistry } = await import(
+			"../model-route-profiles"
+		);
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		const registry = new ModelRouteSessionRegistry([]);
+		ctx.modelRouteSessionRegistry = registry;
+		let denied = false;
+		const routeIntent = spyOn(
+			registry,
+			"isProfileOnlyAccount",
+		).mockImplementation(() => denied && denial === "route-intent");
+		let meta: RequestMeta | undefined;
+		ctx.strategy.select = mock((candidates: Account[], input: RequestMeta) => {
+			meta = input;
+			return candidates;
+		});
+		registerProvider({
+			...makeMockRoutingProvider("anthropic"),
+			buildUrl: (_path, _search, account) =>
+				`https://api.anthropic.com/offline/${account?.id}`,
+			transformRequestBody: async (request) => {
+				denied = true;
+				if (denial === "provider")
+					meta?.headers?.set(
+						"x-better-ccflare-exclude-providers",
+						"anthropic-oauth",
+					);
+				if (denial === "implicit")
+					ctx.implicitFallbackPolicy = {
+						mode: "enforce",
+						allowedClasses: [],
+						deniedClasses: ["oauth-subscription"],
+					};
+				return request;
+			},
+		});
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(denied).toBe(true);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.status).toBe(503);
+			expect(response.headers.get("retry-after")).toBeNull();
+		} finally {
+			routeIntent.mockRestore();
+			restore();
+		}
+	});
+
+	it("does not defer native backups that lack the request's server-tool capability", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) putUsage(account, 100);
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-fable-5",
+					messages: [{ role: "user", content: "offline capability fixture" }],
+					max_tokens: 16,
+					tools: [{ type: "web_search_20250305", name: "web_search" }],
+				}),
+			});
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.status).toBe(503);
+			expect(response.headers.get("x-should-retry")).not.toBe("true");
+		} finally {
+			restore();
+		}
+	});
+
+	it.each([
+		"public-force",
+		"profile",
+		"excluded-profile",
+	])("preserves existing explicit route authority with a native assignment: %s", async (mode) => {
+		const { ModelRouteSessionRegistry, parseModelRouteProfiles } = await import(
+			"../model-route-profiles"
+		);
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		ctx.implicitFallbackPolicy = {
+			mode: "enforce",
+			allowedClasses: [],
+			deniedClasses: ["oauth-subscription"],
+		};
+		if (mode !== "public-force")
+			ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+				parseModelRouteProfiles(
+					JSON.stringify([
+						{
+							id: "offline-native",
+							displayName: "Offline native",
+							accountId: accounts[0].id,
+							logicalModel: "claude-fable-5",
+							expectedProvider: "anthropic",
+							expectedPhysicalModel: "claude-fable-5",
+						},
+					]),
+				),
+			);
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest(
+				mode === "public-force"
+					? "claude-fable-5"
+					: "claude-bccf-route-offline-native",
+				false,
+			);
+			if (mode === "public-force")
+				request.headers.set("x-better-ccflare-account-id", accounts[0].id);
+			if (mode !== "profile")
+				request.headers.set(
+					"x-better-ccflare-exclude-providers",
+					"anthropic-oauth",
+				);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(mode === "excluded-profile" ? 503 : 200);
+			expect(transport).toHaveBeenCalledTimes(
+				mode === "excluded-profile" ? 0 : 1,
+			);
+		} finally {
+			restore();
+		}
+	});
+
+	it("preserves finite native overload across requests while exact-model markers remain active", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		globalThis.fetch = mock(async (input: Request) => {
+			const model = (await input.clone().json()).model;
+			calls.push({
+				account: new URL(input.url).pathname.split("/").at(-1) ?? "",
+				model,
+			});
+			return new Response(
+				'{"type":"error","error":{"type":"rate_limit_error"}}',
+				{
+					status: 429,
+					headers: { "content-type": "application/json" },
+				},
+			);
+		}) as typeof fetch;
+		let restoreClock = () => {};
+		try {
+			const first = makeProxyRequest("claude-fable-5", false);
+			const firstResponse = await handleProxy(first, new URL(first.url), ctx);
+			expect(firstResponse.status).toBe(529);
+			expect(calls).toHaveLength(2);
+			const markers = accounts.map((account) =>
+				usageCache.getModelScopedExhaustion(account.id, "claude-fable-5"),
+			);
+			expect(markers.every((marker) => marker !== null)).toBe(true);
+			const second = makeProxyRequest("claude-fable-5", false);
+			const secondResponse = await handleProxy(
+				second,
+				new URL(second.url),
+				ctx,
+			);
+			expect(secondResponse.status).toBe(529);
+			expect(await secondResponse.json()).toMatchObject({
+				error: { type: "overloaded_error" },
+			});
+			expect(
+				Number(secondResponse.headers.get("retry-after")),
+			).toBeGreaterThanOrEqual(1);
+			expect(
+				Number(secondResponse.headers.get("retry-after")),
+			).toBeLessThanOrEqual(60);
+			expect(calls).toHaveLength(2);
+			expect(calls.every((call) => call.model === "claude-fable-5")).toBe(true);
+			const expiry = Math.max(
+				...markers.map((marker) => marker?.expiresAt ?? 0),
+			);
+			const clock = spyOn(Date, "now").mockReturnValue(expiry + 1);
+			restoreClock = () => clock.mockRestore();
+			for (const account of accounts) putUsage(account, 20);
+			globalThis.fetch = mock(async (input: Request) => {
+				calls.push({
+					account: new URL(input.url).pathname.split("/").at(-1) ?? "",
+					model: (await input.clone().json()).model,
+				});
+				return Response.json({ type: "message", content: [] });
+			}) as typeof fetch;
+			const third = makeProxyRequest("claude-fable-5", false);
+			const thirdResponse = await handleProxy(third, new URL(third.url), ctx);
+			expect(thirdResponse.status).toBe(200);
+			expect(calls).toHaveLength(3);
+			expect(calls[2].model).toBe("claude-fable-5");
+		} finally {
+			restoreClock();
+			restore();
+		}
+	});
+
+	it("preserves session affinity through Fable to Opus and back to recovered Fable", async () => {
+		const { SessionAffinityStrategy } = await import(
+			"@better-ccflare/load-balancer"
+		);
+		const { clearSession, getServedAccountObservation } = await import(
+			"../session-account-observer"
+		);
+		const { accounts, combo, ctx, restore, calls, handleStart } = nativePool();
+		const strategy = new SessionAffinityStrategy();
+		strategy.initialize({ resetAccountSession: () => undefined });
+		ctx.strategy = strategy;
+		const select = spyOn(strategy, "select");
+		const sessionId = "offline-native-quota-affinity";
+		globalThis.fetch = mock(async (request: Request) => {
+			const model = (await request.clone().json()).model;
+			calls.push({
+				account: new URL(request.url).pathname.split("/").at(-1) ?? "",
+				model,
+			});
+			return Response.json({ type: "message", model, content: [] });
+		}) as typeof fetch;
+		try {
+			const expectedModels = [
+				"claude-fable-5",
+				"claude-opus-4-8",
+				"claude-fable-5",
+			];
+			for (const [index, familyPercent] of [20, 100, 20].entries()) {
+				for (const account of accounts) putUsage(account, familyPercent);
+				const request = new Request("https://proxy.local/v1/messages", {
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						"x-claude-code-session-id": sessionId,
+					},
+					body: JSON.stringify({
+						model: "claude-fable-5",
+						metadata: { user_id: sessionId },
+						messages: [{ role: "user", content: "offline fixture" }],
+						max_tokens: 16,
+					}),
+				});
+				const response = await handleProxy(request, new URL(request.url), ctx);
+				expect(response.status).toBe(200);
+				expect((await response.json()).model).toBe(expectedModels[index]);
+				const meta = select.mock.calls[index]?.[1] as RequestMeta;
+				expect(meta.clientSessionId).toBe(sessionId);
+				expect(meta.comboName).toBe(combo.name);
+				expect(meta.routingCandidateCatalog).toHaveLength(4);
+				expect(
+					meta.routingCandidateCatalog?.filter(
+						(candidate) => candidate.tier === 0,
+					),
+				).toHaveLength(2);
+				expect(meta.routingCandidates?.[0]?.modelOverride).toBe(
+					expectedModels[index],
+				);
+				expect(getServedAccountObservation(sessionId)).toMatchObject({
+					accountId: calls[index].account,
+					models: {
+						requestedModel: "claude-fable-5",
+						appliedModel: expectedModels[index],
+						upstreamModel: expectedModels[index],
+					},
+				});
+				expect(handleStart.mock.calls[index]?.[0]).toMatchObject({
+					originalModel: index === 1 ? "claude-fable-5" : null,
+					appliedModel: index === 1 ? expectedModels[index] : null,
+					comboName: combo.name,
+					clientSessionId: sessionId,
+				});
+			}
+			expect(calls.map((call) => call.model)).toEqual(expectedModels);
+			expect(calls[2].account).toBe(calls[0].account);
+			const firstMeta = select.mock.calls[0]?.[1] as RequestMeta;
+			const finalMeta = select.mock.calls[2]?.[1] as RequestMeta;
+			expect(strategy.snapshotAffinityOwner(finalMeta)).toEqual({
+				candidateId: firstMeta.routingCandidates?.[0]?.candidateId,
+				accountId: calls[0].account,
+			});
+			expect(handleStart.mock.calls[1]?.[0]).toMatchObject({
+				comboModelOverrideFrom: "claude-fable-5",
+				comboModelOverrideTo: "claude-opus-4-8",
+			});
+		} finally {
+			clearSession(sessionId);
+			select.mockRestore();
+			restore();
+		}
+	});
+
+	it("uses Opus B despite shared exhaustion on A without dropping request attribution", async () => {
+		const { accounts, ctx, restore, calls, handleStart } = nativePool();
+		putUsage(accounts[0], 51, 100);
+		putUsage(accounts[1], 100, 20);
+		globalThis.fetch = mock(async (input: Request | string | URL) => {
+			const request = input as Request;
+			calls.push({
+				account: new URL(request.url).pathname.split("/").at(-1) ?? "",
+				model: ((await request.clone().json()) as { model: string }).model,
+			});
+			return new Response(
+				'{"type":"message","model":"claude-opus-4-8","content":[]}',
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(200);
+			expect(calls).toEqual([
+				{ account: accounts[1].id, model: "claude-opus-4-8" },
+			]);
+			expect(handleStart.mock.calls[0]?.[0]).toMatchObject({
+				appliedModel: "claude-opus-4-8",
+				comboModelOverrideFrom: "claude-fable-5",
+				comboModelOverrideTo: "claude-opus-4-8",
+			});
+		} finally {
+			restore();
+		}
+	});
+
+	it("blocks destination drift introduced while preparing a native request", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		registerProvider({
+			...makeMockRoutingProvider("anthropic"),
+			buildUrl: (_path, _search, account) =>
+				`https://api.anthropic.com/offline/${account?.id}`,
+			transformRequestBody: async (request) => {
+				for (const account of accounts)
+					account.custom_endpoint = "https://unrelated.example/v1/messages";
+				return request;
+			},
+		});
+		const transport = mock(async () => {
+			throw new Error("drifted native route must not dispatch");
+		});
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.status).toBe(503);
+			expect(response.headers.get("retry-after")).toBeNull();
+		} finally {
+			restore();
+		}
+	});
+
+	it("reports pre-header transport failures as temporary native overload without unlocking Opus", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		globalThis.fetch = mock(async (input: Request | string | URL) => {
+			const request = input as Request;
+			calls.push({
+				account: new URL(request.url).pathname.split("/").at(-1) ?? "",
+				model: ((await request.clone().json()) as { model: string }).model,
+			});
+			throw new Error("offline connection reset before response");
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(calls.map((call) => call.model)).toEqual([
+				"claude-fable-5",
+				"claude-fable-5",
+			]);
+			expect(response.status).toBe(529);
+			expect(await response.json()).toMatchObject({
+				error: {
+					type: "overloaded_error",
+					code: "native_route_temporarily_unavailable",
+				},
+			});
+		} finally {
+			restore();
+		}
+	});
+
+	it("allows a configured same-family native model mapping", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		for (const account of accounts) {
+			putUsage(account, 20);
+			account.model_mappings = JSON.stringify({
+				"claude-fable-5": "claude-fable-5-20260901",
+			});
+		}
+		registerProvider({
+			...makeMockRoutingProvider("anthropic"),
+			buildUrl: (_path, _search, account) =>
+				`https://api.anthropic.com/offline/${account?.id}`,
+			transformRequestBody: async (request) => {
+				const body = await request.json();
+				return new Request(request, {
+					body: JSON.stringify({ ...body, model: "claude-fable-5-20260901" }),
+				});
+			},
+		});
+		globalThis.fetch = mock(async (input: Request) => {
+			calls.push({
+				account: accounts[0].id,
+				model: (await input.clone().json()).model,
+			});
+			return new Response('{"type":"message","content":[]}', {
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			expect(
+				(await handleProxy(request, new URL(request.url), ctx)).status,
+			).toBe(200);
+			expect(calls.map((call) => call.model)).toEqual([
+				"claude-fable-5-20260901",
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("snaps back to recovered Fable when quota changes while preparing Opus", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		for (const account of accounts) putUsage(account, 100);
+		registerProvider({
+			...makeMockRoutingProvider("anthropic"),
+			buildUrl: (_path, _search, account) =>
+				`https://api.anthropic.com/offline/${account?.id}`,
+			transformRequestBody: async (request) => {
+				for (const account of accounts) putUsage(account, 0);
+				return request;
+			},
+		});
+		globalThis.fetch = mock(async (input: Request) => {
+			calls.push({
+				account: new URL(input.url).pathname.split("/").at(-1) ?? "",
+				model: (await input.clone().json()).model,
+			});
+			return new Response('{"type":"message","content":[]}', {
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			expect(
+				(await handleProxy(request, new URL(request.url), ctx)).status,
+			).toBe(200);
+			expect(calls).toEqual([
+				{ account: accounts[0].id, model: "claude-fable-5" },
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("honors cancellation during request preparation without sending or quota retry", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		const cancellation = new AbortController();
+		registerProvider({
+			...makeMockRoutingProvider("anthropic"),
+			buildUrl: (_path, _search, account) =>
+				`https://api.anthropic.com/offline/${account?.id}`,
+			transformRequestBody: async (request) => {
+				cancellation.abort();
+				return request;
+			},
+		});
+		const transport = mock(async () => {
+			throw new Error("cancelled fixture must not send");
+		});
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = new Request(makeProxyRequest("claude-fable-5", false), {
+				signal: cancellation.signal,
+			});
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(499);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.headers.get("x-should-retry")).toBeNull();
+		} finally {
+			restore();
+		}
+	});
+
+	it("does not authorize Opus after generic windowless primary 429s", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		globalThis.fetch = mock(async (input: Request) => {
+			calls.push({
+				account: new URL(input.url).pathname.split("/").at(-1) ?? "",
+				model: (await input.clone().json()).model,
+			});
+			return new Response(
+				'{"type":"error","error":{"type":"rate_limit_error","message":"busy"}}',
+				{ status: 429, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(calls.map((call) => call.model)).toEqual([
+				"claude-fable-5",
+				"claude-fable-5",
+			]);
+			expect([429, 529]).toContain(response.status);
+		} finally {
+			restore();
+		}
+	});
+
+	it("returns a structural nonretrying terminal when every configured account is paused", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) {
+			account.paused = true;
+			putUsage(account, 100, 100);
+		}
+		const transport = mock(async () => {
+			throw new Error("paused fixture must not send");
+		});
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.status).toBe(503);
+			expect(response.headers.get("retry-after")).toBeNull();
+			expect(response.headers.get("x-should-retry")).toBeNull();
+		} finally {
+			restore();
+		}
+	});
+
+	it("retains native ownership when the account read fails with passthrough enabled", async () => {
+		const { ctx, restore } = nativePool();
+		ctx.dbOps.getAllAccounts = mock(async () => {
+			throw new Error("offline account database failure");
+		});
+		const previous = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+		const transport = mock(async () => {
+			throw new Error(
+				"native account read failure cannot authorize passthrough",
+			);
+		});
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.status).toBe(503);
+			expect(response.headers.get("retry-after")).toBeNull();
+		} finally {
+			restore();
+			if (previous === undefined)
+				delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+			else process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = previous;
+		}
+	});
+
+	it("does not deliver a retained retryable response after native destination drift", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		registerProvider({
+			...makeMockRoutingProvider("anthropic"),
+			buildUrl: (_path, _search, account) =>
+				`https://api.anthropic.com/offline/${account?.id}`,
+			transformRequestBody: async (request) => {
+				if (request.url.endsWith(accounts[1].id))
+					accounts[1].custom_endpoint = "https://unrelated.example";
+				return request;
+			},
+		});
+		const transport = mock(
+			async () =>
+				new Response('{"type":"error","error":{"type":"rate_limit_error"}}', {
+					status: 429,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).toHaveBeenCalledTimes(1);
+			expect(response.status).toBe(503);
+			expect(response.headers.get("retry-after")).toBeNull();
+			expect(response.headers.get("x-should-retry")).toBeNull();
+		} finally {
+			restore();
+		}
+	});
+
+	it("can retry a recovered primary that was vetoed before its first physical send", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		let firstPreparation = true;
+		registerProvider({
+			...makeMockRoutingProvider("anthropic"),
+			buildUrl: (_path, _search, account) =>
+				`https://api.anthropic.com/offline/${account?.id}`,
+			transformRequestBody: async (request) => {
+				if (firstPreparation && request.url.endsWith(accounts[0].id)) {
+					firstPreparation = false;
+					putUsage(accounts[0], 20, 100);
+				}
+				return request;
+			},
+		});
+		globalThis.fetch = mock(async (input: Request) => {
+			const id = new URL(input.url).pathname.split("/").at(-1) ?? "";
+			calls.push({ account: id, model: (await input.clone().json()).model });
+			if (id === accounts[1].id) {
+				putUsage(accounts[0], 20);
+				putUsage(accounts[1], 100);
+				return new Response(
+					'{"type":"error","error":{"type":"rate_limit_error"}}',
+					{ status: 429, headers: { "content-type": "application/json" } },
+				);
+			}
+			return new Response('{"type":"message","content":[]}', {
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(200);
+			expect(calls).toEqual([
+				{ account: accounts[1].id, model: "claude-fable-5" },
+				{ account: accounts[0].id, model: "claude-fable-5" },
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("does not turn generic primary failures into Opus or unrelated-provider fallback", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		const unrelated = makeOpenRouterAccount("native-unrelated");
+		ctx.dbOps.getAllAccounts = mock(async () => [...accounts, unrelated]);
+		for (const account of accounts) putUsage(account, 20);
+		globalThis.fetch = mock(async (input: Request | string | URL) => {
+			const request = input as Request;
+			calls.push({
+				account: new URL(request.url).pathname.split("/").at(-1) ?? "",
+				model: ((await request.clone().json()) as { model: string }).model,
+			});
+			return new Response(
+				'{"type":"error","error":{"type":"invalid_request_error","message":"invalid fixture"}}',
+				{ status: 400, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(calls.length).toBeGreaterThan(0);
+			expect(
+				calls.every(
+					(call) =>
+						call.model === "claude-fable-5" && call.account !== unrelated.id,
+				),
+			).toBe(true);
+			expect(response.status).not.toBe(429);
+		} finally {
+			restore();
+		}
+	});
+
+	it("returns native 429 for shared five-hour exhaustion without passthrough or guard authorization", async () => {
+		const { accounts, ctx, restore, handleStart } = nativePool();
+		for (const account of accounts) putUsage(account, 20, 100);
+		const previous = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+		const transport = mock(async () => {
+			throw new Error("offline transport must remain unused");
+		});
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.status).toBe(429);
+			expect(await response.json()).toMatchObject({
+				type: "error",
+				error: { type: "rate_limit_error", code: "native_quota_wait" },
+			});
+			expect(response.headers.get("x-should-retry")).toBe("true");
+			expect(
+				Number(response.headers.get("retry-after")),
+			).toBeGreaterThanOrEqual(1);
+			expect(Number(response.headers.get("retry-after"))).toBeLessThanOrEqual(
+				60,
+			);
+			expect(response.headers.has("x-better-ccflare-pool-status")).toBe(false);
+			expect(response.headers.has("x-better-ccflare-recovery-scope")).toBe(
+				false,
+			);
+			expect(
+				handleStart.mock.calls.some(
+					(call) =>
+						(call[0] as { responseStatus?: number; accountId?: string | null })
+							?.responseStatus === 429 &&
+						(call[0] as { accountId?: string | null })?.accountId === null,
+				),
+			).toBe(true);
+		} finally {
+			restore();
+			if (previous === undefined)
+				delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+			else process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = previous;
+		}
+	});
+
+	it("uses only B's Opus when A is shared-blocked and B has proven Fable exhaustion", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		putUsage(accounts[0], 20, 100);
+		putUsage(accounts[1], 100);
+		globalThis.fetch = mock(async (input: Request) => {
+			calls.push({
+				account: new URL(input.url).pathname.split("/").at(-1) ?? "",
+				model: (await input.clone().json()).model,
+			});
+			return new Response('{"type":"message","content":[]}', {
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			expect(
+				(await handleProxy(request, new URL(request.url), ctx)).status,
+			).toBe(200);
+			expect(calls).toEqual([
+				{ account: accounts[1].id, model: "claude-opus-4-8" },
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("keeps usable Fable first even when a custom strategy reverses its inputs", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		putUsage(accounts[0], 20);
+		putUsage(accounts[1], 100);
+		ctx.strategy.select = mock(async (candidates: Account[]) =>
+			[...candidates].reverse(),
+		);
+		globalThis.fetch = mock(async (input: Request) => {
+			calls.push({
+				account: new URL(input.url).pathname.split("/").at(-1) ?? "",
+				model: (await input.clone().json()).model,
+			});
+			return new Response('{"type":"message","content":[]}', {
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			expect(
+				(await handleProxy(request, new URL(request.url), ctx)).status,
+			).toBe(200);
+			expect(calls).toEqual([
+				{ account: accounts[0].id, model: "claude-fable-5" },
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("rechecks quota after provider transformation before the physical send", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) putUsage(account, 100);
+		const provider = makeMockRoutingProvider("anthropic");
+		provider.buildUrl = (_path, _search, account) =>
+			`https://api.anthropic.com/offline/${account?.id}`;
+		provider.transformRequestBody = async (request) => {
+			for (const account of accounts) putUsage(account, 100, 100);
+			return request;
+		};
+		registerProvider(provider);
+		const transport = mock(async () => {
+			throw new Error("quota changed before physical send");
+		});
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.status).toBe(429);
+		} finally {
+			restore();
+		}
+	});
+
+	it("returns an honest native 529 after offline transport failures without unlocking Opus", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		globalThis.fetch = mock(async (input: Request) => {
+			calls.push({
+				account: new URL(input.url).pathname.split("/").at(-1) ?? "",
+				model: (await input.clone().json()).model,
+			});
+			throw new TypeError("fetch failed: offline fixture");
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(529);
+			expect(await response.json()).toMatchObject({
+				error: { type: "overloaded_error" },
+			});
+			expect(calls.map((call) => call.model)).toEqual([
+				"claude-fable-5",
+				"claude-fable-5",
+			]);
+			expect(response.headers.has("x-better-ccflare-pool-status")).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+
+	it.each([
+		401, 402, 400,
+	])("does not let a retained native 529 conceal a later permanent %s failure", async (permanentStatus) => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		registerProvider({
+			...makeMockRoutingProvider("anthropic"),
+			buildUrl: (_path, _search, account) =>
+				`https://api.anthropic.com/offline/${account?.id}`,
+			parseRateLimit: (response) => ({
+				isRateLimited: response.status === 529,
+				resetTime: Date.now() + 10_000,
+			}),
+		});
+		globalThis.fetch = mock(async (input: Request) => {
+			const id = new URL(input.url).pathname.split("/").at(-1) ?? "";
+			calls.push({ account: id, model: (await input.clone().json()).model });
+			const status = id === accounts[0].id ? 529 : permanentStatus;
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: {
+						type:
+							status === 529
+								? "overloaded_error"
+								: status === 401
+									? "authentication_error"
+									: "invalid_request_error",
+						message:
+							status === 402 ? "Credit balance is too low" : "offline fixture",
+					},
+				}),
+				{ status, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(new Set(calls.map((call) => call.account)).size).toBe(2);
+			expect(calls.every((call) => call.model === "claude-fable-5")).toBe(true);
+			expect([429, 529]).not.toContain(response.status);
+			expect(response.headers.get("x-should-retry")).not.toBe("true");
+		} finally {
+			restore();
+		}
+	});
+
+	it("does not turn persisted reauthentication failure plus exhausted usage into quota retries", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) {
+			account.requires_reauth = true;
+			putUsage(account, 20, 100);
+			usageCache.markModelScopedExhausted(account.id, "claude-fable-5");
+		}
+		const transport = mock(async () => {
+			throw new Error("auth-blocked fixture");
+		});
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).not.toHaveBeenCalled();
+			expect([429, 529]).not.toContain(response.status);
+			expect(response.headers.get("x-should-retry")).not.toBe("true");
+		} finally {
+			restore();
+		}
+	});
+
+	it("does not synthesize capacity retry from a persisted billing cooldown", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) {
+			putUsage(account, 20);
+			account.rate_limited_until = Date.now() + 60_000;
+			account.rate_limited_reason = "out_of_credits";
+			usageCache.markModelScopedExhausted(account.id, "claude-fable-5");
+		}
+		const transport = mock(async () => {
+			throw new Error("billing-blocked offline fixture");
+		});
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).not.toHaveBeenCalled();
+			expect([429, 529]).not.toContain(response.status);
+			expect(response.headers.has("x-better-ccflare-pool-status")).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+
+	it("stops after client cancellation without sending another native route", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		const controller = new AbortController();
+		const transport = mock(async () => {
+			controller.abort();
+			throw new DOMException("offline caller cancelled", "AbortError");
+		});
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = new Request(makeProxyRequest("claude-fable-5", false), {
+				signal: controller.signal,
+			});
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(499);
+			expect(transport).toHaveBeenCalledTimes(1);
+		} finally {
+			restore();
+		}
+	});
+
+	it("does not replay an already delivered partial native stream", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		const provider = makeMockRoutingProvider("anthropic");
+		provider.buildUrl = (_path, _search, account) =>
+			`https://api.anthropic.com/offline/${account?.id}`;
+		provider.isStreamingResponse = () => true;
+		registerProvider(provider);
+		let streamController:
+			| ReadableStreamDefaultController<Uint8Array>
+			| undefined;
+		const transport = mock(
+			async () =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							streamController = controller;
+							controller.enqueue(
+								new TextEncoder().encode(
+									'event: message_start\ndata: {"type":"message_start","message":{"id":"offline-message","type":"message","role":"assistant","model":"claude-fable-5","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"already delivered"}}\n\n',
+								),
+							);
+						},
+					}),
+					{ headers: { "content-type": "text/event-stream" } },
+				),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-fable-5",
+					stream: true,
+					messages: [{ role: "user", content: "offline stream" }],
+					max_tokens: 16,
+				}),
+			});
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(200);
+			if (!response.body || !streamController)
+				throw new Error("Expected a streaming response fixture");
+			const reader = response.body.getReader();
+			const first = await reader.read();
+			expect(first.done).toBe(false);
+			streamController.error(
+				new TypeError("offline stream interruption after delivery"),
+			);
+			try {
+				while (!(await reader.read()).done) {
+					/* Drain the already committed stream. */
+				}
+			} catch {
+				/* Transport failure cannot authorize replay. */
+			}
+			expect(transport).toHaveBeenCalledTimes(1);
+		} finally {
+			restore();
+		}
+	});
+
+	it("keeps the existing physical attempt ceiling for a large opted-in native pool", async () => {
+		const { accounts, combo, ctx, restore } = nativePool();
+		const template = accounts[0];
+		accounts.splice(
+			0,
+			accounts.length,
+			...Array.from({ length: 34 }, (_, index) => ({
+				...template,
+				id: `native-budget-${index}`,
+				name: `native-budget-${index}`,
+			})),
+		);
+		combo.slots = accounts.map((account, index) => ({
+			id: `native-budget-slot-${index}`,
+			combo_id: combo.id,
+			account_id: account.id,
+			model: "claude-fable-5",
+			priority: 0,
+			enabled: true,
+		}));
+		for (const account of accounts) putUsage(account, 20);
+		const transport = mock(async () => {
+			throw new TypeError("offline transport unavailable");
+		});
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(503);
+			expect(await response.json()).toMatchObject({
+				error: { code: "physical_attempt_budget_exhausted" },
+			});
+			expect(transport).toHaveBeenCalledTimes(32);
+		} finally {
+			restore();
+		}
+	});
+
+	it.each([
+		false,
+		true,
+	])("missing overage needs authoritative native family rejection before Opus: %s", async (authoritative) => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		const withoutOverage = (account: Account, percent: number) => {
+			putUsage(account, percent);
+			const snapshot = usageCache.getSnapshot(account.id);
+			if (!snapshot) throw new Error("Expected cached native usage fixture");
+			const data = { ...snapshot.data } as Record<string, unknown>;
+			delete data.spend;
+			usageCache.set(account.id, data as never);
+		};
+		for (const account of accounts) withoutOverage(account, 20);
+		globalThis.fetch = mock(async (input: Request) => {
+			const id = new URL(input.url).pathname.split("/").at(-1) ?? "";
+			const model = (await input.clone().json()).model;
+			calls.push({ account: id, model });
+			if (model === "claude-fable-5") {
+				const matched = accounts.find((account) => account.id === id);
+				if (!matched) throw new Error("Unknown native account fixture");
+				withoutOverage(matched, 100);
+				return new Response(
+					'{"type":"error","error":{"type":"rate_limit_error"}}',
+					{
+						status: 429,
+						headers: {
+							"content-type": "application/json",
+							...(authoritative
+								? {
+										"anthropic-ratelimit-unified-7d-status": "rejected",
+										"anthropic-ratelimit-unified-reset": String(
+											Math.floor(Date.now() / 1000) + 600,
+										),
+									}
+								: {}),
+						},
+					},
+				);
+			}
+			return new Response('{"type":"message","content":[]}', {
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(calls.map((call) => call.model)).toEqual(
+				authoritative
+					? ["claude-fable-5", "claude-fable-5", "claude-opus-4-8"]
+					: ["claude-fable-5", "claude-fable-5"],
+			);
+			if (authoritative) expect(response.status).toBe(200);
+		} finally {
+			restore();
+		}
+	});
+
+	it("revisits recovered Fable when deferred Opus preparation occurs after the primary wave", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		for (const account of accounts) putUsage(account, 100);
+		ctx.strategy.select = mock(async () => []);
+		registerProvider({
+			...makeMockRoutingProvider("anthropic"),
+			buildUrl: (_path, _search, account) =>
+				`https://api.anthropic.com/offline/${account?.id}`,
+			transformRequestBody: async (request) => {
+				putUsage(accounts[0], 20);
+				return request;
+			},
+		});
+		globalThis.fetch = mock(async (input: Request) => {
+			calls.push({
+				account: new URL(input.url).pathname.split("/").at(-1) ?? "",
+				model: (await input.clone().json()).model,
+			});
+			return new Response('{"type":"message","content":[]}', {
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			expect(
+				(await handleProxy(request, new URL(request.url), ctx)).status,
+			).toBe(200);
+			expect(calls).toEqual([
+				{ account: accounts[0].id, model: "claude-fable-5" },
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("retains usable primary routes when the strategy suppresses the primary wave", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		putUsage(accounts[0], 20);
+		putUsage(accounts[1], 100);
+		ctx.strategy.select = mock(async () => []);
+		globalThis.fetch = mock(async (input: Request) => {
+			calls.push({
+				account: new URL(input.url).pathname.split("/").at(-1) ?? "",
+				model: (await input.clone().json()).model,
+			});
+			return new Response('{"type":"message","content":[]}', {
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			expect(
+				(await handleProxy(request, new URL(request.url), ctx)).status,
+			).toBe(200);
+			expect(calls).toEqual([
+				{ account: accounts[0].id, model: "claude-fable-5" },
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("admits configured Opus after every primary gains authoritative family evidence during this request", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		globalThis.fetch = mock(async (input: Request | string | URL) => {
+			const request = input as Request;
+			const id = new URL(request.url).pathname.split("/").at(-1) ?? "";
+			const model = ((await request.clone().json()) as { model: string }).model;
+			calls.push({ account: id, model });
+			if (model === "claude-fable-5") {
+				const account = accounts.find((candidate) => candidate.id === id);
+				if (!account) throw new Error("Unknown native account fixture");
+				putUsage(account, 100);
+				return new Response(
+					'{"type":"error","error":{"type":"rate_limit_error"}}',
+					{ status: 429, headers: { "content-type": "application/json" } },
+				);
+			}
+			return new Response(
+				'{"type":"message","model":"claude-opus-4-8","content":[]}',
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(200);
+			expect(calls.map((call) => call.model)).toEqual([
+				"claude-fable-5",
+				"claude-fable-5",
+				"claude-opus-4-8",
+			]);
+			expect(
+				new Set(calls.map((call) => `${call.account}:${call.model}`)).size,
+			).toBe(calls.length);
+		} finally {
+			restore();
 		}
 	});
 });

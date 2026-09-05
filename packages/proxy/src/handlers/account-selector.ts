@@ -53,6 +53,12 @@ import {
 } from "../server-tool-routing-errors";
 import { buildComboMembershipDiagnostics } from "./managed-routing-diagnostics";
 import {
+	evaluateNativeQuotaPolicy,
+	isNativeQuotaCandidateAdmitted,
+	type NativeQuotaContext,
+	resolveNativeQuotaContext,
+} from "./native-quota-policy";
+import {
 	emitPoolFloorEvent,
 	poolFloorApproachingThreshold,
 } from "./pool-floor-event";
@@ -701,6 +707,233 @@ const capacityDeferredModelRoutesMap = new WeakMap<
 	RequestMeta,
 	readonly CapacityDeferredModelRoute[]
 >();
+
+/** Captured before availability filtering so temporary failures cannot shrink the pool. */
+const nativeQuotaContextMap = new WeakMap<RequestMeta, NativeQuotaContext>();
+const nativeQuotaRequestContextMap = new WeakMap<RequestMeta, ProxyContext>();
+
+/** Request authority is independent of the complete native structural catalog. */
+export function isNativeQuotaRequestCandidateEligible(
+	meta: RequestMeta,
+	account: Account,
+	candidateId: string,
+	physicalModel?: string,
+): boolean {
+	const context = getNativeQuotaContext(meta);
+	if (!context) return true;
+	const ctx = nativeQuotaRequestContextMap.get(meta);
+	const member = context.members.find(
+		(candidate) =>
+			candidate.id === candidateId && candidate.account_id === account.id,
+	);
+	if (!ctx || !member) return false;
+	const policy = ctx.implicitFallbackPolicy ?? IMPLICIT_FALLBACK_POLICY_OFF;
+	if (
+		!isAccountEligibleForRouteIntent(account, meta, ctx) ||
+		isProviderExcludedForRequest(account, getExcludedProviders(meta)) ||
+		(policy.mode === "enforce" &&
+			!isImplicitFallbackAccountAllowed(account, policy))
+	)
+		return false;
+	if (!meta.serverToolRequirements) return true;
+	const routing: RoutingCandidateMetadata = {
+		candidateId: member.id,
+		accountId: account.id,
+		tier: member.tier,
+		ordinal: context.members.indexOf(member),
+		comboSlotId: member.slot_id,
+		modelOverride: member.logical_model,
+		quotaPressure: null,
+	};
+	routing.serverToolCapability = evaluateCandidateServerToolCapability({
+		account,
+		routing,
+		logicalModel: member.logical_model,
+		physicalModel,
+		meta,
+		ctx,
+	});
+	return isServerToolCandidateSemanticallyEligible(routing);
+}
+
+export function getNativeQuotaContext(
+	meta: RequestMeta,
+): NativeQuotaContext | null {
+	return nativeQuotaContextMap.get(meta) ?? null;
+}
+
+export function evaluateNativeQuotaRequest(
+	meta: RequestMeta,
+	now = Date.now(),
+	account?: Account,
+) {
+	const context = getNativeQuotaContext(meta);
+	return context
+		? evaluateNativeQuotaPolicy(context, {
+				accounts: account
+					? context.accounts.map((current) =>
+							current.id === account.id ? account : current,
+						)
+					: context.accounts,
+				getSnapshot: (accountId) => usageCache.getSnapshot(accountId),
+				getFamilyMarker: (accountId, model) =>
+					usageCache.getFamilyScopedExhaustion(accountId, model, now),
+				now,
+			})
+		: null;
+}
+
+/** Finite exact-model vetoes are temporary unavailability, never family proof. */
+export function getNativeQuotaCandidateModelUnavailableUntil(
+	meta: RequestMeta,
+	account: Account,
+	candidateId: string,
+	now = Date.now(),
+): number | null {
+	const context = getNativeQuotaContext(meta);
+	const member = context?.members.find(
+		(candidate) =>
+			candidate.id === candidateId && candidate.account_id === account.id,
+	);
+	if (!member) return null;
+	const destinations = getModelList(member.logical_model, account) ?? [
+		member.logical_model,
+	];
+	const beta = canonicalizeBetaSignature(meta.headers?.get("anthropic-beta"));
+	const logicalMarker = !destinations.includes(member.logical_model)
+		? usageCache.getModelScopedExhaustion(
+				account.id,
+				member.logical_model,
+				beta,
+				now,
+			)
+		: null;
+	const markers = logicalMarker
+		? [logicalMarker]
+		: destinations.map((model) =>
+				usageCache.getModelScopedExhaustion(account.id, model, beta, now),
+			);
+	return markers.length > 0 &&
+		markers.every(
+			(marker) =>
+				marker !== null &&
+				Number.isFinite(marker.expiresAt) &&
+				marker.expiresAt > now &&
+				Number.isFinite(marker.markedAt) &&
+				marker.markedAt <= now,
+		)
+		? Math.min(
+				...markers.map(
+					(marker) => marker?.expiresAt ?? Number.POSITIVE_INFINITY,
+				),
+			)
+		: null;
+}
+
+/** One request-aware fence; the global legacy getter retains its original contract. */
+export function isComboFallbackDisabled(
+	ctx: ProxyContext,
+	meta: RequestMeta,
+): boolean {
+	return (
+		getNativeQuotaContext(meta) !== null || isComboSessionFallbackDisabled(ctx)
+	);
+}
+
+export function isNativeQuotaRouteAllowed(
+	meta: RequestMeta,
+	account: Account,
+	model: string | null | undefined,
+	candidateId: string,
+	physicalModel?: string | null,
+	physicalEndpoint?: string,
+): boolean {
+	let context = getNativeQuotaContext(meta);
+	if (!context) return true;
+	context = {
+		...context,
+		accounts: context.accounts.map((current) =>
+			current.id === account.id ? account : current,
+		),
+	};
+	nativeQuotaContextMap.set(meta, context);
+	if (physicalEndpoint) {
+		try {
+			const endpoint = new URL(physicalEndpoint);
+			if (
+				endpoint.protocol !== "https:" ||
+				endpoint.hostname !== "api.anthropic.com" ||
+				endpoint.port ||
+				endpoint.username ||
+				endpoint.password
+			)
+				throw new Error("Non-native endpoint");
+		} catch {
+			nativeQuotaContextMap.set(meta, {
+				...context,
+				structuralError:
+					"Native quota route destination changed before transport.",
+			});
+			return false;
+		}
+	}
+	if (!model || !isAccountAvailable(account)) return false;
+	const member = context.members.find(
+		(candidate) =>
+			candidate.id === candidateId && candidate.account_id === account.id,
+	);
+	if (
+		!member ||
+		!isNativeQuotaRequestCandidateEligible(
+			meta,
+			account,
+			member.id,
+			physicalModel ?? undefined,
+		)
+	)
+		return false;
+	const evaluation = evaluateNativeQuotaRequest(meta, Date.now(), account);
+	if (evaluation?.structuralError)
+		nativeQuotaContextMap.set(meta, {
+			...context,
+			structuralError: evaluation.structuralError,
+		});
+	if (
+		!evaluation ||
+		!isNativeQuotaCandidateAdmitted(context, evaluation, {
+			accountId: account.id,
+			model,
+			candidateId,
+			physicalModel: physicalModel ?? undefined,
+		})
+	)
+		return false;
+	// A physical marker vetoes only its destination. Explicit same-family
+	// mappings may still have another usable destination for this member.
+	const beta = canonicalizeBetaSignature(meta.headers?.get("anthropic-beta"));
+	const now = Date.now();
+	const destinations = evaluation.physicalModels.get(member.id);
+	if (!destinations) return false;
+	if (
+		!destinations.includes(member.logical_model) &&
+		usageCache.getModelScopedExhaustion(
+			account.id,
+			member.logical_model,
+			beta,
+			now,
+		)
+	)
+		return false;
+	return (physicalModel ? [physicalModel] : destinations).some(
+		(destination) =>
+			usageCache.getModelScopedExhaustion(
+				account.id,
+				destination,
+				beta,
+				now,
+			) === null,
+	);
+}
 
 /** Retrieve request-local hard-capacity evidence (null before selection). */
 export function getRoutingCapacityContext(
@@ -2127,7 +2360,7 @@ async function selectCapabilityDescendantAccounts(
 	return finalAccounts;
 }
 
-function reportAccountDatabaseError(error: unknown): void {
+function reportAccountDatabaseError(error: unknown, nativeOwned = false): void {
 	log.error("Failed to get accounts from database:", error);
 	console.error("\n❌ DATABASE ERROR DETECTED");
 	console.error("═".repeat(50));
@@ -2135,7 +2368,11 @@ function reportAccountDatabaseError(error: unknown): void {
 	console.error("This may indicate database corruption or integrity issues.\n");
 	console.error("To diagnose and repair the database, run:");
 	console.error("  bun run cli --repair-db\n");
-	console.error("The request will fall back to unauthenticated mode.");
+	console.error(
+		nativeOwned
+			? "The native combo request will fail closed without upstream transport."
+			: "The request will fall back to unauthenticated mode.",
+	);
 	console.error(`${"═".repeat(50)}\n`);
 }
 
@@ -2296,6 +2533,8 @@ async function selectAccountsForRequestInternal(
 	options: AccountSelectionOptions = {},
 ): Promise<Account[]> {
 	comboSlotInfoMap.delete(meta);
+	nativeQuotaContextMap.delete(meta);
+	nativeQuotaRequestContextMap.delete(meta);
 	capacityDeferredModelRoutesMap.delete(meta);
 	meta.comboName = null;
 	meta.comboSlotIndex = null;
@@ -2734,11 +2973,29 @@ async function selectAccountsForRequestInternal(
 						exclusions: [],
 					};
 				}
+				// Capture policy ownership before account I/O. A failed read must
+				// not erase an already known native assignment and permit passthrough.
+				const pendingNativeContext = resolveNativeQuotaContext({
+					snapshot: routingPolicy,
+					requestedModel: effectiveModel,
+					members: [],
+					accounts: [],
+					explicitRoute: Boolean(
+						meta.routeProfileId ||
+							meta.forcedAccountId ||
+							publicForcedAccountId,
+					),
+				});
+				if (pendingNativeContext) {
+					nativeQuotaContextMap.set(meta, pendingNativeContext);
+					nativeQuotaRequestContextMap.set(meta, ctx);
+					meta.comboName = routingPolicy.combo?.name ?? null;
+				}
 				let allAccounts: Account[];
 				try {
 					allAccounts = await ctx.dbOps.getAllAccounts();
 				} catch (error) {
-					reportAccountDatabaseError(error);
+					reportAccountDatabaseError(error, pendingNativeContext !== null);
 					if (meta.serverToolRequirements) {
 						throw serverToolSelectionFailure(meta);
 					}
@@ -2765,7 +3022,23 @@ async function selectAccountsForRequestInternal(
 				}
 
 				const combo = routingPolicy.combo;
-				if (resolution.active && combo) {
+				const nativeContext = resolveNativeQuotaContext({
+					snapshot: routingPolicy,
+					requestedModel: effectiveModel,
+					members: resolution.members,
+					accounts: allAccounts,
+					explicitRoute: Boolean(
+						meta.routeProfileId ||
+							meta.forcedAccountId ||
+							publicForcedAccountId,
+					),
+				});
+				const nativePolicyEnabled = nativeContext !== null;
+				if (nativeContext) {
+					nativeQuotaContextMap.set(meta, nativeContext);
+					nativeQuotaRequestContextMap.set(meta, ctx);
+				}
+				if ((resolution.active || nativePolicyEnabled) && combo) {
 					const accountMap = new Map<string, Account>();
 					for (const account of allAccounts) {
 						accountMap.set(account.id, account);
@@ -2807,6 +3080,7 @@ async function selectAccountsForRequestInternal(
 					const candidateCountsByAccount = new Map<string, number>();
 					const eligibleCountsByAccount = new Map<string, number>();
 					const now = Date.now();
+					const nativeEvaluation = evaluateNativeQuotaRequest(meta, now);
 					const beta = canonicalizeBetaSignature(
 						meta.headers?.get("anthropic-beta"),
 					);
@@ -2855,8 +3129,14 @@ async function selectAccountsForRequestInternal(
 						}
 						candidateCatalog.push(routing);
 						if (
-							meta.serverToolRequirements &&
-							!isServerToolCandidateSemanticallyEligible(routing)
+							nativeContext
+								? !isNativeQuotaRequestCandidateEligible(
+										meta,
+										account,
+										member.id,
+									)
+								: meta.serverToolRequirements &&
+									!isServerToolCandidateSemanticallyEligible(routing)
 						) {
 							continue;
 						}
@@ -2868,7 +3148,7 @@ async function selectAccountsForRequestInternal(
 							account.id,
 							(candidateCountsByAccount.get(account.id) ?? 0) + 1,
 						);
-						const evaluation = evaluateCandidateCapacity(
+						let evaluation = evaluateCandidateCapacity(
 							account,
 							member.logical_model,
 							beta,
@@ -2876,6 +3156,41 @@ async function selectAccountsForRequestInternal(
 							capacityOptions,
 						);
 						routing.quotaPressure = evaluation.quotaPressure;
+						if (nativeEvaluation) {
+							const capacity = nativeEvaluation.capacities.get(member.id);
+							const exactMarker = usageCache.getModelScopedExhaustion(
+								account.id,
+								member.logical_model,
+								beta,
+								now,
+							);
+							const blockers: RoutingCapacityBlocker[] = (capacity ?? []).map(
+								snapshotBlocker,
+							);
+							if (exactMarker) {
+								const exact = getReactiveModelCapacityBlocker(
+									account.id,
+									member.logical_model,
+									beta,
+									now,
+								);
+								if (exact) blockers.push(exact);
+							}
+							evaluation = {
+								...evaluation,
+								blockers,
+								blockedUntil: blockers.length
+									? Math.max(
+											...blockers.map((blocker) => blocker.evidenceExpiresAt),
+										)
+									: null,
+							};
+							if (
+								!nativeEvaluation.admittedCandidateIds.includes(member.id) &&
+								blockers.length === 0
+							)
+								continue;
+						}
 						if (evaluation.blockers.length > 0) {
 							capacityExclusions.push(
 								candidateExclusion(
@@ -2903,6 +3218,25 @@ async function selectAccountsForRequestInternal(
 							quotaPressure: evaluation.quotaPressure,
 							routing,
 						});
+					}
+
+					// Keep primary service ahead of every backup even when a custom
+					// strategy or sticky owner would otherwise promote an Opus slot.
+					// Configured backups remain in the request context for deferred
+					// admission after this primary wave has actually failed.
+					if (
+						nativeEvaluation &&
+						eligibleEntries.some(
+							(entry) => getModelFamily(entry.modelOverride) === comboFamily,
+						)
+					) {
+						for (let index = eligibleEntries.length - 1; index >= 0; index--) {
+							if (
+								getModelFamily(eligibleEntries[index].modelOverride) !==
+								comboFamily
+							)
+								eligibleEntries.splice(index, 1);
+						}
 					}
 
 					setXaiCacheEligibleAccounts(
@@ -3067,7 +3401,7 @@ async function selectAccountsForRequestInternal(
 					}
 
 					// All effective candidates unavailable — fall back to normal routing.
-					if (isComboSessionFallbackDisabled(ctx)) {
+					if (isComboFallbackDisabled(ctx, meta)) {
 						setComboSlotInfo(meta, { comboName: combo.name, slots: [] });
 						meta.comboName = combo.name;
 						log.warn(

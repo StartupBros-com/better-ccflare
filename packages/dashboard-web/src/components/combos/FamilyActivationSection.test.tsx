@@ -127,6 +127,18 @@ describe("FamilyActivationSection managed policy controls", () => {
 		).toBe("The family policy was not changed. Try again.");
 	});
 
+	it("explains native shape failures without suggesting blind retries", () => {
+		expect(
+			familyPolicyMutationErrorMessage(
+				{ details: { code: "native_quota_invalid_route" } },
+				"fable",
+				"fable",
+			),
+		).toBe(
+			"Native quota wait was not enabled. Use native Anthropic subscription accounts with a primary family lane; Fable's optional Opus backups must use the same account pool after all primary tiers.",
+		);
+	});
+
 	it("rolls back with a mode-only partial policy update", async () => {
 		const update = mock(async () => assignment({ membership_mode: "manual" }));
 
@@ -312,6 +324,8 @@ describe("FamilyActivationSection managed policy controls", () => {
 		expect(html).toContain("Manual");
 		expect(html).toContain("Managed");
 		expect(html).toContain("Managed logical model");
+		expect(html).toContain("Wait for native Claude quota");
+		expect(html).toContain("same account pool");
 		expect(html).toContain("Changing this model opens a fresh server preview");
 		for (const [family, label] of [
 			["fable", "Fable"],
@@ -321,8 +335,12 @@ describe("FamilyActivationSection managed policy controls", () => {
 		] as const) {
 			expect(html).toContain(`aria-label="Enable ${label} family"`);
 			expect(html).toContain(`aria-label="${label} active combo"`);
+			expect(html).toContain(`aria-label="${label} exhaustion policy"`);
 			expect(html).toContain(`aria-label="${label} managed logical model"`);
 			expect(html).toContain(`id="${family}-managed-model"`);
 		}
+		expect(html).toContain(
+			"Each Opus backup requires confirmed Fable exhaustion on its own account",
+		);
 	});
 });

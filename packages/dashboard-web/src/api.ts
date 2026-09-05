@@ -14,6 +14,7 @@ import type {
 	CacheInsightsResponse,
 	CleanupResponse,
 	Combo,
+	ComboExhaustionPolicy,
 	ComboFamily,
 	ComboFamilyAssignment,
 	ComboMembershipMode,
@@ -2286,7 +2287,13 @@ class API extends HttpClient {
 			success: boolean;
 			data: ComboFamilyAssignment[];
 		}>("/api/families");
-		return { families: res.data.map((f) => ({ ...f, enabled: !!f.enabled })) };
+		return {
+			families: res.data.map((f) => ({
+				...f,
+				enabled: !!f.enabled,
+				exhaustion_policy: f.exhaustion_policy ?? "legacy",
+			})),
+		};
 	}
 
 	async assignFamily(params: {
@@ -2306,6 +2313,7 @@ class API extends HttpClient {
 		enabled?: boolean;
 		membershipMode?: ComboMembershipMode;
 		managedModel?: string | null;
+		exhaustionPolicy?: ComboExhaustionPolicy;
 	}): Promise<ComboFamilyAssignment> {
 		const response = await this.put<{
 			success: true;
@@ -2315,6 +2323,9 @@ class API extends HttpClient {
 			...(params.enabled !== undefined ? { enabled: params.enabled } : {}),
 			...(params.membershipMode !== undefined
 				? { membership_mode: params.membershipMode }
+				: {}),
+			...(params.exhaustionPolicy !== undefined
+				? { exhaustion_policy: params.exhaustionPolicy }
 				: {}),
 			...(params.managedModel !== undefined
 				? { managed_model: params.managedModel }

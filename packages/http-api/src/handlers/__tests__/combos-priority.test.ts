@@ -1,6 +1,7 @@
 import { describe, expect, it, mock } from "bun:test";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import type {
+	Account,
 	Combo,
 	ComboFamilyAssignment,
 	ComboSlot,
@@ -38,6 +39,7 @@ function request(method: "POST" | "PUT", body: unknown): Request {
 function makeDb(
 	existing: ComboSlot[] = [],
 	assignments: ComboFamilyAssignment[] = [],
+	accounts: Account[] = [],
 ) {
 	const addComboSlot = mock(
 		async (
@@ -66,11 +68,78 @@ function makeDb(
 			getCombo: mock(async () => combo),
 			getComboSlots: mock(async () => existing),
 			getFamilyAssignments: mock(async () => assignments),
+			getRoutingPolicyRevision: mock(async () => 0),
+			getAllAccounts: mock(async () => accounts),
+			getComboRoutingPolicy: mock(async (family: string) => ({
+				assignment: assignments.find(
+					(assignment) => assignment.family === family,
+				),
+				combo,
+				slots: existing,
+				rules: [],
+				exclusions: [],
+			})),
 			addComboSlot,
 			updateComboSlot,
 		} as unknown as DatabaseOperations,
 		addComboSlot,
 		updateComboSlot,
+	};
+}
+
+function nativeAccount(id: string, overrides: Partial<Account> = {}): Account {
+	return {
+		id,
+		name: id,
+		provider: "anthropic",
+		api_key: null,
+		refresh_token: `refresh-${id}`,
+		access_token: `access-${id}`,
+		expires_at: null,
+		request_count: 0,
+		total_requests: 0,
+		last_used: null,
+		created_at: 0,
+		rate_limited_until: null,
+		rate_limited_reason: null,
+		rate_limited_at: null,
+		session_start: null,
+		session_request_count: 0,
+		paused: false,
+		requires_reauth: false,
+		rate_limit_reset: null,
+		rate_limit_status: null,
+		rate_limit_remaining: null,
+		priority: 0,
+		auto_fallback_enabled: true,
+		auto_refresh_enabled: true,
+		auto_pause_on_overage_enabled: false,
+		peak_hours_pause_enabled: false,
+		custom_endpoint: null,
+		model_mappings: null,
+		cross_region_mode: null,
+		model_fallbacks: null,
+		billing_type: "plan",
+		pause_reason: null,
+		refresh_token_issued_at: null,
+		consecutive_rate_limits: 0,
+		...overrides,
+	};
+}
+
+function manualSlot(
+	id: string,
+	accountId: string,
+	model: string,
+	priority: number,
+): ComboSlot {
+	return {
+		id,
+		combo_id: combo.id,
+		account_id: accountId,
+		model,
+		priority,
+		enabled: true,
 	};
 }
 
@@ -273,5 +342,166 @@ describe("combo slot family alias validation", () => {
 
 		expect(response.status).toBe(200);
 		expect(updateComboSlot).toHaveBeenCalledWith("slot-0", { model: "opus" });
+	});
+});
+
+describe("native Fable quota-wait slot validation", () => {
+	const fableNativeAssignment: ComboFamilyAssignment = {
+		family: "fable",
+		combo_id: combo.id,
+		enabled: true,
+		membership_mode: "manual",
+		managed_model: null,
+		exhaustion_policy: "native_quota_wait",
+	};
+	const primary = manualSlot("primary", "account-a", "fable", 0);
+
+	it("adds an Opus backup on the primary account at a later tier", async () => {
+		const { dbOps, addComboSlot } = makeDb(
+			[primary],
+			[fableNativeAssignment],
+			[nativeAccount("account-a")],
+		);
+		const response = await createSlotAddHandler(dbOps)(
+			request("POST", {
+				account_id: "account-a",
+				model: "claude-opus-4-8",
+				priority: 1,
+			}),
+			combo.id,
+		);
+
+		expect(response.status).toBe(201);
+		expect(addComboSlot).toHaveBeenCalledWith(
+			combo.id,
+			"account-a",
+			"claude-opus-4-8",
+			1,
+		);
+	});
+
+	it("canonicalizes an Opus alias update after validating the proposed route", async () => {
+		const backup = manualSlot("backup", "account-a", "claude-opus-4-8", 1);
+		const { dbOps, updateComboSlot } = makeDb(
+			[primary, backup],
+			[fableNativeAssignment],
+			[nativeAccount("account-a")],
+		);
+		const response = await createSlotUpdateHandler(dbOps)(
+			request("PUT", { model: "  OPUS  " }),
+			combo.id,
+			backup.id,
+		);
+
+		expect(response.status).toBe(200);
+		expect(updateComboSlot).toHaveBeenCalledWith(backup.id, { model: "opus" });
+	});
+
+	for (const [label, accountId, priority] of [
+		["same tier", "account-a", 0],
+		["non-primary account", "account-b", 1],
+	] as const) {
+		it(`rejects an Opus backup on the ${label}`, async () => {
+			const { dbOps, addComboSlot } = makeDb(
+				[primary],
+				[fableNativeAssignment],
+				[nativeAccount("account-a"), nativeAccount("account-b")],
+			);
+			const response = await createSlotAddHandler(dbOps)(
+				request("POST", {
+					account_id: accountId,
+					model: "opus",
+					priority,
+				}),
+				combo.id,
+			);
+
+			expect(response.status).toBe(422);
+			expect(addComboSlot).not.toHaveBeenCalled();
+		});
+	}
+
+	for (const [label, overrides] of [
+		["mapping", { model_mappings: JSON.stringify({ opus: "gpt-5" }) }],
+		["provider", { provider: "ollama", refresh_token: null }],
+	] as const) {
+		it(`rejects a non-native Opus ${label}`, async () => {
+			const { dbOps, addComboSlot } = makeDb(
+				[primary],
+				[fableNativeAssignment],
+				[nativeAccount("account-a", overrides)],
+			);
+			const response = await createSlotAddHandler(dbOps)(
+				request("POST", {
+					account_id: "account-a",
+					model: "opus",
+					priority: 1,
+				}),
+				combo.id,
+			);
+
+			expect(response.status).toBe(422);
+			expect(addComboSlot).not.toHaveBeenCalled();
+		});
+	}
+
+	it("rejects incompatible simultaneous active native assignments", async () => {
+		const opusNativeAssignment: ComboFamilyAssignment = {
+			...fableNativeAssignment,
+			family: "opus",
+		};
+		const { dbOps, addComboSlot } = makeDb(
+			[primary],
+			[fableNativeAssignment, opusNativeAssignment],
+			[nativeAccount("account-a")],
+		);
+		const response = await createSlotAddHandler(dbOps)(
+			request("POST", {
+				account_id: "account-a",
+				model: "opus",
+				priority: 1,
+			}),
+			combo.id,
+		);
+
+		expect(response.status).toBe(422);
+		expect(addComboSlot).not.toHaveBeenCalled();
+	});
+
+	it("keeps legacy Fable assignments from accepting Opus", async () => {
+		const { dbOps, addComboSlot } = makeDb(
+			[],
+			[{ ...fableNativeAssignment, exhaustion_policy: "legacy" }],
+		);
+		const response = await createSlotAddHandler(dbOps)(
+			request("POST", {
+				account_id: "account-a",
+				model: "opus",
+				priority: 1,
+			}),
+			combo.id,
+		);
+
+		expect(response.status).toBe(400);
+		expect(addComboSlot).not.toHaveBeenCalled();
+	});
+
+	it("keeps unrelated family validation unchanged", async () => {
+		const sonnetAssignment: ComboFamilyAssignment = {
+			...fableNativeAssignment,
+			family: "sonnet",
+		};
+		const { dbOps, addComboSlot } = makeDb([], [sonnetAssignment]);
+		const response = await createSlotAddHandler(dbOps)(
+			request("POST", {
+				account_id: "account-a",
+				model: "opus",
+				priority: 1,
+			}),
+			combo.id,
+		);
+
+		expect(response.status).toBe(400);
+		expect(addComboSlot).not.toHaveBeenCalled();
 	});
 });

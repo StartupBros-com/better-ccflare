@@ -10,6 +10,7 @@ const { usageCache } = await import("@better-ccflare/providers");
 const {
 	getCapacityDeferredModelRoutes,
 	getComboSlotInfo,
+	getNativeQuotaContext,
 	getRoutingCapacityContext,
 	selectAccountsForRequest,
 } = await import("../account-selector");
@@ -327,5 +328,241 @@ describe("selectAccountsForRequest — model-scoped capacity routing", () => {
 		expect(getCapacityDeferredModelRoutes(fallbackMeta)).toMatchObject([
 			{ account: fallbackAccount, model: "claude-opus-4-8" },
 		]);
+	});
+});
+
+describe("native quota wait combo isolation", () => {
+	function nativeSetup(accounts: Account[]) {
+		const combo = makeCombo(accounts[0]?.id ?? "missing");
+		combo.slots = accounts.flatMap((account, index) => [
+			{
+				id: `native-primary-${index}`,
+				combo_id: combo.id,
+				account_id: account.id,
+				model: "claude-fable-5",
+				priority: 0,
+				enabled: true,
+			},
+			{
+				id: `native-backup-${index}`,
+				combo_id: combo.id,
+				account_id: account.id,
+				model: "claude-opus-4-8",
+				priority: 10,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({ accounts, combo, mode: "exhausted" });
+		ctx.config.getComboSessionFallback = () => true;
+		ctx.dbOps.getComboRoutingPolicy = mock(async () => ({
+			assignment: {
+				family: "fable",
+				combo_id: combo.id,
+				enabled: true,
+				membership_mode: "manual",
+				managed_model: null,
+				exhaustion_policy: "native_quota_wait",
+			},
+			combo,
+			slots: combo.slots,
+			rules: [],
+			exclusions: [],
+		}));
+		return { ctx, combo };
+	}
+
+	function familyUsage(
+		accountId: string,
+		percent = 100,
+		sharedPercent = 10,
+	): void {
+		cacheUsage(accountId, {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "session",
+					percent: sharedPercent,
+					resets_at: new Date(Date.now() + 3_600_000).toISOString(),
+					is_active: true,
+				},
+				{
+					kind: "weekly_all",
+					percent: 10,
+					resets_at: new Date(Date.now() + 3_600_000).toISOString(),
+					is_active: true,
+				},
+				{
+					kind: "weekly_scoped",
+					percent,
+					resets_at: new Date(Date.now() + 3_600_000).toISOString(),
+					is_active: true,
+					scope: { model: { id: null, display_name: "Fable" }, surface: null },
+				},
+			],
+		});
+	}
+
+	it("keeps all configured backups locked while any primary Fable allowance is usable", async () => {
+		const first = makeAccount({ id: "native-primary-used" });
+		const second = makeAccount({ id: "native-primary-ready" });
+		familyUsage(first.id);
+		familyUsage(second.id, 30);
+		const { ctx } = nativeSetup([first, second]);
+		const meta = makeRequestMeta();
+		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
+			[second],
+		);
+		expect(
+			meta.routingCandidates?.map((candidate) => candidate.modelOverride),
+		).toEqual(["claude-fable-5"]);
+		expect(meta.routingCandidateCatalog).toHaveLength(4);
+		expect(
+			meta.routingCandidateCatalog?.filter((candidate) => candidate.tier === 0),
+		).toHaveLength(2);
+	});
+
+	it("uses Opus B when A retains Fable allowance but its shared window is exhausted", async () => {
+		const first = makeAccount({ id: "native-shared-a" });
+		const second = makeAccount({ id: "native-proven-b" });
+		familyUsage(first.id, 51, 100);
+		familyUsage(second.id, 100, 20);
+		const { ctx } = nativeSetup([first, second]);
+		const meta = makeRequestMeta();
+		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
+			[second],
+		);
+		expect(
+			meta.routingCandidates?.map((candidate) => candidate.modelOverride),
+		).toEqual(["claude-opus-4-8"]);
+	});
+
+	it("preserves Fable priority against a strategy returning backup-first order", async () => {
+		const first = makeAccount({ id: "native-order-a" });
+		const second = makeAccount({ id: "native-order-b" });
+		familyUsage(first.id, 51, 20);
+		familyUsage(second.id, 100, 20);
+		const { ctx } = nativeSetup([first, second]);
+		ctx.strategy.select = mock((accounts: Account[]) => accounts.toReversed());
+		const meta = makeRequestMeta();
+		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
+			[first],
+		);
+		expect(meta.routingCandidates?.[0]?.modelOverride).toBe("claude-fable-5");
+	});
+
+	it("admits each same-pool Opus route when its own primary account proves family exhaustion", async () => {
+		const accounts = [
+			makeAccount({ id: "native-used-a" }),
+			makeAccount({ id: "native-used-b" }),
+		];
+		for (const account of accounts) familyUsage(account.id);
+		const { ctx } = nativeSetup(accounts);
+		const meta = makeRequestMeta();
+		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
+			accounts,
+		);
+		expect(
+			meta.routingCandidates?.map((candidate) => candidate.modelOverride),
+		).toEqual(["claude-opus-4-8", "claude-opus-4-8"]);
+	});
+
+	it("does not let a different account cooldown veto proven same-account Opus", async () => {
+		const first = makeAccount({ id: "native-cooldown-used" });
+		const second = makeAccount({
+			id: "native-cooldown-ready",
+			rate_limited_until: Date.now() + 60_000,
+		});
+		familyUsage(first.id);
+		familyUsage(second.id, 30);
+		const { ctx } = nativeSetup([first, second]);
+		const meta = makeRequestMeta();
+		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
+			[first],
+		);
+		expect(
+			meta.routingCandidates?.map((candidate) => candidate.modelOverride),
+		).toEqual(["claude-opus-4-8"]);
+		expect(meta.comboName).toBe("Fable Combo");
+	});
+
+	it("keeps mixed shared and family blockers owned by the combo instead of session fallback", async () => {
+		const first = makeAccount({ id: "native-mixed-used" });
+		const second = makeAccount({ id: "native-mixed-shared" });
+		familyUsage(first.id);
+		cacheUsage(second.id, sessionExhausted());
+		const { ctx } = nativeSetup([first, second]);
+		const unrelated = makeAccount({ id: "native-unrelated" });
+		ctx.dbOps.getAllAccounts = mock(async () => [first, second, unrelated]);
+		const meta = makeRequestMeta();
+		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
+			[first],
+		);
+		expect(getComboSlotInfo(meta)).toEqual({
+			comboName: "Fable Combo",
+			slots: [{ accountId: first.id, modelOverride: "claude-opus-4-8" }],
+		});
+	});
+
+	it("fails closed on opted-in cross-provider shape while leaving explicit force routes alone", async () => {
+		const account = makeAccount({
+			id: "native-invalid",
+			provider: "openrouter",
+			api_key: "offline-test",
+		});
+		const { ctx } = nativeSetup([account]);
+		const meta = makeRequestMeta();
+		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
+			[],
+		);
+		expect(meta.comboName).toBe("Fable Combo");
+		const forced = makeRequestMeta({
+			headers: new Headers({ "x-better-ccflare-account-id": account.id }),
+		});
+		expect(
+			await selectAccountsForRequest(forced, ctx, "claude-fable-5"),
+		).toEqual([account]);
+		expect(forced.comboName).toBeNull();
+	});
+
+	it("does not opt a non-Claude substring model into native quota isolation", async () => {
+		const { ctx } = nativeSetup([makeAccount({ id: "native-nonclaude" })]);
+		const meta = makeRequestMeta();
+		await selectAccountsForRequest(meta, ctx, "vendor-fable-custom");
+		expect(getNativeQuotaContext(meta)).toBeNull();
+	});
+
+	it("leaves explicit profiles and globally disabled combos outside native isolation", async () => {
+		const account = makeAccount({ id: "native-explicit" });
+		const { ctx } = nativeSetup([account]);
+		const profileMeta = makeRequestMeta({
+			routeProfileId: "explicit-native",
+			forcedAccountId: account.id,
+		});
+		expect(
+			await selectAccountsForRequest(profileMeta, ctx, "claude-fable-5"),
+		).toEqual([account]);
+		expect(getNativeQuotaContext(profileMeta)).toBeNull();
+		ctx.config.getCombosEnabled = () => false;
+		const disabledMeta = makeRequestMeta();
+		await selectAccountsForRequest(disabledMeta, ctx, "claude-fable-5");
+		expect(getNativeQuotaContext(disabledMeta)).toBeNull();
+	});
+
+	it("snaps back to Fable after refreshed usage recovers without dropping the primary catalog", async () => {
+		const account = makeAccount({ id: "native-reset" });
+		const { ctx } = nativeSetup([account]);
+		familyUsage(account.id);
+		const before = makeRequestMeta();
+		await selectAccountsForRequest(before, ctx, "claude-fable-5");
+		expect(before.routingCandidates?.[0]?.modelOverride).toBe(
+			"claude-opus-4-8",
+		);
+		familyUsage(account.id, 0);
+		const after = makeRequestMeta();
+		await selectAccountsForRequest(after, ctx, "claude-fable-5");
+		expect(
+			after.routingCandidates?.map((candidate) => candidate.modelOverride),
+		).toEqual(["claude-fable-5"]);
+		expect(after.routingCandidateCatalog).toHaveLength(2);
 	});
 });

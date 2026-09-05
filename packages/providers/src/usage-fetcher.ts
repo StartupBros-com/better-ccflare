@@ -60,8 +60,15 @@ interface ModelScopedDepletion {
 	markedAt: number;
 }
 
+/** Optional native rejection provenance; older/inferred markers remain untrusted. */
+export interface FamilyScopedRejectionEvidence {
+	readonly reason: "matching_scoped_limit";
+	readonly authoritativeNativeRejection: true;
+}
+
 interface FamilyScopedDepletion extends ModelScopedDepletion {
 	family: string;
+	evidence?: FamilyScopedRejectionEvidence;
 }
 
 function normalizeModelScope(model: string): string {
@@ -1576,6 +1583,7 @@ class UsageCache {
 		accountId: string,
 		model: string,
 		expiresAt: number = Date.now() + MODEL_SCOPED_DEPLETION_TTL_MS,
+		evidence?: FamilyScopedRejectionEvidence,
 	): boolean {
 		const family = getModelFamily(model);
 		if (family === null) return false;
@@ -1602,6 +1610,10 @@ class UsageCache {
 			family,
 			expiresAt: safeExpiresAt,
 			markedAt: now,
+			...(evidence?.reason === "matching_scoped_limit" &&
+			evidence.authoritativeNativeRejection === true
+				? { evidence: { ...evidence } }
+				: {}),
 		});
 		return true;
 	}
@@ -1616,6 +1628,7 @@ class UsageCache {
 		family: string;
 		expiresAt: number;
 		markedAt: number;
+		evidence?: FamilyScopedRejectionEvidence;
 	} | null {
 		const family = getModelFamily(model);
 		if (family === null) return null;

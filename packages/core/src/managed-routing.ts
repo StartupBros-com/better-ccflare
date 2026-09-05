@@ -6,3 +6,4 @@ export {
 	resolveFamilyAliasModel,
 } from "./model-mappings";
 export { LATEST_MODEL_BY_FAMILY } from "./models";
+export * from "./native-quota-route-shape";
