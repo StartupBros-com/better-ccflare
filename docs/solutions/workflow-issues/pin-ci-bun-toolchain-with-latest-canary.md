@@ -81,7 +81,12 @@ Rejected alternatives:
   a `<!-- bun-latest-canary:state resolved=<v> outcome=<success|failure> -->` marker embedded in the
   issue body and every comment lets the script dedupe — the same verdict for the same resolved
   version writes nothing twice. A passing gate on a version with no open issue writes only a
-  `::notice::`. The script never closes, edits, or labels an existing issue.
+  `::notice::`. The script never closes, edits, or labels an existing issue. The tracking issue and
+  its dedupe history are matched only among issues and comments authored by the workflow's own
+  identity (`github-actions[bot]`, overridable with `CANARY_ACTOR_LOGIN`) — an issue or comment from
+  anyone else can neither hijack the tracking issue nor suppress a real report — and both the open-issue
+  list and the comment history are paginated (`gh api --paginate --slurp`), so a long-lived issue
+  with more than 100 comments still surfaces its newest verdict.
 - **`auto-rerun-failed.yml`** excludes "Bun Latest Canary" from its rerun set: a scheduled
   toolchain verdict does not change on rerun, the report is already deduplicated per version, and
   each rerun would cost a full gate run for no new information.

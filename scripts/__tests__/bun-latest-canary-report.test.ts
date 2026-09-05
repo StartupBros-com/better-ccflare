@@ -76,24 +76,25 @@ function writeGhStub(dir: string): string {
 			"    '{args: $args, bodyFile: $bodyFile}' >> \"${CCFLARE_TEST_GH_LOG}\"",
 			"fi",
 			"",
-			'first_two="${1:-} ${2:-}"',
-			'if [[ -n "${CCFLARE_TEST_GH_FAIL:-}" && "${first_two}" == "${CCFLARE_TEST_GH_FAIL}" ]]; then',
-			'  echo "stub gh: forced failure for: ${first_two}" >&2',
+			'all_args="$*"',
+			'if [[ -n "${CCFLARE_TEST_GH_FAIL:-}" && "${all_args}" == *"${CCFLARE_TEST_GH_FAIL}"* ]]; then',
+			'  echo "stub gh: forced failure for: ${all_args}" >&2',
 			"  exit 1",
 			"fi",
 			"",
 			'case "${1:-}" in',
 			"  issue)",
 			'    case "${2:-}" in',
-			'      list) cat "${CCFLARE_TEST_GH_ISSUES}" ;;',
 			'      create) echo "https://github.com/example/repo/issues/999" ;;',
 			"      comment) : ;;",
 			"    esac",
 			"    ;;",
 			"  api)",
-			'    case "${2:-}" in',
-			"      repos/*/issues/*/comments*) cat \"${CCFLARE_TEST_GH_COMMENTS}\" ;;",
-			"    esac",
+			'    if [[ "${all_args}" == *"/comments"* ]]; then',
+			'      cat "${CCFLARE_TEST_GH_COMMENTS}"',
+			'    elif [[ "${all_args}" == *"issues?"* ]]; then',
+			'      cat "${CCFLARE_TEST_GH_ISSUES}"',
+			"    fi",
 			"    ;;",
 			"esac",
 			"",
@@ -147,8 +148,8 @@ describe("bun-latest-canary-report.sh", () => {
 	test("case 1: failure, no open tracking issue -> files exactly one issue create", () => {
 		const dir = tempDir();
 		const binDir = writeGhStub(dir);
-		writeFileSync(join(dir, "issues.json"), "[]");
-		writeFileSync(join(dir, "comments.json"), "[]");
+		writeFileSync(join(dir, "issues.json"), "[[]]");
+		writeFileSync(join(dir, "comments.json"), "[[]]");
 		const env = baseEnv(dir, binDir);
 
 		const result = runReport(env);
@@ -183,14 +184,17 @@ describe("bun-latest-canary-report.sh", () => {
 		writeFileSync(
 			join(dir, "issues.json"),
 			JSON.stringify([
-				{
-					number: 5,
-					title: "ci: Bun 1.4.3 fails the managed-routing gate",
-					body: `${MARKER}\n${STATE_MARKER}\n`,
-				},
+				[
+					{
+						number: 5,
+						title: "ci: Bun 1.4.3 fails the managed-routing gate",
+						body: `${MARKER}\n${STATE_MARKER}\n`,
+						user: { login: "github-actions[bot]" },
+					},
+				],
 			]),
 		);
-		writeFileSync(join(dir, "comments.json"), "[]");
+		writeFileSync(join(dir, "comments.json"), "[[]]");
 		const env = baseEnv(dir, binDir);
 
 		const result = runReport(env);
@@ -213,19 +217,23 @@ describe("bun-latest-canary-report.sh", () => {
 		writeFileSync(
 			join(dir, "issues.json"),
 			JSON.stringify([
-				{
-					number: 42,
-					title: "some unrelated open issue",
-					body: "just a decoy issue with no marker at all",
-				},
-				{
-					number: 7,
-					title: "ci: Bun 1.4.0 fails the managed-routing gate",
-					body: `${MARKER}\n${oldState}\n`,
-				},
+				[
+					{
+						number: 42,
+						title: "some unrelated open issue",
+						body: "just a decoy issue with no marker at all",
+						user: { login: "someone-else" },
+					},
+					{
+						number: 7,
+						title: "ci: Bun 1.4.0 fails the managed-routing gate",
+						body: `${MARKER}\n${oldState}\n`,
+						user: { login: "github-actions[bot]" },
+					},
+				],
 			]),
 		);
-		writeFileSync(join(dir, "comments.json"), "[]");
+		writeFileSync(join(dir, "comments.json"), "[[]]");
 		const env = baseEnv(dir, binDir);
 
 		const result = runReport(env);
@@ -251,14 +259,17 @@ describe("bun-latest-canary-report.sh", () => {
 		writeFileSync(
 			join(dir, "issues.json"),
 			JSON.stringify([
-				{
-					number: 9,
-					title: "ci: Bun 1.4.3 fails the managed-routing gate",
-					body: `${MARKER}\n${STATE_MARKER}\n`,
-				},
+				[
+					{
+						number: 9,
+						title: "ci: Bun 1.4.3 fails the managed-routing gate",
+						body: `${MARKER}\n${STATE_MARKER}\n`,
+						user: { login: "github-actions[bot]" },
+					},
+				],
 			]),
 		);
-		writeFileSync(join(dir, "comments.json"), "[]");
+		writeFileSync(join(dir, "comments.json"), "[[]]");
 		const env = baseEnv(dir, binDir, { CANARY_GATE_OUTCOME: "success" });
 
 		const result = runReport(env);
@@ -280,10 +291,13 @@ describe("bun-latest-canary-report.sh", () => {
 		writeFileSync(
 			join(dir, "comments.json"),
 			JSON.stringify([
-				{
-					body: "<!-- bun-latest-canary:state resolved=1.4.3 outcome=success -->\nBun 1.4.3 passes.",
-					created_at: "2026-09-05T00:00:00Z",
-				},
+				[
+					{
+						body: "<!-- bun-latest-canary:state resolved=1.4.3 outcome=success -->\nBun 1.4.3 passes.",
+						created_at: "2026-09-05T00:00:00Z",
+						user: { login: "github-actions[bot]" },
+					},
+				],
 			]),
 		);
 		const result2 = runReport(env);
@@ -302,8 +316,8 @@ describe("bun-latest-canary-report.sh", () => {
 	test("case 5: success, no open issue -> no writes, stdout carries ::notice::", () => {
 		const dir = tempDir();
 		const binDir = writeGhStub(dir);
-		writeFileSync(join(dir, "issues.json"), "[]");
-		writeFileSync(join(dir, "comments.json"), "[]");
+		writeFileSync(join(dir, "issues.json"), "[[]]");
+		writeFileSync(join(dir, "comments.json"), "[[]]");
 		const env = baseEnv(dir, binDir, { CANARY_GATE_OUTCOME: "success" });
 
 		const result = runReport(env);
@@ -319,12 +333,14 @@ describe("bun-latest-canary-report.sh", () => {
 		expect(out(result)).toContain("::notice::");
 	});
 
-	test("case 6: gh issue list failure -> exit 1 with ::error::", () => {
+	test("case 6: gh issues fetch failure -> exit 1 with ::error::", () => {
 		const dir = tempDir();
 		const binDir = writeGhStub(dir);
-		writeFileSync(join(dir, "issues.json"), "[]");
-		writeFileSync(join(dir, "comments.json"), "[]");
-		const env = baseEnv(dir, binDir, { CCFLARE_TEST_GH_FAIL: "issue list" });
+		writeFileSync(join(dir, "issues.json"), "[[]]");
+		writeFileSync(join(dir, "comments.json"), "[[]]");
+		const env = baseEnv(dir, binDir, {
+			CCFLARE_TEST_GH_FAIL: "issues?state=open",
+		});
 
 		const result = runReport(env);
 		expect(result.exitCode).toBe(1);
@@ -334,8 +350,8 @@ describe("bun-latest-canary-report.sh", () => {
 	test("case 7: gate outcome skipped -> exit 0, no gh writes at all", () => {
 		const dir = tempDir();
 		const binDir = writeGhStub(dir);
-		writeFileSync(join(dir, "issues.json"), "[]");
-		writeFileSync(join(dir, "comments.json"), "[]");
+		writeFileSync(join(dir, "issues.json"), "[[]]");
+		writeFileSync(join(dir, "comments.json"), "[[]]");
 		const env = baseEnv(dir, binDir, { CANARY_GATE_OUTCOME: "skipped" });
 
 		const result = runReport(env);
@@ -348,11 +364,177 @@ describe("bun-latest-canary-report.sh", () => {
 	test("case 8: missing CANARY_RESOLVED_BUN -> exit 2", () => {
 		const dir = tempDir();
 		const binDir = writeGhStub(dir);
-		writeFileSync(join(dir, "issues.json"), "[]");
-		writeFileSync(join(dir, "comments.json"), "[]");
+		writeFileSync(join(dir, "issues.json"), "[[]]");
+		writeFileSync(join(dir, "comments.json"), "[[]]");
 		const env = baseEnv(dir, binDir, { CANARY_RESOLVED_BUN: undefined });
 
 		const result = runReport(env);
 		expect(result.exitCode).toBe(2);
+	});
+
+	test("case 9: an open issue with the marker authored by another login is ignored, so failure files a new issue", () => {
+		const dir = tempDir();
+		const binDir = writeGhStub(dir);
+		writeFileSync(
+			join(dir, "issues.json"),
+			JSON.stringify([
+				[
+					{
+						number: 5,
+						title: "ci: Bun 1.4.3 fails the managed-routing gate",
+						body: `${MARKER}\n${STATE_MARKER}\n`,
+						user: { login: "someone-else" },
+					},
+				],
+			]),
+		);
+		writeFileSync(join(dir, "comments.json"), "[[]]");
+		const env = baseEnv(dir, binDir);
+
+		const result = runReport(env);
+		expect(result.exitCode).toBe(0);
+
+		const log = readGhLog(join(dir, "gh.log"));
+		const creates = log.filter(
+			(entry) => entry.args[0] === "issue" && entry.args[1] === "create",
+		);
+		const comments = log.filter(
+			(entry) => entry.args[0] === "issue" && entry.args[1] === "comment",
+		);
+		expect(creates.length).toBe(1);
+		expect(comments.length).toBe(0);
+	});
+
+	test("case 10: a comment carrying the current state marker from another login does not suppress the report", () => {
+		const dir = tempDir();
+		const binDir = writeGhStub(dir);
+		const oldState =
+			"<!-- bun-latest-canary:state resolved=1.4.0 outcome=failure -->";
+		writeFileSync(
+			join(dir, "issues.json"),
+			JSON.stringify([
+				[
+					{
+						number: 11,
+						title: "ci: Bun 1.4.0 fails the managed-routing gate",
+						body: `${MARKER}\n${oldState}\n`,
+						user: { login: "github-actions[bot]" },
+					},
+				],
+			]),
+		);
+		writeFileSync(
+			join(dir, "comments.json"),
+			JSON.stringify([
+				[
+					{
+						body: `${STATE_MARKER}\nspoofed by a non-actor login`,
+						created_at: "2026-09-05T00:00:00Z",
+						user: { login: "mallory" },
+					},
+				],
+			]),
+		);
+		const env = baseEnv(dir, binDir);
+
+		const result = runReport(env);
+		expect(result.exitCode).toBe(0);
+
+		const log = readGhLog(join(dir, "gh.log"));
+		const creates = log.filter(
+			(entry) => entry.args[0] === "issue" && entry.args[1] === "create",
+		);
+		const comments = log.filter(
+			(entry) => entry.args[0] === "issue" && entry.args[1] === "comment",
+		);
+		expect(creates.length).toBe(0);
+		expect(comments.length).toBe(1);
+		expect(comments[0].args).toContain("11");
+		expect(comments[0].bodyFile).toContain(STATE_MARKER);
+	});
+
+	test("case 11: comments paginate across two pages; a state marker only on the second page still counts", () => {
+		const dir = tempDir();
+		const binDir = writeGhStub(dir);
+		writeFileSync(
+			join(dir, "issues.json"),
+			JSON.stringify([
+				[
+					{
+						number: 13,
+						title: "ci: Bun 1.4.3 fails the managed-routing gate",
+						body: `${MARKER}\n`,
+						user: { login: "github-actions[bot]" },
+					},
+				],
+			]),
+		);
+		writeFileSync(
+			join(dir, "comments.json"),
+			JSON.stringify([
+				[
+					{
+						body: "<!-- bun-latest-canary:state resolved=1.4.0 outcome=failure -->\nBun 1.4.0 fails.",
+						created_at: "2026-09-01T00:00:00Z",
+						user: { login: "github-actions[bot]" },
+					},
+				],
+				[
+					{
+						body: `${STATE_MARKER}\nBun 1.4.3 still fails.`,
+						created_at: "2026-09-05T00:00:00Z",
+						user: { login: "github-actions[bot]" },
+					},
+				],
+			]),
+		);
+		const env = baseEnv(dir, binDir);
+
+		const result = runReport(env);
+		expect(result.exitCode).toBe(0);
+
+		const log = readGhLog(join(dir, "gh.log"));
+		const writes = log.filter(
+			(entry) =>
+				entry.args[0] === "issue" &&
+				(entry.args[1] === "create" || entry.args[1] === "comment"),
+		);
+		expect(writes.length).toBe(0);
+	});
+
+	test("case 12: an open pull request carrying the marker is ignored, so failure files a new issue", () => {
+		const dir = tempDir();
+		const binDir = writeGhStub(dir);
+		writeFileSync(
+			join(dir, "issues.json"),
+			JSON.stringify([
+				[
+					{
+						number: 6,
+						title: "ci: Bun 1.4.3 fails the managed-routing gate",
+						body: `${MARKER}\n${STATE_MARKER}\n`,
+						user: { login: "github-actions[bot]" },
+						pull_request: {
+							url: "https://api.github.com/repos/example/repo/pulls/6",
+						},
+					},
+				],
+			]),
+		);
+		writeFileSync(join(dir, "comments.json"), "[[]]");
+		const env = baseEnv(dir, binDir);
+
+		const result = runReport(env);
+		expect(result.exitCode).toBe(0);
+
+		const log = readGhLog(join(dir, "gh.log"));
+		const creates = log.filter(
+			(entry) => entry.args[0] === "issue" && entry.args[1] === "create",
+		);
+		const comments = log.filter(
+			(entry) => entry.args[0] === "issue" && entry.args[1] === "comment",
+		);
+		expect(creates.length).toBe(1);
+		expect(comments.length).toBe(0);
 	});
 });

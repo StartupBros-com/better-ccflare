@@ -33,6 +33,13 @@
 #                          (`skipped`, `cancelled`, ...) -> ::warning:: + exit 0
 #   CANARY_REQUESTED_BUN   optional, default "latest" -- the requested channel
 #                          (e.g. "latest", "1.5.x") before setup-bun resolved it
+#   CANARY_ACTOR_LOGIN     optional, default "github-actions[bot]" -- the
+#                          identity secrets.GITHUB_TOKEN writes as. Only the
+#                          open issue and comments authored by this login are
+#                          considered when locating the tracking issue and its
+#                          dedupe history, so an issue or comment from anyone
+#                          else can neither hijack the tracking issue nor
+#                          suppress a real report.
 #
 # Usage (as run by the workflow; GH_TOKEN normally comes from
 # secrets.GITHUB_TOKEN and GITHUB_REPOSITORY from the runner environment):
@@ -57,6 +64,7 @@ for var in GH_TOKEN GITHUB_REPOSITORY CANARY_RUN_URL CANARY_RESOLVED_BUN CANARY_
 done
 
 CANARY_REQUESTED_BUN="${CANARY_REQUESTED_BUN:-latest}"
+CANARY_ACTOR_LOGIN="${CANARY_ACTOR_LOGIN:-github-actions[bot]}"
 
 case "${CANARY_GATE_OUTCOME}" in
   success | failure) ;;
@@ -87,24 +95,40 @@ STATE_MARKER_REGEX='<!-- bun-latest-canary:state resolved=[^[:space:]]+ outcome=
 TMP_DIR="${RUNNER_TEMP:-$(mktemp -d)}"
 mkdir -p "${TMP_DIR}"
 
-ISSUES_JSON="$(gh_capture issue list --repo "${GITHUB_REPOSITORY}" --state open --limit 100 --json number,title,body)"
+# The REST issues list includes pull requests (each carries a `pull_request`
+# key) and every open issue regardless of author, so both are filtered out
+# below rather than trusted from the query string alone. --paginate follows
+# every page; --slurp collects the pages as an array of per-page arrays,
+# which `flatten(1)` merges into one flat array of issues.
+ISSUES_JSON="$(gh_capture api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100")"
+ISSUES_JSON="$(printf '%s' "${ISSUES_JSON}" | jq 'flatten(1)')"
 
-# Lowest-numbered open issue whose body carries MARKER; empty if none. A
-# decoy open issue without the marker must never be picked up here.
-ISSUE="$(printf '%s' "${ISSUES_JSON}" | jq -r --arg marker "${MARKER}" '
-  [.[] | select((.body // "") | contains($marker))]
+# Lowest-numbered open issue authored by CANARY_ACTOR_LOGIN whose body
+# carries MARKER; empty if none. A decoy open issue without the marker, an
+# issue authored by someone else, or an open pull request must never be
+# picked up here -- only the workflow's own identity can hijack or suppress
+# the tracking issue via a crafted issue/comment.
+ISSUE="$(printf '%s' "${ISSUES_JSON}" | jq -r --arg marker "${MARKER}" --arg actor "${CANARY_ACTOR_LOGIN}" '
+  [.[]
+    | select(.pull_request == null)
+    | select((.user.login // "") == $actor)
+    | select((.body // "") | contains($marker))]
   | sort_by(.number)
   | (.[0].number // empty)
 ')"
 
 LAST_STATE_MARKER=""
 if [[ -n "${ISSUE}" ]]; then
-  COMMENTS_JSON="$(gh_capture api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE}/comments?per_page=100")"
+  COMMENTS_JSON="$(gh_capture api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${ISSUE}/comments?per_page=100")"
+  COMMENTS_JSON="$(printf '%s' "${COMMENTS_JSON}" | jq 'flatten(1)')"
   ISSUE_BODY="$(printf '%s' "${ISSUES_JSON}" | jq -r --argjson num "${ISSUE}" '
     .[] | select(.number == $num) | (.body // "")
   ')"
-  COMMENTS_TEXT="$(printf '%s' "${COMMENTS_JSON}" | jq -r '
-    sort_by(.created_at) | map(.body // "") | join("\n")
+  # Only comments authored by CANARY_ACTOR_LOGIN count towards dedupe state;
+  # a comment from anyone else must not suppress (or fake) a report.
+  COMMENTS_TEXT="$(printf '%s' "${COMMENTS_JSON}" | jq -r --arg actor "${CANARY_ACTOR_LOGIN}" '
+    [.[] | select((.user.login // "") == $actor)]
+    | sort_by(.created_at) | map(.body // "") | join("\n")
   ')"
   # History in chronological order: the issue body first, then comments.
   # The last state marker found across that history is the last verdict
