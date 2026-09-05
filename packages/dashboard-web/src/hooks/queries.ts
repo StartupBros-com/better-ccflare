@@ -1,6 +1,7 @@
 import { getModelDisplayName } from "@better-ccflare/core";
 import type {
 	AgentUpdatePayload,
+	ComboExhaustionPolicy,
 	ComboFamily,
 	ComboMembershipMode,
 	ComboRoutingPreviewSubject,
@@ -279,6 +280,7 @@ export interface UpdateFamilyPolicyVariables {
 	enabled?: boolean;
 	membershipMode?: ComboMembershipMode;
 	managedModel?: string | null;
+	exhaustionPolicy?: ComboExhaustionPolicy;
 }
 
 export const getUpdateFamilyPolicyMutationOptions = (

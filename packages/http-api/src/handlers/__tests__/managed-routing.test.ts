@@ -268,6 +268,228 @@ function statefulDb() {
 	};
 }
 
+describe("native quota family policy HTTP control plane", () => {
+	function nativeState() {
+		const state = statefulDb();
+		for (const id of ["a", "b", "new"]) {
+			state.mutateAccount(id, { custom_endpoint: null, model_mappings: null });
+		}
+		state.mutatePolicy((policy) => {
+			policy.assignment.family = "fable";
+			policy.slots = ["a", "b"].flatMap((account_id) => [
+				{
+					id: `${account_id}-fable`,
+					account_id,
+					combo_id: "combo-1",
+					model: "fable",
+					priority: 0,
+					enabled: true,
+				},
+				{
+					id: `${account_id}-opus`,
+					account_id,
+					combo_id: "combo-1",
+					model: "opus",
+					priority: 10,
+					enabled: true,
+				},
+			]);
+		});
+		return state;
+	}
+
+	for (const exhaustion_policy of [
+		null,
+		true,
+		42,
+		"wait",
+		"NATIVE_QUOTA_WAIT",
+	]) {
+		it(`rejects invalid exhaustion policy ${JSON.stringify(exhaustion_policy)}`, async () => {
+			const state = nativeState();
+			const response = await createFamilyAssignHandler(
+				state.dbOps,
+				dependencies,
+			)(request("/api/families/fable", { exhaustion_policy }, "PUT"), "fable");
+			expect(response.status).toBe(400);
+			expect(state.applyFamilyPolicyChanges).not.toHaveBeenCalled();
+		});
+	}
+
+	it("enables native wait as a revision-checked partial update and preserves it on legacy-shaped activation", async () => {
+		const state = nativeState();
+		const handler = createFamilyAssignHandler(state.dbOps, dependencies);
+		const response = await handler(
+			request(
+				"/api/families/fable",
+				{ exhaustion_policy: "native_quota_wait" },
+				"PUT",
+			),
+			"fable",
+		);
+		expect(response.status).toBe(200);
+		expect((await response.json()).data).toMatchObject({
+			exhaustion_policy: "native_quota_wait",
+			combo_id: "combo-1",
+			enabled: true,
+		});
+		expect(state.applyFamilyPolicyChanges.mock.calls[0]?.[0]).toMatchObject({
+			expected_revision: 4,
+			assignment: { exhaustion_policy: "native_quota_wait" },
+		});
+		const again = await handler(
+			request(
+				"/api/families/fable",
+				{ combo_id: "combo-1", enabled: true },
+				"PUT",
+			),
+			"fable",
+		);
+		expect(again.status).toBe(200);
+		expect((await again.json()).data.exhaustion_policy).toBe(
+			"native_quota_wait",
+		);
+		const effective = await createEffectiveRoutingHandler(
+			state.dbOps,
+			dependencies,
+		)("fable");
+		expect(
+			(await effective.json()).data.policy.assignment.exhaustion_policy,
+		).toBe("native_quota_wait");
+	});
+
+	for (const invalidShape of [
+		"foreign-provider",
+		"api-key",
+		"mapped-destination",
+		"empty-primary",
+		"outside-backup",
+		"early-backup",
+		"foreign-family",
+	] as const) {
+		it(`rejects opted-in ${invalidShape} shape without mutating assignment`, async () => {
+			const state = nativeState();
+			if (invalidShape === "foreign-provider")
+				state.mutateAccount("a", { provider: "openrouter" });
+			if (invalidShape === "api-key")
+				state.mutateAccount("a", {
+					api_key: "offline-fixture",
+					refresh_token: null,
+					billing_type: "api",
+				});
+			if (invalidShape === "mapped-destination")
+				state.mutateAccount("a", {
+					model_mappings: JSON.stringify({ fable: "vendor/other" }),
+				});
+			state.mutatePolicy((policy) => {
+				const backup = policy.slots.find((slot) => slot.model === "opus");
+				if (!backup) throw new Error("Native fixture requires an Opus slot");
+				if (invalidShape === "empty-primary")
+					policy.slots = policy.slots.filter((slot) => slot.model === "opus");
+				if (invalidShape === "outside-backup") backup.account_id = "new";
+				if (invalidShape === "early-backup") backup.priority = 0;
+				if (invalidShape === "foreign-family") backup.model = "sonnet";
+			});
+			const response = await createFamilyAssignHandler(
+				state.dbOps,
+				dependencies,
+			)(
+				request(
+					"/api/families/fable",
+					{ exhaustion_policy: "native_quota_wait" },
+					"PUT",
+				),
+				"fable",
+			);
+			expect(response.status).toBe(422);
+			expect((await response.json()).details.code).toBe(
+				"native_quota_invalid_route",
+			);
+			expect(state.applyFamilyPolicyChanges).not.toHaveBeenCalled();
+		});
+	}
+
+	it("revalidates opted-in activation after a route edit but permits rollback and legacy cross-family routes", async () => {
+		const state = nativeState();
+		state.mutatePolicy((policy) => {
+			policy.assignment.exhaustion_policy = "native_quota_wait";
+			const primary = policy.slots[0];
+			if (!primary) throw new Error("Native fixture requires a primary slot");
+			primary.model = "sonnet";
+		});
+		const handler = createFamilyAssignHandler(state.dbOps, dependencies);
+		expect(
+			(
+				await handler(
+					request(
+						"/api/families/fable",
+						{ combo_id: "combo-1", enabled: true },
+						"PUT",
+					),
+					"fable",
+				)
+			).status,
+		).toBe(422);
+		expect(
+			(
+				await handler(
+					request(
+						"/api/families/fable",
+						{ exhaustion_policy: "legacy" },
+						"PUT",
+					),
+					"fable",
+				)
+			).status,
+		).toBe(200);
+		expect(
+			(
+				await handler(
+					request(
+						"/api/families/fable",
+						{ combo_id: "combo-1", enabled: true },
+						"PUT",
+					),
+					"fable",
+				)
+			).status,
+		).toBe(200);
+	});
+
+	it("treats paused accounts as structural members and rejects stale policy previews", async () => {
+		const state = nativeState();
+		state.mutateAccount("a", { paused: true });
+		const handler = createFamilyAssignHandler(state.dbOps, dependencies);
+		expect(
+			(
+				await handler(
+					request(
+						"/api/families/fable",
+						{ exhaustion_policy: "native_quota_wait" },
+						"PUT",
+					),
+					"fable",
+				)
+			).status,
+		).toBe(200);
+		state.interleaveBeforeNextApply(() =>
+			state.mutateAccount("b", { priority: 9 }),
+		);
+		expect(
+			(
+				await handler(
+					request(
+						"/api/families/fable",
+						{ exhaustion_policy: "legacy" },
+						"PUT",
+					),
+					"fable",
+				)
+			).status,
+		).toBe(409);
+	});
+});
+
 describe("managed routing HTTP control plane", () => {
 	it("builds one coherent account-routing overview for ten accounts and two families", async () => {
 		const accounts = Array.from({ length: 10 }, (_, index) =>
@@ -2088,5 +2310,124 @@ describe("managed routing HTTP control plane", () => {
 			expect(response.status).toBe(400);
 		}
 		expect(previewFamilyAliasPolicy).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("native quota family HTTP policy", () => {
+	function nativeState() {
+		const state = statefulDb();
+		for (const id of ["a", "b", "new"])
+			state.mutateAccount(id, { custom_endpoint: null, model_mappings: null });
+		return state;
+	}
+	it("rejects invalid exhaustion enums before applying", async () => {
+		for (const exhaustion_policy of [null, true, "wait", 1]) {
+			const state = statefulDb();
+			const response = await createFamilyAssignHandler(
+				state.dbOps,
+				dependencies,
+			)(request("/api/families/opus", { exhaustion_policy }), "opus");
+			expect(response.status).toBe(400);
+			expect(state.applyFamilyPolicyChanges).not.toHaveBeenCalled();
+		}
+	});
+	it("applies policy alone with revision protection, preserves partial fields, and exposes effective policy", async () => {
+		const state = nativeState();
+		const response = await createFamilyAssignHandler(state.dbOps, dependencies)(
+			request("/api/families/opus", { exhaustion_policy: "native_quota_wait" }),
+			"opus",
+		);
+		expect(response.status).toBe(200);
+		expect((await response.json()).data).toMatchObject({
+			exhaustion_policy: "native_quota_wait",
+			combo_id: "combo-1",
+			enabled: true,
+			membership_mode: "manual",
+		});
+		expect(state.applyFamilyPolicyChanges).toHaveBeenCalledWith({
+			family: "opus",
+			expected_revision: 3,
+			assignment: { exhaustion_policy: "native_quota_wait" },
+		});
+		const effective = await createEffectiveRoutingHandler(
+			state.dbOps,
+			dependencies,
+		)("opus");
+		expect(
+			(await effective.json()).data.policy.assignment.exhaustion_policy,
+		).toBe("native_quota_wait");
+		const disabled = await createFamilyAssignHandler(state.dbOps, dependencies)(
+			request("/api/families/opus", { enabled: false }),
+			"opus",
+		);
+		expect((await disabled.json()).data.exhaustion_policy).toBe(
+			"native_quota_wait",
+		);
+	});
+	it("fails closed for nonnative physical destinations and empty primary lanes", async () => {
+		for (const invalid of [
+			"provider",
+			"endpoint",
+			"mapping",
+			"empty",
+			"family",
+		]) {
+			const state = nativeState();
+			if (invalid === "provider")
+				state.mutateAccount("a", { provider: "openrouter" });
+			if (invalid === "endpoint")
+				state.mutateAccount("a", {
+					custom_endpoint: "https://offline.invalid",
+				});
+			if (invalid === "mapping")
+				state.mutateAccount("a", {
+					model_mappings: JSON.stringify({ "claude-opus-4-8": "other-model" }),
+				});
+			if (invalid === "empty")
+				state.mutatePolicy((policy) => {
+					policy.slots = [];
+				});
+			if (invalid === "family")
+				state.mutatePolicy((policy) => {
+					const primary = policy.slots[0];
+					if (!primary)
+						throw new Error("Native fixture requires a primary slot");
+					primary.model = "claude-sonnet-4-6";
+				});
+			const response = await createFamilyAssignHandler(
+				state.dbOps,
+				dependencies,
+			)(
+				request("/api/families/opus", {
+					exhaustion_policy: "native_quota_wait",
+				}),
+				"opus",
+			);
+			expect(response.status).toBe(422);
+			expect(state.applyFamilyPolicyChanges).not.toHaveBeenCalled();
+		}
+	});
+	it("accepts paused accounts structurally but validates existing opt-in when legacy assignment shape enables it", async () => {
+		const state = nativeState();
+		state.mutateAccount("a", { paused: true });
+		const applied = await createFamilyAssignHandler(state.dbOps, dependencies)(
+			request("/api/families/opus", { exhaustion_policy: "native_quota_wait" }),
+			"opus",
+		);
+		expect(applied.status).toBe(200);
+		state.mutatePolicy((policy) => {
+			policy.slots = [];
+			policy.assignment.enabled = false;
+		});
+		const invalid = await createFamilyAssignHandler(state.dbOps, dependencies)(
+			request("/api/families/opus", { combo_id: "combo-1", enabled: true }),
+			"opus",
+		);
+		expect(invalid.status).toBe(422);
+		const rollback = await createFamilyAssignHandler(state.dbOps, dependencies)(
+			request("/api/families/opus", { exhaustion_policy: "legacy" }),
+			"opus",
+		);
+		expect(rollback.status).toBe(200);
 	});
 });

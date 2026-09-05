@@ -6,6 +6,7 @@ export {
 	ForceRouteUnavailableError,
 	getComboSlotInfo,
 	getRoutingCapacityContext,
+	isComboFallbackDisabled,
 	isComboSessionFallbackDisabled,
 	isForceAccountModelEnabled,
 	resolveEffectiveModel,

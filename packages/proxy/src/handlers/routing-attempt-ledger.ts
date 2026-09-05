@@ -313,6 +313,17 @@ export class RoutingAttemptLedger {
 		return this.physicalAttempts;
 	}
 
+	/** Read-only planning hint; dispatch still requires its synchronous claim. */
+	hasAttempted(accountId: string, concreteModel?: string | null): boolean {
+		return this.attempted.has(
+			JSON.stringify([
+				"routing-attempt-v1",
+				accountId,
+				normalizeConcreteModel(concreteModel),
+			]),
+		);
+	}
+
 	claim(accountId: string, concreteModel?: string | null): boolean {
 		if (this.blockedAccounts.has(accountId)) return false;
 		const key = JSON.stringify([

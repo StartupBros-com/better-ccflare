@@ -7,6 +7,7 @@ import {
 	resolveComboProposalManagedModel,
 	resolveComboProposalPolicyModel,
 	resolveEffectiveComboMembership,
+	validateNativeQuotaRouteShape,
 } from "@better-ccflare/core/managed-routing";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import {
@@ -116,6 +117,41 @@ function availabilityFor(
 	return { available: true, reason: "available" };
 }
 
+/** The same structural check protects policy writes and runtime selection. */
+export function assertNativeQuotaPolicyShape(
+	snapshot: ComboRoutingPolicySnapshot,
+	accounts: readonly Account[],
+	dependencies: ComboResolverDependencies,
+): void {
+	if (
+		snapshot.assignment.exhaustion_policy !== "native_quota_wait" ||
+		!snapshot.assignment.enabled ||
+		!snapshot.assignment.combo_id ||
+		!snapshot.combo?.enabled
+	)
+		return;
+	// Pauses are availability, so preserve configured membership while validating.
+	const structuralAccounts = accounts.map((account) => ({
+		...account,
+		paused: false,
+	}));
+	const resolution = resolveEffectiveComboMembership(
+		snapshot,
+		structuralAccounts,
+		dependencies,
+	);
+	const shape = validateNativeQuotaRouteShape({
+		family: snapshot.assignment.family,
+		members: resolution.members,
+		accounts: structuralAccounts,
+	});
+	if (!shape.valid)
+		throw UnprocessableEntity(
+			"Native quota wait requires a native Anthropic subscription pool with valid primary and backup lanes",
+			{ code: "native_quota_invalid_route", reason: shape.reason },
+		);
+}
+
 export function toEffectiveRoutingView(
 	snapshot: ComboRoutingPolicySnapshot,
 	accounts: readonly Account[],
@@ -143,7 +179,13 @@ export function toEffectiveRoutingView(
 	};
 	return {
 		family: snapshot.assignment.family,
-		policy: snapshot,
+		policy: {
+			...snapshot,
+			assignment: {
+				...snapshot.assignment,
+				exhaustion_policy: snapshot.assignment.exhaustion_policy ?? "legacy",
+			},
+		},
 		resolution: {
 			...resolution,
 			members: resolution.members.map(decorate),
@@ -699,6 +741,7 @@ export async function applyRoutingProposal(
 
 	const snapshot = current.effective.policy;
 	const proposedSnapshot = hypotheticalSnapshot(snapshot, proposal);
+	assertNativeQuotaPolicyShape(proposedSnapshot, accounts, dependencies);
 	const proposedResolution = resolveEffectiveComboMembership(
 		proposedSnapshot,
 		accounts,

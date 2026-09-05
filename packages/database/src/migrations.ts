@@ -698,6 +698,8 @@ export function ensureSchema(db: Database): void {
 			membership_mode TEXT NOT NULL DEFAULT 'manual'
 				CHECK (membership_mode IN ('manual', 'managed')),
 			managed_model TEXT DEFAULT NULL,
+			exhaustion_policy TEXT NOT NULL DEFAULT 'legacy'
+				CHECK (exhaustion_policy IN ('legacy', 'native_quota_wait')),
 			FOREIGN KEY (combo_id) REFERENCES combos(id) ON DELETE SET NULL
 		)
 	`);
@@ -1771,6 +1773,12 @@ export function runMigrations(db: Database, dbPath?: string): void {
 				 CHECK (membership_mode IN ('manual', 'managed'))`,
 			).run();
 			log.info("Added manual-default membership policy to family assignments");
+		}
+		if (!comboFamilyAssignmentColumnNames.includes("exhaustion_policy")) {
+			db.prepare(
+				`ALTER TABLE combo_family_assignments ADD COLUMN exhaustion_policy TEXT NOT NULL DEFAULT 'legacy'
+				 CHECK (exhaustion_policy IN ('legacy', 'native_quota_wait'))`,
+			).run();
 		}
 		if (!comboFamilyAssignmentColumnNames.includes("managed_model")) {
 			db.prepare(

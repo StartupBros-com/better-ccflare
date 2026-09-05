@@ -44,7 +44,9 @@ export interface UsageThrottleStatus {
 	throttledWindows: string[];
 }
 
-function collectWindows(data: AnyUsageData | null): UsageWindowSnapshot[] {
+export function collectWindows(
+	data: AnyUsageData | null,
+): UsageWindowSnapshot[] {
 	if (!data || typeof data !== "object") return [];
 
 	const windows: UsageWindowSnapshot[] = [];
