@@ -1946,6 +1946,22 @@ export function isImplicitCodexDiscoveryEligible(
 	) {
 		return false;
 	}
+	// Check the prospective implicit route without changing the original intent.
+	if (
+		getRouteProfileConstraintViolation(
+			account,
+			{
+				routeProfileId: `implicit-codex:${physicalModel}`,
+				routeProfileSelection: "implicit-codex",
+				routeExpectedProvider: "codex",
+				routeExpectedPhysicalModel: physicalModel,
+				routeProfileExpectedPhysicalModel: physicalModel,
+			},
+			physicalModel,
+		) !== null
+	) {
+		return false;
+	}
 	return (
 		evaluateCandidateCapacity(
 			account,

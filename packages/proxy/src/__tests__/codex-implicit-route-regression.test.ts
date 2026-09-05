@@ -23,7 +23,10 @@ import {
 } from "../codex-model-catalog";
 import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
-import { selectAccountsForRequest } from "../handlers/account-selector";
+import {
+	isImplicitCodexDiscoveryEligible,
+	selectAccountsForRequest,
+} from "../handlers/account-selector";
 import { RESPONSES_ADAPTER_SECRET_HEADER } from "../handlers/proxy-types";
 import {
 	ModelRouteSessionRegistry,
@@ -346,6 +349,85 @@ describe("issue #324 — Codex CLI physical model implicit route", () => {
 			ctx.strategy.select.mock.calls[0]?.[0].map((account) => account.id),
 		).toEqual(["codex-1"]);
 		await expectCodexWireRequest(requests);
+	});
+
+	it.each([
+		["Sol", "gpt-5.6-sol"],
+		["Astra then Sol", ["gpt-6-astra", "gpt-5.6-sol"]],
+		["Sol then Astra", ["gpt-5.6-sol", "gpt-6-astra"]],
+	])("discovers cold Astra capacity when a cached Astra account maps the physical id to %s", async (_label, mapping) => {
+		const known = makeCodexAccount({
+			model_mappings: JSON.stringify({ "gpt-6-astra": mapping }),
+		});
+		const cold = makeCodexAccount({
+			id: "cold-astra",
+			model_mappings: null,
+			access_token: "cold-astra-token",
+		});
+		const ctx = makeCtx({ accounts: [known, cold] });
+		const requests = installUpstream();
+		const listing = await getCodexModels(known.id, ctx);
+		expect(listing?.models.map((model) => model.id)).toEqual(["gpt-6-astra"]);
+		expect(getKnownCodexModels(cold.id)).toBeNull();
+
+		for (let attempt = 0; attempt < 2; attempt++) {
+			await proxyModel(ctx, CLAUDE_SONNET_5, "gpt-6-astra");
+			await expectCodexWireRequest(requests.slice(attempt));
+			expect(
+				ctx.strategy.select.mock.calls[attempt]?.[0].map(
+					(account) => account.id,
+				),
+			).toEqual([cold.id]);
+			expect(requests[attempt].headers.get("authorization")).toBe(
+				`Bearer ${cold.access_token}`,
+			);
+		}
+		expect(
+			getKnownCodexModels(cold.id)?.models.map((model) => model.id),
+		).toEqual(["gpt-6-astra"]);
+	});
+
+	it.each([
+		null,
+		JSON.stringify({ "gpt-6-astra": "gpt-6-astra" }),
+		JSON.stringify({ "gpt-6-astra": [" gpt-6-astra ", "gpt-6-astra"] }),
+	])("uses cached Astra capacity without priming a cold account for a compatible mapping (%s)", async (modelMappings) => {
+		const known = makeCodexAccount({ model_mappings: modelMappings });
+		const cold = makeCodexAccount({
+			id: "unneeded-cold",
+			model_mappings: null,
+		});
+		const ctx = makeCtx({ accounts: [known, cold] });
+		const requests = installUpstream();
+		await getCodexModels(known.id, ctx);
+
+		await proxyModel(ctx, CLAUDE_SONNET_5, "gpt-6-astra");
+
+		await expectCodexWireRequest(requests);
+		expect(requests[0].headers.get("authorization")).toBe(
+			`Bearer ${known.access_token}`,
+		);
+		expect(getKnownCodexModels(cold.id)).toBeNull();
+	});
+
+	it.each([
+		["codex", true],
+		["test-provider", false],
+	] as const)("evaluates prospective %s route eligibility without mutating request metadata or inventing support", (provider, eligible) => {
+		const account = makeCodexAccount({
+			provider: provider as Account["provider"],
+			model_mappings: null,
+		});
+		const ctx = makeCtx({ accounts: [account] });
+		const meta = makeRequestMeta();
+		const original = { ...meta };
+		Object.freeze(meta);
+
+		expect(
+			isImplicitCodexDiscoveryEligible(account, meta, ctx, "gpt-6-astra"),
+		).toBe(eligible);
+		expect(meta).toEqual(original);
+		expect(getKnownCodexModels(account.id)).toBeNull();
 	});
 
 	it.each([
