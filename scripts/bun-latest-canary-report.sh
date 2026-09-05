@@ -27,7 +27,12 @@
 #   GH_TOKEN               token consumed by `gh`
 #   GITHUB_REPOSITORY      "owner/repo" to search/file/comment in
 #   CANARY_RUN_URL         URL of the workflow run being reported
-#   CANARY_RESOLVED_BUN    `bun --version` output for the canaried install
+#   CANARY_RESOLVED_BUN    `bun --revision` output for the canaried install,
+#                          e.g. `1.4.3+abcdef012` (release) or
+#                          `1.4.3-canary.9+0123abcde` (canary). `bun --version`
+#                          omits the canary identity, so the revision is what
+#                          the state marker dedupes on: a canary sharing a
+#                          release's bare version is a distinct verdict
 #   CANARY_PINNED_BUN      contents of .bun-version (trimmed)
 #   CANARY_GATE_OUTCOME    `success` | `failure` handled; anything else
 #                          (`skipped`, `cancelled`, ...) -> ::warning:: + exit 0
@@ -45,7 +50,7 @@
 # secrets.GITHUB_TOKEN and GITHUB_REPOSITORY from the runner environment):
 #   GH_TOKEN=... GITHUB_REPOSITORY=owner/repo \
 #   CANARY_RUN_URL=https://github.com/owner/repo/actions/runs/123 \
-#   CANARY_RESOLVED_BUN=1.4.3 CANARY_PINNED_BUN=1.4.2 \
+#   CANARY_RESOLVED_BUN=1.4.3+abcdef012 CANARY_PINNED_BUN=1.4.2 \
 #   CANARY_GATE_OUTCOME=failure CANARY_REQUESTED_BUN=latest \
 #   ./scripts/bun-latest-canary-report.sh
 

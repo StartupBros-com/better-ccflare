@@ -74,13 +74,19 @@ Rejected alternatives:
   (`bun-version: ${{ inputs.bun-version || 'latest' }}`). It has no `pull_request` trigger, so it can
   never block a merge; it runs on a daily schedule, on `workflow_dispatch` (with an optional
   candidate version and a `run-when-pinned` override), and on `push` to `main` for the files that
-  define it. It never edits `.bun-version`.
+  define it. It never edits `.bun-version`. The installed build is identified by `bun --revision`,
+  not `bun --version`: a canary prints the same bare version as the release it precedes
+  (verified 2026-09-05 on the official canary asset: `--version` 1.4.3, `--revision`
+  `1.4.3-canary.1+76e9dcc6a`), so comparing `--version` to the pin would skip a dispatched canary
+  as "already pinned" and finish green untested. The gate is skipped only when the revision is
+  the pin itself or the pin plus a build sha (the pinned stable release).
 - **`scripts/bun-latest-canary-report.sh`** turns the canary's outcome into at most one write:
   a failing gate files or updates a single tracking issue, identified only by the
   `<!-- bun-latest-canary -->` marker in its body (never by title, so a rename doesn't orphan it);
-  a `<!-- bun-latest-canary:state resolved=<v> outcome=<success|failure> -->` marker embedded in the
-  issue body and every comment lets the script dedupe — the same verdict for the same resolved
-  version writes nothing twice. A passing gate on a version with no open issue writes only a
+  a `<!-- bun-latest-canary:state resolved=<revision> outcome=<success|failure> -->` marker embedded
+  in the issue body and every comment lets the script dedupe — the same verdict for the same
+  resolved revision writes nothing twice, while a canary and a release that share a bare version
+  are distinct verdicts. A passing gate on a build with no open issue writes only a
   `::notice::`. The script never closes, edits, or labels an existing issue. The tracking issue and
   its dedupe history are matched only among issues and comments authored by the workflow's own
   identity (`github-actions[bot]`, overridable with `CANARY_ACTOR_LOGIN`) — an issue or comment from

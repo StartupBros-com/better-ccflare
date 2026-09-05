@@ -537,4 +537,72 @@ describe("bun-latest-canary-report.sh", () => {
 		expect(creates.length).toBe(1);
 		expect(comments.length).toBe(0);
 	});
+	test("case 13 (pro-gate round 1 P2): a canary sharing a reported release's --version but a different --revision is a distinct state, and its own revision dedupes", () => {
+		const dir = tempDir();
+		const binDir = writeGhStub(dir);
+		const stableState =
+			"<!-- bun-latest-canary:state resolved=1.4.3+abcdef012 outcome=failure -->";
+		const canaryResolved = "1.4.3-canary.9+0123abcde";
+		const canaryState = `<!-- bun-latest-canary:state resolved=${canaryResolved} outcome=failure -->`;
+		writeFileSync(
+			join(dir, "issues.json"),
+			JSON.stringify([
+				[
+					{
+						number: 21,
+						title:
+							"ci: Bun 1.4.3+abcdef012 (latest) fails the managed-routing gate",
+						body: `${MARKER}\n${stableState}\n`,
+						user: { login: "github-actions[bot]" },
+					},
+				],
+			]),
+		);
+		writeFileSync(join(dir, "comments.json"), "[[]]");
+		const env = baseEnv(dir, binDir, {
+			CANARY_RESOLVED_BUN: canaryResolved,
+			CANARY_REQUESTED_BUN: "canary",
+		});
+
+		const result = runReport(env);
+		expect(result.exitCode).toBe(0);
+
+		let log = readGhLog(join(dir, "gh.log"));
+		const creates = log.filter(
+			(entry) => entry.args[0] === "issue" && entry.args[1] === "create",
+		);
+		const comments = log.filter(
+			(entry) => entry.args[0] === "issue" && entry.args[1] === "comment",
+		);
+		expect(creates.length).toBe(0);
+		expect(comments.length).toBe(1);
+		expect(comments[0].args).toContain("21");
+		expect(comments[0].bodyFile).toContain(canaryState);
+		expect(comments[0].bodyFile).toContain(`Bun ${canaryResolved} (canary)`);
+
+		// Once that comment exists, the same canary revision writes nothing
+		// more: the state-marker regex must accept the `-canary.N+sha` identity.
+		writeFileSync(join(dir, "gh.log"), "");
+		writeFileSync(
+			join(dir, "comments.json"),
+			JSON.stringify([
+				[
+					{
+						body: `${canaryState}\nBun ${canaryResolved} (canary) still fails.`,
+						created_at: "2026-09-05T00:00:00Z",
+						user: { login: "github-actions[bot]" },
+					},
+				],
+			]),
+		);
+		const result2 = runReport(env);
+		expect(result2.exitCode).toBe(0);
+		log = readGhLog(join(dir, "gh.log"));
+		const writes = log.filter(
+			(entry) =>
+				entry.args[0] === "issue" &&
+				(entry.args[1] === "create" || entry.args[1] === "comment"),
+		);
+		expect(writes.length).toBe(0);
+	});
 });

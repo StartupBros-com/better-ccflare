@@ -4,9 +4,13 @@ name: Bun Latest Canary
 # (managed-routing-postgres.yml) and every release/signing workflow install the
 # exact version in .bun-version. This workflow runs the gate's own steps
 # (.github/actions/managed-routing-gate) on Bun `latest` -- or a dispatch-
-# supplied candidate -- and, when that version differs from the pin, reports the
-# verdict through scripts/bun-latest-canary-report.sh: a failing gate files or
-# updates one tracking issue, a passing gate leaves a note. It has no
+# supplied candidate -- and, unless the installed build is the pinned release
+# itself, reports the verdict through scripts/bun-latest-canary-report.sh: a
+# failing gate files or updates one tracking issue, a passing gate leaves a
+# note. The build is identified by `bun --revision`, not `bun --version`: a
+# canary prints the same bare version as the release it precedes, so only the
+# revision (`1.4.3+<sha>` for a release, `1.4.3-canary.<n>+<sha>` for a
+# canary) can tell a candidate from the pin. It has no
 # pull_request trigger, so it can never block a merge, and it never edits
 # .bun-version: an upgrade is a deliberate one-line change with this evidence
 # in hand (procedure: docs/contributing.md, "Bumping the Bun toolchain").
@@ -79,17 +83,27 @@ jobs:
           RUN_WHEN_PINNED: ${{ inputs.run-when-pinned }}
         run: |
           pinned="$(tr -d '[:space:]' < .bun-version)"
-          resolved="$(bun --version)"
+          version="$(bun --version)"
+          # `bun --version` omits the build identity: a canary built from the
+          # next release's tree prints that release's bare version, so a
+          # dispatched `canary` sharing the pinned version would compare equal,
+          # skip the gate, and finish green untested. `bun --revision` prints
+          # `<version>+<sha>` for a release and `<version>-canary.<n>+<sha>` for
+          # a canary; it is the resolved identity for both this skip decision
+          # and the report's dedupe state.
+          resolved="$(bun --revision)"
           {
             echo "pinned=${pinned}"
             echo "resolved=${resolved}"
           } >> "$GITHUB_OUTPUT"
-          if [[ "${resolved}" == "${pinned}" && "${RUN_WHEN_PINNED}" != "true" ]]; then
+          # Skip only when the installed build is the pinned stable release:
+          # its revision is exactly the pin or the pin plus a build sha.
+          if [[ ( "${resolved}" == "${pinned}" || "${resolved}" == "${pinned}+"* ) && "${RUN_WHEN_PINNED}" != "true" ]]; then
             echo "drift=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Bun ${resolved} is already the pinned version in .bun-version; nothing to canary."
+            echo "::notice::Bun ${resolved} is the pinned release in .bun-version (${pinned}); nothing to canary."
           else
             echo "drift=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Running the managed-routing gate on Bun ${resolved} (pinned: ${pinned})."
+            echo "::notice::Running the managed-routing gate on Bun ${resolved} (bun --version: ${version}; pinned: ${pinned})."
           fi
 
       - name: Run the managed-routing gate on the resolved Bun

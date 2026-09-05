@@ -1,5 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const repositoryRoot = join(import.meta.dir, "..");
@@ -334,5 +345,152 @@ describe("Bun toolchain pin (#321)", () => {
 	test("scripts/bun-latest-canary-report.sh exists and is executable", () => {
 		const stats = statSync(join(repositoryRoot, "scripts/bun-latest-canary-report.sh"));
 		expect(stats.mode & 0o111).not.toBe(0);
+	});
+});
+
+// pro-gate round 1, P2 (PR #327): `bun --version` omits a canary's identity.
+// A canary built from the next release's tree prints the same bare version as
+// that release (verified 2026-09-05 against the official canary asset:
+// `bun --version` -> 1.4.3, `bun --revision` -> 1.4.3-canary.1+76e9dcc6a).
+// A compare on --version alone therefore sets drift=false for a dispatched
+// canary whose base version equals .bun-version, skips the gate, and finishes
+// green having tested nothing. These tests execute the canary's real drift
+// step against a stub `bun` to pin the revision-based decision.
+describe("bun-latest-canary.yml drift step identifies the build by --revision (pro-gate round 1 P2)", () => {
+	type DriftRun = {
+		exitCode: number;
+		outputs: Record<string, string>;
+		stdout: string;
+	};
+
+	function driftStepRun(): string {
+		const parsed = parseYamlFile(`.github/workflows/${CANARY_WORKFLOW}`);
+		const step = stepsOfSingleJob(parsed).find((s) => s.id === "drift");
+		expect(step).toBeDefined();
+		const run = String(step?.run ?? "");
+		expect(run.length).toBeGreaterThan(0);
+		return run;
+	}
+
+	// Executes the drift step's `run:` block verbatim (bash -e, as GitHub does
+	// for a step without an explicit shell) in a scratch checkout whose
+	// .bun-version holds `pinned`, with a stub `bun` first on PATH answering
+	// --version and --revision with the given strings.
+	function runDriftStep(options: {
+		pinned: string;
+		version: string;
+		revision: string;
+		runWhenPinned?: string;
+	}): DriftRun {
+		const dir = mkdtempSync(join(tmpdir(), "ccflare-bun-canary-drift-"));
+		try {
+			const binDir = join(dir, "bin");
+			mkdirSync(binDir);
+			const stub = join(binDir, "bun");
+			writeFileSync(
+				stub,
+				[
+					"#!/usr/bin/env bash",
+					'case "${1:-}" in',
+					"  --version) printf '%s\\n' \"${STUB_BUN_VERSION}\" ;;",
+					"  --revision) printf '%s\\n' \"${STUB_BUN_REVISION}\" ;;",
+					'  *) echo "stub bun: unexpected arguments: $*" >&2; exit 64 ;;',
+					"esac",
+					"",
+				].join("\n"),
+			);
+			chmodSync(stub, 0o755);
+			writeFileSync(join(dir, ".bun-version"), `${options.pinned}\n`);
+			const outputFile = join(dir, "github-output");
+			writeFileSync(outputFile, "");
+			const scriptFile = join(dir, "drift-step.sh");
+			writeFileSync(scriptFile, driftStepRun());
+
+			const result = Bun.spawnSync(["bash", "-e", scriptFile], {
+				cwd: dir,
+				env: {
+					...(process.env as Record<string, string>),
+					PATH: `${binDir}:${process.env.PATH ?? ""}`,
+					GITHUB_OUTPUT: outputFile,
+					RUN_WHEN_PINNED: options.runWhenPinned ?? "false",
+					STUB_BUN_VERSION: options.version,
+					STUB_BUN_REVISION: options.revision,
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+
+			const outputs: Record<string, string> = {};
+			for (const line of readFileSync(outputFile, "utf8").split("\n")) {
+				if (!line) continue;
+				const eq = line.indexOf("=");
+				outputs[line.slice(0, eq)] = line.slice(eq + 1);
+			}
+			return {
+				exitCode: result.exitCode,
+				outputs,
+				stdout: result.stdout.toString() + result.stderr.toString(),
+			};
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	test("a canary sharing the pinned --version is not skipped: drift=true and resolved carries its --revision", () => {
+		const run = runDriftStep({
+			pinned: "1.4.2",
+			version: "1.4.2",
+			revision: "1.4.2-canary.7+0123abcde",
+		});
+		expect(run.exitCode).toBe(0);
+		expect(run.outputs.pinned).toBe("1.4.2");
+		expect(run.outputs.drift).toBe("true");
+		expect(run.outputs.resolved).toBe("1.4.2-canary.7+0123abcde");
+	});
+
+	test("the pinned stable release (same --version, release --revision) is skipped with drift=false", () => {
+		const run = runDriftStep({
+			pinned: "1.4.2",
+			version: "1.4.2",
+			revision: "1.4.2+744846f84",
+		});
+		expect(run.exitCode).toBe(0);
+		expect(run.outputs.drift).toBe("false");
+		expect(run.outputs.resolved).toBe("1.4.2+744846f84");
+		expect(run.stdout).toContain("nothing to canary");
+	});
+
+	test("a newer stable release drifts and is identified by its --revision", () => {
+		const run = runDriftStep({
+			pinned: "1.4.2",
+			version: "1.4.3",
+			revision: "1.4.3+abcdef012",
+		});
+		expect(run.exitCode).toBe(0);
+		expect(run.outputs.drift).toBe("true");
+		expect(run.outputs.resolved).toBe("1.4.3+abcdef012");
+	});
+
+	test("run-when-pinned=true forces the gate even on the pinned stable release", () => {
+		const run = runDriftStep({
+			pinned: "1.4.2",
+			version: "1.4.2",
+			revision: "1.4.2+744846f84",
+			runWhenPinned: "true",
+		});
+		expect(run.exitCode).toBe(0);
+		expect(run.outputs.drift).toBe("true");
+	});
+
+	test("the report step receives the drift step's resolved output as CANARY_RESOLVED_BUN", () => {
+		const parsed = parseYamlFile(`.github/workflows/${CANARY_WORKFLOW}`);
+		const steps = stepsOfSingleJob(parsed);
+		const reportStep = steps.find(
+			(step) =>
+				typeof step.run === "string" &&
+				(step.run as string).includes("scripts/bun-latest-canary-report.sh"),
+		);
+		const env = (reportStep?.env ?? {}) as Record<string, unknown>;
+		expect(env.CANARY_RESOLVED_BUN).toBe("${{ steps.drift.outputs.resolved }}");
 	});
 });
