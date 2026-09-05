@@ -7,7 +7,7 @@ problem_type: workflow_issue
 component: testing_framework
 severity: high
 applies_when:
-  - Bumping the Bun version the CI gate runs on (`bun-version:` in `.github/workflows/managed-routing-postgres.yml`)
+  - Bumping the Bun version CI runs on (`.bun-version`, read by every workflow via `bun-version-file`)
   - Asserting that an upstream `ReadableStream` cancel hook ran after cancelling a stream that goes through `pipeThrough` / `TransformStream` / `tee`
   - Spying on a `Response.body` instance captured before `response.clone()`
   - Writing a `node:net` server fixture whose teardown awaits `server.close()`

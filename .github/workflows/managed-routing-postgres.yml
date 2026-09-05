@@ -36,11 +36,16 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          # Tracks the current Bun release. This gate was pinned to 1.3.14 while
-          # Bun 1.4.0's spec-conformant stream cancel ordering and Node-parity
-          # node:net socket semantics broke three pre-existing suites (#231);
-          # the suites now hold on both 1.3.14 and 1.4.0, so the pin is gone.
-          bun-version: latest
+          # Exact version from .bun-version, the single source of truth for every
+          # workflow that installs Bun (#321). `latest` moved underneath this gate
+          # once (#231/#232) and the unpin in #319 reopened that exposure, so a
+          # bump is a deliberate edit to .bun-version (procedure:
+          # docs/contributing.md, "Bumping the Bun toolchain").
+          bun-version-file: .bun-version
+
+      - name: Verify the installed Bun matches .bun-version
+        # setup-bun only warns and falls back to `latest` if the file is missing.
+        run: test "$(bun --version)" = "$(tr -d '[:space:]' < .bun-version)"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile

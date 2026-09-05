@@ -160,6 +160,14 @@ bun run typecheck
 bun run format
 ```
 
+### Bumping the Bun toolchain
+
+`.bun-version` is the single source of truth: every CI workflow that installs Bun reads it via
+`bun-version-file` and asserts the installed `bun --version` matches (#321). To bump it, edit
+`.bun-version` to the exact new version, run `bun test tests/bun-toolchain-pin.test.ts`, and open a
+PR; the merge gate on that PR is the proof the new version passes. Never restore
+`bun-version: latest` in a workflow: the pin test fails the gate if it comes back.
+
 ### Repository Agent Instructions
 
 The root `AGENTS.md` file is the canonical repository policy for agents working with the codebase. The root `CLAUDE.md` file imports `AGENTS.md` instead of maintaining a duplicate full copy.
