@@ -26,7 +26,8 @@ interface SessionAccountEntry {
 	/** Account id, or null for a TOMBSTONE — a cleared session whose version
 	 * watermark is retained so a slow older request can't recreate the mapping. */
 	accountId: string | null;
-	/** Model-route profile provenance, or null for an ordinary account route. */
+	/** Operator profile slug or `implicit-codex:<model>` provenance, or null for
+	 * an ordinary account route. */
 	routeProfileId: string | null;
 	/** Models associated with the same successful physical route, when observed. */
 	models: SessionModelObservation | null;
@@ -63,7 +64,8 @@ export interface SessionModelObservation {
 /** The account observation stored atomically for one live Claude Code session. */
 export interface SessionAccountObservation {
 	accountId: string;
-	/** Internal profile slug, or null when ordinary account selection served it. */
+	/** Operator profile slug or `implicit-codex:<model>`, or null when ordinary
+	 * account selection served it. */
 	routeProfileId: string | null;
 	/** Same-attempt model provenance; absent for legacy/test callers. */
 	models?: SessionModelObservation;

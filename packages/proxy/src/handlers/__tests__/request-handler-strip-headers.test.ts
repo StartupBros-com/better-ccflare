@@ -30,6 +30,7 @@ describe("makeProxyRequest strips internal control headers before provider forwa
 	it("does not forward the probe secret or markers on the headers-param path", async () => {
 		const headers = new Headers({
 			"x-better-ccflare-internal-probe-secret": "s3cr3t",
+			"x-better-ccflare-responses-adapter-secret": "s3cr3t",
 			"x-better-ccflare-auto-refresh": "true",
 			"x-better-ccflare-keepalive": "true",
 			"x-better-ccflare-guard-request-id": "signed-envelope",
@@ -47,6 +48,9 @@ describe("makeProxyRequest strips internal control headers before provider forwa
 		expect(
 			sentHeaders?.get("x-better-ccflare-internal-probe-secret"),
 		).toBeNull();
+		expect(
+			sentHeaders?.get("x-better-ccflare-responses-adapter-secret"),
+		).toBeNull();
 		expect(sentHeaders?.get("x-better-ccflare-auto-refresh")).toBeNull();
 		expect(sentHeaders?.get("x-better-ccflare-keepalive")).toBeNull();
 		expect(sentHeaders?.get("x-better-ccflare-guard-request-id")).toBeNull();
@@ -63,6 +67,7 @@ describe("makeProxyRequest strips internal control headers before provider forwa
 			method: "POST",
 			headers: {
 				"x-better-ccflare-internal-probe-secret": "s3cr3t",
+				"x-better-ccflare-responses-adapter-secret": "s3cr3t",
 				"x-better-ccflare-keepalive": "true",
 				"x-better-ccflare-guard-request-id": "signed-envelope",
 				"x-better-ccflare-guard-correlation-secret": "must-never-be-http",
@@ -72,6 +77,9 @@ describe("makeProxyRequest strips internal control headers before provider forwa
 		await makeProxyRequest(req);
 		expect(
 			sentHeaders?.get("x-better-ccflare-internal-probe-secret"),
+		).toBeNull();
+		expect(
+			sentHeaders?.get("x-better-ccflare-responses-adapter-secret"),
 		).toBeNull();
 		expect(sentHeaders?.get("x-better-ccflare-keepalive")).toBeNull();
 		expect(sentHeaders?.get("x-better-ccflare-guard-request-id")).toBeNull();

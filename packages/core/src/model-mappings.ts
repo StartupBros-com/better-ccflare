@@ -275,6 +275,23 @@ export function getModelMappings(
 		}
 	}
 
+	return mergeAccountModelMappings(account, mappings);
+}
+
+/**
+ * Read only configuration stored on this account, including legacy endpoint
+ * mappings and fallbacks. Shared environment mappings are not capability proof.
+ */
+export function getAccountOwnedModelMappings(
+	account: Account,
+): Record<string, string | string[]> {
+	return mergeAccountModelMappings(account, {});
+}
+
+function mergeAccountModelMappings(
+	account: Account,
+	mappings: Record<string, string | string[]>,
+): Record<string, string | string[]> {
 	// Check for account-specific mappings in model_mappings field
 	const accountMappings = parseModelMappings(account.model_mappings);
 	if (accountMappings) {

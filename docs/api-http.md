@@ -225,8 +225,10 @@ This endpoint is **exempt from API-key authentication**: the caller is a local
 status-line script with no credential store, and the payload is coarse
 operational state (account name plus usage/health) with no secrets.
 
-Ordinary account routing includes the account's existing `id` field. When a
-model-route profile served the request, the response omits that raw account UUID
+Ordinary account routing and implicit Codex routing include the account's existing
+`id` field. Implicit Codex routes have no registered picker model, so they omit
+`profileModelId`; their physical model is available in `upstreamModel`. When an
+operator model-route profile served the request, the response omits that raw account UUID
 and instead includes the public picker model id in `profileModelId` (for example,
 `claude-bccf-route-pro-primary-sol`). This distinct field is display provenance,
 not an account id that can be reused with the force-account header.

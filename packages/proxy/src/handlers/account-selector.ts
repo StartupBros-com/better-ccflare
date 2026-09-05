@@ -45,6 +45,7 @@ import type {
 	AnthropicDegradedRouteInspection,
 	AnthropicReplayRisk,
 } from "../anthropic-degraded-mode";
+import { accountServesPhysicalModel } from "../codex-implicit-route";
 import { getKnownCodexModels } from "../codex-model-catalog";
 import { evaluateServerToolReplayEligibility } from "../server-tool-replay-eligibility";
 import {
@@ -81,6 +82,12 @@ const STOCK_CLAUDE_FAMILY_ALIASES = new Set([
 
 export function isForceAccountModelEnabled(ctx: ProxyContext): boolean {
 	return ctx.config?.getForceAccountModel?.() ?? false;
+}
+
+export function isCapabilityRouteSelection(
+	selection: RequestMeta["routeProfileSelection"],
+): boolean {
+	return selection === "capability" || selection === "implicit-codex";
 }
 
 function isClaudeModelId(model: string): boolean {
@@ -199,9 +206,10 @@ function isOrdinaryStockModelAccountEligible(
 }
 
 function accountServesModel(account: Account, model: string): boolean {
-	const known =
-		account.provider === "codex" ? getKnownCodexModels(account.id) : null;
-	if (known) return known.models.some((entry) => entry.id === model);
+	if (account.provider === "codex") {
+		const known = getKnownCodexModels(account.id);
+		return known?.models.some((entry) => entry.id === model) ?? false;
+	}
 	return (
 		providerAcceptsClientModel(account.provider) === isClaudeModelId(model)
 	);
@@ -677,6 +685,8 @@ export interface CapacityDeferredModelRoute {
 }
 
 export interface AccountSelectionOptions {
+	/** Request-local accounts already fetched by implicit route admission. */
+	readonly preloadedAccounts?: Account[];
 	/** Bypass active combo lookup for the explicit post-combo normal fallback. */
 	readonly skipCombo?: boolean;
 	/** Ignore request-reactive model/family markers for a trusted synthetic probe. */
@@ -2002,7 +2012,7 @@ function setImplicitFallbackSelectionDiagnostics(
 			? "policy_excluded"
 			: "all_unavailable",
 		forcedRoute,
-		capabilityProfile: meta.routeProfileSelection === "capability",
+		capabilityProfile: isCapabilityRouteSelection(meta.routeProfileSelection),
 		routeProfile: meta.routeProfileId != null,
 	};
 	meta.routingSelectionDiagnostics = diagnostics;
@@ -2396,8 +2406,9 @@ export async function getOrderedAccounts(
 	try {
 		const capacityOptions: CandidateCapacityEvaluationOptions = {
 			modelScopedCapacityRouting,
-			routeIntent:
-				meta.routeProfileSelection === "capability" ? "capability" : "ordinary",
+			routeIntent: isCapabilityRouteSelection(meta.routeProfileSelection)
+				? "capability"
+				: "ordinary",
 			syntheticProbe,
 		};
 		const loadedAccounts =
@@ -2564,7 +2575,9 @@ async function selectAccountsForRequestInternal(
 		"x-better-ccflare-account-id",
 	);
 	const serverForcedAccountId = meta.forcedAccountId?.trim();
-	const capabilityProfileRoute = meta.routeProfileSelection === "capability";
+	const capabilityProfileRoute = isCapabilityRouteSelection(
+		meta.routeProfileSelection,
+	);
 	if (
 		serverForcedAccountId &&
 		publicForcedAccountId &&
@@ -2796,9 +2809,16 @@ async function selectAccountsForRequestInternal(
 	}
 
 	if (capabilityProfileRoute) {
+		if (
+			meta.routeProfileSelection === "implicit-codex" &&
+			meta.routeLineage?.kind !== "root"
+		) {
+			throw capabilityRouteUnavailable(meta, []);
+		}
 		let allAccounts: Account[];
 		try {
-			allAccounts = await ctx.dbOps.getAllAccounts();
+			allAccounts =
+				options.preloadedAccounts ?? (await ctx.dbOps.getAllAccounts());
 		} catch (error) {
 			log.error(
 				"Failed to get accounts from database for capability route lookup:",
@@ -2824,6 +2844,66 @@ async function selectAccountsForRequestInternal(
 			);
 		}
 		const excludedProviders = getExcludedProviders(meta);
+		let matchesRoute: (account: Account) => boolean;
+		let refreshImplicitAccountProofs:
+			| ((accounts: Account[]) => Promise<void>)
+			| undefined;
+		if (meta.routeProfileSelection === "implicit-codex") {
+			// Request-time resolution may prime the account's catalog. Selection
+			// only consumes that evidence or explicit mappings; it never relies on
+			// the physical id's pass-through mapping as proof of support.
+			const physicalModel = meta.routeProfileExpectedPhysicalModel?.trim();
+			const proofsByAccountId = new Map<
+				string,
+				{
+					provider: Account["provider"];
+					modelMappings: Account["model_mappings"];
+					modelFallbacks: Account["model_fallbacks"];
+					customEndpoint: Account["custom_endpoint"];
+					catalog: ReturnType<typeof getKnownCodexModels>;
+					serves: boolean;
+				}
+			>();
+			refreshImplicitAccountProofs = async (accounts) => {
+				await Promise.all(
+					accounts.map(async (account) => {
+						const previous = proofsByAccountId.get(account.id);
+						const catalog = getKnownCodexModels(account.id);
+						if (
+							previous &&
+							previous.provider === account.provider &&
+							previous.modelMappings === account.model_mappings &&
+							previous.modelFallbacks === account.model_fallbacks &&
+							previous.customEndpoint === account.custom_endpoint &&
+							previous.catalog?.models === catalog?.models
+						) {
+							return;
+						}
+						const proof = {
+							provider: account.provider,
+							modelMappings: account.model_mappings,
+							modelFallbacks: account.model_fallbacks,
+							customEndpoint: account.custom_endpoint,
+							catalog,
+							serves: false,
+						};
+						proof.serves = Boolean(
+							physicalModel &&
+								(await accountServesPhysicalModel(account, physicalModel, {
+									prime: false,
+								})),
+						);
+						proofsByAccountId.set(account.id, proof);
+					}),
+				);
+			};
+			await refreshImplicitAccountProofs(allAccounts);
+			matchesRoute = (account) =>
+				proofsByAccountId.get(account.id)?.serves === true &&
+				matchesCapabilityRouteProfile(account, meta);
+		} else {
+			matchesRoute = (account) => matchesCapabilityRouteProfile(account, meta);
+		}
 		const selectGlobalHelperFallback = async (): Promise<Account[]> => {
 			const selected = await getOrderedAccounts(
 				meta,
@@ -2852,7 +2932,7 @@ async function selectAccountsForRequestInternal(
 		const matchingAccounts = allAccounts.filter(
 			(account) =>
 				isAccountEligibleForRouteIntent(account, meta, ctx) &&
-				matchesCapabilityRouteProfile(account, meta) &&
+				matchesRoute(account) &&
 				!isProviderExcludedForRequest(account, excludedProviders),
 		);
 		if (matchingAccounts.length === 0) {
@@ -2875,7 +2955,7 @@ async function selectAccountsForRequestInternal(
 					accounts.filter(
 						(account) =>
 							isAccountEligibleForRouteIntent(account, meta, ctx) &&
-							matchesCapabilityRouteProfile(account, meta) &&
+							matchesRoute(account) &&
 							!isProviderExcludedForRequest(account, excludedProviders),
 					),
 				modelScopedCapacityRouting,
@@ -2893,10 +2973,15 @@ async function selectAccountsForRequestInternal(
 		// A custom strategy is allowed to return stale/unavailable candidates;
 		// dynamic profiles must not let those candidates turn into a passthrough
 		// or an unrelated normal-pool route.
+		// Reuse proof by account id for unchanged objects and clones; only changed
+		// account-owned configuration or catalog evidence needs another derivation.
+		if (refreshImplicitAccountProofs) {
+			await refreshImplicitAccountProofs(selected);
+		}
 		const available = selected.filter(
 			(account) =>
 				isAccountEligibleForRouteIntent(account, meta, ctx) &&
-				matchesCapabilityRouteProfile(account, meta) &&
+				matchesRoute(account) &&
 				!isProviderExcludedForRequest(account, excludedProviders) &&
 				isAccountAvailable(account),
 		);
@@ -2938,7 +3023,7 @@ async function selectAccountsForRequestInternal(
 		!options.skipCombo &&
 		(ctx.config?.getCombosEnabled?.() ?? true) &&
 		!(isForceAccountModelEnabled(ctx) && !isInternalProbe(meta.headers, ctx)) &&
-		meta.routeProfileSelection !== "capability"
+		!isCapabilityRouteSelection(meta.routeProfileSelection)
 	) {
 		const family = getModelFamily(effectiveModel);
 		if (family) {

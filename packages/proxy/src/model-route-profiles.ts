@@ -199,6 +199,14 @@ export function parseModelRouteProfiles(
 			}
 		}
 
+		if (
+			typeof candidate.id === "string" &&
+			candidate.id.trim().startsWith("implicit-codex:")
+		) {
+			throw configError(
+				`profile ${index} id namespace implicit-codex: is reserved for request-time Codex routing`,
+			);
+		}
 		const id = requiredString(candidate, "id", index, MAX_ID_LENGTH);
 		if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) {
 			throw configError(
