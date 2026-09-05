@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { PAUSE_REASON_NEEDS_REAUTH } from "@better-ccflare/core";
 import type { Provider } from "@better-ccflare/providers";
 import type {
 	Account,
@@ -1506,6 +1507,7 @@ describe("native quota wait execution", () => {
 		account: Account,
 		familyPercent: number,
 		sharedPercent = 10,
+		sharedReset: number | null = Date.now() + 3_600_000,
 	) {
 		cachedUsageAccountIds.add(account.id);
 		usageCache.set(account.id, {
@@ -1515,7 +1517,8 @@ describe("native quota wait execution", () => {
 					kind: "session",
 					percent: sharedPercent,
 					is_active: true,
-					resets_at: new Date(Date.now() + 3_600_000).toISOString(),
+					resets_at:
+						sharedReset === null ? null : new Date(sharedReset).toISOString(),
 				},
 				{
 					kind: "weekly_all",
@@ -1533,6 +1536,501 @@ describe("native quota wait execution", () => {
 			],
 		} as never);
 	}
+
+	async function reserveProfileAccounts(
+		ctx: ProxyContext,
+		accounts: Account[],
+	) {
+		const { ModelRouteSessionRegistry, parseModelRouteProfiles } = await import(
+			"../model-route-profiles"
+		);
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify(
+					accounts.map((account) => ({
+						id: `offline-exclusive-${account.id}`,
+						displayName: "Offline exclusive",
+						accountId: account.id,
+						logicalModel: "claude-fable-5",
+						expectedProvider: "anthropic",
+						expectedPhysicalModel: "claude-fable-5",
+						exclusiveAccount: true,
+					})),
+				),
+			),
+		);
+	}
+
+	it.each([
+		{ status: 429, usage: "missing" },
+		{ status: 429, usage: "stale" },
+		{ status: 429, usage: "below-cap" },
+		{ status: 529, usage: "missing" },
+		{ status: 529, usage: "stale" },
+		{ status: 529, usage: "below-cap" },
+	])("keeps persisted automatic $status cooldowns native across requests with $usage usage", async ({
+		status,
+		usage,
+	}) => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		for (const account of accounts) cachedUsageAccountIds.add(account.id);
+		const persisted = accounts.map((account) => ({ ...account }));
+		ctx.dbOps.getAllAccounts = mock(async () =>
+			persisted.map((account) => ({ ...account })),
+		);
+		ctx.dbOps.updateAccountUsage = mock(async () => undefined);
+		ctx.dbOps.markAccountRateLimited = mock(async (id, until, reason) => {
+			const account = persisted.find((candidate) => candidate.id === id);
+			if (!account) throw new Error("Unknown persisted fixture account");
+			account.rate_limited_until = until;
+			account.rate_limited_reason = reason;
+			return { consecutiveRateLimits: 1, applied: true };
+		});
+		const writes: Array<() => Promise<void>> = [];
+		ctx.asyncWriter.enqueue = mock((write: () => Promise<void>) => {
+			writes.push(write);
+		});
+		registerProvider({
+			...makeMockRoutingProvider("anthropic"),
+			buildUrl: (_path, _search, account) =>
+				`https://api.anthropic.com/offline/${account?.id}`,
+			// Exercise the response processor's upstream_429 cooldown path. Raw
+			// pre-byte 429s use the separate model_fallback_429 audit reason.
+			processResponse: async (response) =>
+				status === 429 &&
+				response.status === 200 &&
+				response.headers.has("x-offline-limit")
+					? new Response(response.body, { status, headers: response.headers })
+					: response,
+			parseRateLimit: (response) => ({
+				isRateLimited: response.status === status,
+				resetTime: Date.now() + 30_000,
+			}),
+		});
+		globalThis.fetch = mock(async (input: Request) => {
+			calls.push({
+				account: new URL(input.url).pathname.split("/").at(-1) ?? "",
+				model: (await input.clone().json()).model,
+			});
+			return Response.json(
+				{
+					type: "error",
+					error: {
+						type: status === 429 ? "rate_limit_error" : "overloaded_error",
+					},
+				},
+				{
+					status: status === 429 ? 200 : status,
+					headers: { "x-offline-limit": "true" },
+				},
+			);
+		}) as typeof fetch;
+		let restoreClock = () => {};
+		try {
+			const first = makeProxyRequest("claude-fable-5", false);
+			const firstResponse = await handleProxy(first, new URL(first.url), ctx);
+			await Promise.all(writes.map((write) => write()));
+			expect(firstResponse.status).toBe(529);
+			expect(calls).toHaveLength(2);
+			expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(2);
+			for (const account of persisted) {
+				expect(account.rate_limited_reason).toContain(`upstream_${status}_`);
+				expect(account.rate_limited_until).toBeGreaterThan(Date.now());
+				if (usage !== "missing")
+					putUsage(account, usage === "stale" ? 100 : 20);
+			}
+			const observedAt = Date.now();
+			const realGetSnapshot = usageCache.getSnapshot.bind(usageCache);
+			const staleSnapshot =
+				usage === "stale"
+					? spyOn(usageCache, "getSnapshot").mockImplementation((id) => {
+							const snapshot = realGetSnapshot(id);
+							return snapshot
+								? { ...snapshot, observedAt: observedAt - 600_000 }
+								: null;
+						})
+					: null;
+			try {
+				const second = makeProxyRequest("claude-fable-5", false);
+				const secondResponse = await handleProxy(
+					second,
+					new URL(second.url),
+					ctx,
+				);
+				expect(secondResponse.status).toBe(529);
+				expect(await secondResponse.json()).toMatchObject({
+					error: { type: "overloaded_error", reset_at: null },
+				});
+				expect(
+					Number(secondResponse.headers.get("retry-after")),
+				).toBeGreaterThanOrEqual(1);
+				expect(
+					Number(secondResponse.headers.get("retry-after")),
+				).toBeLessThanOrEqual(60);
+				expect(secondResponse.headers.has("x-better-ccflare-pool-status")).toBe(
+					false,
+				);
+				expect(
+					secondResponse.headers.has("x-better-ccflare-recovery-scope"),
+				).toBe(false);
+				expect(calls).toHaveLength(2);
+			} finally {
+				staleSnapshot?.mockRestore();
+			}
+			const expiry = Math.max(
+				...persisted.map((account) => account.rate_limited_until ?? 0),
+			);
+			const clock = spyOn(Date, "now").mockReturnValue(expiry + 1);
+			restoreClock = () => clock.mockRestore();
+			for (const account of persisted) putUsage(account, 20);
+			globalThis.fetch = mock(async (input: Request) => {
+				calls.push({
+					account: new URL(input.url).pathname.split("/").at(-1) ?? "",
+					model: (await input.clone().json()).model,
+				});
+				return Response.json({ type: "message", content: [] });
+			}) as typeof fetch;
+			const third = makeProxyRequest("claude-fable-5", false);
+			const thirdResponse = await handleProxy(third, new URL(third.url), ctx);
+			expect(await thirdResponse.clone().json()).toMatchObject({
+				type: "message",
+			});
+			expect(thirdResponse.status).toBe(200);
+			expect(calls).toHaveLength(3);
+			expect(calls.every((call) => call.model === "claude-fable-5")).toBe(true);
+		} finally {
+			restoreClock();
+			restore();
+		}
+	});
+
+	it.each([
+		"out_of_credits",
+		"upstream_402_payment_required",
+		"extra_usage_exhausted",
+	])("ignores expired %s annotations when current authorized quota is exhausted", async (reason) => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) {
+			putUsage(account, 20, 100);
+			account.rate_limited_until = Date.now() - 1;
+			account.rate_limited_reason = reason as Account["rate_limited_reason"];
+		}
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(429);
+			expect(transport).not.toHaveBeenCalled();
+			expect(await response.json()).toMatchObject({
+				error: { code: "native_quota_wait" },
+			});
+		} finally {
+			restore();
+		}
+	});
+
+	it.each([
+		"healthy",
+		"reauth",
+		"billing",
+	])("waits for authorized quota when the profile-only member is %s", async (state) => {
+		const { accounts, ctx, restore } = nativePool();
+		putUsage(accounts[0], 20, 100);
+		putUsage(accounts[1], 20);
+		if (state === "reauth") accounts[1].requires_reauth = true;
+		if (state === "billing") {
+			accounts[1].rate_limited_reason = "out_of_credits";
+			accounts[1].rate_limited_until = Date.now() + 60_000;
+		}
+		await reserveProfileAccounts(ctx, [accounts[1]]);
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.status).toBe(429);
+			expect(await response.json()).toMatchObject({
+				error: { code: "native_quota_wait", reason: "shared_capacity" },
+			});
+			expect(response.headers.get("x-should-retry")).toBe("true");
+			expect(response.headers.has("x-better-ccflare-pool-status")).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+
+	it.each([
+		"earlier",
+		"resetless",
+	])("uses only authorized quota reset and recheck metadata when denied quota is %s", async (reset) => {
+		const { accounts, ctx, restore } = nativePool();
+		const now = Date.now();
+		const clock = spyOn(Date, "now").mockReturnValue(now - 179_000);
+		putUsage(accounts[1], 20, 100, reset === "earlier" ? now + 5_000 : null);
+		clock.mockReturnValue(now);
+		putUsage(accounts[0], 20, 100, now + 3_600_000);
+		await reserveProfileAccounts(ctx, [accounts[1]]);
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(429);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.headers.get("retry-after")).toBe("60");
+			expect(await response.json()).toMatchObject({
+				error: {
+					reset_at: new Date(now + 3_600_000).toISOString(),
+					next_recheck_at: new Date(now + 60_000).toISOString(),
+				},
+			});
+		} finally {
+			clock.mockRestore();
+			restore();
+		}
+	});
+
+	it.each([
+		"quota",
+		"cooldown",
+	])("preserves authorized %s recovery when the other native OAuth account is provider-excluded", async (hold) => {
+		const { accounts, ctx, restore } = nativePool();
+		accounts[0].refresh_token = null as never;
+		putUsage(accounts[0], 20, hold === "quota" ? 100 : 20);
+		putUsage(accounts[1], 20);
+		if (hold === "cooldown") {
+			accounts[0].rate_limited_until = Date.now() + 25_000;
+			accounts[0].rate_limited_reason = "upstream_429_with_reset";
+			accounts[1].requires_reauth = true;
+		}
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			request.headers.set(
+				"x-better-ccflare-exclude-providers",
+				"anthropic-oauth",
+			);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(hold === "quota" ? 429 : 529);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.headers.has("x-better-ccflare-pool-status")).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+
+	it.each([
+		"quota",
+		"cooldown",
+		"model-marker",
+	])("keeps a single denied profile-only member nonretrying even with %s evidence", async (hold) => {
+		const { accounts, combo, ctx, restore } = nativePool();
+		accounts.splice(1);
+		combo.slots = combo.slots.filter(
+			(slot) => slot.account_id === accounts[0].id,
+		);
+		await reserveProfileAccounts(ctx, accounts);
+		putUsage(accounts[0], 20, hold === "quota" ? 100 : 20);
+		if (hold === "cooldown") {
+			accounts[0].rate_limited_until = Date.now() + 30_000;
+			accounts[0].rate_limited_reason = "upstream_529_overloaded_with_reset";
+		}
+		if (hold === "model-marker")
+			usageCache.markModelScopedExhausted(accounts[0].id, "claude-fable-5");
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(503);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.headers.get("retry-after")).toBeNull();
+			expect(response.headers.get("x-should-retry")).toBeNull();
+			expect(response.headers.has("x-better-ccflare-pool-status")).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+
+	it.each([
+		"healthy",
+		"reauth",
+		"billing",
+	])("waits for an authorized cooldown while the profile-only member is %s", async (state) => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) putUsage(account, 20);
+		accounts[0].rate_limited_until = Date.now() + 30_000;
+		accounts[0].rate_limited_reason = "upstream_429_with_reset";
+		if (state === "reauth") accounts[1].requires_reauth = true;
+		if (state === "billing") {
+			accounts[1].rate_limited_until = Date.now() + 60_000;
+			accounts[1].rate_limited_reason = "out_of_credits";
+		}
+		await reserveProfileAccounts(ctx, [accounts[1]]);
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(529);
+			expect(transport).not.toHaveBeenCalled();
+			expect(
+				Number(response.headers.get("retry-after")),
+			).toBeGreaterThanOrEqual(1);
+			expect(Number(response.headers.get("retry-after"))).toBeLessThanOrEqual(
+				30,
+			);
+			expect(response.headers.has("x-better-ccflare-pool-status")).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+
+	it("combines active automatic cooldowns with exact-model holds without unlocking Opus", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		const now = Date.now();
+		const clock = spyOn(Date, "now").mockReturnValue(now);
+		for (const account of accounts) putUsage(account, 20);
+		accounts[0].rate_limited_until = now + 20_000;
+		accounts[0].rate_limited_reason = "upstream_529_overloaded_with_reset";
+		usageCache.markModelScopedExhausted(
+			accounts[0].id,
+			"claude-fable-5",
+			null,
+			now + 40_000,
+		);
+		usageCache.markModelScopedExhausted(
+			accounts[1].id,
+			"claude-fable-5",
+			null,
+			now + 30_000,
+		);
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(529);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.headers.get("retry-after")).toBe("30");
+			expect(response.headers.has("x-better-ccflare-pool-status")).toBe(false);
+		} finally {
+			clock.mockRestore();
+			restore();
+		}
+	});
+
+	it("keeps temporary authorized capacity distinct from a fully quota-blocked pool", async () => {
+		const { accounts, ctx, restore } = nativePool();
+		putUsage(accounts[0], 20, 100);
+		putUsage(accounts[1], 20);
+		accounts[1].rate_limited_until = Date.now() + 30_000;
+		accounts[1].rate_limited_reason = "upstream_529_overloaded_with_reset";
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(529);
+			expect(transport).not.toHaveBeenCalled();
+			expect(await response.json()).toMatchObject({
+				error: { code: "native_route_temporarily_unavailable", reset_at: null },
+			});
+		} finally {
+			restore();
+		}
+	});
+
+	it("dispatches usable authorized Fable before a cooling account's proven Opus backup", async () => {
+		const { accounts, ctx, restore, calls } = nativePool();
+		putUsage(accounts[0], 100);
+		putUsage(accounts[1], 20);
+		accounts[0].rate_limited_until = Date.now() + 30_000;
+		accounts[0].rate_limited_reason = "upstream_429_with_reset";
+		globalThis.fetch = mock(async (request: Request) => {
+			calls.push({
+				account: new URL(request.url).pathname.split("/").at(-1) ?? "",
+				model: (await request.clone().json()).model,
+			});
+			return Response.json({ type: "message", content: [] });
+		}) as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(200);
+			expect(calls).toEqual([
+				{ account: accounts[1].id, model: "claude-fable-5" },
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it.each([
+		"unknown",
+		"manual",
+		"out_of_credits",
+		"upstream_402_payment_required",
+		"extra_usage_exhausted",
+		"model_fallback_429",
+		"indefinite",
+		"paused",
+		"reauth",
+		"reauth-reason",
+	])("does not promote %s account holds into temporary native capacity", async (hold) => {
+		const { accounts, ctx, restore } = nativePool();
+		for (const account of accounts) {
+			putUsage(account, 20);
+			account.rate_limited_until =
+				hold === "indefinite" ? Number.POSITIVE_INFINITY : Date.now() + 30_000;
+			account.rate_limited_reason = [
+				"indefinite",
+				"paused",
+				"reauth",
+				"reauth-reason",
+			].includes(hold)
+				? "upstream_429_with_reset"
+				: hold === "unknown"
+					? null
+					: (hold as Account["rate_limited_reason"]);
+			if (hold === "paused") account.paused = true;
+			if (hold === "reauth") account.requires_reauth = true;
+			if (hold === "reauth-reason")
+				account.pause_reason = PAUSE_REASON_NEEDS_REAUTH;
+		}
+		const transport = mock(async () =>
+			Response.json({ type: "message", content: [] }),
+		);
+		globalThis.fetch = transport as typeof fetch;
+		try {
+			const request = makeProxyRequest("claude-fable-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(transport).not.toHaveBeenCalled();
+			expect(response.status).toBe(503);
+			expect(response.headers.get("x-should-retry")).not.toBe("true");
+		} finally {
+			restore();
+		}
+	});
 
 	it.each([
 		"anthropic-oauth",

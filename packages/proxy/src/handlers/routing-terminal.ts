@@ -286,6 +286,18 @@ function isFiniteFuture(
 	return typeof value === "number" && Number.isFinite(value) && value > now;
 }
 
+/** A known automatic account hold, independent of request authority and auth. */
+export function getAutomaticAccountCooldownUntil(
+	account: Account,
+	now: number,
+): number | null {
+	return isFiniteFuture(account.rate_limited_until, now) &&
+		account.rate_limited_reason != null &&
+		GLOBAL_COOLDOWN_REASONS.has(account.rate_limited_reason)
+		? account.rate_limited_until
+		: null;
+}
+
 function modelOnlyCapacity(
 	context: RoutingCapacityContext | null,
 	accounts: readonly Account[],
@@ -390,16 +402,13 @@ function findAutomaticRecoveries(
 	const recoveries: AutomaticRecovery[] = [];
 	for (const account of accounts) {
 		if (account.paused) continue;
-		let accountCooldown: number | null = null;
-		if (isFiniteFuture(account.rate_limited_until, now)) {
-			if (
-				!account.rate_limited_reason ||
-				!GLOBAL_COOLDOWN_REASONS.has(account.rate_limited_reason)
-			) {
-				// A live but unverified account marker is itself an unknown blocker.
-				continue;
-			}
-			accountCooldown = account.rate_limited_until;
+		const accountCooldown = getAutomaticAccountCooldownUntil(account, now);
+		if (
+			isFiniteFuture(account.rate_limited_until, now) &&
+			accountCooldown === null
+		) {
+			// A live but unverified account marker is itself an unknown blocker.
+			continue;
 		}
 
 		const candidates = exclusionsByAccount.get(account.id) ?? [];

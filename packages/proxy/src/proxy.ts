@@ -4,6 +4,7 @@ import {
 	isAccountAvailable,
 	isForceAccountModelEnabled as isForceAccountModelRewriteEnabled,
 	MAX_REQUEST_BODY_BYTES,
+	PAUSE_REASON_NEEDS_REAUTH,
 	RequestBodyTooLargeError,
 	requestEvents,
 	resolveBuildProvenance,
@@ -131,7 +132,10 @@ import {
 	wouldSuppressProbe,
 } from "./handlers/rate-limit-cooldown";
 import { getRequestRateLimitOutcomes } from "./handlers/rate-limit-scope";
-import { createProtectedAnthropicOverloadResponse } from "./handlers/routing-terminal";
+import {
+	createProtectedAnthropicOverloadResponse,
+	getAutomaticAccountCooldownUntil,
+} from "./handlers/routing-terminal";
 import { consumeInternalAutoRefreshAuth } from "./internal-probe-auth";
 import {
 	isBoundedModelRouteProfile,
@@ -2052,16 +2056,29 @@ async function handleProxyCoreImpl(
 		const context = getNativeQuotaContext(requestMeta);
 		if (!context) return false;
 		const evaluation = evaluateNativeQuotaRequest(requestMeta);
+		const now = Date.now();
 		return (
 			nativePermanentFailure ||
 			routingAttemptLedger.authFailureCount > 0 ||
 			context.accounts.some(
 				(account) =>
 					evaluation?.primaryAccountIds.includes(account.id) &&
+					context.members.some(
+						(member) =>
+							member.account_id === account.id &&
+							isNativeQuotaRequestCandidateEligible(
+								requestMeta,
+								account,
+								member.id,
+							),
+					) &&
 					(account.requires_reauth ||
-						account.rate_limited_reason === "out_of_credits" ||
-						account.rate_limited_reason === "upstream_402_payment_required" ||
-						account.rate_limited_reason === "extra_usage_exhausted"),
+						account.pause_reason === PAUSE_REASON_NEEDS_REAUTH ||
+						((account.rate_limited_until ?? 0) > now &&
+							(account.rate_limited_reason === "out_of_credits" ||
+								account.rate_limited_reason ===
+									"upstream_402_payment_required" ||
+								account.rate_limited_reason === "extra_usage_exhausted"))),
 			)
 		);
 	};
@@ -2081,6 +2098,9 @@ async function handleProxyCoreImpl(
 				isNativeQuotaRequestCandidateEligible(requestMeta, account, member.id)
 			);
 		});
+		const authorizedAccountIds = new Set(
+			authorizedMembers.map((member) => member.account_id),
+		);
 		const requestAuthorityDenied = authorizedMembers.length === 0;
 		const nativeCandidates = authorizedMembers.filter((member) =>
 			evaluation?.admittedCandidateIds.includes(member.id),
@@ -2094,17 +2114,30 @@ async function handleProxyCoreImpl(
 				const account = nativeContext.accounts.find(
 					(candidate) => candidate.id === member.account_id,
 				);
-				if (!account || account.paused || account.requires_reauth) return false;
-				const modelUnavailableUntil = isAccountAvailable(account)
-					? getNativeQuotaCandidateModelUnavailableUntil(
-							requestMeta,
-							account,
-							member.id,
-							now,
-						)
-					: null;
-				if (modelUnavailableUntil !== null) {
-					temporaryRecheckTimes.push(modelUnavailableUntil);
+				if (
+					!account ||
+					account.paused ||
+					account.requires_reauth ||
+					account.pause_reason === PAUSE_REASON_NEEDS_REAUTH
+				)
+					return false;
+				const accountCooldownUntil = getAutomaticAccountCooldownUntil(
+					account,
+					now,
+				);
+				const modelUnavailableUntil =
+					isAccountAvailable(account, now) || accountCooldownUntil !== null
+						? getNativeQuotaCandidateModelUnavailableUntil(
+								requestMeta,
+								account,
+								member.id,
+								now,
+							)
+						: null;
+				if (accountCooldownUntil !== null || modelUnavailableUntil !== null) {
+					temporaryRecheckTimes.push(
+						Math.max(accountCooldownUntil ?? now, modelUnavailableUntil ?? now),
+					);
 					return true;
 				}
 				if (!nativeTemporaryFailures.has(account.id)) return false;
@@ -2143,8 +2176,10 @@ async function handleProxyCoreImpl(
 				permanentAvailabilityFailure ||
 				nativePermanentFailure
 					? []
-					: nativeContext.accounts.filter((account) =>
-							evaluation?.primaryAccountIds.includes(account.id),
+					: nativeContext.accounts.filter(
+							(account) =>
+								authorizedAccountIds.has(account.id) &&
+								evaluation?.primaryAccountIds.includes(account.id),
 						),
 			capacityContext:
 				evaluation?.structuralError ||

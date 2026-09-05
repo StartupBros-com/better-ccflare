@@ -323,6 +323,11 @@ export function evaluateNativeQuotaPolicy(
 	context: NativeQuotaContext,
 	options: {
 		accounts?: readonly Account[];
+		/** Request authority only; temporary availability must not remove quota coverage. */
+		isCandidateEligible?: (
+			account: Account,
+			member: EffectiveComboMember,
+		) => boolean;
 		now: number;
 		getSnapshot: (accountId: string) => UsageSnapshot | null;
 		getFamilyMarker: (
@@ -434,12 +439,23 @@ export function evaluateNativeQuotaPolicy(
 			});
 		candidateBlockers.set(member.id, blockers);
 	}
-	const admittedCandidateIds = gatedMembers
+	// Validate and retain proof for the complete catalog, but only routes this
+	// request may use can establish quota coverage or its recovery timing.
+	const authorizedMembers = gatedMembers.filter((member) => {
+		const account = accounts.find((entry) => entry.id === member.account_id);
+		return (
+			account !== undefined &&
+			(options.isCandidateEligible?.(account, member) ?? true)
+		);
+	});
+	const admittedCandidateIds = authorizedMembers
 		.filter((member) => candidateBlockers.get(member.id)?.length === 0)
 		.map((member) => member.id);
 	let quotaWait: NativeQuotaTerminalPresentation | null = null;
-	if (gatedMembers.length > 0 && admittedCandidateIds.length === 0) {
-		const blockerSets = [...candidateBlockers.values()];
+	if (authorizedMembers.length > 0 && admittedCandidateIds.length === 0) {
+		const blockerSets = authorizedMembers.map(
+			(member) => candidateBlockers.get(member.id) ?? [],
+		);
 		const blockers = blockerSets.flat();
 		const routeResets = blockerSets.map((rows) => {
 			const resets = rows.map((row) => row.resetAtMs);

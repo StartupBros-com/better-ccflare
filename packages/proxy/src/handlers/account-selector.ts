@@ -775,6 +775,12 @@ export function evaluateNativeQuotaRequest(
 							current.id === account.id ? account : current,
 						)
 					: context.accounts,
+				isCandidateEligible: (candidateAccount, member) =>
+					isNativeQuotaRequestCandidateEligible(
+						meta,
+						candidateAccount,
+						member.id,
+					),
 				getSnapshot: (accountId) => usageCache.getSnapshot(accountId),
 				getFamilyMarker: (accountId, model) =>
 					usageCache.getFamilyScopedExhaustion(accountId, model, now),

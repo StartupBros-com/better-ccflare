@@ -113,6 +113,84 @@ const evaluate = (
 	});
 
 describe("native quota admission evidence", () => {
+	it("keeps the configured catalog and per-account proof when request authority denies a member", () => {
+		const result = evaluateNativeQuotaPolicy(context(), {
+			now: NOW,
+			isCandidateEligible: (candidate) => candidate.id === "a",
+			getSnapshot: (id) => (id === "a" ? usage(20) : usage(100)),
+			getFamilyMarker: () => null,
+		});
+		expect(result.primaryAccountIds).toEqual(["a", "b"]);
+		expect(result.backupAllowedAccountIds).toEqual(["b"]);
+		expect(result.familyProofs.has("a")).toBe(false);
+		expect(result.familyProofs.has("b")).toBe(true);
+		expect(result.physicalModels.get("b:claude-opus-5")).toEqual([
+			"claude-opus-5",
+		]);
+		expect(result.capacities.get("b:claude-fable-5")).toMatchObject([
+			{ scope: "family" },
+		]);
+		expect(result.admittedCandidateIds).toEqual(["a:claude-fable-5"]);
+		expect(result.wait).toBeNull();
+	});
+
+	it("does not let denied usage govern authorized quota coverage or recovery timing", () => {
+		const deniedUsage = usage(20, 100, false, NOW - 179_000);
+		(deniedUsage.data as TestUsageData).limits[0].resets_at = new Date(
+			NOW + 5000,
+		).toISOString();
+		const result = evaluateNativeQuotaPolicy(context(), {
+			now: NOW,
+			isCandidateEligible: (candidate) => candidate.id === "a",
+			getSnapshot: (id) => (id === "a" ? usage(20, 100) : deniedUsage),
+			getFamilyMarker: () => null,
+		});
+		expect(result.capacities.size).toBe(2);
+		expect(result.wait).toMatchObject({
+			kind: "quota_wait",
+			resetAt: RESET,
+			nextRecheckAt: NOW + 60_000,
+		});
+	});
+
+	it("does not treat temporary account unavailability as request authority denial", () => {
+		const result = evaluateNativeQuotaPolicy(context(), {
+			now: NOW,
+			accounts: [
+				account("a", {
+					rate_limited_until: RESET,
+					rate_limited_reason: "upstream_429_with_reset",
+				}),
+				account("b"),
+			],
+			isCandidateEligible: (candidate) => candidate.id === "a",
+			getSnapshot: () => usage(20, 100),
+			getFamilyMarker: () => null,
+		});
+		expect(result.wait).toMatchObject({ kind: "quota_wait", resetAt: RESET });
+	});
+
+	it("keeps all-denied routes nonretrying while still validating denied destinations", () => {
+		const options = {
+			now: NOW,
+			isCandidateEligible: () => false,
+			getSnapshot: () => usage(20, 100),
+			getFamilyMarker: () => null,
+		};
+		const result = evaluateNativeQuotaPolicy(context(), options);
+		expect(result.admittedCandidateIds).toEqual([]);
+		expect(result.wait).toBeNull();
+		expect(result.structuralError).toBeNull();
+		const invalid = evaluateNativeQuotaPolicy(context(), {
+			...options,
+			accounts: [
+				account("a"),
+				account("b", { custom_endpoint: "https://offline.invalid" }),
+			],
+		});
+		expect(invalid.structuralError).toContain("physical destinations");
+	});
+
 	it("shares the selector context and terminal contracts", () => {
 		const captured = createNativeQuotaContext({
 			family: "fable",
