@@ -1930,6 +1930,37 @@ function isAccountEligibleForRouteIntent(
 	);
 }
 
+/** Reuse selection policy for discovery without conflating it with support proof. */
+export function isImplicitCodexDiscoveryEligible(
+	account: Account,
+	meta: RequestMeta,
+	ctx: ProxyContext,
+	physicalModel: string,
+	syntheticProbe = false,
+): boolean {
+	if (
+		meta.forcedAccountId?.trim() ||
+		meta.headers?.get("x-better-ccflare-account-id") ||
+		!isAccountEligibleForRouteIntent(account, meta, ctx) ||
+		isProviderExcludedForRequest(account, getExcludedProviders(meta))
+	) {
+		return false;
+	}
+	return (
+		evaluateCandidateCapacity(
+			account,
+			physicalModel,
+			canonicalizeBetaSignature(meta.headers?.get("anthropic-beta")),
+			Date.now(),
+			{
+				modelScopedCapacityRouting: getModelScopedCapacityRoutingMode(ctx),
+				routeIntent: "capability",
+				syntheticProbe,
+			},
+		).blockers.length === 0
+	);
+}
+
 export type ImplicitFallbackPolicyDecisionReason =
 	| "off"
 	| "allowed"

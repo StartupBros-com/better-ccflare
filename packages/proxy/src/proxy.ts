@@ -118,6 +118,7 @@ import {
 	isCapabilityRouteSelection,
 	isComboSessionFallbackDisabled,
 	isForceAccountModelEnabled,
+	isImplicitCodexDiscoveryEligible,
 	isNativeQuotaRequestCandidateEligible,
 	isNativeQuotaRouteAllowed,
 } from "./handlers/account-selector";
@@ -1297,6 +1298,22 @@ async function handleProxyCoreImpl(
 		terminal.response.headers.set("retry-after", "1");
 		return finishPacing(pacingSlot, terminal.response);
 	};
+	const getPredictiveThrottleUntil = (
+		account: Account,
+		model: string | null,
+		now: number,
+	): number | null => {
+		const settings = {
+			fiveHourEnabled: ctx.config.getUsageThrottlingFiveHourEnabled(),
+			weeklyEnabled: ctx.config.getUsageThrottlingWeeklyEnabled(),
+		};
+		return settings.fiveHourEnabled || settings.weeklyEnabled
+			? getUsageThrottleUntil(usageCache.get(account.id), settings, now, {
+					requestModel: model,
+					scopedMode: "match",
+				})
+			: null;
+	};
 	let implicitAccountSelectionBudgetMs: number | undefined;
 	let implicitRouteAccounts: Account[] | undefined;
 	const codexPhysicalModel = getCodexPassthroughPhysicalModel(
@@ -1332,6 +1349,35 @@ async function handleProxyCoreImpl(
 							ctx,
 							deadlineAt: implicitAccountSelectionDeadlineAt,
 							signal: routingSignal,
+							isAccountEligible: (account) => {
+								if (
+									!isImplicitCodexDiscoveryEligible(
+										account,
+										requestMeta,
+										ctx,
+										codexPhysicalModel,
+										trustedInternalKeepalive,
+									)
+								)
+									return false;
+								if (trustedInternalAutoRefresh || trustedInternalKeepalive)
+									return true;
+								const now = Date.now();
+								return (
+									(getPredictiveThrottleUntil(
+										account,
+										codexPhysicalModel,
+										now,
+									) ?? 0) <= now &&
+									!isReactivelyModelDepleted({
+										accountId: account.id,
+										model: codexPhysicalModel,
+										betaSignature: req.headers.get("anthropic-beta"),
+										syntheticProbe: false,
+										now,
+									})
+								);
+							},
 						},
 					);
 				},
@@ -1736,22 +1782,6 @@ async function handleProxyCoreImpl(
 				? recoveryAt
 				: Math.min(reactiveModelRecoveryAt, recoveryAt);
 		return true;
-	};
-	const getPredictiveThrottleUntil = (
-		account: Account,
-		model: string | null,
-		now: number,
-	): number | null => {
-		const settings = {
-			fiveHourEnabled: ctx.config.getUsageThrottlingFiveHourEnabled(),
-			weeklyEnabled: ctx.config.getUsageThrottlingWeeklyEnabled(),
-		};
-		return settings.fiveHourEnabled || settings.weeklyEnabled
-			? getUsageThrottleUntil(usageCache.get(account.id), settings, now, {
-					requestModel: model,
-					scopedMode: "match",
-				})
-			: null;
 	};
 	const applyUsageThrottling = (accounts: Account[]) => {
 		// Internal synthetic probes (auto-refresh window-reset checks, cache
