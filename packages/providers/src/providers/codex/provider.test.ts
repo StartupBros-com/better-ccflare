@@ -85,17 +85,17 @@ const CODEX_TURN_STATE_ENV_KEYS = [
 
 describe("CodexProvider release identity", () => {
 	it("uses the exact upstream version in model URLs and request headers", () => {
-		expect(CODEX_VERSION).toBe("0.150.1");
+		expect(CODEX_VERSION).toBe("0.153.2");
 
 		const provider = new CodexProvider();
 		expect(provider.buildUrl("/v1/models", "")).toBe(
-			"https://chatgpt.com/backend-api/codex/models?client_version=0.150.1",
+			"https://chatgpt.com/backend-api/codex/models?client_version=0.153.2",
 		);
 
 		const headers = provider.prepareHeaders(new Headers(), "test-token");
-		expect(headers.get("Version")).toBe("0.150.1");
+		expect(headers.get("Version")).toBe("0.153.2");
 		expect(headers.get("User-Agent")).toBe(
-			"codex-cli/0.150.1 (Windows 10.0.26100; x64)",
+			"codex-cli/0.153.2 (Windows 10.0.26100; x64)",
 		);
 	});
 });
