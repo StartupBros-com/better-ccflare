@@ -300,24 +300,6 @@ describe("issue #324 — Codex CLI physical model implicit route", () => {
 		await expectCodexWireRequest(requests);
 	});
 
-	it("does not consult native quota combo routing for a physical Responses route", async () => {
-		const codex = makeCodexAccount();
-		const ctx = makeCtx({ accounts: [makeOrdinaryDecoy(), codex] });
-		const getActiveComboForFamily = mock(() => {
-			throw new Error("implicit Codex routing must bypass native quota combos");
-		});
-		ctx.dbOps.getActiveComboForFamily = getActiveComboForFamily;
-		const requests = installUpstream();
-
-		await proxyModel(ctx, CLAUDE_SONNET_5, "gpt-6-astra");
-
-		expect(getActiveComboForFamily).not.toHaveBeenCalled();
-		expect(
-			ctx.strategy.select.mock.calls[0]?.[0].map((account) => account.id),
-		).toEqual(["codex-1"]);
-		await expectCodexWireRequest(requests);
-	});
-
 	it("C (control): an ordinary Claude family request keeps its ordinary Claude account", async () => {
 		const claude = makeAccount({ id: "claude-1", provider: "anthropic" });
 		const ctx = makeCtx({ accounts: [claude] });

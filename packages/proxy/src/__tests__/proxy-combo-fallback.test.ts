@@ -17,6 +17,10 @@ const { usageCache } = await import("@better-ccflare/providers");
 const { getProvider, registerProvider } = await import(
 	"@better-ccflare/providers"
 );
+const { clearCodexModelCacheForTests } = await import("../codex-model-catalog");
+const { RESPONSES_ADAPTER_SECRET_HEADER } = await import(
+	"../handlers/proxy-types"
+);
 const usageCollectorModule = await import("../usage-collector");
 const { clearRoutingObservations, getRoutingObservations } = await import(
 	"../handlers/routing-observations"
@@ -119,11 +123,14 @@ function makeCodexOAuthAccount(id: string): Account {
 
 const originalFetch = globalThis.fetch;
 let restoreUsageCollector = (): void => {};
+let restoreCodexProvider = (): void => {};
 const cachedUsageAccountIds = new Set<string>();
 
 afterEach(() => {
 	restoreUsageCollector();
 	restoreUsageCollector = (): void => {};
+	restoreCodexProvider();
+	restoreCodexProvider = (): void => {};
 	clearRoutingObservations();
 	for (const accountId of cachedUsageAccountIds) usageCache.delete(accountId);
 	cachedUsageAccountIds.clear();
@@ -3276,5 +3283,99 @@ describe("native quota wait execution", () => {
 		} finally {
 			restore();
 		}
+	});
+});
+
+describe("adapter-authorized physical routing", () => {
+	it("does not consult native quota combo routing for a physical Responses route", async () => {
+		installUsageCollector();
+		clearCodexModelCacheForTests();
+		const codex = makeCodexOAuthAccount("codex-physical");
+		codex.model_mappings = JSON.stringify({
+			opus: "gpt-6-astra",
+			fable: "gpt-6-astra",
+			sonnet: "gpt-5.6-sol",
+			haiku: "gpt-5.6-terra",
+		});
+		const previousCodexProvider = getProvider("codex");
+		registerProvider({
+			...makeMockRoutingProvider("codex"),
+			buildUrl: (path, search, account) =>
+				`https://upstream.test/${account?.id ?? "anonymous"}${path}${search}`,
+		});
+		restoreCodexProvider = () => {
+			if (previousCodexProvider) registerProvider(previousCodexProvider);
+		};
+		const unusedCombo: ComboWithSlots = {
+			id: "unused-physical-combo",
+			name: "Unused physical combo",
+			description: null,
+			enabled: true,
+			created_at: 0,
+			updated_at: 0,
+			slots: [],
+		};
+		const strategySelect = mock((accounts: Account[]) => accounts);
+		const ctx = makeContext([codex], unusedCombo, strategySelect);
+		ctx.internalProbeSecret = "physical-route-test-secret";
+		ctx.config.getCombosEnabled = () => true;
+		ctx.config.getCodexImplicitRouteEnabled = () => true;
+		ctx.config.getForceAccountModel = () => false;
+		ctx.dbOps.getAccount = async (id: string) =>
+			id === codex.id ? codex : null;
+		ctx.dbOps.getAgentPreference = async () => null;
+		const getComboRoutingPolicy = mock(() => {
+			throw new Error("physical Codex routing must bypass native quota combos");
+		});
+		ctx.dbOps.getComboRoutingPolicy = getComboRoutingPolicy;
+		const requests: Request[] = [];
+		globalThis.fetch = mock(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request =
+					input instanceof Request ? input : new Request(input, init);
+				if (new URL(request.url).pathname.endsWith("/models")) {
+					return Response.json({
+						models: [
+							{
+								slug: "gpt-6-astra",
+								display_name: "Astra",
+								visibility: "list",
+								priority: 1,
+							},
+						],
+					});
+				}
+				requests.push(request.clone());
+				return Response.json({
+					id: "msg-physical-route",
+					type: "message",
+					role: "assistant",
+					content: [],
+				});
+			},
+		) as unknown as typeof fetch;
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				[RESPONSES_ADAPTER_SECRET_HEADER]: "physical-route-test-secret",
+				"x-better-ccflare-exclude-providers": "anthropic-oauth",
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-5",
+				messages: [{ role: "user", content: "offline fixture" }],
+				max_tokens: 16,
+				__better_ccflare_codex_passthrough: { model: "gpt-6-astra" },
+			}),
+		});
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		expect(response.status, await response.text()).toBe(200);
+		expect(getComboRoutingPolicy).not.toHaveBeenCalled();
+		expect(
+			strategySelect.mock.calls[0]?.[0].map((account) => account.id),
+		).toEqual([codex.id]);
+		expect(requests).toHaveLength(1);
+		expect(new URL(requests[0].url).pathname).toContain(codex.id);
 	});
 });
