@@ -52,10 +52,7 @@ We are committed to providing a welcoming and inspiring community for all. We pl
 
 Before you begin, ensure you have the following installed:
 
-- **Bun** >= 1.2.8 (required): Install from [bun.sh](https://bun.sh). CI installs the exact version in
-  `.bun-version` (the version the merge gate was last proven green on); to reproduce CI locally,
-  install that version (`mise install bun@$(cat .bun-version)`) and run commands through it
-  (`mise x bun@$(cat .bun-version) -- bun test`)
+- **Bun** >= 1.2.8 (required): Install from [bun.sh](https://bun.sh)
 - **Git**: For version control
 - **SQLite**: Comes bundled with Bun, no separate installation needed
 
@@ -165,23 +162,11 @@ bun run format
 
 ### Bumping the Bun toolchain
 
-`.bun-version` is the single source of truth for the Bun toolchain: floating `latest` moved
-underneath the merge gate once (#231/#232) and the unpin in #319 reopened that exposure (#321), so
-every gate, release, and signing workflow now installs the exact version pinned there via
-`bun-version-file`. Never set `bun-version: latest` on any of those workflows — the contract test
-`tests/bun-toolchain-pin.test.ts` fails the gate if it comes back. To move the pin:
-
-1. Dispatch the drift detector against the candidate version — `gh workflow run
-   bun-latest-canary.yml -f bun-version=<candidate>` (or wait for its daily scheduled run). A
-   failing candidate files or updates a tracking issue labelled `bug` instead of blocking any
-   merge.
-2. If the canary is green, change `.bun-version` in a PR — the canary run itself is the proof that
-   the new version passes the full managed-routing gate.
-3. If the canary is red, fix the affected suites and/or production code first, per
-   `docs/solutions/workflow-issues/bun-1-4-stream-cancel-and-net-close-semantics.md` §6 — do not
-   restore `bun-version: latest` as a workaround.
-4. Close the canary's tracking issue once the pin moves past the failing version; the canary itself
-   never closes it.
+`.bun-version` is the single source of truth: every CI workflow that installs Bun reads it via
+`bun-version-file` and asserts the installed `bun --version` matches (#321). To bump it, edit
+`.bun-version` to the exact new version, run `bun test tests/bun-toolchain-pin.test.ts`, and open a
+PR; the merge gate on that PR is the proof the new version passes. Never restore
+`bun-version: latest` in a workflow: the pin test fails the gate if it comes back.
 
 ### Repository Agent Instructions
 

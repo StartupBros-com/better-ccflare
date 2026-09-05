@@ -38,9 +38,9 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           # Exact version from .bun-version, the single source of truth for every
-          # workflow that installs Bun (see bun-latest-canary.yml and #321).
-          # Never float `latest` here: it moved underneath the merge gate once
-          # (#231/#232) and would do the same to a release build.
+          # workflow that installs Bun (#321). Never float `latest` here: it moved
+          # underneath the merge gate once (#231/#232) and would do the same to a
+          # release build.
           bun-version-file: .bun-version
 
       - name: Verify the installed Bun matches .bun-version
