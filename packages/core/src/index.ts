@@ -42,6 +42,7 @@ export {
 export * from "./force-account-model";
 export * from "./lifecycle";
 export * from "./memory-monitor";
+export * from "./native-quota-route-shape";
 export {
 	type BoundedOAuthResponseText,
 	MAX_OAUTH_ERROR_INPUT_LENGTH,

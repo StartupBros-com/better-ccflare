@@ -1,6 +1,7 @@
 import {
 	getAccountOwnedModelMappings,
 	getModelFamily,
+	isAccountAvailable,
 	KNOWN_PATTERNS,
 } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
@@ -16,6 +17,8 @@ export interface ImplicitCodexRouteOptions {
 	ctx?: ProxyContext;
 	/** Absolute account-selection deadline, in epoch milliseconds. */
 	deadlineAt?: number;
+	/** Resolver-only request/capacity gate, in addition to shared availability. */
+	isAccountEligible?: (account: Account) => boolean;
 	/** Selector rechecks use false; only request-time resolution may prime. */
 	prime?: boolean;
 	signal?: AbortSignal;
@@ -137,9 +140,30 @@ export async function resolveImplicitCodexRoute(
 	options: ImplicitCodexRouteOptions = {},
 ): Promise<{ id: string; matchingAccounts: Account[] } | null> {
 	const id = getCodexPassthroughPhysicalModel(parsedBody);
-	if (!id) return null;
+	if (!id || selectionExpired(options)) return null;
+	// Evidence defines route identity even for unavailable accounts. Only a
+	// ready proof lets us skip discovery of other potentially usable capacity.
+	const known = await Promise.all(
+		accounts.map((account) =>
+			accountServesPhysicalModel(account, id, { ...options, prime: false }),
+		),
+	);
+	if (selectionExpired(options)) return null;
+	const knownAccounts = accounts.filter((_account, index) => known[index]);
+	const isReady = (account: Account) =>
+		isAccountAvailable(account) &&
+		(options.isAccountEligible?.(account) ?? true);
+	if (knownAccounts.some(isReady)) {
+		return { id, matchingAccounts: knownAccounts };
+	}
+	// Keep negative cached catalogs authoritative and retain unavailable proofs.
+	// Only eligible cold accounts may join the catalog's shared bounded ensure.
 	const serves = await Promise.all(
-		accounts.map((account) => accountServesPhysicalModel(account, id, options)),
+		accounts.map((account, index) =>
+			known[index] || account.provider !== "codex" || !isReady(account)
+				? known[index]
+				: accountServesPhysicalModel(account, id, options),
+		),
 	);
 	if (selectionExpired(options)) return null;
 	const matchingAccounts = accounts.filter((_account, index) => serves[index]);

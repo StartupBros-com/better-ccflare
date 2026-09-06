@@ -1,5 +1,6 @@
 export type ComboFamily = "fable" | "opus" | "sonnet" | "haiku";
 export type ComboMembershipMode = "manual" | "managed";
+export type ComboExhaustionPolicy = "legacy" | "native_quota_wait";
 export type ComboRouteClass =
 	| "oauth-subscription"
 	| "api-key"
@@ -69,6 +70,7 @@ export interface ComboFamilyAssignmentRow {
 	enabled: number; // 0 or 1
 	membership_mode: string;
 	managed_model: string | null;
+	exhaustion_policy?: string;
 }
 
 export interface ComboEnrollmentRuleRow {
@@ -128,6 +130,8 @@ export interface ComboFamilyAssignment {
 	enabled: boolean;
 	membership_mode: ComboMembershipMode;
 	managed_model: string | null;
+	/** Missing on older callers and mocks; interpreted as legacy. */
+	exhaustion_policy?: ComboExhaustionPolicy;
 }
 
 export interface ComboEnrollmentRule {
@@ -176,6 +180,7 @@ export interface ComboFamilyPolicyUpdateInput {
 	enabled?: boolean;
 	membership_mode?: ComboMembershipMode;
 	managed_model?: string | null;
+	exhaustion_policy?: ComboExhaustionPolicy;
 }
 
 export interface ComboFamilyPolicyChanges {
@@ -498,6 +503,8 @@ export function toComboFamilyAssignment(
 		enabled: !!row.enabled,
 		membership_mode: row.membership_mode as ComboMembershipMode,
 		managed_model: row.managed_model,
+		exhaustion_policy: (row.exhaustion_policy ??
+			"legacy") as ComboExhaustionPolicy,
 	};
 }
 

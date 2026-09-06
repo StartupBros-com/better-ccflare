@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { PAUSE_REASON_NEEDS_REAUTH } from "@better-ccflare/core";
 import {
 	clearDerivedProviderModelDefaults,
 	setDerivedProviderModelDefaults,
@@ -216,6 +217,128 @@ describe("accountServesPhysicalModel evidence", () => {
 });
 
 describe("implicit Codex catalog priming", () => {
+	it.each([
+		{ paused: true },
+		{ pause_reason: PAUSE_REASON_NEEDS_REAUTH, requires_reauth: true },
+		{ rate_limited_until: Date.now() + 60_000 },
+	])("preserves unavailable route evidence without priming unavailable cold accounts: %j", async (hold) => {
+		const mapped = makeAccount({
+			...hold,
+			model_mappings: JSON.stringify({ sonnet: PHYSICAL_MODEL }),
+		});
+		const cold = makeAccount({ ...hold, id: "unavailable-cold" });
+		let reads = 0;
+		const ctx = makeContext(cold);
+		ctx.dbOps.getAccount = async () => {
+			reads++;
+			return cold;
+		};
+		expect(
+			await accountServesPhysicalModel(mapped, PHYSICAL_MODEL, {
+				prime: false,
+			}),
+		).toBe(true);
+		expect(
+			await resolveImplicitCodexRoute(carrier(PHYSICAL_MODEL), [mapped, cold], {
+				ctx,
+				deadlineAt: Date.now() + 1_000,
+			}),
+		).toEqual({ id: PHYSICAL_MODEL, matchingAccounts: [mapped] });
+		expect(reads).toBe(0);
+	});
+
+	it.each([
+		false,
+		true,
+	])("does not await an unrelated cold catalog when a cached route is ready (shared ensure=%s)", async (inFlight) => {
+		const known = makeAccount({ id: "known-catalog" });
+		await primeCatalog(known, PHYSICAL_MODEL);
+		const cold = makeAccount();
+		const ctx = makeContext(cold);
+		const response = Promise.withResolvers<Response>();
+		let fetches = 0;
+		globalThis.fetch = (async () => {
+			fetches++;
+			return response.promise;
+		}) as typeof fetch;
+		const shared = inFlight ? ensureCodexModelDefaults(cold, ctx) : undefined;
+		try {
+			expect(
+				await resolveImplicitCodexRoute(
+					carrier(PHYSICAL_MODEL),
+					[cold, known],
+					{
+						ctx,
+						deadlineAt: Date.now() + 50,
+					},
+				),
+			).toEqual({ id: PHYSICAL_MODEL, matchingAccounts: [known] });
+			expect(fetches).toBe(inFlight ? 1 : 0);
+		} finally {
+			response.resolve(catalogResponse(PHYSICAL_MODEL));
+			if (shared) await shared;
+			else if (fetches) await ensureCodexModelDefaults(cold, ctx);
+		}
+		if (inFlight)
+			expect(
+				await accountServesPhysicalModel(cold, PHYSICAL_MODEL, {
+					prime: false,
+				}),
+			).toBe(true);
+	});
+
+	it("discovers eligible cold capacity with an expired hold using a shared ensure", async () => {
+		const cold = makeAccount({ rate_limited_until: Date.now() - 1 });
+		const ctx = makeContext(cold);
+		const response = Promise.withResolvers<Response>();
+		let fetches = 0;
+		globalThis.fetch = (async () => {
+			fetches++;
+			return response.promise;
+		}) as typeof fetch;
+		const shared = ensureCodexModelDefaults(cold, ctx);
+		const selection = resolveImplicitCodexRoute(
+			carrier(PHYSICAL_MODEL),
+			[cold],
+			{ ctx, deadlineAt: Date.now() + 1_000 },
+		);
+		response.resolve(catalogResponse(PHYSICAL_MODEL));
+		expect(await selection).toEqual({
+			id: PHYSICAL_MODEL,
+			matchingAccounts: [cold],
+		});
+		await shared;
+		expect(fetches).toBe(1);
+	});
+
+	it("never primes a cached negative even when another cold account needs discovery", async () => {
+		const negative = makeAccount({
+			id: "negative",
+			model_mappings: JSON.stringify({ sonnet: PHYSICAL_MODEL }),
+		});
+		await primeCatalog(negative, "other-model");
+		const cold = makeAccount();
+		const ctx = makeContext(cold);
+		const reads: string[] = [];
+		ctx.dbOps.getAccount = async (id) => {
+			reads.push(id);
+			return cold;
+		};
+		globalThis.fetch = (async () =>
+			catalogResponse(PHYSICAL_MODEL)) as typeof fetch;
+		expect(
+			await resolveImplicitCodexRoute(
+				carrier(PHYSICAL_MODEL),
+				[negative, cold],
+				{
+					ctx,
+					deadlineAt: Date.now() + 1_000,
+				},
+			),
+		).toEqual({ id: PHYSICAL_MODEL, matchingAccounts: [cold] });
+		expect(reads).toEqual([cold.id]);
+	});
+
 	it("primes an unprimed account once within the selection deadline", async () => {
 		const account = makeAccount();
 		let fetchCount = 0;
@@ -275,6 +398,13 @@ describe("implicit Codex catalog priming", () => {
 			expect(
 				await accountServesPhysicalModel(account, PHYSICAL_MODEL, options),
 			).toBe(false);
+			expect(
+				await resolveImplicitCodexRoute(
+					carrier(PHYSICAL_MODEL),
+					[account],
+					options,
+				),
+			).toBeNull();
 		}
 		expect(accountReads).toBe(0);
 	});

@@ -33,25 +33,87 @@ const postgresUrl = configuredPostgresUrl
 	: undefined;
 const describePostgres = postgresUrl ? describe : describe.skip;
 
+describePostgres("native quota policy PostgreSQL round trips", () => {
+	for (const upgrade of [false, true]) {
+		it(`preserves native policy and revisions on ${upgrade ? "upgraded" : "fresh"} PostgreSQL`, async () => {
+			await withDisposableDatabase(async (adapter) => {
+				await ensureSchemaPg(adapter);
+				if (upgrade) {
+					await adapter.unsafe(
+						"ALTER TABLE combo_family_assignments DROP COLUMN exhaustion_policy",
+					);
+					await runMigrationsPg(adapter);
+				}
+				await seedPolicyBase(adapter);
+				const repo = new ComboRepository(adapter);
+				expect(
+					(await repo.getRoutingPolicySnapshot("fable")).assignment
+						.exhaustion_policy,
+				).toBe("legacy");
+				const revision = await repo.getRoutingPolicyRevision();
+				await repo.updateFamilyPolicy("fable", {
+					exhaustion_policy: "native_quota_wait",
+				});
+				expect(await repo.getRoutingPolicyRevision()).toBeGreaterThan(revision);
+				await repo.setFamilyAssignment("fable", "combo-1", true);
+				await repo.updateFamilyPolicy("fable", { membership_mode: "manual" });
+				expect(
+					(await repo.getFamilyAssignments()).find(
+						(assignment) => assignment.family === "fable",
+					)?.exhaustion_policy,
+				).toBe("native_quota_wait");
+				expect(
+					(await repo.getRoutingPolicySnapshot("fable")).assignment,
+				).toMatchObject({
+					exhaustion_policy: "native_quota_wait",
+					combo_id: "combo-1",
+					enabled: true,
+				});
+				await repo.setFamilyAssignment("fable", null, false);
+				expect(
+					(await repo.getRoutingPolicySnapshot("fable")).assignment,
+				).toMatchObject({
+					exhaustion_policy: "native_quota_wait",
+					combo_id: null,
+					enabled: false,
+				});
+				await repo.applyFamilyPolicyChanges({
+					family: "fable",
+					expected_revision: await repo.getRoutingPolicyRevision(),
+					assignment: { exhaustion_policy: "legacy" },
+				});
+				expect(
+					(await repo.getRoutingPolicySnapshot("fable")).assignment
+						.exhaustion_policy,
+				).toBe("legacy");
+				await expect(
+					repo.updateFamilyPolicy("fable", {
+						exhaustion_policy: "invalid" as never,
+					}),
+				).rejects.toThrow();
+			});
+		});
+	}
+});
+
 async function withDisposableDatabase(
 	test: (adapter: BunSqlAdapter) => Promise<void>,
 ): Promise<void> {
 	if (!postgresUrl) throw new Error("PostgreSQL integration URL is required");
-	const databaseName = `ccflare_managed_${randomUUID().replaceAll("-", "")}`;
+	const schemaName = `ccflare_managed_${randomUUID().replaceAll("-", "")}`;
 	const adminSql = new SQL({ url: postgresUrl, max: 1, prepare: false });
-	const databaseUrl = new URL(postgresUrl);
-	databaseUrl.pathname = `/${databaseName}`;
 	let adapter: BunSqlAdapter | undefined;
-	let databaseCreated = false;
+	let schemaCreated = false;
 	let primaryError: unknown;
 	let hasPrimaryError = false;
 	try {
-		await adminSql.unsafe(`CREATE DATABASE ${databaseName}`);
-		databaseCreated = true;
+		await adminSql.unsafe(`CREATE SCHEMA ${schemaName}`);
+		schemaCreated = true;
 		const sql = new SQL({
-			url: databaseUrl.toString(),
+			url: postgresUrl,
 			max: 4,
 			prepare: false,
+			connection: { search_path: schemaName },
 		});
 		adapter = new BunSqlAdapter(sql, false);
 		await test(adapter);
@@ -66,11 +128,9 @@ async function withDisposableDatabase(
 	} catch (error) {
 		cleanupErrors.push(error);
 	}
-	if (databaseCreated) {
+	if (schemaCreated) {
 		try {
-			await adminSql.unsafe(
-				`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`,
-			);
+			await adminSql.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`);
 		} catch (error) {
 			cleanupErrors.push(error);
 		}
@@ -130,6 +190,7 @@ async function policyIndexes(
 			ON attribute.attrelid = table_class.oid
 			AND attribute.attnum = index_key.attnum
 		 WHERE table_class.relname IN ('combo_enrollment_rules', 'combo_membership_exclusions')
+			AND table_class.relnamespace = current_schema()::regnamespace
 			AND index_class.relname LIKE 'idx_combo_%'
 		 GROUP BY index_class.relname, index_meta.indisunique
 		 ORDER BY index_class.relname`,
@@ -264,6 +325,7 @@ async function routingAttemptIndexes(
 			ON attribute.attrelid = table_class.oid
 			AND attribute.attnum = index_key.attnum
 		 WHERE table_class.relname = 'routing_attempts'
+			AND table_class.relnamespace = current_schema()::regnamespace
 			AND index_class.relname LIKE 'idx_routing_attempts_%'
 		 GROUP BY index_class.relname
 		 ORDER BY index_class.relname`,
@@ -302,6 +364,7 @@ describePostgres("managed routing PostgreSQL integration", () => {
 				 FROM pg_constraint constraint_meta
 				 JOIN pg_class table_class ON table_class.oid = constraint_meta.conrelid
 				 WHERE table_class.relname = 'routing_attempts'
+					AND table_class.relnamespace = current_schema()::regnamespace
 					AND constraint_meta.contype = 'f'`,
 				),
 			).toEqual([{ foreign_key_count: "0" }]);
@@ -886,6 +949,7 @@ describePostgres("managed routing PostgreSQL integration", () => {
 				enabled: true,
 				membership_mode: "manual",
 				managed_model: null,
+				exhaustion_policy: "legacy",
 			});
 
 			expect(

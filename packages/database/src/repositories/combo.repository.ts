@@ -65,6 +65,7 @@ interface RoutingPolicySnapshotRow {
 	route_class: string | null;
 	membership_mode: string | null;
 	managed_model: string | null;
+	exhaustion_policy: string | null;
 	enabled: number | null;
 	priority: number | null;
 	created_at: number | null;
@@ -270,7 +271,7 @@ export class ComboRepository extends BaseRepository<Combo> {
 			throw new Error(`Family assignment not found: ${family}`);
 		}
 		const row = await this.get<ComboFamilyAssignmentRow>(
-			`SELECT family, combo_id, enabled, membership_mode, managed_model
+			`SELECT family, combo_id, enabled, membership_mode, managed_model, exhaustion_policy
 			 FROM combo_family_assignments WHERE family = ?`,
 			[family],
 		);
@@ -280,7 +281,7 @@ export class ComboRepository extends BaseRepository<Combo> {
 
 	async getFamilyAssignments(): Promise<ComboFamilyAssignment[]> {
 		const rows = await this.query<ComboFamilyAssignmentRow>(
-			`SELECT family, combo_id, enabled, membership_mode, managed_model
+			`SELECT family, combo_id, enabled, membership_mode, managed_model, exhaustion_policy
 			 FROM combo_family_assignments`,
 		);
 		// Return stored rows; callers handle missing families as "no assignment"
@@ -298,7 +299,7 @@ export class ComboRepository extends BaseRepository<Combo> {
 		family: ComboFamily,
 	): Promise<ComboWithSlots | null> {
 		const assignment = await this.get<ComboFamilyAssignmentRow>(
-			`SELECT family, combo_id, enabled, membership_mode, managed_model
+			`SELECT family, combo_id, enabled, membership_mode, managed_model, exhaustion_policy
 			 FROM combo_family_assignments
        WHERE family = ? AND enabled = 1 AND combo_id IS NOT NULL`,
 			[family],
@@ -470,7 +471,7 @@ export class ComboRepository extends BaseRepository<Combo> {
 	): Promise<ComboRoutingPolicySnapshot> {
 		const rows = await this.query<RoutingPolicySnapshotRow>(
 			`WITH selected_assignment AS (
-				SELECT family, combo_id, enabled, membership_mode, managed_model
+				SELECT family, combo_id, enabled, membership_mode, managed_model, exhaustion_policy
 				FROM combo_family_assignments
 				WHERE family = ?
 			),
@@ -488,6 +489,7 @@ export class ComboRepository extends BaseRepository<Combo> {
 					CAST(NULL AS TEXT) AS route_class,
 					a.membership_mode,
 					a.managed_model,
+					a.exhaustion_policy,
 					a.enabled,
 					CAST(NULL AS INTEGER) AS priority,
 					CAST(NULL AS BIGINT) AS created_at,
@@ -503,7 +505,7 @@ export class ComboRepository extends BaseRepository<Combo> {
 					'combo', a.family, a.combo_id, c.id, c.name, c.description,
 					CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT),
 					CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT),
-					c.enabled, CAST(NULL AS INTEGER), c.created_at, c.updated_at,
+					CAST(NULL AS TEXT), c.enabled, CAST(NULL AS INTEGER), c.created_at, c.updated_at,
 					1, CAST(0 AS BIGINT), c.id
 				FROM selected_assignment a
 				JOIN combos c ON c.id = a.combo_id
@@ -514,7 +516,7 @@ export class ComboRepository extends BaseRepository<Combo> {
 					'slot', a.family, s.combo_id, s.id, CAST(NULL AS TEXT),
 					CAST(NULL AS TEXT), s.model, s.account_id, CAST(NULL AS TEXT),
 					CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT),
-					s.enabled, s.priority, CAST(NULL AS BIGINT), CAST(NULL AS BIGINT),
+					CAST(NULL AS TEXT), s.enabled, s.priority, CAST(NULL AS BIGINT), CAST(NULL AS BIGINT),
 					2, CAST(s.priority AS BIGINT), s.id
 				FROM selected_assignment a
 				JOIN combo_slots s ON s.combo_id = a.combo_id
@@ -525,7 +527,7 @@ export class ComboRepository extends BaseRepository<Combo> {
 					'rule', r.family, r.combo_id, r.id, CAST(NULL AS TEXT),
 					CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT),
 					r.provider, r.route_class, CAST(NULL AS TEXT), CAST(NULL AS TEXT),
-					r.enabled, CAST(NULL AS INTEGER), r.created_at, r.updated_at,
+					CAST(NULL AS TEXT), r.enabled, CAST(NULL AS INTEGER), r.created_at, r.updated_at,
 					3, r.created_at, r.id
 				FROM selected_assignment a
 				JOIN combo_enrollment_rules r
@@ -537,14 +539,14 @@ export class ComboRepository extends BaseRepository<Combo> {
 					'exclusion', e.family, e.combo_id, e.id, CAST(NULL AS TEXT),
 					CAST(NULL AS TEXT), CAST(NULL AS TEXT), e.account_id,
 					CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT),
-					CAST(NULL AS TEXT), CAST(NULL AS INTEGER), CAST(NULL AS INTEGER),
+					CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS INTEGER), CAST(NULL AS INTEGER),
 					e.created_at, CAST(NULL AS BIGINT), 4, e.created_at, e.id
 				FROM selected_assignment a
 				JOIN combo_membership_exclusions e
 					ON e.family = a.family AND e.combo_id = a.combo_id
 			)
 			SELECT row_kind, family, combo_id, id, name, description, model,
-				account_id, provider, route_class, membership_mode, managed_model,
+				account_id, provider, route_class, membership_mode, managed_model, exhaustion_policy,
 				enabled, priority, created_at, updated_at
 			FROM snapshot_rows
 			ORDER BY sort_group, sort_primary, sort_text`,
@@ -565,6 +567,7 @@ export class ComboRepository extends BaseRepository<Combo> {
 						enabled: row.enabled ?? 0,
 						membership_mode: row.membership_mode ?? "manual",
 						managed_model: row.managed_model,
+						exhaustion_policy: row.exhaustion_policy ?? "legacy",
 					});
 					break;
 				case "combo":
@@ -1023,6 +1026,10 @@ export class ComboRepository extends BaseRepository<Combo> {
 		if (Object.hasOwn(fields, "managed_model")) {
 			clauses.push("managed_model = ?");
 			params.push(fields.managed_model ?? null);
+		}
+		if (fields.exhaustion_policy !== undefined) {
+			clauses.push("exhaustion_policy = ?");
+			params.push(fields.exhaustion_policy);
 		}
 		if (clauses.length === 0) return { sql: "", params: [] };
 		params.push(family);

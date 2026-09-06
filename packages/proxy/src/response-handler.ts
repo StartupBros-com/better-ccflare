@@ -36,6 +36,7 @@ import {
 	boundedAccountHoldReset,
 	classifyPreByte429,
 	getAnthropicRateLimitResetAt,
+	nativeFamilyRejectionEvidence,
 	type RateLimitScopeDecision,
 } from "./handlers/rate-limit-scope";
 import { createSseRateLimitSniffer } from "./handlers/sse-rate-limit-sniffer";
@@ -177,6 +178,7 @@ export function handleAnthropicSseRateLimit(
 				account.id,
 				attemptedModel,
 				decision.markerExpiresAt,
+				nativeFamilyRejectionEvidence(classificationResponse, decision),
 			);
 		} else if (
 			decision.scope === "model" &&

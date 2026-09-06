@@ -150,6 +150,7 @@ import {
 	boundedAccountHoldReset,
 	classifyPreByte429,
 	getAnthropicRateLimitResetAt,
+	nativeFamilyRejectionEvidence,
 	recordRequestRateLimitOutcome,
 } from "./rate-limit-scope";
 import { makeProxyRequest, validateProviderPath } from "./request-handler";
@@ -814,6 +815,9 @@ export interface ContextAdmissionEstimate {
 	readonly confidence: ContextAdmissionEstimateConfidence;
 }
 
+/** A request-local policy veto before bytes; never account-health evidence. */
+class NativeQuotaAdmissionDenied extends Error {}
+
 /**
  * Request-orchestrator boundary for implicit account-local model fallbacks.
  * The global executor can defer a cross-family fallback, or any fallback that
@@ -846,6 +850,13 @@ export interface ModelFallbackExecutionPolicy {
 	 */
 	readonly preferContextOverflowFallback?: (model: string) => void;
 	readonly implicitFallbacksEnabled?: boolean;
+	/** Rechecked at the physical send after asynchronous request preparation. */
+	readonly nativeQuotaAdmission?: (
+		model: string | null,
+		endpoint: string,
+	) => boolean;
+	/** Request-local pre-header outcome; null means transport failed before a response. */
+	readonly observeNativeQuotaAttempt?: (status: number | null) => void;
 	/** A planned non-final candidate must not terminate the global route queue. */
 	readonly forwardModelUnavailableResponse?: boolean;
 	/**
@@ -3244,6 +3255,34 @@ export async function proxyWithAccount(
 			plannedPhysicalModel,
 			modelFallbackPolicy?.recomputeServerToolCapability !== true,
 		);
+		let nativeInitialModelIndex = 0;
+		let nativeInitialPhysicalModel: string | null = null;
+		if (modelFallbackPolicy?.nativeQuotaAdmission && admittedRequestModel) {
+			const models = getModelList(admittedRequestModel, account) ?? [
+				admittedRequestModel,
+			];
+			nativeInitialModelIndex = models.findIndex(
+				(model) =>
+					(staleTokenRetryAttempt > 0 ||
+						!routingAttemptLedger?.hasAttempted(account.id, model)) &&
+					modelFallbackPolicy.nativeQuotaAdmission?.(
+						model,
+						attemptPlan.targetUrl,
+					),
+			);
+			if (nativeInitialModelIndex < 0) return null;
+			if (nativeInitialModelIndex > 0) {
+				// A finite exact-model marker can outlive the request that wrote it.
+				// Start at an admitted physical alternative instead of abandoning the
+				// configured member before its healthy same-family models can run.
+				nativeInitialPhysicalModel = models[nativeInitialModelIndex];
+				attemptPlan = materializeAttemptPlan(
+					effectiveBodyBuffer,
+					nativeInitialPhysicalModel,
+					false,
+				);
+			}
+		}
 		const contextOverflowCapabilityForPlan = (
 			plan: ProviderAttemptPlan,
 		): DeterministicFailureCapabilityKey | null =>
@@ -3901,6 +3940,7 @@ export async function proxyWithAccount(
 		 * exit is one guard for the whole class, so a new veto added ahead of the
 		 * transport is covered without a matching release beside it.
 		 */
+		const nativeClaimedModels = new Set<string | null>();
 		const executeCacheAwareProviderAttempt = async (
 			transportRequest: Request,
 			replayBody: ArrayBuffer | null,
@@ -3912,6 +3952,8 @@ export async function proxyWithAccount(
 			try {
 				return await runCacheAwareProviderAttempt();
 			} catch (error) {
+				if (dispatchStarted && !req.signal.aborted)
+					modelFallbackPolicy?.observeNativeQuotaAttempt?.(null);
 				if (attemptPlan.providerName === "codex") {
 					try {
 						if (dispatchStarted) {
@@ -3958,6 +4000,15 @@ export async function proxyWithAccount(
 				transportRequest = new Request(transportRequest, {
 					headers: trustedTransportHeaders,
 				});
+				if (
+					modelFallbackPolicy?.nativeQuotaAdmission?.(
+						resolvedModel ?? null,
+						transportRequest.url,
+					) === false
+				) {
+					if (reservation) cancelPhysicalSendReservation(reservation);
+					throw new NativeQuotaAdmissionDenied();
+				}
 				const isSynthetic = isSyntheticProviderResponse(transportRequest);
 				latestPhysicalAnthropicCohortKey = isSynthetic
 					? null
@@ -4004,7 +4055,36 @@ export async function proxyWithAccount(
 					currentCodexWebSocketReceipt = null;
 					return materializeSyntheticResponse(transportRequest);
 				}
+				const ensureNativeQuotaDispatch = (): void => {
+					if (!modelFallbackPolicy?.nativeQuotaAdmission) return;
+					if (
+						modelFallbackPolicy.nativeQuotaAdmission(
+							resolvedModel ?? null,
+							transportRequest.url,
+						) === false
+					)
+						throw new NativeQuotaAdmissionDenied();
+					const model = resolvedModel ?? null;
+					if (nativeClaimedModels.has(model)) return;
+					// Quota may change during preparation. Only a route that is
+					// actually about to send owns the one-shot native route claim.
+					if (
+						routingAttemptLedger &&
+						!(staleTokenRetryAttempt > 0
+							? routingAttemptLedger.claimRetry(account.id, model)
+							: routingAttemptLedger.claim(account.id, model))
+					)
+						throw new NativeQuotaAdmissionDenied();
+					nativeClaimedModels.add(model);
+					if (routingAttemptLedger) {
+						failoverAttempts = Math.max(
+							failoverAttempts,
+							routingAttemptLedger.attemptedCount - 1,
+						);
+					}
+				};
 				const recordPhysicalDispatch = (): void => {
+					ensureNativeQuotaDispatch();
 					routingAttemptLedger?.recordPhysicalAttempt({
 						accountId: account.id,
 						candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
@@ -4043,6 +4123,7 @@ export async function proxyWithAccount(
 					claimCurrentHostedDispatch();
 				};
 				const claimHostedAndRecordHttpDispatch = (): void => {
+					ensureNativeQuotaDispatch();
 					routingAttemptLedger?.assertPhysicalAttemptAvailable(
 						physicalAttemptVetoContext(),
 					);
@@ -4115,6 +4196,7 @@ export async function proxyWithAccount(
 						commitCodexDispatchedRoute();
 					},
 				);
+				modelFallbackPolicy?.observeNativeQuotaAttempt?.(response.status);
 				observeTrustedHttpOverload(response, transportRequest, resolvedModel);
 				return response;
 			}
@@ -4162,7 +4244,7 @@ export async function proxyWithAccount(
 			transformedRequest,
 			attemptPlan.providerName === "codex"
 				? attemptPlan.physicalModel
-				: replayResolvedModel,
+				: (nativeInitialPhysicalModel ?? replayResolvedModel),
 		);
 		// Provider-local stream intent must reach processResponse, not upstream.
 		// Capture it before transport sanitization and reattach only to the local
@@ -4208,6 +4290,7 @@ export async function proxyWithAccount(
 		let currentTransportModel = transformedModel || concreteAttemptModel;
 		if (
 			routingAttemptLedger &&
+			!modelFallbackPolicy?.nativeQuotaAdmission &&
 			!(staleTokenRetryAttempt > 0
 				? routingAttemptLedger.claimRetry(account.id, currentTransportModel)
 				: routingAttemptLedger.claim(account.id, currentTransportModel))
@@ -5383,6 +5466,7 @@ export async function proxyWithAccount(
 						account.id,
 						attemptedModel,
 						decision.markerExpiresAt,
+						nativeFamilyRejectionEvidence(failureResponse, decision),
 					)
 				) {
 					return null;
@@ -5772,15 +5856,19 @@ export async function proxyWithAccount(
 				}
 
 				if (requestedModel) {
-					const modelList =
-						modelFallbackPolicy?.implicitFallbacksEnabled === false
+					// Native admission validates the whole configured physical list and
+					// fences every destination again before sending. Its same-family
+					// alternatives remain available when implicit fallback is disabled.
+					const modelList = modelFallbackPolicy?.nativeQuotaAdmission
+						? getModelList(requestedModel, account)
+						: modelFallbackPolicy?.implicitFallbacksEnabled === false
 							? null
 							: usesCodexAdmissionPlan
 								? concreteCodexModels
 								: getModelList(requestedModel, account);
 					const fallbackStartIndex = usesCodexAdmissionPlan
 						? admittedModelIndex + 1
-						: 1;
+						: nativeInitialModelIndex + 1;
 					if (!modelList || fallbackStartIndex >= modelList.length) {
 						if (isScopedFailure(rawFailureClassification)) {
 							return null;
@@ -6024,6 +6112,13 @@ export async function proxyWithAccount(
 						null;
 					for (let i = fallbackStartIndex; i < modelList.length; i++) {
 						const nextModel = modelList[i];
+						if (modelFallbackPolicy?.nativeQuotaAdmission)
+							req.signal.throwIfAborted();
+						if (
+							modelFallbackPolicy?.nativeQuotaAdmission &&
+							routingAttemptLedger?.hasAttempted(account.id, nextModel)
+						)
+							continue;
 						if (candidateHasScopedFailure(nextModel)) {
 							log.info(
 								`Skipping model ${nextModel} on account ${account.name} because the current request has scoped exhaustion evidence`,
@@ -6108,6 +6203,13 @@ export async function proxyWithAccount(
 								nextModel,
 								false,
 							);
+							if (
+								modelFallbackPolicy?.nativeQuotaAdmission?.(
+									nextModel,
+									fallbackPlan.targetUrl,
+								) === false
+							)
+								continue;
 							fallbackHeaders = prepareAttemptHeaders(fallbackPlan);
 							// Stamp before the request is built and transformed: the Codex
 							// provider registers this attempt's turn-state context during the
@@ -6170,7 +6272,8 @@ export async function proxyWithAccount(
 
 						// getModelList returns concrete provider models, and the transformed
 						// request is force-patched to this exact value. Claim only after the
-						// proof-equality transform gate has succeeded.
+						// proof-equality transform gate has succeeded. Native routes defer
+						// their claim to the final admission check at physical dispatch.
 						const fallbackContextOverflowCapability =
 							contextOverflowCapabilityForPlan(fallbackPlan);
 						if (
@@ -6179,7 +6282,8 @@ export async function proxyWithAccount(
 								routingAttemptLedger.hasDeterministicFailure(
 									fallbackContextOverflowCapability,
 								)) ||
-								!routingAttemptLedger.claim(account.id, nextModel))
+								(!modelFallbackPolicy?.nativeQuotaAdmission &&
+									!routingAttemptLedger.claim(account.id, nextModel)))
 						) {
 							if (attemptAdmissionTracker) {
 								attemptAdmissionTracker.nonCapacitySkipCount++;
@@ -6221,12 +6325,24 @@ export async function proxyWithAccount(
 						currentCacheIdentityHasCacheControl = undefined;
 						// Attribution advances only once a concrete request is ready to
 						// execute. A failed patch must leave it on the previous model.
-						rawResponse = await executeCacheAwareProviderAttempt(
-							retryTransportRequest,
-							currentReplayBody,
-							currentCacheIdentityHasCacheControl,
-							currentTransportModel,
-						);
+						try {
+							rawResponse = await executeCacheAwareProviderAttempt(
+								retryTransportRequest,
+								currentReplayBody,
+								currentCacheIdentityHasCacheControl,
+								currentTransportModel,
+							);
+						} catch (error) {
+							// Evidence can change while transforming or staging this model.
+							// A pre-send veto spends no physical route; remaining configured
+							// alternatives still pass their own admission and dispatch fences.
+							if (
+								error instanceof NativeQuotaAdmissionDenied &&
+								!req.signal.aborted
+							)
+								continue;
+							throw error;
+						}
 						rawFailureClassification = await handleRawAttemptFailure(
 							rawResponse,
 							nextModel,
@@ -7558,6 +7674,7 @@ export async function proxyWithAccount(
 					: new HostedDispatchTerminalError("ambiguous_transport", err);
 			return createHostedDispatchTerminalResponse(terminalError);
 		}
+		if (err instanceof NativeQuotaAdmissionDenied) return null;
 		if (err instanceof ForceRouteUnavailableError) {
 			throw err;
 		}

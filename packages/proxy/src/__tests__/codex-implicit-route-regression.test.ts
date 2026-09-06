@@ -17,12 +17,21 @@ import type { Account, RequestMeta } from "@better-ccflare/types";
 import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
 import {
 	clearCodexModelCacheForTests,
+	ensureCodexModelDefaults,
 	getCodexModels,
+	getKnownCodexModels,
 } from "../codex-model-catalog";
 import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
-import { selectAccountsForRequest } from "../handlers/account-selector";
+import {
+	isImplicitCodexDiscoveryEligible,
+	selectAccountsForRequest,
+} from "../handlers/account-selector";
 import { RESPONSES_ADAPTER_SECRET_HEADER } from "../handlers/proxy-types";
+import {
+	ModelRouteSessionRegistry,
+	parseModelRouteProfiles,
+} from "../model-route-profiles";
 import { handleProxy } from "../proxy";
 import type { UsageCollector } from "../usage-collector";
 import * as usageCollectorModule from "../usage-collector";
@@ -209,6 +218,11 @@ async function proxyModel(
 	ctx: ProxyContext,
 	model: string,
 	physicalModel?: string,
+	options: {
+		headers?: Record<string, string>;
+		signal?: AbortSignal;
+		status?: number;
+	} = {},
 ) {
 	const request = new Request("https://proxy.test/v1/messages", {
 		method: "POST",
@@ -220,7 +234,9 @@ async function proxyModel(
 						"x-better-ccflare-exclude-providers": "anthropic-oauth",
 					}
 				: {}),
+			...options.headers,
 		},
+		signal: options.signal,
 		body: JSON.stringify({
 			model,
 			messages: [{ role: "user", content: "hello" }],
@@ -233,7 +249,8 @@ async function proxyModel(
 	const response = await handleProxy(request, new URL(request.url), ctx, "key");
 	// Drain response processing before restoring shared spies and fetch.
 	const responseBody = await response.text();
-	expect(response.status, responseBody).toBe(200);
+	expect(response.status, responseBody).toBe(options.status ?? 200);
+	return { response, body: responseBody };
 }
 
 async function expectCodexWireRequest(requests: Request[]) {
@@ -332,6 +349,269 @@ describe("issue #324 — Codex CLI physical model implicit route", () => {
 			ctx.strategy.select.mock.calls[0]?.[0].map((account) => account.id),
 		).toEqual(["codex-1"]);
 		await expectCodexWireRequest(requests);
+	});
+
+	it.each([
+		["Sol", "gpt-5.6-sol"],
+		["Astra then Sol", ["gpt-6-astra", "gpt-5.6-sol"]],
+		["Sol then Astra", ["gpt-5.6-sol", "gpt-6-astra"]],
+	])("discovers cold Astra capacity when a cached Astra account maps the physical id to %s", async (_label, mapping) => {
+		const known = makeCodexAccount({
+			model_mappings: JSON.stringify({ "gpt-6-astra": mapping }),
+		});
+		const cold = makeCodexAccount({
+			id: "cold-astra",
+			model_mappings: null,
+			access_token: "cold-astra-token",
+		});
+		const ctx = makeCtx({ accounts: [known, cold] });
+		const requests = installUpstream();
+		const listing = await getCodexModels(known.id, ctx);
+		expect(listing?.models.map((model) => model.id)).toEqual(["gpt-6-astra"]);
+		expect(getKnownCodexModels(cold.id)).toBeNull();
+
+		for (let attempt = 0; attempt < 2; attempt++) {
+			await proxyModel(ctx, CLAUDE_SONNET_5, "gpt-6-astra");
+			await expectCodexWireRequest(requests.slice(attempt));
+			expect(
+				ctx.strategy.select.mock.calls[attempt]?.[0].map(
+					(account) => account.id,
+				),
+			).toEqual([cold.id]);
+			expect(requests[attempt].headers.get("authorization")).toBe(
+				`Bearer ${cold.access_token}`,
+			);
+		}
+		expect(
+			getKnownCodexModels(cold.id)?.models.map((model) => model.id),
+		).toEqual(["gpt-6-astra"]);
+	});
+
+	it.each([
+		null,
+		JSON.stringify({ "gpt-6-astra": "gpt-6-astra" }),
+		JSON.stringify({ "gpt-6-astra": [" gpt-6-astra ", "gpt-6-astra"] }),
+	])("uses cached Astra capacity without priming a cold account for a compatible mapping (%s)", async (modelMappings) => {
+		const known = makeCodexAccount({ model_mappings: modelMappings });
+		const cold = makeCodexAccount({
+			id: "unneeded-cold",
+			model_mappings: null,
+		});
+		const ctx = makeCtx({ accounts: [known, cold] });
+		const requests = installUpstream();
+		await getCodexModels(known.id, ctx);
+
+		await proxyModel(ctx, CLAUDE_SONNET_5, "gpt-6-astra");
+
+		await expectCodexWireRequest(requests);
+		expect(requests[0].headers.get("authorization")).toBe(
+			`Bearer ${known.access_token}`,
+		);
+		expect(getKnownCodexModels(cold.id)).toBeNull();
+	});
+
+	it.each([
+		["codex", true],
+		["test-provider", false],
+	] as const)("evaluates prospective %s route eligibility without mutating request metadata or inventing support", (provider, eligible) => {
+		const account = makeCodexAccount({
+			provider: provider as Account["provider"],
+			model_mappings: null,
+		});
+		const ctx = makeCtx({ accounts: [account] });
+		const meta = makeRequestMeta();
+		const original = { ...meta };
+		Object.freeze(meta);
+
+		expect(
+			isImplicitCodexDiscoveryEligible(account, meta, ctx, "gpt-6-astra"),
+		).toBe(eligible);
+		expect(meta).toEqual(original);
+		expect(getKnownCodexModels(account.id)).toBeNull();
+	});
+
+	it.each([
+		true,
+		false,
+	])("dispatches the mapped account without priming a stalled cold account (paused=%s)", async (paused) => {
+		const healthy = makeCodexAccount();
+		const cold = makeCodexAccount({
+			id: "cold-codex",
+			model_mappings: null,
+			paused,
+		});
+		const ctx = makeCtx({ accounts: [cold, healthy] });
+		const requests = installUpstream();
+		const lookup = Promise.withResolvers<Account | null>();
+		let coldReads = 0;
+		ctx.dbOps.getAccount = async (id) => {
+			if (id === cold.id) {
+				coldReads++;
+				return lookup.promise;
+			}
+			return healthy;
+		};
+		const previous = process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS;
+		process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS = "100";
+		try {
+			await proxyModel(ctx, CLAUDE_SONNET_5, "gpt-6-astra");
+			expect(coldReads).toBe(0);
+			expect(
+				ctx.strategy.select.mock.calls[0]?.[0].map((account) => account.id),
+			).toEqual([healthy.id]);
+			await expectCodexWireRequest(requests);
+		} finally {
+			lookup.resolve(null);
+			if (coldReads > 0) await ensureCodexModelDefaults(cold, ctx);
+			if (previous === undefined)
+				delete process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS;
+			else process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS = previous;
+		}
+	});
+
+	it.each([
+		"hard quota",
+		"reactive depletion",
+		"predictive throttle",
+		"profile only",
+	])("discovers eligible cold capacity when the known account is blocked by %s", async (blocker) => {
+		const known = makeCodexAccount();
+		const cold = makeCodexAccount({
+			id: "cold-capacity",
+			model_mappings: null,
+			access_token: "cold-token",
+		});
+		const ctx = makeCtx({ accounts: [known, cold] });
+		const requests = installUpstream();
+		if (blocker === "profile only") {
+			ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+				parseModelRouteProfiles(
+					JSON.stringify([
+						{
+							id: "reserved",
+							displayName: "Reserved",
+							accountId: known.id,
+							logicalModel: CLAUDE_SONNET_5,
+							expectedProvider: "codex",
+							exclusiveAccount: true,
+						},
+					]),
+				),
+			);
+		} else if (blocker === "reactive depletion") {
+			usageCache.markModelScopedExhausted(
+				known.id,
+				"gpt-6-astra",
+				"",
+				Date.now() + 60_000,
+			);
+		} else {
+			usageCache.set(known.id, {
+				seven_day: { utilization: 0, resets_at: null },
+				five_hour: {
+					utilization: blocker === "hard quota" ? 100 : 80,
+					resets_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+				},
+			} as never);
+			ctx.config.getUsageThrottlingFiveHourEnabled = () =>
+				blocker === "predictive throttle";
+		}
+		await proxyModel(ctx, CLAUDE_SONNET_5, "gpt-6-astra");
+		await expectCodexWireRequest(requests);
+		expect(
+			getKnownCodexModels(cold.id)?.models.map((model) => model.id),
+		).toEqual(["gpt-6-astra"]);
+		expect(requests[0].headers.get("authorization")).toBe(
+			`Bearer ${cold.access_token}`,
+		);
+	});
+
+	it.each([
+		"provider exclusion",
+		"force conflict",
+		"profile only",
+	])("never primes an ineligible cold account for %s", async (reason) => {
+		const cold = makeCodexAccount({
+			id: "ineligible-cold",
+			model_mappings: null,
+		});
+		const ctx = makeCtx({ accounts: [cold] });
+		const requests = installUpstream();
+		const reads = mock(async () => cold);
+		ctx.dbOps.getAccount = reads;
+		if (reason === "profile only") {
+			ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+				parseModelRouteProfiles(
+					JSON.stringify([
+						{
+							id: "reserved",
+							displayName: "Reserved",
+							accountId: cold.id,
+							logicalModel: CLAUDE_SONNET_5,
+							expectedProvider: "codex",
+							exclusiveAccount: true,
+						},
+					]),
+				),
+			);
+		}
+		await proxyModel(ctx, CLAUDE_SONNET_5, "gpt-6-astra", {
+			status: 503,
+			headers:
+				reason === "provider exclusion"
+					? { "x-better-ccflare-exclude-providers": "codex" }
+					: reason === "force conflict"
+						? { "x-better-ccflare-account-id": cold.id }
+						: {},
+		});
+		expect(reads).toHaveBeenCalledTimes(0);
+		expect(requests).toHaveLength(0);
+	});
+
+	it.each([
+		"already aborted",
+		"aborted after lookup",
+		"expired after lookup",
+	])("never primes or dispatches an %s selection", async (state) => {
+		const known = makeCodexAccount();
+		const cold = makeCodexAccount({
+			id: "cancelled-cold",
+			model_mappings: null,
+		});
+		const ctx = makeCtx({ accounts: [known, cold] });
+		const requests = installUpstream();
+		const reads = mock(async () => cold);
+		ctx.dbOps.getAccount = reads;
+		const controller = new AbortController();
+		const reason = new DOMException("client left", "AbortError");
+		let now = Date.now();
+		const clockSpy = spyOn(Date, "now").mockImplementation(() => now);
+		ctx.dbOps.getAllAccounts = async () => {
+			if (state === "expired after lookup") now += 100_000;
+			else controller.abort(reason);
+			return [known, cold];
+		};
+		if (state === "already aborted") controller.abort(reason);
+		try {
+			const result = proxyModel(ctx, CLAUDE_SONNET_5, "gpt-6-astra", {
+				signal: controller.signal,
+				status: 503,
+			});
+			if (state === "expired after lookup") {
+				expect(JSON.parse((await result).body)).toMatchObject({
+					error: {
+						routing_diagnostics: { zero_attempt_reason: "selection_timeout" },
+					},
+				});
+			} else {
+				await expect(result).rejects.toBe(reason);
+			}
+			expect(reads).toHaveBeenCalledTimes(0);
+			expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+			expect(requests).toHaveLength(0);
+		} finally {
+			clockSpy.mockRestore();
+		}
 	});
 
 	it("E: an unprimed Codex catalog fails closed for a made-up physical id under forceAccountModel", async () => {
