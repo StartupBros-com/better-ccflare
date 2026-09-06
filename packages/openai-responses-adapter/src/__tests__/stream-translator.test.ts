@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { BUFFER_SIZES } from "@better-ccflare/core";
 import { translateAnthropicStreamToResponses } from "../stream-translator";
 
@@ -1393,6 +1393,69 @@ describe("translateAnthropicStreamToResponses bounded memory under concurrency",
 // shape that stops taking the fast path must still translate identically, so
 // the optimization can never silently change how a frame is read.
 describe("translateAnthropicStreamToResponses frame shape parsing", () => {
+	// The translator stamps created_at from Date.now(): once when it emits
+	// response.created and response.in_progress (one read, shared by both) and
+	// again when it emits response.completed. The equivalence test below
+	// translates the canonical shape first and every other shape after it,
+	// comparing whole payloads, so two translations that straddle a wall-clock
+	// second differ in created_at alone and the comparison fails (#335).
+	// Freeze the clock for this block so the comparison stays exact, and
+	// restore it so no later test inherits the frozen value.
+	const realDateNow = Date.now;
+	// Mid-second, so floor() lands on the same second no matter which side of
+	// a boundary a real clock would have been on.
+	const FROZEN_NOW_MS = 1_788_650_989_500;
+	const FROZEN_CREATED_AT = Math.floor(FROZEN_NOW_MS / 1000);
+
+	beforeEach(() => {
+		Date.now = () => FROZEN_NOW_MS;
+	});
+
+	afterEach(() => {
+		Date.now = realDateNow;
+	});
+
+	/** Every created_at the translated stream carries, in emission order. */
+	function createdAtStamps(
+		events: Array<{ event: string; data: unknown }>,
+	): number[] {
+		return events.flatMap((e) => {
+			const response = (e.data as { response?: { created_at?: unknown } })
+				.response;
+			return typeof response?.created_at === "number"
+				? [response.created_at]
+				: [];
+		});
+	}
+
+	function expectEveryCreatedAt(
+		events: Array<{ event: string; data: unknown }>,
+		second: number,
+		label: string,
+	): void {
+		const stamps = createdAtStamps(events);
+		expect(stamps.length, `no created_at emitted for ${label}`).toBeGreaterThan(
+			0,
+		);
+		expect(stamps, `created_at for ${label}`).toEqual(stamps.map(() => second));
+	}
+
+	/**
+	 * The same stream with created_at removed. Only the volatile timestamp is
+	 * dropped; every other field stays in place and in order.
+	 */
+	function withoutCreatedAt(
+		events: Array<{ event: string; data: unknown }>,
+	): Array<{ event: string; data: unknown }> {
+		return events.map((e) => {
+			const data = e.data as Record<string, unknown>;
+			const response = data.response as Record<string, unknown> | undefined;
+			if (!response || !("created_at" in response)) return e;
+			const { created_at: _createdAt, ...rest } = response;
+			return { event: e.event, data: { ...data, response: rest } };
+		});
+	}
+
 	const logicalEvents: Array<[string, unknown]> = [
 		[
 			"message_start",
@@ -1508,6 +1571,10 @@ describe("translateAnthropicStreamToResponses frame shape parsing", () => {
 		const canonical = await translateShape(shapes[0]);
 		expect(canonical.length).toBeGreaterThan(0);
 		expect(canonical[canonical.length - 1].event).toBe("response.completed");
+		// Proves the freeze reached the translator. If created_at ever came from
+		// a clock other than Date.now(), the exact-payload comparison below would
+		// be back at the mercy of the wall clock without anything failing here.
+		expectEveryCreatedAt(canonical, FROZEN_CREATED_AT, "canonical shape");
 
 		for (const shape of shapes) {
 			const parsed = await translateShape(shape);
@@ -1519,6 +1586,44 @@ describe("translateAnthropicStreamToResponses frame shape parsing", () => {
 				JSON.stringify(parsed),
 				`payloads differ for shape: ${shape.name}`,
 			).toBe(JSON.stringify(canonical));
+		}
+	});
+
+	test("a second boundary between translations moves created_at and nothing else", async () => {
+		// Deterministic replay of the CI failure behind #335: the canonical shape
+		// is translated in the last millisecond of one second and every other
+		// shape in the first millisecond of the next. Without the freeze above,
+		// a real clock does exactly this now and then. The streams must then
+		// differ in created_at only, so the exact-payload test can be trusted to
+		// catch parse divergence and never anything else.
+		const boundaryMs = 1_788_650_990_000;
+		const secondBefore = Math.floor((boundaryMs - 1) / 1000);
+		const secondAfter = Math.floor(boundaryMs / 1000);
+		expect(secondAfter).toBe(secondBefore + 1);
+
+		Date.now = () => boundaryMs - 1;
+		const canonical = await translateShape(shapes[0]);
+		expectEveryCreatedAt(canonical, secondBefore, "canonical shape");
+
+		Date.now = () => boundaryMs;
+		for (const shape of shapes.slice(1)) {
+			const parsed = await translateShape(shape);
+			expectEveryCreatedAt(parsed, secondAfter, shape.name);
+			expect(
+				parsed.map((e) => e.event),
+				`event sequence differs for shape: ${shape.name}`,
+			).toEqual(canonical.map((e) => e.event));
+			// This is the comparison that flaked: whole payloads across the
+			// boundary are not byte-identical...
+			expect(
+				JSON.stringify(parsed),
+				`created_at did not move across the boundary for shape: ${shape.name}`,
+			).not.toBe(JSON.stringify(canonical));
+			// ...and created_at is the only reason why.
+			expect(
+				JSON.stringify(withoutCreatedAt(parsed)),
+				`something other than created_at differs for shape: ${shape.name}`,
+			).toBe(JSON.stringify(withoutCreatedAt(canonical)));
 		}
 	});
 
