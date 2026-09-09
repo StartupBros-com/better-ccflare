@@ -199,9 +199,14 @@ the complete tuple `4294967296` bytes, `60000` ms polling, `1800000` ms minimum
 uptime, 5 consecutive high samples, `3600000` ms cooldown, and at most 3
 recycles per `86400000` ms window. Source defaults remain disabled
 (`RUNNER_RSS_THRESHOLD_BYTES=0`). The watchdog reads only the exact supervised
-upstream PID and verifies its `/proc/<pid>/stat` start time before every
-`VmRSS` sample; it never scans by process name. A trigger drains the guard
-first, then stops Bun, and does not consume the ordinary child-failure circuit.
+upstream PID and verifies its `/proc/<pid>/stat` start time both before and
+after every memory sample; it never scans by process name. The sample is
+`VmRSS + VmSwap`, not `VmRSS` alone: under host memory pressure the kernel
+evicts a leaking process's pages to swap, which lowers `VmRSS` and would
+otherwise blind the watchdog exactly when containment is needed. Hosts without
+swap report no `VmSwap` and keep the previous resident-only behavior. A
+trigger drains the guard first, then stops Bun, and does not consume the
+ordinary child-failure circuit.
 All seven values are an all-or-none policy: partial or non-production managed
 deployment values fail validation. The rollback compatibility path accepts an
 older pin only when the entire tuple is absent.

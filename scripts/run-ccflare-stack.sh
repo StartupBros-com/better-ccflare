@@ -263,17 +263,37 @@ proc_start_time() {
 	printf '%s\n' "${20}"
 }
 
-proc_rss_bytes() {
-	local key kib unit extra
+# Total committed anonymous memory for a pid: VmRSS + VmSwap, in bytes.
+#
+# VmRSS alone is not a containment signal. When the host comes under memory
+# pressure the kernel evicts the leaking process's pages to swap, which
+# *lowers* its VmRSS -- so an RSS-only threshold goes blind exactly when
+# containment is needed. Observed 2026-09-09 in production: the upstream held
+# 0.69 GiB VmRSS against 10.66 GiB VmSwap -- 2.8x the 4 GiB threshold -- while
+# the watchdog sampled 17% of it, reset its streak every poll, and never fired.
+# Refs #277.
+#
+# VmSwap is absent on kernels built without swap support; treat a missing field
+# as zero rather than failing the sample, so swapless hosts keep the previous
+# RSS-only behavior instead of silently losing containment altogether.
+#
+# Prints "<total_bytes> <rss_bytes> <swap_bytes>" so the caller can log the
+# breakdown that made this failure invisible in the first place.
+proc_mem_bytes() {
+	local key kib unit extra rss="" swap=0
 	while read -r key kib unit extra; do
-		if [[ "$key" == "VmRSS:" ]]; then
+		case "$key" in
+		VmRSS: | VmSwap:)
 			[[ "$kib" =~ ^[0-9]+$ && "$unit" == "kB" && -z "${extra:-}" ]] || return 1
 			((kib <= 8796093022207)) || return 1
-			printf '%s\n' "$((kib * 1024))"
-			return 0
-		fi
+			if [[ "$key" == "VmRSS:" ]]; then rss="$kib"; else swap="$kib"; fi
+			;;
+		esac
 	done <"$RUNNER_PROC_ROOT/$1/status"
-	return 1
+	[[ -n "$rss" ]] || return 1
+	((rss + swap <= 8796093022207)) || return 1
+	printf '%s %s %s\n' "$(((rss + swap) * 1024))" "$((rss * 1024))" "$((swap * 1024))"
+	return 0
 }
 
 wait_watchdog_interval() {
@@ -290,7 +310,7 @@ wait_watchdog_interval() {
 }
 
 rss_watchdog() {
-	local pid="$1" identity="$2" generation_started_ms="$3" streak=0 now rss current_identity
+	local pid="$1" identity="$2" generation_started_ms="$3" streak=0 now sample mem rss swap current_identity
 	while :; do
 		wait_watchdog_interval "$RUNNER_RSS_POLL_INTERVAL_MS" || return 0
 		current_identity="$(proc_start_time "$pid" 2>/dev/null)" || continue
@@ -299,13 +319,14 @@ rss_watchdog() {
 		now="$(epoch_ms)"
 		((now - generation_started_ms >= RUNNER_RSS_MIN_UPTIME_MS)) || continue
 		((rss_last_recycle_ms == 0 || now - rss_last_recycle_ms >= RUNNER_RSS_RECYCLE_COOLDOWN_MS)) || continue
-		rss="$(proc_rss_bytes "$pid" 2>/dev/null)" || continue
-		# Re-check the start-time identity after the RSS read: the two reads are
-		# not atomic, so a PID that was replaced in between would otherwise be
-		# charged with another process's RSS. Discard the sample instead.
+		sample="$(proc_mem_bytes "$pid" 2>/dev/null)" || continue
+		read -r mem rss swap <<<"$sample" || true
+		# Re-check the start-time identity after the memory read: the two reads
+		# are not atomic, so a PID that was replaced in between would otherwise be
+		# charged with another process's memory. Discard the sample instead.
 		current_identity="$(proc_start_time "$pid" 2>/dev/null)" || continue
 		[[ "$current_identity" == "$identity" ]] || continue
-		if ((rss >= RUNNER_RSS_THRESHOLD_BYTES)); then
+		if ((mem >= RUNNER_RSS_THRESHOLD_BYTES)); then
 			((streak += 1))
 		else
 			streak=0
@@ -316,7 +337,7 @@ rss_watchdog() {
 				streak=0
 				continue
 			fi
-			log "RSS recycle trigger; upstream_pid=${pid}; rss_bytes=${rss}; threshold_bytes=${RUNNER_RSS_THRESHOLD_BYTES}; samples=${streak}"
+			log "RSS recycle trigger; upstream_pid=${pid}; mem_bytes=${mem}; rss_bytes=${rss}; swap_bytes=${swap}; threshold_bytes=${RUNNER_RSS_THRESHOLD_BYTES}; samples=${streak}"
 			return 66
 		fi
 	done

@@ -63,7 +63,8 @@ function writeFixturePrograms(dir: string): {
 			'const starttime = String(process.env.FAKE_PROC_STARTTIME || "424242");',
 			'if (procEnabled) writeFileSync(`${procDir}/stat`, `${process.pid} (fake-upstream) S ${Array(18).fill("0").join(" ")} ${starttime} 0\\n`);',
 			"const rssControl = `${process.env.CAPTURE_DIR}/rss-kib`;",
-			'const writeStatus = () => { if (!procEnabled) return; const rss = existsSync(rssControl) ? readFileSync(rssControl, "utf8").trim() : "1"; writeFileSync(`${procDir}/status`, `Name:\\tfake\\nVmRSS:\\t${rss} kB\\n`); };',
+			"const swapControl = `${process.env.CAPTURE_DIR}/swap-kib`;",
+			'const writeStatus = () => { if (!procEnabled) return; const rss = existsSync(rssControl) ? readFileSync(rssControl, "utf8").trim() : "1"; const swap = existsSync(swapControl) ? readFileSync(swapControl, "utf8").trim() : "0"; writeFileSync(`${procDir}/status`, `Name:\\tfake\\nVmRSS:\\t${rss} kB\\nVmSwap:\\t${swap} kB\\n`); };',
 			"writeStatus();",
 			"const rssTimer = procEnabled ? setInterval(writeStatus, 2) : undefined;",
 			'appendFileSync(`${process.env.CAPTURE_DIR}/upstream.json`, JSON.stringify({ pid: process.pid, secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, logLevel: process.env.LOG_LEVEL, argv: process.argv }) + "\\n");',
@@ -379,6 +380,13 @@ function setRssKiB(
 	writeFileSync(join(runner.captureDir, "rss-kib"), `${rssKiB}\n`);
 }
 
+function setSwapKiB(
+	runner: Awaited<ReturnType<typeof spawnRunner>>,
+	swapKiB: number,
+): void {
+	writeFileSync(join(runner.captureDir, "swap-kib"), `${swapKiB}\n`);
+}
+
 async function stopRunner(
 	runner: Awaited<ReturnType<typeof spawnRunner>>,
 ): Promise<void> {
@@ -522,6 +530,34 @@ describe("run-ccflare-stack RSS containment behavior", () => {
 			).toBeLessThan(
 				lifecycle.findIndex((line) => line.startsWith("upstream-term")),
 			);
+		} finally {
+			await stopRunner(runner);
+		}
+	}, 10_000);
+
+	test("counts swapped-out pages so a leak hidden in swap still recycles", async () => {
+		const fixtureDir = tempDir("ccflare-stack-rss-swap-");
+		const programs = writeFixturePrograms(fixtureDir);
+		const runner = await spawnRunner(
+			programs,
+			rssPolicy({ RUNNER_RSS_POLL_INTERVAL_MS: "100" }),
+		);
+		try {
+			setRssKiB(runner, 1);
+			setSwapKiB(runner, 0);
+			await waitForOutput(runner, "ccflare stack ready");
+			expect(generationCount(runner)).toBe(1);
+			// Resident stays an order of magnitude below the 10240-byte threshold
+			// while the growth sits entirely in swap. An RSS-only sample reads
+			// 1024 bytes here and never fires -- the production failure of
+			// 2026-09-09, where 0.69 GiB resident hid 10.66 GiB swapped.
+			setSwapKiB(runner, 20);
+			await waitForOutput(runner, "RSS recycle trigger");
+			await waitForGenerationCount(runner, 2);
+			const output = runner.getOutput().stdout;
+			expect(output).toContain("mem_bytes=21504");
+			expect(output).toContain("rss_bytes=1024");
+			expect(output).toContain("swap_bytes=20480");
 		} finally {
 			await stopRunner(runner);
 		}
