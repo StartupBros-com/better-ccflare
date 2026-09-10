@@ -760,6 +760,100 @@ describe("handleResponsesRequest", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual(terminalResponse);
 	});
+
+	test("non-streaming native terminal response survives CRLF-framed SSE with a trailing non-terminal frame (upstream 7862a9df parity)", async () => {
+		// extractTerminalNativeResponse's frame split must recognize \r\n\r\n
+		// boundaries, not only \n\n. Without that, a CRLF-framed stream
+		// collapses into one merged blob and a later non-terminal event's
+		// data: line overwrites the real terminal event's data: line, losing
+		// it entirely.
+		const terminalResponse = {
+			id: "resp_crlf",
+			model: "gpt-5.6-sol",
+			output: [],
+		};
+		const sseBody =
+			"event: response.completed\r\ndata: " +
+			JSON.stringify({
+				type: "response.completed",
+				response: terminalResponse,
+			}) +
+			"\r\n\r\n" +
+			"event: response.output_text.delta\r\ndata: " +
+			JSON.stringify({ type: "response.output_text.delta", delta: "stray" }) +
+			"\r\n\r\n";
+		const mockHandleProxy: HandleProxyFn = async () =>
+			new Response(sseBody, {
+				status: 200,
+				headers: {
+					"Content-Type": "text/event-stream",
+					"x-better-ccflare-codex-response-format": "responses-api",
+				},
+			});
+		const req = new Request("http://localhost/v1/responses", {
+			method: "POST",
+			body: JSON.stringify({
+				model: "gpt-5.6-sol",
+				input: "Hi",
+				stream: false,
+			}),
+			headers: { "Content-Type": "application/json" },
+		});
+
+		const response = await handleResponsesRequest(
+			req,
+			new URL(req.url),
+			mockHandleProxy,
+			{},
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual(terminalResponse);
+	});
+
+	test("non-streaming native terminal response joins a multi-line data field instead of keeping only its last line (upstream 7862a9df parity)", async () => {
+		// Per the SSE spec, a data field spanning multiple `data:` lines must
+		// be reassembled by joining those lines with \n, not by keeping only
+		// the last one.
+		const terminalResponse = {
+			id: "resp_multiline",
+			model: "gpt-5.6-sol",
+			output: [],
+		};
+		const fullData = JSON.stringify({
+			type: "response.completed",
+			response: terminalResponse,
+		});
+		const splitPoint = fullData.indexOf('"response":');
+		const sseBody = `event: response.completed\ndata: ${fullData.slice(0, splitPoint)}\ndata: ${fullData.slice(splitPoint)}\n\n`;
+		const mockHandleProxy: HandleProxyFn = async () =>
+			new Response(sseBody, {
+				status: 200,
+				headers: {
+					"Content-Type": "text/event-stream",
+					"x-better-ccflare-codex-response-format": "responses-api",
+				},
+			});
+		const req = new Request("http://localhost/v1/responses", {
+			method: "POST",
+			body: JSON.stringify({
+				model: "gpt-5.6-sol",
+				input: "Hi",
+				stream: false,
+			}),
+			headers: { "Content-Type": "application/json" },
+		});
+
+		const response = await handleResponsesRequest(
+			req,
+			new URL(req.url),
+			mockHandleProxy,
+			{},
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual(terminalResponse);
+	});
 });
 
 describe("Responses request body admission", () => {

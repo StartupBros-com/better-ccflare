@@ -4643,7 +4643,7 @@ export class CodexProvider extends BaseProvider {
 					const { done, value } = await reader.read();
 					if (done) break;
 					pending += value;
-					const parts = pending.split("\n");
+					const parts = pending.split(/\r?\n/);
 					pending = parts.pop() ?? "";
 					for (const line of parts) {
 						processLine(line);

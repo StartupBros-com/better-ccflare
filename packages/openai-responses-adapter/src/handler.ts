@@ -54,20 +54,22 @@ const TERMINAL_RESPONSE_EVENT_TYPES = new Set([
 function extractTerminalNativeResponse(
 	sseText: string,
 ): Record<string, unknown> | null {
-	const rawEvents = sseText.split("\n\n");
+	const rawEvents = sseText.split(/\r?\n\r?\n/);
 	for (let i = rawEvents.length - 1; i >= 0; i--) {
 		const rawEvent = rawEvents[i];
 		if (!rawEvent.trim()) continue;
 
 		let eventType = "";
-		let dataStr = "";
-		for (const line of rawEvent.split("\n")) {
+		const dataLines: string[] = [];
+		for (const line of rawEvent.split(/\r?\n/)) {
 			if (line.startsWith("event:")) {
 				eventType = line.slice("event:".length).trim();
 			} else if (line.startsWith("data:")) {
-				dataStr = line.slice("data:".length).trim();
+				const value = line.slice("data:".length);
+				dataLines.push(value.startsWith(" ") ? value.slice(1) : value);
 			}
 		}
+		const dataStr = dataLines.join("\n");
 		if (!dataStr) continue;
 		try {
 			const data = JSON.parse(dataStr) as {

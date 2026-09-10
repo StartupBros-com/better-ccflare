@@ -4417,6 +4417,87 @@ describe("CodexProvider.processResponse", () => {
 		});
 	});
 
+	it("tolerates CRLF-framed SSE in the buffered non-streaming fallback (upstream 4cdd64fc parity)", async () => {
+		// Isolates the parsing loop at transformSseResponseToJson's
+		// `pending.split(...)` line, independent of transformStreamingResponse's
+		// own upstream-facing framing (which already tolerates CRLF via
+		// SseFrameBuffer/findCodexSseFrameLines). The internal Anthropic-format
+		// stream that fallback re-parses is self-generated, but the fallback's
+		// own split must still match upstream's CRLF-tolerant /\r?\n/ pattern
+		// for defensive parity, not silently drop or mis-parse a field whose
+		// line happens to end in \r.
+		const provider = new CodexProvider();
+		const crlfBody =
+			"event: message_start\r\ndata: " +
+			JSON.stringify({
+				type: "message_start",
+				message: {
+					id: "msg_crlf",
+					type: "message",
+					role: "assistant",
+					model: "gpt-5.4",
+					content: [],
+					usage: { input_tokens: 0, output_tokens: 0 },
+				},
+			}) +
+			"\r\n\r\n" +
+			"event: content_block_start\r\ndata: " +
+			JSON.stringify({
+				type: "content_block_start",
+				index: 0,
+				content_block: { type: "text", text: "" },
+			}) +
+			"\r\n\r\n" +
+			"event: content_block_delta\r\ndata: " +
+			JSON.stringify({
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "text_delta", text: "Hi" },
+			}) +
+			"\r\n\r\n" +
+			"event: message_delta\r\ndata: " +
+			JSON.stringify({
+				type: "message_delta",
+				delta: { stop_reason: "end_turn", stop_sequence: null },
+				usage: { input_tokens: 7, output_tokens: 2 },
+			}) +
+			"\r\n\r\n";
+
+		const providerInternals = provider as unknown as {
+			transformStreamingResponse: (...args: unknown[]) => Response;
+			transformSseResponseToJson: (...args: unknown[]) => Promise<Response>;
+		};
+		// Shadow the prototype method with an own-property override so the
+		// buffered fallback under test reads exactly this CRLF-framed body,
+		// bypassing the (already CRLF-tolerant) upstream frame parser.
+		providerInternals.transformStreamingResponse = () =>
+			new Response(crlfBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+
+		const rawResponse = new Response(null, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": "req_crlf_1",
+			},
+		});
+
+		const result =
+			await providerInternals.transformSseResponseToJson(rawResponse);
+		const payload = JSON.parse(await result.text()) as Record<string, unknown>;
+		expect(payload.type).toBe("message");
+		expect(payload.role).toBe("assistant");
+		expect(payload.content).toEqual([{ type: "text", text: "Hi" }]);
+		expect(payload.usage).toEqual({
+			input_tokens: 7,
+			output_tokens: 2,
+			cache_read_input_tokens: 0,
+			cache_creation_input_tokens: 0,
+		});
+	});
+
 	it("preserves retained reasoning with a representable id in non-streaming SSE-to-JSON conversion", async () => {
 		const provider = new CodexProvider();
 		const requestId = "req_non_stream_reasoning_1";
