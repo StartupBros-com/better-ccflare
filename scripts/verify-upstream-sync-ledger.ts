@@ -1,8 +1,12 @@
 #!/usr/bin/env bun
 
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  closeSync,
+  mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -11,12 +15,20 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join, normalize, relative, resolve } from "node:path";
 
-const SCHEMA_VERSION = 2;
-const SUPPORTED_SCHEMA_VERSIONS = [1, 2] as const;
+const SCHEMA_VERSION = 3;
+const SUPPORTED_SCHEMA_VERSIONS = [1, 2, 3] as const;
 const ALGORITHM_VERSIONS = {
   1: "upstream-sync-ledger/v1",
   2: "upstream-sync-ledger/v2",
+  3: "upstream-sync-ledger/v3",
 } as const;
+const DEFAULT_TRACKING_ISSUE = 338;
+const CANONICAL_EXCLUSIONS = [
+  "packages/database/src/inline-incremental-vacuum-worker.ts",
+  "packages/database/src/inline-integrity-check-worker.ts",
+  "packages/database/src/inline-vacuum-worker.ts",
+  "packages/proxy/src/inline-worker.ts",
+] as const;
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const KINDS = ["upstream-commit", "conflict", "shared-path", "rerere"] as const;
@@ -42,6 +54,14 @@ type SchemaVersion = (typeof SUPPORTED_SCHEMA_VERSIONS)[number];
 type Kind = (typeof KINDS)[number];
 type Disposition = (typeof DISPOSITIONS)[number];
 type Phase = (typeof PHASES)[number];
+type TreeTriplet = { base: string; fork: string; target: string };
+
+interface TreeEntry {
+  mode: string;
+  type: string;
+  objectId: string;
+  path: string;
+}
 
 export interface RerereApplication {
   path: string;
@@ -100,6 +120,7 @@ export interface EvidenceRecord {
 
 export interface SyncInventory {
   schemaVersion: number;
+  trackingIssue?: number;
   phase: Phase;
   baseline: {
     forkParent: string;
@@ -122,6 +143,12 @@ export interface SyncInventory {
     upstreamCommitOrder: string;
     pathSemantics: string;
     conflictMechanism: string;
+    exclusions?: string[];
+    exclusionsSha256?: string;
+    originalTrees?: TreeTriplet;
+    projectedTrees?: TreeTriplet;
+    retainedEntriesSha256?: TreeTriplet;
+    excludedEntries?: TreeEntry[];
   };
   expected: {
     upstreamCommits: string[];
@@ -146,6 +173,8 @@ export interface GenerateOptions {
   requiredAncestors: string[];
   target: string;
   canonicalTag: string;
+  trackingIssue?: number;
+  exclusions?: string[];
 }
 
 export interface ValidationOptions {
@@ -226,32 +255,66 @@ function assertStringArray(
   }
 }
 
+const MAX_GIT_STDERR_CHARS = 4_096;
+
+function normalizedChildOutput(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value instanceof Uint8Array) return new TextDecoder().decode(value);
+  return "";
+}
+
+function boundedGitStderr(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= MAX_GIT_STDERR_CHARS) return trimmed;
+  return `${trimmed.slice(0, MAX_GIT_STDERR_CHARS)}\n[stderr truncated; ${trimmed.length - MAX_GIT_STDERR_CHARS} characters omitted]`;
+}
+
 function git(
   repo: string,
   args: string[],
-  options: { allowConflictExit?: boolean; env?: Record<string, string> } = {},
+  options: {
+    allowConflictExit?: boolean;
+    env?: Record<string, string>;
+    input?: string;
+    stdinFd?: number;
+    stdoutFd?: number;
+  } = {},
 ): { stdout: string; stderr: string; exitCode: number } {
-  const result = Bun.spawnSync(["git", ...args], {
+  const result = spawnSync("git", args, {
     cwd: repo,
+    encoding: "utf8",
     env: { ...process.env, ...options.env },
-    stdout: "pipe",
-    stderr: "pipe",
+    input: options.input,
+    stdio: [options.stdinFd ?? "pipe", options.stdoutFd ?? "pipe", "pipe"],
   });
-  const exitCode = result.exitCode ?? 1;
-  if (exitCode !== 0 && !(options.allowConflictExit && exitCode === 1)) {
+  const stdout = normalizedChildOutput(result.stdout);
+  const stderr = normalizedChildOutput(result.stderr);
+  const exitCode = result.status ?? 1;
+  if (
+    result.error !== undefined ||
+    (exitCode !== 0 && !(options.allowConflictExit && exitCode === 1))
+  ) {
+    const childError = result.error as NodeJS.ErrnoException | undefined;
+    const details = [
+      childError
+        ? `child-process error${childError.code ? ` ${childError.code}` : ""}: ${childError.message}`
+        : "",
+      stderr ? `stderr: ${boundedGitStderr(stderr)}` : "",
+      stdout ? `stdout omitted (${stdout.length} characters captured)` : "",
+    ].filter(Boolean);
     fail(
-      `git ${args.join(" ")} failed (${exitCode}): ${result.stderr.toString().trim() || result.stdout.toString().trim()}`,
+      `git ${args.join(" ")} failed (${result.status ?? "no exit code"}): ${details.join("; ") || "unknown error"}`,
     );
   }
-  return {
-    stdout: result.stdout.toString(),
-    stderr: result.stderr.toString(),
-    exitCode,
-  };
+  return { stdout, stderr, exitCode };
 }
 
-function gitText(repo: string, args: string[]): string {
-  return git(repo, args).stdout.trim();
+function gitText(
+  repo: string,
+  args: string[],
+  options: { env?: Record<string, string>; input?: string } = {},
+): string {
+  return git(repo, args, options).stdout.trim();
 }
 
 function resolveCommit(repo: string, value: string, label: string): string {
@@ -291,14 +354,92 @@ function packageVersion(repo: string, commit: string, path: string): string {
   return parsed.version;
 }
 
-function changedPaths(repo: string, base: string, parent: string): string[] {
-  const output = git(repo, [
-    "diff",
-    "--name-status",
-    "-z",
-    "--find-renames",
-    `${base}..${parent}`,
-  ]).stdout;
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function normalizeExclusions(value?: readonly string[]): string[] {
+  const exclusions = value === undefined ? [...CANONICAL_EXCLUSIONS] : [...value];
+  for (const path of exclusions) assertSafePath(path, "exclusion path");
+  const normalized = [...exclusions].sort();
+  if (new Set(normalized).size !== normalized.length) {
+    fail("exclusion policy contains duplicate paths");
+  }
+  if (!sameJson(normalized, CANONICAL_EXCLUSIONS)) {
+    fail("exclusion policy must exactly match the canonical normalized exclusions");
+  }
+  return normalized;
+}
+
+function trackingIssue(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0) {
+    fail("trackingIssue must be a positive integer");
+  }
+  return value as number;
+}
+
+function readTreeEntries(repo: string, commit: string): TreeEntry[] {
+  const output = git(repo, ["ls-tree", "-r", "-z", "--full-tree", commit]).stdout;
+  const records = output.split("\0");
+  if (records.at(-1) === "") records.pop();
+  return records.map((record) => {
+    const separator = record.indexOf("\t");
+    if (separator === -1) fail("git ls-tree returned malformed tree metadata");
+    const metadata = record.slice(0, separator).split(" ");
+    if (metadata.length !== 3) fail("git ls-tree returned malformed entry metadata");
+    const [mode, type, objectId] = metadata;
+    if (!/^[0-7]{6}$/.test(mode)) fail(`git ls-tree returned invalid mode ${mode}`);
+    if (!["blob", "commit"].includes(type)) {
+      fail(`git ls-tree returned unsupported entry type ${type}`);
+    }
+    assertSha(objectId, "tree entry object ID");
+    const path = record.slice(separator + 1);
+    assertSafePath(path, "tree entry path");
+    return { mode, type, objectId, path };
+  });
+}
+
+function retainedEntries(
+  entries: TreeEntry[],
+  exclusions: readonly string[],
+): TreeEntry[] {
+  const excluded = new Set(exclusions);
+  return entries.filter((entry) => !excluded.has(entry.path));
+}
+
+function excludedEntries(
+  entries: TreeEntry[],
+  exclusions: readonly string[],
+): TreeEntry[] {
+  const excluded = new Set(exclusions);
+  return entries.filter((entry) => excluded.has(entry.path));
+}
+
+function retainedEntriesDigest(entries: TreeEntry[]): string {
+  return sha256(
+    stableJson(
+      entries.map(({ path, mode, objectId }) => ({ path, mode, objectId })),
+    ),
+  );
+}
+
+function changedPaths(
+  repo: string,
+  base: string,
+  parent: string,
+  env?: Record<string, string>,
+): string[] {
+  const output = git(
+    repo,
+    [
+      "diff",
+      "--name-status",
+      "-z",
+      "--find-renames",
+      `${base}..${parent}`,
+    ],
+    { env },
+  ).stdout;
   const fields = output.split("\0");
   if (fields.at(-1) === "") fields.pop();
   const paths = new Set<string>();
@@ -325,6 +466,85 @@ function sourceObjectDirectory(repo: string): string {
   return isAbsolute(path) ? path : resolve(repo, path);
 }
 
+function parseMergeTreeConflicts(
+  repo: string,
+  forkParent: string,
+  target: string,
+  env: Record<string, string>,
+): Array<{ path: string; conflictClass: string }> {
+  const result = git(
+    repo,
+    ["merge-tree", "--write-tree", "--name-only", "-z", forkParent, target],
+    { allowConflictExit: true, env },
+  );
+  const fields = result.stdout.split("\0");
+  if (fields.at(-1) === "") fields.pop();
+  const tree = fields.shift();
+  assertSha(tree, "merge-tree result tree");
+
+  const conflictPaths: string[] = [];
+  while (fields.length > 0 && fields[0] !== "") {
+    const path = fields.shift();
+    assertSafePath(path, "conflict path");
+    conflictPaths.push(path);
+  }
+  if (fields[0] === "") fields.shift();
+  if (result.exitCode === 0 && conflictPaths.length > 0) {
+    fail("merge-tree returned conflict paths with a successful exit");
+  }
+  if (result.exitCode === 1 && conflictPaths.length === 0) {
+    fail("merge-tree reported conflicts without exact conflict paths");
+  }
+
+  const conflictPathSet = new Set(conflictPaths);
+  const classByPath = new Map<string, string>();
+  while (fields.length > 0) {
+    const pathCountText = fields.shift();
+    if (!/^(0|[1-9][0-9]*)$/.test(pathCountText ?? "")) {
+      fail("merge-tree returned a malformed informational record");
+    }
+    const pathCount = Number(pathCountText);
+    if (!Number.isSafeInteger(pathCount) || fields.length < pathCount + 2) {
+      fail("merge-tree returned a truncated informational record");
+    }
+    const paths = fields.splice(0, pathCount);
+    for (const path of paths) assertSafePath(path, "merge-tree message path");
+    const shortMessage = fields.shift();
+    const message = fields.shift();
+    if (shortMessage === undefined || message === undefined) {
+      fail("merge-tree returned a truncated informational record");
+    }
+    if (!shortMessage.startsWith("CONFLICT (")) continue;
+    const match = message.match(/^CONFLICT \(([^)]+)\):/);
+    if (!match) {
+      fail(`merge-tree returned a malformed conflict message: ${message}`);
+    }
+    const conflictClass = match[1].trim();
+    if (conflictClass === "") fail("merge-tree returned an empty conflict class");
+    const exactPaths = paths.filter((path) => conflictPathSet.has(path));
+    if (exactPaths.length === 0) {
+      fail(`could not link merge-tree conflict message: ${message}`);
+    }
+    for (const path of exactPaths) {
+      const priorClass = classByPath.get(path);
+      if (priorClass !== undefined && priorClass !== conflictClass) {
+        fail(`conflicting merge-tree conflict classes for ${path}`);
+      }
+      classByPath.set(path, conflictClass);
+    }
+  }
+  const conflicts = conflictPaths.map((path) => {
+    const conflictClass = classByPath.get(path);
+    if (!conflictClass) {
+      fail(
+        `missing explicit conflict class for ${path}; merge-tree diagnostics: ${stableJson({ stdout: result.stdout, stderr: result.stderr })}`,
+      );
+    }
+    return { path, conflictClass };
+  });
+  return conflicts.sort((left, right) => left.path.localeCompare(right.path));
+}
+
 function deriveConflicts(
   repo: string,
   forkParent: string,
@@ -332,54 +552,277 @@ function deriveConflicts(
 ): Array<{ path: string; conflictClass: string }> {
   const alternateObjects = mkdtempSync(join(tmpdir(), "ccflare-sync-objects-"));
   try {
-    const result = git(
-      repo,
-      ["merge-tree", "--write-tree", "--name-only", forkParent, target],
-      {
-        allowConflictExit: true,
-        env: {
-          GIT_OBJECT_DIRECTORY: alternateObjects,
-          GIT_ALTERNATE_OBJECT_DIRECTORIES: sourceObjectDirectory(repo),
-        },
-      },
-    );
-    const sections = result.stdout.split(/\n\n/);
-    const summary = sections.shift()?.split("\n") ?? [];
-    const tree = summary.shift()?.trim();
-    assertSha(tree, "merge-tree result tree");
-    const conflictPaths = summary.filter(Boolean);
-    for (const path of conflictPaths) assertSafePath(path, "conflict path");
-    if (result.exitCode === 0 && conflictPaths.length > 0) {
-      fail("merge-tree returned conflict paths with a successful exit");
-    }
-    if (result.exitCode === 1 && conflictPaths.length === 0) {
-      fail("merge-tree reported conflicts without exact conflict paths");
-    }
-
-    const classByPath = new Map<string, string>();
-    const orderedPaths = [...conflictPaths].sort(
-      (left, right) => right.length - left.length || left.localeCompare(right),
-    );
-    for (const line of sections.join("\n\n").split("\n")) {
-      const match = line.match(/^CONFLICT \(([^)]+)\): (.+)$/);
-      if (!match) continue;
-      const path = orderedPaths.find((candidate) =>
-        match[2].includes(candidate),
-      );
-      if (!path) fail(`could not link merge-tree conflict message: ${line}`);
-      if (classByPath.has(path)) fail(`duplicate conflict message for ${path}`);
-      const conflictClass = match[1].trim();
-      if (conflictClass === "") fail(`empty conflict class for ${path}`);
-      classByPath.set(path, conflictClass);
-    }
-    const conflicts = conflictPaths.map((path) => {
-      const conflictClass = classByPath.get(path);
-      if (!conflictClass) fail(`missing explicit conflict class for ${path}`);
-      return { path, conflictClass };
+    return parseMergeTreeConflicts(repo, forkParent, target, {
+      GIT_OBJECT_DIRECTORY: alternateObjects,
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: sourceObjectDirectory(repo),
     });
-    return conflicts.sort((left, right) => left.path.localeCompare(right.path));
   } finally {
     rmSync(alternateObjects, { recursive: true, force: true });
+  }
+}
+
+function writeProjectedTree(
+  repo: string,
+  entries: TreeEntry[],
+  indexPath: string,
+  objectEnv: Record<string, string>,
+): string {
+  const env = { ...objectEnv, GIT_INDEX_FILE: indexPath };
+  git(repo, ["read-tree", "--empty"], { env });
+  if (entries.length > 0) {
+    git(repo, ["update-index", "-z", "--index-info"], {
+      env,
+      input: entries
+        .map(
+          (entry) =>
+            `${entry.mode} ${entry.type} ${entry.objectId}\t${entry.path}\0`,
+        )
+        .join(""),
+    });
+  }
+  const tree = gitText(repo, ["write-tree"], { env });
+  assertSha(tree, "projected tree");
+  return tree;
+}
+
+function projectedCommit(
+  repo: string,
+  tree: string,
+  parent: string | undefined,
+  label: string,
+  objectEnv: Record<string, string>,
+): string {
+  const env = {
+    ...objectEnv,
+    GIT_AUTHOR_NAME: "Upstream Sync Projection",
+    GIT_AUTHOR_EMAIL: "projection@example.invalid",
+    GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
+    GIT_COMMITTER_NAME: "Upstream Sync Projection",
+    GIT_COMMITTER_EMAIL: "projection@example.invalid",
+    GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+  };
+  const commit = gitText(
+    repo,
+    ["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", label],
+    { env },
+  );
+  assertSha(commit, "projected commit");
+  return commit;
+}
+
+function deriveProjectedCherryPickCounts(
+  repo: string,
+  forkParent: string,
+  target: string,
+  exclusions: readonly string[],
+  temporaryStore: string,
+  objectEnv: Record<string, string>,
+): { left: number; right: number } {
+  const commits = { left: [] as string[], right: [] as string[] };
+  const symmetricDifference = git(repo, [
+    "rev-list",
+    "--left-right",
+    `${forkParent}...${target}`,
+  ]).stdout;
+  for (const line of symmetricDifference.split("\n").filter(Boolean)) {
+    const marker = line[0];
+    const commit = line.slice(1);
+    assertSha(commit, "symmetric-difference commit");
+    if (marker === "<") commits.left.push(commit);
+    else if (marker === ">") commits.right.push(commit);
+    else fail(`git rev-list returned an invalid side marker ${marker}`);
+  }
+
+  const projectedTreeByCommit = new Map<string, string>();
+  let indexSequence = 0;
+  const projectedTree = (commit: string): string => {
+    const cached = projectedTreeByCommit.get(commit);
+    if (cached !== undefined) return cached;
+    const tree = writeProjectedTree(
+      repo,
+      retainedEntries(readTreeEntries(repo, commit), exclusions),
+      join(temporaryStore, `patch-${indexSequence++}.index`),
+      objectEnv,
+    );
+    projectedTreeByCommit.set(commit, tree);
+    return tree;
+  };
+  let emptyTree: string | undefined;
+  const patchId = (commit: string): string | null => {
+    const commitHeaders = git(repo, ["cat-file", "commit", commit]).stdout
+      .split("\n\n", 1)[0]
+      .split("\n");
+    const parents = commitHeaders
+      .filter((line) => line.startsWith("parent "))
+      .map((line) => line.slice("parent ".length));
+    for (const parent of parents) assertSha(parent, "commit parent");
+    if (parents.length > 1) return null;
+    const parentTree =
+      parents.length === 0
+        ? (emptyTree ??= writeProjectedTree(
+            repo,
+            [],
+            join(temporaryStore, `patch-${indexSequence++}.index`),
+            objectEnv,
+          ))
+        : projectedTree(parents[0]);
+    const patchPath = join(temporaryStore, "projected.patch");
+    let patchWriteFd: number | undefined;
+    let patchReadFd: number | undefined;
+    let output: string;
+    try {
+      patchWriteFd = openSync(patchPath, "w", 0o600);
+      git(
+        repo,
+        [
+          "diff-tree",
+          "-r",
+          "-p",
+          "--full-index",
+          "--no-renames",
+          parentTree,
+          projectedTree(commit),
+        ],
+        { env: objectEnv, stdoutFd: patchWriteFd },
+      );
+      closeSync(patchWriteFd);
+      patchWriteFd = undefined;
+
+      patchReadFd = openSync(patchPath, "r");
+      output = git(repo, ["patch-id", "--stable"], {
+        env: objectEnv,
+        stdinFd: patchReadFd,
+      }).stdout.trim();
+    } finally {
+      if (patchWriteFd !== undefined) closeSync(patchWriteFd);
+      if (patchReadFd !== undefined) closeSync(patchReadFd);
+      rmSync(patchPath, { force: true });
+    }
+    if (output === "") return "empty-projected-patch";
+    const lines = output.split("\n");
+    if (lines.length !== 1) fail("git patch-id returned multiple patch IDs");
+    const id = lines[0].split(/\s+/)[0];
+    assertSha(id, "projected patch ID");
+    return id;
+  };
+
+  const patches = {
+    left: commits.left.map(patchId),
+    right: commits.right.map(patchId),
+  };
+  const leftIds = new Set(patches.left.filter((id) => id !== null));
+  const rightIds = new Set(patches.right.filter((id) => id !== null));
+  return {
+    left: patches.left.filter((id) => id === null || !rightIds.has(id)).length,
+    right: patches.right.filter((id) => id === null || !leftIds.has(id)).length,
+  };
+}
+
+function deriveProjectedState(
+  repo: string,
+  commits: TreeTriplet,
+  exclusions: readonly string[],
+): {
+  conflicts: Array<{ path: string; conflictClass: string }>;
+  leftPaths: string[];
+  rightPaths: string[];
+  cherryPickCounts: { left: number; right: number };
+  originalTrees: TreeTriplet;
+  projectedTrees: TreeTriplet;
+  retainedEntriesSha256: TreeTriplet;
+  excludedEntries: TreeEntry[];
+} {
+  const entries = {
+    base: readTreeEntries(repo, commits.base),
+    fork: readTreeEntries(repo, commits.fork),
+    target: readTreeEntries(repo, commits.target),
+  };
+  const retained = {
+    base: retainedEntries(entries.base, exclusions),
+    fork: retainedEntries(entries.fork, exclusions),
+    target: retainedEntries(entries.target, exclusions),
+  };
+  const originalTrees = {
+    base: gitText(repo, ["rev-parse", `${commits.base}^{tree}`]),
+    fork: gitText(repo, ["rev-parse", `${commits.fork}^{tree}`]),
+    target: gitText(repo, ["rev-parse", `${commits.target}^{tree}`]),
+  };
+  for (const tree of Object.values(originalTrees)) {
+    assertSha(tree, "original tree");
+  }
+
+  const temporaryStore = mkdtempSync(join(tmpdir(), "ccflare-sync-projection-"));
+  const objectDirectory = join(temporaryStore, "objects");
+  mkdirSync(objectDirectory);
+  const objectEnv = {
+    GIT_OBJECT_DIRECTORY: objectDirectory,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: sourceObjectDirectory(repo),
+  };
+  try {
+    const projectedTrees = {
+      base: writeProjectedTree(
+        repo,
+        retained.base,
+        join(temporaryStore, "base.index"),
+        objectEnv,
+      ),
+      fork: writeProjectedTree(
+        repo,
+        retained.fork,
+        join(temporaryStore, "fork.index"),
+        objectEnv,
+      ),
+      target: writeProjectedTree(
+        repo,
+        retained.target,
+        join(temporaryStore, "target.index"),
+        objectEnv,
+      ),
+    };
+    const base = projectedCommit(
+      repo,
+      projectedTrees.base,
+      undefined,
+      "projected base",
+      objectEnv,
+    );
+    const fork = projectedCommit(
+      repo,
+      projectedTrees.fork,
+      base,
+      "projected fork",
+      objectEnv,
+    );
+    const target = projectedCommit(
+      repo,
+      projectedTrees.target,
+      base,
+      "projected target",
+      objectEnv,
+    );
+    return {
+      conflicts: parseMergeTreeConflicts(repo, fork, target, objectEnv),
+      leftPaths: changedPaths(repo, base, fork, objectEnv),
+      rightPaths: changedPaths(repo, base, target, objectEnv),
+      cherryPickCounts: deriveProjectedCherryPickCounts(
+        repo,
+        commits.fork,
+        commits.target,
+        exclusions,
+        temporaryStore,
+        objectEnv,
+      ),
+      originalTrees,
+      projectedTrees,
+      retainedEntriesSha256: {
+        base: retainedEntriesDigest(retained.base),
+        fork: retainedEntriesDigest(retained.fork),
+        target: retainedEntriesDigest(retained.target),
+      },
+      excludedEntries: excludedEntries(entries.fork, exclusions),
+    };
+  } finally {
+    rmSync(temporaryStore, { recursive: true, force: true });
   }
 }
 
@@ -388,6 +831,12 @@ function deriveGitState(
   schemaVersion: SchemaVersion = SCHEMA_VERSION,
 ): Omit<SyncInventory, "items" | "evidenceCatalog"> {
   const repo = realpathSync(options.repo);
+  const issue =
+    schemaVersion === 3
+      ? trackingIssue(options.trackingIssue ?? DEFAULT_TRACKING_ISSUE)
+      : undefined;
+  const exclusions =
+    schemaVersion === 3 ? normalizeExclusions(options.exclusions) : undefined;
   const forkParent = resolveCommit(repo, options.forkParent, "fork parent");
   const requiredAncestors = options.requiredAncestors
     .map((ancestor) => resolveCommit(repo, ancestor, "required ancestor"))
@@ -416,7 +865,7 @@ function deriveGitState(
   ]);
   assertSha(tagObject, "canonical tag object");
   if (
-    schemaVersion === 2 &&
+    schemaVersion >= 2 &&
     gitText(repo, ["cat-file", "-t", tagObject]) !== "tag"
   ) {
     fail(`${options.canonicalTag} must resolve to an annotated tag object`);
@@ -442,10 +891,21 @@ function deriveGitState(
     .filter(Boolean);
   for (const commit of upstreamCommits)
     assertSha(commit, "upstream-only commit");
-  const conflicts = deriveConflicts(repo, forkParent, target);
+  const projected =
+    schemaVersion === 3 && exclusions
+      ? deriveProjectedState(
+          repo,
+          { base: mergeBase, fork: forkParent, target },
+          exclusions,
+        )
+      : undefined;
+  const conflicts =
+    projected?.conflicts ?? deriveConflicts(repo, forkParent, target);
   const conflictPaths = new Set(conflicts.map((entry) => entry.path));
-  const leftPaths = changedPaths(repo, mergeBase, forkParent);
-  const rightPaths = changedPaths(repo, mergeBase, target);
+  const leftPaths =
+    projected?.leftPaths ?? changedPaths(repo, mergeBase, forkParent);
+  const rightPaths =
+    projected?.rightPaths ?? changedPaths(repo, mergeBase, target);
   const rightSet = new Set(rightPaths);
   const sharedPaths = leftPaths
     .filter((path) => rightSet.has(path) && !conflictPaths.has(path))
@@ -457,13 +917,14 @@ function deriveGitState(
 
   return {
     schemaVersion,
+    ...(schemaVersion === 3 ? { trackingIssue: issue } : {}),
     phase: "pre-merge",
     baseline: {
       forkParent,
       requiredAncestors,
       target,
       canonicalTag: options.canonicalTag,
-      ...(schemaVersion === 2
+      ...(schemaVersion >= 2
         ? { tagObject, integrationCommit: null }
         : {}),
       peeledTag,
@@ -477,16 +938,18 @@ function deriveGitState(
         ]),
         "raw rev-list",
       ),
-      cherryPickCounts: parseCounts(
-        gitText(repo, [
-          "rev-list",
-          "--left-right",
-          "--count",
-          "--cherry-pick",
-          `${forkParent}...${target}`,
-        ]),
-        "cherry-pick rev-list",
-      ),
+      cherryPickCounts:
+        projected?.cherryPickCounts ??
+        parseCounts(
+          gitText(repo, [
+            "rev-list",
+            "--left-right",
+            "--count",
+            "--cherry-pick",
+            `${forkParent}...${target}`,
+          ]),
+          "cherry-pick rev-list",
+        ),
       versions: {
         fork: {
           root: packageVersion(repo, forkParent, "package.json"),
@@ -503,9 +966,23 @@ function deriveGitState(
       upstreamCommitOrder:
         "git rev-list --topo-order --reverse <merge-base>..<target>",
       pathSemantics:
-        "git diff --name-status -z --find-renames; rename destinations and current repo-relative paths",
+        schemaVersion === 3
+          ? "canonical exclusions applied to Git tree-entry metadata before projected-tree rename detection and current repo-relative path comparison"
+          : "git diff --name-status -z --find-renames; rename destinations and current repo-relative paths",
       conflictMechanism:
-        "git merge-tree --write-tree --name-only with a temporary alternate object directory under OS tmpdir",
+        schemaVersion === 3
+          ? "git merge-tree --write-tree --name-only over projected commits in a temporary object store"
+          : "git merge-tree --write-tree --name-only with a temporary alternate object directory under OS tmpdir",
+      ...(schemaVersion === 3 && exclusions && projected
+        ? {
+            exclusions,
+            exclusionsSha256: sha256(stableJson(exclusions)),
+            originalTrees: projected.originalTrees,
+            projectedTrees: projected.projectedTrees,
+            retainedEntriesSha256: projected.retainedEntriesSha256,
+            excludedEntries: projected.excludedEntries,
+          }
+        : {}),
     },
     expected: {
       upstreamCommits,
@@ -649,8 +1126,10 @@ function stableJson(value: unknown): string {
 export function renderLedger(inventory: SyncInventory): string {
   const release = inventory.baseline.canonicalTag.split("/").at(-1);
   if (!release) fail("canonical tag must identify a release");
+  const issue =
+    inventory.schemaVersion === 3 ? trackingIssue(inventory.trackingIssue) : 260;
   const lines = [
-    `# Issue #260 — ${release} Resolution Ledger`,
+    `# Issue #${issue} — ${release} Resolution Ledger`,
     "",
     "> Generated review skeleton. Edit the machine inventory first, then regenerate this ledger explicitly.",
     "> `check` never rewrites either file.",
@@ -661,13 +1140,23 @@ export function renderLedger(inventory: SyncInventory): string {
     `- Required fork-parent ancestors: \`${stableJson(inventory.baseline.requiredAncestors)}\``,
     `- Target: \`${inventory.baseline.target}\``,
     `- Canonical tag: \`${inventory.baseline.canonicalTag}\``,
-    ...(inventory.schemaVersion === 2
+    ...(inventory.schemaVersion >= 2
       ? [
           `- Annotated tag object: \`${inventory.baseline.tagObject}\``,
           `- Integration commit: \`${stableJson(inventory.baseline.integrationCommit)}\``,
         ]
       : []),
     `- Merge base: \`${inventory.baseline.mergeBase}\``,
+    ...(inventory.schemaVersion === 3
+      ? [
+          `- Exclusions: \`${stableJson(inventory.derivation.exclusions)}\``,
+          `- Exclusions digest: \`${inventory.derivation.exclusionsSha256}\``,
+          `- Original trees: \`${stableJson(inventory.derivation.originalTrees)}\``,
+          `- Projected trees: \`${stableJson(inventory.derivation.projectedTrees)}\``,
+          `- Retained-entry digests: \`${stableJson(inventory.derivation.retainedEntriesSha256)}\``,
+          `- Excluded fork entries: \`${stableJson(inventory.derivation.excludedEntries)}\``,
+        ]
+      : []),
     `- Qwen comparison trigger: \`${stableJson(inventory.expected.qwenComparisonTrigger)}\``,
     "",
   ];
@@ -1053,12 +1542,27 @@ function validateExpected(inventory: SyncInventory): void {
 }
 
 function validateLedger(inventory: SyncInventory, ledger: string): void {
+  const release = inventory.baseline.canonicalTag.split("/").at(-1);
+  if (!release) fail("canonical tag must identify a release");
+  const issue =
+    inventory.schemaVersion === 3 ? trackingIssue(inventory.trackingIssue) : 260;
   for (const expectedHeader of [
+    `# Issue #${issue} — ${release} Resolution Ledger`,
     `- Required fork-parent ancestors: \`${stableJson(inventory.baseline.requiredAncestors)}\``,
-    ...(inventory.schemaVersion === 2
+    ...(inventory.schemaVersion >= 2
       ? [
           `- Annotated tag object: \`${inventory.baseline.tagObject}\``,
           `- Integration commit: \`${stableJson(inventory.baseline.integrationCommit)}\``,
+        ]
+      : []),
+    ...(inventory.schemaVersion === 3
+      ? [
+          `- Exclusions: \`${stableJson(inventory.derivation.exclusions)}\``,
+          `- Exclusions digest: \`${inventory.derivation.exclusionsSha256}\``,
+          `- Original trees: \`${stableJson(inventory.derivation.originalTrees)}\``,
+          `- Projected trees: \`${stableJson(inventory.derivation.projectedTrees)}\``,
+          `- Retained-entry digests: \`${stableJson(inventory.derivation.retainedEntriesSha256)}\``,
+          `- Excluded fork entries: \`${stableJson(inventory.derivation.excludedEntries)}\``,
         ]
       : []),
     `- Qwen comparison trigger: \`${stableJson(inventory.expected.qwenComparisonTrigger)}\``,
@@ -1123,12 +1627,32 @@ function sameJson(left: unknown, right: unknown): boolean {
   return stableJson(left) === stableJson(right);
 }
 
+function validateExcludedEntryParity(
+  inventory: SyncInventory,
+  repo: string,
+  commit: string,
+  label: string,
+): void {
+  if (inventory.schemaVersion !== 3) return;
+  const exclusions = normalizeExclusions(inventory.derivation.exclusions);
+  const expected = inventory.derivation.excludedEntries;
+  if (!Array.isArray(expected)) {
+    fail("schema-v3 derivation.excludedEntries must be an array");
+  }
+  const actual = excludedEntries(readTreeEntries(repo, commit), exclusions);
+  if (!sameJson(actual, expected)) {
+    fail(
+      `excluded entry parity differs at ${label}: expected ${stableJson(expected)}, received ${stableJson(actual)}`,
+    );
+  }
+}
+
 function validateIntegrationTopology(
   inventory: SyncInventory,
   repo: string,
   reviewedRef: string,
 ): void {
-  if (inventory.schemaVersion !== 2 || inventory.phase !== "final") return;
+  if (inventory.schemaVersion < 2 || inventory.phase !== "final") return;
   const integrationCommit = inventory.baseline.integrationCommit;
   assertSha(integrationCommit, "baseline.integrationCommit");
   if (gitText(repo, ["cat-file", "-t", integrationCommit]) !== "commit") {
@@ -1151,6 +1675,12 @@ function validateIntegrationTopology(
       `baseline.integrationCommit ${integrationCommit} must have exact ordered parents [forkParent ${inventory.baseline.forkParent}, target ${inventory.baseline.target}], received ${stableJson(parents)}`,
     );
   }
+  validateExcludedEntryParity(
+    inventory,
+    repo,
+    integrationCommit,
+    "integration commit",
+  );
   const reviewedCommit = resolveCommit(repo, reviewedRef, "reviewed ref");
   const reachability = git(
     repo,
@@ -1162,6 +1692,7 @@ function validateIntegrationTopology(
       `baseline.integrationCommit ${integrationCommit} is not an ancestor of reviewed ref ${reviewedRef} (${reviewedCommit})`,
     );
   }
+  validateExcludedEntryParity(inventory, repo, reviewedCommit, "reviewed ref");
 }
 
 function validateGitDerivation(
@@ -1195,7 +1726,7 @@ function validateGitDerivation(
     }
   }
   if (
-    inventory.schemaVersion === 2 &&
+    inventory.schemaVersion >= 2 &&
     inventory.baseline.tagObject !== regenerated.baseline.tagObject
   ) {
     fail("recorded tag object diverges from canonical tag ref Git evidence");
@@ -1214,6 +1745,81 @@ function validateGitDerivation(
     }
   }
   validateIntegrationTopology(inventory, repo, reviewedRef);
+}
+
+function validateTreeTriplet(
+  value: unknown,
+  label: string,
+  digest: boolean,
+): void {
+  assertRecord(value, label);
+  if (!sameJson(Object.keys(value).sort(), ["base", "fork", "target"])) {
+    fail(`${label} must contain exactly base, fork, and target`);
+  }
+  for (const side of ["base", "fork", "target"] as const) {
+    if (digest) assertSha256(value[side], `${label}.${side}`);
+    else assertSha(value[side], `${label}.${side}`);
+  }
+}
+
+function validateSchemaV3Derivation(inventory: SyncInventory): void {
+  if (inventory.schemaVersion !== 3) return;
+  trackingIssue(inventory.trackingIssue);
+  const exclusions = normalizeExclusions(inventory.derivation.exclusions);
+  assertSha256(
+    inventory.derivation.exclusionsSha256,
+    "derivation.exclusionsSha256",
+  );
+  if (
+    inventory.derivation.exclusionsSha256 !== sha256(stableJson(exclusions))
+  ) {
+    fail("derivation exclusions digest does not match the canonical policy");
+  }
+  validateTreeTriplet(
+    inventory.derivation.originalTrees,
+    "derivation.originalTrees",
+    false,
+  );
+  validateTreeTriplet(
+    inventory.derivation.projectedTrees,
+    "derivation.projectedTrees",
+    false,
+  );
+  validateTreeTriplet(
+    inventory.derivation.retainedEntriesSha256,
+    "derivation.retainedEntriesSha256",
+    true,
+  );
+  if (!Array.isArray(inventory.derivation.excludedEntries)) {
+    fail("schema-v3 derivation.excludedEntries must be an array");
+  }
+  const paths = new Set<string>();
+  for (const entry of inventory.derivation.excludedEntries) {
+    assertRecord(entry, "derivation excluded entry");
+    assertString(entry.mode, "derivation excluded entry mode");
+    if (!/^[0-7]{6}$/.test(entry.mode)) {
+      fail(`derivation excluded entry has invalid mode ${entry.mode}`);
+    }
+    assertString(entry.type, "derivation excluded entry type");
+    if (!["blob", "commit"].includes(entry.type)) {
+      fail(`derivation excluded entry has unsupported type ${entry.type}`);
+    }
+    assertSha(entry.objectId, "derivation excluded entry object ID");
+    assertSafePath(entry.path, "derivation excluded entry path");
+    if (!exclusions.includes(entry.path)) {
+      fail(`derivation excluded entry ${entry.path} is outside the exclusions`);
+    }
+    if (paths.has(entry.path)) {
+      fail(`duplicate derivation excluded entry ${entry.path}`);
+    }
+    paths.add(entry.path);
+  }
+  const recordedPaths = inventory.derivation.excludedEntries.map(
+    (entry) => entry.path,
+  );
+  if (!sameJson(recordedPaths, [...recordedPaths].sort())) {
+    fail("derivation excluded entries must be deterministically sorted");
+  }
 }
 
 function validateBaseline(inventory: SyncInventory): void {
@@ -1258,7 +1864,7 @@ function validateBaseline(inventory: SyncInventory): void {
   ) {
     fail("baseline.canonicalTag must be an explicit safe refs/tags ref");
   }
-  if (inventory.schemaVersion === 2) {
+  if (inventory.schemaVersion >= 2) {
     assertSha(inventory.baseline.tagObject, "baseline.tagObject");
     if (!("integrationCommit" in inventory.baseline)) {
       if (inventory.phase === "final") {
@@ -1331,6 +1937,7 @@ function validateBaseline(inventory: SyncInventory): void {
       `unknown derivation algorithm version ${inventory.derivation.algorithmVersion}`,
     );
   }
+  validateSchemaV3Derivation(inventory);
 }
 
 function normalizedApplications(applications: RerereApplication[]): string[] {

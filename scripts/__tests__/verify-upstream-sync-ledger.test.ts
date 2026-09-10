@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -12,6 +14,7 @@ import {
   canonicalLedgerAnchor,
   generateSyncInventory,
   renderLedger,
+  type InventoryItem,
   type RerereApplication,
   type SyncInventory,
   validateSyncInventory,
@@ -20,6 +23,13 @@ import {
 const SHA_A = "1111111111111111111111111111111111111111";
 const SHA_B = "2222222222222222222222222222222222222222";
 const SHA_C = "3333333333333333333333333333333333333333";
+const EXCLUDED_PATH = "packages/proxy/src/inline-worker.ts";
+const CANONICAL_EXCLUSIONS = [
+  "packages/database/src/inline-incremental-vacuum-worker.ts",
+  "packages/database/src/inline-integrity-check-worker.ts",
+  "packages/database/src/inline-vacuum-worker.ts",
+  EXCLUDED_PATH,
+];
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -38,7 +48,7 @@ function item(
   kind: "upstream-commit" | "conflict" | "shared-path" | "rerere",
   source: Record<string, string>,
   overrides: Record<string, unknown> = {},
-) {
+): InventoryItem {
   const sourceValue =
     kind === "upstream-commit"
       ? source.sha
@@ -130,6 +140,28 @@ function validateFixture(inventory: SyncInventory): void {
 
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+function asLegacySchema(
+  inventory: SyncInventory,
+  schemaVersion: 1 | 2,
+): SyncInventory {
+  inventory.schemaVersion = schemaVersion;
+  delete inventory.trackingIssue;
+  inventory.derivation = {
+    algorithmVersion: `upstream-sync-ledger/v${schemaVersion}`,
+    upstreamCommitOrder:
+      "git rev-list --topo-order --reverse <merge-base>..<target>",
+    pathSemantics:
+      "git diff --name-status -z --find-renames; rename destinations and current repo-relative paths",
+    conflictMechanism:
+      "git merge-tree --write-tree --name-only with a temporary alternate object directory under OS tmpdir",
+  };
+  if (schemaVersion === 1) {
+    delete inventory.baseline.tagObject;
+    delete inventory.baseline.integrationCommit;
+  }
+  return inventory;
 }
 
 function completeInventory(inventory: SyncInventory): SyncInventory {
@@ -497,17 +529,13 @@ describe("disposition and evidence validation", () => {
 });
 
 function git(cwd: string, ...args: string[]): string {
-  const result = Bun.spawnSync(["git", ...args], {
-    cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  if (result.exitCode !== 0) {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  if (result.status !== 0) {
     throw new Error(
-      `git ${args.join(" ")} failed:\n${result.stdout.toString()}\n${result.stderr.toString()}`,
+      `git ${args.join(" ")} failed:\n${result.stdout}\n${result.stderr}`,
     );
   }
-  return result.stdout.toString().trim();
+  return result.stdout.trim();
 }
 
 function write(repo: string, path: string, contents: string): void {
@@ -538,6 +566,7 @@ function createMergeFixture(): {
   write(repo, "apps/cli/package.json", '{"version":"1.0.0"}\n');
   write(repo, "content.txt", "base\n");
   write(repo, "modify-delete.txt", "base\n");
+  write(repo, "rename-source.txt", "rename me\n");
   write(repo, "shared.txt", "first\nmiddle\nlast\n");
   write(
     repo,
@@ -632,8 +661,225 @@ function commitWithParents(
   );
 }
 
+function treeEntry(repo: string, commit: string, path: string): string | null {
+  const entry = git(repo, "ls-tree", commit, "--", path);
+  return entry === "" ? null : entry;
+}
+
+function removeLooseObject(repo: string, objectId: string): void {
+  const objects = git(repo, "rev-parse", "--git-path", "objects");
+  rmSync(join(repo, objects, objectId.slice(0, 2), objectId.slice(2)));
+}
+
+function createProjectionFixture(): ReturnType<typeof createMergeFixture> & {
+  excludedObjects: string[];
+} {
+  const fixture = createMergeFixture();
+  git(fixture.repo, "checkout", "main");
+  write(fixture.repo, EXCLUDED_PATH, "fork-only opaque contents\n");
+  const fork = commitAll(fixture.repo, "add excluded fork artifact");
+
+  git(fixture.repo, "checkout", "upstream");
+  write(fixture.repo, EXCLUDED_PATH, "upstream-only opaque contents\n");
+  git(fixture.repo, "mv", "rename-source.txt", "rename-target.txt");
+  write(fixture.repo, "shape/file.txt", "directory side\n");
+  const target = commitAll(fixture.repo, "rename and add directory shape");
+  git(fixture.repo, "tag", "-f", "-a", "v-test", "-m", "annotated target", target);
+
+  git(fixture.repo, "checkout", "main");
+  git(fixture.repo, "mv", "rename-source.txt", "fork-rename-target.txt");
+  write(fixture.repo, "shape", "file side\n");
+  const projectedFork = commitAll(fixture.repo, "fork rename and file shape");
+
+  const excludedObjects = [fork, target]
+    .map((commit) => treeEntry(fixture.repo, commit, EXCLUDED_PATH))
+    .filter((entry): entry is string => entry !== null)
+    .map((entry) => entry.split(/\s+/)[2]);
+  return {
+    ...fixture,
+    fork: projectedFork,
+    target,
+    tagObject: git(fixture.repo, "rev-parse", fixture.tag),
+    excludedObjects,
+  };
+}
+
+function createProjectedCherryPickFixture(): ReturnType<
+  typeof createMergeFixture
+> & {
+  upstreamCommits: string[];
+  intermediateExcludedObjects: string[];
+} {
+  const repo = tempDir("ccflare-upstream-sync-cherry-pick-");
+  git(repo, "init", "-b", "main");
+  git(repo, "config", "user.name", "Upstream Sync Test");
+  git(repo, "config", "user.email", "sync-test@example.invalid");
+  write(repo, "package.json", '{"version":"1.0.0"}\n');
+  write(repo, "apps/cli/package.json", '{"version":"1.0.0"}\n');
+  write(repo, "equivalent.txt", "base\n");
+  const root = commitAll(repo, "root boundary");
+  git(repo, "branch", "boundary-topic", root);
+
+  write(repo, "boundary-main.txt", "main boundary\n");
+  commitAll(repo, "main boundary change");
+  git(repo, "checkout", "boundary-topic");
+  write(repo, "boundary-topic.txt", "topic boundary\n");
+  commitAll(repo, "topic boundary change");
+  git(repo, "checkout", "main");
+  git(repo, "merge", "--no-ff", "boundary-topic", "-m", "merge boundary history");
+  const base = git(repo, "rev-parse", "HEAD");
+  git(repo, "branch", "upstream");
+
+  write(repo, "equivalent.txt", "same allowed patch\n");
+  write(repo, EXCLUDED_PATH, "fork-only intermediate excluded edit\n");
+  const forkEquivalent = commitAll(repo, "fork equivalent allowed patch");
+  write(repo, "fork-only.txt", "fork only\n");
+  rmSync(join(repo, EXCLUDED_PATH));
+  commitAll(repo, "fork follow-up");
+  git(repo, "branch", "fork-topic", forkEquivalent);
+  git(repo, "checkout", "fork-topic");
+  write(repo, "fork-topic.txt", "fork topic\n");
+  commitAll(repo, "fork topic change");
+  git(repo, "checkout", "main");
+  git(repo, "merge", "--no-ff", "fork-topic", "-m", "merge fork topic");
+  const fork = git(repo, "rev-parse", "HEAD");
+
+  git(repo, "checkout", "upstream");
+  write(repo, "equivalent.txt", "same allowed patch\n");
+  write(repo, EXCLUDED_PATH, "upstream-only intermediate excluded edit\n");
+  const upstreamEquivalent = commitAll(repo, "upstream equivalent allowed patch");
+  write(repo, "package.json", '{"version":"2.0.0"}\n');
+  write(repo, "apps/cli/package.json", '{"version":"2.0.0"}\n');
+  write(repo, "upstream-only.txt", "upstream only\n");
+  rmSync(join(repo, EXCLUDED_PATH));
+  const target = commitAll(repo, "upstream follow-up");
+  git(repo, "tag", "-a", "v-cherry-pick", "-m", "annotated target", target);
+  const tag = "refs/tags/v-cherry-pick";
+  const tagObject = git(repo, "rev-parse", tag);
+
+  const intermediateExcludedObjects = [forkEquivalent, upstreamEquivalent].map(
+    (commit) => {
+      const entry = treeEntry(repo, commit, EXCLUDED_PATH);
+      if (entry === null) throw new Error("fixture excluded entry");
+      return entry.split(/\s+/)[2];
+    },
+  );
+  git(repo, "checkout", "main");
+  return {
+    repo,
+    base,
+    fork,
+    target,
+    tag,
+    tagObject,
+    upstreamCommits: [upstreamEquivalent, target],
+    intermediateExcludedObjects,
+  };
+}
+
+function createLargeProjectedPatchFixture(): ReturnType<
+  typeof createMergeFixture
+> {
+  const fixture = createMergeFixture();
+  git(fixture.repo, "checkout", "upstream");
+  write(
+    fixture.repo,
+    "large-permitted-patch.txt",
+    "permitted textual patch payload\n".repeat(50_000),
+  );
+  const target = commitAll(fixture.repo, "add large permitted textual patch");
+  git(fixture.repo, "tag", "-f", "-a", "v-test", "-m", "annotated target", target);
+  git(fixture.repo, "checkout", "main");
+  return {
+    ...fixture,
+    target,
+    tagObject: git(fixture.repo, "rev-parse", fixture.tag),
+  };
+}
+
+function createPrefixConflictFixture(): ReturnType<typeof createMergeFixture> {
+  const repo = tempDir("ccflare-upstream-sync-prefix-conflict-");
+  git(repo, "init", "-b", "main");
+  git(repo, "config", "user.name", "Upstream Sync Test");
+  git(repo, "config", "user.email", "sync-test@example.invalid");
+  write(repo, "package.json", '{"version":"1.0.0"}\n');
+  write(repo, "apps/cli/package.json", '{"version":"1.0.0"}\n');
+  write(repo, "one.txt", "base\n");
+  write(repo, "one.txt.extra", "base\n");
+  const base = commitAll(repo, "base");
+  git(repo, "branch", "upstream");
+
+  write(repo, "one.txt", "fork content\n");
+  write(repo, "one.txt.extra", "fork modified\n");
+  const fork = commitAll(repo, "fork conflicts");
+
+  git(repo, "checkout", "upstream");
+  write(repo, "package.json", '{"version":"2.0.0"}\n');
+  write(repo, "apps/cli/package.json", '{"version":"2.0.0"}\n');
+  write(repo, "one.txt", "upstream content\n");
+  rmSync(join(repo, "one.txt.extra"));
+  const target = commitAll(repo, "upstream conflicts");
+  git(repo, "tag", "-a", "v-prefix-conflict", "-m", "annotated target", target);
+  const tag = "refs/tags/v-prefix-conflict";
+  const tagObject = git(repo, "rev-parse", tag);
+  git(repo, "checkout", "main");
+  return { repo, base, fork, target, tag, tagObject };
+}
+
+type ExcludedMutation = "addition" | "removal" | "rename" | "mode" | "object";
+
+function createExcludedTopologyFixture(mutation?: ExcludedMutation): ReturnType<
+  typeof createTopologyFixture
+> {
+  const repo = tempDir("ccflare-upstream-sync-excluded-topology-");
+  git(repo, "init", "-b", "main");
+  git(repo, "config", "user.name", "Upstream Sync Test");
+  git(repo, "config", "user.email", "sync-test@example.invalid");
+  write(repo, "package.json", '{"version":"1.0.0"}\n');
+  write(repo, "apps/cli/package.json", '{"version":"1.0.0"}\n');
+  if (mutation !== "addition") write(repo, EXCLUDED_PATH, "fork artifact\n");
+  write(repo, "base.txt", "base\n");
+  const base = commitAll(repo, "base");
+  git(repo, "branch", "upstream");
+
+  write(repo, "fork.txt", "fork\n");
+  const fork = commitAll(repo, "fork changes");
+
+  git(repo, "checkout", "upstream");
+  write(repo, "package.json", '{"version":"2.0.0"}\n');
+  write(repo, "apps/cli/package.json", '{"version":"2.0.0"}\n');
+  write(repo, "upstream.txt", "upstream\n");
+  switch (mutation) {
+    case "addition":
+      write(repo, EXCLUDED_PATH, "upstream addition\n");
+      break;
+    case "removal":
+      rmSync(join(repo, EXCLUDED_PATH));
+      break;
+    case "rename":
+      git(repo, "mv", EXCLUDED_PATH, `${EXCLUDED_PATH}.renamed`);
+      break;
+    case "mode":
+      chmodSync(join(repo, EXCLUDED_PATH), 0o755);
+      break;
+    case "object":
+      write(repo, EXCLUDED_PATH, "upstream replacement\n");
+      break;
+  }
+  const target = commitAll(repo, "upstream changes");
+  git(repo, "tag", "-a", "v-topology", "-m", "annotated target", target);
+  const tag = "refs/tags/v-topology";
+  const tagObject = git(repo, "rev-parse", tag);
+
+  git(repo, "checkout", "main");
+  git(repo, "merge", "--no-ff", "upstream", "-m", "integrate upstream");
+  const integrationCommit = git(repo, "rev-parse", "HEAD");
+  return { repo, base, fork, target, tag, tagObject, integrationCommit };
+}
+
 function finalTopologyInventory(
   fixture: ReturnType<typeof createTopologyFixture>,
+  schemaVersion: 2 | 3 = 3,
 ): SyncInventory {
   const inventory = generateSyncInventory({
     repo: fixture.repo,
@@ -645,6 +891,7 @@ function finalTopologyInventory(
   Object.assign(inventory.baseline, {
     integrationCommit: fixture.integrationCommit,
   });
+  if (schemaVersion === 2) asLegacySchema(inventory, 2);
   return completeInventory(inventory);
 }
 
@@ -665,9 +912,9 @@ describe("hermetic derivation and CLI", () => {
       "..",
       "verify-upstream-sync-ledger.ts",
     );
-    const generateCli = Bun.spawnSync(
+    const generateCli = spawnSync(
+      process.execPath,
       [
-        "bun",
         script,
         "generate",
         "--repo",
@@ -685,10 +932,10 @@ describe("hermetic derivation and CLI", () => {
         "--ledger",
         ledgerPath,
       ],
-      { stdout: "pipe", stderr: "pipe" },
+      { encoding: "utf8" },
     );
-    expect(generateCli.exitCode, generateCli.stderr.toString()).toBe(0);
-    expect(generateCli.stdout.toString()).toContain("generated");
+    expect(generateCli.status, generateCli.stderr).toBe(0);
+    expect(generateCli.stdout).toContain("generated");
     const inventory = JSON.parse(
       readFileSync(inventoryPath, "utf8"),
     ) as SyncInventory;
@@ -696,10 +943,12 @@ describe("hermetic derivation and CLI", () => {
       repo: fixture.repo,
     });
 
-    expect(inventory.schemaVersion).toBe(2);
+    expect(inventory.schemaVersion).toBe(3);
+    expect(inventory.trackingIssue).toBe(338);
     expect(inventory.derivation.algorithmVersion).toBe(
-      "upstream-sync-ledger/v2",
+      "upstream-sync-ledger/v3",
     );
+    expect(inventory.derivation.exclusions).toEqual(CANONICAL_EXCLUSIONS);
     expect(
       (inventory.baseline as unknown as Record<string, unknown>).tagObject,
     ).toBe(fixture.tagObject);
@@ -733,9 +982,9 @@ describe("hermetic derivation and CLI", () => {
       [...inventory.items.map((entry) => entry.id)].sort(),
     );
 
-    const cli = Bun.spawnSync(
+    const cli = spawnSync(
+      process.execPath,
       [
-        "bun",
         script,
         "check",
         "--repo",
@@ -745,10 +994,10 @@ describe("hermetic derivation and CLI", () => {
         "--ledger",
         ledgerPath,
       ],
-      { stdout: "pipe", stderr: "pipe" },
+      { encoding: "utf8" },
     );
-    expect(cli.exitCode, cli.stderr.toString()).toBe(0);
-    expect(cli.stdout.toString()).toContain("validated");
+    expect(cli.status, cli.stderr).toBe(0);
+    expect(cli.stdout).toContain("validated");
 
     expect({
       head: git(fixture.repo, "rev-parse", "HEAD"),
@@ -756,6 +1005,50 @@ describe("hermetic derivation and CLI", () => {
       status: git(fixture.repo, "status", "--porcelain=v1"),
     }).toEqual(before);
   }, 30_000);
+
+  test("reports child-process capture failures without embedding stdout payloads", () => {
+    const repo = tempDir("ccflare-upstream-sync-git-failure-");
+    const bin = tempDir("ccflare-upstream-sync-git-wrapper-");
+    const gitWrapper = join(bin, "git");
+    writeFileSync(
+      gitWrapper,
+      `#!/bin/sh
+printf 'synthetic actionable git failure\\n' >&2
+i=0
+while [ "$i" -lt 50000 ]; do
+  printf 'SYNTHETIC_STDOUT_PAYLOAD\\n'
+  i=$((i + 1))
+done
+exit 23
+`,
+    );
+    chmodSync(gitWrapper, 0o755);
+    const originalPath = process.env.PATH;
+    let message = "";
+    try {
+      process.env.PATH = `${bin}:${originalPath ?? ""}`;
+      try {
+        generateSyncInventory({
+          repo,
+          forkParent: SHA_A,
+          requiredAncestors: [SHA_A],
+          target: SHA_B,
+          canonicalTag: "refs/tags/v-synthetic-failure",
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+
+    expect(message).toContain("ENOBUFS");
+    expect(message).toContain("synthetic actionable git failure");
+    expect(message).toContain("stdout omitted");
+    expect(message).not.toContain("SYNTHETIC_STDOUT_PAYLOAD");
+    expect(message.length).toBeLessThan(10_000);
+  });
 
   test("check rejects required-ancestor failure and Qwen trigger drift", () => {
     const fixture = createMergeFixture();
@@ -787,7 +1080,7 @@ describe("hermetic derivation and CLI", () => {
     ).toThrow(/Qwen comparison trigger/);
   }, 30_000);
 
-  test("schema v2 rejects lightweight tags while schema v1 retains its old tag contract", () => {
+  test("schema v2 and v3 reject lightweight tags while schema v1 retains its old tag contract", () => {
     const fixture = createMergeFixture();
     const lightweightTag = "refs/tags/v-lightweight";
     git(fixture.repo, "tag", "v-lightweight", fixture.target);
@@ -802,105 +1095,127 @@ describe("hermetic derivation and CLI", () => {
       }),
     ).toThrow(/annotated tag/);
 
-    const v1 = generateSyncInventory({
+    const generated = generateSyncInventory({
       repo: fixture.repo,
       forkParent: fixture.fork,
       requiredAncestors: [fixture.base],
       target: fixture.target,
       canonicalTag: fixture.tag,
     });
-    v1.schemaVersion = 1;
-    v1.derivation.algorithmVersion = "upstream-sync-ledger/v1";
-    v1.baseline.canonicalTag = lightweightTag;
-    delete (v1.baseline as unknown as Record<string, unknown>).tagObject;
-    delete (v1.baseline as unknown as Record<string, unknown>).integrationCommit;
+    const v2 = asLegacySchema(clone(generated), 2);
+    v2.baseline.canonicalTag = lightweightTag;
+    v2.baseline.tagObject = fixture.target;
+    expect(() =>
+      validateSyncInventory(v2, renderLedger(v2), { repo: fixture.repo }),
+    ).toThrow(/annotated tag/);
 
+    const v1 = asLegacySchema(generated, 1);
+    v1.baseline.canonicalTag = lightweightTag;
     expect(() =>
       validateSyncInventory(v1, renderLedger(v1), { repo: fixture.repo }),
     ).not.toThrow();
   }, 30_000);
 
-  test("schema v2 rejects a recorded tag object that differs from the canonical ref", () => {
+  test("schema v2 and v3 reject a recorded tag object that differs from the canonical ref", () => {
     const fixture = createMergeFixture();
-    const inventory = generateSyncInventory({
+    expect(() =>
+      generateSyncInventory({
+        repo: fixture.repo,
+        forkParent: fixture.fork,
+        requiredAncestors: [fixture.base],
+        target: fixture.fork,
+        canonicalTag: fixture.tag,
+      }),
+    ).toThrow(/canonical tag peels.*not recorded target/);
+
+    const generated = generateSyncInventory({
       repo: fixture.repo,
       forkParent: fixture.fork,
       requiredAncestors: [fixture.base],
       target: fixture.target,
       canonicalTag: fixture.tag,
     });
-    Object.assign(inventory.baseline, { tagObject: fixture.target });
 
-    expect(() =>
-      validateSyncInventory(inventory, renderLedger(inventory), {
-        repo: fixture.repo,
-      }),
-    ).toThrow(/recorded tag object/);
+    for (const schemaVersion of [2, 3] as const) {
+      const inventory = clone(generated);
+      if (schemaVersion === 2) asLegacySchema(inventory, 2);
+      Object.assign(inventory.baseline, { tagObject: fixture.target });
+      expect(() =>
+        validateSyncInventory(inventory, renderLedger(inventory), {
+          repo: fixture.repo,
+        }),
+      ).toThrow(/recorded tag object/);
+    }
   }, 30_000);
 
-  test("schema v2 final validation accepts the real ordered two-parent integration merge", () => {
+  test("schema v2 and v3 final validation accept the real ordered two-parent integration merge", () => {
     const fixture = createTopologyFixture();
-    const inventory = finalTopologyInventory(fixture);
-
-    expect(() =>
-      validateSyncInventory(inventory, renderLedger(inventory), {
-        repo: fixture.repo,
-        observedRerereApplications: [],
-      }),
-    ).not.toThrow();
+    for (const schemaVersion of [2, 3] as const) {
+      const inventory = finalTopologyInventory(fixture, schemaVersion);
+      expect(() =>
+        validateSyncInventory(inventory, renderLedger(inventory), {
+          repo: fixture.repo,
+          observedRerereApplications: [],
+        }),
+      ).not.toThrow();
+    }
   }, 30_000);
 
-  test("schema v2 final validation ignores parent-prefixed commit message lines", () => {
+  test("schema v2 and v3 final validation ignore parent-prefixed commit message lines", () => {
     const fixture = createTopologyFixture();
-    const inventory = finalTopologyInventory(fixture);
     const integrationCommit = commitWithParents(
       fixture.repo,
       fixture.integrationCommit,
       [fixture.fork, fixture.target],
       `integrate upstream\n\nparent ${fixture.base}`,
     );
-    Object.assign(inventory.baseline, { integrationCommit });
-
-    expect(() =>
-      validateSyncInventory(inventory, renderLedger(inventory), {
-        repo: fixture.repo,
-        observedRerereApplications: [],
-        reviewedRef: integrationCommit,
-      }),
-    ).not.toThrow();
+    for (const schemaVersion of [2, 3] as const) {
+      const inventory = finalTopologyInventory(fixture, schemaVersion);
+      Object.assign(inventory.baseline, { integrationCommit });
+      expect(() =>
+        validateSyncInventory(inventory, renderLedger(inventory), {
+          repo: fixture.repo,
+          observedRerereApplications: [],
+          reviewedRef: integrationCommit,
+        }),
+      ).not.toThrow();
+    }
   }, 30_000);
 
-  test("schema v2 final validation rejects a detached valid integration merge", () => {
+  test("schema v2 and v3 final validation reject a detached valid integration merge", () => {
     const fixture = createTopologyFixture();
-    const inventory = finalTopologyInventory(fixture);
     const integrationCommit = commitWithParents(
       fixture.repo,
       fixture.integrationCommit,
       [fixture.fork, fixture.target],
     );
     git(fixture.repo, "branch", "detached-integration", integrationCommit);
-    Object.assign(inventory.baseline, { integrationCommit });
-
-    expect(() =>
-      validateSyncInventory(inventory, renderLedger(inventory), {
-        repo: fixture.repo,
-        observedRerereApplications: [],
-      }),
-    ).toThrow(/not an ancestor of reviewed ref HEAD/);
+    for (const schemaVersion of [2, 3] as const) {
+      const inventory = finalTopologyInventory(fixture, schemaVersion);
+      Object.assign(inventory.baseline, { integrationCommit });
+      expect(() =>
+        validateSyncInventory(inventory, renderLedger(inventory), {
+          repo: fixture.repo,
+          observedRerereApplications: [],
+        }),
+      ).toThrow(/not an ancestor of reviewed ref HEAD/);
+    }
   }, 30_000);
 
-  test("schema v2 final validation accepts a reviewed descendant after follow-up commits", () => {
+  test("schema v2 and v3 final validation accept a reviewed descendant after follow-up commits", () => {
     const fixture = createTopologyFixture();
-    const inventory = finalTopologyInventory(fixture);
     write(fixture.repo, "follow-up.txt", "follow-up\n");
     commitAll(fixture.repo, "follow-up");
 
-    expect(() =>
-      validateSyncInventory(inventory, renderLedger(inventory), {
-        repo: fixture.repo,
-        observedRerereApplications: [],
-      }),
-    ).not.toThrow();
+    for (const schemaVersion of [2, 3] as const) {
+      const inventory = finalTopologyInventory(fixture, schemaVersion);
+      expect(() =>
+        validateSyncInventory(inventory, renderLedger(inventory), {
+          repo: fixture.repo,
+          observedRerereApplications: [],
+        }),
+      ).not.toThrow();
+    }
   }, 30_000);
 
   test.each([
@@ -938,18 +1253,256 @@ describe("hermetic derivation and CLI", () => {
           fixture.base,
         ]),
     ],
-  ])("schema v2 final validation rejects %s", (_label, integrationCommit) => {
+  ])("schema v2 and v3 final validation reject %s", (_label, integrationCommit) => {
     const fixture = createTopologyFixture();
-    const inventory = finalTopologyInventory(fixture);
-    Object.assign(inventory.baseline, {
-      integrationCommit: integrationCommit(fixture),
+    const invalidCommit = integrationCommit(fixture);
+    for (const schemaVersion of [2, 3] as const) {
+      const inventory = finalTopologyInventory(fixture, schemaVersion);
+      Object.assign(inventory.baseline, { integrationCommit: invalidCommit });
+      expect(() =>
+        validateSyncInventory(inventory, renderLedger(inventory), {
+          repo: fixture.repo,
+          observedRerereApplications: [],
+        }),
+      ).toThrow(/exact ordered parents.*forkParent.*target/);
+    }
+  }, 30_000);
+});
+
+describe("schema v3 exclusion-safe projection", () => {
+  test("computes projected patch IDs for permitted textual patches larger than one MiB", () => {
+    const fixture = createLargeProjectedPatchFixture();
+    let inventory: SyncInventory | undefined;
+    let failureSummary:
+      | { messageLength: number; reportsCaptureLimit: boolean }
+      | undefined;
+
+    try {
+      inventory = generateSyncInventory({
+        repo: fixture.repo,
+        forkParent: fixture.fork,
+        requiredAncestors: [fixture.base],
+        target: fixture.target,
+        canonicalTag: fixture.tag,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      failureSummary = {
+        messageLength: message.length,
+        reportsCaptureLimit: /ENOBUFS|maxBuffer/.test(message),
+      };
+    }
+
+    expect(failureSummary).toBeUndefined();
+    expect(inventory?.baseline.rawCounts).toEqual({ left: 1, right: 2 });
+    expect(inventory?.baseline.cherryPickCounts).toEqual({ left: 1, right: 2 });
+  }, 30_000);
+
+  test("counts projected patch equivalence across multi-commit sides, an in-range merge, and merged boundary history", () => {
+    const fixture = createProjectedCherryPickFixture();
+    const inventory = generateSyncInventory({
+      repo: fixture.repo,
+      forkParent: fixture.fork,
+      requiredAncestors: [fixture.base],
+      target: fixture.target,
+      canonicalTag: fixture.tag,
     });
+
+    expect(inventory.baseline.rawCounts).toEqual({ left: 4, right: 2 });
+    expect(inventory.baseline.cherryPickCounts).toEqual({ left: 3, right: 1 });
+    expect(inventory.expected.upstreamCommits).toEqual(fixture.upstreamCommits);
+  }, 30_000);
+
+  test("counts projected patch equivalence without excluded blobs from intermediate history", () => {
+    const fixture = createProjectedCherryPickFixture();
+    expect(treeEntry(fixture.repo, fixture.fork, EXCLUDED_PATH)).toBeNull();
+    expect(treeEntry(fixture.repo, fixture.target, EXCLUDED_PATH)).toBeNull();
+    for (const objectId of fixture.intermediateExcludedObjects) {
+      removeLooseObject(fixture.repo, objectId);
+    }
+
+    const inventory = generateSyncInventory({
+      repo: fixture.repo,
+      forkParent: fixture.fork,
+      requiredAncestors: [fixture.base],
+      target: fixture.target,
+      canonicalTag: fixture.tag,
+    });
+
+    expect(inventory.baseline.rawCounts).toEqual({ left: 4, right: 2 });
+    expect(inventory.baseline.cherryPickCounts).toEqual({ left: 3, right: 1 });
+    expect(inventory.expected.upstreamCommits).toEqual(fixture.upstreamCommits);
+  }, 30_000);
+
+  test("attributes prefix-related conflict paths to their exact classes", () => {
+    const fixture = createPrefixConflictFixture();
+    const inventory = generateSyncInventory({
+      repo: fixture.repo,
+      forkParent: fixture.fork,
+      requiredAncestors: [fixture.base],
+      target: fixture.target,
+      canonicalTag: fixture.tag,
+    });
+
+    expect(inventory.expected.conflicts).toEqual([
+      { path: "one.txt", conflictClass: "content" },
+      { path: "one.txt.extra", conflictClass: "modify/delete" },
+    ]);
+  }, 30_000);
+
+  test("derives conflicts from projected trees without reading excluded blobs", () => {
+    const fixture = createProjectionFixture();
+    for (const objectId of fixture.excludedObjects) {
+      removeLooseObject(fixture.repo, objectId);
+    }
+
+    const inventory = generateSyncInventory({
+      repo: fixture.repo,
+      forkParent: fixture.fork,
+      requiredAncestors: [fixture.base],
+      target: fixture.target,
+      canonicalTag: fixture.tag,
+      trackingIssue: 338,
+    });
+    const proof = inventory.derivation as unknown as {
+      exclusions: string[];
+      exclusionsSha256: string;
+      originalTrees: Record<string, string>;
+      projectedTrees: Record<string, string>;
+      retainedEntriesSha256: Record<string, string>;
+    };
+
+    expect(inventory.schemaVersion).toBe(3);
+    expect(inventory.trackingIssue).toBe(338);
+    expect(proof.exclusions).toEqual(CANONICAL_EXCLUSIONS);
+    expect(proof.exclusionsSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(Object.keys(proof.originalTrees).sort()).toEqual([
+      "base",
+      "fork",
+      "target",
+    ]);
+    expect(Object.keys(proof.projectedTrees).sort()).toEqual([
+      "base",
+      "fork",
+      "target",
+    ]);
+    expect(Object.values(proof.retainedEntriesSha256)).toEqual([
+      expect.stringMatching(/^[0-9a-f]{64}$/),
+      expect.stringMatching(/^[0-9a-f]{64}$/),
+      expect.stringMatching(/^[0-9a-f]{64}$/),
+    ]);
+    expect(JSON.stringify(inventory.expected)).not.toContain(EXCLUDED_PATH);
+    expect(inventory.expected.conflicts).toContainEqual({
+      path: "content.txt",
+      conflictClass: "content",
+    });
+    expect(
+      inventory.expected.conflicts.some((entry) =>
+        entry.path.startsWith("shape"),
+      ),
+    ).toBe(true);
+    expect(
+      inventory.expected.conflicts.some((entry) =>
+        entry.path.includes("rename-target"),
+      ),
+    ).toBe(true);
+    expect(renderLedger(inventory)).toStartWith(
+      "# Issue #338 — v-test Resolution Ledger",
+    );
+    expect(() =>
+      validateSyncInventory(inventory, renderLedger(inventory), {
+        repo: fixture.repo,
+      }),
+    ).not.toThrow();
+  }, 30_000);
+
+  test("rejects changed exclusion policy and tampered immutable projection proofs", () => {
+    const fixture = createMergeFixture();
+    const inventory = generateSyncInventory({
+      repo: fixture.repo,
+      forkParent: fixture.fork,
+      requiredAncestors: [fixture.base],
+      target: fixture.target,
+      canonicalTag: fixture.tag,
+      trackingIssue: 338,
+    });
+
+    for (const mutate of [
+      (value: SyncInventory) => {
+        const derivation = value.derivation as unknown as {
+          exclusions: string[];
+        };
+        derivation.exclusions = derivation.exclusions.slice(1);
+      },
+      (value: SyncInventory) => {
+        const derivation = value.derivation as unknown as {
+          exclusions: string[];
+        };
+        derivation.exclusions = ["../unsafe"];
+      },
+      (value: SyncInventory) => {
+        const derivation = value.derivation as unknown as {
+          projectedTrees: { fork: string };
+        };
+        derivation.projectedTrees.fork = SHA_A;
+      },
+      (value: SyncInventory) => {
+        const derivation = value.derivation as unknown as {
+          retainedEntriesSha256: { target: string };
+        };
+        derivation.retainedEntriesSha256.target = "0".repeat(64);
+      },
+    ]) {
+      const tampered = clone(inventory);
+      mutate(tampered);
+      expect(() =>
+        validateSyncInventory(tampered, renderLedger(tampered), {
+          repo: fixture.repo,
+        }),
+      ).toThrow(/exclusion|projection|derivation contract|Git evidence/);
+    }
+  }, 30_000);
+
+  test.each([
+    "addition",
+    "removal",
+    "rename",
+    "mode",
+    "object",
+  ] as const)(
+    "rejects an excluded-entry %s in the integration tree",
+    (mutation) => {
+      const fixture = createExcludedTopologyFixture(mutation);
+      const inventory = finalTopologyInventory(fixture);
+
+      expect(() =>
+        validateSyncInventory(inventory, renderLedger(inventory), {
+          repo: fixture.repo,
+          observedRerereApplications: [],
+        }),
+      ).toThrow(/excluded entry parity.*integration commit/);
+    },
+    30_000,
+  );
+
+  test("checks excluded-entry parity again at the reviewed descendant", () => {
+    const fixture = createExcludedTopologyFixture();
+    const inventory = finalTopologyInventory(fixture);
 
     expect(() =>
       validateSyncInventory(inventory, renderLedger(inventory), {
         repo: fixture.repo,
         observedRerereApplications: [],
       }),
-    ).toThrow(/exact ordered parents.*forkParent.*target/);
+    ).not.toThrow();
+
+    write(fixture.repo, EXCLUDED_PATH, "post-integration replacement\n");
+    commitAll(fixture.repo, "change excluded entry after integration");
+    expect(() =>
+      validateSyncInventory(inventory, renderLedger(inventory), {
+        repo: fixture.repo,
+        observedRerereApplications: [],
+      }),
+    ).toThrow(/excluded entry parity.*reviewed ref/);
   }, 30_000);
 });
