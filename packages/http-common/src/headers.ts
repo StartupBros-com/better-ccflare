@@ -18,6 +18,53 @@ export const GUARD_CORRELATION_SECRET_HEADER =
 export const CODEX_LOGICAL_MODEL_FAMILY_HEADER =
 	"x-better-ccflare-logical-model-family" as const;
 
+const CLIENT_FORWARDING_HEADER_EXACT_NAMES = [
+	"cookie",
+	"cdn-loop",
+	"forwarded",
+	"x-real-ip",
+] as const;
+const CLIENT_FORWARDING_HEADER_PREFIXES = ["cf-", "x-forwarded-"] as const;
+
+/**
+ * Strips a CLIENT's own Cookie, CDN-Loop, Forwarded, X-Real-IP, and any
+ * header prefixed "cf-" or "x-forwarded-" before a request is dispatched to
+ * an upstream provider. These describe (or claim to describe) the network path the
+ * request took to reach this proxy -- they are meaningless to, and none of
+ * this proxy's business to relay to, the upstream API. Left unstripped they
+ * leak the client's session cookies and apparent network topology straight
+ * through the proxy.
+ *
+ * Callers that also inject their own outbound values under one of these
+ * names (e.g. the Codex chatgpt.com Cloudflare-clearance cookie jar) MUST
+ * call this before that injection, never after: this only removes what
+ * arrived with the inbound request, so it can never clobber something the
+ * proxy itself adds afterward, but calling it in the other order would
+ * strip the proxy's own value too.
+ *
+ * This is a genuine physical-dispatch boundary function: call it at every
+ * place a request headers set is about to leave the process for a real
+ * network write (an HTTP fetch or a WebSocket handshake), not once per
+ * provider -- a provider-specific header-preparation step upstream of that
+ * boundary can be bypassed by a retry/failover path that rebuilds headers
+ * from the original request.
+ */
+export function stripClientForwardingHeaders(headers: Headers): void {
+	for (const name of CLIENT_FORWARDING_HEADER_EXACT_NAMES) {
+		headers.delete(name);
+	}
+	for (const key of [...headers.keys()]) {
+		const lower = key.toLowerCase();
+		if (
+			CLIENT_FORWARDING_HEADER_PREFIXES.some((prefix) =>
+				lower.startsWith(prefix),
+			)
+		) {
+			headers.delete(key);
+		}
+	}
+}
+
 /**
  * Sanitizes proxy headers by removing hop-by-hop headers that should not be forwarded
  * after Bun has automatically decompressed the response body, and reserved,

@@ -1,3 +1,4 @@
+import { stripClientForwardingHeaders } from "@better-ccflare/http-common";
 import {
 	CODEX_RESPONSES_HTTP_URL,
 	type CodexWebSocketFactory,
@@ -9,13 +10,17 @@ import {
 const RESPONSES_WEBSOCKET_BETA = "responses_websockets=2026-02-06";
 const SSE_ENCODER = new TextEncoder();
 
+// Cookie is handled by the shared stripClientForwardingHeaders() call below
+// (which also covers X-Real-IP/Forwarded/CDN-Loop/CF-*/X-Forwarded-*), not
+// listed here, to keep that one list as the single source of truth for
+// client-forwarding-header names shared with the HTTP fetch choke point in
+// packages/proxy/src/handlers/request-handler.ts.
 const STRIPPED_HANDSHAKE_HEADERS = new Set([
 	"accept-encoding",
 	"connection",
 	"content-encoding",
 	"content-length",
 	"content-type",
-	"cookie",
 	"host",
 	"keep-alive",
 	"proxy-authenticate",
@@ -132,6 +137,11 @@ export function buildCodexWebSocketHandshakeHeaders(
 			headers.delete(name);
 		}
 	}
+	// Strip before the Cloudflare-cookie injection below, not after: the
+	// client's own Cookie must be gone before applyCloudflareCookies adds the
+	// fork's allowlisted cookie, so a client-forged cookie can never survive a
+	// merge into the outgoing handshake header.
+	stripClientForwardingHeaders(headers);
 	headers.set("openai-beta", RESPONSES_WEBSOCKET_BETA);
 	applyCloudflareCookies(CODEX_RESPONSES_HTTP_URL, headers);
 	return headers;

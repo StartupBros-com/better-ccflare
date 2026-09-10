@@ -7,6 +7,7 @@ import {
 import {
 	GUARD_CORRELATION_SECRET_HEADER,
 	GUARD_REQUEST_ID_HEADER,
+	stripClientForwardingHeaders,
 } from "@better-ccflare/http-common";
 import type { Provider } from "@better-ccflare/providers";
 import { registerResponseDrainTransport } from "@better-ccflare/providers/stream-drain";
@@ -156,6 +157,11 @@ export async function makeProxyRequest(
 			const targetUrl = target.url;
 			const mutableHeaders = new Headers(target.headers);
 			stripInternalControlHeaders(mutableHeaders);
+			// Strip the CLIENT's own Cookie/CDN-Loop/Forwarded/X-Real-IP/CF-*/
+			// X-Forwarded-* headers before any provider-owned cookie injection
+			// below, so the fork's own Cloudflare clearance cookie is added to a
+			// clean header set rather than merged with a client-forged one.
+			stripClientForwardingHeaders(mutableHeaders);
 			chatGptCloudflareCookieJar.applyCookieHeader(targetUrl, mutableHeaders);
 
 			const response = await fetch(
@@ -171,6 +177,9 @@ export async function makeProxyRequest(
 
 		const mutableHeaders = new Headers(headers);
 		stripInternalControlHeaders(mutableHeaders);
+		// See the matching comment in the Request-target branch above: strip
+		// before the jar injects its own cookie, not after.
+		stripClientForwardingHeaders(mutableHeaders);
 		chatGptCloudflareCookieJar.applyCookieHeader(target, mutableHeaders);
 
 		const response = await fetch(target, {
