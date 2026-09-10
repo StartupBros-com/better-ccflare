@@ -734,6 +734,15 @@ export OPENAI_COMPATIBLE_MODEL_MAPPINGS='{
 }'
 ```
 
+### Model Discovery
+
+Beyond the static mapping table above, better-ccflare can ask an OpenAI-compatible endpoint what models it actually serves, at two different points in an account's lifecycle:
+
+- **Before the account is saved** — the add-account wizard's "Discover models" step calls `POST /api/models/preview` with the credential/endpoint pair the user just typed in, before anything is persisted. This is a one-shot check: it shares no cache or state with the saved-account path below, grants no routing eligibility, and creates nothing. See [`POST /api/models/preview`](api-http.md#post-apimodelspreview).
+- **After the account is saved** — `GET /api/models?provider=openai-compatible&accountId=<id>` returns that account's own live listing, each entry tagged `source: "account"` to distinguish it from the built-in/reference model lists `GET /api/models?provider=<name>` (no `accountId`) falls back to for other providers. See [`GET /api/models`](api-http.md#get-apimodels) for the full scoped-query reference, including the equivalent `provider=codex` listing.
+
+Both paths call the same underlying OpenAI-compatible `/models` discovery, but through independent code paths (`fetchOpenAICompatibleModelsPreview` for the unsaved case) — a successful preview result is not capability evidence for a saved account, and vice versa.
+
 ### Usage Examples
 
 **OpenRouter:**

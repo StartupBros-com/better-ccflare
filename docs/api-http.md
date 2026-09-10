@@ -1218,6 +1218,53 @@ Return the cached Anthropic model catalog used to populate model dropdowns (dash
 curl http://localhost:8080/api/models
 ```
 
+##### Scoped queries: `?provider=` and `&accountId=`
+
+Without a `provider`/`accountId` query, `GET /api/models` returns exactly the unscoped Anthropic catalog above, unchanged for existing callers. Adding either query switches to an entitlement-aware response tagged with where each model id came from (`ModelListingSource`: `builtin` — ccflare's own compiled table for that provider; `catalog` — the live Anthropic catalog; `reference` — the public models.dev listing, which proves a model exists but not that a given account's plan may call it; `account` — the account's own live listing, the only source that distinguishes an entitled model from one the plan does not reach).
+
+- **`?provider=codex&accountId=<id>`** — the Codex account's own model listing (`chatgpt.com/backend-api/codex/models`), each entry additionally carrying `description`, `contextWindow`, `maxContextWindow`, `effectiveContextPercent`, and `supersededBy`. If the account cannot read its own listing, the response falls back to another account of the same provider and sets `source: "shared"` with a `warning` explaining that accounts on different plans can differ.
+- **`?provider=openai-compatible&accountId=<id>`** — the saved OpenAI-compatible account's own live model listing (see [Model Discovery](providers.md#model-discovery) in the provider guide).
+- **`?accountId=<id>`** alone, or an `accountId`/`provider` combination with no account-specific discovery path, returns `{"models": [], "source": "unavailable", "warning": "..."}` rather than erroring.
+- **Any other `provider=<name>`** (no `accountId`) returns the union of ccflare's built-in model list for that provider and the public models.dev catalogue, deduplicated by id with the stronger (`builtin`) marking winning; a failed or unavailable catalogue fetch degrades to the builtin list plus a `warning` rather than failing the request.
+
+**Example:**
+```bash
+curl "http://localhost:8080/api/models?provider=openai-compatible&accountId=<account-id>"
+```
+
+#### POST /api/models/preview
+
+List the models one **unsaved** OpenAI-compatible credential/endpoint pair can call, without persisting an account — the discovery step in the add-account wizard, used before a "Discover models" click has anything saved to query by `accountId`. The caller supplies `apiKey`/`endpoint` directly in the request body; this path shares no cache, state, or routing-default plumbing with the saved-account discovery above, and a successful call grants no routing eligibility and creates nothing.
+
+**Request:**
+```json
+{
+  "apiKey": "sk-...",
+  "endpoint": "https://openrouter.ai/api/v1"
+}
+```
+
+**Response:**
+```json
+{
+  "provider": "openai-compatible",
+  "source": "preview",
+  "models": [
+    { "id": "some-model", "displayName": "Some Model", "source": "preview" }
+  ],
+  "fetchedAt": 1751270400000
+}
+```
+
+On a discovery failure (invalid credential, unreachable endpoint, non-JSON response) this returns `502` with a redacted error message — credentials and raw upstream response bodies are never forwarded in the error.
+
+**Example:**
+```bash
+curl -X POST http://localhost:8080/api/models/preview \
+  -H "Content-Type: application/json" \
+  -d '{"apiKey":"sk-...","endpoint":"https://openrouter.ai/api/v1"}'
+```
+
 #### POST /api/models/refresh
 
 Force an immediate live model catalog refresh, bypassing the scheduled interval. Prefers a console/API-key account but falls back to an OAuth account if `BETTER_CCFLARE_MODELS_OAUTH_REFRESH` (or the equivalent config toggle) is enabled. Never throws — always returns `200` with the outcome, even on failure (e.g. no eligible account, network error).

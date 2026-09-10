@@ -37,6 +37,8 @@ The strategy is selected with `LB_STRATEGY`, the `lb_strategy` configuration key
 
 For Anthropic OAuth accounts, prefer `session`, `session-affinity`, or the opt-in `session-drain-soonest`. These preserve natural account stickiness. `least-used` intentionally spreads requests and may trigger provider anti-abuse controls when used with OAuth credentials.
 
+**Dashboard exposure**: the dashboard's strategy selector deliberately offers only `session` and its `session-drain-soonest`/`session-drain-soonest-strict` variants — `least-used` and `session-affinity` are per-request spreading strategies that can trip provider anti-abuse systems, so they are excluded from the dropdown even though both remain fully supported via `LB_STRATEGY`, the config file, or the HTTP configuration endpoint. If either is already active (set out-of-band), the dashboard shows it as a disabled "(current)" entry rather than silently switching away from it. (Source: `packages/dashboard-web/src/components/overview/RoutingCard.tsx`.)
+
 ## Session-Based Strategy
 
 **Description**: Maintains one sticky session with an individual account for a configurable duration (default: 5 hours). This is the default strategy and is designed to minimize account switching and reduce the likelihood of hitting rate limits.
