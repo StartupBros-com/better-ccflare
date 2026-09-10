@@ -184,6 +184,7 @@ function request(
 		bodyMarker?: string;
 		url?: string;
 		stream?: boolean;
+		extraHeaders?: Record<string, string>;
 	} = {},
 ): Request {
 	return new Request(
@@ -202,6 +203,7 @@ function request(
 				version: "0.144.4",
 				"x-codex-turn-state": "must-not-leak-turn-state",
 				"x-test-conversation-key": opts.cacheKey ?? "private-cache-key",
+				...opts.extraHeaders,
 			},
 			body: JSON.stringify({
 				type: "must-not-override-response-create",
@@ -601,6 +603,59 @@ describe("CodexWebSocketTransport wire contract", () => {
 				fallbackReason: null,
 			}),
 		);
+	});
+
+	/**
+	 * Same confirmed finding as the HTTP fetch path (see
+	 * request-handler-strip-headers.test.ts): a client's own X-Real-IP,
+	 * Forwarded, CDN-Loop, CF-* and X-Forwarded-* headers must not reach the
+	 * Codex WebSocket handshake either -- this is a second, independent
+	 * physical-dispatch boundary for the same upstream that the HTTP-fetch
+	 * choke point (stripInternalControlHeaders/makeProxyRequest) never sees.
+	 */
+	test("strips client-supplied forwarding headers from the WebSocket handshake", async () => {
+		enableCanary();
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) =>
+					queueMicrotask(() => {
+						ws.emitJson({ type: "response.created", response: { id: "r1" } });
+						ws.emitJson({ type: "response.completed", response: { id: "r1" } });
+					});
+			},
+		});
+		await attempt(
+			h.transport,
+			request({
+				extraHeaders: {
+					"x-real-ip": "203.0.113.9",
+					forwarded: "for=203.0.113.9;proto=https",
+					"cdn-loop": "cloudflare",
+					"cf-connecting-ip": "203.0.113.9",
+					"cf-ipcountry": "US",
+					"x-forwarded-for": "203.0.113.9",
+					"x-forwarded-proto": "https",
+				},
+			}),
+		);
+
+		const headers = new Headers(h.connections[0].options.headers);
+		for (const name of [
+			"x-real-ip",
+			"forwarded",
+			"cdn-loop",
+			"cf-connecting-ip",
+			"cf-ipcountry",
+			"x-forwarded-for",
+			"x-forwarded-proto",
+		]) {
+			expect(headers.has(name)).toBe(false);
+		}
+		// The fork's own Cloudflare-clearance cookie injection must still work
+		// on this transport after the strip.
+		expect(headers.get("cookie")).toBe("__cf_bm=current-cloudflare-cookie");
+		// Unrelated required headers are still present.
+		expect(headers.get("authorization")).toBe("Bearer secret-access-token");
 	});
 
 	test("rejects non-exact subscription URLs, non-streaming, and non-POST requests", async () => {
