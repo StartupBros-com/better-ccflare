@@ -263,10 +263,10 @@ export function updateAccountMetadata(
 				ctx.asyncWriter.enqueue(() =>
 					ctx.dbOps
 						.getAdapter()
-						.run("UPDATE accounts SET rate_limit_reset = ? WHERE id = ?", [
-							earliestReset,
-							account.id,
-						]),
+						.run(
+							"UPDATE accounts SET rate_limit_reset = ?, rate_limit_reset_at = ? WHERE id = ?",
+							[earliestReset, Date.now(), account.id],
+						),
 				);
 			}
 

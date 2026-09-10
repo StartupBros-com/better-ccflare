@@ -29,7 +29,7 @@ describe("persistForwardOnlyCodexRateLimitReset", () => {
 		const sqlite = new Database(":memory:");
 		const db = new BunSqlAdapter(sqlite);
 		sqlite.run(
-			"CREATE TABLE accounts (id TEXT PRIMARY KEY, rate_limit_reset INTEGER)",
+			"CREATE TABLE accounts (id TEXT PRIMARY KEY, rate_limit_reset INTEGER, rate_limit_reset_at INTEGER)",
 		);
 		sqlite.run("INSERT INTO accounts (id, rate_limit_reset) VALUES (?, ?)", [
 			"acct-forward",

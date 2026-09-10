@@ -524,6 +524,7 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			session_request_count INTEGER DEFAULT 0,
 			paused INTEGER DEFAULT 0,
 			rate_limit_reset BIGINT,
+			rate_limit_reset_at BIGINT,
 			rate_limit_status TEXT,
 			rate_limit_remaining INTEGER,
 			auto_fallback_enabled INTEGER DEFAULT 0,
@@ -1311,6 +1312,7 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 			   rate_limited_until = (SELECT MAX(COALESCE(rate_limited_until, 0)) FROM accounts ${PG_GROUP_SCOPE}),
 			   session_start = (SELECT MAX(COALESCE(session_start, 0)) FROM accounts ${PG_GROUP_SCOPE}),
 			   rate_limit_reset = (SELECT MAX(COALESCE(rate_limit_reset, 0)) FROM accounts ${PG_GROUP_SCOPE}),
+			   rate_limit_reset_at = (SELECT MAX(COALESCE(rate_limit_reset_at, 0)) FROM accounts ${PG_GROUP_SCOPE}),
 			   rate_limited_at = (SELECT MAX(COALESCE(rate_limited_at, 0)) FROM accounts ${PG_GROUP_SCOPE}),
 			   auto_fallback_enabled = (SELECT MAX(COALESCE(auto_fallback_enabled, 0)) FROM accounts ${PG_GROUP_SCOPE}),
 			   auto_refresh_enabled = (SELECT MAX(COALESCE(auto_refresh_enabled, 0)) FROM accounts ${PG_GROUP_SCOPE}),
@@ -1555,6 +1557,11 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			table: "accounts",
 			column: "rate_limited_at",
 			definition: "ALTER TABLE accounts ADD COLUMN rate_limited_at BIGINT",
+		},
+		{
+			table: "accounts",
+			column: "rate_limit_reset_at",
+			definition: "ALTER TABLE accounts ADD COLUMN rate_limit_reset_at BIGINT",
 		},
 		{
 			table: "accounts",

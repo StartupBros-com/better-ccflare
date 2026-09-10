@@ -356,9 +356,40 @@ export class AccountRepository extends BaseRepository<Account> {
 		remaining?: number | null,
 	): Promise<void> {
 		await this.run(
-			`UPDATE accounts SET rate_limit_status = ?, rate_limit_reset = ?, rate_limit_remaining = ? WHERE id = ?`,
-			[status, reset, remaining ?? null, accountId],
+			`UPDATE accounts SET rate_limit_status = ?, rate_limit_reset = ?, rate_limit_reset_at = ?, rate_limit_remaining = ? WHERE id = ?`,
+			[
+				status,
+				reset,
+				reset !== null ? Date.now() : null,
+				remaining ?? null,
+				accountId,
+			],
 		);
+	}
+
+	/**
+	 * Compare-and-clear a stale reset without clobbering a newer write or a
+	 * replacement account generation. Legacy rows with no write stamp remain
+	 * eligible; same-millisecond and later writes are deliberately preserved.
+	 */
+	async clearStaleRateLimitReset(
+		accountId: string,
+		expectedReset: number,
+		observedAt: number,
+		expectedCreatedAt: number,
+	): Promise<boolean> {
+		const changes = await this.runWithChanges(
+			`UPDATE accounts
+			 SET rate_limit_status = 'allowed',
+			     rate_limit_reset = NULL,
+			     rate_limit_reset_at = NULL
+			 WHERE id = ?
+			   AND created_at = ?
+			   AND rate_limit_reset = ?
+			   AND (rate_limit_reset_at IS NULL OR rate_limit_reset_at < ?)`,
+			[accountId, expectedCreatedAt, expectedReset, observedAt],
+		);
+		return changes > 0;
 	}
 
 	async clearRateLimitState(
@@ -378,6 +409,7 @@ export class AccountRepository extends BaseRepository<Account> {
 			 	rate_limited_reason = NULL,
 			 	rate_limited_at = NULL,
 			 	rate_limit_reset = NULL,
+			 	rate_limit_reset_at = NULL,
 			 	rate_limit_status = NULL,
 				rate_limit_remaining = NULL,
 				consecutive_rate_limits = 0

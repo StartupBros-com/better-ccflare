@@ -411,6 +411,8 @@ export function ensureSchema(db: Database): void {
 			request_count INTEGER DEFAULT 0,
 			total_requests INTEGER DEFAULT 0,
 			priority INTEGER DEFAULT 0,
+			rate_limit_reset INTEGER,
+			rate_limit_reset_at INTEGER,
 			consecutive_rate_limits INTEGER NOT NULL DEFAULT 0,
 			requires_reauth INTEGER DEFAULT 0
 		)
@@ -1119,6 +1121,7 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 		   rate_limited_until = ${agg("MAX", "rate_limited_until")},
 		   session_start = ${agg("MAX", "session_start")},
 		   rate_limit_reset = ${agg("MAX", "rate_limit_reset")},
+		   rate_limit_reset_at = ${agg("MAX", "rate_limit_reset_at")},
 		   paused = ${agg("MAX", "paused")},
 		   requires_reauth = ${agg("MAX", "requires_reauth")},
 		   rate_limited_at = ${agg("MAX", "rate_limited_at")},
@@ -1877,6 +1880,15 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			log.info("Added rate_limit_reset column to accounts table");
 		}
 
+		// Track when rate_limit_reset was last written so stale-clear guards can
+		// distinguish legacy (pre-column) state from a concurrent reset write.
+		if (!initialAccountsColumnNames.includes("rate_limit_reset_at")) {
+			db.prepare(
+				"ALTER TABLE accounts ADD COLUMN rate_limit_reset_at INTEGER",
+			).run();
+			log.info("Added rate_limit_reset_at column to accounts table");
+		}
+
 		// Add rate_limit_status column if it doesn't exist
 		if (!initialAccountsColumnNames.includes("rate_limit_status")) {
 			db.prepare(
@@ -2046,6 +2058,7 @@ export function runMigrations(db: Database, dbPath?: string): void {
 					session_request_count INTEGER DEFAULT 0,
 					paused INTEGER DEFAULT 0,
 					rate_limit_reset INTEGER,
+					rate_limit_reset_at INTEGER,
 					rate_limit_status TEXT,
 					rate_limit_remaining INTEGER,
 					auto_fallback_enabled INTEGER DEFAULT 0,
@@ -2069,7 +2082,7 @@ export function runMigrations(db: Database, dbPath?: string): void {
 					expires_at, created_at, last_used,
 					request_count, total_requests, priority,
 					rate_limited_until, session_start, session_request_count,
-					paused, rate_limit_reset, rate_limit_status, rate_limit_remaining,
+					paused, rate_limit_reset, rate_limit_reset_at, rate_limit_status, rate_limit_remaining,
 					auto_fallback_enabled, custom_endpoint, auto_refresh_enabled,
 					model_mappings, cross_region_mode, model_fallbacks,
 					auto_pause_on_overage_enabled, pause_reason, requires_reauth
@@ -2404,7 +2417,7 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			SELECT id, name, provider, api_key, refresh_token, access_token, expires_at,
 			       created_at, last_used, request_count, total_requests, priority,
 			       rate_limited_until, session_start, session_request_count, paused,
-			       rate_limit_reset, rate_limit_status, rate_limit_remaining,
+			       rate_limit_reset, rate_limit_reset_at, rate_limit_status, rate_limit_remaining,
 			       auto_fallback_enabled, custom_endpoint, auto_refresh_enabled, model_mappings,
 			       cross_region_mode, model_fallbacks, billing_type, auto_pause_on_overage_enabled,
 			       pause_reason, requires_reauth
