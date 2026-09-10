@@ -2,10 +2,15 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { Config } from "@better-ccflare/config";
-import { alertEvents, authFailureEvents } from "@better-ccflare/core";
+import {
+	alertEvents,
+	authFailureEvents,
+	requestEvents,
+} from "@better-ccflare/core";
 import type { BunSqlAdapter as BunSqlAdapterType } from "@better-ccflare/database";
 import { BunSqlAdapter, ensureSchema } from "@better-ccflare/database";
-import type { RequestResponse } from "@better-ccflare/types";
+import { logBus } from "@better-ccflare/logger";
+import type { LogEvent, RequestResponse } from "@better-ccflare/types";
 import { AlertService } from "../alerts";
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -19,6 +24,9 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 function makeConfig(
 	overrides: Partial<{
 		requestTokens: number;
+		tokensPerHour: number;
+		anomalyEnabled: boolean;
+		anomalyIntervalMinutes: number;
 		webhookUrl: string;
 	}> = {},
 ): Config {
@@ -30,11 +38,12 @@ function makeConfig(
 	const store = new Map<string, string | number | boolean>();
 	return Object.assign(new EventEmitter(), {
 		getAlertDailySpendUsd: () => 0,
-		getAlertTokensPerHour: () => 0,
+		getAlertTokensPerHour: () => overrides.tokensPerHour ?? 0,
 		getAlertRequestTokens: () => overrides.requestTokens ?? 0,
 		getAlertUsageWindowThresholdPercent: () => 0,
-		getAlertAnomalyEnabled: () => false,
-		getAlertAnomalyIntervalMinutes: () => 15,
+		getAlertAnomalyEnabled: () => overrides.anomalyEnabled ?? false,
+		getAlertAnomalyIntervalMinutes: () =>
+			overrides.anomalyIntervalMinutes ?? 15,
 		getAlertAnomalyBaselineWindowMinutes: () => 1440,
 		getAlertAnomalyLoopMinRequests: () => 25,
 		getAlertCooldownMinutes: () => 60,
@@ -342,6 +351,244 @@ describe("AlertService persistAndEmit (issue #326)", () => {
 			service.stop();
 			alertEvents.off("event", emitted);
 			process.off("unhandledRejection", unhandledRejection);
+		}
+	});
+});
+
+class RecoveringPgAdapter implements BunSqlAdapterType {
+	readonly isSQLite = false;
+	failAggregate = true;
+	failAnomaly = true;
+	getCalls = 0;
+	queryCalls = 0;
+	writeAttempts = 0;
+
+	async get<T>(_sql: string, _params?: unknown[]): Promise<T | null> {
+		this.getCalls++;
+		if (this.failAggregate) {
+			throw new Error("PG query timeout after 8000ms: SELECT SUM(...)");
+		}
+		return null;
+	}
+
+	async query<T>(_sql: string, _params?: unknown[]): Promise<T[]> {
+		this.queryCalls++;
+		if (this.failAnomaly) {
+			throw new Error("PG query timeout after 8000ms: SELECT requests");
+		}
+		return [];
+	}
+
+	async run(_sql: string, _params?: unknown[]): Promise<void> {}
+
+	async runWithChanges(
+		_sql: string,
+		_params?: unknown[],
+	): Promise<number> {
+		this.writeAttempts++;
+		return 1;
+	}
+}
+
+function highTokenRequest(id: string): RequestResponse {
+	return {
+		id,
+		timestamp: new Date().toISOString(),
+		method: "POST",
+		path: "/v1/messages",
+		accountUsed: "account-1",
+		statusCode: 200,
+		success: true,
+		errorMessage: null,
+		responseTimeMs: 100,
+		failoverAttempts: 0,
+		model: "claude-3",
+		totalTokens: 10,
+		inputTokens: 10,
+		cacheReadInputTokens: 0,
+		cacheCreationInputTokens: 0,
+		outputTokens: 0,
+		costUsd: 0,
+		project: null,
+	};
+}
+
+describe("AlertService fire-and-forget failures", () => {
+	let unhandled: unknown[];
+	let unhandledListener: (reason: unknown) => void;
+	let logs: LogEvent[];
+	let logListener: (event: LogEvent) => void;
+
+	beforeEach(() => {
+		unhandled = [];
+		unhandledListener = (reason) => unhandled.push(reason);
+		process.on("unhandledRejection", unhandledListener);
+		logs = [];
+		logListener = (event) => logs.push(event);
+		logBus.on("log", logListener);
+	});
+
+	afterEach(() => {
+		process.off("unhandledRejection", unhandledListener);
+		logBus.off("log", logListener);
+	});
+
+	it("logs a request aggregate rejection and processes a later summary", async () => {
+		const adapter = new RecoveringPgAdapter();
+		const service = new AlertService(
+			adapter,
+			makeConfig({ requestTokens: 1, tokensPerHour: 1, webhookUrl: "" }),
+		);
+		const emitted = mock((_event: unknown) => undefined);
+		alertEvents.on("event", emitted);
+		service.start();
+		try {
+			requestEvents.emit("event", {
+				type: "summary",
+				payload: highTokenRequest("request-times-out"),
+			});
+			await waitFor(() => unhandled.length > 0 || logs.length > 0);
+
+			expect(unhandled).toHaveLength(0);
+			expect(
+				logs.some(
+					(event) =>
+						event.level === "ERROR" &&
+						event.msg.includes("request-times-out") &&
+						event.msg.includes("PG query timeout"),
+				),
+			).toBe(true);
+
+			adapter.failAggregate = false;
+			requestEvents.emit("event", {
+				type: "summary",
+				payload: highTokenRequest("request-recovers"),
+			});
+			await waitFor(() => adapter.writeAttempts === 1);
+			expect(emitted).toHaveBeenCalledTimes(1);
+		} finally {
+			service.stop();
+			alertEvents.off("event", emitted);
+		}
+	});
+
+	it("catches the real registered anomaly timer callback and restarts cleanly", async () => {
+		const adapter = new RecoveringPgAdapter();
+		const originalSetInterval = globalThis.setInterval;
+		const originalClearInterval = globalThis.clearInterval;
+		const callbacks: Array<() => void> = [];
+		const handles: object[] = [];
+		const cleared: unknown[] = [];
+		globalThis.setInterval = ((callback: () => void) => {
+			callbacks.push(callback);
+			const handle = {};
+			handles.push(handle);
+			return handle;
+		}) as unknown as typeof setInterval;
+		globalThis.clearInterval = ((handle: unknown) => {
+			cleared.push(handle);
+		}) as unknown as typeof clearInterval;
+		const requestListenersBefore = requestEvents.listenerCount("event");
+		const authListenersBefore = authFailureEvents.listenerCount("event");
+		const service = new AlertService(
+			adapter,
+			makeConfig({ anomalyEnabled: true, webhookUrl: "" }),
+		);
+		try {
+			service.start();
+			expect(callbacks).toHaveLength(1);
+			expect(requestEvents.listenerCount("event")).toBe(
+				requestListenersBefore + 1,
+			);
+			expect(authFailureEvents.listenerCount("event")).toBe(
+				authListenersBefore + 1,
+			);
+
+			callbacks[0]?.();
+			await waitFor(() => unhandled.length > 0 || logs.length > 0);
+			expect(unhandled).toHaveLength(0);
+			expect(
+				logs.some(
+					(event) =>
+						event.level === "ERROR" &&
+						event.msg.includes("Anomaly evaluation failed") &&
+						event.msg.includes("PG query timeout"),
+				),
+			).toBe(true);
+
+			adapter.failAnomaly = false;
+			callbacks[0]?.();
+			await waitFor(() => adapter.queryCalls === 2);
+
+			service.stop();
+			expect(cleared).toEqual([handles[0]]);
+			expect(requestEvents.listenerCount("event")).toBe(
+				requestListenersBefore,
+			);
+			expect(authFailureEvents.listenerCount("event")).toBe(
+				authListenersBefore,
+			);
+
+			service.start();
+			expect(callbacks).toHaveLength(2);
+			expect(requestEvents.listenerCount("event")).toBe(
+				requestListenersBefore + 1,
+			);
+			expect(authFailureEvents.listenerCount("event")).toBe(
+				authListenersBefore + 1,
+			);
+			callbacks[1]?.();
+			await waitFor(() => adapter.queryCalls === 3);
+		} finally {
+			service.stop();
+			globalThis.setInterval = originalSetInterval;
+			globalThis.clearInterval = originalClearInterval;
+		}
+	});
+
+	it("logs an auth-failure cooldown lookup rejection and handles the next event", async () => {
+		const adapter = new RecoveringPgAdapter();
+		const config = makeConfig({ webhookUrl: "" });
+		let failCooldownLookup = false;
+		config.getAlertCooldownMinutes = () => {
+			if (failCooldownLookup) throw new Error("cooldown lookup unavailable");
+			return 60;
+		};
+		const emitted = mock((_event: unknown) => undefined);
+		alertEvents.on("event", emitted);
+		const service = new AlertService(adapter, config);
+		service.start();
+		try {
+			failCooldownLookup = true;
+			authFailureEvents.emit("event", {
+				accountId: "account-auth",
+				accountName: "Auth account",
+				provider: "anthropic",
+				reason: "invalid_grant",
+			});
+			await waitFor(() => unhandled.length > 0 || logs.length > 0);
+			expect(unhandled).toHaveLength(0);
+			expect(
+				logs.some(
+					(event) =>
+						event.level === "ERROR" &&
+						event.msg.includes("account-auth") &&
+						event.msg.includes("cooldown lookup unavailable"),
+				),
+			).toBe(true);
+
+			failCooldownLookup = false;
+			authFailureEvents.emit("event", {
+				accountId: "account-auth-recovered",
+				accountName: "Recovered auth account",
+				provider: "anthropic",
+				reason: "invalid_grant",
+			});
+			await waitFor(() => adapter.writeAttempts === 1);
+			expect(emitted).toHaveBeenCalledTimes(1);
+		} finally {
+			service.stop();
+			alertEvents.off("event", emitted);
 		}
 	});
 });
