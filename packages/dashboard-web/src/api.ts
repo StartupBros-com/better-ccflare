@@ -1942,10 +1942,10 @@ class API extends HttpClient {
 		this.logger.debug(`→ POST ${url}`);
 
 		try {
-			const data = await this.post<OpenAICompatibleModelPreviewResponse>(
-				url,
-				{ apiKey, endpoint },
-			);
+			const data = await this.post<OpenAICompatibleModelPreviewResponse>(url, {
+				apiKey,
+				endpoint,
+			});
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return data;

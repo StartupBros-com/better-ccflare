@@ -184,9 +184,9 @@ describe("AccountAddForm provider contracts", () => {
 		);
 		const fetchEnd = source.indexOf("\n\tconst ", fetchStart + 1);
 		const handler = source.slice(fetchStart, fetchEnd);
-		expect(handler.match(/requestId !== previewRequestIdRef\.current/g)).toHaveLength(
-			2,
-		);
+		expect(
+			handler.match(/requestId !== previewRequestIdRef\.current/g),
+		).toHaveLength(2);
 	});
 
 	it("preserves free-text mappings and focus while adding preview suggestions", () => {

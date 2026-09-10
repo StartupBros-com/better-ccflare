@@ -4,7 +4,12 @@ import {
 	validateEndpointUrl,
 } from "@better-ccflare/core";
 import { ValidationError } from "@better-ccflare/errors";
-import { BadGateway, BadRequest, errorResponse, jsonResponse } from "@better-ccflare/http-common";
+import {
+	BadGateway,
+	BadRequest,
+	errorResponse,
+	jsonResponse,
+} from "@better-ccflare/http-common";
 import {
 	fetchOpenAICompatibleModelsPreview,
 	OpenAICompatibleModelDiscoveryError,
@@ -286,7 +291,10 @@ export function createModelsPreviewHandler() {
 		let apiKey: string;
 		let endpoint: string;
 		try {
-			const candidate = (body ?? {}) as { apiKey?: unknown; endpoint?: unknown };
+			const candidate = (body ?? {}) as {
+				apiKey?: unknown;
+				endpoint?: unknown;
+			};
 			apiKey = validateApiKey(candidate.apiKey, "apiKey");
 			endpoint = validateEndpointUrl(candidate.endpoint, "endpoint");
 		} catch (error) {

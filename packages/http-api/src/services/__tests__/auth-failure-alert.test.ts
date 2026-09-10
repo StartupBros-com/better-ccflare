@@ -381,10 +381,7 @@ class RecoveringPgAdapter implements BunSqlAdapterType {
 
 	async run(_sql: string, _params?: unknown[]): Promise<void> {}
 
-	async runWithChanges(
-		_sql: string,
-		_params?: unknown[],
-	): Promise<number> {
+	async runWithChanges(_sql: string, _params?: unknown[]): Promise<number> {
 		this.writeAttempts++;
 		return 1;
 	}
@@ -522,9 +519,7 @@ describe("AlertService fire-and-forget failures", () => {
 
 			service.stop();
 			expect(cleared).toEqual([handles[0]]);
-			expect(requestEvents.listenerCount("event")).toBe(
-				requestListenersBefore,
-			);
+			expect(requestEvents.listenerCount("event")).toBe(requestListenersBefore);
 			expect(authFailureEvents.listenerCount("event")).toBe(
 				authListenersBefore,
 			);

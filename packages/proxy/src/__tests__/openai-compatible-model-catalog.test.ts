@@ -468,9 +468,12 @@ describe("fetchOpenAICompatibleModelsPreview", () => {
 	it("returns isolated live models for each unsaved credential tuple", async () => {
 		const authorizations: string[] = [];
 		globalThis.fetch = (async (_input, init) => {
-			const authorization = new Headers(init?.headers).get("authorization") ?? "";
+			const authorization =
+				new Headers(init?.headers).get("authorization") ?? "";
 			authorizations.push(authorization);
-			const id = authorization.endsWith("first-key") ? "first-model" : "second-model";
+			const id = authorization.endsWith("first-key")
+				? "first-model"
+				: "second-model";
 			return new Response(JSON.stringify({ data: [{ id }] }));
 		}) as typeof globalThis.fetch;
 
@@ -508,7 +511,9 @@ describe("fetchOpenAICompatibleModelsPreview", () => {
 	it("redacts upstream error bodies and submitted credentials", async () => {
 		const secret = "preview-secret-key";
 		globalThis.fetch = (async () =>
-			new Response(`upstream leaked ${secret}`, { status: 401 })) as typeof fetch;
+			new Response(`upstream leaked ${secret}`, {
+				status: 401,
+			})) as typeof fetch;
 
 		try {
 			await fetchOpenAICompatibleModelsPreview(
@@ -538,7 +543,9 @@ describe("fetchOpenAICompatibleModelsPreview", () => {
 			},
 		});
 		globalThis.fetch = (async () =>
-			new Response(body, { headers: { "content-length": "1" } })) as typeof fetch;
+			new Response(body, {
+				headers: { "content-length": "1" },
+			})) as typeof fetch;
 
 		await expect(
 			fetchOpenAICompatibleModelsPreview(
@@ -597,7 +604,9 @@ describe("fetchOpenAICompatibleModelsPreview", () => {
 			OPENAI_COMPATIBLE_MODEL_MAX_ID_BYTES / 2 + 1,
 		);
 		globalThis.fetch = (async () =>
-			new Response(JSON.stringify({ data: [{ id: oversizedId }] }))) as typeof fetch;
+			new Response(
+				JSON.stringify({ data: [{ id: oversizedId }] }),
+			)) as typeof fetch;
 
 		await expect(
 			fetchOpenAICompatibleModelsPreview(

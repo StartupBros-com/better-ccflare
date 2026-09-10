@@ -1,19 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { generateApiKey } from "@better-ccflare/cli-commands";
 import type { Config } from "@better-ccflare/config";
 import { DatabaseOperations } from "@better-ccflare/database";
-import { generateApiKey } from "@better-ccflare/cli-commands";
-import type { APIContext } from "../../types";
 import { APIRouter } from "../../router";
+import type { APIContext } from "../../types";
 import { createModelsPreviewHandler } from "../models";
 
 const LIVE_BODY = {
 	data: [{ id: "gpt-oss-120b" }, { id: "gpt-oss-20b" }],
 };
 
-function previewRequest(
-	body: unknown,
-	apiKey?: string,
-): Request {
+function previewRequest(body: unknown, apiKey?: string): Request {
 	return new Request("http://localhost/api/models/preview", {
 		method: "POST",
 		headers: {
@@ -83,9 +80,9 @@ describe("POST /api/models/preview", () => {
 			],
 		});
 		expect(
-			await dbOps.getAdapter().get<{ count: number }>(
-				"SELECT COUNT(*) AS count FROM accounts",
-			),
+			await dbOps
+				.getAdapter()
+				.get<{ count: number }>("SELECT COUNT(*) AS count FROM accounts"),
 		).toEqual({ count: 0 });
 	});
 
@@ -155,7 +152,10 @@ describe("POST /api/models/preview", () => {
 		const admin = await generateApiKey(dbOps, "preview-admin", "admin");
 		const apiOnly = await generateApiKey(dbOps, "preview-api-only", "api-only");
 
-		const unauthenticated = await router.handleRequest(url, previewRequest(body));
+		const unauthenticated = await router.handleRequest(
+			url,
+			previewRequest(body),
+		);
 		expect(unauthenticated?.status).toBe(401);
 		expect(fetchCalls).toBe(1);
 
