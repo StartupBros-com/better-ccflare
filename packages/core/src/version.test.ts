@@ -15,7 +15,7 @@ import {
 } from "./version";
 
 describe("release lineage", () => {
-	it("keeps root and CLI package lineage at exact v3.5.70 parity", () => {
+	it("keeps root and CLI package lineage at exact v3.5.78 parity", () => {
 		const repositoryRoot = resolve(import.meta.dir, "../../..");
 		const rootPackage = JSON.parse(
 			readFileSync(resolve(repositoryRoot, "package.json"), "utf8"),
@@ -24,8 +24,8 @@ describe("release lineage", () => {
 			readFileSync(resolve(repositoryRoot, "apps/cli/package.json"), "utf8"),
 		) as { version?: unknown };
 
-		expect(rootPackage.version).toBe("3.5.70");
-		expect(cliPackage.version).toBe("3.5.70");
+		expect(rootPackage.version).toBe("3.5.78");
+		expect(cliPackage.version).toBe("3.5.78");
 		expect(rootPackage.version).toBe(cliPackage.version);
 	});
 
