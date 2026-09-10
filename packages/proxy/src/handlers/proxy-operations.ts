@@ -38,6 +38,7 @@ import {
 	materializeProviderAttemptPlan,
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
+	readRequestJson,
 	resolveCodexEndpoint,
 	resolveCodexRequestModel,
 	resolveModelContextCapability,
@@ -142,6 +143,7 @@ import {
 	getXaiConvId,
 } from "./account-selector";
 import { cancelDiscardedResponseBody } from "./discard-body-cancel";
+import { forwardObservedUpstream } from "./observed-upstream";
 import {
 	ERROR_MESSAGES,
 	isInternalProbe,
@@ -1318,8 +1320,10 @@ export async function forceModelInTransformedRequest(
 	model: string,
 ): Promise<Request> {
 	try {
-		const text = await request.clone().text();
-		const body = JSON.parse(text);
+		// Not `request.clone().text()` inline — readRequestJson centralizes the
+		// non-consuming-read contract (Bun 1.3.x request.clone().json() leak,
+		// #382) so every genuine non-consuming caller shares one audited path.
+		const body = await readRequestJson<Record<string, unknown>>(request);
 		if (body.model === model) return request;
 		body.model = model;
 		return new Request(request.url, {
@@ -1417,6 +1421,15 @@ function materializeSyntheticResponse(request: Request): Response {
 	const cacheControl = request.headers.get("cache-control");
 	if (contentType) headers.set("content-type", contentType);
 	if (cacheControl) headers.set("cache-control", cacheControl);
+	// Forward the synthetic-response markers onto the client-facing Response
+	// too, not just content negotiation headers -- otherwise downstream
+	// consumers (gateways, dashboards, log pipelines) can't tell a locally
+	// synthesized response (e.g. Codex's count_tokens estimate) apart from an
+	// authoritative upstream value once it reaches the wire.
+	const syntheticMarker = request.headers.get(SYNTHETIC_RESPONSE_HEADER);
+	if (syntheticMarker) headers.set(SYNTHETIC_RESPONSE_HEADER, syntheticMarker);
+	const syntheticStatus = request.headers.get(SYNTHETIC_STATUS_HEADER);
+	if (syntheticStatus) headers.set(SYNTHETIC_STATUS_HEADER, syntheticStatus);
 
 	return new Response(request.body, {
 		status: parseSyntheticStatus(request),
@@ -2404,22 +2417,41 @@ export async function proxyUnauthenticated(
 		routingAttemptLedger?.recordPhysicalAttempt({
 			laneKey: requestMeta.affinityLaneKey ?? null,
 		});
-		let response = await makeProxyRequest(
-			targetUrl,
-			req.method,
-			headers,
-			createBodyStream,
-			!!req.body,
-			// Abort upstream when the client disconnects; this path builds no
-			// Request object, so the signal has to be passed explicitly.
-			// routingSignal already falls back to req.signal when there is no
-			// active pre-commit rescue, so this chain covers both cases. The
-			// drain controller must be present when fetch is created so terminal
-			// recovery can later tear down a stuck response body.
-			AbortSignal.any([
-				attemptCommitment?.signal ?? routingSignal,
-				drainAbortController.signal,
-			]),
+		const dispatchSignal = AbortSignal.any([
+			attemptCommitment?.signal ?? routingSignal,
+			drainAbortController.signal,
+		]);
+		// KTD8 final-wire observation: purely diagnostic (see
+		// forwardObservedUpstream), captured at the exact point of physical
+		// dispatch, after every header/body transformation above. `headers` is
+		// the already-prepared, sanitized set actually being sent; `req.headers`
+		// carries the pre-transform source for diagnostics correlation only.
+		let response = await forwardObservedUpstream(
+			ctx.provider,
+			new Request(targetUrl, { method: req.method, headers }),
+			{
+				requestId: requestMeta.id,
+				account: null,
+				sourceBody: requestBodyBuffer,
+				sourceHeaders: req.headers,
+				nativeResponses: isResponsesAdapterRequest(req.headers, ctx),
+				signal: dispatchSignal,
+			},
+			() =>
+				makeProxyRequest(
+					targetUrl,
+					req.method,
+					headers,
+					createBodyStream,
+					!!req.body,
+					// Abort upstream when the client disconnects; this path builds no
+					// Request object, so the signal has to be passed explicitly.
+					// routingSignal already falls back to req.signal when there is no
+					// active pre-commit rescue, so this chain covers both cases. The
+					// drain controller must be present when fetch is created so
+					// terminal recovery can later tear down a stuck response body.
+					dispatchSignal,
+				),
 		);
 
 		if (
@@ -2639,6 +2671,13 @@ export async function proxyWithAccount(
 	 */
 	const makeAttemptRequest = async (
 		request: Request,
+		// This physical attempt's replay body, exactly as it will be sent (after
+		// model forcing and any retry-loop body mutation). `makeAttemptRequest`
+		// is defined once, above the per-attempt `try` block that owns the live
+		// `currentReplayBody`/`effectiveBodyBuffer` trackers, so it cannot close
+		// over either -- the caller threads the right value in per call instead.
+		// Diagnostic correlation only (KTD8): never re-sent, never routing input.
+		sourceBody: ArrayBuffer | null,
 		optionalOutboundTransport?: (
 			signal: AbortSignal,
 			markDispatched: () => void,
@@ -2678,13 +2717,35 @@ export async function proxyWithAccount(
 				// returns, when nothing remains between here and the fetch below.
 				onHttpDispatch?.();
 				markDispatched();
-				return makeProxyRequest(
+				// KTD8 final-wire observation: purely diagnostic (see
+				// forwardObservedUpstream). `request` here is the fully-transformed
+				// wire request for this physical attempt -- after model forcing,
+				// provider body transforms, and header preparation. `sourceBody`
+				// is this attempt's replay body (reflecting model forcing and any
+				// retry-loop delta), passed in by the caller for diagnostic
+				// correlation only, never re-sent. Skipped entirely for the
+				// websocket/optional-transport path above, which never reaches
+				// this line.
+				return await forwardObservedUpstream(
+					ctx.provider,
 					request,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					attemptSignal,
+					{
+						requestId: requestMeta.id,
+						account,
+						sourceBody,
+						sourceHeaders: req.headers,
+						nativeResponses: isResponsesAdapterRequest(req.headers, ctx),
+						signal: attemptSignal,
+					},
+					() =>
+						makeProxyRequest(
+							request,
+							undefined,
+							undefined,
+							undefined,
+							undefined,
+							attemptSignal,
+						),
 				);
 			};
 			const transportSignal = currentTransportSignal();
@@ -4171,6 +4232,7 @@ export async function proxyWithAccount(
 					: transportRequest;
 				const response = await makeAttemptRequest(
 					httpTransportRequest,
+					replayBody,
 					attemptPlan.providerName === "codex" && !hasCodexTurnStateReplay
 						? async (signal, markDispatched) => {
 								currentCodexWebSocketReceipt = null;

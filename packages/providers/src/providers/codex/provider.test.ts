@@ -10,6 +10,7 @@ import {
 	registerResponseDrainTransport,
 } from "../../utils/stream-drain";
 import { analyzeCodexCacheExperiments } from "./analyze-trace";
+import { CODEX_CACHE_DIAGNOSTICS_ENV } from "./cache-diagnostics";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -24,6 +25,7 @@ import {
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_PING_MODEL,
 	CODEX_PROMPT_CACHE_KEY_ENV,
+	CODEX_SYNTHETIC_COUNT_TOKENS_ENV,
 	CODEX_VERSION,
 	CodexProvider,
 	codexEventCommitsOutput,
@@ -7738,6 +7740,85 @@ describe("CodexProvider.transformRequestBody", () => {
 		expect(body).not.toHaveProperty("store");
 	});
 
+	it("returns a typed 501 for count_tokens when the synthetic estimate is opted out", async () => {
+		const previous = process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV];
+		process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV] = "0";
+		try {
+			const provider = new CodexProvider();
+			const url = provider.buildUrl("/v1/messages/count_tokens", "");
+			const request = new Request(url, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-7-sonnet",
+					messages: [{ role: "user", content: "hello world" }],
+				}),
+			});
+
+			const transformed = await provider.transformRequestBody(
+				request,
+				undefined,
+			);
+			const body = await transformed.json();
+
+			expect(
+				transformed.headers.get("x-better-ccflare-synthetic-response"),
+			).toBe("true");
+			expect(transformed.headers.get("x-better-ccflare-synthetic-status")).toBe(
+				"501",
+			);
+			expect(body).toEqual({
+				type: "error",
+				error: {
+					type: "not_implemented_error",
+					message:
+						"Codex does not support count_tokens; synthetic estimates are disabled (CCFLARE_CODEX_SYNTHETIC_COUNT_TOKENS=0).",
+				},
+			});
+		} finally {
+			if (previous === undefined) {
+				delete process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV];
+			} else {
+				process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV] = previous;
+			}
+		}
+	});
+
+	it("keeps the default character-based count_tokens estimate when the opt-out is unset", async () => {
+		const previous = process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV];
+		delete process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV];
+		try {
+			const provider = new CodexProvider();
+			const url = provider.buildUrl("/v1/messages/count_tokens", "");
+			const request = new Request(url, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-7-sonnet",
+					messages: [{ role: "user", content: "hello world" }],
+				}),
+			});
+
+			const transformed = await provider.transformRequestBody(
+				request,
+				undefined,
+			);
+			const body = await transformed.json();
+
+			expect(transformed.headers.get("x-better-ccflare-synthetic-status")).toBe(
+				"200",
+			);
+			expect(body.input_tokens).toBeNumber();
+			expect(body.input_tokens).toBeGreaterThan(0);
+		} finally {
+			if (previous === undefined) {
+				delete process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV];
+			} else {
+				process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV] = previous;
+			}
+		}
+	});
+
 	it("estimates count_tokens from prompt material instead of the full JSON envelope", async () => {
 		const provider = new CodexProvider();
 		const url = provider.buildUrl("/v1/messages/count_tokens", "");
@@ -10215,5 +10296,113 @@ describe("fetchCodexUsageOnDemand", () => {
 			/non-empty access token/,
 		);
 		expect(called).toBe(false);
+	});
+});
+
+describe("CodexProvider.observeUpstream", () => {
+	const previousDiagnosticsEnv = process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+
+	afterEach(() => {
+		if (previousDiagnosticsEnv === undefined) {
+			delete process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+		} else {
+			process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = previousDiagnosticsEnv;
+		}
+	});
+
+	function makeWireRequest(): Request {
+		return new Request("https://chatgpt.com/backend-api/codex/responses", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "gpt-5.4",
+				input: [{ type: "message", role: "user", content: "hi" }],
+			}),
+		});
+	}
+
+	it("is observational-only: undefined when diagnostics are disabled (default)", async () => {
+		delete process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+		const provider = new CodexProvider();
+		const request = makeWireRequest();
+		const observation = await provider.observeUpstream?.(request, {
+			requestId: "req-1",
+			account: null,
+			sourceBody: await request.clone().arrayBuffer(),
+			sourceHeaders: new Headers(),
+			nativeResponses: false,
+			signal: new AbortController().signal,
+		});
+		expect(observation).toBeUndefined();
+	});
+
+	it("does not observe GET requests even when diagnostics are enabled", async () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const request = new Request(
+			"https://chatgpt.com/backend-api/codex/models",
+			{ method: "GET" },
+		);
+		const observation = await provider.observeUpstream?.(request, {
+			requestId: "req-2",
+			account: null,
+			sourceBody: null,
+			sourceHeaders: new Headers(),
+			nativeResponses: false,
+			signal: new AbortController().signal,
+		});
+		expect(observation).toBeUndefined();
+	});
+
+	it("returns an observation handle that passes a non-ok response through unmodified (identity) when diagnostics are enabled", async () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const request = makeWireRequest();
+		const observation = await provider.observeUpstream?.(request, {
+			requestId: "req-3",
+			account: null,
+			sourceBody: await request.clone().arrayBuffer(),
+			sourceHeaders: new Headers(),
+			nativeResponses: false,
+			signal: new AbortController().signal,
+		});
+		expect(observation).toBeDefined();
+		expect(observation?.response).toBeFunction();
+		expect(observation?.error).toBeFunction();
+
+		// A non-ok upstream response is diagnostics-inert: returned by identity,
+		// never re-wrapped or consumed, so a caller's error-handling path (which
+		// may itself read the body) is never disturbed by the observer.
+		const upstreamErrorResponse = new Response("boom", { status: 500 });
+		const passedThrough = observation?.response(upstreamErrorResponse);
+		expect(passedThrough).toBe(upstreamErrorResponse);
+
+		// Must never throw into the caller's request path, even on a transport
+		// failure it merely observed.
+		expect(() => observation?.error(new Error("upstream boom"))).not.toThrow();
+	});
+
+	it("preserves an ok response's body content byte-for-byte when diagnostics are enabled", async () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const request = makeWireRequest();
+		const observation = await provider.observeUpstream?.(request, {
+			requestId: "req-4",
+			account: null,
+			sourceBody: await request.clone().arrayBuffer(),
+			sourceHeaders: new Headers(),
+			nativeResponses: false,
+			signal: new AbortController().signal,
+		});
+		expect(observation).toBeDefined();
+
+		const upstreamResponse = new Response('{"ok":true}', {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+		const observed = observation?.response(upstreamResponse);
+		expect(observed?.status).toBe(200);
+		const text = await observed?.text();
+		expect(text).toBe('{"ok":true}');
 	});
 });

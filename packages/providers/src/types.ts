@@ -45,6 +45,36 @@ export interface RateLimitInfo {
  */
 export type CacheReplayModelStrategy = "normalized-source" | "transformed-body";
 
+/**
+ * Final-wire observation context for `Provider.observeUpstream`. Captured at
+ * the point closest to the actual dispatched HTTP request/response -- after
+ * every retry's final body mutations, immediately before the physical send.
+ *
+ * This is a read-only, request-local snapshot. Implementations must treat it
+ * as observational only: it carries no routing or continuation authority, and
+ * must never influence replay eligibility or checkpoint promotion.
+ */
+export interface UpstreamObservationContext {
+	readonly requestId: string;
+	readonly account: Account | null;
+	readonly sourceBody: ArrayBuffer | null;
+	readonly sourceHeaders: Headers;
+	readonly nativeResponses: boolean;
+	readonly signal: AbortSignal;
+}
+
+/**
+ * Observer handle returned by `Provider.observeUpstream`. The caller invokes
+ * exactly one of `response`/`error` once the physical attempt concludes.
+ * Both methods are expected to be resilient: a diagnostics failure inside
+ * either must never fail the inference or alter the response returned to the
+ * client (see `forwardObservedUpstream`, the sole caller).
+ */
+export interface UpstreamObservation {
+	response(response: Response): Response;
+	error(error: unknown): void;
+}
+
 export interface ProviderUsageInfo {
 	model?: string;
 	promptTokens?: number;
@@ -373,6 +403,20 @@ export interface Provider {
 	 * Check if the response is a streaming response
 	 */
 	isStreamingResponse?(response: Response): boolean;
+
+	/**
+	 * Optional: observe the final-wire request/response for a physical attempt,
+	 * strictly at the boundary closest to the actual dispatched HTTP transport
+	 * (after every retry's final body mutations, before the send). Purely
+	 * observational -- never routing or continuation authority, never altering
+	 * replay eligibility or checkpoint promotion. Implementations must not
+	 * consume `request`'s body destructively for unrelated callers and must
+	 * fail silently (never throw into the caller's request path).
+	 */
+	observeUpstream?(
+		request: Request,
+		context: UpstreamObservationContext,
+	): Promise<UpstreamObservation | undefined>;
 }
 
 // OAuth-specific types

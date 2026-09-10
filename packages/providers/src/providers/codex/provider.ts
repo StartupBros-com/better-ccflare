@@ -49,6 +49,7 @@ import type {
 	ProviderServerToolReplayIssuer,
 	RateLimitInfo,
 	TokenRefreshResult,
+	UpstreamObservationContext,
 } from "../../types";
 import { CODEX_REASONING_RETENTION_PREFIX } from "../../utils/codex-reasoning-retention";
 import {
@@ -60,6 +61,16 @@ import {
 	getResponseDrainTransport,
 	transferResponseDrainTransport,
 } from "../../utils/stream-drain";
+import {
+	CODEX_CACHE_DIAGNOSTICS_ENV,
+	CodexCacheDiagnostics,
+} from "./cache-diagnostics";
+import {
+	type CacheFacts,
+	persistCacheTelemetry,
+	sanitizeCacheFacts,
+} from "./cache-telemetry";
+import { observeCodexWire } from "./cache-wire";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
 	deriveConversationIdentity,
@@ -100,6 +111,21 @@ import {
 import { normalizeCodexResponseInputUsage } from "./usage";
 
 const log = new Logger("CodexProvider");
+
+/**
+ * Shared sink for cache-diagnostics lifecycle facts (observer readiness,
+ * sweeps, coverage gaps): logs a bounded, sanitized summary and forwards to
+ * the opt-in private telemetry file. Never throws into the caller -- a
+ * diagnostics failure must not affect the request path.
+ */
+function recordCacheLifecycle(facts: CacheFacts): void {
+	log.info("Codex cache observation lifecycle", sanitizeCacheFacts(facts));
+	persistCacheTelemetry(facts, (dropped) =>
+		log.warn("Codex cache telemetry persistence failure", {
+			dropped_events: dropped,
+		}),
+	);
+}
 
 export { CODEX_LOGICAL_MODEL_FAMILY_HEADER };
 
@@ -160,6 +186,17 @@ export const CODEX_CONVERSATION_ID_HEADER =
 export const CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 /** "conversation" (default) or "session"; see derivePromptCacheKey. */
 export const CODEX_CACHE_KEY_MODE_ENV = "CCFLARE_CODEX_CACHE_KEY_MODE";
+/**
+ * Set to "0" to make Codex's synthetic count_tokens endpoint return a typed
+ * Anthropic-shaped error instead of a character-based estimate. Anthropic-
+ * compatible clients (e.g. Claude Code) already degrade gracefully to a local
+ * estimate on a count_tokens error, so this costs them nothing and lets an
+ * operator fail the route closed on purpose instead of exposing an estimate
+ * that downstream consumers may treat as authoritative. Default behavior is
+ * unchanged.
+ */
+export const CODEX_SYNTHETIC_COUNT_TOKENS_ENV =
+	"CCFLARE_CODEX_SYNTHETIC_COUNT_TOKENS";
 export const CODEX_CACHE_KEY_SESSION_PERCENT_ENV =
 	"CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT";
 export const CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV =
@@ -1497,9 +1534,26 @@ export class CodexProvider extends BaseProvider {
 	/** Lane -> expiry. At most one repair per lane while suppressed. */
 	private readonly responseIdRejectedLanes = new Map<string, number>();
 	private responseIdBudgetBytes = 0;
+	// ── Final-wire cache diagnostics (KTD8): observational only, opt-in via
+	// CODEX_CACHE_DIAGNOSTICS_ENV, never routing or continuation authority. ──
+	private readonly cacheDiagnostics = new CodexCacheDiagnostics(
+		(facts) => {
+			log.info("Codex outgoing cache diagnostics", sanitizeCacheFacts(facts));
+			persistCacheTelemetry(facts, (dropped) =>
+				log.warn("Codex cache telemetry persistence failure", {
+					dropped_events: dropped,
+				}),
+			);
+		},
+		Date.now,
+		recordCacheLifecycle,
+	);
 
 	constructor(options: CodexProviderOptionsForTests = {}) {
 		super();
+		if (process.env[CODEX_CACHE_DIAGNOSTICS_ENV] === "1") {
+			recordCacheLifecycle({ event: "observer_ready" });
+		}
 		this.streamLivenessOptions = {
 			heartbeatIntervalMs: options.streamHeartbeatIntervalMs,
 			rawSilenceTimeoutMs: options.streamRawSilenceTimeoutMs,
@@ -2523,6 +2577,31 @@ export class CodexProvider extends BaseProvider {
 	}
 
 	/**
+	 * Final-wire observation (KTD8): captured by the proxy at the point closest
+	 * to the actual dispatched HTTP request, strictly AFTER every retry's final
+	 * model/input/header transformations. Purely observational -- opt-in via
+	 * `CODEX_CACHE_DIAGNOSTICS_ENV`, and a diagnostics failure here must never
+	 * affect the request path (see `observeCodexWire`'s own guarantees). Skips
+	 * GET requests (e.g. `/v1/models` passthrough), which carry no body to
+	 * correlate.
+	 */
+	async observeUpstream(request: Request, context: UpstreamObservationContext) {
+		if (
+			process.env[CODEX_CACHE_DIAGNOSTICS_ENV] !== "1" ||
+			request.method === "GET"
+		) {
+			return undefined;
+		}
+		return observeCodexWire(
+			this.cacheDiagnostics,
+			request,
+			context,
+			(source) =>
+				this.extractSessionId(source as unknown as AnthropicRequest) ?? null,
+		);
+	}
+
+	/**
 	 * @param _beforePhysicalTransport - Third positional slot in the `Provider`
 	 * contract, reserved for providers whose transform performs the physical send
 	 * itself (Bedrock). Codex only rewrites the body — the proxy owns its
@@ -2594,6 +2673,14 @@ export class CodexProvider extends BaseProvider {
 			const logicalModelFamily =
 				trustedLogicalModelFamily ?? getModelFamily(body.model);
 			if (isSyntheticCountTokens) {
+				if (process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV] === "0") {
+					return this.createSyntheticErrorResponse(
+						request,
+						501,
+						"not_implemented_error",
+						"Codex does not support count_tokens; synthetic estimates are disabled (CCFLARE_CODEX_SYNTHETIC_COUNT_TOKENS=0).",
+					);
+				}
 				return this.createSyntheticCountTokensResponse(request, body);
 			}
 			const isSubscriptionEndpoint = isCodexSubscriptionEndpoint(request.url);
