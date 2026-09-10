@@ -1,8 +1,11 @@
 import { Logger } from "@better-ccflare/logger";
 import type { BunSqlAdapter } from "./adapters/bun-sql-adapter";
-// Separate import statement (rather than merging into the one above) so the
-// exact single-symbol import text stays intact for the SQLite/PostgreSQL
-// migration-parity check in routing-attempt-migrations.test.ts.
+// Both ROUTING_ATTEMPT_REASON_SQL and ROUTING_ATTEMPT_REASONS come from the
+// shared taxonomy module (not hardcoded locally) so this file's reason
+// allowlist can't drift from the SQLite side. The migration-parity check in
+// routing-attempt-migrations.test.ts asserts this import formatting-
+// tolerantly — it doesn't depend on this being a single-symbol import or on
+// exact line breaks.
 import {
 	ROUTING_ATTEMPT_REASON_SQL,
 	ROUTING_ATTEMPT_REASONS,
@@ -535,7 +538,7 @@ async function routingAttemptsReasonConstraintIsCurrentPg(
 		 WHERE conrelid = ?::regclass AND conname = ?`,
 		["routing_attempts", ROUTING_ATTEMPTS_REASON_CONSTRAINT_NAME],
 	);
-	if (!row) return false;
+	if (!row || typeof row.definition !== "string") return false;
 	const currentReasons = Array.from(row.definition.matchAll(/'([^']*)'/g)).map(
 		(match) => match[1],
 	);

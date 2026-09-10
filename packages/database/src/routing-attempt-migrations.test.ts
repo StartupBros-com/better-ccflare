@@ -439,9 +439,20 @@ describe("routing_attempts migrations", () => {
 			"utf8",
 		);
 		for (const migrationSource of [source, sqliteSource]) {
-			expect(migrationSource).toContain(
-				'import { ROUTING_ATTEMPT_REASON_SQL } from "./routing-attempt-taxonomy";',
+			// Formatting-tolerant: matches a single- or multi-line named import,
+			// with any number of sibling symbols, as long as it pulls
+			// ROUTING_ATTEMPT_REASON_SQL from the shared taxonomy module. This is
+			// what actually guarantees the SQLite and PostgreSQL reason lists
+			// can't drift — the exact import text/formatting is incidental.
+			const importMatch = migrationSource.match(
+				/import\s*\{([^}]*)\}\s*from\s*["']\.\/routing-attempt-taxonomy["'];/,
 			);
+			expect(importMatch).not.toBeNull();
+			const importedSymbols = (importMatch?.[1] ?? "")
+				.split(",")
+				.map((symbol) => symbol.trim())
+				.filter(Boolean);
+			expect(importedSymbols).toContain("ROUTING_ATTEMPT_REASON_SQL");
 		}
 		expect(pgTable).toContain(
 			"reason TEXT NOT NULL CHECK (reason IN ($" +

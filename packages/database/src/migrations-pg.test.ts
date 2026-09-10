@@ -616,6 +616,56 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Regression: routingAttemptsReasonConstraintIsCurrentPg must not crash when
+// a `get()` implementation returns a truthy row that lacks a `definition`
+// field (e.g. a test stub, or a driver that returns `{}` instead of `null`
+// for "no matching row"). Drives the real runMigrationsPg end to end — not a
+// mock of the guard itself — with the same generic `get: async () => ({
+// exists: 1 })` stub shape used by device-setup-job-migrations.test.ts,
+// managed-routing-migrations.test.ts, native-quota-policy.test.ts, and
+// server-tool-replay-issuance-migrations.test.ts, all of which hit this
+// exact crash before the guard fix.
+// ---------------------------------------------------------------------------
+
+describe("routing_attempts reason constraint guard (malformed pg_constraint row)", () => {
+	it("does not throw when the constraint-definition lookup returns a row without `definition`, and still upgrades the constraint", async () => {
+		const statements: string[] = [];
+		const truthyRowWithoutDefinitionAdapter = {
+			get: async () => ({ exists: 1 }) as never,
+			run: async () => {},
+			unsafe: async (sql: string) => {
+				statements.push(sql.replace(/\s+/g, " ").trim());
+				return [];
+			},
+			query: async () => [],
+			runWithChanges: async () => 0,
+		};
+
+		await expect(
+			runMigrationsPg(truthyRowWithoutDefinitionAdapter as never),
+		).resolves.toBeUndefined();
+
+		// A missing/malformed `definition` must be treated as "constraint not
+		// current" (the safe direction), so the DROP/ADD upgrade path runs.
+		expect(
+			statements.some((sql) =>
+				sql.startsWith(
+					"ALTER TABLE routing_attempts DROP CONSTRAINT IF EXISTS routing_attempts_reason_check",
+				),
+			),
+		).toBe(true);
+		expect(
+			statements.some(
+				(sql) =>
+					sql.startsWith(
+						"ALTER TABLE routing_attempts ADD CONSTRAINT routing_attempts_reason_check CHECK",
+					) && sql.includes("'org_permission_denied'"),
+			),
+		).toBe(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // Live PostgreSQL smoke test — only runs when a real PG server is reachable.
 // ---------------------------------------------------------------------------
 
