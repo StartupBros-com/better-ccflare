@@ -498,7 +498,7 @@ for expected_line in \
 	"Environment=RUNNER_RSS_MIN_UPTIME_MS=1800000" \
 	"Environment=RUNNER_RSS_CONSECUTIVE_SAMPLES=5" \
 	"Environment=RUNNER_RSS_RECYCLE_COOLDOWN_MS=3600000" \
-	"Environment=RUNNER_RSS_MAX_RECYCLES=3" \
+	"Environment=RUNNER_RSS_MAX_RECYCLES=8" \
 	"Environment=RUNNER_RSS_RECYCLE_WINDOW_MS=86400000" \
 	"ExecStart=" \
 	"ExecStart=${RUNNER_SCRIPT}"; do

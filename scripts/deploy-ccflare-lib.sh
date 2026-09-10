@@ -434,7 +434,7 @@ render_systemd_pin() {
 		printf '%s\n' "Environment=RUNNER_RSS_MIN_UPTIME_MS=1800000"
 		printf '%s\n' "Environment=RUNNER_RSS_CONSECUTIVE_SAMPLES=5"
 		printf '%s\n' "Environment=RUNNER_RSS_RECYCLE_COOLDOWN_MS=3600000"
-		printf '%s\n' "Environment=RUNNER_RSS_MAX_RECYCLES=3"
+		printf '%s\n' "Environment=RUNNER_RSS_MAX_RECYCLES=8"
 		printf '%s\n' "Environment=RUNNER_RSS_RECYCLE_WINDOW_MS=86400000"
 		printf 'KillMode=%s\n' "$kill_mode"
 		printf 'TimeoutStopSec=%s\n' "$stop_timeout"
@@ -788,7 +788,7 @@ validate_production_rss_policy_values() {
 	if [[ "$#" -ne 8 ]]; then return 2; fi
 	local label="$8"
 	local -a values=("$1" "$2" "$3" "$4" "$5" "$6" "$7")
-	local -a expected=(4294967296 60000 1800000 5 3600000 3 86400000)
+	local -a expected=(4294967296 60000 1800000 5 3600000 8 86400000)
 	local index
 	for index in "${!values[@]}"; do
 		if [[ "${values[$index]}" != "${expected[$index]}" ]]; then
