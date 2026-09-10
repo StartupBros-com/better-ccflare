@@ -1,0 +1,140 @@
+{
+  "schemaVersion": 1,
+  "issue": 338,
+  "release": "v3.5.78",
+  "mergeTarget": "dfcb724f8044426da8944a10b4cc8ed305fac2b3",
+  "toolingCommit": "f6677b03357958b535d132ae2ea7f63edeb5febb",
+  "scope": "U1 tooling and pre-merge source inventory only. U2-U9 implementation, full-suite/PG evidence, and genuine integration acceptance remain pending.",
+  "executionPolicy": "Pinned Bun 1.4.2; one focused tooling test file per process; no live provider traffic. Import-heavy verification modules were built before repository static gates. No production database or deployment was used.",
+  "proofFirst": [
+    {
+      "unit": "U1",
+      "requirements": [
+        "R1",
+        "R15",
+        "R16"
+      ],
+      "path": "scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "beforeSourceChange": {
+        "status": "expected-failure",
+        "passes": 54,
+        "failures": 3,
+        "assertions": 139,
+        "observed": "Projected-equivalence counts differed from original-graph counts; missing intermediate excluded blobs failed; one.txt and one.txt.extra conflict classes were cross-attributed."
+      },
+      "afterSourceChange": {
+        "status": "passed",
+        "passes": 57,
+        "failures": 0,
+        "assertions": 146
+      }
+    },
+    {
+      "unit": "U1",
+      "requirements": [
+        "R15",
+        "R16"
+      ],
+      "path": "scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "beforeSourceChange": {
+        "status": "expected-failure",
+        "passes": 57,
+        "failures": 1,
+        "assertions": 147,
+        "observed": "A synthetic permitted textual patch larger than 1 MiB failed synchronous capture; failure was safely summarized without emitting its contents."
+      },
+      "afterSourceChange": {
+        "status": "passed",
+        "passes": 59,
+        "failures": 0,
+        "assertions": 154
+      }
+    }
+  ],
+  "isolatedTests": [
+    {
+      "units": [
+        "U1"
+      ],
+      "requirements": [
+        "R1",
+        "R2",
+        "R15",
+        "R16"
+      ],
+      "path": "scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "command": "mise exec bun@1.4.2 -- bun test --timeout 15000 scripts/__tests__/verify-upstream-sync-ledger.test.ts",
+      "status": "passed",
+      "exitCode": 0,
+      "passes": 59,
+      "failures": 0,
+      "assertions": 154
+    }
+  ],
+  "totals": {
+    "scope": "U1 only",
+    "files": 1,
+    "passes": 59,
+    "failures": 0,
+    "assertions": 154
+  },
+  "toolingGates": [
+    {
+      "name": "focused-script-typecheck",
+      "status": "passed",
+      "exitCode": 0,
+      "details": "TypeScript 6.0.2 with --ignoreConfig --noEmit --strict --skipLibCheck --target esnext --module esnext --moduleResolution bundler --allowImportingTsExtensions --types bun-types over both owned scripts. Root typecheck is recorded separately, not substituted."
+    },
+    {
+      "name": "build:cli",
+      "command": "mise exec bun@1.4.2 -- bun run build:cli",
+      "status": "passed",
+      "exitCode": 0
+    },
+    {
+      "name": "build:dashboard",
+      "command": "mise exec bun@1.4.2 -- bun run build:dashboard",
+      "status": "passed",
+      "exitCode": 0
+    },
+    {
+      "name": "lint",
+      "command": "mise exec bun@1.4.2 -- bun run lint",
+      "status": "passed",
+      "exitCode": 0
+    },
+    {
+      "name": "typecheck",
+      "command": "mise exec bun@1.4.2 -- bun run typecheck",
+      "status": "passed",
+      "exitCode": 0
+    },
+    {
+      "name": "format",
+      "command": "mise exec bun@1.4.2 -- bun run format",
+      "status": "passed",
+      "exitCode": 0
+    },
+    {
+      "name": "lint-warnings",
+      "status": "non-blocking",
+      "details": "Eight existing warnings outside U1; lint and format applied no fixes."
+    },
+    {
+      "name": "diff-check",
+      "status": "passed",
+      "exitCode": 0
+    },
+    {
+      "name": "real-ref-premerge-rederivation",
+      "status": "passed",
+      "exitCode": 0,
+      "details": "75 upstream commits, 38 conflicts, 28 clean shared paths, four canonical exclusions; generated inventory and ledger independently validated against Git."
+    }
+  ],
+  "integration": {
+    "status": "not-started",
+    "integrationCommit": null,
+    "upstreamIntentAcceptance": "pending"
+  }
+}
