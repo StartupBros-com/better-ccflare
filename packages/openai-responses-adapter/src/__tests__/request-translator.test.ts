@@ -233,6 +233,36 @@ describe("translateRequestToAnthropic", () => {
 		expect(result.max_tokens).toBe(4096);
 	});
 
+	// Regression: upstream dfcb724f added temperature/top_p/service_tier to
+	// ResponsesRequest. translateRequestToAnthropic constructs `result` as a
+	// brand-new object listing only known fields explicitly — any client-sent
+	// field not in that list is silently discarded before the outbound fetch,
+	// not merged through from the original body.
+	test("temperature/top_p/service_tier survive translation to the outbound Anthropic request", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [],
+			temperature: 0.4,
+			top_p: 0.9,
+			service_tier: "auto",
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.temperature).toBe(0.4);
+		expect(result.top_p).toBe(0.9);
+		expect(result.service_tier).toBe("auto");
+	});
+
+	test("temperature/top_p/service_tier omitted when not sent by the client", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [],
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.temperature).toBeUndefined();
+		expect(result.top_p).toBeUndefined();
+		expect(result.service_tier).toBeUndefined();
+	});
+
 	test('tool_choice "auto" → {type:"auto"}, "required" → {type:"any"}', () => {
 		const fnTool = {
 			type: "function" as const,
