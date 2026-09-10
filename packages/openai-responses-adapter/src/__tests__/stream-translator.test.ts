@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { BUFFER_SIZES } from "@better-ccflare/core";
+import { logBus } from "@better-ccflare/logger";
 import { translateAnthropicStreamToResponses } from "../stream-translator";
 
 async function collectSseEvents(
@@ -216,6 +217,39 @@ describe("translateAnthropicStreamToResponses", () => {
 			output_tokens: 3,
 			total_tokens: 10,
 		});
+	});
+
+	test("logs a JSON parse failure payload-blind, never echoing the raw data field (GAP 4)", async () => {
+		const secretMarker = "SENSITIVE_UPSTREAM_PAYLOAD_MARKER_abc123";
+		const events: Array<{ ts: number; msg: string }> = [];
+		const handler = (event: { ts: number; msg: string }) => {
+			events.push(event);
+		};
+		logBus.on("log", handler);
+		try {
+			const rawEvent = `event: content_block_delta\ndata: {not-json "${secretMarker}"`;
+			const upstream = makeAnthropicStream([
+				rawEvent,
+				sseEvent("message_stop", { type: "message_stop" }),
+			]);
+			await collectSseEvents(
+				translateAnthropicStreamToResponses(
+					upstream,
+					"resp_parse_fail",
+					"test-model",
+				),
+			);
+		} finally {
+			logBus.off("log", handler);
+		}
+
+		const parseFailureLogs = events.filter((e) =>
+			e.msg.includes("Failed to parse SSE data"),
+		);
+		expect(parseFailureLogs.length).toBeGreaterThan(0);
+		for (const log of parseFailureLogs) {
+			expect(log.msg).not.toContain(secretMarker);
+		}
 	});
 
 	test("tool call streaming — correct function_call item events", async () => {

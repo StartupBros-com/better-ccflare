@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUFFER_SIZES } from "@better-ccflare/core";
 import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
+import { logBus } from "@better-ccflare/logger";
 import { setDerivedProviderModelDefaults } from "../../provider-model-defaults";
 import {
 	getResponseDrainTransport,
@@ -10485,5 +10486,89 @@ describe("CodexProvider.observeUpstream", () => {
 		expect(observed?.status).toBe(200);
 		const text = await observed?.text();
 		expect(text).toBe('{"ok":true}');
+	});
+});
+
+describe("CodexProvider.observeRequest", () => {
+	const previousDiagnosticsEnv = process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+
+	afterEach(() => {
+		if (previousDiagnosticsEnv === undefined) {
+			delete process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+		} else {
+			process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = previousDiagnosticsEnv;
+		}
+	});
+
+	it("is observational-only: undefined when diagnostics are disabled (default)", () => {
+		delete process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+		const provider = new CodexProvider();
+		const observation = provider.observeRequest?.(new Headers(), false);
+		expect(observation).toBeUndefined();
+	});
+
+	it("returns an observation handle with bindRequestId/response/error when diagnostics are enabled", () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const observation = provider.observeRequest?.(new Headers(), false);
+		expect(observation).toBeDefined();
+		expect(observation?.bindRequestId).toBeFunction();
+		expect(observation?.response).toBeFunction();
+		expect(observation?.error).toBeFunction();
+	});
+
+	it("passes a response through unmodified (identity), even a refusal response", () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const observation = provider.observeRequest?.(new Headers(), false);
+		const refusalResponse = new Response("refused", {
+			status: 503,
+			headers: { "x-better-ccflare-pool-status": "exhausted" },
+		});
+		const observed = observation?.response(refusalResponse);
+		expect(observed).toBe(refusalResponse);
+	});
+
+	it("reports refusal_reason: pool_exhausted only when the pool-status header says exhausted", () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const lifecycleEvents: Array<Record<string, unknown>> = [];
+		const handler = (event: { msg: string; data?: unknown }) => {
+			if (event.msg === "Codex cache observation lifecycle") {
+				lifecycleEvents.push(event.data as Record<string, unknown>);
+			}
+		};
+		logBus.on("log", handler);
+		try {
+			const exhausted = provider.observeRequest?.(new Headers(), false);
+			exhausted?.response(
+				new Response(null, {
+					status: 503,
+					headers: { "x-better-ccflare-pool-status": "exhausted" },
+				}),
+			);
+
+			const notExhausted = provider.observeRequest?.(new Headers(), false);
+			notExhausted?.response(new Response(null, { status: 200 }));
+
+			const headerEvents = lifecycleEvents.filter(
+				(e) => e.event === "request_headers",
+			);
+			expect(headerEvents).toHaveLength(2);
+			expect(headerEvents[0]?.refusal_reason).toBe("pool_exhausted");
+			expect(headerEvents[0]?.status_code).toBe(503);
+			expect(headerEvents[1]?.refusal_reason).toBeNull();
+			expect(headerEvents[1]?.status_code).toBe(200);
+		} finally {
+			logBus.off("log", handler);
+		}
+	});
+
+	it("never throws from bindRequestId or error(), even with unusual input", () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const observation = provider.observeRequest?.(new Headers(), true);
+		expect(() => observation?.bindRequestId("req-1")).not.toThrow();
+		expect(() => observation?.error(new Error("local refusal"))).not.toThrow();
 	});
 });

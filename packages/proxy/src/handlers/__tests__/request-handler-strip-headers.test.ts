@@ -35,6 +35,13 @@ describe("makeProxyRequest strips internal control headers before provider forwa
 			"x-better-ccflare-keepalive": "true",
 			"x-better-ccflare-guard-request-id": "signed-envelope",
 			"x-better-ccflare-guard-correlation-secret": "must-never-be-http",
+			"x-better-ccflare-request-id": "req-1",
+			"x-better-ccflare-request-stream": "true",
+			"x-better-ccflare-codex-custom-tools": "true",
+			"x-better-ccflare-native-responses": "true",
+			"x-better-ccflare-authenticated-caller": "apikey-1",
+			"x-better-ccflare-exclude-providers": "codex",
+			"x-better-ccflare-codex-continuation": "1",
 			authorization: "Bearer token",
 			"content-type": "application/json",
 		});
@@ -57,6 +64,19 @@ describe("makeProxyRequest strips internal control headers before provider forwa
 		expect(
 			sentHeaders?.get("x-better-ccflare-guard-correlation-secret"),
 		).toBeNull();
+		expect(sentHeaders?.get("x-better-ccflare-request-id")).toBeNull();
+		expect(sentHeaders?.get("x-better-ccflare-request-stream")).toBeNull();
+		expect(sentHeaders?.get("x-better-ccflare-codex-custom-tools")).toBeNull();
+		expect(sentHeaders?.get("x-better-ccflare-native-responses")).toBeNull();
+		// Regression for the risk the upstream port itself calls out: an
+		// external caller forging this header must never have it reach the
+		// provider either (see CODEX_AUTHENTICATED_CALLER_HEADER's own
+		// "deleted before any outbound transport" contract in provider.ts).
+		expect(
+			sentHeaders?.get("x-better-ccflare-authenticated-caller"),
+		).toBeNull();
+		expect(sentHeaders?.get("x-better-ccflare-exclude-providers")).toBeNull();
+		expect(sentHeaders?.get("x-better-ccflare-codex-continuation")).toBeNull();
 		// unrelated headers still forwarded
 		expect(sentHeaders?.get("authorization")).toBe("Bearer token");
 		expect(sentHeaders?.get("content-type")).toBe("application/json");
@@ -71,6 +91,8 @@ describe("makeProxyRequest strips internal control headers before provider forwa
 				"x-better-ccflare-keepalive": "true",
 				"x-better-ccflare-guard-request-id": "signed-envelope",
 				"x-better-ccflare-guard-correlation-secret": "must-never-be-http",
+				"x-better-ccflare-request-id": "req-1",
+				"x-better-ccflare-authenticated-caller": "apikey-1",
 				authorization: "Bearer token",
 			},
 		});
@@ -85,6 +107,10 @@ describe("makeProxyRequest strips internal control headers before provider forwa
 		expect(sentHeaders?.get("x-better-ccflare-guard-request-id")).toBeNull();
 		expect(
 			sentHeaders?.get("x-better-ccflare-guard-correlation-secret"),
+		).toBeNull();
+		expect(sentHeaders?.get("x-better-ccflare-request-id")).toBeNull();
+		expect(
+			sentHeaders?.get("x-better-ccflare-authenticated-caller"),
 		).toBeNull();
 		expect(sentHeaders?.get("authorization")).toBe("Bearer token");
 	});

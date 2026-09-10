@@ -23,6 +23,7 @@ import {
 	isCacheFlightRecorderEnabled,
 	isOfficialXaiEndpoint,
 	isXaiCacheNativeEnabled,
+	type RequestObservation,
 	usageCache,
 } from "@better-ccflare/providers";
 import type {
@@ -139,6 +140,11 @@ import {
 	wouldSuppressProbe,
 } from "./handlers/rate-limit-cooldown";
 import { getRequestRateLimitOutcomes } from "./handlers/rate-limit-scope";
+import {
+	beginRequestObservation,
+	bindObservedRequestId,
+	forwardObservedRequest,
+} from "./handlers/request-observation";
 import {
 	createProtectedAnthropicOverloadResponse,
 	getAutomaticAccountCooldownUntil,
@@ -611,11 +617,24 @@ export function handleProxy(
 	apiKeyId?: string | null,
 	apiKeyName?: string | null,
 ): Promise<Response> {
-	return isInternalProbe(req.headers, ctx)
-		? runForceAccountModelExempt(() =>
-				handleProxyImpl(req, url, ctx, apiKeyId, apiKeyName),
-			)
-		: handleProxyImpl(req, url, ctx, apiKeyId, apiKeyName);
+	// Request-top observation (before account selection): handleProxy is only
+	// ever invoked with `/v1/messages` (a real Responses-protocol request is
+	// translated to a synthetic /v1/messages call by openai-responses-adapter
+	// before reaching here -- see isResponsesAdapterRequest). Gating on the
+	// literal pathname keeps this a no-op for every other route.
+	const observation =
+		url.pathname === "/v1/messages"
+			? beginRequestObservation(
+					ctx.provider,
+					req.headers,
+					isResponsesAdapterRequest(req.headers, ctx),
+				)
+			: undefined;
+	const run = () =>
+		handleProxyImpl(req, url, ctx, apiKeyId, apiKeyName, observation);
+	return forwardObservedRequest(observation, () =>
+		isInternalProbe(req.headers, ctx) ? runForceAccountModelExempt(run) : run(),
+	);
 }
 
 async function handleProxyImpl(
@@ -624,6 +643,7 @@ async function handleProxyImpl(
 	ctx: ProxyContext,
 	apiKeyId?: string | null,
 	apiKeyName?: string | null,
+	observation?: RequestObservation,
 ): Promise<Response> {
 	// Reserve root intent synchronously, before body buffering or agent
 	// interception can await and invert same-session request order. Discovery,
@@ -653,6 +673,7 @@ async function handleProxyImpl(
 				rootIntentGeneration,
 				undefined,
 				telemetry,
+				observation,
 			);
 		} else {
 			const activation = createAnthropicPreCommitRescueActivation();
@@ -677,6 +698,7 @@ async function handleProxyImpl(
 				rootIntentGeneration,
 				routeContext,
 				telemetry,
+				observation,
 			);
 			const coordinatedResponse = await coordinateAnthropicPreCommitRescue({
 				response: routedResponse,
@@ -734,6 +756,7 @@ async function handleProxyCore(
 	rootIntentGeneration: number | null = null,
 	anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext,
 	degradedTelemetry?: DegradedTelemetryHolder,
+	observation?: RequestObservation,
 ): Promise<Response> {
 	try {
 		return await handleProxyCoreImpl(
@@ -745,6 +768,7 @@ async function handleProxyCore(
 			rootIntentGeneration,
 			anthropicPreCommitRescue,
 			degradedTelemetry,
+			observation,
 		);
 	} catch (error) {
 		if (!(error instanceof PhysicalAttemptBudgetExceededError)) throw error;
@@ -771,6 +795,7 @@ async function handleProxyCoreImpl(
 	rootIntentGeneration: number | null = null,
 	anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext,
 	degradedTelemetry?: DegradedTelemetryHolder,
+	observation?: RequestObservation,
 ): Promise<Response> {
 	// Consume the private scheduler credential before any request inspection,
 	// metadata construction, logging, cache staging, or upstream forwarding.
@@ -888,6 +913,7 @@ async function handleProxyCoreImpl(
 		url,
 		ctx.guardCorrelationVerifier,
 	);
+	bindObservedRequestId(observation, requestMeta.id);
 	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
 	const routingAttemptLedger = new RoutingAttemptLedger();
 	const recordLocalRoutingTerminal = (

@@ -75,6 +75,19 @@ export interface UpstreamObservation {
 	error(error: unknown): void;
 }
 
+/**
+ * Observer handle returned by `Provider.observeRequest`. Extends
+ * `UpstreamObservation`'s response()/error() contract with `bindRequestId`,
+ * called once the proxy's canonical request id is known (request creation
+ * happens after account-selection setup, strictly after this observation is
+ * created at the top of the handler). The caller invokes `bindRequestId` at
+ * most once, then exactly one of `response`/`error` once the request
+ * concludes -- whether or not it ever reached physical dispatch.
+ */
+export interface RequestObservation extends UpstreamObservation {
+	bindRequestId(requestId: string): void;
+}
+
 export interface ProviderUsageInfo {
 	model?: string;
 	promptTokens?: number;
@@ -417,6 +430,22 @@ export interface Provider {
 		request: Request,
 		context: UpstreamObservationContext,
 	): Promise<UpstreamObservation | undefined>;
+
+	/**
+	 * Optional: observe request coverage from the very top of the proxy
+	 * handler, strictly BEFORE account selection. Complements `observeUpstream`
+	 * (which only fires once an account is selected and a physical attempt is
+	 * imminent) by also covering a purely local refusal -- pool exhaustion, a
+	 * policy exclusion, an early validation error -- that never reaches
+	 * physical dispatch. Synchronous and cheap: implementations must not block
+	 * or await network/disk work on the request path. Purely observational --
+	 * never routing or continuation authority -- and must fail silently (never
+	 * throw into the caller's request path).
+	 */
+	observeRequest?(
+		headers: Headers,
+		nativeResponses: boolean,
+	): RequestObservation | undefined;
 }
 
 // OAuth-specific types

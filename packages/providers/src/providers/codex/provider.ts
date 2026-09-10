@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { getCodexReasoningRetention } from "@better-ccflare/config";
 import {
 	BUFFER_SIZES,
@@ -34,6 +34,10 @@ import type {
 	ServerToolCapabilityTuple,
 	ServerToolRequirements,
 } from "@better-ccflare/types";
+import {
+	RECOVERY_STATUS_EXHAUSTED,
+	RECOVERY_STATUS_HEADER,
+} from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import {
 	registerProviderModelDefaultFactory,
@@ -48,6 +52,7 @@ import type {
 	ProviderServerToolCapabilityContext,
 	ProviderServerToolReplayIssuer,
 	RateLimitInfo,
+	RequestObservation,
 	TokenRefreshResult,
 	UpstreamObservationContext,
 } from "../../types";
@@ -67,6 +72,7 @@ import {
 } from "./cache-diagnostics";
 import {
 	type CacheFacts,
+	cacheDigest,
 	persistCacheTelemetry,
 	sanitizeCacheFacts,
 } from "./cache-telemetry";
@@ -2574,6 +2580,64 @@ export class CodexProvider extends BaseProvider {
 		newHeaders.set("originator", "codex_cli_rs");
 
 		return newHeaders;
+	}
+
+	/**
+	 * Request-top observation, strictly BEFORE account selection: the proxy
+	 * calls this before any account is chosen, so it also covers a purely
+	 * local refusal (pool exhaustion, a policy exclusion, ...) that never
+	 * reaches `observeUpstream`'s final-wire boundary below. Opt-in via the
+	 * same `CODEX_CACHE_DIAGNOSTICS_ENV` switch, and a diagnostics failure
+	 * here must never affect the request path -- every fact is computed from
+	 * caller-supplied headers/response only, nothing here can throw into
+	 * routing. `refusal_reason: "pool_exhausted"` is read off the recovery
+	 * headers `createModelPoolExhaustedResponse`/`createRoutingTerminalResponse`
+	 * already set on a locally-terminated response, not from any Codex-specific
+	 * signal, so this fires for a pool refusal regardless of which provider
+	 * ultimately would have served the request.
+	 */
+	observeRequest(
+		headers: Headers,
+		nativeResponses: boolean,
+	): RequestObservation | undefined {
+		if (process.env[CODEX_CACHE_DIAGNOSTICS_ENV] !== "1") return undefined;
+		const gatewayIdentity = (name: string): string | null => {
+			const value = headers.get(name);
+			return value && /^[0-9a-f]{64}$/.test(value) ? value : null;
+		};
+		const facts: CacheFacts = {
+			ingress_digest: cacheDigest(randomUUID()),
+			path: nativeResponses ? "native" : "legacy",
+			gateway_request_digest: gatewayIdentity(
+				"x-better-ccflare-gateway-request-digest",
+			),
+			gateway_attempt_digest: gatewayIdentity(
+				"x-better-ccflare-gateway-attempt-digest",
+			),
+		};
+		recordCacheLifecycle({ ...facts, event: "request_received" });
+		return {
+			bindRequestId(requestId: string) {
+				facts.request_digest = cacheDigest(requestId);
+				recordCacheLifecycle({ ...facts, event: "request_identified" });
+			},
+			response(response: Response) {
+				recordCacheLifecycle({
+					...facts,
+					event: "request_headers",
+					status_code: response.status,
+					refusal_reason:
+						response.headers.get(RECOVERY_STATUS_HEADER) ===
+						RECOVERY_STATUS_EXHAUSTED
+							? "pool_exhausted"
+							: null,
+				});
+				return response;
+			},
+			error(_error: unknown) {
+				recordCacheLifecycle({ ...facts, event: "request_error" });
+			},
+		};
 	}
 
 	/**

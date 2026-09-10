@@ -568,8 +568,11 @@ function processSseFrame(
 	try {
 		data = JSON.parse(dataStr) as Record<string, unknown>;
 	} catch {
+		// Payload-blind: the raw data field can carry upstream response content
+		// (prompt/completion text), so it must never be logged verbatim — only
+		// the event type and byte length are safe to record here.
 		log.warn(
-			`Failed to parse SSE data for event ${eventType}: ${dataStr.slice(0, 200)}`,
+			`Failed to parse SSE data for event ${eventType} (${dataStr.length} bytes)`,
 		);
 		return;
 	}

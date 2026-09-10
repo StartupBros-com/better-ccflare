@@ -32,6 +32,19 @@ function stripInternalControlHeaders(headers: Headers): void {
 	headers.delete("x-better-ccflare-keepalive");
 	headers.delete(GUARD_REQUEST_ID_HEADER);
 	headers.delete(GUARD_CORRELATION_SECRET_HEADER);
+	// The rest of this list is every other in-use x-better-ccflare-* internal
+	// signalling header read anywhere upstream of this call (account
+	// selection, routing, provider request-shaping): this function runs at
+	// the physical-dispatch boundary, strictly after every such read, on a
+	// disposable Headers copy the caller never sees again -- so stripping
+	// here cannot affect anything already read from the original headers.
+	headers.delete("x-better-ccflare-request-id");
+	headers.delete("x-better-ccflare-request-stream");
+	headers.delete("x-better-ccflare-codex-custom-tools");
+	headers.delete("x-better-ccflare-native-responses");
+	headers.delete("x-better-ccflare-authenticated-caller");
+	headers.delete("x-better-ccflare-exclude-providers");
+	headers.delete("x-better-ccflare-codex-continuation");
 }
 
 /**
