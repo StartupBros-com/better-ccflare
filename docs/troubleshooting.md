@@ -202,7 +202,8 @@ export NO_PROXY=localhost,127.0.0.1
 3. Use session-based routing for conversational workloads:
    ```bash
    # Set strategy to session for better performance with conversations
-   # Session is the default and only supported strategy
+   # (the default). session-affinity and session-drain-soonest are also
+   # session-based; least-used is available for non-OAuth pools.
    ```
 
 ### High Memory Usage
@@ -211,13 +212,28 @@ export NO_PROXY=localhost,127.0.0.1
 
 If RSS grows into multiple GB while `process.memoryUsage().heapUsed` stays
 flat at tens of MB, this is native (off-heap) memory retention, not a JS
-object leak — clearing history or caches will not help. This was tracked as
-issue [#382](https://github.com/tombii/better-ccflare/issues/382): stream
-reader locks were never released on normal stream completion, and a few
-response paths cloned bodies whose tee branches were never consumed. Fixed
-upstream — upgrade to the latest version. If it still reproduces on a recent
-release, report your provider mix and an idle-vs-traffic RSS comparison on
-the issue.
+object leak — clearing history or caches will not help. Two earlier causes —
+stream reader locks never released on normal stream completion, and a few
+response paths cloning bodies whose tee branches were never consumed (issue
+[#382](https://github.com/tombii/better-ccflare/issues/382)) — were already
+fixed by the time this fork identified the dominant contributor: on Bun
+1.3.x, `Request.clone().json()` never frees the clone's native body buffer,
+so any proxy code that reads the client body that way leaks roughly the
+request-body size on every request — measured at ~950 KiB/request on Bun
+1.3.11 with `bun run bench/request-clone-json-leak.ts json 300 800` (N=300,
+800 KiB body, 4 concurrent clients), which works out to roughly half a
+gigabyte per hour under sustained traffic. `.text()` reads and unread
+clones do not leak; Bun 1.4.0+ fixes the
+underlying bug for all read modes. This fork's model-mapping transform used
+to hit exactly this path via `request.clone().json()`. The fix in
+`packages/providers/src/utils/model-mapping.ts` goes further than avoiding
+`.json()` on a clone: it makes no clone at all — the request body is
+consumed once with `arrayBuffer()` and a fresh `Request` is rebuilt from the
+resulting bytes for forwarding. See
+[`bench/request-clone-json-leak.ts`](../bench/request-clone-json-leak.ts) for
+the measurement harness and mode-by-mode numbers. If RSS growth still
+reproduces on a recent release after ruling this out, report your provider
+mix and an idle-vs-traffic RSS comparison on an issue.
 
 **Solutions**:
 1. Check log file size (auto-rotates at 10MB):
@@ -271,13 +287,28 @@ the issue.
 **Solutions**:
 1. Check current strategy:
    ```bash
-   # Session strategy is the default and only supported strategy
+   curl http://localhost:8080/api/config/strategy
+   # {"strategy":"session"}
    ```
 
-2. Session strategy behavior:
-   - `session`: Maintains 1-hour sessions with individual accounts (default: 3600000ms)
-   - This is the only supported strategy to avoid account bans
-   - Adjust session_duration_ms if needed
+2. Strategy behavior (`packages/core/src/strategy.ts`, `packages/load-balancer/src/strategies/`):
+   - `session` (default): One global sticky session per account, duration `SESSION_DURATION_MS` (default 5 hours / 18000000ms, `TIME_CONSTANTS.ANTHROPIC_SESSION_DURATION_DEFAULT`) — not 1 hour.
+   - `session-affinity`: Independent per-client sticky affinity instead of one shared global session; see "Parallel sessions causing cache misses" below.
+   - `session-drain-soonest`: Opt-in `session-affinity` variant that additionally drains the account with the soonest all-model weekly reset first.
+   - `least-used`: Orders accounts by utilization instead of session stickiness; intended for non-OAuth/API-key pools, not Anthropic OAuth accounts, where per-request spreading risks anti-abuse bans.
+   - Full descriptions and use cases: [`docs/configuration.md`](configuration.md#load-balancing-strategy).
+
+### Parallel Sessions Causing Cache Misses
+
+**Symptom**: Running multiple concurrent Claude Code sessions (or other concurrent clients) against the same account pool causes prompt-cache misses and uneven load, because the default `session` strategy pins one global active account per pool — every concurrent session competes for the same single sticky slot instead of getting its own.
+
+**Solution**: Switch to `session-affinity`, which keys stickiness per client session id (`metadata.user_id`) instead of one shared global session, so each concurrent client keeps its own sticky account and prompt-cache locality:
+```bash
+curl -X POST http://localhost:8080/api/config/strategy \
+  -H "Content-Type: application/json" \
+  -d '{"strategy":"session-affinity"}'
+```
+Or set `LB_STRATEGY=session-affinity` / `"lb_strategy": "session-affinity"` in the config file. See `packages/load-balancer/src/strategies/session-affinity.ts` and [`docs/routing-architecture.md`](routing-architecture.md#session-affinity-sessionaffinitystrategy) for the full selection flow.
 
 ## Configuration Problems
 
@@ -726,9 +757,9 @@ grep "\[Server\]" /tmp/better-ccflare-logs/app.log
 **Meaning**: Unknown load balancing strategy specified
 
 **Solutions**:
-1. Only valid strategy: `session`
+1. Valid strategies: `session` (default), `session-affinity`, `session-drain-soonest`, `least-used` — see [`docs/configuration.md`](configuration.md#load-balancing-strategy)
 2. Check spelling in config or environment variable
-3. The default is already `session`
+3. If unset, the default is `session`
 
 ### HTTP Status Codes
 
@@ -787,11 +818,11 @@ grep "\[Server\]" /tmp/better-ccflare-logs/app.log
 |----------|-------------|---------|---------|
 | `CLIENT_ID` | OAuth client ID for Anthropic | None | `my-oauth-client-id` |
 | `PORT` | Server port | 8080 | `3000` |
-| `LB_STRATEGY` | Load balancing strategy | `session` | Only `session` is supported |
+| `LB_STRATEGY` | Load balancing strategy | `session` | `session`, `session-affinity`, `session-drain-soonest`, or `least-used` |
 | `RETRY_ATTEMPTS` | Number of retry attempts | 3 | `5` |
 | `RETRY_DELAY_MS` | Initial retry delay in ms | 1000 | `500` |
 | `RETRY_BACKOFF` | Retry backoff multiplier | 2 | `1.5` |
-| `SESSION_DURATION_MS` | Session duration for session strategy | 3600000 (1 hour) | `1800000` |
+| `SESSION_DURATION_MS` | Session duration for session/session-affinity/session-drain-soonest strategies | 18000000 (5 hours) | `1800000` |
 
 ### Paths and Storage
 
@@ -907,7 +938,7 @@ Expected response:
 
 **A**: Best practices for rate limit handling:
 1. Add multiple accounts to your pool
-2. Maintain proper session duration (default 1 hour)
+2. Maintain proper session duration (default 5 hours; `SESSION_DURATION_MS`)
 3. Monitor rate limit warnings in logs
 4. Set up alerts for rate-limited accounts
 5. Consider implementing request queuing in your application
@@ -1119,6 +1150,6 @@ When experiencing issues, check these in order:
 | Port in use | Use different port: `PORT=3000 bun start` |
 | Config corrupted | Reset config: `rm ~/.config/better-ccflare/better-ccflare.json` |
 | Analytics missing | Clear history: `better-ccflare --clear-history` |
-| Slow responses | Check session duration settings (default 1 hour) |
+| Slow responses | Check session duration settings (default 5 hours) |
 
 Remember: Most issues can be resolved by checking logs, verifying account status, and ensuring proper network connectivity. When in doubt, restart the service with debug logging enabled: `better-ccflare_DEBUG=1 LOG_LEVEL=DEBUG bun start`

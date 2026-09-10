@@ -328,7 +328,7 @@ An agent's effective model can be influenced through two independent mechanisms,
 
 ### 4. Load Balancer Package (`packages/load-balancer`)
 
-Implements the session-based load balancing strategy:
+Implements the pluggable `LoadBalancingStrategy` interface and its four concrete strategies (detailed below). The diagram shows the interface plus the default `SessionStrategy` implementation as a representative example — `SessionAffinityStrategy`, `SessionDrainSoonestStrategy`, and `LeastUsedStrategy` implement the same interface:
 
 ```mermaid
 classDiagram
@@ -360,14 +360,16 @@ classDiagram
     SessionStrategy ..> StrategyStore : uses
 ```
 
-**Session Strategy:**
-- **Session**: The only available strategy, maintains sticky sessions for a configured duration (default 5 hours)
-- Minimizes account switching to avoid triggering Claude's anti-abuse systems
-- Automatically handles failover when the active session account becomes unavailable
-- Tracks session start time and request count per session
-- **Usage Window Alignment**: Sessions automatically align with Anthropic OAuth usage window resets for optimal resource utilization
+**Load Balancing Strategies:**
 
-**Note:** Other strategies (round-robin, least-requests, weighted) were removed from the codebase as they could trigger account bans.
+This fork implements four selectable strategies (`packages/core/src/strategy.ts`, `packages/load-balancer/src/strategies/`), all documented for operators in [`docs/configuration.md`](configuration.md#load-balancing-strategy):
+
+- **`session`** (default): Maintains one global sticky session for a configured duration (default 5 hours, `TIME_CONSTANTS.ANTHROPIC_SESSION_DURATION_DEFAULT`). Minimizes account switching to avoid triggering Claude's anti-abuse systems, automatically handles failover when the active session account becomes unavailable, and aligns sessions with Anthropic OAuth usage window resets for optimal resource utilization.
+- **`session-affinity`**: Maintains independent, per-client sticky affinity (keyed by client session id) instead of one shared global active account, while preserving automatic failover and session expiry — needed when multiple concurrent clients/sessions must route consistently without contending over a single session slot.
+- **`session-drain-soonest`**: An opt-in `session-affinity` variant (`packages/load-balancer/src/strategies/session-drain-soonest.ts`) that additionally ranks fresh-assignment/failover candidates by earliest known future all-model weekly reset, so weekly capacity gets consumed before it expires, while still preserving per-client/lane stickiness.
+- **`least-used`**: Orders available accounts by effective utilization rather than maintaining sticky OAuth sessions. Intended for API-key and compatible-provider pools where per-request spreading is acceptable — not for Anthropic OAuth accounts, where it can trigger anti-abuse systems.
+
+Round-robin, least-requests, and weighted strategies were removed from the original upstream codebase because per-request spreading across Anthropic OAuth accounts could trigger account bans; the strategies above replace them with session-based (and opt-in utilization-based) alternatives instead.
 
 ### 5. Provider Package (`packages/providers`)
 
