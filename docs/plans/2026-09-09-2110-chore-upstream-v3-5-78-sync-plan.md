@@ -4,7 +4,7 @@ type: chore
 date: 2026-09-09
 deepened: 2026-09-09
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: requirements-only
+artifact_readiness: implementation-ready
 product_contract_source: ce-plan-bootstrap
 execution: code
 tracking_issue: "https://github.com/StartupBros-com/better-ccflare/issues/338"
@@ -126,7 +126,7 @@ Before generation, verify that the canonical release tag still resolves to that 
 ### Key Technical Decisions
 
 - KTD1. **Preserve genuine upstream ancestry.** Under R1 and R2, retain one real two-parent integration commit whose ordered parents are the recorded fork parent and exact release target. Semantic resolutions and later fixes may be descendants. A squash of the integration that loses target reachability is not an acceptable closeout. Follow `docs/solutions/workflow-issues/authenticate-upstream-sync-closeout.md`. (session-settled: user-approved — chosen over cherry-pick-only replay: future syncs need an authentic common ancestor.)
-- KTD2. **Extend the existing ledger only where required for exclusions.** Under R15 and R16, add a versioned exclusion/derivation contract to `scripts/verify-upstream-sync-ledger.ts`; preserve old inventory compatibility. Construct projected base/fork/target trees from tree-entry metadata, applying the exact normalized exclusion predicate before blob reads, rename detection, or content comparison. Confine content-sensitive derivation to those projections in the existing temporary object store; `merge-tree` has no pathspec option. Record original tree IDs, normalized exclusions and their digest, projected tree IDs, and a digest of retained path/mode/object-ID tuples. Validation independently regenerates that evidence and rejects any missing, added, renamed, or mode-changed permitted entry. Record the tracking issue in the new inventory and render the ledger title from that field; the existing renderer hardcodes issue #260, which is not this packet's owner. Preserve legacy fixture rendering. Original commit/tag identities remain the ancestry authority; projected identities are only derivation evidence. Do not run the current unrestricted generator on this release.
+- KTD2. **Extend the existing ledger only where required for exclusions.** Under R15 and R16, add a versioned exclusion/derivation contract to `scripts/verify-upstream-sync-ledger.ts`; preserve old inventory compatibility. Construct projected base/fork/target trees from tree-entry metadata, applying the exact normalized exclusion predicate before blob reads, rename detection, or content comparison. Confine content-sensitive derivation to those projections in the existing temporary object store; `merge-tree` has no pathspec option. Record original tree IDs, normalized exclusions and their digest, projected tree IDs, and a digest of retained path/mode/object-ID tuples. Validation independently regenerates that evidence and rejects any missing, added, renamed, or mode-changed permitted entry. Record the tracking issue in the new inventory and render the ledger title from that field; the existing renderer hardcodes issue #260, which is not this packet's owner. Preserve legacy fixture rendering. Original commit/tag identities remain the ancestry authority; projected identities are only derivation evidence. At merge construction and final reviewed-descendant validation, compare each excluded entry's presence, path, mode, and object ID with the fork parent using tree metadata only. Any addition, removal, rename, mode change, or object change fails closeout. Preserve those original entry tuples without reading their blobs; an unexpected excluded-file change stops integration rather than triggering an automatic file rewrite. Do not run the current unrestricted generator on this release.
 - KTD3. **One audit row per intent, conflict, clean shared path, and applied rerere resolution.** Under R1 and R16, reuse the existing inventory's dispositions, typed evidence catalog, focused packet, combined-diff review, dependencies, and reviewer fields. Proposed mappings in the Appendix are not acceptance evidence. `already-superseded` requires refreshed-main evidence plus a behavioral oracle.
 - KTD4. **Stamp every reset writer through the shared persistence boundary where possible.** Under R4 and R14, add `rate_limit_reset_at` to all fresh/upgrade schemas and compose timestamp stamping with existing monotonic and account-generation predicates. Clearing compares the expected reset and requires the stored write time to precede the poll observation strictly; legacy null timestamps retain upstream compatibility. Clear value and timestamp together. Do not weaken guards while consolidating callers.
 - KTD5. **Keep the existing proxy as retry authority.** Under R3 and R6, integrate reset-less 529, Zai 1305, recognized organization-permission failure, and rejected-continuation recovery through existing attempt reservations, provider bindings, and exact-owner disposal. Zai inspection adopts the release's 4 KiB/500 ms bounds and JSON error-code predicate. A peek cannot acquire abort authority over a live sibling response or create an uncounted send.
@@ -136,7 +136,10 @@ Before generation, verify that the canonical release tag still resolves to that 
 - KTD9. **Adapt parser intent without replacing the fork's resource bounds.** Under R9, retain `SseFrameBuffer` limits and the no-clone body-transform path. Implement multiline data joining and event/data reconciliation where needed by native continuation and live translation. Do not silently change the reusable first-match helper's contract for unrelated callers. A complete final frame without a trailing separator must be processed; an incomplete frame cannot authorize a checkpoint.
 - KTD10. **Model preview uses existing management authorization.** Under R10, retain admin-versus-api-only role behavior and the existing no-key bootstrap policy. Enforce route-level authorization before outbound discovery. Preserve supported private/loopback custom endpoints rather than introduce a network ban in this sync. Keys and endpoint credentials are not returned or logged. Preview data does not establish provider capability or expand candidates.
 - KTD11. **Use executable database suites, not a validation-only rehearsal claim.** Under R14 and R16, create fresh and legacy disposable fixtures for both dialects, execute migration and repository operations, and record restore/old-binary compatibility evidence. `scripts/rehearse-upstream-sync-migrations.ts` validates target safety only and hardcodes a historical manifest; do not claim it executes migration or generalize it merely to make a receipt look green.
-- KTD12. **Release metadata is not a license to roll back fork compatibility.** Under R13, accept the exact upstream package lineage while retaining fork scripts, build-time/runtime Git-SHA identity, newer supported client identities, and dynamic discovery/fallback behavior. Compare scalar changes individually; do not choose either manifest or provider wholesale.
+- KTD12. **Release metadata is not a license to roll back fork compatibility.** Under R13, accept the exact upstream package lineage while retaining fork scripts, build-time/runtime Git-SHA identity, newer supported client identities, and dynamic discovery/fallback behavior. Compare scalar changes individually; do not choose either manifest or provider wholesale. This consumes upstream's already-committed version hunks through the source integration, as the prior sync did; it does not authorize an independent version edit, increment, or publish. Retaining an older package value after importing the newer tag would contradict the source-version gate in `scripts/deploy-ccflare.sh`.
+- KTD13. **Bound continuation retention without rejecting inference.** Under R7 and R9, charge pending and promoted response-ID state to one process-wide budget across both protocol lanes. Initial safety ceilings are 2,048 combined input/output digest items, a 256-byte response ID, 512 KiB of conservatively accounted retained state per checkpoint, and 32 MiB in aggregate. The item ceiling follows the bounded upstream cache observer; the byte ceilings are implementation defaults, not measured RSS guarantees. Check limits before retaining/appending items and include binding strings and container overhead in the charge. Keep existing count/TTL limits as additional ceilings. On overflow, discard that attempt's candidate and record a bounded reason; do not truncate inference input or fail the client request. Release charges exactly once on promotion transfer, replacement, rejection, expiry, eviction, cancellation, and shutdown. (session-settled: user-approved — chosen over unbounded capture: exceeding a retention budget must not exhaust the proxy or break ordinary inference.)
+- KTD14. **Bound model-preview input before parsing.** Under R10, read at most 8 MiB of decoded upstream response bytes before JSON parsing, then accept at most 10,000 unique model IDs of at most 1,024 UTF-8 bytes each. These initial safety ceilings retain ordinary large catalogues without relying on claimed content length. Abort and dispose the exact preview fetch on overflow, return a redacted size-limit outcome, and preserve manual model entry; do not silently return a truncated catalogue. Byte, count, ID-length, and existing time limits all apply independently. (session-settled: user-approved — chosen over an unbounded model-list response: a custom endpoint must not consume arbitrary proxy memory.)
+- KTD15. **Expose preview state to assistive technology.** Under R10, use the existing wizard's component/accessibility conventions for busy state and a scoped live status region. Announce current-generation loading, success, empty/error, and invalidation outcomes without reading credentials aloud or moving keyboard focus. Stale completions must neither update the options nor emit announcements. (session-settled: user-approved — chosen over visual-only status: model discovery must remain understandable to screen-reader users.)
 
 ### High-Level Technical Design
 
@@ -262,19 +265,11 @@ flowchart TB
 - A new versioned exclusion contract is the minimum necessary extension to the existing ledger; a replacement audit system is not warranted.
 - Safe database restore evidence can come from test-owned fixtures without copying or opening the operator's production database.
 
-### Open Questions
+### Sensitive Diagnostics
 
-The technical plan is drafted, but these review additions await one operator confirmation before it is marked implementation-ready.
-They are proposals, not changes already applied to the units.
-
-- **Blocking — final excluded-entry proof:** Add a final-tree path/mode/object-ID equality check against the fork parent for excluded entries, so a clean merge cannot change them outside the projected review surface (U1/U9).
-- **Blocking — continuation retention limits:** Add finite per-checkpoint item/byte limits and an aggregate retained-state budget, covering pending and promoted candidates; exceeding the budget disables capture rather than failing inference (U5).
-- **Blocking — model-preview size limits:** Add a streaming byte limit before JSON parsing, model-count and identifier-length limits, and abort-on-limit tests while retaining supported private endpoints (U7).
-- **Deferred until U7 — accessible preview status:** Add busy/live-status semantics and component assertions for asynchronous preview loading, success, failure, and invalidation.
-
-The review also noted that stable content digests are not anonymization.
-Upstream telemetry is opt-in, private-file-only, and bounded; journals must remain sensitive metadata rather than public support attachments.
-Replacing stable digests with per-process keyed digests would change cross-restart correlation and is not part of the current proposal.
+Stable content digests are not anonymization.
+Under R8 and R13, preserve upstream telemetry's opt-in, private-file-only, bounded journal behavior; journals remain sensitive metadata rather than public support attachments.
+Replacing stable digests with per-process keyed digests would change cross-restart correlation and is not part of this integration.
 
 ### Sequencing and Shared Ownership
 
@@ -323,6 +318,8 @@ U9 cannot pass until all earlier units and every Appendix cluster have complete 
 5. Legacy fixture inventories retain their prior schema behavior; the new release packet records its derivation version and exclusions.
 6. A reviewer marks a shared path complete without required focused, combined-diff, refreshed-main, or rerere evidence. Final validation rejects the packet.
 7. The issue-338 inventory renders an issue-338 ledger title; legacy issue-260 fixtures retain their original identity.
+8. A clean upstream change, deletion, addition, rename, or mode change at an excluded entry cannot pass final validation; the integration and reviewed descendant must match fork-parent metadata without reading excluded blobs.
+9. A follow-up commit changes an excluded entry after an otherwise valid integration. Final reviewed-descendant validation detects it.
 
 **Verification:** Reproducible safe inventory; original ancestry remains authoritative; synthetic negative cases fail for the intended reason; no old release artifact is rewritten.
 
@@ -438,7 +435,7 @@ U9 cannot pass until all earlier units and every Appendix cluster have complete 
 
 **Goal:** Add upstream native and Messages continuation through the fork's attempt and terminal lifecycle.
 
-**Requirements:** R3, R7, R9; KTD5, KTD6, KTD7.
+**Requirements:** R3, R7, R9; KTD5, KTD6, KTD7, KTD13.
 
 **Dependencies:** U1, U4; coordinate serialization/framing changes with U6.
 
@@ -477,6 +474,9 @@ U9 cannot pass until all earlier units and every Appendix cluster have complete 
 9. JSON responses require completed status; HTTP SSE, native Responses, Messages, and any affected WebSocket lane retain their existing semantics.
 10. Completion and `[DONE]` in the same chunk, duplicate markers, illegal same-chunk trailing events, and a partial trailing frame exercise the buffered handoff, not only future reads.
 11. Handoff failure retains old cleanup; successful handoff permits only the new owner to read/release/abort. Cancellation, deadline, and late settlement resolve the candidate once and do not emit another request terminal trace.
+12. Oversized response IDs, combined input/output digest arrays, or retained binding metadata exceed the applicable KTD13 limit. Capture is skipped before excess retention, but the client receives ordinary inference output.
+13. Many lanes and pending attempts exhaust the shared retention budget across both protocols. No per-lane allowance bypasses the aggregate cap, and no input is silently truncated.
+14. Promotion transfers rather than duplicates the charge; replacement, rejection, expiry, eviction, cancellation, and shutdown free it exactly once. A later eligible capture succeeds after capacity is released.
 
 **Verification:** Both upstream continuation packets and all fork lineage, abandonment, native routing, and server-tool tests pass; wire-level fixtures prove mode exclusivity and final serialized input, not only internal state flags.
 
@@ -523,7 +523,7 @@ U9 cannot pass until all earlier units and every Appendix cluster have complete 
 
 **Goal:** Add the upstream wizard preview while retaining safe account-backed discovery and management authorization.
 
-**Requirements:** R3, R10, R13; KTD10.
+**Requirements:** R3, R10, R13; KTD10, KTD14, KTD15.
 
 **Dependencies:** U1; reconcile any shared proxy export with U6.
 
@@ -540,7 +540,8 @@ U9 cannot pass until all earlier units and every Appendix cluster have complete 
 1. Keep the fork's current safe Codex discovery and saved-account behavior while adding the upstream unsaved-credential preview.
 2. Verify route-level management authorization before handler dispatch and outbound fetch.
 3. Bind each preview to its start-time credential/endpoint tuple and request generation.
-4. Preserve manual model entry and existing provider-specific model mappings on empty, failed, or stale discovery.
+4. Preserve manual model entry and existing provider-specific model mappings on empty, failed, stale, or size-limited discovery per KTD14.
+5. Expose the existing preview state machine through the wizard's busy/live-status conventions per KTD15, without focus jumps or stale announcements.
 
 **Test scenarios:**
 1. Valid preview returns the expected model list without persisting an account or exposing the submitted credential.
@@ -549,8 +550,11 @@ U9 cannot pass until all earlier units and every Appendix cluster have complete 
 4. Covers AE5. Editing key/endpoint, resetting or cancelling the form, and out-of-order success/error completions cannot restore stale options.
 5. Saved-account discovery retains current Codex physical-model validation and does not widen the root-capable pool or fallback rungs.
 6. Supported private endpoints and manual mapping remain usable; a discovered model does not become routing-authorized solely by appearing in the list.
+7. Excess decoded response bytes, model count, or UTF-8 ID length produce a redacted size-limit outcome and exact-fetch disposal. Missing/false content length and continuously arriving chunks cannot bypass the independent byte/time limits.
+8. Catalogue-limit failures preserve manual entry and never present a truncated list as complete.
+9. Loading exposes busy status; success, empty/error, and invalidation announce only current-generation outcomes. Delayed stale promises produce neither option changes nor live announcements, and focus remains stable.
 
-**Verification:** Both handler and route-auth tests pass; UI race cases exercise delayed promises rather than only synchronous state resets.
+**Verification:** Both handler and route-auth tests pass; component tests assert accessibility semantics, and delayed-promise race cases prove stale state cannot reappear.
 
 ### U8. Catch asynchronous alert failures at callback boundaries
 
@@ -629,7 +633,8 @@ The following gates apply to the eventual integrated candidate, not to the plann
 | Changed caller contracts | Text-safe caller searches and manual mock/barrel review, including test files excluded from TypeScript | U3–U7 |
 | Negative oracles | Removal of same-ms CAS guard; bypassed route/commit guard; dual continuation restoration; premature checkpoint promotion; reintroduced cloning; api-only preview fetch; unhandled alert rejection | Relevant unit |
 | Integration review | Both-parent review for conflicts and clean shared paths; accepted reviewer and authoritative rerere capture | U9 |
-| Final authenticity | Existing ledger `check` path extended per KTD2; exact ordered parents, target reachability, evidence dependencies, and clean-clone replay | U9 |
+| Final authenticity | Existing ledger `check` path extended per KTD2; exact ordered parents, target reachability, fork-parent equality of excluded entry metadata in the integration and reviewed descendant, evidence dependencies, and clean-clone replay | U9 |
+| Approved resource and accessibility safeguards | KTD13 retention accounting/overflow/release cases; KTD14 pre-parse byte and normalized-result limits; KTD15 busy/live-status and stale-announcement assertions | U5, U7, U9 |
 
 Tests use fixtures or local servers and test-owned databases.
 Do not use an ambient `DATABASE_URL`, open/copy the production database, probe real Anthropic accounts, or treat the validation-only migration script as executable evidence.
