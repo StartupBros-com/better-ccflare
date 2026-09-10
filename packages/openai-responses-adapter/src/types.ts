@@ -97,12 +97,24 @@ export interface CustomToolCallItem {
 	id?: string;
 	call_id: string;
 	name: string;
-	arguments: string;
+	// Unlike function_call, a custom tool call's payload field is `input`, not
+	// `arguments` — and it is a raw freeform string (the model's freeform-
+	// grammar output for the tool), never a JSON-arguments string. Do not
+	// rename this to `arguments` to "match" FunctionCallItem; that mismatch
+	// previously caused `item.arguments` to read `undefined` here and get
+	// silently discarded. See OpenAI's ResponseCustomToolCall.input.
+	input: string;
 }
 
 export interface CustomToolCallOutputItem {
 	type: "custom_tool_call_output";
 	call_id: string;
+	// Real OpenAI shape (ResponseCustomToolCallOutput.output) is
+	// `string | Array<ResponseInputText | ResponseInputImage | ResponseInputFile>`.
+	// Only the string case is modeled/handled here; the array case would need
+	// its own content-block mapping into Anthropic's tool_result shape, which
+	// is out of scope for this fix (would mean adding real custom-tool
+	// support, not just fixing a field-name mismatch).
 	output: string;
 }
 

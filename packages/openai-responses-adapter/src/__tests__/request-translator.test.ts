@@ -515,7 +515,13 @@ describe("translateRequestToAnthropic", () => {
 		expect(toolUse.input).toEqual({});
 	});
 
-	test("custom_tool_call appended like function_call", () => {
+	test("custom_tool_call preserves its raw freeform input string (not JSON arguments)", () => {
+		// A custom_tool_call's payload field is `input` (a raw freeform-grammar
+		// string), never `arguments` — that field only exists on function_call.
+		// Using a non-JSON string here is deliberate: a real custom tool call's
+		// input is not JSON, so a fix that quietly ran it through the
+		// JSON-arguments parser would still silently lose the content (falling
+		// back to `{}` on the parse failure) even after the field-name fix.
 		const req: ResponsesRequest = {
 			model: "claude-3-5-sonnet-20241022",
 			input: [
@@ -523,7 +529,7 @@ describe("translateRequestToAnthropic", () => {
 					type: "custom_tool_call",
 					call_id: "call_custom",
 					name: "custom_fn",
-					arguments: '{"a":1}',
+					input: "echo hello && exit 0",
 				},
 			],
 		};
@@ -532,7 +538,7 @@ describe("translateRequestToAnthropic", () => {
 			type: "tool_use",
 			id: "call_custom",
 			name: "custom_fn",
-			input: { a: 1 },
+			input: { input: "echo hello && exit 0" },
 		});
 	});
 
@@ -2020,7 +2026,7 @@ describe("translateRequestToAnthropic", () => {
 					type: "custom_tool_call",
 					call_id: "call:1",
 					name: "two",
-					arguments: "{}",
+					input: "",
 				},
 				{ type: "function_call_output", call_id: "call:1", output: "first" },
 				{

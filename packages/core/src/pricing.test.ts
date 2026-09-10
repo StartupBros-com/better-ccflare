@@ -192,7 +192,15 @@ describe("models.dev pricing", () => {
 });
 
 describe("NanoGPT Pricing", () => {
+	// Several tests below assign `global.fetch = vi.fn(...)` directly rather
+	// than via `vi.spyOn`, so `vi.restoreAllMocks()` below does not undo that
+	// assignment — capture/restore it explicitly per test, matching the
+	// "models.dev pricing" describe block above, so a leaked mock never
+	// survives into the next test or the next describe block in this file.
+	let originalFetch: typeof global.fetch;
+
 	beforeEach(() => {
+		originalFetch = global.fetch;
 		// Clear any existing intervals
 		stopNanoGPTPricingRefresh();
 		// Reset the global cache state to ensure test isolation
@@ -203,6 +211,7 @@ describe("NanoGPT Pricing", () => {
 	});
 
 	afterEach(() => {
+		global.fetch = originalFetch;
 		// Stop any intervals after each test
 		stopNanoGPTPricingRefresh();
 		// Reset the global cache state to ensure test isolation
