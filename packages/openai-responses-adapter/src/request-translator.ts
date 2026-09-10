@@ -473,11 +473,27 @@ export function translateRequestToAnthropic(
 				continue;
 			}
 			consumedCallIds.add(toolUseId);
+			// function_call.arguments is a JSON-arguments string (parse it into
+			// the object it represents). custom_tool_call.input is a raw
+			// freeform string (the model's freeform-grammar output, not JSON) —
+			// Anthropic's tool_use.input must be an object, so wrap the raw
+			// string under a stable `input` key rather than JSON.parse-ing text
+			// that usually isn't JSON. This fork doesn't declare custom tools
+			// yet (translateTools drops non-function tool types), so no code
+			// path builds one of these from a live model turn today; this only
+			// affects history replay of an item recorded by a different
+			// backend. The `{ input: <raw string> }` wrapper keeps the raw
+			// content losslessly round-trippable under a name that matches
+			// OpenAI's own field, so future custom-tool support can unwrap it
+			// the same way.
 			const toolUseBlock: AnthropicContent = {
 				type: "tool_use",
 				id: mapToolId(toolUseId),
 				name: item.name,
-				input: parseArguments(item.arguments),
+				input:
+					item.type === "function_call"
+						? parseArguments(item.arguments)
+						: { input: item.input },
 			};
 			appendAssistantBlock(messages, toolUseBlock);
 			continue;
