@@ -120,12 +120,21 @@ describe("issue #273 — Group A: helper contract", () => {
 // This is a census, not a ceiling: a new body-replacing retry legitimately adds
 // a site, and the count moves with it in the same commit. What the guard
 // catches is a site DISAPPEARING (a leak) or being added without the drain.
-// 19 helper invocations: one delegation from discardUpstreamBody plus 18
-// owned-response release sites. The latest two release a prior model-fallback
-// response and a current 529 before a physical-attempt budget veto escapes.
-// This specifically guards outer winner arbitration and request-budget exits
-// from regressing to Bun's ineffective direct body.cancel path.
-const EXPECTED_DRAIN_INVOCATION_COUNT = 19;
+// 20 helper invocations: one delegation from discardUpstreamBody plus 19
+// owned-response release sites. The latest (added with Zai in-stream 1305
+// overload detection) mirrors the pre-existing 529 veto-catch pattern:
+// discards the current raw response before a physical-attempt budget veto
+// escapes the 1305 in-place retry loop. Two other new discard calls in that
+// same retry loop (the superseded response before each retry send, and the
+// final unresolved response before it is replaced by a synthetic 429 for
+// model-cycling fallback) intentionally use non-literal local variable names
+// (`previousRawResponse` / `exhaustedRawResponse`) rather than `rawResponse`
+// and so do not match this census's literal-argument regex — they are real
+// drain-backed release sites, just not ones this particular text-pattern
+// census can see. This specifically guards outer winner arbitration and
+// request-budget exits from regressing to Bun's ineffective direct
+// body.cancel path.
+const EXPECTED_DRAIN_INVOCATION_COUNT = 20;
 
 describe("issue #273 — Group B: call-site coverage in proxy-operations.ts", () => {
 	it("proxy-operations.ts has the expected drain-backed helper invocations", () => {

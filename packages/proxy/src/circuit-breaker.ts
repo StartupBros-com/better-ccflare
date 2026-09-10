@@ -249,10 +249,12 @@ export function shouldCountAsCircuitFailure(kind: FailureKind): boolean {
 		case "all_models_exhausted_429":
 		case "upstream_529_overloaded_with_reset":
 		case "upstream_529_overloaded_no_reset":
-		// Account-wide benching reasons: payment-required cooldown and native
-		// xAI capacity 402 both take the whole account out of rotation.
+		// Account-wide benching reasons: payment-required cooldown, native
+		// xAI capacity 402, and an org-wide permission denial all take the
+		// whole account out of rotation.
 		case "upstream_402_payment_required":
 		case "xai_capacity_402":
+		case "org_permission_denied":
 			return true;
 		default:
 			return assertNever(kind);

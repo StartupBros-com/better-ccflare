@@ -28,6 +28,7 @@ import {
 	estimateAnthropicAdmissionTokens,
 	hasDeferredCustomTool,
 	isAnthropicExtraUsageExhausted,
+	isAnthropicOrgPermissionDenied,
 	isAnthropicOutOfCredits,
 	isCodexSubscriptionEndpoint,
 	materializeProviderAttemptPlan,
@@ -179,6 +180,7 @@ import {
 	tryAcquireStaleTokenRefresh,
 	upstreamAuthFailureReason,
 } from "./token-manager";
+import { peekSseForZai1305 } from "./zai-1305";
 
 const log = new Logger("ProxyOperations");
 
@@ -4789,6 +4791,116 @@ export async function proxyWithAccount(
 			currentTransportModel,
 		);
 
+		// Zai reports "service overloaded" (error.code 1305) *inside* a
+		// successful SSE stream: HTTP 200, content-type text/event-stream, and
+		// the error as the first SSE event. Nothing in the status line or
+		// headers marks it a failure, so nothing else in this function would
+		// ever notice — peek the leading bytes (bounded by SSE_PEEK_MAX_BYTES /
+		// SSE_PEEK_TIMEOUT_MS, one peek per physical attempt) and, on a hit,
+		// retry through the same physical-attempt reservation/budget machinery
+		// as the 529 in-place retry below rather than an unauthorized raw
+		// fetch. If every retry is still 1305, convert to a synthetic 429 so
+		// the existing isModelUnavailableError / model-cycling machinery
+		// downstream drives failover — this recurses into a fresh
+		// proxyWithAccount call per model attempt, so this check naturally
+		// runs (and peeks) exactly once per physical attempt with no extra
+		// bookkeeping needed to prevent a double peek.
+		if (
+			!hostedDispatchCommitted() &&
+			!isSyntheticInternal &&
+			!wasProtectedLifecycleForLatestResponse() &&
+			account.provider === "zai" &&
+			rawResponse.status === 200 &&
+			(rawResponse.headers.get("content-type")?.includes("text/event-stream") ??
+				false) &&
+			(await peekSseForZai1305(rawResponse))
+		) {
+			log.warn(
+				`Account ${account.name}: detected 1305 overloaded error in SSE stream, retrying`,
+			);
+			const zaiRetryCfg = getOverloadRetryConfig();
+			let zai1305Unresolved = true;
+			if (zaiRetryCfg.enabled && zaiRetryCfg.maxAttempts > 1) {
+				for (let attempt = 1; attempt < zaiRetryCfg.maxAttempts; attempt++) {
+					try {
+						routingAttemptLedger?.assertPhysicalAttemptAvailable(
+							physicalAttemptVetoContext(),
+						);
+					} catch (error) {
+						// Mirrors the 529 loop's veto-catch below: the current raw
+						// response is local ownership and cannot be seen by any
+						// terminalizer once the budget veto crosses this account seam.
+						await discardUpstreamBody(rawResponse);
+						throw error;
+					}
+					const zaiRetryTransport = retryTransformedTemplate.clone();
+					const zaiDegradedReservation = reservePhysicalSend(
+						zaiRetryTransport,
+						currentTransportModel,
+						rawResponse,
+					);
+					const zaiCap = Math.min(
+						zaiRetryCfg.baseMs * 2 ** attempt,
+						zaiRetryCfg.maxMs,
+					);
+					const zaiDelayMs = Math.random() * zaiCap;
+					try {
+						await new Promise<void>((resolve) =>
+							setTimeout(resolve, zaiDelayMs),
+						);
+					} catch (error) {
+						cancelPhysicalSendReservation(zaiDegradedReservation);
+						throw error;
+					}
+					log.info(
+						`Account ${account.name}: 1305 in-place retry ${attempt}/${zaiRetryCfg.maxAttempts - 1} after ${Math.round(zaiDelayMs)}ms for zai overloaded stream`,
+					);
+					commitPhysicalSendReservation(zaiDegradedReservation, rawResponse);
+					const previousRawResponse = rawResponse;
+					await discardUpstreamBody(previousRawResponse);
+					rawResponse = await executeCacheAwareProviderAttempt(
+						zaiRetryTransport,
+						currentReplayBody,
+						currentCacheIdentityHasCacheControl,
+						currentTransportModel,
+						zaiDegradedReservation,
+					);
+					zai1305Unresolved =
+						rawResponse.status === 200 &&
+						(rawResponse.headers
+							.get("content-type")
+							?.includes("text/event-stream") ??
+							false) &&
+						(await peekSseForZai1305(rawResponse));
+					if (!zai1305Unresolved) {
+						log.info(
+							`Account ${account.name}: 1305 resolved on retry ${attempt}`,
+						);
+						break;
+					}
+				}
+			}
+			if (zai1305Unresolved) {
+				log.warn(
+					`Account ${account.name}: 1305 retries exhausted (or disabled), converting to synthetic 429 for model fallback`,
+				);
+				const exhaustedRawResponse = rawResponse;
+				rawResponse = new Response(
+					JSON.stringify({
+						error: {
+							type: "overloaded_error",
+							message: "ZAI service overloaded (1305)",
+						},
+					}),
+					{
+						status: 429,
+						headers: { "content-type": "application/json" },
+					},
+				);
+				await discardUpstreamBody(exhaustedRawResponse);
+			}
+		}
+
 		// Check if this is a Claude provider and we got an invalid thinking signature error
 		if (
 			!hostedDispatchCommitted() &&
@@ -5116,6 +5228,101 @@ export async function proxyWithAccount(
 				log.warn("Failed to retry without cache_control:", err);
 			}
 		}
+
+		/**
+		 * Anthropic answers 403 `permission_error` when an account's ORGANIZATION
+		 * forbids the request — OAuth disabled org-wide, Claude Code subscription
+		 * access turned off by an admin — not a per-account quota problem. The
+		 * account cannot serve ANY request until someone changes a setting
+		 * upstream, so like handlePaymentRequired402 below it is benched
+		 * account-wide and the request fails over without model cycling (cycling
+		 * models would just re-earn the same organization-level rejection on
+		 * every one of them). isAnthropicOrgPermissionDenied is narrowed to the
+		 * one known error_code (or no error_code at all); an unrecognized
+		 * error_code, a non-JSON 403 (edge/WAF block page), or any other 403
+		 * keeps today's pass-through behavior untouched.
+		 *
+		 * POOL-WIDE DRAIN CAVEAT: if every account in the pool belongs to the
+		 * same org and that org has disabled access, every account benches in
+		 * turn and the pool goes fully dark — bench, cooldown expiry,
+		 * single-flight probe, re-bench, repeat — until an admin changes the
+		 * org setting. There is no pool-wide/provider-wide circuit here, only
+		 * this per-account exponential cooldown, so nothing short-circuits that
+		 * loop early. The warn log below fires on every account as it benches,
+		 * so an "all accounts benched with org_permission_denied" pattern across
+		 * the pool in a short window is the signal to look for when debugging a
+		 * fully-dark pool.
+		 */
+		const handleOrgPermissionDenied403 = async (
+			failureResponse: Response,
+			attemptedModel = currentTransportModel || effectiveBodyContext.getModel(),
+		): Promise<RawAttemptFailureClassification | null> => {
+			if (failureResponse.status !== 403 || !isClaudeProvider) return null;
+			// Passed un-cloned on purpose: the predicate clones internally and
+			// never consumes its argument, so wrapping it in another clone here
+			// would strand a tee branch for every non-matching 403 (issue #356).
+			if (!(await isAnthropicOrgPermissionDenied(failureResponse))) return null;
+			const reason = "org_permission_denied";
+			const cooldownBefore = captureCooldownState(account);
+			// No reset hint exists for this condition (unlike a 402/429 with a
+			// resend-after header), so no resetTime is passed — the exponential
+			// backoff in applyRateLimitCooldownInMemory is what governs the bench
+			// duration. Awaited (not fire-and-forget) for the same R9 reason as
+			// handlePaymentRequired402 below: failover selection reads fresh
+			// account state from the DB, and a fast follow-up request must not
+			// race ahead of this write.
+			await applyRateLimitCooldownAwaitingPersist(account, { reason }, ctx);
+			const accountBenched = appliedCooldown(account, cooldownBefore);
+			const routeSuppressed = routingAttemptLedger !== undefined;
+			routingAttemptLedger?.blockAccount(account.id);
+			recordRequestRateLimitOutcome(req, {
+				accountId: account.id,
+				status: 403,
+				scope: "account",
+				family: attemptedModel ? getModelFamily(attemptedModel) : null,
+				attemptedModel,
+				reason,
+				availableAt: null,
+			});
+			log.warn(
+				`Account ${account.name} org_permission_denied (403${attemptedModel ? `, model=${attemptedModel}` : ""}) — ` +
+					"organization forbids OAuth/Claude Code access for this account; " +
+					"benching account and failing over to next account",
+			);
+			recordRoutingAttempt({
+				parentRequestId: requestMeta.id,
+				timestamp: Date.now(),
+				provider: account.provider,
+				accountId: account.id,
+				attemptedModel: attemptedModel,
+				modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
+				statusCode: 403,
+				reason,
+				upstreamEvidence: await captureSanitizedUpstreamEvidence(
+					ctx,
+					failureResponse,
+					{
+						consumeOriginalBody: true,
+					},
+				),
+				scope: "account",
+				availableAt: null,
+				failoverAttempts,
+				physicalAttempt:
+					routingAttemptLedger && routingAttemptLedger.physicalAttemptCount > 0
+						? routingAttemptLedger.physicalAttemptCount
+						: null,
+				accountBenched,
+				routeSuppressed,
+				circuitCounted: false,
+			});
+			return {
+				scope: "account",
+				attemptedModel,
+				family: attemptedModel ? getModelFamily(attemptedModel) : null,
+				stopAccountAttempt: true,
+			};
+		};
 
 		/**
 		 * HTTP 402 is an account-specific billing/credit failure, not a model
@@ -5656,6 +5863,7 @@ export async function proxyWithAccount(
 		): Promise<RawAttemptFailureClassification> => {
 			const classification =
 				(await handleExtraUsageExhausted400(failureResponse, attemptedModel)) ??
+				(await handleOrgPermissionDenied403(failureResponse, attemptedModel)) ??
 				(await handlePaymentRequired402(failureResponse, attemptedModel)) ??
 				(await handleExactModel429(failureResponse, attemptedModel)) ??
 				(await handleScopedAnthropic429(failureResponse, attemptedModel));
@@ -6544,7 +6752,13 @@ export async function proxyWithAccount(
 			// disposed of — one orphan per 529, plus one per in-place retry
 			// below. See issue #354.
 			const rlInfo = attemptPlan.parseRateLimit(response);
-			if (rlInfo.isRateLimited && !rlInfo.resetTime) {
+			// Do NOT gate on rlInfo.isRateLimited: providers such as
+			// ZaiProvider.parseRateLimit only classify isRateLimited=true for a
+			// 429, so on a 529 it always answers false and this whole branch
+			// was dead for zai-shaped accounts — the very overload case it
+			// exists for. We are already inside `status === 529`; resetTime
+			// alone decides in-place retry vs. cooldown.
+			if (!rlInfo.resetTime) {
 				const retryCfg = getOverloadRetryConfig();
 				if (retryCfg.enabled && retryCfg.maxAttempts > 1) {
 					for (let attempt = 1; attempt < retryCfg.maxAttempts; attempt++) {
@@ -6729,8 +6943,13 @@ export async function proxyWithAccount(
 
 						// Header-only read, see the note on the first parseRateLimit
 						// call above — the retry response must not be teed either.
+						// Same reason as the entry guard above: isRateLimited is
+						// always false here for zai-shaped providers, so this broke
+						// out after a single retry and silently capped the budget
+						// at 1. Status is known to be 529 here (checked below);
+						// only a reset hint stops the loop.
 						const retryRlInfo = attemptPlan.parseRateLimit(retryResponse);
-						if (!retryRlInfo.isRateLimited || retryRlInfo.resetTime) {
+						if (retryRlInfo.resetTime) {
 							// Got a reset hint on retry — stop; let processProxyResponse apply cooldown
 							break;
 						}

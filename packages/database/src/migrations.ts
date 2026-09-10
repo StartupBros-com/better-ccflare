@@ -1630,6 +1630,26 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		"append_order",
 	);
 
+	// SQLite stores a table's CREATE TABLE text verbatim in sqlite_master, so
+	// an existing routing_attempts table whose reason CHECK predates a newly
+	// added allowlisted reason (e.g. org_permission_denied) still contains
+	// the OLD literal list here — it will not match the current fragment
+	// ensureRoutingAttemptsSchema() would render today. A fresh install's
+	// table already contains the current fragment at creation time, so this
+	// is a true no-op for it.
+	const routingAttemptsTableSql =
+		(
+			db
+				.query(
+					"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'routing_attempts'",
+				)
+				.get() as { sql: string } | null
+		)?.sql ?? "";
+	const routingAttemptsReasonConstraintCurrent =
+		routingAttemptsTableSql.includes(
+			`CHECK (reason IN (${ROUTING_ATTEMPT_REASON_SQL}))`,
+		);
+
 	const refreshTokenCol = accountsInfo.find(
 		(col) => col.name === "refresh_token",
 	);
@@ -1647,7 +1667,8 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		(refreshTokenCol && refreshTokenCol.notnull === 1) ||
 		finalAccountsColumnNames.includes("account_tier") ||
 		finalOAuthColumnNames.includes("tier") ||
-		!usageSnapshotsHasAppendOrder;
+		!usageSnapshotsHasAppendOrder ||
+		!routingAttemptsReasonConstraintCurrent;
 
 	// Create backup before *destructive* schema modifications only.
 	if (willMutate && dbPath && dbPath !== "") {
@@ -1768,6 +1789,75 @@ export function runMigrations(db: Database, dbPath?: string): void {
 				`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_ts ON usage_snapshots(timestamp)`,
 			).run();
 			log.info("Added durable append order to usage snapshots");
+		}
+		if (!routingAttemptsReasonConstraintCurrent) {
+			// SQLite cannot ALTER a CHECK constraint in place, so rebuild the
+			// table with the current allowlist. By this point in runMigrations
+			// the additive ALTER TABLE ADD COLUMN calls above (upstream_evidence,
+			// route_fallback_rung, route_candidate_id) have already run, so an
+			// upgrading table already has every current column — only the
+			// reason CHECK is stale. Copying in rowid order preserves every
+			// existing row's values and relative append order; there are no
+			// foreign keys into or out of this table to worry about.
+			db.prepare(`
+				CREATE TABLE routing_attempts_new (
+					id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 128),
+					parent_request_id TEXT NOT NULL CHECK (length(parent_request_id) BETWEEN 1 AND 128),
+					timestamp INTEGER NOT NULL CHECK (timestamp >= 0),
+					provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 128),
+					account_id TEXT NOT NULL CHECK (length(account_id) BETWEEN 1 AND 256),
+					attempted_model TEXT CHECK (attempted_model IS NULL OR length(attempted_model) BETWEEN 1 AND 512),
+					model_family TEXT CHECK (model_family IS NULL OR length(model_family) BETWEEN 1 AND 128),
+					status_code INTEGER NOT NULL CHECK (status_code BETWEEN 100 AND 599),
+					reason TEXT NOT NULL CHECK (reason IN (${ROUTING_ATTEMPT_REASON_SQL})),
+					scope TEXT NOT NULL CHECK (scope IN ('account', 'family', 'model', 'request')),
+					available_at INTEGER CHECK (available_at IS NULL OR available_at >= 0),
+					failover_attempts INTEGER NOT NULL CHECK (failover_attempts >= 0),
+					physical_attempt INTEGER CHECK (physical_attempt IS NULL OR physical_attempt >= 1),
+					account_benched INTEGER NOT NULL CHECK (account_benched IN (0, 1)),
+					route_suppressed INTEGER NOT NULL CHECK (route_suppressed IN (0, 1)),
+					circuit_counted INTEGER NOT NULL CHECK (circuit_counted IN (0, 1)),
+					upstream_evidence TEXT CHECK (upstream_evidence IS NULL OR length(upstream_evidence) <= 2048),
+					route_fallback_rung TEXT,
+					route_candidate_id TEXT
+				)
+			`).run();
+			db.prepare(`
+				INSERT INTO routing_attempts_new
+					(id, parent_request_id, timestamp, provider, account_id, attempted_model,
+					 model_family, status_code, reason, scope, available_at, failover_attempts,
+					 physical_attempt, account_benched, route_suppressed, circuit_counted,
+					 upstream_evidence, route_fallback_rung, route_candidate_id)
+				SELECT id, parent_request_id, timestamp, provider, account_id, attempted_model,
+					model_family, status_code, reason, scope, available_at, failover_attempts,
+					physical_attempt, account_benched, route_suppressed, circuit_counted,
+					upstream_evidence, route_fallback_rung, route_candidate_id
+				FROM routing_attempts
+				ORDER BY rowid ASC
+			`).run();
+			db.prepare("DROP TABLE routing_attempts").run();
+			db.prepare(
+				"ALTER TABLE routing_attempts_new RENAME TO routing_attempts",
+			).run();
+			db.prepare(
+				`CREATE INDEX IF NOT EXISTS idx_routing_attempts_timestamp
+				 ON routing_attempts(timestamp DESC, id DESC)`,
+			).run();
+			db.prepare(
+				`CREATE INDEX IF NOT EXISTS idx_routing_attempts_parent_timestamp
+				 ON routing_attempts(parent_request_id, timestamp ASC, id ASC)`,
+			).run();
+			db.prepare(
+				`CREATE INDEX IF NOT EXISTS idx_routing_attempts_reason_scope_timestamp
+				 ON routing_attempts(reason, scope, timestamp DESC)`,
+			).run();
+			db.prepare(
+				`CREATE INDEX IF NOT EXISTS idx_routing_attempts_account_timestamp
+				 ON routing_attempts(account_id, timestamp DESC)`,
+			).run();
+			log.info(
+				"Rebuilt routing_attempts reason constraint to include the current allowlist",
+			);
 		}
 		if (!comboFamilyAssignmentColumnNames.includes("membership_mode")) {
 			db.prepare(

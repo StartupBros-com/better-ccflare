@@ -14,6 +14,7 @@ export const ROUTING_ATTEMPT_REASONS = [
 	"upstream_529_overloaded_with_reset",
 	"upstream_529_overloaded_no_reset",
 	"all_models_exhausted_429",
+	"org_permission_denied",
 ] as const satisfies readonly RateLimitReason[];
 
 export type RoutingAttemptReason = (typeof ROUTING_ATTEMPT_REASONS)[number];

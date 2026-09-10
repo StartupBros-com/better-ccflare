@@ -1,6 +1,12 @@
 import { Logger } from "@better-ccflare/logger";
 import type { BunSqlAdapter } from "./adapters/bun-sql-adapter";
-import { ROUTING_ATTEMPT_REASON_SQL } from "./routing-attempt-taxonomy";
+// Separate import statement (rather than merging into the one above) so the
+// exact single-symbol import text stays intact for the SQLite/PostgreSQL
+// migration-parity check in routing-attempt-migrations.test.ts.
+import {
+	ROUTING_ATTEMPT_REASON_SQL,
+	ROUTING_ATTEMPT_REASONS,
+} from "./routing-attempt-taxonomy";
 
 const log = new Logger("DatabaseMigrations-PG");
 
@@ -497,6 +503,73 @@ async function ensureRoutingAttemptsSchemaPg(
 	await adapter.unsafe(
 		`CREATE INDEX IF NOT EXISTS idx_routing_attempts_account_timestamp
 		 ON routing_attempts(account_id, timestamp DESC)`,
+	);
+}
+
+/** Name Postgres itself would assign to an unnamed column-level CHECK on
+ * `routing_attempts.reason` (verified: `<table>_<column>_check`). Naming it
+ * explicitly here lets the upgrade path DROP/ADD it deterministically without
+ * depending on that naming convention holding for the fresh-install
+ * CREATE TABLE above, which still declares the CHECK inline/unnamed. */
+const ROUTING_ATTEMPTS_REASON_CONSTRAINT_NAME = "routing_attempts_reason_check";
+
+/**
+ * Report whether an existing `routing_attempts` table's reason CHECK
+ * constraint already allows exactly the current `ROUTING_ATTEMPT_REASONS`
+ * set.
+ *
+ * PostgreSQL rewrites a `CHECK (col IN (...))` constraint into a canonical
+ * `col = ANY (ARRAY[...])` form internally, so `pg_get_constraintdef` never
+ * returns the original `IN (...)` source text verbatim — comparing against
+ * the literal CREATE TABLE fragment would never match, even immediately
+ * after creation. Instead this extracts the quoted string literals from the
+ * canonical definition and compares that set to the current allowlist,
+ * which is robust to the rewrite and to formatting/version differences.
+ */
+async function routingAttemptsReasonConstraintIsCurrentPg(
+	adapter: BunSqlAdapter,
+): Promise<boolean> {
+	const row = await adapter.get<{ definition: string }>(
+		`SELECT pg_get_constraintdef(oid) AS definition
+		 FROM pg_constraint
+		 WHERE conrelid = ?::regclass AND conname = ?`,
+		["routing_attempts", ROUTING_ATTEMPTS_REASON_CONSTRAINT_NAME],
+	);
+	if (!row) return false;
+	const currentReasons = Array.from(row.definition.matchAll(/'([^']*)'/g)).map(
+		(match) => match[1],
+	);
+	return (
+		currentReasons.length === ROUTING_ATTEMPT_REASONS.length &&
+		ROUTING_ATTEMPT_REASONS.every((reason) => currentReasons.includes(reason))
+	);
+}
+
+/**
+ * Bring an existing `routing_attempts` table's reason CHECK constraint up to
+ * the current `ROUTING_ATTEMPT_REASONS` allowlist. Unlike SQLite, PostgreSQL
+ * can alter a CHECK constraint without rebuilding the table: drop the named
+ * constraint (if present) and re-add it with the current allowlist. This is
+ * a superset upgrade only — every previously-allowed reason stays allowed —
+ * so re-validating existing rows against the new constraint always succeeds
+ * without a `NOT VALID` escape hatch. Idempotent: no-ops once the
+ * constraint already matches, so it never runs on a table already at the
+ * current allowlist (including every fresh install).
+ */
+async function ensureRoutingAttemptsReasonConstraintPg(
+	adapter: BunSqlAdapter,
+): Promise<void> {
+	if (await routingAttemptsReasonConstraintIsCurrentPg(adapter)) {
+		return;
+	}
+	await adapter.unsafe(
+		`ALTER TABLE routing_attempts DROP CONSTRAINT IF EXISTS ${ROUTING_ATTEMPTS_REASON_CONSTRAINT_NAME}`,
+	);
+	await adapter.unsafe(
+		`ALTER TABLE routing_attempts ADD CONSTRAINT ${ROUTING_ATTEMPTS_REASON_CONSTRAINT_NAME} CHECK (reason IN (${ROUTING_ATTEMPT_REASON_SQL}))`,
+	);
+	log.info(
+		"Upgraded routing_attempts reason constraint to the current allowlist",
 	);
 }
 
@@ -1470,6 +1543,12 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 	// Repair an interrupted additive routing-attempt migration independently.
 	await ensureRoutingAttemptsSchemaPg(adapter);
+	// Bring an existing table's reason CHECK constraint up to the current
+	// allowlist. `CREATE TABLE IF NOT EXISTS` above only takes effect for a
+	// brand-new table, so an existing routing_attempts predating a newly
+	// added reason keeps its old constraint and rejects the new reason at
+	// insert time until this runs.
+	await ensureRoutingAttemptsReasonConstraintPg(adapter);
 
 	// The turn observation column below carries a foreign key to the new
 	// registry tables, so legacy upgrades must create the recorder tables before
