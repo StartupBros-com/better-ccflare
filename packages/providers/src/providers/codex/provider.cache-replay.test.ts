@@ -239,6 +239,7 @@ type CodexProviderInternalsForTest = {
 		model: string,
 		callerDigestArg: string | null,
 		sessionIdentity: string | null,
+		protocol: "native-responses" | "messages",
 	) => string;
 	sweepCodexResponseIdState: () => void;
 };
@@ -663,6 +664,7 @@ describe("CodexProvider KTD6 defect fix: LRU-cap eviction preserves lane generat
 			physicalModel,
 			callerDigest,
 			sessionIdentity,
+			"native-responses",
 		);
 		const seedEntry = internals(provider).responseIdLanes.get(laneKeyX);
 		expect(seedEntry?.generation).toBe(1);
@@ -892,6 +894,7 @@ describe("CodexProvider KTD6 defect fix: LRU-cap eviction preserves lane generat
 				physicalModel,
 				callerDigest,
 				sessionIdentity,
+				"native-responses",
 			);
 			expect(internals(provider).responseIdLanes.has(laneKey)).toBe(true);
 

@@ -33,6 +33,7 @@ import {
 	isAnthropicExtraUsageExhausted,
 	isAnthropicOrgPermissionDenied,
 	isAnthropicOutOfCredits,
+	isCodexResponseIdRejectionError,
 	isCodexSubscriptionEndpoint,
 	materializeProviderAttemptPlan,
 	materializeProviderServerToolCapabilityDecision,
@@ -3411,7 +3412,8 @@ export async function proxyWithAccount(
 				| "cache_lane_rescue"
 				| "precommit_sse_retry"
 				| "account_failover"
-				| "other_retry",
+				| "other_retry"
+				| "continuation_repair_retry",
 			finalModel?: string,
 		) => {
 			if (attemptPlan.providerName !== "codex") return;
@@ -5258,6 +5260,83 @@ export async function proxyWithAccount(
 			} catch (err) {
 				if (isAttemptControlError(err)) throw err;
 				log.warn("Failed to retry without cache_control:", err);
+			}
+		}
+
+		// Behavior 2 (KTD6/KTD13 rejected-id repair): upstream can reject the
+		// gateway-supplied previous_response_id with a recognized 400/404
+		// naming that exact field. Repair AT MOST ONCE per lane: remove the
+		// rejected id, suppress turn-state (via the dedicated
+		// "continuation_repair_retry" attemptCause, self-suppressed in
+		// turn-state.ts's RESCUE_CAUSES), and resend full history on the SAME
+		// authorized account and physical model through this exact shared
+		// physical-send boundary, consuming one physical-attempt budget slot
+		// (transportAttemptOrdinal, via stampCodexAttempt below).
+		// `prepareCodexResponseIdRejectionRepair` drains the rejected
+		// response through its exact owner and retires/suppresses the lane
+		// BEFORE this block ever sends the retry, so a generic 400/404, a
+		// malformed error, a budget veto (never staged as response-id-owned
+		// in the first place), or a second rejection on an already-suppressed
+		// lane all correctly perform no repair.
+		if (
+			!hostedDispatchCommitted() &&
+			attemptPlan.providerName === "codex" &&
+			(await isCodexResponseIdRejectionError(
+				rawResponse,
+				readAttemptBoundJson,
+			)) &&
+			provider.prepareCodexResponseIdRejectionRepair?.(
+				currentTransportAttemptId,
+			)
+		) {
+			// Retiring the lane (done by prepareCodexResponseIdRejectionRepair in
+			// the condition above) is the unconditional half and the half that
+			// matters for correctness: a rejected checkpoint must never be
+			// offered again, or every later turn on this lane re-earns the same
+			// rejection. The full-history resend is the conditional half — it
+			// can only replay a body this request actually buffered, exactly as
+			// the sibling 529 and precommit-rescue retries below require. With
+			// no buffered body there is nothing to resend, and a bodyless
+			// request would drop the whole conversation instead of repairing it,
+			// so leave the rejection to normal error handling with the lane
+			// already retired.
+			const repairReplayBody = currentReplayBody;
+			if (repairReplayBody) {
+				log.info(
+					`Codex rejected previous_response_id for account=${account.name} model=${transformedModel}, retrying once with full history`,
+				);
+				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
+				const retryHeaders = new Headers(providerRequest.headers);
+				stampCodexAttempt(retryHeaders, "continuation_repair_retry");
+				const retrySourceInit: RequestInit & { duplex?: "half" } = {
+					method: providerRequest.method,
+					headers: retryHeaders,
+					body: new Uint8Array(repairReplayBody),
+					duplex: "half",
+				};
+				const retrySource = new Request(providerRequest.url, retrySourceInit);
+				retrySourceRequest = retrySource.clone();
+				let retryTransformed = await transformWithCurrentAttemptPlan(
+					attemptPlan,
+					retrySource,
+				);
+				retryTransformed = await enforcePhysicalModelAfterTransform(
+					retryTransformed,
+					currentTransportModel,
+				);
+				retryTransformedTemplate = retryTransformed.clone();
+				const retryTransport = retryTransformedTemplate.clone();
+				rawResponse = await executeCacheAwareProviderAttempt(
+					retryTransport,
+					repairReplayBody,
+					currentCacheIdentityHasCacheControl,
+					currentTransportModel,
+				);
+			} else {
+				log.warn(
+					`Codex rejected previous_response_id for account=${account.name} model=${transformedModel}; retired the lane without a repair retry (no buffered replay body)`,
+				);
 			}
 		}
 

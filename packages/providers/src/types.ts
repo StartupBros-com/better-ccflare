@@ -285,6 +285,21 @@ export interface Provider {
 	): void;
 
 	/**
+	 * Optional: Behavior 2 (Codex rejected-id repair). Called immediately
+	 * after a recognized rejected-`previous_response_id` classification and
+	 * strictly BEFORE dispatching the one-shot full-history repair retry
+	 * through the shared physical-send boundary. Confirms the physical
+	 * attempt was actually response-id-owned with a real (non-cold)
+	 * continuation, drains it through the provider's own owner choke point,
+	 * retires the rejected lane's checkpoint, and suppresses repeated repair
+	 * on that lane. Returns true iff a repair retry is warranted. Providers
+	 * that hold no response-id continuation state omit it.
+	 */
+	prepareCodexResponseIdRejectionRepair?(
+		attemptId: string | null | undefined,
+	): boolean;
+
+	/**
 	 * Optional: Pre-process the request before building URL
 	 * This allows providers to extract information from the request body
 	 * before buildUrl is called (e.g., for including model in URL path)

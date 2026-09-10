@@ -40,6 +40,7 @@ export {
 	fetchCodexUsageOnDemand,
 	getCodexExplicitCacheBreakpointSuppressionCount,
 	isCodexExplicitCacheBreakpointSuppressed,
+	isCodexResponseIdRejectionError,
 	isCodexSubscriptionEndpoint,
 	mapWhamUsageResponse,
 	parseCodexUsageHeaders,

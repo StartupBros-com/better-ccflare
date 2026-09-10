@@ -110,7 +110,8 @@ export type CodexTurnStateAttemptCause =
 	| "cache_lane_rescue"
 	| "precommit_sse_retry"
 	| "account_failover"
-	| "other_retry";
+	| "other_retry"
+	| "continuation_repair_retry";
 
 export type CodexTurnStateLineage =
 	| { readonly kind: "none" }
@@ -500,6 +501,11 @@ const COMPATIBLE_RETRY_CAUSES = new Set<CodexTurnStateAttemptCause>([
 const RESCUE_CAUSES = new Set<CodexTurnStateAttemptCause>([
 	"cache_lane_rescue",
 	"precommit_sse_retry",
+	// Behavior 2 (rejected-id repair): the repair retry must never register,
+	// replay, or capture turn-state -- it reuses "rescue_suppressed" exactly
+	// like the two causes above rather than a new action, so no exhaustiveness
+	// cross-check (trace.ts/analyze-trace.ts) needs updating for it.
+	"continuation_repair_retry",
 ]);
 const FAILOVER_CAUSES = new Set<CodexTurnStateAttemptCause>([
 	"account_failover",

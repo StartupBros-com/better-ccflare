@@ -33,6 +33,7 @@ export {
 	deriveCodexExplicitBreakpointBucket,
 	getCodexExplicitCacheBreakpointSuppressionCount,
 	isCodexExplicitCacheBreakpointSuppressed,
+	isCodexResponseIdRejectionError,
 	isCodexSubscriptionEndpoint,
 	readCodexCacheKeyContinuityPercent,
 	readCodexCacheKeyPrefixShardPercent,

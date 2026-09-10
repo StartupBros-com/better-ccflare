@@ -1132,13 +1132,44 @@ export const CODEX_NATIVE_RESPONSES_HEADER =
 export const CODEX_AUTHENTICATED_CALLER_HEADER =
 	"x-better-ccflare-authenticated-caller";
 
+/**
+ * Behavior 1 (Messages-lane continuation): default-OFF gate. Nothing on the
+ * plain Claude Messages lane (a request that did NOT arrive through the
+ * trusted Responses adapter, i.e. `!nativeResponses`) may become
+ * response-id-owned unless this env var is exactly "1". Mirrors upstream
+ * 99f5dce0's own env var name.
+ */
+export const CODEX_MESSAGES_CONTINUATION_ENV =
+	"CCFLARE_CODEX_MESSAGES_CONTINUATION";
+/**
+ * Optional comma-separated allowlist of physical Codex models admitted to
+ * Behavior 1. Undefined means "all models admitted" (once the flag above is
+ * on); an empty string admits none, matching upstream's own
+ * `undefined || list.includes(model)` semantics exactly (an empty string
+ * splits to `[""]`, which never matches a real model id).
+ */
+export const CODEX_MESSAGES_CONTINUATION_MODELS_ENV =
+	"CCFLARE_CODEX_MESSAGES_CONTINUATION_MODELS";
+
 type CodexContinuationOwner = "response-id" | "turn-state" | "none";
+/** Protocol lane discriminator, hashed into every response-id lane key so a
+ * native-Responses checkpoint and a Messages-lane checkpoint can never be
+ * reachable from one another, even for an identical account/model/caller/
+ * session tuple. */
+type CodexResponseIdProtocol = "native-responses" | "messages";
 
 /** KTD13: shared cross-lane retention ceilings. */
 const CODEX_RESPONSE_ID_MAX_DIGEST_ITEMS = 2_048;
 const CODEX_RESPONSE_ID_MAX_ID_BYTES = 256;
 const CODEX_RESPONSE_ID_MAX_CHECKPOINT_BYTES = 512 * 1_024;
-const CODEX_RESPONSE_ID_MAX_AGGREGATE_BYTES = 32 * 1_024 * 1_024;
+/**
+ * Exported (not just module-private) so
+ * provider.response-id-rejection-repair.test.ts's budget-exhaustion proof can
+ * assert the veto boundary it discovers by genuinely charging the real
+ * aggregate ceiling instead of duplicating this number as an untracked
+ * magic-number copy.
+ */
+export const CODEX_RESPONSE_ID_MAX_AGGREGATE_BYTES = 32 * 1_024 * 1_024;
 /**
  * Additional ceilings, on top of the byte/item budget above. Exported (not
  * just module-private) so provider.cache-replay.test.ts's KTD6
@@ -1151,8 +1182,12 @@ export const CODEX_RESPONSE_ID_MAX_LANES = 2_048;
 const CODEX_RESPONSE_ID_MAX_PENDING_ATTEMPTS = 4_096;
 export const CODEX_RESPONSE_ID_PENDING_TTL_MS =
 	CODEX_STREAM_DRAIN_DEADLINE_MS * 4;
-/** Per-lane suppression window after a recognized rejected-id repair. */
-const _CODEX_RESPONSE_ID_REJECTED_TTL_MS = 5 * 60 * 1_000;
+/**
+ * Behavior 2 (rejected-id repair): per-lane suppression window after a
+ * recognized rejected-id repair. Exported so tests can fast-forward past it
+ * deterministically instead of duplicating the magic number.
+ */
+export const CODEX_RESPONSE_ID_REJECTED_TTL_MS = 5 * 60 * 1_000;
 /** Approximate per-entry container overhead charged alongside digest bytes. */
 const CODEX_RESPONSE_ID_ENTRY_OVERHEAD_BYTES = 16;
 
@@ -1187,6 +1222,14 @@ interface CodexPendingResponseIdCandidate {
 	configDigest: string;
 	chargedBytes: number;
 	ts: number;
+	/**
+	 * True iff this attempt actually carried a `previous_response_id` (a
+	 * prefix-match hit against committed lane state), false for a cold send.
+	 * Behavior 2 (rejected-id repair) must never fire for a cold send: it
+	 * never sent a `previous_response_id`, so a rejection naming that field
+	 * cannot legitimately apply to it.
+	 */
+	continued: boolean;
 }
 
 /** Deep-sorts object keys so digest input is stable regardless of key order. */
@@ -1357,6 +1400,41 @@ function estimateCodexResponseIdCharge(
 	}
 	if (bytes > CODEX_RESPONSE_ID_MAX_CHECKPOINT_BYTES) return null;
 	return bytes;
+}
+
+/**
+ * Behavior 2 (rejected-id repair) classifier: detects a recognized upstream
+ * rejection of the gateway-supplied `previous_response_id` -- a 400/404
+ * naming that exact field, matching the same error shapes upstream 99f5dce0
+ * recognizes (`previous_response_not_found` / `invalid_previous_response_id`
+ * error codes, or `param === "previous_response_id"` with
+ * `type === "invalid_request_error"`). Pure and stateless: never mutates any
+ * continuation state. A caller must still gate the actual repair on
+ * `CodexProvider.prepareCodexResponseIdRejectionRepair` returning `true`
+ * before dispatching a retry -- this function alone never confirms the
+ * attempt was response-id-owned, so a generic 400/404 that happens to
+ * mention that field on a turn-state-owned or cold attempt is correctly
+ * refused downstream instead of here.
+ */
+export async function isCodexResponseIdRejectionError(
+	response: Response,
+	readJson: (response: Response) => Promise<unknown | null>,
+): Promise<boolean> {
+	if (response.status !== 400 && response.status !== 404) return false;
+	const parsed = await readJson(response);
+	if (!parsed || typeof parsed !== "object") return false;
+	const error = (parsed as { error?: unknown }).error;
+	if (!error || typeof error !== "object") return false;
+	const { code, param, type } = error as {
+		code?: unknown;
+		param?: unknown;
+		type?: unknown;
+	};
+	return (
+		code === "previous_response_not_found" ||
+		code === "invalid_previous_response_id" ||
+		(param === "previous_response_id" && type === "invalid_request_error")
+	);
 }
 
 /**
@@ -1604,6 +1682,7 @@ export class CodexProvider extends BaseProvider {
 		model: string,
 		callerDigest: string | null,
 		sessionIdentity: string | null,
+		protocol: CodexResponseIdProtocol,
 	): string {
 		return createHash("sha256")
 			.update(
@@ -1612,6 +1691,7 @@ export class CodexProvider extends BaseProvider {
 					model,
 					callerDigest,
 					sessionIdentity,
+					protocol,
 				}),
 			)
 			.digest("hex");
@@ -1643,6 +1723,15 @@ export class CodexProvider extends BaseProvider {
 	private selectCodexResponseIdOwner(params: {
 		nativeResponses: boolean;
 		continuationOptIn: boolean;
+		/**
+		 * Behavior 1 (Messages-lane continuation): true iff
+		 * `CCFLARE_CODEX_MESSAGES_CONTINUATION=1` (and, when set, the optional
+		 * model allowlist admits this physical model) for a request that did
+		 * NOT arrive through the trusted Responses adapter. Only ever
+		 * consulted when `!nativeResponses`; a native-Responses attempt is
+		 * gated exclusively by `continuationOptIn` as before.
+		 */
+		messagesLaneAdmitted: boolean;
 		hosted: boolean;
 		customToolsDeclared: boolean;
 		accountId: string | undefined;
@@ -1654,6 +1743,7 @@ export class CodexProvider extends BaseProvider {
 		const {
 			nativeResponses,
 			continuationOptIn,
+			messagesLaneAdmitted,
 			hosted,
 			customToolsDeclared,
 			accountId,
@@ -1662,9 +1752,13 @@ export class CodexProvider extends BaseProvider {
 			callerDigest,
 			sessionIdentity,
 		} = params;
+		// Exactly one lane can be eligible for a given attempt: the trusted
+		// native Responses lane (server-verified header + explicit client
+		// opt-in) or the plain Messages lane (server-verified ABSENCE of that
+		// header + the default-OFF env flag, and optional model filter).
+		const eligible = nativeResponses ? continuationOptIn : messagesLaneAdmitted;
 		if (
-			!nativeResponses ||
-			!continuationOptIn ||
+			!eligible ||
 			!attemptId ||
 			hosted ||
 			// A request declaring a custom (non-function) tool takes the raw
@@ -1679,6 +1773,9 @@ export class CodexProvider extends BaseProvider {
 		) {
 			return false;
 		}
+		const protocol: CodexResponseIdProtocol = nativeResponses
+			? "native-responses"
+			: "messages";
 		// Digested *after* full conversion (Skill-nudge appends included), so
 		// the fork's converted-tail safeguard is naturally preserved: a
 		// response-id continuation always carries whatever the wire will
@@ -1690,6 +1787,7 @@ export class CodexProvider extends BaseProvider {
 			codexBody.model,
 			callerDigest,
 			sessionIdentity,
+			protocol,
 		);
 		const rejectedUntil = this.responseIdRejectedLanes.get(lane);
 		if (rejectedUntil && rejectedUntil > Date.now()) return false;
@@ -1739,7 +1837,65 @@ export class CodexProvider extends BaseProvider {
 			configDigest,
 			chargedBytes: chargeEstimate,
 			ts: Date.now(),
+			continued: matchedPrefixLength > 0,
 		});
+		return true;
+	}
+
+	/**
+	 * Behavior 2 (rejected-id repair): must be called by proxy-operations.ts's
+	 * shared physical-send boundary immediately after
+	 * `isCodexResponseIdRejectionError` has classified the raw upstream
+	 * response as a recognized rejection of the gateway-supplied
+	 * `previous_response_id`, and strictly BEFORE dispatching the one-shot
+	 * full-history repair retry.
+	 *
+	 * Confirms this exact physical attempt was actually response-id-owned
+	 * with a real (non-cold) continuation -- a cold send never carried a
+	 * `previous_response_id`, so a rejection naming that field cannot
+	 * legitimately apply to it, and no repair is warranted -- then:
+	 *  1. Drains the rejected attempt through the exact KTD13 owner choke
+	 *     point (`releaseCodexResponseIdAttempt`), matching every other
+	 *     non-promoting exit from this engine.
+	 *  2. Retires the rejected lane's checkpoint: `state` is cleared (a
+	 *     tombstone, `generation` preserved) exactly like TTL/LRU eviction in
+	 *     `sweepCodexResponseIdState`, so no stale checkpoint can ever be
+	 *     reused by a later attempt on this lane.
+	 *  3. Populates `responseIdRejectedLanes` so `selectCodexResponseIdOwner`
+	 *     refuses response-id ownership on this lane for
+	 *     `CODEX_RESPONSE_ID_REJECTED_TTL_MS` -- the existing (previously
+	 *     unwired) suppression gate this method activates. A second
+	 *     rejection therefore can never trigger a second repair: the retry
+	 *     that follows a `true` return here is sent with no
+	 *     `previous_response_id` at all (full history, cold), and if upstream
+	 *     rejects THAT attempt too, no continuation was ever staged for it,
+	 *     so this method returns `false` and no further repair is attempted.
+	 *
+	 * Idempotent for a repeated call with the same `attemptId`: the second
+	 * call's `pendingResponseIdByAttempt` lookup misses because the first
+	 * call already drained it, so it returns `false` without mutating
+	 * anything further.
+	 */
+	prepareCodexResponseIdRejectionRepair(
+		attemptId: string | null | undefined,
+	): boolean {
+		if (!attemptId) return false;
+		const owner = this.continuationOwnerByAttempt.get(attemptId);
+		if (!owner || owner.owner !== "response-id") return false;
+		const pending = this.pendingResponseIdByAttempt.get(attemptId);
+		if (!pending?.continued) return false;
+		const lane = pending.lane;
+		this.releaseCodexResponseIdAttempt(attemptId);
+		const laneEntry = this.responseIdLanes.get(lane);
+		if (laneEntry?.state) {
+			this.releaseCodexResponseIdBytes(laneEntry.state.chargedBytes);
+			laneEntry.state = undefined;
+			laneEntry.tombstonedAt = Date.now();
+		}
+		this.responseIdRejectedLanes.set(
+			lane,
+			Date.now() + CODEX_RESPONSE_ID_REJECTED_TTL_MS,
+		);
 		return true;
 	}
 
@@ -2517,24 +2673,38 @@ export class CodexProvider extends BaseProvider {
 					(item) => (item as { type?: string }).type === "additional_tools",
 				);
 			// KTD6: resolve the single continuation owner for this physical
-			// attempt before CodexTurnStateCoordinator.beginAttempt runs. Only a
-			// server-verified native-Responses request (see prepareAttemptHeaders
-			// in proxy-operations.ts) with an explicit client opt-in
-			// (`continuation_strategy: "previous_response_id"`, carried only
-			// through the already-trust-gated passthrough carrier) is eligible;
-			// everything else falls through to the fork's own turn-state
-			// mechanism unchanged.
+			// attempt before CodexTurnStateCoordinator.beginAttempt runs. Either
+			// a server-verified native-Responses request (see
+			// prepareAttemptHeaders in proxy-operations.ts) with an explicit
+			// client opt-in (`continuation_strategy: "previous_response_id"`,
+			// carried only through the already-trust-gated passthrough
+			// carrier), or -- Behavior 1 -- a plain Claude Messages request
+			// (server-verified ABSENCE of the native-Responses header) with
+			// the default-OFF CCFLARE_CODEX_MESSAGES_CONTINUATION=1 env flag
+			// (and optional model allowlist) is eligible; everything else
+			// falls through to the fork's own turn-state mechanism unchanged.
 			this.sweepCodexResponseIdState();
 			const nativeResponses =
 				request.headers.get(CODEX_NATIVE_RESPONSES_HEADER) === "1";
 			const continuationOptIn =
 				passthrough?.continuation_strategy === "previous_response_id";
+			const messagesContinuationModels =
+				process.env[CODEX_MESSAGES_CONTINUATION_MODELS_ENV];
+			const messagesLaneAdmitted =
+				!nativeResponses &&
+				process.env[CODEX_MESSAGES_CONTINUATION_ENV] === "1" &&
+				(messagesContinuationModels === undefined ||
+					messagesContinuationModels
+						.split(",")
+						.map((model) => model.trim())
+						.includes(codexBody.model));
 			const sessionIdentity =
 				cacheKeyDecision.selectedConversationIdentity ??
 				cacheKeyDecision.conversationIdentity;
 			const responseIdOwns = this.selectCodexResponseIdOwner({
 				nativeResponses,
 				continuationOptIn,
+				messagesLaneAdmitted,
 				hosted: options.hosted === true,
 				customToolsDeclared: hasCustomTools,
 				accountId: account?.id,
