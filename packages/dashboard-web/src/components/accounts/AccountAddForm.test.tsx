@@ -162,4 +162,38 @@ describe("AccountAddForm provider contracts", () => {
 		expect(fableLabels).toBe(opusLabels);
 		expect(source).toContain('fableModel: ""');
 	});
+
+	it("keeps model preview status scoped, live, and credential-free", () => {
+		expect(source).toContain('id="openai-model-preview-status"');
+		expect(source).toContain('role="status"');
+		expect(source).toContain('aria-live="polite"');
+		expect(source).toContain('aria-atomic="true"');
+		expect(source).toContain('aria-busy={modelPreviewState === "loading"}');
+		expect(source).not.toContain("preview-secret-key");
+	});
+
+	it("fences delayed preview successes and failures by tuple and generation", () => {
+		expect(source).toContain("previewRequestIdRef.current");
+		expect(source).toContain("requestId !== previewRequestIdRef.current");
+		expect(source).toContain("provider: newAccount.mode");
+		expect(source).toContain("invalidateModelPreview");
+		expect(source).toContain('setModelPreviewState("invalidated")');
+
+		const fetchStart = source.indexOf(
+			"const handleFetchOpenAICompatibleModels = async () => {",
+		);
+		const fetchEnd = source.indexOf("\n\tconst ", fetchStart + 1);
+		const handler = source.slice(fetchStart, fetchEnd);
+		expect(handler.match(/requestId !== previewRequestIdRef\.current/g)).toHaveLength(
+			2,
+		);
+	});
+
+	it("preserves free-text mappings and focus while adding preview suggestions", () => {
+		expect(source).toContain('list="openai-compatible-model-options"');
+		expect(source).toContain('id="openai-compatible-model-options"');
+		expect(source).toContain("previewModels.map");
+		expect(source).not.toContain(".focus(");
+		expect(source).not.toContain("autoFocus");
+	});
 });

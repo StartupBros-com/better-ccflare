@@ -32,6 +32,37 @@ export interface OpenAICompatibleModelListing {
 
 const FETCH_TIMEOUT_MS = 15_000;
 
+/** Hard limits for untrusted OpenAI-compatible model listings. */
+export const OPENAI_COMPATIBLE_MODEL_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+export const OPENAI_COMPATIBLE_MODEL_MAX_UNIQUE_IDS = 10_000;
+export const OPENAI_COMPATIBLE_MODEL_MAX_ID_BYTES = 1_024;
+
+export interface OpenAICompatibleModelPreviewListing {
+	models: OpenAICompatibleModelEntry[];
+	fetchedAt: number;
+	source: "preview";
+}
+
+export type OpenAICompatibleModelDiscoveryErrorKind =
+	| "upstream"
+	| "malformed"
+	| "empty"
+	| "size-limit"
+	| "count-limit"
+	| "id-limit"
+	| "timeout";
+
+/** A credential-free, caller-safe discovery failure. */
+export class OpenAICompatibleModelDiscoveryError extends Error {
+	constructor(
+		public readonly kind: OpenAICompatibleModelDiscoveryErrorKind,
+		message: string,
+	) {
+		super(message);
+		this.name = "OpenAICompatibleModelDiscoveryError";
+	}
+}
+
 /**
  * One active account's cache and request ordering. The object identity is the
  * invalidation fence: clearing removes it from the map, so old requests cannot
@@ -82,19 +113,174 @@ function readCache(
 }
 
 interface OpenAIModelsResponse {
-	data?: Array<{ id?: string }>;
+	data: unknown[];
 }
 
 function normalize(body: OpenAIModelsResponse): OpenAICompatibleModelEntry[] {
 	const seen = new Set<string>();
 	const entries: OpenAICompatibleModelEntry[] = [];
-	for (const raw of body.data ?? []) {
-		const id = typeof raw.id === "string" ? raw.id.trim() : "";
+	const encoder = new TextEncoder();
+	for (const raw of body.data) {
+		if (!raw || typeof raw !== "object") continue;
+		const rawId = (raw as { id?: unknown }).id;
+		const id = typeof rawId === "string" ? rawId.trim() : "";
 		if (!id || seen.has(id)) continue;
+		if (encoder.encode(id).byteLength > OPENAI_COMPATIBLE_MODEL_MAX_ID_BYTES) {
+			throw new OpenAICompatibleModelDiscoveryError(
+				"id-limit",
+				"OpenAI-compatible model discovery contained a model ID over 1,024 UTF-8 bytes",
+			);
+		}
 		seen.add(id);
+		if (seen.size > OPENAI_COMPATIBLE_MODEL_MAX_UNIQUE_IDS) {
+			throw new OpenAICompatibleModelDiscoveryError(
+				"count-limit",
+				"OpenAI-compatible model discovery returned more than 10,000 unique model IDs",
+			);
+		}
 		entries.push({ id, displayName: id });
 	}
 	return entries;
+}
+
+async function cancelBody(response: Response): Promise<void> {
+	try {
+		await response.body?.cancel();
+	} catch {
+		// The body may already be locked or closed. Aborting the fetch is the
+		// remaining disposal signal in that case.
+	}
+}
+
+async function readBoundedResponseBody(
+	response: Response,
+	controller: AbortController,
+): Promise<Uint8Array> {
+	const declaredLength = Number(response.headers.get("content-length"));
+	if (
+		Number.isFinite(declaredLength) &&
+		declaredLength > OPENAI_COMPATIBLE_MODEL_MAX_RESPONSE_BYTES
+	) {
+		controller.abort();
+		await cancelBody(response);
+		throw new OpenAICompatibleModelDiscoveryError(
+			"size-limit",
+			"OpenAI-compatible model discovery response exceeded 8 MiB",
+		);
+	}
+
+	if (!response.body) return new Uint8Array();
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let totalBytes = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			totalBytes += value.byteLength;
+			if (totalBytes > OPENAI_COMPATIBLE_MODEL_MAX_RESPONSE_BYTES) {
+				controller.abort();
+				await reader.cancel();
+				throw new OpenAICompatibleModelDiscoveryError(
+					"size-limit",
+					"OpenAI-compatible model discovery response exceeded 8 MiB",
+				);
+			}
+			chunks.push(value);
+		}
+	} catch (error) {
+		try {
+			await reader.cancel();
+		} catch {
+			// Best-effort disposal after stream errors.
+		}
+		throw error;
+	} finally {
+		reader.releaseLock();
+	}
+
+	const body = new Uint8Array(totalBytes);
+	let offset = 0;
+	for (const chunk of chunks) {
+		body.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return body;
+}
+
+async function fetchModelsFromEndpoint(
+	apiKey: string,
+	endpoint: string,
+): Promise<OpenAICompatibleModelEntry[]> {
+	const url = `${endpoint}${endpoint.endsWith("/v1") ? "" : "/v1"}/models`;
+	const controller = new AbortController();
+	let timedOut = false;
+	const timeout = setTimeout(() => {
+		timedOut = true;
+		controller.abort();
+	}, FETCH_TIMEOUT_MS);
+
+	try {
+		const response = await fetch(url, {
+			method: "GET",
+			headers: {
+				authorization: `Bearer ${apiKey}`,
+				accept: "application/json",
+			},
+			signal: controller.signal,
+		});
+		if (!response.ok) {
+			await cancelBody(response);
+			throw new OpenAICompatibleModelDiscoveryError(
+				"upstream",
+				`OpenAI-compatible model discovery failed with HTTP ${response.status}`,
+			);
+		}
+
+		const bytes = await readBoundedResponseBody(response, controller);
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(new TextDecoder().decode(bytes));
+		} catch {
+			throw new OpenAICompatibleModelDiscoveryError(
+				"malformed",
+				"OpenAI-compatible model discovery returned malformed data",
+			);
+		}
+		if (
+			!parsed ||
+			typeof parsed !== "object" ||
+			!Array.isArray((parsed as { data?: unknown }).data)
+		) {
+			throw new OpenAICompatibleModelDiscoveryError(
+				"malformed",
+				"OpenAI-compatible model discovery returned malformed data",
+			);
+		}
+
+		const models = normalize(parsed as OpenAIModelsResponse);
+		if (models.length === 0) {
+			throw new OpenAICompatibleModelDiscoveryError(
+				"empty",
+				"OpenAI-compatible model discovery returned no usable models",
+			);
+		}
+		return models;
+	} catch (error) {
+		if (timedOut) {
+			throw new OpenAICompatibleModelDiscoveryError(
+				"timeout",
+				"OpenAI-compatible model discovery timed out",
+			);
+		}
+		if (error instanceof OpenAICompatibleModelDiscoveryError) throw error;
+		throw new OpenAICompatibleModelDiscoveryError(
+			"upstream",
+			"OpenAI-compatible model discovery failed",
+		);
+	} finally {
+		clearTimeout(timeout);
+	}
 }
 
 async function fetchLive(
@@ -107,27 +293,19 @@ async function fetchLive(
 	if (!resolvedEndpoint.ok) {
 		throw new Error("no valid endpoint for this account");
 	}
-	const endpoint = resolvedEndpoint.endpoint;
-	const url = `${endpoint}${endpoint.endsWith("/v1") ? "" : "/v1"}/models`;
+	return fetchModelsFromEndpoint(account.api_key, resolvedEndpoint.endpoint);
+}
 
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-	try {
-		const response = await fetch(url, {
-			method: "GET",
-			headers: {
-				authorization: `Bearer ${account.api_key}`,
-				accept: "application/json",
-			},
-			signal: controller.signal,
-		});
-		if (!response.ok) {
-			throw new Error(`HTTP ${response.status}`);
-		}
-		return normalize((await response.json()) as OpenAIModelsResponse);
-	} finally {
-		clearTimeout(timeout);
-	}
+/**
+ * Read models using an unsaved credential tuple. This has deliberately no
+ * account-cache, persistence, or derived-routing-default side effects.
+ */
+export async function fetchOpenAICompatibleModelsPreview(
+	apiKey: string,
+	endpoint: string,
+): Promise<OpenAICompatibleModelPreviewListing> {
+	const models = await fetchModelsFromEndpoint(apiKey, endpoint);
+	return { models, fetchedAt: Date.now(), source: "preview" };
 }
 
 /**

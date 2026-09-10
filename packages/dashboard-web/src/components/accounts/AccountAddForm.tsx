@@ -273,6 +273,56 @@ export function AccountAddForm({
 		AccountRoutingSelection[]
 	>([]);
 	const [routingLoading, setRoutingLoading] = useState(false);
+	/**
+	 * Unsaved-credential model discovery for the openai-compatible wizard step.
+	 * Deliberately separate from routingPreviews/routingSelections above: a
+	 * preview listing is not capability evidence and creates nothing, so it
+	 * must never be conflated with confirmed routing state.
+	 */
+	const [modelPreviewState, setModelPreviewState] = useState<
+		"idle" | "loading" | "success" | "empty" | "error" | "invalidated"
+	>("idle");
+	const [previewModels, setPreviewModels] = useState<
+		{ id: string; displayName: string }[]
+	>([]);
+	const [modelPreviewError, setModelPreviewError] = useState("");
+	// Fences a preview's start-time credential/endpoint/provider tuple and
+	// request generation: an edit, reset, or cancel bumps the generation so a
+	// delayed success or failure from a superseded tuple can never surface.
+	const previewRequestIdRef = useRef(0);
+
+	const invalidateModelPreview = useCallback(() => {
+		previewRequestIdRef.current += 1;
+		setPreviewModels([]);
+		setModelPreviewError("");
+		setModelPreviewState("invalidated");
+	}, []);
+
+	const handleFetchOpenAICompatibleModels = async () => {
+		const requestId = ++previewRequestIdRef.current;
+		const tuple = {
+			apiKey: newAccount.apiKey,
+			endpoint: newAccount.customEndpoint,
+			provider: newAccount.mode,
+		};
+		setModelPreviewState("loading");
+		setModelPreviewError("");
+		try {
+			const result = await api.previewOpenAICompatibleModels(
+				tuple.apiKey,
+				tuple.endpoint,
+			);
+			if (requestId !== previewRequestIdRef.current) return;
+			setPreviewModels(result.models);
+			setModelPreviewState(result.models.length === 0 ? "empty" : "success");
+		} catch (error) {
+			if (requestId !== previewRequestIdRef.current) return;
+			setModelPreviewError(
+				error instanceof Error ? error.message : "Model preview failed",
+			);
+			setModelPreviewState("error");
+		}
+	};
 	const [accountSetupState, setAccountSetupState] = useState(
 		createInitialAccountSetupState,
 	);
@@ -1037,6 +1087,7 @@ export function AccountAddForm({
 		setSessionId("");
 		setRoutingPreviews([]);
 		setRoutingSelections([]);
+		invalidateModelPreview();
 		setNewAccount({
 			name: "",
 			mode: "claude-oauth",
@@ -1076,6 +1127,7 @@ export function AccountAddForm({
 		setSessionId("");
 		setRoutingPreviews([]);
 		setRoutingSelections([]);
+		invalidateModelPreview();
 		setNewAccount({
 			name: "",
 			mode: "claude-oauth",
@@ -1146,7 +1198,10 @@ export function AccountAddForm({
 										| "qwen"
 										| "ollama"
 										| "ollama-cloud",
-								) => setNewAccount({ ...newAccount, mode: value })}
+								) => {
+									invalidateModelPreview();
+									setNewAccount({ ...newAccount, mode: value });
+								}}
 							>
 								<SelectTrigger id="mode">
 									<SelectValue />
@@ -2345,12 +2400,13 @@ export function AccountAddForm({
 										id="apiKey"
 										type="password"
 										value={newAccount.apiKey}
-										onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+										onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+											invalidateModelPreview();
 											setNewAccount({
 												...newAccount,
 												apiKey: (e.target as HTMLInputElement).value,
-											})
-										}
+											});
+										}}
 										placeholder="Enter your API key"
 									/>
 								</div>
@@ -2359,17 +2415,62 @@ export function AccountAddForm({
 									<Input
 										id="endpoint"
 										value={newAccount.customEndpoint}
-										onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+										onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+											invalidateModelPreview();
 											setNewAccount({
 												...newAccount,
 												customEndpoint: (e.target as HTMLInputElement).value,
-											})
-										}
+											});
+										}}
 										placeholder="https://api.openrouter.ai/api/v1"
 									/>
 									<p className="text-xs text-muted-foreground">
 										Enter the base URL for the OpenAI-compatible API
 									</p>
+								</div>
+								<div className="space-y-2">
+									<Button
+										type="button"
+										variant="outline"
+										size="sm"
+										disabled={
+											modelPreviewState === "loading" ||
+											!newAccount.apiKey ||
+											!newAccount.customEndpoint
+										}
+										onClick={() => void handleFetchOpenAICompatibleModels()}
+									>
+										{modelPreviewState === "loading"
+											? "Checking models…"
+											: "Discover models"}
+									</Button>
+									<div
+										id="openai-model-preview-status"
+										role="status"
+										aria-live="polite"
+										aria-atomic="true"
+										aria-busy={modelPreviewState === "loading"}
+										className="text-xs text-muted-foreground"
+									>
+										{modelPreviewState === "loading" &&
+											"Checking which models this endpoint offers…"}
+										{modelPreviewState === "success" &&
+											`Found ${previewModels.length} model${
+												previewModels.length === 1 ? "" : "s"
+											}. Pick one below or type your own.`}
+										{modelPreviewState === "empty" &&
+											"This endpoint did not list any models. You can still enter a model id manually below."}
+										{modelPreviewState === "error" &&
+											(modelPreviewError ||
+												"Could not check this endpoint's models. You can still enter a model id manually below.")}
+									</div>
+									<datalist id="openai-compatible-model-options">
+										{previewModels.map((model) => (
+											<option key={model.id} value={model.id}>
+												{model.displayName}
+											</option>
+										))}
+									</datalist>
 								</div>
 								<div className="space-y-2">
 									<Label>Model Mappings (Optional)</Label>
@@ -2384,6 +2485,7 @@ export function AccountAddForm({
 											</Label>
 											<Input
 												id="opusModel"
+												list="openai-compatible-model-options"
 												value={newAccount.opusModel}
 												onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
 													setNewAccount({
@@ -2401,6 +2503,7 @@ export function AccountAddForm({
 											</Label>
 											<Input
 												id="openAiFableModel"
+												list="openai-compatible-model-options"
 												value={newAccount.fableModel}
 												onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
 													setNewAccount({
@@ -2418,6 +2521,7 @@ export function AccountAddForm({
 											</Label>
 											<Input
 												id="sonnetModel"
+												list="openai-compatible-model-options"
 												value={newAccount.sonnetModel}
 												onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
 													setNewAccount({
@@ -2435,6 +2539,7 @@ export function AccountAddForm({
 											</Label>
 											<Input
 												id="haikuModel"
+												list="openai-compatible-model-options"
 												value={newAccount.haikuModel}
 												onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
 													setNewAccount({

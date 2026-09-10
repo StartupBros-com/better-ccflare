@@ -238,6 +238,24 @@ export interface TokenHealthAccountResponse {
 	data: TokenHealthResponse;
 }
 
+/**
+ * One model an unsaved openai-compatible credential/endpoint tuple can call.
+ * `source` is always "preview": a successful listing is not saved-account
+ * evidence and grants no routing eligibility on its own.
+ */
+export interface OpenAICompatibleModelPreviewEntry {
+	id: string;
+	displayName: string;
+	source: "preview";
+}
+
+export interface OpenAICompatibleModelPreviewResponse {
+	provider: "openai-compatible";
+	source: "preview";
+	models: OpenAICompatibleModelPreviewEntry[];
+	fetchedAt: number;
+}
+
 export interface ReauthNeededResponse {
 	success: boolean;
 	data: {
@@ -1905,6 +1923,41 @@ class API extends HttpClient {
 				error: error instanceof Error ? error.message : String(error),
 				stack: error instanceof Error ? error.stack : undefined,
 			});
+			throw error;
+		}
+	}
+
+	/**
+	 * Lists the models one unsaved openai-compatible apiKey/endpoint tuple can
+	 * call, without saving an account. Never logs the submitted credential or
+	 * endpoint — only the outcome.
+	 */
+	async previewOpenAICompatibleModels(
+		apiKey: string,
+		endpoint: string,
+	): Promise<OpenAICompatibleModelPreviewResponse> {
+		const startTime = Date.now();
+		const url = "/api/models/preview";
+
+		this.logger.debug(`→ POST ${url}`);
+
+		try {
+			const data = await this.post<OpenAICompatibleModelPreviewResponse>(
+				url,
+				{ apiKey, endpoint },
+			);
+			const duration = Date.now() - startTime;
+			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
+			return data;
+		} catch (error) {
+			const duration = Date.now() - startTime;
+			this.logger.error(`✗ POST ${url} - ERROR (${duration}ms)`, {
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
+			if (error instanceof HttpError) {
+				throw new Error(error.message);
+			}
 			throw error;
 		}
 	}
