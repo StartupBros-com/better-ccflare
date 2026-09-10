@@ -581,7 +581,8 @@ export interface RequestRateLimitOutcome {
 	readonly reason:
 		| RateLimitScopeReason
 		| "out_of_credits"
-		| "upstream_402_payment_required";
+		| "upstream_402_payment_required"
+		| "org_permission_denied";
 	readonly availableAt: number | null;
 }
 

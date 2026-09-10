@@ -4,7 +4,9 @@ export {
 	AnthropicProvider,
 	EXTRA_USAGE_EXHAUSTED_REASON,
 	isAnthropicExtraUsageExhausted,
+	isAnthropicOrgPermissionDenied,
 	isAnthropicOutOfCredits,
+	ORG_PERMISSION_DENIED_REASON,
 	OUT_OF_CREDITS_REASON,
 	parseAnthropicRateLimitResetAt,
 } from "./anthropic/index";
@@ -15,11 +17,14 @@ export {
 export { BedrockProvider, parseBedrockConfig } from "./bedrock/index";
 export type { CodexUsageRefreshFetchResult } from "./codex/index";
 export {
+	CODEX_AUTHENTICATED_CALLER_HEADER,
 	CODEX_CACHE_KEY_MODE_ENV,
+	CODEX_CONTINUATION_HEADER,
 	CODEX_CONVERSATION_ID_HEADER,
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV,
 	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
+	CODEX_NATIVE_RESPONSES_HEADER,
 	CODEX_PING_MODEL,
 	CODEX_PROMPT_CACHE_KEY_ENV,
 	CODEX_TURN_STATE_HEADER,
@@ -35,6 +40,7 @@ export {
 	fetchCodexUsageOnDemand,
 	getCodexExplicitCacheBreakpointSuppressionCount,
 	isCodexExplicitCacheBreakpointSuppressed,
+	isCodexResponseIdRejectionError,
 	isCodexSubscriptionEndpoint,
 	mapWhamUsageResponse,
 	parseCodexUsageHeaders,

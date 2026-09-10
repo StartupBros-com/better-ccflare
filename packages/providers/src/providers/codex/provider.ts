@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { getCodexReasoningRetention } from "@better-ccflare/config";
 import {
 	BUFFER_SIZES,
@@ -34,6 +34,10 @@ import type {
 	ServerToolCapabilityTuple,
 	ServerToolRequirements,
 } from "@better-ccflare/types";
+import {
+	RECOVERY_STATUS_EXHAUSTED,
+	RECOVERY_STATUS_HEADER,
+} from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import {
 	registerProviderModelDefaultFactory,
@@ -48,7 +52,9 @@ import type {
 	ProviderServerToolCapabilityContext,
 	ProviderServerToolReplayIssuer,
 	RateLimitInfo,
+	RequestObservation,
 	TokenRefreshResult,
+	UpstreamObservationContext,
 } from "../../types";
 import { CODEX_REASONING_RETENTION_PREFIX } from "../../utils/codex-reasoning-retention";
 import {
@@ -60,6 +66,17 @@ import {
 	getResponseDrainTransport,
 	transferResponseDrainTransport,
 } from "../../utils/stream-drain";
+import {
+	CODEX_CACHE_DIAGNOSTICS_ENV,
+	CodexCacheDiagnostics,
+} from "./cache-diagnostics";
+import {
+	type CacheFacts,
+	cacheDigest,
+	persistCacheTelemetry,
+	sanitizeCacheFacts,
+} from "./cache-telemetry";
+import { observeCodexWire } from "./cache-wire";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
 	deriveConversationIdentity,
@@ -100,6 +117,21 @@ import {
 import { normalizeCodexResponseInputUsage } from "./usage";
 
 const log = new Logger("CodexProvider");
+
+/**
+ * Shared sink for cache-diagnostics lifecycle facts (observer readiness,
+ * sweeps, coverage gaps): logs a bounded, sanitized summary and forwards to
+ * the opt-in private telemetry file. Never throws into the caller -- a
+ * diagnostics failure must not affect the request path.
+ */
+function recordCacheLifecycle(facts: CacheFacts): void {
+	log.info("Codex cache observation lifecycle", sanitizeCacheFacts(facts));
+	persistCacheTelemetry(facts, (dropped) =>
+		log.warn("Codex cache telemetry persistence failure", {
+			dropped_events: dropped,
+		}),
+	);
+}
 
 export { CODEX_LOGICAL_MODEL_FAMILY_HEADER };
 
@@ -160,6 +192,17 @@ export const CODEX_CONVERSATION_ID_HEADER =
 export const CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 /** "conversation" (default) or "session"; see derivePromptCacheKey. */
 export const CODEX_CACHE_KEY_MODE_ENV = "CCFLARE_CODEX_CACHE_KEY_MODE";
+/**
+ * Set to "0" to make Codex's synthetic count_tokens endpoint return a typed
+ * Anthropic-shaped error instead of a character-based estimate. Anthropic-
+ * compatible clients (e.g. Claude Code) already degrade gracefully to a local
+ * estimate on a count_tokens error, so this costs them nothing and lets an
+ * operator fail the route closed on purpose instead of exposing an estimate
+ * that downstream consumers may treat as authoritative. Default behavior is
+ * unchanged.
+ */
+export const CODEX_SYNTHETIC_COUNT_TOKENS_ENV =
+	"CCFLARE_CODEX_SYNTHETIC_COUNT_TOKENS";
 export const CODEX_CACHE_KEY_SESSION_PERCENT_ENV =
 	"CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT";
 export const CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV =
@@ -678,6 +721,12 @@ interface CodexRequest {
 		| { type: "function"; name: string };
 	parallel_tool_calls?: boolean;
 	max_output_tokens?: number;
+	/**
+	 * Only ever set internally from a digest-verified prior response id (see
+	 * `selectCodexContinuationOwner` / KTD6). Never populated from a
+	 * caller-supplied value.
+	 */
+	previous_response_id?: string;
 }
 
 export interface CodexPromptCacheKeyDecision {
@@ -933,6 +982,26 @@ interface StreamState {
 	// One terminal response trace per physical attempt, across every terminal
 	// path (completed, failed, abrupt EOF, read error, downstream cancel).
 	terminalTraceWritten: boolean;
+	/**
+	 * Staged by the "response.completed" case only (never "response.incomplete")
+	 * when this attempt is response-id-owned. Consumed by the tail validator
+	 * after the client-facing stream has already reached its terminal boundary;
+	 * never delays client delivery.
+	 */
+	responseIdTerminal?: { responseId: string; output: unknown[] } | null;
+	/**
+	 * KTD7 tail check: set when a data-bearing SSE frame (or a second
+	 * `[DONE]` marker) is observed either in the SAME chunk after the
+	 * terminal event was already handled (`processEvents`'s frame loop), or
+	 * on a LATER read by the dedicated `runCodexResponseIdTailValidator`
+	 * after a successful move-only handoff. `commitCodexResponseIdCheckpoint`
+	 * discards a staged candidate rather than promoting it when this is set,
+	 * since "exactly one valid completed response ... no other data-bearing
+	 * frame" no longer holds.
+	 */
+	responseIdTailTainted?: boolean;
+	/** Internal bookkeeping for the taint check above: at most one trailing `[DONE]` is expected. */
+	responseIdDoneSeenAfterTerminal?: boolean;
 }
 
 function writeCodexStreamTerminalTrace(
@@ -1071,14 +1140,426 @@ interface CodexProcessResponseOptions {
 	hosted?: boolean;
 }
 
+// ── Native response-id continuation (KTD6/KTD7/KTD13) ───────────────────────
+//
+// A SEPARATE mechanism from the fork's own turn-state continuation
+// (turn-state.ts), scoped to the native Responses protocol lane only (a
+// request that reached this provider through the trusted Responses adapter,
+// see `x-better-ccflare-native-responses` below). Exactly one of
+// {"response-id", "turn-state", "none"} owns a given physical attempt; see
+// `selectCodexContinuationOwner`.
+//
+// Trust boundary: the client's own opt-in header
+// (`x-better-ccflare-codex-continuation: previous_response_id`) is read only
+// by the Responses adapter itself (openai-responses-adapter/src/handler.ts)
+// and carried inside the already-trust-gated
+// `__better_ccflare_codex_passthrough` carrier. A caller-supplied
+// `previous_response_id` value is NEVER consumed -- only an internally
+// computed, digest-verified prior response id may ever populate
+// `codexBody.previous_response_id`.
+
+/** External opt-in header consumed only by the Responses adapter. */
+export const CODEX_CONTINUATION_HEADER = "x-better-ccflare-codex-continuation";
+/**
+ * Internal-only signal, set exclusively by proxy-operations.ts from a
+ * server-verified check (`isResponsesAdapterRequest`), never trusted from a
+ * raw client header. Deleted before any outbound transport.
+ */
+export const CODEX_NATIVE_RESPONSES_HEADER =
+	"x-better-ccflare-native-responses";
+/**
+ * Internal-only caller-identity digest, stamped by proxy-operations.ts from
+ * the already-authenticated API key id for *this* physical request. Never
+ * trusted from a raw client header; deleted before any outbound transport.
+ */
+export const CODEX_AUTHENTICATED_CALLER_HEADER =
+	"x-better-ccflare-authenticated-caller";
+
+/**
+ * Behavior 1 (Messages-lane continuation): default-OFF gate. Nothing on the
+ * plain Claude Messages lane (a request that did NOT arrive through the
+ * trusted Responses adapter, i.e. `!nativeResponses`) may become
+ * response-id-owned unless this env var is exactly "1". Mirrors upstream
+ * 99f5dce0's own env var name.
+ */
+export const CODEX_MESSAGES_CONTINUATION_ENV =
+	"CCFLARE_CODEX_MESSAGES_CONTINUATION";
+/**
+ * Optional comma-separated allowlist of physical Codex models admitted to
+ * Behavior 1. Undefined means "all models admitted" (once the flag above is
+ * on); an empty string admits none, matching upstream's own
+ * `undefined || list.includes(model)` semantics exactly (an empty string
+ * splits to `[""]`, which never matches a real model id).
+ */
+export const CODEX_MESSAGES_CONTINUATION_MODELS_ENV =
+	"CCFLARE_CODEX_MESSAGES_CONTINUATION_MODELS";
+
+type CodexContinuationOwner = "response-id" | "turn-state" | "none";
+/** Protocol lane discriminator, hashed into every response-id lane key so a
+ * native-Responses checkpoint and a Messages-lane checkpoint can never be
+ * reachable from one another, even for an identical account/model/caller/
+ * session tuple. */
+type CodexResponseIdProtocol = "native-responses" | "messages";
+
+/** KTD13: shared cross-lane retention ceilings. */
+const CODEX_RESPONSE_ID_MAX_DIGEST_ITEMS = 2_048;
+const CODEX_RESPONSE_ID_MAX_ID_BYTES = 256;
+const CODEX_RESPONSE_ID_MAX_CHECKPOINT_BYTES = 512 * 1_024;
+/**
+ * Exported (not just module-private) so
+ * provider.response-id-rejection-repair.test.ts's budget-exhaustion proof can
+ * assert the veto boundary it discovers by genuinely charging the real
+ * aggregate ceiling instead of duplicating this number as an untracked
+ * magic-number copy.
+ */
+export const CODEX_RESPONSE_ID_MAX_AGGREGATE_BYTES = 32 * 1_024 * 1_024;
+/**
+ * Additional ceilings, on top of the byte/item budget above. Exported (not
+ * just module-private) so provider.cache-replay.test.ts's KTD6
+ * eviction/tombstone proof-first tests can compute exact fixture sizes and
+ * fast-forward exact TTL/tombstone boundaries instead of duplicating these
+ * numbers as untracked magic-number copies.
+ */
+export const CODEX_RESPONSE_ID_LANE_TTL_MS = 30 * 60 * 1_000;
+export const CODEX_RESPONSE_ID_MAX_LANES = 2_048;
+const CODEX_RESPONSE_ID_MAX_PENDING_ATTEMPTS = 4_096;
+export const CODEX_RESPONSE_ID_PENDING_TTL_MS =
+	CODEX_STREAM_DRAIN_DEADLINE_MS * 4;
+/**
+ * Behavior 2 (rejected-id repair): per-lane suppression window after a
+ * recognized rejected-id repair. Exported so tests can fast-forward past it
+ * deterministically instead of duplicating the magic number.
+ */
+export const CODEX_RESPONSE_ID_REJECTED_TTL_MS = 5 * 60 * 1_000;
+/** Approximate per-entry container overhead charged alongside digest bytes. */
+const CODEX_RESPONSE_ID_ENTRY_OVERHEAD_BYTES = 16;
+
+interface CodexResponseIdLaneState {
+	responseId: string;
+	digests: string[];
+	configDigest: string;
+	expiresAt: number;
+	chargedBytes: number;
+	lastUsedAt: number;
+}
+
+interface CodexResponseIdLaneEntry {
+	generation: number;
+	state?: CodexResponseIdLaneState;
+	/**
+	 * Set the instant `state` is cleared without deleting the entry (TTL
+	 * expiry or LRU-cap eviction), so the entry is a tombstone that still
+	 * carries the real `generation` high-water mark forward. Cleared back to
+	 * undefined the moment `state` is set again. See
+	 * `sweepCodexResponseIdState`'s tombstone-eviction block for why a
+	 * tombstone is only safe to fully delete once `CODEX_RESPONSE_ID_PENDING_TTL_MS`
+	 * has passed since it was created.
+	 */
+	tombstonedAt?: number;
+}
+
+interface CodexPendingResponseIdCandidate {
+	lane: string;
+	generation: number;
+	requestDigests: string[];
+	configDigest: string;
+	chargedBytes: number;
+	ts: number;
+	/**
+	 * True iff this attempt actually carried a `previous_response_id` (a
+	 * prefix-match hit against committed lane state), false for a cold send.
+	 * Behavior 2 (rejected-id repair) must never fire for a cold send: it
+	 * never sent a `previous_response_id`, so a rejection naming that field
+	 * cannot legitimately apply to it.
+	 */
+	continued: boolean;
+}
+
+/** Deep-sorts object keys so digest input is stable regardless of key order. */
+function canonicalizeForDigest(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalizeForDigest);
+	if (value && typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		const sorted: Record<string, unknown> = {};
+		for (const key of Object.keys(record).sort()) {
+			sorted[key] = canonicalizeForDigest(record[key]);
+		}
+		return sorted;
+	}
+	return value;
+}
+
+/**
+ * Normalizes a Codex Responses-format replay item (input or, symmetrically,
+ * a completed response's own output item fed back as input on the next
+ * turn) into a stable, lossy-replay-tolerant shape for digesting.
+ *
+ * Clients (and this provider's own Anthropic<->Responses round trip) replay
+ * history lossily: a `function_call` item may drop `status`, assistant
+ * `output_text`/`refusal` blocks may be coalesced, and annotations may be
+ * stripped. Digesting the raw bytes would treat a lossless-but-differently
+ * shaped replay as a mismatch and needlessly fall back to a cold, full
+ * history send. `reasoning` items are intentionally excluded: their content
+ * is retained server-side by the response id itself, and clients frequently
+ * do not replay them at all.
+ *
+ * Returns null for any item this function does not recognize, which the
+ * caller treats as fail-closed: an unsupported item anywhere in history
+ * disqualifies the whole array from response-id continuation for this
+ * attempt, never a truncation.
+ */
+function normalizeReplayItemForDigest(
+	item: unknown,
+): Record<string, unknown> | null {
+	if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+	const record = item as Record<string, unknown>;
+	const type = record.type;
+	if (type === "function_call") {
+		if (
+			typeof record.call_id !== "string" ||
+			typeof record.name !== "string" ||
+			typeof record.arguments !== "string"
+		) {
+			return null;
+		}
+		return {
+			type: "function_call",
+			call_id: record.call_id,
+			name: record.name,
+			arguments: record.arguments,
+		};
+	}
+	if (type === "function_call_output") {
+		if (typeof record.call_id !== "string") return null;
+		return {
+			type: "function_call_output",
+			call_id: record.call_id,
+			output: record.output ?? null,
+		};
+	}
+	if (type === "reasoning") {
+		// Retained server-side by the response id; excluded from the digest.
+		return { type: "reasoning" };
+	}
+	// Message items in this fork's `codexBody.input` (see `CodexMessage` /
+	// `isCodexMessage`) are recognized structurally -- role + a content
+	// array -- and never carry an explicit `type: "message"` discriminant
+	// (the field is optional on the wire and this fork's own converter never
+	// sets it). Requiring a literal `type === "message"` here would fail
+	// closed for every ordinary text-only conversation, since none of its
+	// input items would ever match. Accept both an explicit "message" type
+	// (upstream/defensive) and this fork's untyped shape.
+	const looksLikeUntypedMessage =
+		type === undefined &&
+		(record.role === "user" ||
+			record.role === "assistant" ||
+			record.role === "system") &&
+		Array.isArray(record.content);
+	if (type === "message" || looksLikeUntypedMessage) {
+		const content = record.content;
+		if (!Array.isArray(content)) return null;
+		const normalizedContent: Array<{ type: "text" | "image"; value: unknown }> =
+			[];
+		for (const block of content) {
+			if (!block || typeof block !== "object" || Array.isArray(block)) {
+				return null;
+			}
+			const blockRecord = block as Record<string, unknown>;
+			if (
+				blockRecord.type === "input_text" ||
+				blockRecord.type === "output_text"
+			) {
+				normalizedContent.push({ type: "text", value: blockRecord.text });
+			} else if (blockRecord.type === "input_image") {
+				normalizedContent.push({
+					type: "image",
+					value: blockRecord.image_url,
+				});
+			} else if (blockRecord.type === "refusal") {
+				normalizedContent.push({ type: "text", value: blockRecord.refusal });
+			} else {
+				return null;
+			}
+		}
+		return {
+			type: "message",
+			role: record.role ?? null,
+			content: normalizedContent,
+		};
+	}
+	return null;
+}
+
+function replayItemDigest(item: unknown): string | null {
+	const normalized = normalizeReplayItemForDigest(item);
+	if (normalized === null) return null;
+	return createHash("sha256")
+		.update(JSON.stringify(canonicalizeForDigest(normalized)))
+		.digest("hex");
+}
+
+/** Digests every item in order; fails closed (returns null) on any miss. */
+function digestReplayItems(
+	items: readonly unknown[] | null | undefined,
+): string[] | null {
+	if (!Array.isArray(items)) return null;
+	const digests: string[] = [];
+	for (const item of items) {
+		const digest = replayItemDigest(item);
+		if (digest === null) return null;
+		digests.push(digest);
+	}
+	return digests;
+}
+
+function isDigestPrefixMatch(prefix: string[], candidate: string[]): boolean {
+	if (prefix.length === 0 || prefix.length > candidate.length) return false;
+	for (let i = 0; i < prefix.length; i++) {
+		if (prefix[i] !== candidate[i]) return false;
+	}
+	return true;
+}
+
+/**
+ * KTD13: estimates the retained-state charge for a checkpoint. Returns null
+ * when the checkpoint itself exceeds a per-item ceiling (response id length
+ * or digest item count) or the resulting byte total exceeds the per-checkpoint
+ * ceiling -- callers treat null as "skip capture", never as a truncation or a
+ * failed client request.
+ */
+function estimateCodexResponseIdCharge(
+	responseId: string,
+	digests: readonly string[],
+): number | null {
+	if (Buffer.byteLength(responseId, "utf8") > CODEX_RESPONSE_ID_MAX_ID_BYTES) {
+		return null;
+	}
+	if (digests.length > CODEX_RESPONSE_ID_MAX_DIGEST_ITEMS) return null;
+	let bytes = Buffer.byteLength(responseId, "utf8");
+	for (const digest of digests) {
+		bytes +=
+			Buffer.byteLength(digest, "utf8") +
+			CODEX_RESPONSE_ID_ENTRY_OVERHEAD_BYTES;
+	}
+	if (bytes > CODEX_RESPONSE_ID_MAX_CHECKPOINT_BYTES) return null;
+	return bytes;
+}
+
+/**
+ * Behavior 2 (rejected-id repair) classifier: detects a recognized upstream
+ * rejection of the gateway-supplied `previous_response_id` -- a 400/404
+ * naming that exact field, matching the same error shapes upstream 99f5dce0
+ * recognizes (`previous_response_not_found` / `invalid_previous_response_id`
+ * error codes, or `param === "previous_response_id"` with
+ * `type === "invalid_request_error"`). Pure and stateless: never mutates any
+ * continuation state. A caller must still gate the actual repair on
+ * `CodexProvider.prepareCodexResponseIdRejectionRepair` returning `true`
+ * before dispatching a retry -- this function alone never confirms the
+ * attempt was response-id-owned, so a generic 400/404 that happens to
+ * mention that field on a turn-state-owned or cold attempt is correctly
+ * refused downstream instead of here.
+ */
+export async function isCodexResponseIdRejectionError(
+	response: Response,
+	readJson: (response: Response) => Promise<unknown | null>,
+): Promise<boolean> {
+	if (response.status !== 400 && response.status !== 404) return false;
+	const parsed = await readJson(response);
+	if (!parsed || typeof parsed !== "object") return false;
+	const error = (parsed as { error?: unknown }).error;
+	if (!error || typeof error !== "object") return false;
+	const { code, param, type } = error as {
+		code?: unknown;
+		param?: unknown;
+		type?: unknown;
+	};
+	return (
+		code === "previous_response_not_found" ||
+		code === "invalid_previous_response_id" ||
+		(param === "previous_response_id" && type === "invalid_request_error")
+	);
+}
+
+/**
+ * KTD7 tail validator teardown helper: duplicated locally rather than
+ * imported because packages/providers/src/utils/stream-drain.ts does not
+ * export this exact primitive. Releasing a reader's lock while a read() is
+ * still outstanding only rejects that promise (WHATWG Streams §4.5); it
+ * never tells the underlying native source the stream is abandoned, which
+ * is exactly the "touched then abandoned" shape Bun's native fetch can
+ * buffer without bound (oven-sh/bun#39590, #382). Every losing exit from
+ * `runCodexResponseIdTailValidator`'s read loop therefore aborts the
+ * transport first, then gives the still-outstanding read this bounded
+ * grace window to actually settle before `releaseLock()` runs.
+ */
+async function awaitCodexTailPendingReadSettlement(
+	pendingRead: Promise<unknown>,
+	graceMs: number,
+): Promise<void> {
+	const observedPendingRead = pendingRead.then(
+		() => undefined,
+		() => undefined,
+	);
+	let graceTimer: ReturnType<typeof setTimeout> | undefined;
+	const grace = new Promise<void>((resolve) => {
+		graceTimer = setTimeout(resolve, graceMs);
+	});
+	try {
+		await Promise.race([observedPendingRead, grace]);
+	} finally {
+		if (graceTimer !== undefined) clearTimeout(graceTimer);
+	}
+}
+
 export class CodexProvider extends BaseProvider {
 	name = "codex";
 	private readonly streamLivenessOptions: CodexStreamLivenessOptions;
 	private readonly streamDrainDeadlineMs: number;
 	private readonly turnStateCoordinator = new CodexTurnStateCoordinator();
 
+	// ── Native response-id continuation state (KTD6/KTD7/KTD13) ──────────────
+	/** Keyed by lane digest (account+model+caller+session+config). */
+	private readonly responseIdLanes = new Map<
+		string,
+		CodexResponseIdLaneEntry
+	>();
+	/**
+	 * Keyed by the physical attempt id (never the logical request id): a retry
+	 * or failover must not let a still-draining sibling's staged candidate be
+	 * overwritten.
+	 */
+	private readonly pendingResponseIdByAttempt = new Map<
+		string,
+		CodexPendingResponseIdCandidate
+	>();
+	/** Recorded once per physical attempt, before either facility has side effects. */
+	private readonly continuationOwnerByAttempt = new Map<
+		string,
+		{ owner: CodexContinuationOwner; ts: number }
+	>();
+	/** Lane -> expiry. At most one repair per lane while suppressed. */
+	private readonly responseIdRejectedLanes = new Map<string, number>();
+	private responseIdBudgetBytes = 0;
+	// ── Final-wire cache diagnostics (KTD8): observational only, opt-in via
+	// CODEX_CACHE_DIAGNOSTICS_ENV, never routing or continuation authority. ──
+	private readonly cacheDiagnostics = new CodexCacheDiagnostics(
+		(facts) => {
+			log.info("Codex outgoing cache diagnostics", sanitizeCacheFacts(facts));
+			persistCacheTelemetry(facts, (dropped) =>
+				log.warn("Codex cache telemetry persistence failure", {
+					dropped_events: dropped,
+				}),
+			);
+		},
+		Date.now,
+		recordCacheLifecycle,
+	);
+
 	constructor(options: CodexProviderOptionsForTests = {}) {
 		super();
+		if (process.env[CODEX_CACHE_DIAGNOSTICS_ENV] === "1") {
+			recordCacheLifecycle({ event: "observer_ready" });
+		}
 		this.streamLivenessOptions = {
 			heartbeatIntervalMs: options.streamHeartbeatIntervalMs,
 			rawSilenceTimeoutMs: options.streamRawSilenceTimeoutMs,
@@ -1101,6 +1582,7 @@ export class CodexProvider extends BaseProvider {
 	abortTurnStateAttempt(attemptId: string | null | undefined): void {
 		const requestId = this.turnStateCoordinator.abortAttempt(attemptId);
 		writeCodexAbortedAttemptTrace({ attemptId, requestId });
+		this.releaseCodexResponseIdAttempt(attemptId);
 	}
 
 	/**
@@ -1123,6 +1605,633 @@ export class CodexProvider extends BaseProvider {
 		attemptId: string | null | undefined,
 	): void {
 		this.turnStateCoordinator.abortAttempt(attemptId);
+		this.releaseCodexResponseIdAttempt(attemptId);
+	}
+
+	// ── Native response-id continuation helpers (KTD6/KTD7/KTD13) ────────────
+
+	/**
+	 * Releases a still-pending response-id candidate's charge and removes it,
+	 * without ever promoting it. Idempotent. Called whenever a physical
+	 * attempt is known to never reach (or never complete) `processResponse`:
+	 * this is the single choke point for "cancellation" release under KTD13.
+	 */
+	private releaseCodexResponseIdAttempt(
+		attemptId: string | null | undefined,
+	): void {
+		if (!attemptId) return;
+		this.continuationOwnerByAttempt.delete(attemptId);
+		const pending = this.pendingResponseIdByAttempt.get(attemptId);
+		if (!pending) return;
+		this.pendingResponseIdByAttempt.delete(attemptId);
+		this.releaseCodexResponseIdBytes(pending.chargedBytes);
+	}
+
+	private chargeCodexResponseIdBytes(bytes: number): boolean {
+		if (bytes <= 0) return true;
+		if (
+			this.responseIdBudgetBytes + bytes >
+			CODEX_RESPONSE_ID_MAX_AGGREGATE_BYTES
+		) {
+			return false;
+		}
+		this.responseIdBudgetBytes += bytes;
+		return true;
+	}
+
+	private releaseCodexResponseIdBytes(bytes: number): void {
+		this.responseIdBudgetBytes = Math.max(
+			0,
+			this.responseIdBudgetBytes - bytes,
+		);
+	}
+
+	/** TTL sweep + LRU-style cap for bounded retention (additional ceilings on top of KTD13's byte budget). */
+	private sweepCodexResponseIdState(): void {
+		const now = Date.now();
+		for (const [attemptId, pending] of this.pendingResponseIdByAttempt) {
+			if (now - pending.ts > CODEX_RESPONSE_ID_PENDING_TTL_MS) {
+				this.pendingResponseIdByAttempt.delete(attemptId);
+				this.releaseCodexResponseIdBytes(pending.chargedBytes);
+			}
+		}
+		if (
+			this.pendingResponseIdByAttempt.size >
+			CODEX_RESPONSE_ID_MAX_PENDING_ATTEMPTS
+		) {
+			const oldestFirst = [...this.pendingResponseIdByAttempt.entries()].sort(
+				(a, b) => a[1].ts - b[1].ts,
+			);
+			const excess =
+				this.pendingResponseIdByAttempt.size -
+				CODEX_RESPONSE_ID_MAX_PENDING_ATTEMPTS;
+			for (let i = 0; i < excess; i++) {
+				const [attemptId, pending] = oldestFirst[i];
+				this.pendingResponseIdByAttempt.delete(attemptId);
+				this.releaseCodexResponseIdBytes(pending.chargedBytes);
+			}
+		}
+		for (const [attemptId, entry] of this.continuationOwnerByAttempt) {
+			if (now - entry.ts > CODEX_RESPONSE_ID_PENDING_TTL_MS) {
+				this.continuationOwnerByAttempt.delete(attemptId);
+			}
+		}
+		for (const [, entry] of this.responseIdLanes) {
+			if (entry.state && entry.state.expiresAt <= now) {
+				this.releaseCodexResponseIdBytes(entry.state.chargedBytes);
+				entry.state = undefined;
+				entry.tombstonedAt = now;
+			}
+		}
+		// KTD6 defect fix: LRU-cap eviction must never discard `generation`.
+		// Deleting the whole entry would let a still-pending attempt from
+		// before eviction (carrying a large pre-eviction generation number)
+		// pass `laneEntry.generation > pending.generation` once a fresh
+		// attempt chain on the same lane key restarts counting from 0/1 --
+		// silently overwriting newer state with stale output. Clearing only
+		// `state` (a tombstone) preserves the high-water mark so every
+		// subsequent generation on this lane, evicted or not, keeps
+		// increasing monotonically.
+		if (this.responseIdLanes.size > CODEX_RESPONSE_ID_MAX_LANES) {
+			const withState = [...this.responseIdLanes.entries()].filter(
+				([, entry]) => entry.state,
+			);
+			withState.sort(
+				(a, b) => (a[1].state?.lastUsedAt ?? 0) - (b[1].state?.lastUsedAt ?? 0),
+			);
+			const excess = this.responseIdLanes.size - CODEX_RESPONSE_ID_MAX_LANES;
+			for (let i = 0; i < excess && i < withState.length; i++) {
+				const [, entry] = withState[i];
+				if (entry.state)
+					this.releaseCodexResponseIdBytes(entry.state.chargedBytes);
+				entry.state = undefined;
+				entry.tombstonedAt = now;
+			}
+		}
+		// Tombstones (state cleared, generation preserved) are themselves
+		// bounded, just not by the state-holding LRU cap above: a tombstone
+		// is safe to fully delete once `CODEX_RESPONSE_ID_PENDING_TTL_MS` has
+		// passed since it was created. Proof: any still-pending attempt that
+		// could reference a generation <= this tombstone's was necessarily
+		// staged (its own `ts`) at or before `tombstonedAt` -- generation
+		// numbers only increase and are burned into `pendingResponseIdByAttempt`
+		// at staging time. By the time `tombstonedAt + PENDING_TTL_MS` has
+		// elapsed, that attempt's own `ts + PENDING_TTL_MS` has also elapsed,
+		// so the pending-attempt sweep at the top of this function has
+		// already purged it in this very pass (or an earlier one) --
+		// `commitCodexResponseIdCheckpoint` becomes a no-op for it via its
+		// own `pendingResponseIdByAttempt.get(attemptId)` miss, independent
+		// of anything still (or no longer) in `responseIdLanes`. So deleting
+		// the tombstone here can never resurrect the reset-generation bug.
+		for (const [lane, entry] of this.responseIdLanes) {
+			if (
+				!entry.state &&
+				entry.tombstonedAt !== undefined &&
+				now - entry.tombstonedAt > CODEX_RESPONSE_ID_PENDING_TTL_MS
+			) {
+				this.responseIdLanes.delete(lane);
+			}
+		}
+		for (const [lane, expiresAt] of this.responseIdRejectedLanes) {
+			if (expiresAt <= now) this.responseIdRejectedLanes.delete(lane);
+		}
+	}
+
+	private codexResponseIdLaneKey(
+		accountId: string | undefined,
+		model: string,
+		callerDigest: string | null,
+		sessionIdentity: string | null,
+		protocol: CodexResponseIdProtocol,
+	): string {
+		return createHash("sha256")
+			.update(
+				JSON.stringify({
+					accountId: accountId ?? null,
+					model,
+					callerDigest,
+					sessionIdentity,
+					protocol,
+				}),
+			)
+			.digest("hex");
+	}
+
+	private codexResponseIdConfigDigest(
+		accountId: string | undefined,
+		codexBody: Pick<CodexRequest, "store" | "reasoning">,
+	): string {
+		return createHash("sha256")
+			.update(
+				JSON.stringify({
+					accountId: accountId ?? null,
+					store: codexBody.store,
+					reasoningEffort: codexBody.reasoning?.effort ?? null,
+				}),
+			)
+			.digest("hex");
+	}
+
+	/**
+	 * KTD6: selects exactly one continuation owner for this physical attempt
+	 * and, when response-id owns it, mutates the codex request in place
+	 * (setting `previous_response_id` and truncating `input` to the new tail)
+	 * and stages a pending candidate keyed by `attemptId`. Must run, and must
+	 * fully resolve ownership, before `CodexTurnStateCoordinator.beginAttempt`
+	 * is invoked for this attempt.
+	 */
+	private selectCodexResponseIdOwner(params: {
+		nativeResponses: boolean;
+		continuationOptIn: boolean;
+		/**
+		 * Behavior 1 (Messages-lane continuation): true iff
+		 * `CCFLARE_CODEX_MESSAGES_CONTINUATION=1` (and, when set, the optional
+		 * model allowlist admits this physical model) for a request that did
+		 * NOT arrive through the trusted Responses adapter. Only ever
+		 * consulted when `!nativeResponses`; a native-Responses attempt is
+		 * gated exclusively by `continuationOptIn` as before.
+		 */
+		messagesLaneAdmitted: boolean;
+		hosted: boolean;
+		customToolsDeclared: boolean;
+		accountId: string | undefined;
+		attemptId: string | null;
+		codexBody: CodexRequest;
+		callerDigest: string | null;
+		sessionIdentity: string | null;
+	}): boolean {
+		const {
+			nativeResponses,
+			continuationOptIn,
+			messagesLaneAdmitted,
+			hosted,
+			customToolsDeclared,
+			accountId,
+			attemptId,
+			codexBody,
+			callerDigest,
+			sessionIdentity,
+		} = params;
+		// Exactly one lane can be eligible for a given attempt: the trusted
+		// native Responses lane (server-verified header + explicit client
+		// opt-in) or the plain Messages lane (server-verified ABSENCE of that
+		// header + the default-OFF env flag, and optional model filter).
+		const eligible = nativeResponses ? continuationOptIn : messagesLaneAdmitted;
+		if (
+			!eligible ||
+			!attemptId ||
+			hosted ||
+			// A request declaring a custom (non-function) tool takes the raw
+			// Responses passthrough branch in processResponse
+			// (buildCustomToolCallPassthroughResponse), which never runs
+			// processEvents/handleCodexEvent at all. Claiming response-id
+			// ownership here would suppress turn-state for nothing -- no
+			// checkpoint can ever be committed on that path -- and would leak
+			// the KTD13 charge staged below. Fail closed to "turn-state" (or
+			// "none") instead.
+			customToolsDeclared
+		) {
+			return false;
+		}
+		const protocol: CodexResponseIdProtocol = nativeResponses
+			? "native-responses"
+			: "messages";
+		// Digested *after* full conversion (Skill-nudge appends included), so
+		// the fork's converted-tail safeguard is naturally preserved: a
+		// response-id continuation always carries whatever the wire will
+		// actually see, never what the client originally supplied.
+		const fullDigests = digestReplayItems(codexBody.input);
+		if (!fullDigests) return false;
+		const lane = this.codexResponseIdLaneKey(
+			accountId,
+			codexBody.model,
+			callerDigest,
+			sessionIdentity,
+			protocol,
+		);
+		const rejectedUntil = this.responseIdRejectedLanes.get(lane);
+		if (rejectedUntil && rejectedUntil > Date.now()) return false;
+		const configDigest = this.codexResponseIdConfigDigest(accountId, codexBody);
+		const laneEntry = this.responseIdLanes.get(lane) ?? { generation: 0 };
+		const laneState = laneEntry.state;
+		let matchedPrefixLength = 0;
+		if (
+			laneState &&
+			laneState.expiresAt > Date.now() &&
+			laneState.configDigest === configDigest &&
+			isDigestPrefixMatch(laneState.digests, fullDigests)
+		) {
+			matchedPrefixLength = laneState.digests.length;
+		}
+		// KTD13: check the pending charge before retaining/mutating anything.
+		// A staged candidate is charged for its own response id slot too (the
+		// worst case for what this attempt might promote), so overflow is
+		// caught here rather than silently truncating input or failing later.
+		const chargeEstimate = estimateCodexResponseIdCharge(
+			"x".repeat(CODEX_RESPONSE_ID_MAX_ID_BYTES),
+			fullDigests,
+		);
+		if (
+			chargeEstimate === null ||
+			!this.chargeCodexResponseIdBytes(chargeEstimate)
+		) {
+			// Aggregate budget (or a per-checkpoint ceiling) exhausted: fall
+			// back safely to no continuation for this attempt. Never truncate
+			// input and never fail the client request.
+			return false;
+		}
+		const generation = laneEntry.generation + 1;
+		laneEntry.generation = generation;
+		this.responseIdLanes.set(lane, laneEntry);
+		if (matchedPrefixLength > 0 && laneState) {
+			codexBody.previous_response_id = laneState.responseId;
+			// Only response-id projection truncates input; fork turn-state
+			// never does.
+			codexBody.input = codexBody.input.slice(matchedPrefixLength);
+			laneState.lastUsedAt = Date.now();
+		}
+		this.pendingResponseIdByAttempt.set(attemptId, {
+			lane,
+			generation,
+			requestDigests: fullDigests,
+			configDigest,
+			chargedBytes: chargeEstimate,
+			ts: Date.now(),
+			continued: matchedPrefixLength > 0,
+		});
+		return true;
+	}
+
+	/**
+	 * Behavior 2 (rejected-id repair): must be called by proxy-operations.ts's
+	 * shared physical-send boundary immediately after
+	 * `isCodexResponseIdRejectionError` has classified the raw upstream
+	 * response as a recognized rejection of the gateway-supplied
+	 * `previous_response_id`, and strictly BEFORE dispatching the one-shot
+	 * full-history repair retry.
+	 *
+	 * Confirms this exact physical attempt was actually response-id-owned
+	 * with a real (non-cold) continuation -- a cold send never carried a
+	 * `previous_response_id`, so a rejection naming that field cannot
+	 * legitimately apply to it, and no repair is warranted -- then:
+	 *  1. Drains the rejected attempt through the exact KTD13 owner choke
+	 *     point (`releaseCodexResponseIdAttempt`), matching every other
+	 *     non-promoting exit from this engine.
+	 *  2. Retires the rejected lane's checkpoint: `state` is cleared (a
+	 *     tombstone, `generation` preserved) exactly like TTL/LRU eviction in
+	 *     `sweepCodexResponseIdState`, so no stale checkpoint can ever be
+	 *     reused by a later attempt on this lane.
+	 *  3. Populates `responseIdRejectedLanes` so `selectCodexResponseIdOwner`
+	 *     refuses response-id ownership on this lane for
+	 *     `CODEX_RESPONSE_ID_REJECTED_TTL_MS` -- the existing (previously
+	 *     unwired) suppression gate this method activates. A second
+	 *     rejection therefore can never trigger a second repair: the retry
+	 *     that follows a `true` return here is sent with no
+	 *     `previous_response_id` at all (full history, cold), and if upstream
+	 *     rejects THAT attempt too, no continuation was ever staged for it,
+	 *     so this method returns `false` and no further repair is attempted.
+	 *
+	 * Idempotent for a repeated call with the same `attemptId`: the second
+	 * call's `pendingResponseIdByAttempt` lookup misses because the first
+	 * call already drained it, so it returns `false` without mutating
+	 * anything further.
+	 */
+	prepareCodexResponseIdRejectionRepair(
+		attemptId: string | null | undefined,
+	): boolean {
+		if (!attemptId) return false;
+		const owner = this.continuationOwnerByAttempt.get(attemptId);
+		if (!owner || owner.owner !== "response-id") return false;
+		const pending = this.pendingResponseIdByAttempt.get(attemptId);
+		if (!pending?.continued) return false;
+		const lane = pending.lane;
+		this.releaseCodexResponseIdAttempt(attemptId);
+		const laneEntry = this.responseIdLanes.get(lane);
+		if (laneEntry?.state) {
+			this.releaseCodexResponseIdBytes(laneEntry.state.chargedBytes);
+			laneEntry.state = undefined;
+			laneEntry.tombstonedAt = Date.now();
+		}
+		this.responseIdRejectedLanes.set(
+			lane,
+			Date.now() + CODEX_RESPONSE_ID_REJECTED_TTL_MS,
+		);
+		return true;
+	}
+
+	/**
+	 * KTD7: promotes a staged response-id candidate into committed lane state,
+	 * or discards it, from data the "response.completed" case already holds in
+	 * memory (the terminal event's own `id` and `output`) -- it never reads,
+	 * releases, or otherwise touches the upstream transport, so it cannot
+	 * interfere with `cancelUpstreamOnce`/drain/finally for that transport,
+	 * and it never gates or delays anything already written to the
+	 * client-facing stream. Called from two places, both after the terminal
+	 * SSE frames are already enqueued to the client: (1) `processEvents`'s
+	 * frame loop, directly, once the rest of the chunk containing the
+	 * terminal event has been scanned for a same-chunk trailing frame (see
+	 * `state.responseIdTailTainted`) -- this is the ONLY call site when the
+	 * KTD7 move-only handoff below is not eligible (turn-state-owned
+	 * attempts, an already-tainted same-chunk tail, or no reader/pending
+	 * candidate to hand off); and (2) `runCodexResponseIdTailValidator`,
+	 * asynchronously, once that dedicated validator has independently
+	 * observed true clean EOF across every subsequent read. Safe to call
+	 * unconditionally in either case (idempotent: a missing or
+	 * already-consumed pending candidate is a no-op).
+	 *
+	 * Never called for "response.incomplete" -- an incomplete response's
+	 * `output` is not a trustworthy replay tail for the next turn, so that
+	 * path (and every other non-clean terminal path: errors, cancellation,
+	 * abrupt EOF) instead relies on the unconditional
+	 * `releaseCodexResponseIdAttempt` cleanup in `processEvents`'s `finally`.
+	 */
+	private commitCodexResponseIdCheckpoint(state: StreamState): void {
+		const attemptId = state.traceAttemptId;
+		const terminal = state.responseIdTerminal;
+		const tainted = state.responseIdTailTainted === true;
+		state.responseIdTerminal = null;
+		state.responseIdTailTainted = false;
+		state.responseIdDoneSeenAfterTerminal = false;
+		if (!attemptId || !terminal) return;
+		const pending = this.pendingResponseIdByAttempt.get(attemptId);
+		if (!pending) return;
+		const outputDigests = digestReplayItems(terminal.output);
+		// Release the pending (request-time, worst-case) charge unconditionally
+		// before any attempt at a real (response-time, exact) charge -- the two
+		// must never be double-counted against the aggregate budget, whichever
+		// branch below returns.
+		this.pendingResponseIdByAttempt.delete(attemptId);
+		this.continuationOwnerByAttempt.delete(attemptId);
+		this.releaseCodexResponseIdBytes(pending.chargedBytes);
+		if (tainted) {
+			// KTD7: a same-chunk trailing frame (or duplicate "[DONE]") after the
+			// terminal event disqualifies this checkpoint outright -- "exactly
+			// one valid completed response ... no other data-bearing frame" no
+			// longer holds.
+			return;
+		}
+		if (!outputDigests) {
+			// Fail closed: an unrecognized output item type disqualifies this
+			// checkpoint. The lane keeps whatever committed state (if any) it
+			// already had, so the next request on this lane can still prefix-
+			// match against that older checkpoint or fall back to a cold send.
+			return;
+		}
+		const fullDigests = [...pending.requestDigests, ...outputDigests];
+		const chargeEstimate = estimateCodexResponseIdCharge(
+			terminal.responseId,
+			fullDigests,
+		);
+		if (
+			chargeEstimate === null ||
+			!this.chargeCodexResponseIdBytes(chargeEstimate)
+		) {
+			// Ceiling exceeded at commit time: skip capture, retain no new lane.
+			return;
+		}
+		const laneEntry = this.responseIdLanes.get(pending.lane) ?? {
+			generation: pending.generation,
+		};
+		if (laneEntry.generation > pending.generation) {
+			// KTD6 lane-generation guard: superseded by a newer attempt on the
+			// same lane. Never let a stale, slower-finishing attempt clobber a
+			// fresher checkpoint. Release the just-approved charge too.
+			this.releaseCodexResponseIdBytes(chargeEstimate);
+			return;
+		}
+		if (laneEntry.state) {
+			this.releaseCodexResponseIdBytes(laneEntry.state.chargedBytes);
+		}
+		laneEntry.generation = pending.generation;
+		laneEntry.state = {
+			responseId: terminal.responseId,
+			digests: fullDigests,
+			configDigest: pending.configDigest,
+			expiresAt: Date.now() + CODEX_RESPONSE_ID_LANE_TTL_MS,
+			chargedBytes: chargeEstimate,
+			lastUsedAt: Date.now(),
+		};
+		// Reactivating a tombstoned entry (evicted/expired, generation kept):
+		// it is no longer eligible for tombstone-only sweeping now that it
+		// carries live state again.
+		laneEntry.tombstonedAt = undefined;
+		this.responseIdLanes.set(pending.lane, laneEntry);
+	}
+
+	/**
+	 * KTD7 attempt-scoped tail validator: the sole owner, from the instant
+	 * `processEvents` hands it off, of the upstream reader, the SSE parser's
+	 * carried partial buffer, and the transport's abort capability. This is a
+	 * move, not a share -- the handoff call site forces
+	 * `upstreamDrainStarted = true` first, which makes `cancelUpstreamOnce`
+	 * and the `finally` block's own reader release/settlement permanently
+	 * no-ops for this transport, so nothing else can read, release, drain, or
+	 * abort it while this method is running. There is no separate
+	 * outstanding upstream read to move at handoff time: `CodexStreamLiveness
+	 * .next()` already consumed and cleared its own pending read to produce
+	 * the `{ value, done }` for the very chunk that triggered the terminal
+	 * event, so reader + buffer + abort capability is the whole of what
+	 * needs to transfer.
+	 *
+	 * Resolves the staged response-id candidate through exactly one of five
+	 * distinct outcomes -- clean EOF (promote via
+	 * `commitCodexResponseIdCheckpoint`), or invalid tail / deadline / read
+	 * error / cancellation (all four discard via
+	 * `releaseCodexResponseIdAttempt`) -- via a single `resolved` compare-
+	 * and-set, so whichever trigger (a later frame, the deadline timer, or a
+	 * downstream cancel) reaches the gate first is the only one that can act;
+	 * every later trigger becomes a no-op. Never touches `writeSSE`/
+	 * `writeTerminalTrace`/the downstream controller: the client-facing
+	 * stream has already reached its terminal boundary and closed by the
+	 * time this runs (the handoff call site never awaits this method), and a
+	 * tail result only ever appends checkpoint diagnostics
+	 * (`state.responseIdTailTainted`), never a second terminal trace or a
+	 * retraction of what the client already received.
+	 *
+	 * One monotonic budget covers the whole loop plus the final pending-read
+	 * settlement grace on a losing exit, mirroring -- never stacking beyond
+	 * -- `drainReaderWithDeadline`'s own read-plus-settlement shape:
+	 * `deadlineMs` bounds how long the read loop may run, and the same
+	 * `deadlineMs` bounds the one settlement grace given to a still-
+	 * outstanding read after the transport is aborted.
+	 */
+	private async runCodexResponseIdTailValidator(params: {
+		state: StreamState;
+		reader: ReadableStreamDefaultReader<Uint8Array>;
+		sseFrameBuffer: SseFrameBuffer;
+		drainAbort?: AbortController;
+		deadlineMs: number;
+		cancelSignal: AbortSignal;
+	}): Promise<void> {
+		const {
+			state,
+			reader,
+			sseFrameBuffer,
+			drainAbort,
+			deadlineMs,
+			cancelSignal,
+		} = params;
+		let resolved = false;
+		const resolveOnce = (
+			outcome:
+				| "clean_eof"
+				| "invalid_tail"
+				| "deadline"
+				| "read_error"
+				| "cancellation",
+		): void => {
+			if (resolved) return;
+			resolved = true;
+			if (outcome === "clean_eof") {
+				this.commitCodexResponseIdCheckpoint(state);
+				return;
+			}
+			if (outcome === "invalid_tail") {
+				// Diagnostics only, per contract: never a second terminal
+				// trace, never a retraction of already-delivered client
+				// output. commitCodexResponseIdCheckpoint (not called here)
+				// would also discard correctly on `tainted`, but this exit
+				// never received a fresh terminal frame to stage, so the
+				// dedicated KTD13 discard choke point is used directly.
+				state.responseIdTailTainted = true;
+			}
+			this.releaseCodexResponseIdAttempt(state.traceAttemptId ?? null);
+		};
+
+		const abortTransport = (message: string) => {
+			if (drainAbort && !drainAbort.signal.aborted) {
+				drainAbort.abort(new Error(message));
+			}
+		};
+
+		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<"deadline">((resolve) => {
+			deadlineTimer = setTimeout(() => resolve("deadline"), deadlineMs);
+		});
+		const cancellation = new Promise<"cancellation">((resolve) => {
+			if (cancelSignal.aborted) {
+				resolve("cancellation");
+				return;
+			}
+			cancelSignal.addEventListener("abort", () => resolve("cancellation"), {
+				once: true,
+			});
+		});
+
+		try {
+			while (true) {
+				const pendingRead = reader.read();
+				const raced = await Promise.race([pendingRead, deadline, cancellation]);
+				if (raced === "deadline" || raced === "cancellation") {
+					abortTransport(
+						raced === "deadline"
+							? "Codex response-id tail validation deadline exceeded"
+							: "Codex response-id tail validation cancelled",
+					);
+					await awaitCodexTailPendingReadSettlement(pendingRead, deadlineMs);
+					resolveOnce(raced);
+					return;
+				}
+				const { value, done } = raced;
+				if (done) {
+					// Reached true upstream EOF. A non-empty flush() means a
+					// partial frame straddled the buffer boundary and was
+					// never terminated -- KTD7 requires clean EOF, not "EOF
+					// after discarding unterminated bytes".
+					let leftover: string;
+					try {
+						leftover = sseFrameBuffer.flush();
+					} catch {
+						resolveOnce("invalid_tail");
+						return;
+					}
+					resolveOnce(leftover.length > 0 ? "invalid_tail" : "clean_eof");
+					return;
+				}
+				let frames: string[];
+				try {
+					frames = sseFrameBuffer.push(value);
+				} catch {
+					// SseLimitError or similar: an oversized frame/tail on the
+					// tail read is itself a disqualifying, non-clean EOF.
+					abortTransport(
+						"Codex response-id tail validation hit a resource limit",
+					);
+					resolveOnce("invalid_tail");
+					return;
+				}
+				for (const eventText of frames) {
+					// Mirrors the same-chunk scanner above: only a data-bearing
+					// frame disqualifies the candidate, and at most one
+					// trailing "[DONE]" is tolerated (state.responseIdDoneSeen
+					// AfterTerminal is the same flag threaded from the
+					// same-chunk scan, so a "[DONE]" already seen there still
+					// counts here).
+					const { dataLine } = findCodexSseFrameLines(eventText);
+					if (!dataLine) continue;
+					const dataStr = dataLine.slice("data:".length).trim();
+					if (dataStr === "[DONE]" && !state.responseIdDoneSeenAfterTerminal) {
+						state.responseIdDoneSeenAfterTerminal = true;
+						continue;
+					}
+					abortTransport(
+						"Codex response-id tail validation found a disqualifying frame",
+					);
+					resolveOnce("invalid_tail");
+					return;
+				}
+			}
+		} catch {
+			abortTransport("Codex response-id tail validation read failed");
+			resolveOnce("read_error");
+		} finally {
+			if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+			try {
+				reader.releaseLock();
+			} catch {
+				// Reader may already be errored/released by the transport abort.
+			}
+		}
 	}
 
 	createServerToolCapabilityTuple(
@@ -1474,6 +2583,89 @@ export class CodexProvider extends BaseProvider {
 	}
 
 	/**
+	 * Request-top observation, strictly BEFORE account selection: the proxy
+	 * calls this before any account is chosen, so it also covers a purely
+	 * local refusal (pool exhaustion, a policy exclusion, ...) that never
+	 * reaches `observeUpstream`'s final-wire boundary below. Opt-in via the
+	 * same `CODEX_CACHE_DIAGNOSTICS_ENV` switch, and a diagnostics failure
+	 * here must never affect the request path -- every fact is computed from
+	 * caller-supplied headers/response only, nothing here can throw into
+	 * routing. `refusal_reason: "pool_exhausted"` is read off the recovery
+	 * headers `createModelPoolExhaustedResponse`/`createRoutingTerminalResponse`
+	 * already set on a locally-terminated response, not from any Codex-specific
+	 * signal, so this fires for a pool refusal regardless of which provider
+	 * ultimately would have served the request.
+	 */
+	observeRequest(
+		headers: Headers,
+		nativeResponses: boolean,
+	): RequestObservation | undefined {
+		if (process.env[CODEX_CACHE_DIAGNOSTICS_ENV] !== "1") return undefined;
+		const gatewayIdentity = (name: string): string | null => {
+			const value = headers.get(name);
+			return value && /^[0-9a-f]{64}$/.test(value) ? value : null;
+		};
+		const facts: CacheFacts = {
+			ingress_digest: cacheDigest(randomUUID()),
+			path: nativeResponses ? "native" : "legacy",
+			gateway_request_digest: gatewayIdentity(
+				"x-better-ccflare-gateway-request-digest",
+			),
+			gateway_attempt_digest: gatewayIdentity(
+				"x-better-ccflare-gateway-attempt-digest",
+			),
+		};
+		recordCacheLifecycle({ ...facts, event: "request_received" });
+		return {
+			bindRequestId(requestId: string) {
+				facts.request_digest = cacheDigest(requestId);
+				recordCacheLifecycle({ ...facts, event: "request_identified" });
+			},
+			response(response: Response) {
+				recordCacheLifecycle({
+					...facts,
+					event: "request_headers",
+					status_code: response.status,
+					refusal_reason:
+						response.headers.get(RECOVERY_STATUS_HEADER) ===
+						RECOVERY_STATUS_EXHAUSTED
+							? "pool_exhausted"
+							: null,
+				});
+				return response;
+			},
+			error(_error: unknown) {
+				recordCacheLifecycle({ ...facts, event: "request_error" });
+			},
+		};
+	}
+
+	/**
+	 * Final-wire observation (KTD8): captured by the proxy at the point closest
+	 * to the actual dispatched HTTP request, strictly AFTER every retry's final
+	 * model/input/header transformations. Purely observational -- opt-in via
+	 * `CODEX_CACHE_DIAGNOSTICS_ENV`, and a diagnostics failure here must never
+	 * affect the request path (see `observeCodexWire`'s own guarantees). Skips
+	 * GET requests (e.g. `/v1/models` passthrough), which carry no body to
+	 * correlate.
+	 */
+	async observeUpstream(request: Request, context: UpstreamObservationContext) {
+		if (
+			process.env[CODEX_CACHE_DIAGNOSTICS_ENV] !== "1" ||
+			request.method === "GET"
+		) {
+			return undefined;
+		}
+		return observeCodexWire(
+			this.cacheDiagnostics,
+			request,
+			context,
+			(source) =>
+				this.extractSessionId(source as unknown as AnthropicRequest) ?? null,
+		);
+	}
+
+	/**
 	 * @param _beforePhysicalTransport - Third positional slot in the `Provider`
 	 * contract, reserved for providers whose transform performs the physical send
 	 * itself (Bedrock). Codex only rewrites the body — the proxy owns its
@@ -1545,6 +2737,14 @@ export class CodexProvider extends BaseProvider {
 			const logicalModelFamily =
 				trustedLogicalModelFamily ?? getModelFamily(body.model);
 			if (isSyntheticCountTokens) {
+				if (process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV] === "0") {
+					return this.createSyntheticErrorResponse(
+						request,
+						501,
+						"not_implemented_error",
+						"Codex does not support count_tokens; synthetic estimates are disabled (CCFLARE_CODEX_SYNTHETIC_COUNT_TOKENS=0).",
+					);
+				}
 				return this.createSyntheticCountTokensResponse(request, body);
 			}
 			const isSubscriptionEndpoint = isCodexSubscriptionEndpoint(request.url);
@@ -1610,23 +2810,96 @@ export class CodexProvider extends BaseProvider {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
 				delete codexBody.max_output_tokens;
 			}
-			const turnStateDecision = this.turnStateCoordinator.beginAttempt({
-				accountId: account?.id,
-				model: codexBody.model,
-				conversationIdentity:
-					cacheKeyDecision.selectedConversationIdentity ??
-					cacheKeyDecision.conversationIdentity,
-				requestId,
-				attemptId,
-				attemptCause: attemptCause as CodexTurnStateAttemptCause | null,
-				eligibleEndpoint: isSubscriptionEndpoint,
+			// Computed BEFORE any response-id input truncation below (which
+			// mutates codexBody.input in place): both the owner-eligibility gate
+			// and the later processResponse-format bookkeeping must see the
+			// original declaration, not a possibly-truncated tail that could
+			// have sliced away the declaring "additional_tools" item.
+			const hasCustomTools =
+				(codexBody.tools?.some(
+					(t) => (t as { type?: string }).type !== "function",
+				) ??
+					false) ||
+				codexBody.input.some(
+					(item) => (item as { type?: string }).type === "additional_tools",
+				);
+			// KTD6: resolve the single continuation owner for this physical
+			// attempt before CodexTurnStateCoordinator.beginAttempt runs. Either
+			// a server-verified native-Responses request (see
+			// prepareAttemptHeaders in proxy-operations.ts) with an explicit
+			// client opt-in (`continuation_strategy: "previous_response_id"`,
+			// carried only through the already-trust-gated passthrough
+			// carrier), or -- Behavior 1 -- a plain Claude Messages request
+			// (server-verified ABSENCE of the native-Responses header) with
+			// the default-OFF CCFLARE_CODEX_MESSAGES_CONTINUATION=1 env flag
+			// (and optional model allowlist) is eligible; everything else
+			// falls through to the fork's own turn-state mechanism unchanged.
+			this.sweepCodexResponseIdState();
+			const nativeResponses =
+				request.headers.get(CODEX_NATIVE_RESPONSES_HEADER) === "1";
+			const continuationOptIn =
+				passthrough?.continuation_strategy === "previous_response_id";
+			const messagesContinuationModels =
+				process.env[CODEX_MESSAGES_CONTINUATION_MODELS_ENV];
+			const messagesLaneAdmitted =
+				!nativeResponses &&
+				process.env[CODEX_MESSAGES_CONTINUATION_ENV] === "1" &&
+				(messagesContinuationModels === undefined ||
+					messagesContinuationModels
+						.split(",")
+						.map((model) => model.trim())
+						.includes(codexBody.model));
+			const sessionIdentity =
+				cacheKeyDecision.selectedConversationIdentity ??
+				cacheKeyDecision.conversationIdentity;
+			const responseIdOwns = this.selectCodexResponseIdOwner({
+				nativeResponses,
+				continuationOptIn,
+				messagesLaneAdmitted,
 				hosted: options.hosted === true,
-				lineage: extractCodexTurnStateLineage(body.messages),
-				// Reported from the converted body, not the client's messages: those
-				// are what lineage is derived from, but conversion is free to append
-				// after them (see the Skill nudge in convertToCodexFormat).
-				continuationTailIntact: codexInputEndsWithToolOutput(codexBody.input),
+				customToolsDeclared: hasCustomTools,
+				accountId: account?.id,
+				attemptId,
+				codexBody,
+				callerDigest: request.headers.get(CODEX_AUTHENTICATED_CALLER_HEADER),
+				sessionIdentity,
 			});
+			if (attemptId) {
+				this.continuationOwnerByAttempt.set(attemptId, {
+					owner: responseIdOwns ? "response-id" : "turn-state",
+					ts: Date.now(),
+				});
+			}
+			// KTD6 owner exclusivity: response-id and turn-state never both own
+			// the same physical attempt. When response-id owns it, turn-state's
+			// own beginAttempt (percentage/cohort gating, token issuance, replay
+			// bookkeeping) must not run at all for this attempt -- not run and
+			// discarded, never run.
+			const turnStateDecision = responseIdOwns
+				? {
+						arm: "ineligible" as const,
+						cohortId: null,
+						action: "response_id_owned" as const,
+						replayApplied: false,
+						turnState: undefined,
+					}
+				: this.turnStateCoordinator.beginAttempt({
+						accountId: account?.id,
+						model: codexBody.model,
+						conversationIdentity: sessionIdentity,
+						requestId,
+						attemptId,
+						attemptCause: attemptCause as CodexTurnStateAttemptCause | null,
+						eligibleEndpoint: isSubscriptionEndpoint,
+						hosted: options.hosted === true,
+						lineage: extractCodexTurnStateLineage(body.messages),
+						// Reported from the converted body, not the client's messages: those
+						// are what lineage is derived from, but conversion is free to append
+						// after them (see the Skill nudge in convertToCodexFormat).
+						continuationTailIntact: codexInputEndsWithToolOutput(
+							codexBody.input,
+						),
+					});
 			// Best-effort, env-gated observability (no-op unless CCFLARE_CODEX_TRACE_DIR set).
 			writeCodexTrace({
 				requestId: requestId ?? undefined,
@@ -1696,19 +2969,9 @@ export class CodexProvider extends BaseProvider {
 				codexRequest: codexBody,
 			});
 
-			// Only custom (non-function) tools can produce custom_tool_call output;
-			// let processResponse skip buffering when none were declared. Responses
-			// Lite can also declare custom tools via an "additional_tools" input
-			// item instead of codexBody.tools.
-			const hasCustomTools =
-				(codexBody.tools?.some(
-					(t) => (t as { type?: string }).type !== "function",
-				) ??
-					false) ||
-				codexBody.input.some(
-					(item) => (item as { type?: string }).type === "additional_tools",
-				);
-
+			// hasCustomTools was already computed above (before any response-id
+			// input truncation) so processResponse's buffering-skip decision and
+			// the KTD6 owner-eligibility gate agree on the same declaration.
 			if (requestId) {
 				this.requestStreamById.set(requestId, {
 					stream: body.stream === true,
@@ -1751,6 +3014,8 @@ export class CodexProvider extends BaseProvider {
 			newHeaders.delete("x-better-ccflare-pacing-role");
 			newHeaders.delete("x-better-ccflare-pacing-wait-ms");
 			newHeaders.delete("x-better-ccflare-pacing-release-reason");
+			newHeaders.delete(CODEX_NATIVE_RESPONSES_HEADER);
+			newHeaders.delete(CODEX_AUTHENTICATED_CALLER_HEADER);
 			newHeaders.delete("content-length");
 
 			const serializedBody = JSON.stringify(codexBody);
@@ -1879,6 +3144,14 @@ export class CodexProvider extends BaseProvider {
 			// originate from the /v1/responses adapter, whose client speaks
 			// Responses SSE natively — pass the live stream through untouched.
 			if (requestedStream) {
+				// KTD13: this passthrough branch never reaches
+				// transformStreamingResponse/processEvents, so no commit or
+				// finally-block release will ever run for a candidate staged at
+				// request time. selectCodexResponseIdOwner already excludes a
+				// custom-tools-declaring request from ownership, so this is
+				// normally a no-op; kept as defense-in-depth so no charge can leak
+				// on this branch regardless.
+				this.releaseCodexResponseIdAttempt(attemptId);
 				return this.buildCustomToolCallPassthroughResponse(
 					response.body,
 					response,
@@ -1886,6 +3159,7 @@ export class CodexProvider extends BaseProvider {
 			}
 			// The Responses adapter consumes the native terminal event and returns
 			// its response object as JSON for non-streaming clients.
+			this.releaseCodexResponseIdAttempt(attemptId);
 			return this.buildCustomToolCallPassthroughResponse(
 				await response.text(),
 				response,
@@ -1897,6 +3171,7 @@ export class CodexProvider extends BaseProvider {
 				`Codex returned successful response without SSE content-type (<missing>); transforming as ${requestedStream ? "SSE" : "JSON"}`,
 			);
 			if (mightHaveCustomToolCalls && requestedStream) {
+				this.releaseCodexResponseIdAttempt(attemptId);
 				return this.buildCustomToolCallPassthroughResponse(
 					response.body,
 					response,
@@ -1910,6 +3185,7 @@ export class CodexProvider extends BaseProvider {
 				mightHaveCustomToolCalls &&
 				hasCustomToolCallEvent(body)
 			) {
+				this.releaseCodexResponseIdAttempt(attemptId);
 				return this.buildCustomToolCallPassthroughResponse(body, response);
 			}
 			// Keep private upstream headers until the normal response transformer has
@@ -1942,6 +3218,10 @@ export class CodexProvider extends BaseProvider {
 			);
 		}
 
+		// This attempt never reached an SSE body at all (a genuine HTTP-level
+		// error), so transformStreamingResponse's own cleanup never runs for
+		// it: release any staged response-id candidate here instead.
+		this.releaseCodexResponseIdAttempt(attemptId);
 		const turnStateTerminalAction = attemptId
 			? this.turnStateCoordinator.finalizeAttempt({
 					attemptId,
@@ -3427,7 +4707,7 @@ export class CodexProvider extends BaseProvider {
 					const { done, value } = await reader.read();
 					if (done) break;
 					pending += value;
-					const parts = pending.split("\n");
+					const parts = pending.split(/\r?\n/);
 					pending = parts.pop() ?? "";
 					for (const line of parts) {
 						processLine(line);
@@ -3636,6 +4916,27 @@ export class CodexProvider extends BaseProvider {
 			upstreamDrainStarted = true;
 			void drainUpstream().catch(() => undefined);
 		};
+		/**
+		 * KTD7 move-only handoff: once the response-id tail validator has taken
+		 * over `upstreamReader`/`drainAbort`, this stream's own cancel/catch/
+		 * finally paths must never read, release, drain, or abort that
+		 * transport again (see `upstreamDrainStarted` being force-set at
+		 * handoff, which makes `cancelUpstreamOnce` a permanent no-op). A
+		 * downstream cancel arriving after handoff is instead routed to the
+		 * validator itself, which owns the only remaining abort capability and
+		 * reports "cancellation" as one of its distinct outcomes.
+		 */
+		let tailValidatorCancel: ((reason: unknown) => void) | null = null;
+		/**
+		 * Set exactly once, synchronously, at the KTD7 move-only handoff site
+		 * below. Gates the `finally` block's own
+		 * `releaseCodexResponseIdAttempt` call: once true, the detached tail
+		 * validator owns that single-choke-point call instead (via its own
+		 * `commitCodexResponseIdCheckpoint`/`releaseCodexResponseIdAttempt`
+		 * resolution), so `finally` must not race it by releasing the still-
+		 * pending candidate out from under an in-flight validation.
+		 */
+		let responseIdTailHandoff = false;
 		let downstreamController: ReadableStreamDefaultController<Uint8Array>;
 		let cancelled = false;
 		const pullWaiters = new Set<() => void>();
@@ -3706,6 +5007,13 @@ export class CodexProvider extends BaseProvider {
 					message,
 				});
 				releasePullWaiters();
+				if (tailValidatorCancel) {
+					// Transport ownership already moved to the tail validator;
+					// let it abort/release itself as its own "cancellation"
+					// outcome instead of racing it here.
+					tailValidatorCancel(reason);
+					return;
+				}
 				if (drainAbort && !drainAbort.signal.aborted) {
 					drainAbort.abort(
 						reason instanceof Error ? reason : new Error(message),
@@ -3862,6 +5170,34 @@ export class CodexProvider extends BaseProvider {
 
 					// Process complete SSE events extracted from this chunk
 					for (const eventText of frames) {
+						if (state.hasSentTerminalEvents) {
+							// KTD7 same-chunk tail check: the terminal event already
+							// ran (from an earlier frame in this same chunk). At most
+							// one trailing "[DONE]" is expected; any other data-bearing
+							// frame here -- including a duplicate "[DONE]" -- means
+							// "exactly one valid completed response ... no other
+							// data-bearing frame" no longer holds, so disqualify the
+							// staged response-id candidate. This only covers a
+							// trailing frame observed in THIS chunk; one arriving on a
+							// later read is instead caught by
+							// runCodexResponseIdTailValidator after the move-only
+							// handoff below (see its own doc comment).
+							const { dataLine: tailDataLine } =
+								findCodexSseFrameLines(eventText);
+							if (tailDataLine) {
+								const tailDataStr = tailDataLine.slice("data:".length).trim();
+								if (
+									tailDataStr === "[DONE]" &&
+									!state.responseIdDoneSeenAfterTerminal
+								) {
+									state.responseIdDoneSeenAfterTerminal = true;
+								} else {
+									state.responseIdTailTainted = true;
+								}
+							}
+							continue;
+						}
+
 						const { eventLine, dataLine } = findCodexSseFrameLines(eventText);
 
 						if (!eventLine || !dataLine) continue;
@@ -3885,12 +5221,63 @@ export class CodexProvider extends BaseProvider {
 							writeSSE,
 							ensureMessageStart,
 						);
-						if (state.hasSentTerminalEvents) break;
 					}
 
 					if (state.hasSentTerminalEvents) {
-						streamLiveness.stop();
-						cancelUpstreamOnce("Codex terminal response received");
+						// KTD7: promote/discard only after the whole chunk containing
+						// the terminal event has been scanned for a same-chunk tail
+						// taint above -- never from inside handleCodexEvent itself,
+						// which cannot see frames later in the same `frames` array.
+						const handoffAttemptId = state.traceAttemptId;
+						const handoffEligible =
+							!state.responseIdTailTainted &&
+							!!handoffAttemptId &&
+							!!state.responseIdTerminal &&
+							this.pendingResponseIdByAttempt.has(handoffAttemptId) &&
+							!!upstreamReader;
+						if (handoffEligible && upstreamReader) {
+							// KTD7 move-only handoff: from this point on,
+							// `upstreamDrainStarted = true` makes
+							// `cancelUpstreamOnce` and the `finally` block's own
+							// reader release/settlement permanent no-ops for this
+							// transport -- runCodexResponseIdTailValidator is the
+							// sole remaining owner of the reader, sseFrameBuffer's
+							// carried partial bytes, and drainAbort. Launched
+							// detached (never awaited): the client-facing stream
+							// still closes at the current completion boundary via
+							// the unconditional `downstreamController.close()`
+							// below, not on validator completion.
+							upstreamDrainStarted = true;
+							responseIdTailHandoff = true;
+							streamLiveness.stop();
+							const tailAbort = new AbortController();
+							tailValidatorCancel = (reason) => {
+								if (!tailAbort.signal.aborted) {
+									tailAbort.abort(
+										reason instanceof Error
+											? reason
+											: new Error(String(reason)),
+									);
+								}
+							};
+							void this.runCodexResponseIdTailValidator({
+								state,
+								reader: upstreamReader,
+								sseFrameBuffer,
+								drainAbort,
+								deadlineMs: this.streamDrainDeadlineMs,
+								cancelSignal: tailAbort.signal,
+							});
+						} else {
+							// Handoff not eligible (turn-state-owned attempt,
+							// already same-chunk-tainted, no pending candidate, or
+							// no reader): fall back to the existing cleanup path
+							// unchanged. commitCodexResponseIdCheckpoint is a
+							// no-op whenever there is nothing to promote/discard.
+							this.commitCodexResponseIdCheckpoint(state);
+							streamLiveness.stop();
+							cancelUpstreamOnce("Codex terminal response received");
+						}
 						break;
 					}
 				}
@@ -3989,6 +5376,20 @@ export class CodexProvider extends BaseProvider {
 					upstreamReader?.releaseLock();
 				}
 				if (!cancelled) downstreamController.close();
+				// KTD13: single choke point for every non-promoted exit from this
+				// attempt's lifecycle (response.incomplete, error, cancellation,
+				// abrupt EOF). Idempotent -- a no-op when
+				// commitCodexResponseIdCheckpoint already consumed the pending
+				// candidate on the clean response.completed path above. Skipped
+				// entirely once the KTD7 tail validator has taken ownership of
+				// this attempt's candidate (responseIdTailHandoff): the
+				// validator's own resolveOnce is that attempt's single choke
+				// point from here on, and this call running concurrently would
+				// race it, releasing (or double-releasing) a charge the
+				// validator may still promote.
+				if (!responseIdTailHandoff) {
+					this.releaseCodexResponseIdAttempt(state.traceAttemptId ?? null);
+				}
 			}
 		};
 
@@ -4675,6 +6076,22 @@ export class CodexProvider extends BaseProvider {
 				if (typeof resp?.id === "string" && resp.id) {
 					state.traceResponseId = resp.id;
 				}
+				// KTD7: stage the terminal checkpoint candidate from data this
+				// event already carries in memory. "response.incomplete" never
+				// stages one -- its output is not a trustworthy replay tail --
+				// so commitCodexResponseIdCheckpoint below is a no-op for that
+				// path (state.responseIdTerminal stays null).
+				if (
+					eventName === "response.completed" &&
+					typeof resp?.id === "string" &&
+					resp.id &&
+					Array.isArray(resp.output)
+				) {
+					state.responseIdTerminal = {
+						responseId: resp.id,
+						output: resp.output,
+					};
+				}
 				state.contextWindow = this.extractContextWindow(resp, usage);
 				// Close any lingering content block
 				if (state.hasSentContentBlockStart) {
@@ -4766,6 +6183,14 @@ export class CodexProvider extends BaseProvider {
 				await writeSSE("message_stop", { type: "message_stop" });
 				state.hasSentTerminalEvents = true;
 				writeCodexStreamTerminalTrace(state, messageDelta.delta.stop_reason);
+				// KTD7: promotion/discard is NOT done here. `processEvents`'s frame
+				// loop must first finish scanning the rest of the current chunk for
+				// a same-chunk trailing frame (this function cannot see frames
+				// later in that same `frames` array) before calling
+				// `commitCodexResponseIdCheckpoint`. Both terminal SSE frames are
+				// already enqueued to the client at this point regardless, so
+				// deferring the commit cannot delay or interfere with client
+				// delivery.
 				break;
 			}
 			default:

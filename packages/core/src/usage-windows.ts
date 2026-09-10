@@ -120,6 +120,7 @@ export function normalizeProviderUsageWindows(
 	if (provider === "zai") {
 		for (const [key, windowKey] of [
 			["tokens_limit", "five_hour"],
+			["tokens_limit_weekly", "seven_day"],
 			["time_limit", "time_limit"],
 		] as const) {
 			const window = asRecord(data[key]);

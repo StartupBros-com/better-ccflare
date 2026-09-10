@@ -239,6 +239,7 @@ interface TraceInputs {
 		| "cache_lane_rescue"
 		| "precommit_sse_retry"
 		| "account_failover"
+		| "continuation_repair_retry"
 		| "other_retry";
 	account?: string;
 	modelIn?: string;

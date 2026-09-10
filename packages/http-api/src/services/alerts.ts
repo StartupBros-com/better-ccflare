@@ -551,11 +551,24 @@ export class AlertService {
 		this.config = config;
 		this.requestListener = (event) => {
 			if (event.type === "summary") {
-				void this.evaluateRequest(event.payload);
+				// Request-level alerting includes aggregate database queries. A transient
+				// rejection must stay inside this fire-and-forget event boundary rather
+				// than becoming an unhandled rejection that terminates the proxy.
+				this.evaluateRequest(event.payload).catch((error) => {
+					log.error(
+						`Alert evaluation failed for request ${event.payload.id}: ${(error as Error).message}`,
+					);
+				});
 			}
 		};
 		this.authFailureListener = (event) => {
-			void this.handleAuthFailure(event);
+			// Authentication alerts are also dispatched from a synchronous event
+			// emitter, so contain failures from config lookup or persistence here.
+			this.handleAuthFailure(event).catch((error) => {
+				log.error(
+					`Auth-failure alert evaluation failed for account ${event.accountId}: ${(error as Error).message}`,
+				);
+			});
 		};
 		this.configChangeListener = ({ key }: { key: string }) => {
 			if (
@@ -619,7 +632,11 @@ export class AlertService {
 		if (!config.anomalyEnabled) return;
 		this.anomalyTimer = setInterval(
 			() => {
-				void this.evaluateAnomalies();
+				// The interval has no caller to await its asynchronous database work.
+				// Catch failures at the registered callback so later ticks remain active.
+				this.evaluateAnomalies().catch((error) => {
+					log.error(`Anomaly evaluation failed: ${(error as Error).message}`);
+				});
 			},
 			config.anomalyIntervalMinutes * 60 * 1000,
 		);

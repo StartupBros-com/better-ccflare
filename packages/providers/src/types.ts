@@ -45,6 +45,49 @@ export interface RateLimitInfo {
  */
 export type CacheReplayModelStrategy = "normalized-source" | "transformed-body";
 
+/**
+ * Final-wire observation context for `Provider.observeUpstream`. Captured at
+ * the point closest to the actual dispatched HTTP request/response -- after
+ * every retry's final body mutations, immediately before the physical send.
+ *
+ * This is a read-only, request-local snapshot. Implementations must treat it
+ * as observational only: it carries no routing or continuation authority, and
+ * must never influence replay eligibility or checkpoint promotion.
+ */
+export interface UpstreamObservationContext {
+	readonly requestId: string;
+	readonly account: Account | null;
+	readonly sourceBody: ArrayBuffer | null;
+	readonly sourceHeaders: Headers;
+	readonly nativeResponses: boolean;
+	readonly signal: AbortSignal;
+}
+
+/**
+ * Observer handle returned by `Provider.observeUpstream`. The caller invokes
+ * exactly one of `response`/`error` once the physical attempt concludes.
+ * Both methods are expected to be resilient: a diagnostics failure inside
+ * either must never fail the inference or alter the response returned to the
+ * client (see `forwardObservedUpstream`, the sole caller).
+ */
+export interface UpstreamObservation {
+	response(response: Response): Response;
+	error(error: unknown): void;
+}
+
+/**
+ * Observer handle returned by `Provider.observeRequest`. Extends
+ * `UpstreamObservation`'s response()/error() contract with `bindRequestId`,
+ * called once the proxy's canonical request id is known (request creation
+ * happens after account-selection setup, strictly after this observation is
+ * created at the top of the handler). The caller invokes `bindRequestId` at
+ * most once, then exactly one of `response`/`error` once the request
+ * concludes -- whether or not it ever reached physical dispatch.
+ */
+export interface RequestObservation extends UpstreamObservation {
+	bindRequestId(requestId: string): void;
+}
+
 export interface ProviderUsageInfo {
 	model?: string;
 	promptTokens?: number;
@@ -285,6 +328,21 @@ export interface Provider {
 	): void;
 
 	/**
+	 * Optional: Behavior 2 (Codex rejected-id repair). Called immediately
+	 * after a recognized rejected-`previous_response_id` classification and
+	 * strictly BEFORE dispatching the one-shot full-history repair retry
+	 * through the shared physical-send boundary. Confirms the physical
+	 * attempt was actually response-id-owned with a real (non-cold)
+	 * continuation, drains it through the provider's own owner choke point,
+	 * retires the rejected lane's checkpoint, and suppresses repeated repair
+	 * on that lane. Returns true iff a repair retry is warranted. Providers
+	 * that hold no response-id continuation state omit it.
+	 */
+	prepareCodexResponseIdRejectionRepair?(
+		attemptId: string | null | undefined,
+	): boolean;
+
+	/**
 	 * Optional: Pre-process the request before building URL
 	 * This allows providers to extract information from the request body
 	 * before buildUrl is called (e.g., for including model in URL path)
@@ -358,6 +416,36 @@ export interface Provider {
 	 * Check if the response is a streaming response
 	 */
 	isStreamingResponse?(response: Response): boolean;
+
+	/**
+	 * Optional: observe the final-wire request/response for a physical attempt,
+	 * strictly at the boundary closest to the actual dispatched HTTP transport
+	 * (after every retry's final body mutations, before the send). Purely
+	 * observational -- never routing or continuation authority, never altering
+	 * replay eligibility or checkpoint promotion. Implementations must not
+	 * consume `request`'s body destructively for unrelated callers and must
+	 * fail silently (never throw into the caller's request path).
+	 */
+	observeUpstream?(
+		request: Request,
+		context: UpstreamObservationContext,
+	): Promise<UpstreamObservation | undefined>;
+
+	/**
+	 * Optional: observe request coverage from the very top of the proxy
+	 * handler, strictly BEFORE account selection. Complements `observeUpstream`
+	 * (which only fires once an account is selected and a physical attempt is
+	 * imminent) by also covering a purely local refusal -- pool exhaustion, a
+	 * policy exclusion, an early validation error -- that never reaches
+	 * physical dispatch. Synchronous and cheap: implementations must not block
+	 * or await network/disk work on the request path. Purely observational --
+	 * never routing or continuation authority -- and must fail silently (never
+	 * throw into the caller's request path).
+	 */
+	observeRequest?(
+		headers: Headers,
+		nativeResponses: boolean,
+	): RequestObservation | undefined;
 }
 
 // OAuth-specific types

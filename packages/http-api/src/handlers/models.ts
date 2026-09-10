@@ -1,5 +1,19 @@
-import { listCatalogueModels } from "@better-ccflare/core";
-import { errorResponse, jsonResponse } from "@better-ccflare/http-common";
+import {
+	listCatalogueModels,
+	validateApiKey,
+	validateEndpointUrl,
+} from "@better-ccflare/core";
+import { ValidationError } from "@better-ccflare/errors";
+import {
+	BadGateway,
+	BadRequest,
+	errorResponse,
+	jsonResponse,
+} from "@better-ccflare/http-common";
+import {
+	fetchOpenAICompatibleModelsPreview,
+	OpenAICompatibleModelDiscoveryError,
+} from "@better-ccflare/proxy";
 import type { APIContext } from "../types";
 
 /**
@@ -244,5 +258,76 @@ export function createModelsRefreshHandler(context: APIContext) {
 		const result = await context.modelCatalog.refresh();
 		const catalog = await context.modelCatalog.get();
 		return jsonResponse({ ...result, catalog });
+	};
+}
+
+/**
+ * POST /api/models/preview — list the models one unsaved OpenAI-compatible
+ * credential/endpoint tuple can call, without ever persisting an account.
+ *
+ * The caller supplies `apiKey`/`endpoint` directly in the body rather than an
+ * account id: this exists precisely for the moment before an account is
+ * saved, in the add-account wizard. It shares no cache, state, or derived
+ * routing-default plumbing with the saved-account discovery path above —
+ * see fetchOpenAICompatibleModelsPreview in @better-ccflare/proxy. A
+ * successful call is not capability evidence: it grants no routing
+ * eligibility and creates nothing.
+ *
+ * Route registration relies on the router's normal auth/authz gate running
+ * before this handler is ever invoked (management-role semantics identical
+ * to every other /api/* route: admin or no-key bootstrap may call it,
+ * api-only and unauthenticated callers are rejected before any outbound
+ * fetch happens).
+ */
+export function createModelsPreviewHandler() {
+	return async (req: Request): Promise<Response> => {
+		let body: unknown;
+		try {
+			body = await req.json();
+		} catch {
+			return errorResponse(BadRequest("Request body must be valid JSON"));
+		}
+
+		let apiKey: string;
+		let endpoint: string;
+		try {
+			const candidate = (body ?? {}) as {
+				apiKey?: unknown;
+				endpoint?: unknown;
+			};
+			apiKey = validateApiKey(candidate.apiKey, "apiKey");
+			endpoint = validateEndpointUrl(candidate.endpoint, "endpoint");
+		} catch (error) {
+			if (error instanceof ValidationError) {
+				return errorResponse(BadRequest(error.message));
+			}
+			return errorResponse(BadRequest("Invalid preview request"));
+		}
+
+		try {
+			const listing = await fetchOpenAICompatibleModelsPreview(
+				apiKey,
+				endpoint,
+			);
+			return jsonResponse({
+				provider: "openai-compatible",
+				source: "preview",
+				models: listing.models.map((model) => ({
+					id: model.id,
+					displayName: model.displayName,
+					source: "preview" as const,
+				})),
+				fetchedAt: listing.fetchedAt,
+			});
+		} catch (error) {
+			// fetchOpenAICompatibleModelsPreview already redacts credentials and
+			// upstream bodies from its thrown message — never forward anything
+			// else (e.g. a raw non-Error throw) that might not be redacted.
+			const message =
+				error instanceof OpenAICompatibleModelDiscoveryError
+					? error.message
+					: "Model preview failed";
+			return errorResponse(BadGateway(message));
+		}
 	};
 }

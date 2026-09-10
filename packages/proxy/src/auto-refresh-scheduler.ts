@@ -704,8 +704,13 @@ export class AutoRefreshScheduler {
 				// Update rate limit fields from unified headers
 				if (rateLimitInfo.resetTime) {
 					await this.db.run(
-						"UPDATE accounts SET rate_limit_reset = ?, rate_limited_until = NULL WHERE id = ? AND created_at = ?",
-						[rateLimitInfo.resetTime, accountRow.id, accountRow.created_at],
+						"UPDATE accounts SET rate_limit_reset = ?, rate_limit_reset_at = ?, rate_limited_until = NULL WHERE id = ? AND created_at = ?",
+						[
+							rateLimitInfo.resetTime,
+							Date.now(),
+							accountRow.id,
+							accountRow.created_at,
+						],
 					);
 					if (!(await isCurrent())) {
 						return false;

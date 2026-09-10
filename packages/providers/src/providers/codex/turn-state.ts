@@ -75,6 +75,11 @@ export const CODEX_TURN_STATE_REQUEST_ACTIONS = [
 	"model_not_allowlisted",
 	"percent_control",
 	"cohort_not_allowlisted",
+	// KTD6: another continuation mechanism (response-id) already owns this
+	// physical attempt exclusively. beginAttempt is never invoked in this
+	// case -- this label exists purely so trace/analyze-trace can see why
+	// turn-state was skipped rather than reading a gap as a dropped action.
+	"response_id_owned",
 ] as const;
 export type CodexTurnStateRequestAction =
 	(typeof CODEX_TURN_STATE_REQUEST_ACTIONS)[number];
@@ -105,7 +110,8 @@ export type CodexTurnStateAttemptCause =
 	| "cache_lane_rescue"
 	| "precommit_sse_retry"
 	| "account_failover"
-	| "other_retry";
+	| "other_retry"
+	| "continuation_repair_retry";
 
 export type CodexTurnStateLineage =
 	| { readonly kind: "none" }
@@ -495,6 +501,11 @@ const COMPATIBLE_RETRY_CAUSES = new Set<CodexTurnStateAttemptCause>([
 const RESCUE_CAUSES = new Set<CodexTurnStateAttemptCause>([
 	"cache_lane_rescue",
 	"precommit_sse_retry",
+	// Behavior 2 (rejected-id repair): the repair retry must never register,
+	// replay, or capture turn-state -- it reuses "rescue_suppressed" exactly
+	// like the two causes above rather than a new action, so no exhaustiveness
+	// cross-check (trace.ts/analyze-trace.ts) needs updating for it.
+	"continuation_repair_retry",
 ]);
 const FAILOVER_CAUSES = new Set<CodexTurnStateAttemptCause>([
 	"account_failover",

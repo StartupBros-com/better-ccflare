@@ -284,8 +284,12 @@ describe("Codex usage-window session rollover", () => {
 		await flush();
 
 		expect(calls.runs).toContainEqual({
-			sql: "UPDATE accounts SET rate_limit_reset = ? WHERE id = ?",
-			params: [Date.parse(NEXT_FIVE_HOUR_RESET), account.id],
+			sql: "UPDATE accounts SET rate_limit_reset = ?, rate_limit_reset_at = ? WHERE id = ?",
+			params: [
+				Date.parse(NEXT_FIVE_HOUR_RESET),
+				expect.any(Number),
+				account.id,
+			],
 		});
 	});
 });

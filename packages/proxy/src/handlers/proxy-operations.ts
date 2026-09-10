@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	type AccountUsageSnapshot,
 	getConfiguredModelMapping,
@@ -22,17 +23,22 @@ import type { Provider, ProviderAttemptPlan } from "@better-ccflare/providers";
 import {
 	applyXaiConvIdHeader,
 	buildServerToolCapabilityProofKey,
+	CODEX_AUTHENTICATED_CALLER_HEADER,
 	CODEX_CONVERSATION_ID_HEADER,
+	CODEX_NATIVE_RESPONSES_HEADER,
 	CODEX_TURN_STATE_HEADER,
 	decideContextAdmission,
 	estimateAnthropicAdmissionTokens,
 	hasDeferredCustomTool,
 	isAnthropicExtraUsageExhausted,
+	isAnthropicOrgPermissionDenied,
 	isAnthropicOutOfCredits,
+	isCodexResponseIdRejectionError,
 	isCodexSubscriptionEndpoint,
 	materializeProviderAttemptPlan,
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
+	readRequestJson,
 	resolveCodexEndpoint,
 	resolveCodexRequestModel,
 	resolveModelContextCapability,
@@ -137,9 +143,11 @@ import {
 	getXaiConvId,
 } from "./account-selector";
 import { cancelDiscardedResponseBody } from "./discard-body-cancel";
+import { forwardObservedUpstream } from "./observed-upstream";
 import {
 	ERROR_MESSAGES,
 	isInternalProbe,
+	isResponsesAdapterRequest,
 	type ProxyContext,
 } from "./proxy-types";
 import {
@@ -179,6 +187,7 @@ import {
 	tryAcquireStaleTokenRefresh,
 	upstreamAuthFailureReason,
 } from "./token-manager";
+import { peekSseForZai1305 } from "./zai-1305";
 
 const log = new Logger("ProxyOperations");
 
@@ -1311,8 +1320,10 @@ export async function forceModelInTransformedRequest(
 	model: string,
 ): Promise<Request> {
 	try {
-		const text = await request.clone().text();
-		const body = JSON.parse(text);
+		// Not `request.clone().text()` inline — readRequestJson centralizes the
+		// non-consuming-read contract (Bun 1.3.x request.clone().json() leak,
+		// #382) so every genuine non-consuming caller shares one audited path.
+		const body = await readRequestJson<Record<string, unknown>>(request);
 		if (body.model === model) return request;
 		body.model = model;
 		return new Request(request.url, {
@@ -1410,6 +1421,15 @@ function materializeSyntheticResponse(request: Request): Response {
 	const cacheControl = request.headers.get("cache-control");
 	if (contentType) headers.set("content-type", contentType);
 	if (cacheControl) headers.set("cache-control", cacheControl);
+	// Forward the synthetic-response markers onto the client-facing Response
+	// too, not just content negotiation headers -- otherwise downstream
+	// consumers (gateways, dashboards, log pipelines) can't tell a locally
+	// synthesized response (e.g. Codex's count_tokens estimate) apart from an
+	// authoritative upstream value once it reaches the wire.
+	const syntheticMarker = request.headers.get(SYNTHETIC_RESPONSE_HEADER);
+	if (syntheticMarker) headers.set(SYNTHETIC_RESPONSE_HEADER, syntheticMarker);
+	const syntheticStatus = request.headers.get(SYNTHETIC_STATUS_HEADER);
+	if (syntheticStatus) headers.set(SYNTHETIC_STATUS_HEADER, syntheticStatus);
 
 	return new Response(request.body, {
 		status: parseSyntheticStatus(request),
@@ -2397,22 +2417,41 @@ export async function proxyUnauthenticated(
 		routingAttemptLedger?.recordPhysicalAttempt({
 			laneKey: requestMeta.affinityLaneKey ?? null,
 		});
-		let response = await makeProxyRequest(
-			targetUrl,
-			req.method,
-			headers,
-			createBodyStream,
-			!!req.body,
-			// Abort upstream when the client disconnects; this path builds no
-			// Request object, so the signal has to be passed explicitly.
-			// routingSignal already falls back to req.signal when there is no
-			// active pre-commit rescue, so this chain covers both cases. The
-			// drain controller must be present when fetch is created so terminal
-			// recovery can later tear down a stuck response body.
-			AbortSignal.any([
-				attemptCommitment?.signal ?? routingSignal,
-				drainAbortController.signal,
-			]),
+		const dispatchSignal = AbortSignal.any([
+			attemptCommitment?.signal ?? routingSignal,
+			drainAbortController.signal,
+		]);
+		// KTD8 final-wire observation: purely diagnostic (see
+		// forwardObservedUpstream), captured at the exact point of physical
+		// dispatch, after every header/body transformation above. `headers` is
+		// the already-prepared, sanitized set actually being sent; `req.headers`
+		// carries the pre-transform source for diagnostics correlation only.
+		let response = await forwardObservedUpstream(
+			ctx.provider,
+			new Request(targetUrl, { method: req.method, headers }),
+			{
+				requestId: requestMeta.id,
+				account: null,
+				sourceBody: requestBodyBuffer,
+				sourceHeaders: req.headers,
+				nativeResponses: isResponsesAdapterRequest(req.headers, ctx),
+				signal: dispatchSignal,
+			},
+			() =>
+				makeProxyRequest(
+					targetUrl,
+					req.method,
+					headers,
+					createBodyStream,
+					!!req.body,
+					// Abort upstream when the client disconnects; this path builds no
+					// Request object, so the signal has to be passed explicitly.
+					// routingSignal already falls back to req.signal when there is no
+					// active pre-commit rescue, so this chain covers both cases. The
+					// drain controller must be present when fetch is created so
+					// terminal recovery can later tear down a stuck response body.
+					dispatchSignal,
+				),
 		);
 
 		if (
@@ -2632,6 +2671,13 @@ export async function proxyWithAccount(
 	 */
 	const makeAttemptRequest = async (
 		request: Request,
+		// This physical attempt's replay body, exactly as it will be sent (after
+		// model forcing and any retry-loop body mutation). `makeAttemptRequest`
+		// is defined once, above the per-attempt `try` block that owns the live
+		// `currentReplayBody`/`effectiveBodyBuffer` trackers, so it cannot close
+		// over either -- the caller threads the right value in per call instead.
+		// Diagnostic correlation only (KTD8): never re-sent, never routing input.
+		sourceBody: ArrayBuffer | null,
 		optionalOutboundTransport?: (
 			signal: AbortSignal,
 			markDispatched: () => void,
@@ -2671,13 +2717,35 @@ export async function proxyWithAccount(
 				// returns, when nothing remains between here and the fetch below.
 				onHttpDispatch?.();
 				markDispatched();
-				return makeProxyRequest(
+				// KTD8 final-wire observation: purely diagnostic (see
+				// forwardObservedUpstream). `request` here is the fully-transformed
+				// wire request for this physical attempt -- after model forcing,
+				// provider body transforms, and header preparation. `sourceBody`
+				// is this attempt's replay body (reflecting model forcing and any
+				// retry-loop delta), passed in by the caller for diagnostic
+				// correlation only, never re-sent. Skipped entirely for the
+				// websocket/optional-transport path above, which never reaches
+				// this line.
+				return await forwardObservedUpstream(
+					ctx.provider,
 					request,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					attemptSignal,
+					{
+						requestId: requestMeta.id,
+						account,
+						sourceBody,
+						sourceHeaders: req.headers,
+						nativeResponses: isResponsesAdapterRequest(req.headers, ctx),
+						signal: attemptSignal,
+					},
+					() =>
+						makeProxyRequest(
+							request,
+							undefined,
+							undefined,
+							undefined,
+							undefined,
+							attemptSignal,
+						),
 				);
 			};
 			const transportSignal = currentTransportSignal();
@@ -3405,7 +3473,8 @@ export async function proxyWithAccount(
 				| "cache_lane_rescue"
 				| "precommit_sse_retry"
 				| "account_failover"
-				| "other_retry",
+				| "other_retry"
+				| "continuation_repair_retry",
 			finalModel?: string,
 		) => {
 			if (attemptPlan.providerName !== "codex") return;
@@ -3520,6 +3589,27 @@ export async function proxyWithAccount(
 						requestMeta.codexPacingReleaseReason,
 					);
 				}
+				// Native-Responses trust carrier (KTD6/response-id continuation).
+				// `isResponsesAdapterRequest` verifies the process-local secret set
+				// only by the in-process openai-responses-adapter synthetic request
+				// (see proxy.ts's own use of the same check); a client can never
+				// forge it. The caller-identity digest is derived here from the
+				// already-authenticated `apiKeyId` for *this* physical request,
+				// never from anything client-supplied.
+				if (isResponsesAdapterRequest(req.headers, ctx)) {
+					prepared.set(CODEX_NATIVE_RESPONSES_HEADER, "1");
+					if (apiKeyId) {
+						prepared.set(
+							CODEX_AUTHENTICATED_CALLER_HEADER,
+							createHash("sha256").update(apiKeyId).digest("hex"),
+						);
+					} else {
+						prepared.delete(CODEX_AUTHENTICATED_CALLER_HEADER);
+					}
+				} else {
+					prepared.delete(CODEX_NATIVE_RESPONSES_HEADER);
+					prepared.delete(CODEX_AUTHENTICATED_CALLER_HEADER);
+				}
 			} else {
 				prepared.delete("x-better-ccflare-attributed-agent");
 			}
@@ -3527,6 +3617,13 @@ export async function proxyWithAccount(
 			// client-supplied copies before providers transform the outbound request.
 			prepared.delete(SYNTHETIC_RESPONSE_HEADER);
 			prepared.delete(SYNTHETIC_STATUS_HEADER);
+			// Defense in depth: these two headers are only ever meaningful for the
+			// codex branch above, but strip any client-supplied copy unconditionally
+			// so a non-codex provider request can never carry a forged value through.
+			if (plan.providerName !== "codex") {
+				prepared.delete(CODEX_NATIVE_RESPONSES_HEADER);
+				prepared.delete(CODEX_AUTHENTICATED_CALLER_HEADER);
+			}
 			return prepared;
 		};
 		let headers = prepareAttemptHeaders(attemptPlan);
@@ -4135,6 +4232,7 @@ export async function proxyWithAccount(
 					: transportRequest;
 				const response = await makeAttemptRequest(
 					httpTransportRequest,
+					replayBody,
 					attemptPlan.providerName === "codex" && !hasCodexTurnStateReplay
 						? async (signal, markDispatched) => {
 								currentCodexWebSocketReceipt = null;
@@ -4789,6 +4887,116 @@ export async function proxyWithAccount(
 			currentTransportModel,
 		);
 
+		// Zai reports "service overloaded" (error.code 1305) *inside* a
+		// successful SSE stream: HTTP 200, content-type text/event-stream, and
+		// the error as the first SSE event. Nothing in the status line or
+		// headers marks it a failure, so nothing else in this function would
+		// ever notice — peek the leading bytes (bounded by SSE_PEEK_MAX_BYTES /
+		// SSE_PEEK_TIMEOUT_MS, one peek per physical attempt) and, on a hit,
+		// retry through the same physical-attempt reservation/budget machinery
+		// as the 529 in-place retry below rather than an unauthorized raw
+		// fetch. If every retry is still 1305, convert to a synthetic 429 so
+		// the existing isModelUnavailableError / model-cycling machinery
+		// downstream drives failover — this recurses into a fresh
+		// proxyWithAccount call per model attempt, so this check naturally
+		// runs (and peeks) exactly once per physical attempt with no extra
+		// bookkeeping needed to prevent a double peek.
+		if (
+			!hostedDispatchCommitted() &&
+			!isSyntheticInternal &&
+			!wasProtectedLifecycleForLatestResponse() &&
+			account.provider === "zai" &&
+			rawResponse.status === 200 &&
+			(rawResponse.headers.get("content-type")?.includes("text/event-stream") ??
+				false) &&
+			(await peekSseForZai1305(rawResponse))
+		) {
+			log.warn(
+				`Account ${account.name}: detected 1305 overloaded error in SSE stream, retrying`,
+			);
+			const zaiRetryCfg = getOverloadRetryConfig();
+			let zai1305Unresolved = true;
+			if (zaiRetryCfg.enabled && zaiRetryCfg.maxAttempts > 1) {
+				for (let attempt = 1; attempt < zaiRetryCfg.maxAttempts; attempt++) {
+					try {
+						routingAttemptLedger?.assertPhysicalAttemptAvailable(
+							physicalAttemptVetoContext(),
+						);
+					} catch (error) {
+						// Mirrors the 529 loop's veto-catch below: the current raw
+						// response is local ownership and cannot be seen by any
+						// terminalizer once the budget veto crosses this account seam.
+						await discardUpstreamBody(rawResponse);
+						throw error;
+					}
+					const zaiRetryTransport = retryTransformedTemplate.clone();
+					const zaiDegradedReservation = reservePhysicalSend(
+						zaiRetryTransport,
+						currentTransportModel,
+						rawResponse,
+					);
+					const zaiCap = Math.min(
+						zaiRetryCfg.baseMs * 2 ** attempt,
+						zaiRetryCfg.maxMs,
+					);
+					const zaiDelayMs = Math.random() * zaiCap;
+					try {
+						await new Promise<void>((resolve) =>
+							setTimeout(resolve, zaiDelayMs),
+						);
+					} catch (error) {
+						cancelPhysicalSendReservation(zaiDegradedReservation);
+						throw error;
+					}
+					log.info(
+						`Account ${account.name}: 1305 in-place retry ${attempt}/${zaiRetryCfg.maxAttempts - 1} after ${Math.round(zaiDelayMs)}ms for zai overloaded stream`,
+					);
+					commitPhysicalSendReservation(zaiDegradedReservation, rawResponse);
+					const previousRawResponse = rawResponse;
+					await discardUpstreamBody(previousRawResponse);
+					rawResponse = await executeCacheAwareProviderAttempt(
+						zaiRetryTransport,
+						currentReplayBody,
+						currentCacheIdentityHasCacheControl,
+						currentTransportModel,
+						zaiDegradedReservation,
+					);
+					zai1305Unresolved =
+						rawResponse.status === 200 &&
+						(rawResponse.headers
+							.get("content-type")
+							?.includes("text/event-stream") ??
+							false) &&
+						(await peekSseForZai1305(rawResponse));
+					if (!zai1305Unresolved) {
+						log.info(
+							`Account ${account.name}: 1305 resolved on retry ${attempt}`,
+						);
+						break;
+					}
+				}
+			}
+			if (zai1305Unresolved) {
+				log.warn(
+					`Account ${account.name}: 1305 retries exhausted (or disabled), converting to synthetic 429 for model fallback`,
+				);
+				const exhaustedRawResponse = rawResponse;
+				rawResponse = new Response(
+					JSON.stringify({
+						error: {
+							type: "overloaded_error",
+							message: "ZAI service overloaded (1305)",
+						},
+					}),
+					{
+						status: 429,
+						headers: { "content-type": "application/json" },
+					},
+				);
+				await discardUpstreamBody(exhaustedRawResponse);
+			}
+		}
+
 		// Check if this is a Claude provider and we got an invalid thinking signature error
 		if (
 			!hostedDispatchCommitted() &&
@@ -5116,6 +5324,178 @@ export async function proxyWithAccount(
 				log.warn("Failed to retry without cache_control:", err);
 			}
 		}
+
+		// Behavior 2 (KTD6/KTD13 rejected-id repair): upstream can reject the
+		// gateway-supplied previous_response_id with a recognized 400/404
+		// naming that exact field. Repair AT MOST ONCE per lane: remove the
+		// rejected id, suppress turn-state (via the dedicated
+		// "continuation_repair_retry" attemptCause, self-suppressed in
+		// turn-state.ts's RESCUE_CAUSES), and resend full history on the SAME
+		// authorized account and physical model through this exact shared
+		// physical-send boundary, consuming one physical-attempt budget slot
+		// (transportAttemptOrdinal, via stampCodexAttempt below).
+		// `prepareCodexResponseIdRejectionRepair` drains the rejected
+		// response through its exact owner and retires/suppresses the lane
+		// BEFORE this block ever sends the retry, so a generic 400/404, a
+		// malformed error, a budget veto (never staged as response-id-owned
+		// in the first place), or a second rejection on an already-suppressed
+		// lane all correctly perform no repair.
+		if (
+			!hostedDispatchCommitted() &&
+			attemptPlan.providerName === "codex" &&
+			(await isCodexResponseIdRejectionError(
+				rawResponse,
+				readAttemptBoundJson,
+			)) &&
+			provider.prepareCodexResponseIdRejectionRepair?.(
+				currentTransportAttemptId,
+			)
+		) {
+			// Retiring the lane (done by prepareCodexResponseIdRejectionRepair in
+			// the condition above) is the unconditional half and the half that
+			// matters for correctness: a rejected checkpoint must never be
+			// offered again, or every later turn on this lane re-earns the same
+			// rejection. The full-history resend is the conditional half — it
+			// can only replay a body this request actually buffered, exactly as
+			// the sibling 529 and precommit-rescue retries below require. With
+			// no buffered body there is nothing to resend, and a bodyless
+			// request would drop the whole conversation instead of repairing it,
+			// so leave the rejection to normal error handling with the lane
+			// already retired.
+			const repairReplayBody = currentReplayBody;
+			if (repairReplayBody) {
+				log.info(
+					`Codex rejected previous_response_id for account=${account.name} model=${transformedModel}, retrying once with full history`,
+				);
+				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
+				const retryHeaders = new Headers(providerRequest.headers);
+				stampCodexAttempt(retryHeaders, "continuation_repair_retry");
+				const retrySourceInit: RequestInit & { duplex?: "half" } = {
+					method: providerRequest.method,
+					headers: retryHeaders,
+					body: new Uint8Array(repairReplayBody),
+					duplex: "half",
+				};
+				const retrySource = new Request(providerRequest.url, retrySourceInit);
+				retrySourceRequest = retrySource.clone();
+				let retryTransformed = await transformWithCurrentAttemptPlan(
+					attemptPlan,
+					retrySource,
+				);
+				retryTransformed = await enforcePhysicalModelAfterTransform(
+					retryTransformed,
+					currentTransportModel,
+				);
+				retryTransformedTemplate = retryTransformed.clone();
+				const retryTransport = retryTransformedTemplate.clone();
+				rawResponse = await executeCacheAwareProviderAttempt(
+					retryTransport,
+					repairReplayBody,
+					currentCacheIdentityHasCacheControl,
+					currentTransportModel,
+				);
+			} else {
+				log.warn(
+					`Codex rejected previous_response_id for account=${account.name} model=${transformedModel}; retired the lane without a repair retry (no buffered replay body)`,
+				);
+			}
+		}
+
+		/**
+		 * Anthropic answers 403 `permission_error` when an account's ORGANIZATION
+		 * forbids the request — OAuth disabled org-wide, Claude Code subscription
+		 * access turned off by an admin — not a per-account quota problem. The
+		 * account cannot serve ANY request until someone changes a setting
+		 * upstream, so like handlePaymentRequired402 below it is benched
+		 * account-wide and the request fails over without model cycling (cycling
+		 * models would just re-earn the same organization-level rejection on
+		 * every one of them). isAnthropicOrgPermissionDenied is narrowed to the
+		 * one known error_code (or no error_code at all); an unrecognized
+		 * error_code, a non-JSON 403 (edge/WAF block page), or any other 403
+		 * keeps today's pass-through behavior untouched.
+		 *
+		 * POOL-WIDE DRAIN CAVEAT: if every account in the pool belongs to the
+		 * same org and that org has disabled access, every account benches in
+		 * turn and the pool goes fully dark — bench, cooldown expiry,
+		 * single-flight probe, re-bench, repeat — until an admin changes the
+		 * org setting. There is no pool-wide/provider-wide circuit here, only
+		 * this per-account exponential cooldown, so nothing short-circuits that
+		 * loop early. The warn log below fires on every account as it benches,
+		 * so an "all accounts benched with org_permission_denied" pattern across
+		 * the pool in a short window is the signal to look for when debugging a
+		 * fully-dark pool.
+		 */
+		const handleOrgPermissionDenied403 = async (
+			failureResponse: Response,
+			attemptedModel = currentTransportModel || effectiveBodyContext.getModel(),
+		): Promise<RawAttemptFailureClassification | null> => {
+			if (failureResponse.status !== 403 || !isClaudeProvider) return null;
+			// Passed un-cloned on purpose: the predicate clones internally and
+			// never consumes its argument, so wrapping it in another clone here
+			// would strand a tee branch for every non-matching 403 (issue #356).
+			if (!(await isAnthropicOrgPermissionDenied(failureResponse))) return null;
+			const reason = "org_permission_denied";
+			const cooldownBefore = captureCooldownState(account);
+			// No reset hint exists for this condition (unlike a 402/429 with a
+			// resend-after header), so no resetTime is passed — the exponential
+			// backoff in applyRateLimitCooldownInMemory is what governs the bench
+			// duration. Awaited (not fire-and-forget) for the same R9 reason as
+			// handlePaymentRequired402 below: failover selection reads fresh
+			// account state from the DB, and a fast follow-up request must not
+			// race ahead of this write.
+			await applyRateLimitCooldownAwaitingPersist(account, { reason }, ctx);
+			const accountBenched = appliedCooldown(account, cooldownBefore);
+			const routeSuppressed = routingAttemptLedger !== undefined;
+			routingAttemptLedger?.blockAccount(account.id);
+			recordRequestRateLimitOutcome(req, {
+				accountId: account.id,
+				status: 403,
+				scope: "account",
+				family: attemptedModel ? getModelFamily(attemptedModel) : null,
+				attemptedModel,
+				reason,
+				availableAt: null,
+			});
+			log.warn(
+				`Account ${account.name} org_permission_denied (403${attemptedModel ? `, model=${attemptedModel}` : ""}) — ` +
+					"organization forbids OAuth/Claude Code access for this account; " +
+					"benching account and failing over to next account",
+			);
+			recordRoutingAttempt({
+				parentRequestId: requestMeta.id,
+				timestamp: Date.now(),
+				provider: account.provider,
+				accountId: account.id,
+				attemptedModel: attemptedModel,
+				modelFamily: attemptedModel ? getModelFamily(attemptedModel) : null,
+				statusCode: 403,
+				reason,
+				upstreamEvidence: await captureSanitizedUpstreamEvidence(
+					ctx,
+					failureResponse,
+					{
+						consumeOriginalBody: true,
+					},
+				),
+				scope: "account",
+				availableAt: null,
+				failoverAttempts,
+				physicalAttempt:
+					routingAttemptLedger && routingAttemptLedger.physicalAttemptCount > 0
+						? routingAttemptLedger.physicalAttemptCount
+						: null,
+				accountBenched,
+				routeSuppressed,
+				circuitCounted: false,
+			});
+			return {
+				scope: "account",
+				attemptedModel,
+				family: attemptedModel ? getModelFamily(attemptedModel) : null,
+				stopAccountAttempt: true,
+			};
+		};
 
 		/**
 		 * HTTP 402 is an account-specific billing/credit failure, not a model
@@ -5656,6 +6036,7 @@ export async function proxyWithAccount(
 		): Promise<RawAttemptFailureClassification> => {
 			const classification =
 				(await handleExtraUsageExhausted400(failureResponse, attemptedModel)) ??
+				(await handleOrgPermissionDenied403(failureResponse, attemptedModel)) ??
 				(await handlePaymentRequired402(failureResponse, attemptedModel)) ??
 				(await handleExactModel429(failureResponse, attemptedModel)) ??
 				(await handleScopedAnthropic429(failureResponse, attemptedModel));
@@ -6544,7 +6925,13 @@ export async function proxyWithAccount(
 			// disposed of — one orphan per 529, plus one per in-place retry
 			// below. See issue #354.
 			const rlInfo = attemptPlan.parseRateLimit(response);
-			if (rlInfo.isRateLimited && !rlInfo.resetTime) {
+			// Do NOT gate on rlInfo.isRateLimited: providers such as
+			// ZaiProvider.parseRateLimit only classify isRateLimited=true for a
+			// 429, so on a 529 it always answers false and this whole branch
+			// was dead for zai-shaped accounts — the very overload case it
+			// exists for. We are already inside `status === 529`; resetTime
+			// alone decides in-place retry vs. cooldown.
+			if (!rlInfo.resetTime) {
 				const retryCfg = getOverloadRetryConfig();
 				if (retryCfg.enabled && retryCfg.maxAttempts > 1) {
 					for (let attempt = 1; attempt < retryCfg.maxAttempts; attempt++) {
@@ -6729,8 +7116,13 @@ export async function proxyWithAccount(
 
 						// Header-only read, see the note on the first parseRateLimit
 						// call above — the retry response must not be teed either.
+						// Same reason as the entry guard above: isRateLimited is
+						// always false here for zai-shaped providers, so this broke
+						// out after a single retry and silently capped the budget
+						// at 1. Status is known to be 529 here (checked below);
+						// only a reset hint stops the loop.
 						const retryRlInfo = attemptPlan.parseRateLimit(retryResponse);
-						if (!retryRlInfo.isRateLimited || retryRlInfo.resetTime) {
+						if (retryRlInfo.resetTime) {
 							// Got a reset hint on retry — stop; let processProxyResponse apply cooldown
 							break;
 						}

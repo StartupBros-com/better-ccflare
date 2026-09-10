@@ -8,6 +8,7 @@ import {
 	spyOn,
 } from "bun:test";
 import { ANTHROPIC_DEGRADED_MODE_DEFAULTS } from "@better-ccflare/config";
+import { logBus } from "@better-ccflare/logger";
 import type { Account } from "@better-ccflare/types";
 import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
 import { DegradedModeObservability } from "../anthropic-degraded-observability";
@@ -822,6 +823,105 @@ describe("routing terminal — 503 response", () => {
 			expect((await response.json()).error.code).toBe("pool_exhausted");
 		} finally {
 			Date.now = realDateNow;
+		}
+	});
+
+	it("emits a Codex cache-diagnostics lifecycle for a purely local pool-exhausted refusal that never reached upstream (GAP 1)", async () => {
+		// KTD8's forwardObservedUpstream only fires once an account is chosen
+		// and a physical attempt is imminent, so it is structurally blind to a
+		// refusal this local: handleProxy's own routing terminal answers the
+		// request before any account is selected. beginRequestObservation
+		// (wired at the very top of handleProxy, before account selection) is
+		// what must produce this lifecycle instead. `ctx.provider` here is the
+		// generic test double from makeContext, which never defines
+		// `observeRequest` -- so this also proves beginRequestObservation's
+		// getProvider("codex") fallback resolves the *real*, registered
+		// CodexProvider hook rather than silently no-op'ing.
+		const previousDiagnosticsEnv = process.env.CCFLARE_CODEX_CACHE_DIAGNOSTICS;
+		process.env.CCFLARE_CODEX_CACHE_DIAGNOSTICS = "1";
+		const lifecycleEvents: Array<Record<string, unknown>> = [];
+		const handler = (event: { msg: string; data?: unknown }) => {
+			if (event.msg === "Codex cache observation lifecycle") {
+				lifecycleEvents.push(event.data as Record<string, unknown>);
+			}
+		};
+		logBus.on("log", handler);
+		const now = Date.UTC(2026, 6, 20, 12);
+		const primary = makeAccount({
+			id: "acc-diag-primary",
+			name: "primary",
+			provider: "claude-console-api",
+			rate_limited_until: now + 60_000,
+			rate_limited_reason: "upstream_429_with_reset",
+		});
+		const secondary = makeAccount({
+			id: "acc-diag-fable-secondary",
+			name: "secondary",
+			provider: "claude-console-api",
+		});
+		const realDateNow = Date.now;
+		Date.now = () => now;
+		let upstreamAttempts = 0;
+		globalThis.fetch = mock(async () => {
+			upstreamAttempts += 1;
+			throw new Error("upstream must not be called");
+		}) as unknown as typeof fetch;
+		try {
+			usageCache.set(secondary.id, {
+				limits: [
+					{
+						kind: "weekly_scoped",
+						percent: 100,
+						resets_at: new Date(now + 120_000).toISOString(),
+						scope: { model: { id: null, display_name: "Fable" } },
+						is_active: true,
+					},
+				],
+			});
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-fable-4-5",
+					messages: [{ role: "user", content: "hello" }],
+					max_tokens: 16,
+				}),
+			});
+			const response = await handleProxy(
+				request,
+				new URL(request.url),
+				makeContext([primary, secondary]),
+			);
+
+			// Proves this really is the local-refusal path the fix targets.
+			expect(upstreamAttempts).toBe(0);
+			expect(response.status).toBe(503);
+			expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+				"exhausted",
+			);
+
+			// The proof: a refusal that never reached upstream still produced a
+			// diagnostics lifecycle, and its terminal event carries
+			// refusal_reason: "pool_exhausted" -- previously impossible, since
+			// forwardObservedUpstream is never invoked on this code path.
+			const events = lifecycleEvents.map((e) => e.event);
+			expect(events).toContain("request_received");
+			expect(events).toContain("request_identified");
+			expect(events).toContain("request_headers");
+			const terminal = lifecycleEvents.find(
+				(e) => e.event === "request_headers",
+			);
+			expect(terminal?.refusal_reason).toBe("pool_exhausted");
+			expect(terminal?.status_code).toBe(503);
+		} finally {
+			Date.now = realDateNow;
+			logBus.off("log", handler);
+			usageCache.delete(secondary.id);
+			if (previousDiagnosticsEnv === undefined) {
+				delete process.env.CCFLARE_CODEX_CACHE_DIAGNOSTICS;
+			} else {
+				process.env.CCFLARE_CODEX_CACHE_DIAGNOSTICS = previousDiagnosticsEnv;
+			}
 		}
 	});
 

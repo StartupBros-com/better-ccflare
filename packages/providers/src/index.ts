@@ -47,6 +47,8 @@ export {
 	isProxyMintedCodexReasoningBlock,
 	stripCodexReasoningRetention,
 } from "./utils/codex-reasoning-retention";
+// Export shared request-body helper (Bun 1.3.x clone().json() leak, #382)
+export * from "./utils/request-json";
 // Export xAI usage fetcher
 export * from "./xai-usage-fetcher";
 // Export Zai usage fetcher

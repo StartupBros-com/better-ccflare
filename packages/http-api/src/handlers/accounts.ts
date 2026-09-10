@@ -84,6 +84,10 @@ const RATE_LIMIT_REASONS = new Set<RateLimitReason>([
 	"upstream_529_overloaded_no_reset",
 	"out_of_credits",
 	"extra_usage_exhausted",
+	// 403 permission_error bench reason (see proxy-operations.ts): written to
+	// accounts.rate_limited_reason, and without this entry it was silently
+	// nulled here, hiding the bench reason from the accounts API/dashboard.
+	"org_permission_denied",
 	// Native xAI capacity signal (R5-R10): XaiProvider.parseRateLimit classifies
 	// an upstream 402 (Grok Build credits exhausted) with this typed reason
 	// instead of relabeling it as a generic 429.

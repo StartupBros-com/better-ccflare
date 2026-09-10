@@ -247,10 +247,10 @@ export async function persistForwardOnlyCodexRateLimitReset(
 	resetTime: number,
 ): Promise<void> {
 	await db.run(
-		`UPDATE accounts SET rate_limit_reset = ?
+		`UPDATE accounts SET rate_limit_reset = ?, rate_limit_reset_at = ?
 		 WHERE id = ?
 		   AND (rate_limit_reset IS NULL OR rate_limit_reset < ?)`,
-		[resetTime, accountId, resetTime],
+		[resetTime, Date.now(), accountId, resetTime],
 	);
 }
 
@@ -1020,6 +1020,36 @@ export function startUsagePollingWithRefresh(
 						} catch (err) {
 							logger.warn(
 								`Usage window ledger failed for account ${accountId}: ${err}`,
+							);
+						}
+					})();
+				},
+				(accountId, observedAt) => {
+					void (async () => {
+						if (accountId !== account.id || !(await isCurrent())) return;
+						try {
+							const currentAccount =
+								await proxyContext.dbOps.getAccount(accountId);
+							if (
+								currentAccount?.created_at !== lease.createdAt ||
+								!(await isCurrent()) ||
+								currentAccount.rate_limit_reset == null
+							)
+								return;
+							const cleared = await proxyContext.dbOps.clearStaleRateLimitReset(
+								accountId,
+								Number(currentAccount.rate_limit_reset),
+								observedAt,
+								lease.createdAt,
+							);
+							if (cleared) {
+								logger.info(
+									`Cleared stale rate_limit_reset for account ${currentAccount.name} (${accountId}): weekly usage window reset`,
+								);
+							}
+						} catch (err) {
+							logger.warn(
+								`Failed to check/clear stale rate_limit_reset for account ${accountId}: ${err}`,
 							);
 						}
 					})();
@@ -2004,13 +2034,13 @@ export default async function startServer(options?: {
 					// earlier on introspection data alone.
 					try {
 						await db.run(
-							`UPDATE accounts SET rate_limit_reset = ?
+							`UPDATE accounts SET rate_limit_reset = ?, rate_limit_reset_at = ?
 							 WHERE id = ?
 							   AND NOT (
 							     rate_limited_until IS NOT NULL AND rate_limited_until > ?
 							     AND rate_limit_reset IS NOT NULL AND rate_limit_reset > ?
 							   )`,
-							[candidateMs, account.id, Date.now(), candidateMs],
+							[candidateMs, Date.now(), account.id, Date.now(), candidateMs],
 						);
 					} catch (error) {
 						log.warn(

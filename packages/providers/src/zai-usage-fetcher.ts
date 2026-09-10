@@ -12,7 +12,10 @@ export interface ZaiUsageWindow {
 
 export interface ZaiUsageData {
 	time_limit: ZaiUsageWindow | null;
+	/** Short token window (5-hour on current plans) — the nearest reset. */
 	tokens_limit: ZaiUsageWindow | null;
+	/** Long token window (weekly on current plans), null on single-window plans. */
+	tokens_limit_weekly?: ZaiUsageWindow | null;
 }
 
 /**
@@ -77,7 +80,9 @@ export async function fetchZaiUsageData(
 		const result: ZaiUsageData = {
 			time_limit: null,
 			tokens_limit: null,
+			tokens_limit_weekly: null,
 		};
+		const tokenWindows: ZaiUsageWindow[] = [];
 
 		// Parse each limit type
 		for (const limit of limits) {
@@ -90,15 +95,27 @@ export async function fetchZaiUsageData(
 					type: "time_limit",
 				};
 			} else if (limit.type === "TOKENS_LIMIT") {
-				result.tokens_limit = {
+				tokenWindows.push({
 					used: limit.currentValue ?? 0,
 					remaining: limit.remaining ?? 0,
 					percentage: limit.percentage ?? 0,
 					resetAt: limit.nextResetTime ?? null,
 					type: "tokens_limit",
-				};
+				});
 			}
 		}
+
+		// Zai sends multiple identically-typed token limits. Reset order is the
+		// stable discriminator: nearest is the short window, later is weekly.
+		tokenWindows.sort(
+			(a, b) =>
+				(a.resetAt ?? Number.POSITIVE_INFINITY) -
+				(b.resetAt ?? Number.POSITIVE_INFINITY),
+		);
+		result.tokens_limit = tokenWindows[0] ?? null;
+		result.tokens_limit_weekly = tokenWindows[1]
+			? { ...tokenWindows[1], type: "tokens_limit_weekly" }
+			: null;
 
 		return result;
 	} catch (error) {
@@ -107,49 +124,57 @@ export async function fetchZaiUsageData(
 	}
 }
 
-/**
- * Get the representative utilization percentage (0-100)
- * Returns the tokens_limit utilization (5-hour token quota)
- */
+interface NamedTokenWindow {
+	name: "five_hour" | "seven_day";
+	window: ZaiUsageWindow;
+}
+
+/** Token quotas only: TIME_LIMIT caps web tools, not model traffic. */
+function tokenWindows(usage: ZaiUsageData): NamedTokenWindow[] {
+	const windows: NamedTokenWindow[] = [];
+	if (usage.tokens_limit) {
+		windows.push({ name: "five_hour", window: usage.tokens_limit });
+	}
+	if (usage.tokens_limit_weekly) {
+		windows.push({ name: "seven_day", window: usage.tokens_limit_weekly });
+	}
+	return windows;
+}
+
+/** Highest utilization wins; ties choose the later known reset. */
+export function getWinningZaiTokenWindow(
+	usage: ZaiUsageData | null,
+): NamedTokenWindow | null {
+	if (!usage) return null;
+	const windows = tokenWindows(usage);
+	if (windows.length === 0) return null;
+	return windows.reduce((prev, current) => {
+		if (current.window.percentage !== prev.window.percentage) {
+			return current.window.percentage > prev.window.percentage
+				? current
+				: prev;
+		}
+		// On a tie, prefer the LATER known reset — but if either tied window's
+		// reset is unknown, we cannot safely claim a recovery time at all (the
+		// unknown window might still be exhausted after the known one clears),
+		// so surface the unknown one rather than guessing.
+		if (current.window.resetAt === null || prev.window.resetAt === null) {
+			return prev.window.resetAt === null ? prev : current;
+		}
+		return current.window.resetAt > prev.window.resetAt ? current : prev;
+	});
+}
+
+/** Return the utilization of the binding model-traffic token quota. */
 export function getRepresentativeZaiUtilization(
 	usage: ZaiUsageData | null,
 ): number | null {
-	if (!usage) return null;
-
-	// Only consider tokens_limit (5-hour token quota)
-	// time_limit is not displayed to users
-	if (usage.tokens_limit && usage.tokens_limit.percentage !== undefined) {
-		return usage.tokens_limit.percentage;
-	}
-
-	return null;
+	return getWinningZaiTokenWindow(usage)?.window.percentage ?? null;
 }
 
-/**
- * Determine which limit is the most restrictive (highest utilization)
- * Returns "five_hour" (for tokens_limit) to match Claude terminology
- */
+/** Return the canonical name of the binding model-traffic token quota. */
 export function getRepresentativeZaiWindow(
 	usage: ZaiUsageData | null,
 ): string | null {
-	if (!usage) return null;
-
-	const windows: Array<{ name: string; percentage: number }> = [];
-
-	// Only consider tokens_limit (5-hour token quota)
-	// time_limit is not displayed to users
-	if (usage.tokens_limit && usage.tokens_limit.percentage !== undefined) {
-		windows.push({
-			name: "five_hour", // Map to "5-hour" to match Claude terminology
-			percentage: usage.tokens_limit.percentage,
-		});
-	}
-
-	if (windows.length === 0) return null;
-
-	const max = windows.reduce((prev, current) =>
-		current.percentage > prev.percentage ? current : prev,
-	);
-
-	return max.name;
+	return getWinningZaiTokenWindow(usage)?.name ?? null;
 }

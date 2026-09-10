@@ -393,6 +393,20 @@ sqlite3 ~/.config/better-ccflare/better-ccflare.db \
 Nothing is sent while the pool is dry, and the accounts are not penalised for
 it — the refusal is not counted as a refresh failure.
 
+For Anthropic accounts specifically, a `rate_limit_reset` stuck in the past
+because the weekly usage window rolled over out of band (before the next
+usage poll happened to observe it) is now cleared automatically: when usage
+polling next observes zero utilization with no active weekly window for the
+account, a compare-and-set write (`clearStaleRateLimitReset`, guarded on the
+account's `created_at` and the exact `rate_limit_reset`/`rate_limit_reset_at`
+last written) resets `rate_limit_status` back to `allowed` and clears
+`rate_limit_reset`. This is Anthropic-only — no other provider wires the
+callback that triggers it — and only fires once real usage evidence confirms
+the reset, so it does not mask a genuinely still-active window. If this
+symptom persists on an Anthropic account despite the guard, the stuck value
+predates a usage-polling cycle that could observe the rollover; the manual
+`sqlite3` check above still applies.
+
 #### 4. Too Frequent Refreshes
 
 **Symptoms:**

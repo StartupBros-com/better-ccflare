@@ -43,6 +43,7 @@ import {
 	fetchZaiUsageData,
 	getRepresentativeZaiUtilization,
 	getRepresentativeZaiWindow,
+	getWinningZaiTokenWindow,
 	type ZaiUsageData,
 } from "./zai-usage-fetcher";
 
@@ -278,6 +279,29 @@ export function extractWeeklyResetTime(
 	);
 }
 
+function getCanonicalActiveWeeklyWindow(
+	data: AnyUsageData,
+	provider: string,
+): CanonicalUsageWindow | null {
+	if (provider !== "anthropic" && provider !== "codex") return null;
+	return (
+		normalizeProviderUsageWindows(data, provider).find(
+			(window) =>
+				window.windowKey === "seven_day" &&
+				window.scope === "account" &&
+				window.active,
+		) ?? null
+	);
+}
+
+/** Utilization of the valid, active, account-wide weekly window only. */
+export function extractWeeklyUtilization(
+	data: AnyUsageData,
+	provider: string,
+): number | null {
+	return getCanonicalActiveWeeklyWindow(data, provider)?.utilization ?? null;
+}
+
 /**
  * Fetch usage data from Anthropic's OAuth usage endpoint
  */
@@ -397,7 +421,12 @@ function accountLevelLimitWindows(
 	if (!Array.isArray(usage.limits)) return [];
 	const out: Array<{ window: string; util: number }> = [];
 	for (const limit of usage.limits) {
-		if (!limit || typeof limit.percent !== "number") continue;
+		if (
+			!limit ||
+			limit.is_active === false ||
+			typeof limit.percent !== "number"
+		)
+			continue;
 		if (limit.kind === "session")
 			out.push({ window: "five_hour", util: limit.percent });
 		else if (limit.kind === "weekly_all")
@@ -543,12 +572,7 @@ function utilizationForProvider(
 			return getRepresentativeNanoGPTUtilization(data as NanoGPTUsageData);
 		}
 		case "zai": {
-			const zai = data as ZaiUsageData;
-			const candidates = [
-				zai.time_limit?.percentage ?? null,
-				zai.tokens_limit?.percentage ?? null,
-			].filter((v): v is number => v !== null);
-			return candidates.length > 0 ? Math.max(...candidates) : null;
+			return getRepresentativeZaiUtilization(data as ZaiUsageData);
 		}
 		case "kilo": {
 			return getRepresentativeKiloUtilization(data as KiloUsageData);
@@ -754,11 +778,11 @@ export function getRepresentativeUsageResetMs(
 				// resets_at so the staleness guard still has a real reset time.
 				return getRepresentativeLimitResetMs(data as UsageData, windowName);
 			}
-			case "zai":
-				return extractUsageResetMs(
-					data,
-					(data as ZaiUsageData).tokens_limit ? "tokens_limit" : null,
+			case "zai": {
+				return (
+					getWinningZaiTokenWindow(data as ZaiUsageData)?.window.resetAt ?? null
 				);
+			}
 			case "nanogpt":
 				return extractUsageResetMs(
 					data,
@@ -810,28 +834,13 @@ export function getRepresentativeUsageSnapshotForProvider(
 	provider: string,
 ): { utilization: number; resetMs: number | null } | null {
 	if (provider === "zai") {
-		const zai = data as ZaiUsageData;
-		const candidates = [zai.time_limit, zai.tokens_limit].filter(
-			(window): window is NonNullable<typeof window> => window !== null,
-		);
-		if (candidates.length === 0) return null;
-		// On a tie (both windows equally exhausted), prefer the LATER reset —
-		// the account isn't actually available again until every exhausted
-		// window clears, so picking the earlier one would tell clients to
-		// retry while the other window is still capped.
-		const winning = candidates.reduce((prev, current) => {
-			if (current.percentage !== prev.percentage) {
-				return current.percentage > prev.percentage ? current : prev;
-			}
-			if (current.resetAt === null || prev.resetAt === null) {
-				return prev.resetAt === null ? prev : current;
-			}
-			return current.resetAt > prev.resetAt ? current : prev;
-		});
-		return {
-			utilization: winning.percentage,
-			resetMs: winning.resetAt,
-		};
+		const winning = getWinningZaiTokenWindow(data as ZaiUsageData);
+		return winning
+			? {
+					utilization: winning.window.percentage,
+					resetMs: winning.window.resetAt,
+				}
+			: null;
 	}
 
 	const utilization = getRepresentativeUtilizationForProvider(data, provider);
@@ -863,6 +872,7 @@ type PollRegistration = {
 	baseIntervalMs: number;
 	onWindowReset?: (accountId: string) => void;
 	onCapacityRestored?: (accountId: string) => void;
+	onStaleWeeklyReset?: (accountId: string, observedAt: number) => void;
 	onSnapshot?: (payload: UsageSnapshotPayload) => void;
 	timer?: NodeJS.Timeout;
 	abortController: AbortController;
@@ -1038,6 +1048,7 @@ class UsageCache {
 		onWindowReset?: (accountId: string) => void,
 		onCapacityRestored?: (accountId: string) => void,
 		onSnapshot?: (payload: UsageSnapshotPayload) => void,
+		onStaleWeeklyReset?: (accountId: string, observedAt: number) => void,
 	) {
 		// Check if provider supports usage tracking
 		if (provider && !supportsUsageTracking(provider)) {
@@ -1072,6 +1083,7 @@ class UsageCache {
 			baseIntervalMs: intervalMs ?? 90000,
 			onWindowReset,
 			onCapacityRestored,
+			onStaleWeeklyReset,
 			onSnapshot,
 			abortController: new AbortController(),
 			failureCount: 0,
@@ -1386,6 +1398,16 @@ class UsageCache {
 					);
 					this.setRegistrationCache(registration, result.data);
 					this.notifySnapshot(registration, result.data);
+					const weeklyWindow = getCanonicalActiveWeeklyWindow(
+						result.data,
+						"anthropic",
+					);
+					if (
+						weeklyWindow?.utilization === 0 &&
+						weeklyWindow.resetsAtMs === null
+					) {
+						registration.onStaleWeeklyReset?.(accountId, Date.now());
+					}
 					const utilization = getRepresentativeUtilization(
 						result.data as UsageData,
 					);

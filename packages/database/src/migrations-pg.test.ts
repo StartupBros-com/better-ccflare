@@ -616,6 +616,56 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Regression: routingAttemptsReasonConstraintIsCurrentPg must not crash when
+// a `get()` implementation returns a truthy row that lacks a `definition`
+// field (e.g. a test stub, or a driver that returns `{}` instead of `null`
+// for "no matching row"). Drives the real runMigrationsPg end to end — not a
+// mock of the guard itself — with the same generic `get: async () => ({
+// exists: 1 })` stub shape used by device-setup-job-migrations.test.ts,
+// managed-routing-migrations.test.ts, native-quota-policy.test.ts, and
+// server-tool-replay-issuance-migrations.test.ts, all of which hit this
+// exact crash before the guard fix.
+// ---------------------------------------------------------------------------
+
+describe("routing_attempts reason constraint guard (malformed pg_constraint row)", () => {
+	it("does not throw when the constraint-definition lookup returns a row without `definition`, and still upgrades the constraint", async () => {
+		const statements: string[] = [];
+		const truthyRowWithoutDefinitionAdapter = {
+			get: async () => ({ exists: 1 }) as never,
+			run: async () => {},
+			unsafe: async (sql: string) => {
+				statements.push(sql.replace(/\s+/g, " ").trim());
+				return [];
+			},
+			query: async () => [],
+			runWithChanges: async () => 0,
+		};
+
+		await expect(
+			runMigrationsPg(truthyRowWithoutDefinitionAdapter as never),
+		).resolves.toBeUndefined();
+
+		// A missing/malformed `definition` must be treated as "constraint not
+		// current" (the safe direction), so the DROP/ADD upgrade path runs.
+		expect(
+			statements.some((sql) =>
+				sql.startsWith(
+					"ALTER TABLE routing_attempts DROP CONSTRAINT IF EXISTS routing_attempts_reason_check",
+				),
+			),
+		).toBe(true);
+		expect(
+			statements.some(
+				(sql) =>
+					sql.startsWith(
+						"ALTER TABLE routing_attempts ADD CONSTRAINT routing_attempts_reason_check CHECK",
+					) && sql.includes("'org_permission_denied'"),
+			),
+		).toBe(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // Live PostgreSQL smoke test — only runs when a real PG server is reachable.
 // ---------------------------------------------------------------------------
 
@@ -1228,6 +1278,139 @@ describe.skipIf(!livePgAvailable)(
 				await adapter.unsafe(
 					`DELETE FROM cache_flight_recorder_service_epochs WHERE id = ?`,
 					[epochId],
+				);
+				await adapter.close();
+			}
+		});
+
+		it("upgrades an existing PostgreSQL reason constraint to accept a newly allowlisted reason without losing rows", async () => {
+			// Regression test for the routing_attempts.reason CHECK constraint
+			// not being upgraded for existing databases: runMigrationsPg only
+			// ADDs columns, it never rebuilds the reason allowlist rendered
+			// into the CHECK at CREATE TABLE time, so a database created
+			// before org_permission_denied was added kept rejecting it.
+			const { SQL } = await import("bun");
+			const { BunSqlAdapter } = await import("./adapters/bun-sql-adapter");
+			const { ensureSchemaPg, runMigrationsPg } = await import(
+				"./migrations-pg"
+			);
+			const { ROUTING_ATTEMPT_REASONS } = await import(
+				"./routing-attempt-taxonomy"
+			);
+
+			// biome-ignore lint/style/noNonNullAssertion: guarded by describe.skipIf(!livePgAvailable)
+			const databaseUrl = process.env.DATABASE_URL!;
+			const sqlClient = new SQL({ url: databaseUrl });
+			const adapter = new BunSqlAdapter(sqlClient, false);
+
+			const legacyReasons = ROUTING_ATTEMPT_REASONS.filter(
+				(reason) => reason !== "org_permission_denied",
+			);
+			const legacyReasonSql = legacyReasons
+				.map((reason) => `'${reason}'`)
+				.join(", ");
+
+			const insertAttempt = (id: string, reason: string) =>
+				adapter.unsafe(
+					`INSERT INTO routing_attempts (
+						id, parent_request_id, timestamp, provider, account_id, attempted_model,
+						model_family, status_code, reason, scope, available_at, failover_attempts,
+						physical_attempt, account_benched, route_suppressed, circuit_counted
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					[
+						id,
+						"parent",
+						1,
+						"anthropic",
+						"account",
+						"model",
+						"family",
+						429,
+						reason,
+						"model",
+						null,
+						0,
+						1,
+						0,
+						0,
+						0,
+					],
+				);
+
+			try {
+				await ensureSchemaPg(adapter);
+				await runMigrationsPg(adapter);
+
+				// Fresh installs already accept the current reason (proves
+				// requirement 6 for PostgreSQL). Delete it again before rolling
+				// the constraint back below — modeling a database that predates
+				// org_permission_denied means it must hold no row using that
+				// reason yet, or the rollback's own re-validation would fail.
+				await insertAttempt(
+					"pg-fresh-accepts-new-reason",
+					"org_permission_denied",
+				);
+				await adapter.unsafe(
+					"DELETE FROM routing_attempts WHERE id = 'pg-fresh-accepts-new-reason'",
+				);
+
+				// Roll the live constraint back to the pre-org_permission_denied
+				// allowlist to model an existing database that predates this
+				// change, then exercise the upgrade path under test.
+				await adapter.unsafe(
+					"ALTER TABLE routing_attempts DROP CONSTRAINT IF EXISTS routing_attempts_reason_check",
+				);
+				await adapter.unsafe(
+					`ALTER TABLE routing_attempts ADD CONSTRAINT routing_attempts_reason_check CHECK (reason IN (${legacyReasonSql}))`,
+				);
+
+				await insertAttempt("pg-legacy-pre-existing", "extra_usage_exhausted");
+
+				// Red: the legacy constraint rejects the new reason before migrating.
+				await expect(
+					insertAttempt("pg-legacy-rejected-before", "org_permission_denied"),
+				).rejects.toThrow();
+
+				const beforeRows = await adapter.query(
+					"SELECT * FROM routing_attempts WHERE id = 'pg-legacy-pre-existing'",
+				);
+
+				await runMigrationsPg(adapter);
+
+				// Green: the same reason is now accepted post-migration.
+				await insertAttempt(
+					"pg-legacy-accepted-after",
+					"org_permission_denied",
+				);
+
+				// The pre-existing row survived migration with identical values.
+				const afterRows = await adapter.query(
+					"SELECT * FROM routing_attempts WHERE id = 'pg-legacy-pre-existing'",
+				);
+				expect(afterRows).toEqual(beforeRows);
+
+				// Previously prohibited reasons are still rejected — the
+				// rebuild must not have dropped the constraint entirely.
+				for (const reason of [
+					"upstream_429_no_reset_default_5h",
+					"not_a_routing_attempt_reason",
+				]) {
+					await expect(
+						insertAttempt(`pg-legacy-still-rejected-${reason}`, reason),
+					).rejects.toThrow();
+				}
+
+				// Idempotent: running the upgrade again must not fail, duplicate,
+				// or lose rows.
+				await runMigrationsPg(adapter);
+				const countRow = await adapter.get<{ count: string | number }>(
+					`SELECT COUNT(*) AS count FROM routing_attempts
+					 WHERE id IN ('pg-legacy-pre-existing', 'pg-legacy-accepted-after')`,
+				);
+				expect(Number(countRow?.count ?? 0)).toBe(2);
+			} finally {
+				await adapter.unsafe(
+					"DELETE FROM routing_attempts WHERE id LIKE 'pg-legacy-%' OR id = 'pg-fresh-accepts-new-reason'",
 				);
 				await adapter.close();
 			}

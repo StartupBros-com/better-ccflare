@@ -31,6 +31,7 @@ function makeDb(): { db: Database; repo: AccountRepository } {
 			session_request_count INTEGER DEFAULT 0,
 			paused INTEGER DEFAULT 0,
 			rate_limit_reset INTEGER,
+			rate_limit_reset_at INTEGER,
 			rate_limit_status TEXT,
 			rate_limit_remaining INTEGER,
 			priority INTEGER DEFAULT 0,

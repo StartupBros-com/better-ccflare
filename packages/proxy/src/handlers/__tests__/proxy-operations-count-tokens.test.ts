@@ -213,6 +213,16 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		expect(ctx.asyncWriter.enqueue).toHaveBeenCalledTimes(0);
 		expect(result).toBeInstanceOf(Response);
 		expect(result?.status).toBe(200);
+		// Regression guard: materializeSyntheticResponse must forward the
+		// synthetic-response markers onto the client-facing Response, not just
+		// content-type/cache-control, so downstream consumers can tell the count
+		// is a local estimate rather than an authoritative upstream value.
+		expect(result?.headers.get("x-better-ccflare-synthetic-response")).toBe(
+			"true",
+		);
+		expect(result?.headers.get("x-better-ccflare-synthetic-status")).toBe(
+			"200",
+		);
 		const payload = await result?.json();
 		expect(payload.input_tokens).toBeNumber();
 		expect(payload.input_tokens).toBeGreaterThan(0);

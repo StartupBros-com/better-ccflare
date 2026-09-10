@@ -232,23 +232,30 @@ describe("createPoolExhaustedResponse — usage-aware", () => {
 });
 
 describe("Zai pool-exhausted snapshot pairing", () => {
+	// TIME_LIMIT caps web-tool usage, not model traffic, so it is deliberately
+	// excluded from the token-window pairing below (see
+	// `tokenWindows()`/`getWinningZaiTokenWindow` in zai-usage-fetcher.ts).
+	// These scenarios exercise the winning-window selection between the two
+	// TOKEN windows instead: tokens_limit (five_hour) vs tokens_limit_weekly
+	// (seven_day).
 	it("uses the reset from the window with the winning utilization", async () => {
-		const timeLimitResetMs = Date.now() + 120_000;
-		const tokensLimitResetMs = Date.now() + 3_600_000;
+		const fiveHourResetMs = Date.now() + 120_000;
+		const weeklyResetMs = Date.now() + 3_600_000;
 		const zaiUsage: ZaiUsageData = {
-			time_limit: {
+			time_limit: null,
+			tokens_limit: {
 				used: 100,
 				remaining: 0,
 				percentage: 100,
-				resetAt: timeLimitResetMs,
-				type: "time_limit",
+				resetAt: fiveHourResetMs,
+				type: "tokens_limit",
 			},
-			tokens_limit: {
+			tokens_limit_weekly: {
 				used: 50,
 				remaining: 50,
 				percentage: 50,
-				resetAt: tokensLimitResetMs,
-				type: "tokens_limit",
+				resetAt: weeklyResetMs,
+				type: "tokens_limit_weekly",
 			},
 		};
 		const account = makeAccount({ provider: "zai" });
@@ -269,15 +276,15 @@ describe("Zai pool-exhausted snapshot pairing", () => {
 				}>;
 			};
 		};
-		const winningReset = new Date(timeLimitResetMs).toISOString();
+		const winningReset = new Date(fiveHourResetMs).toISOString();
 
 		expect(snapshot.utilization).toBe(100);
-		expect(snapshot.resetMs).toBe(timeLimitResetMs);
+		expect(snapshot.resetMs).toBe(fiveHourResetMs);
 		expect(body.error.accounts[0]?.reason).toBe("usage_exhausted");
 		expect(body.error.accounts[0]?.available_at).toBe(winningReset);
 		expect(body.error.next_available_at).toBe(winningReset);
 		expect(body.error.next_available_at).not.toBe(
-			new Date(tokensLimitResetMs).toISOString(),
+			new Date(weeklyResetMs).toISOString(),
 		);
 		const retryAfter = Number(response.headers.get("Retry-After"));
 		expect(retryAfter).toBeGreaterThan(110);
@@ -286,19 +293,20 @@ describe("Zai pool-exhausted snapshot pairing", () => {
 
 	it("keeps the reset unknown when the winning window has no reset", () => {
 		const zaiUsage: ZaiUsageData = {
-			time_limit: {
+			time_limit: null,
+			tokens_limit: {
 				used: 100,
 				remaining: 0,
 				percentage: 100,
 				resetAt: null,
-				type: "time_limit",
+				type: "tokens_limit",
 			},
-			tokens_limit: {
+			tokens_limit_weekly: {
 				used: 10,
 				remaining: 90,
 				percentage: 10,
 				resetAt: Date.now() + 3_600_000,
-				type: "tokens_limit",
+				type: "tokens_limit_weekly",
 			},
 		};
 		const snapshot = getRepresentativeUsageSnapshotForProvider(zaiUsage, "zai");
@@ -309,25 +317,26 @@ describe("Zai pool-exhausted snapshot pairing", () => {
 
 	it("on a 100%/100% tie, uses the LATER reset so clients don't retry before every window clears", async () => {
 		// Greptile P1 on PR #365: a strict `current.percentage > prev.percentage`
-		// comparison keeps `prev` (time_limit) on a tie, discarding a later
-		// tokens_limit reset. That tells clients capacity returns before
-		// tokens_limit actually clears — the account is still capped.
+		// comparison keeps `prev` on a tie, discarding a later reset. That tells
+		// clients capacity returns before the other window actually clears —
+		// the account is still capped.
 		const earlierResetMs = Date.now() + 120_000;
 		const laterResetMs = Date.now() + 3_600_000;
 		const zaiUsage: ZaiUsageData = {
-			time_limit: {
-				used: 100,
-				remaining: 0,
-				percentage: 100,
-				resetAt: earlierResetMs,
-				type: "time_limit",
-			},
+			time_limit: null,
 			tokens_limit: {
 				used: 100,
 				remaining: 0,
 				percentage: 100,
-				resetAt: laterResetMs,
+				resetAt: earlierResetMs,
 				type: "tokens_limit",
+			},
+			tokens_limit_weekly: {
+				used: 100,
+				remaining: 0,
+				percentage: 100,
+				resetAt: laterResetMs,
+				type: "tokens_limit_weekly",
 			},
 		};
 		const account = makeAccount({ provider: "zai" });
@@ -361,19 +370,20 @@ describe("Zai pool-exhausted snapshot pairing", () => {
 		// recovery time — the unknown window might still be exhausted after
 		// the known one clears.
 		const zaiUsage: ZaiUsageData = {
-			time_limit: {
-				used: 100,
-				remaining: 0,
-				percentage: 100,
-				resetAt: null,
-				type: "time_limit",
-			},
+			time_limit: null,
 			tokens_limit: {
 				used: 100,
 				remaining: 0,
 				percentage: 100,
-				resetAt: Date.now() + 3_600_000,
+				resetAt: null,
 				type: "tokens_limit",
+			},
+			tokens_limit_weekly: {
+				used: 100,
+				remaining: 0,
+				percentage: 100,
+				resetAt: Date.now() + 3_600_000,
+				type: "tokens_limit_weekly",
 			},
 		};
 		const snapshot = getRepresentativeUsageSnapshotForProvider(zaiUsage, "zai");

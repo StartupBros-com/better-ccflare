@@ -14,6 +14,12 @@ export interface ResponsesRequest {
 	previous_response_id?: string | null;
 	max_output_tokens?: number;
 	store?: boolean;
+	/** Sampling temperature; forwarded verbatim to the Anthropic Messages request. */
+	temperature?: number;
+	/** Nucleus sampling threshold; forwarded verbatim to the Anthropic Messages request. */
+	top_p?: number;
+	/** Anthropic API priority-tier selector ("auto" | "standard_only"); forwarded verbatim. */
+	service_tier?: string;
 	/** Codex CLI's stable conversation identity for prompt-cache routing. */
 	prompt_cache_key?: string;
 	/** Optional Claude-compatible session envelope accepted by proxy clients. */
@@ -276,6 +282,9 @@ export interface AnthropicRequest {
 	tool_choice?: AnthropicToolChoice;
 	max_tokens: number;
 	stream?: boolean;
+	temperature?: number;
+	top_p?: number;
+	service_tier?: string;
 	/** Session identity surfaced the way Anthropic clients send it. */
 	metadata?: { user_id?: string };
 }

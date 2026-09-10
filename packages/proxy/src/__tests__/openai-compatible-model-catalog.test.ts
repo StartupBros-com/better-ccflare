@@ -10,8 +10,11 @@ import {
 	clearOpenAICompatibleModelCacheForAccount,
 	clearOpenAICompatibleModelCacheForTests,
 	deriveFamilyDefaults,
+	fetchOpenAICompatibleModelsPreview,
 	getOpenAICompatibleModelCatalogStateCountForTests,
 	getOpenAICompatibleModels,
+	OPENAI_COMPATIBLE_MODEL_MAX_ID_BYTES,
+	OPENAI_COMPATIBLE_MODEL_MAX_RESPONSE_BYTES,
 } from "../openai-compatible-model-catalog";
 
 /**
@@ -458,6 +461,190 @@ describe("getOpenAICompatibleModels", () => {
 			(await getOpenAICompatibleModels(account.id, makeCtx(account)))?.models[0]
 				.id,
 		).toBe("new-model");
+	});
+});
+
+describe("fetchOpenAICompatibleModelsPreview", () => {
+	it("returns isolated live models for each unsaved credential tuple", async () => {
+		const authorizations: string[] = [];
+		globalThis.fetch = (async (_input, init) => {
+			const authorization =
+				new Headers(init?.headers).get("authorization") ?? "";
+			authorizations.push(authorization);
+			const id = authorization.endsWith("first-key")
+				? "first-model"
+				: "second-model";
+			return new Response(JSON.stringify({ data: [{ id }] }));
+		}) as typeof globalThis.fetch;
+
+		const first = await fetchOpenAICompatibleModelsPreview(
+			"first-key",
+			"http://127.0.0.1:11434",
+		);
+		const second = await fetchOpenAICompatibleModelsPreview(
+			"second-key",
+			"http://localhost:4000/v1",
+		);
+
+		expect(first.models.map((model) => model.id)).toEqual(["first-model"]);
+		expect(second.models.map((model) => model.id)).toEqual(["second-model"]);
+		expect(authorizations).toEqual(["Bearer first-key", "Bearer second-key"]);
+		expect(getOpenAICompatibleModelCatalogStateCountForTests()).toBe(0);
+	});
+
+	it("rejects malformed and empty model responses without partial results", async () => {
+		for (const response of [
+			new Response("not-json"),
+			new Response(JSON.stringify({ data: "not-an-array" })),
+			new Response(JSON.stringify({ data: [] })),
+		]) {
+			globalThis.fetch = (async () => response) as typeof globalThis.fetch;
+			await expect(
+				fetchOpenAICompatibleModelsPreview(
+					"preview-key",
+					"http://localhost:4000/v1",
+				),
+			).rejects.toThrow(/model discovery/i);
+		}
+	});
+
+	it("redacts upstream error bodies and submitted credentials", async () => {
+		const secret = "preview-secret-key";
+		globalThis.fetch = (async () =>
+			new Response(`upstream leaked ${secret}`, {
+				status: 401,
+			})) as typeof fetch;
+
+		try {
+			await fetchOpenAICompatibleModelsPreview(
+				secret,
+				"http://localhost:4000/v1",
+			);
+			throw new Error("expected preview to fail");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			expect(message).toContain("401");
+			expect(message).not.toContain(secret);
+			expect(message).not.toContain("upstream leaked");
+		}
+	});
+
+	it("rejects decoded bodies over 8 MiB despite a false Content-Length and cancels them", async () => {
+		let cancelled = false;
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					new Uint8Array(OPENAI_COMPATIBLE_MODEL_MAX_RESPONSE_BYTES),
+				);
+				controller.enqueue(new Uint8Array([0x20]));
+			},
+			cancel() {
+				cancelled = true;
+			},
+		});
+		globalThis.fetch = (async () =>
+			new Response(body, {
+				headers: { "content-length": "1" },
+			})) as typeof fetch;
+
+		await expect(
+			fetchOpenAICompatibleModelsPreview(
+				"preview-key",
+				"http://localhost:4000/v1",
+			),
+		).rejects.toThrow("8 MiB");
+		expect(cancelled).toBe(true);
+	});
+
+	it("rejects a declared oversized response before consuming it", async () => {
+		let cancelled = false;
+		const body = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				controller.enqueue(new Uint8Array([0x7b]));
+			},
+			cancel() {
+				cancelled = true;
+			},
+		});
+		globalThis.fetch = (async () =>
+			new Response(body, {
+				headers: {
+					"content-length": String(
+						OPENAI_COMPATIBLE_MODEL_MAX_RESPONSE_BYTES + 1,
+					),
+				},
+			})) as typeof fetch;
+
+		await expect(
+			fetchOpenAICompatibleModelsPreview(
+				"preview-key",
+				"http://localhost:4000/v1",
+			),
+		).rejects.toThrow("8 MiB");
+		expect(cancelled).toBe(true);
+	});
+
+	it("rejects more than 10,000 unique model IDs", async () => {
+		const data = Array.from({ length: 10_001 }, (_, index) => ({
+			id: `model-${index}`,
+		}));
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ data }))) as typeof fetch;
+
+		await expect(
+			fetchOpenAICompatibleModelsPreview(
+				"preview-key",
+				"http://localhost:4000/v1",
+			),
+		).rejects.toThrow("10,000");
+	});
+
+	it("rejects model IDs over 1,024 UTF-8 bytes", async () => {
+		const oversizedId = "é".repeat(
+			OPENAI_COMPATIBLE_MODEL_MAX_ID_BYTES / 2 + 1,
+		);
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({ data: [{ id: oversizedId }] }),
+			)) as typeof fetch;
+
+		await expect(
+			fetchOpenAICompatibleModelsPreview(
+				"preview-key",
+				"http://localhost:4000/v1",
+			),
+		).rejects.toThrow("1,024 UTF-8 bytes");
+	});
+
+	it("times out and aborts a request that never settles", async () => {
+		const originalSetTimeout = globalThis.setTimeout;
+		let observedSignal: AbortSignal | undefined;
+		globalThis.setTimeout = ((callback: TimerHandler) => {
+			queueMicrotask(() => {
+				if (typeof callback === "function") callback();
+			});
+			return 1 as unknown as ReturnType<typeof setTimeout>;
+		}) as typeof setTimeout;
+		globalThis.fetch = ((_input, init) => {
+			observedSignal = init?.signal ?? undefined;
+			return new Promise<Response>((_resolve, reject) => {
+				observedSignal?.addEventListener("abort", () =>
+					reject(new DOMException("Aborted", "AbortError")),
+				);
+			});
+		}) as typeof fetch;
+
+		try {
+			await expect(
+				fetchOpenAICompatibleModelsPreview(
+					"preview-key",
+					"http://localhost:4000/v1",
+				),
+			).rejects.toThrow(/timed out/i);
+			expect(observedSignal?.aborted).toBe(true);
+		} finally {
+			globalThis.setTimeout = originalSetTimeout;
+		}
 	});
 });
 

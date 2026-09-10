@@ -1112,6 +1112,25 @@ OAuth tokens will need to be re-authenticated.
 		);
 	}
 
+	async clearStaleRateLimitReset(
+		accountId: string,
+		expectedReset: number,
+		observedAt: number,
+		expectedCreatedAt: number,
+	): Promise<boolean> {
+		return withDatabaseRetry(
+			() =>
+				this.accounts.clearStaleRateLimitReset(
+					accountId,
+					expectedReset,
+					observedAt,
+					expectedCreatedAt,
+				),
+			this.retryConfig,
+			"clearStaleRateLimitReset",
+		);
+	}
+
 	getDeviceSetupJobRepository(): DeviceSetupJobRepository {
 		return this.deviceSetupJobs;
 	}

@@ -725,6 +725,16 @@ export function translateRequestToAnthropic(
 		result.stream = req.stream;
 	}
 
+	// Sampling/routing params with a direct Anthropic Messages equivalent.
+	// `result` above is a brand-new object listing only known fields — a
+	// field absent from that list is silently dropped even though it exists
+	// on `req`, so each pass-through has to be explicit here. `truncation`,
+	// `include`, and `text` are OpenAI Responses-API-only concepts with no
+	// Anthropic Messages equivalent and are intentionally left unforwarded.
+	if (req.temperature !== undefined) result.temperature = req.temperature;
+	if (req.top_p !== undefined) result.top_p = req.top_p;
+	if (req.service_tier !== undefined) result.service_tier = req.service_tier;
+
 	const translatedTools =
 		Array.isArray(req.tools) && req.tools.length > 0
 			? translateTools(req.tools, emitWarn)

@@ -132,6 +132,21 @@ const KNOWN_ERROR_META: Record<
 			"recovers automatically on the next successful request.",
 		severity: "error",
 	},
+	org_permission_denied: {
+		title: "Organization denied this account",
+		description:
+			"Anthropic returned 403 permission_error for this account. Nothing " +
+			"about its own quota is wrong — the organization that owns it " +
+			"forbids the request, typically because an admin disabled OAuth " +
+			"apps or Claude Code subscription access. The account is benched " +
+			"and the request fails over to another account.",
+		suggestion:
+			"An organization admin has to re-enable OAuth app or Claude Code " +
+			"access for this account. Until that setting changes upstream, the " +
+			"recovery probe will keep rediscovering the same 403, so no amount " +
+			"of waiting or retrying clears it on the proxy side.",
+		severity: "error",
+	},
 };
 
 function getModelFallbackMeta(context?: ErrorContext): ErrorMeta {

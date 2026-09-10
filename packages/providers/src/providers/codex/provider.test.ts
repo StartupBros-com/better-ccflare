@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUFFER_SIZES } from "@better-ccflare/core";
 import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
+import { logBus } from "@better-ccflare/logger";
 import { setDerivedProviderModelDefaults } from "../../provider-model-defaults";
 import {
 	getResponseDrainTransport,
 	registerResponseDrainTransport,
 } from "../../utils/stream-drain";
 import { analyzeCodexCacheExperiments } from "./analyze-trace";
+import { CODEX_CACHE_DIAGNOSTICS_ENV } from "./cache-diagnostics";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -24,6 +26,7 @@ import {
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_PING_MODEL,
 	CODEX_PROMPT_CACHE_KEY_ENV,
+	CODEX_SYNTHETIC_COUNT_TOKENS_ENV,
 	CODEX_VERSION,
 	CodexProvider,
 	codexEventCommitsOutput,
@@ -4415,6 +4418,87 @@ describe("CodexProvider.processResponse", () => {
 		});
 	});
 
+	it("tolerates CRLF-framed SSE in the buffered non-streaming fallback (upstream 4cdd64fc parity)", async () => {
+		// Isolates the parsing loop at transformSseResponseToJson's
+		// `pending.split(...)` line, independent of transformStreamingResponse's
+		// own upstream-facing framing (which already tolerates CRLF via
+		// SseFrameBuffer/findCodexSseFrameLines). The internal Anthropic-format
+		// stream that fallback re-parses is self-generated, but the fallback's
+		// own split must still match upstream's CRLF-tolerant /\r?\n/ pattern
+		// for defensive parity, not silently drop or mis-parse a field whose
+		// line happens to end in \r.
+		const provider = new CodexProvider();
+		const crlfBody =
+			"event: message_start\r\ndata: " +
+			JSON.stringify({
+				type: "message_start",
+				message: {
+					id: "msg_crlf",
+					type: "message",
+					role: "assistant",
+					model: "gpt-5.4",
+					content: [],
+					usage: { input_tokens: 0, output_tokens: 0 },
+				},
+			}) +
+			"\r\n\r\n" +
+			"event: content_block_start\r\ndata: " +
+			JSON.stringify({
+				type: "content_block_start",
+				index: 0,
+				content_block: { type: "text", text: "" },
+			}) +
+			"\r\n\r\n" +
+			"event: content_block_delta\r\ndata: " +
+			JSON.stringify({
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "text_delta", text: "Hi" },
+			}) +
+			"\r\n\r\n" +
+			"event: message_delta\r\ndata: " +
+			JSON.stringify({
+				type: "message_delta",
+				delta: { stop_reason: "end_turn", stop_sequence: null },
+				usage: { input_tokens: 7, output_tokens: 2 },
+			}) +
+			"\r\n\r\n";
+
+		const providerInternals = provider as unknown as {
+			transformStreamingResponse: (...args: unknown[]) => Response;
+			transformSseResponseToJson: (...args: unknown[]) => Promise<Response>;
+		};
+		// Shadow the prototype method with an own-property override so the
+		// buffered fallback under test reads exactly this CRLF-framed body,
+		// bypassing the (already CRLF-tolerant) upstream frame parser.
+		providerInternals.transformStreamingResponse = () =>
+			new Response(crlfBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+
+		const rawResponse = new Response(null, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": "req_crlf_1",
+			},
+		});
+
+		const result =
+			await providerInternals.transformSseResponseToJson(rawResponse);
+		const payload = JSON.parse(await result.text()) as Record<string, unknown>;
+		expect(payload.type).toBe("message");
+		expect(payload.role).toBe("assistant");
+		expect(payload.content).toEqual([{ type: "text", text: "Hi" }]);
+		expect(payload.usage).toEqual({
+			input_tokens: 7,
+			output_tokens: 2,
+			cache_read_input_tokens: 0,
+			cache_creation_input_tokens: 0,
+		});
+	});
+
 	it("preserves retained reasoning with a representable id in non-streaming SSE-to-JSON conversion", async () => {
 		const provider = new CodexProvider();
 		const requestId = "req_non_stream_reasoning_1";
@@ -7738,6 +7822,85 @@ describe("CodexProvider.transformRequestBody", () => {
 		expect(body).not.toHaveProperty("store");
 	});
 
+	it("returns a typed 501 for count_tokens when the synthetic estimate is opted out", async () => {
+		const previous = process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV];
+		process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV] = "0";
+		try {
+			const provider = new CodexProvider();
+			const url = provider.buildUrl("/v1/messages/count_tokens", "");
+			const request = new Request(url, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-7-sonnet",
+					messages: [{ role: "user", content: "hello world" }],
+				}),
+			});
+
+			const transformed = await provider.transformRequestBody(
+				request,
+				undefined,
+			);
+			const body = await transformed.json();
+
+			expect(
+				transformed.headers.get("x-better-ccflare-synthetic-response"),
+			).toBe("true");
+			expect(transformed.headers.get("x-better-ccflare-synthetic-status")).toBe(
+				"501",
+			);
+			expect(body).toEqual({
+				type: "error",
+				error: {
+					type: "not_implemented_error",
+					message:
+						"Codex does not support count_tokens; synthetic estimates are disabled (CCFLARE_CODEX_SYNTHETIC_COUNT_TOKENS=0).",
+				},
+			});
+		} finally {
+			if (previous === undefined) {
+				delete process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV];
+			} else {
+				process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV] = previous;
+			}
+		}
+	});
+
+	it("keeps the default character-based count_tokens estimate when the opt-out is unset", async () => {
+		const previous = process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV];
+		delete process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV];
+		try {
+			const provider = new CodexProvider();
+			const url = provider.buildUrl("/v1/messages/count_tokens", "");
+			const request = new Request(url, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-7-sonnet",
+					messages: [{ role: "user", content: "hello world" }],
+				}),
+			});
+
+			const transformed = await provider.transformRequestBody(
+				request,
+				undefined,
+			);
+			const body = await transformed.json();
+
+			expect(transformed.headers.get("x-better-ccflare-synthetic-status")).toBe(
+				"200",
+			);
+			expect(body.input_tokens).toBeNumber();
+			expect(body.input_tokens).toBeGreaterThan(0);
+		} finally {
+			if (previous === undefined) {
+				delete process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV];
+			} else {
+				process.env[CODEX_SYNTHETIC_COUNT_TOKENS_ENV] = previous;
+			}
+		}
+	});
+
 	it("estimates count_tokens from prompt material instead of the full JSON envelope", async () => {
 		const provider = new CodexProvider();
 		const url = provider.buildUrl("/v1/messages/count_tokens", "");
@@ -10215,5 +10378,197 @@ describe("fetchCodexUsageOnDemand", () => {
 			/non-empty access token/,
 		);
 		expect(called).toBe(false);
+	});
+});
+
+describe("CodexProvider.observeUpstream", () => {
+	const previousDiagnosticsEnv = process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+
+	afterEach(() => {
+		if (previousDiagnosticsEnv === undefined) {
+			delete process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+		} else {
+			process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = previousDiagnosticsEnv;
+		}
+	});
+
+	function makeWireRequest(): Request {
+		return new Request("https://chatgpt.com/backend-api/codex/responses", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "gpt-5.4",
+				input: [{ type: "message", role: "user", content: "hi" }],
+			}),
+		});
+	}
+
+	it("is observational-only: undefined when diagnostics are disabled (default)", async () => {
+		delete process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+		const provider = new CodexProvider();
+		const request = makeWireRequest();
+		const observation = await provider.observeUpstream?.(request, {
+			requestId: "req-1",
+			account: null,
+			sourceBody: await request.clone().arrayBuffer(),
+			sourceHeaders: new Headers(),
+			nativeResponses: false,
+			signal: new AbortController().signal,
+		});
+		expect(observation).toBeUndefined();
+	});
+
+	it("does not observe GET requests even when diagnostics are enabled", async () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const request = new Request(
+			"https://chatgpt.com/backend-api/codex/models",
+			{ method: "GET" },
+		);
+		const observation = await provider.observeUpstream?.(request, {
+			requestId: "req-2",
+			account: null,
+			sourceBody: null,
+			sourceHeaders: new Headers(),
+			nativeResponses: false,
+			signal: new AbortController().signal,
+		});
+		expect(observation).toBeUndefined();
+	});
+
+	it("returns an observation handle that passes a non-ok response through unmodified (identity) when diagnostics are enabled", async () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const request = makeWireRequest();
+		const observation = await provider.observeUpstream?.(request, {
+			requestId: "req-3",
+			account: null,
+			sourceBody: await request.clone().arrayBuffer(),
+			sourceHeaders: new Headers(),
+			nativeResponses: false,
+			signal: new AbortController().signal,
+		});
+		expect(observation).toBeDefined();
+		expect(observation?.response).toBeFunction();
+		expect(observation?.error).toBeFunction();
+
+		// A non-ok upstream response is diagnostics-inert: returned by identity,
+		// never re-wrapped or consumed, so a caller's error-handling path (which
+		// may itself read the body) is never disturbed by the observer.
+		const upstreamErrorResponse = new Response("boom", { status: 500 });
+		const passedThrough = observation?.response(upstreamErrorResponse);
+		expect(passedThrough).toBe(upstreamErrorResponse);
+
+		// Must never throw into the caller's request path, even on a transport
+		// failure it merely observed.
+		expect(() => observation?.error(new Error("upstream boom"))).not.toThrow();
+	});
+
+	it("preserves an ok response's body content byte-for-byte when diagnostics are enabled", async () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const request = makeWireRequest();
+		const observation = await provider.observeUpstream?.(request, {
+			requestId: "req-4",
+			account: null,
+			sourceBody: await request.clone().arrayBuffer(),
+			sourceHeaders: new Headers(),
+			nativeResponses: false,
+			signal: new AbortController().signal,
+		});
+		expect(observation).toBeDefined();
+
+		const upstreamResponse = new Response('{"ok":true}', {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+		const observed = observation?.response(upstreamResponse);
+		expect(observed?.status).toBe(200);
+		const text = await observed?.text();
+		expect(text).toBe('{"ok":true}');
+	});
+});
+
+describe("CodexProvider.observeRequest", () => {
+	const previousDiagnosticsEnv = process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+
+	afterEach(() => {
+		if (previousDiagnosticsEnv === undefined) {
+			delete process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+		} else {
+			process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = previousDiagnosticsEnv;
+		}
+	});
+
+	it("is observational-only: undefined when diagnostics are disabled (default)", () => {
+		delete process.env[CODEX_CACHE_DIAGNOSTICS_ENV];
+		const provider = new CodexProvider();
+		const observation = provider.observeRequest?.(new Headers(), false);
+		expect(observation).toBeUndefined();
+	});
+
+	it("returns an observation handle with bindRequestId/response/error when diagnostics are enabled", () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const observation = provider.observeRequest?.(new Headers(), false);
+		expect(observation).toBeDefined();
+		expect(observation?.bindRequestId).toBeFunction();
+		expect(observation?.response).toBeFunction();
+		expect(observation?.error).toBeFunction();
+	});
+
+	it("passes a response through unmodified (identity), even a refusal response", () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const observation = provider.observeRequest?.(new Headers(), false);
+		const refusalResponse = new Response("refused", {
+			status: 503,
+			headers: { "x-better-ccflare-pool-status": "exhausted" },
+		});
+		const observed = observation?.response(refusalResponse);
+		expect(observed).toBe(refusalResponse);
+	});
+
+	it("reports refusal_reason: pool_exhausted only when the pool-status header says exhausted", () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const lifecycleEvents: Array<Record<string, unknown>> = [];
+		const handler = (event: { msg: string; data?: unknown }) => {
+			if (event.msg === "Codex cache observation lifecycle") {
+				lifecycleEvents.push(event.data as Record<string, unknown>);
+			}
+		};
+		logBus.on("log", handler);
+		try {
+			const exhausted = provider.observeRequest?.(new Headers(), false);
+			exhausted?.response(
+				new Response(null, {
+					status: 503,
+					headers: { "x-better-ccflare-pool-status": "exhausted" },
+				}),
+			);
+
+			const notExhausted = provider.observeRequest?.(new Headers(), false);
+			notExhausted?.response(new Response(null, { status: 200 }));
+
+			const headerEvents = lifecycleEvents.filter(
+				(e) => e.event === "request_headers",
+			);
+			expect(headerEvents).toHaveLength(2);
+			expect(headerEvents[0]?.refusal_reason).toBe("pool_exhausted");
+			expect(headerEvents[0]?.status_code).toBe(503);
+			expect(headerEvents[1]?.refusal_reason).toBeNull();
+			expect(headerEvents[1]?.status_code).toBe(200);
+		} finally {
+			logBus.off("log", handler);
+		}
+	});
+
+	it("never throws from bindRequestId or error(), even with unusual input", () => {
+		process.env[CODEX_CACHE_DIAGNOSTICS_ENV] = "1";
+		const provider = new CodexProvider();
+		const observation = provider.observeRequest?.(new Headers(), true);
+		expect(() => observation?.bindRequestId("req-1")).not.toThrow();
+		expect(() => observation?.error(new Error("local refusal"))).not.toThrow();
 	});
 });

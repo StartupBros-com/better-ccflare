@@ -63,4 +63,68 @@ describe("accounts API 402 cooldown reason", () => {
 		expect(query).toHaveBeenCalledTimes(1);
 		expect(payload[0]?.rateLimitedReason).toBe("upstream_402_payment_required");
 	});
+
+	it("exposes org_permission_denied from persisted account state (GAP 3)", async () => {
+		// proxy-operations.ts benches an account with this reason on a 403
+		// permission_error and writes it to accounts.rate_limited_reason; it
+		// must round-trip through the API's toRateLimitReason allowlist
+		// instead of being silently nulled.
+		const now = Date.now();
+		const query = mock(async () => [
+			{
+				id: "org-permission-denied-account",
+				name: "Org Permission Denied Account",
+				provider: "anthropic",
+				request_count: 1,
+				total_requests: 2,
+				last_used: null,
+				created_at: now - 60_000,
+				expires_at: null,
+				rate_limited_until: now + 120_000,
+				rate_limited_reason: "org_permission_denied",
+				rate_limited_at: now,
+				rate_limit_reset: null,
+				rate_limit_status: null,
+				rate_limit_remaining: null,
+				session_start: null,
+				session_request_count: 0,
+				refresh_token: "test-key",
+				access_token: "test-key",
+				paused: 0,
+				priority: 0,
+				token_valid: 0,
+				rate_limited: 1,
+				session_info: "-",
+				auto_fallback_enabled: 0,
+				auto_refresh_enabled: 0,
+				auto_pause_on_overage_enabled: 0,
+				peak_hours_pause_enabled: 0,
+				custom_endpoint: null,
+				model_mappings: null,
+				cross_region_mode: null,
+				model_fallbacks: null,
+				billing_type: null,
+				pause_reason: null,
+			},
+		]);
+		const dbOps = {
+			getAdapter: () => ({ query }),
+			getStatsRepository: () => ({
+				getSessionStats: mock(async () => new Map()),
+			}),
+		} as unknown as DatabaseOperations;
+		const config = {
+			getUsageThrottlingFiveHourEnabled: () => false,
+			getUsageThrottlingWeeklyEnabled: () => false,
+		} as unknown as Config;
+
+		const response = await createAccountsListHandler(dbOps, config)();
+		const payload = (await response.json()) as Array<{
+			rateLimitedReason: string | null;
+		}>;
+
+		expect(response.status).toBe(200);
+		expect(query).toHaveBeenCalledTimes(1);
+		expect(payload[0]?.rateLimitedReason).toBe("org_permission_denied");
+	});
 });

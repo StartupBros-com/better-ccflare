@@ -164,6 +164,87 @@ describe("handleResponsesRequest", () => {
 		});
 	});
 
+	test("carries the KTD6 response-id continuation opt-in into the private Codex passthrough carrier when the exact header value is present", async () => {
+		let forwardedBody: Record<string, unknown> | null = null;
+		const mockHandleProxy: HandleProxyFn = async (request) => {
+			forwardedBody = (await request.json()) as Record<string, unknown>;
+			return new Response(ANTHROPIC_MESSAGE_BODY, {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		};
+		const makeReq = (headerValue: string | undefined) =>
+			new Request("http://localhost/v1/responses", {
+				method: "POST",
+				body: JSON.stringify({
+					model: "gpt-5.4-mini",
+					input: [
+						{
+							type: "message",
+							role: "user",
+							content: [{ type: "input_text", text: "Hi" }],
+						},
+					],
+					stream: false,
+				}),
+				headers: {
+					"Content-Type": "application/json",
+					...(headerValue !== undefined
+						? { "x-better-ccflare-codex-continuation": headerValue }
+						: {}),
+				},
+			});
+
+		const optedIn = makeReq("previous_response_id");
+		await handleResponsesRequest(
+			optedIn,
+			new URL(optedIn.url),
+			mockHandleProxy,
+			{},
+		);
+		expect(
+			(
+				forwardedBody?.__better_ccflare_codex_passthrough as
+					| Record<string, unknown>
+					| undefined
+			)?.continuation_strategy,
+		).toBe("previous_response_id");
+
+		// Any other value, or a missing header, must never set the flag: this
+		// is a client-facing opt-in only, not a default-on behavior change.
+		forwardedBody = null;
+		const wrongValue = makeReq("something-else");
+		await handleResponsesRequest(
+			wrongValue,
+			new URL(wrongValue.url),
+			mockHandleProxy,
+			{},
+		);
+		expect(
+			(
+				forwardedBody?.__better_ccflare_codex_passthrough as
+					| Record<string, unknown>
+					| undefined
+			)?.continuation_strategy,
+		).toBeUndefined();
+
+		forwardedBody = null;
+		const absent = makeReq(undefined);
+		await handleResponsesRequest(
+			absent,
+			new URL(absent.url),
+			mockHandleProxy,
+			{},
+		);
+		expect(
+			(
+				forwardedBody?.__better_ccflare_codex_passthrough as
+					| Record<string, unknown>
+					| undefined
+			)?.continuation_strategy,
+		).toBeUndefined();
+	});
+
 	test("surfaces a privacy-safe Codex CLI session identity as metadata.user_id", async () => {
 		let forwardedBody: Record<string, unknown> | null = null;
 		const mockHandleProxy: HandleProxyFn = async (req2) => {
@@ -659,6 +740,100 @@ describe("handleResponsesRequest", () => {
 					},
 				},
 			);
+		const req = new Request("http://localhost/v1/responses", {
+			method: "POST",
+			body: JSON.stringify({
+				model: "gpt-5.6-sol",
+				input: "Hi",
+				stream: false,
+			}),
+			headers: { "Content-Type": "application/json" },
+		});
+
+		const response = await handleResponsesRequest(
+			req,
+			new URL(req.url),
+			mockHandleProxy,
+			{},
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual(terminalResponse);
+	});
+
+	test("non-streaming native terminal response survives CRLF-framed SSE with a trailing non-terminal frame (upstream 7862a9df parity)", async () => {
+		// extractTerminalNativeResponse's frame split must recognize \r\n\r\n
+		// boundaries, not only \n\n. Without that, a CRLF-framed stream
+		// collapses into one merged blob and a later non-terminal event's
+		// data: line overwrites the real terminal event's data: line, losing
+		// it entirely.
+		const terminalResponse = {
+			id: "resp_crlf",
+			model: "gpt-5.6-sol",
+			output: [],
+		};
+		const sseBody =
+			"event: response.completed\r\ndata: " +
+			JSON.stringify({
+				type: "response.completed",
+				response: terminalResponse,
+			}) +
+			"\r\n\r\n" +
+			"event: response.output_text.delta\r\ndata: " +
+			JSON.stringify({ type: "response.output_text.delta", delta: "stray" }) +
+			"\r\n\r\n";
+		const mockHandleProxy: HandleProxyFn = async () =>
+			new Response(sseBody, {
+				status: 200,
+				headers: {
+					"Content-Type": "text/event-stream",
+					"x-better-ccflare-codex-response-format": "responses-api",
+				},
+			});
+		const req = new Request("http://localhost/v1/responses", {
+			method: "POST",
+			body: JSON.stringify({
+				model: "gpt-5.6-sol",
+				input: "Hi",
+				stream: false,
+			}),
+			headers: { "Content-Type": "application/json" },
+		});
+
+		const response = await handleResponsesRequest(
+			req,
+			new URL(req.url),
+			mockHandleProxy,
+			{},
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual(terminalResponse);
+	});
+
+	test("non-streaming native terminal response joins a multi-line data field instead of keeping only its last line (upstream 7862a9df parity)", async () => {
+		// Per the SSE spec, a data field spanning multiple `data:` lines must
+		// be reassembled by joining those lines with \n, not by keeping only
+		// the last one.
+		const terminalResponse = {
+			id: "resp_multiline",
+			model: "gpt-5.6-sol",
+			output: [],
+		};
+		const fullData = JSON.stringify({
+			type: "response.completed",
+			response: terminalResponse,
+		});
+		const splitPoint = fullData.indexOf('"response":');
+		const sseBody = `event: response.completed\ndata: ${fullData.slice(0, splitPoint)}\ndata: ${fullData.slice(splitPoint)}\n\n`;
+		const mockHandleProxy: HandleProxyFn = async () =>
+			new Response(sseBody, {
+				status: 200,
+				headers: {
+					"Content-Type": "text/event-stream",
+					"x-better-ccflare-codex-response-format": "responses-api",
+				},
+			});
 		const req = new Request("http://localhost/v1/responses", {
 			method: "POST",
 			body: JSON.stringify({

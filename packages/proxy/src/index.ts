@@ -190,12 +190,19 @@ export {
 	parseModelRouteProfiles,
 } from "./model-route-profiles";
 export type {
+	OpenAICompatibleModelDiscoveryErrorKind,
 	OpenAICompatibleModelEntry,
 	OpenAICompatibleModelListing,
+	OpenAICompatibleModelPreviewListing,
 } from "./openai-compatible-model-catalog";
 export {
 	clearOpenAICompatibleModelCacheForAccount,
+	fetchOpenAICompatibleModelsPreview,
 	getOpenAICompatibleModels,
+	OPENAI_COMPATIBLE_MODEL_MAX_ID_BYTES,
+	OPENAI_COMPATIBLE_MODEL_MAX_RESPONSE_BYTES,
+	OPENAI_COMPATIBLE_MODEL_MAX_UNIQUE_IDS,
+	OpenAICompatibleModelDiscoveryError,
 } from "./openai-compatible-model-catalog";
 export {
 	drainUsageCollector,
