@@ -75,6 +75,11 @@ export const CODEX_TURN_STATE_REQUEST_ACTIONS = [
 	"model_not_allowlisted",
 	"percent_control",
 	"cohort_not_allowlisted",
+	// KTD6: another continuation mechanism (response-id) already owns this
+	// physical attempt exclusively. beginAttempt is never invoked in this
+	// case -- this label exists purely so trace/analyze-trace can see why
+	// turn-state was skipped rather than reading a gap as a dropped action.
+	"response_id_owned",
 ] as const;
 export type CodexTurnStateRequestAction =
 	(typeof CODEX_TURN_STATE_REQUEST_ACTIONS)[number];

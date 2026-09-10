@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	type AccountUsageSnapshot,
 	getConfiguredModelMapping,
@@ -22,7 +23,9 @@ import type { Provider, ProviderAttemptPlan } from "@better-ccflare/providers";
 import {
 	applyXaiConvIdHeader,
 	buildServerToolCapabilityProofKey,
+	CODEX_AUTHENTICATED_CALLER_HEADER,
 	CODEX_CONVERSATION_ID_HEADER,
+	CODEX_NATIVE_RESPONSES_HEADER,
 	CODEX_TURN_STATE_HEADER,
 	decideContextAdmission,
 	estimateAnthropicAdmissionTokens,
@@ -141,6 +144,7 @@ import { cancelDiscardedResponseBody } from "./discard-body-cancel";
 import {
 	ERROR_MESSAGES,
 	isInternalProbe,
+	isResponsesAdapterRequest,
 	type ProxyContext,
 } from "./proxy-types";
 import {
@@ -3522,6 +3526,27 @@ export async function proxyWithAccount(
 						requestMeta.codexPacingReleaseReason,
 					);
 				}
+				// Native-Responses trust carrier (KTD6/response-id continuation).
+				// `isResponsesAdapterRequest` verifies the process-local secret set
+				// only by the in-process openai-responses-adapter synthetic request
+				// (see proxy.ts's own use of the same check); a client can never
+				// forge it. The caller-identity digest is derived here from the
+				// already-authenticated `apiKeyId` for *this* physical request,
+				// never from anything client-supplied.
+				if (isResponsesAdapterRequest(req.headers, ctx)) {
+					prepared.set(CODEX_NATIVE_RESPONSES_HEADER, "1");
+					if (apiKeyId) {
+						prepared.set(
+							CODEX_AUTHENTICATED_CALLER_HEADER,
+							createHash("sha256").update(apiKeyId).digest("hex"),
+						);
+					} else {
+						prepared.delete(CODEX_AUTHENTICATED_CALLER_HEADER);
+					}
+				} else {
+					prepared.delete(CODEX_NATIVE_RESPONSES_HEADER);
+					prepared.delete(CODEX_AUTHENTICATED_CALLER_HEADER);
+				}
 			} else {
 				prepared.delete("x-better-ccflare-attributed-agent");
 			}
@@ -3529,6 +3554,13 @@ export async function proxyWithAccount(
 			// client-supplied copies before providers transform the outbound request.
 			prepared.delete(SYNTHETIC_RESPONSE_HEADER);
 			prepared.delete(SYNTHETIC_STATUS_HEADER);
+			// Defense in depth: these two headers are only ever meaningful for the
+			// codex branch above, but strip any client-supplied copy unconditionally
+			// so a non-codex provider request can never carry a forged value through.
+			if (plan.providerName !== "codex") {
+				prepared.delete(CODEX_NATIVE_RESPONSES_HEADER);
+				prepared.delete(CODEX_AUTHENTICATED_CALLER_HEADER);
+			}
 			return prepared;
 		};
 		let headers = prepareAttemptHeaders(attemptPlan);

@@ -34,6 +34,17 @@ const log = new Logger("openai-responses-adapter");
 const RESPONSES_ADAPTER_SECRET_HEADER =
 	"x-better-ccflare-responses-adapter-secret";
 
+// Mirrors CODEX_CONTINUATION_HEADER in
+// packages/providers/src/providers/codex/provider.ts, to avoid an adapter ->
+// providers dependency. This is a client-facing opt-in only: the adapter
+// reads it and, if present with this exact value, carries a same-named
+// `continuation_strategy` flag inside the already-trust-gated
+// `__better_ccflare_codex_passthrough` carrier. The Codex provider treats
+// that flag as opt-in only -- it never trusts a client-supplied
+// `previous_response_id` value itself (see the request body handling below).
+const CODEX_CONTINUATION_HEADER = "x-better-ccflare-codex-continuation";
+const CODEX_CONTINUATION_STRATEGY_PREVIOUS_RESPONSE_ID = "previous_response_id";
+
 const TERMINAL_RESPONSE_EVENT_TYPES = new Set([
 	"response.completed",
 	"response.incomplete",
@@ -473,6 +484,17 @@ export async function handleResponsesRequest(
 	if (body.parallel_tool_calls !== undefined)
 		codexPassthrough.parallel_tool_calls = body.parallel_tool_calls;
 	if (body.store !== undefined) codexPassthrough.store = body.store;
+	// Opt-in only: this header selects the response-id continuation strategy
+	// (KTD6/KTD7/KTD13) for this request's lane. Any other value, or absence
+	// of the header, leaves `continuation_strategy` unset and the Codex
+	// provider falls back to its existing turn-state continuation.
+	if (
+		req.headers.get(CODEX_CONTINUATION_HEADER) ===
+		CODEX_CONTINUATION_STRATEGY_PREVIOUS_RESPONSE_ID
+	) {
+		codexPassthrough.continuation_strategy =
+			CODEX_CONTINUATION_STRATEGY_PREVIOUS_RESPONSE_ID;
+	}
 	const additionalToolsItems = Array.isArray(body.input)
 		? body.input.filter((item) => item.type === "additional_tools")
 		: [];

@@ -164,6 +164,87 @@ describe("handleResponsesRequest", () => {
 		});
 	});
 
+	test("carries the KTD6 response-id continuation opt-in into the private Codex passthrough carrier when the exact header value is present", async () => {
+		let forwardedBody: Record<string, unknown> | null = null;
+		const mockHandleProxy: HandleProxyFn = async (request) => {
+			forwardedBody = (await request.json()) as Record<string, unknown>;
+			return new Response(ANTHROPIC_MESSAGE_BODY, {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		};
+		const makeReq = (headerValue: string | undefined) =>
+			new Request("http://localhost/v1/responses", {
+				method: "POST",
+				body: JSON.stringify({
+					model: "gpt-5.4-mini",
+					input: [
+						{
+							type: "message",
+							role: "user",
+							content: [{ type: "input_text", text: "Hi" }],
+						},
+					],
+					stream: false,
+				}),
+				headers: {
+					"Content-Type": "application/json",
+					...(headerValue !== undefined
+						? { "x-better-ccflare-codex-continuation": headerValue }
+						: {}),
+				},
+			});
+
+		const optedIn = makeReq("previous_response_id");
+		await handleResponsesRequest(
+			optedIn,
+			new URL(optedIn.url),
+			mockHandleProxy,
+			{},
+		);
+		expect(
+			(
+				forwardedBody?.__better_ccflare_codex_passthrough as
+					| Record<string, unknown>
+					| undefined
+			)?.continuation_strategy,
+		).toBe("previous_response_id");
+
+		// Any other value, or a missing header, must never set the flag: this
+		// is a client-facing opt-in only, not a default-on behavior change.
+		forwardedBody = null;
+		const wrongValue = makeReq("something-else");
+		await handleResponsesRequest(
+			wrongValue,
+			new URL(wrongValue.url),
+			mockHandleProxy,
+			{},
+		);
+		expect(
+			(
+				forwardedBody?.__better_ccflare_codex_passthrough as
+					| Record<string, unknown>
+					| undefined
+			)?.continuation_strategy,
+		).toBeUndefined();
+
+		forwardedBody = null;
+		const absent = makeReq(undefined);
+		await handleResponsesRequest(
+			absent,
+			new URL(absent.url),
+			mockHandleProxy,
+			{},
+		);
+		expect(
+			(
+				forwardedBody?.__better_ccflare_codex_passthrough as
+					| Record<string, unknown>
+					| undefined
+			)?.continuation_strategy,
+		).toBeUndefined();
+	});
+
 	test("surfaces a privacy-safe Codex CLI session identity as metadata.user_id", async () => {
 		let forwardedBody: Record<string, unknown> | null = null;
 		const mockHandleProxy: HandleProxyFn = async (req2) => {
