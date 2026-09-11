@@ -64,7 +64,8 @@ function writeFixturePrograms(dir: string): {
 			'if (procEnabled) writeFileSync(`${procDir}/stat`, `${process.pid} (fake-upstream) S ${Array(18).fill("0").join(" ")} ${starttime} 0\\n`);',
 			"const rssControl = `${process.env.CAPTURE_DIR}/rss-kib`;",
 			"const swapControl = `${process.env.CAPTURE_DIR}/swap-kib`;",
-			'const writeStatus = () => { if (!procEnabled) return; const rss = existsSync(rssControl) ? readFileSync(rssControl, "utf8").trim() : "1"; const swap = existsSync(swapControl) ? readFileSync(swapControl, "utf8").trim() : "0"; writeFileSync(`${procDir}/status`, `Name:\\tfake\\nVmRSS:\\t${rss} kB\\nVmSwap:\\t${swap} kB\\n`); };',
+			'const omitSwap = process.env.FAKE_PROC_OMIT_SWAP === "1";',
+			'const writeStatus = () => { if (!procEnabled) return; const rss = existsSync(rssControl) ? readFileSync(rssControl, "utf8").trim() : "1"; const swap = existsSync(swapControl) ? readFileSync(swapControl, "utf8").trim() : "0"; const swapLine = omitSwap ? "" : `VmSwap:\\t${swap} kB\\n`; writeFileSync(`${procDir}/status`, `Name:\\tfake\\nVmRSS:\\t${rss} kB\\n${swapLine}`); };',
 			"writeStatus();",
 			"const rssTimer = procEnabled ? setInterval(writeStatus, 2) : undefined;",
 			'appendFileSync(`${process.env.CAPTURE_DIR}/upstream.json`, JSON.stringify({ pid: process.pid, secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, logLevel: process.env.LOG_LEVEL, argv: process.argv }) + "\\n");',
@@ -380,11 +381,32 @@ function setRssKiB(
 	writeFileSync(join(runner.captureDir, "rss-kib"), `${rssKiB}\n`);
 }
 
+function setSwapRaw(
+	runner: Awaited<ReturnType<typeof spawnRunner>>,
+	raw: string,
+): void {
+	writeFileSync(join(runner.captureDir, "swap-kib"), `${raw}\n`);
+}
+
 function setSwapKiB(
 	runner: Awaited<ReturnType<typeof spawnRunner>>,
 	swapKiB: number,
 ): void {
-	writeFileSync(join(runner.captureDir, "swap-kib"), `${swapKiB}\n`);
+	setSwapRaw(runner, String(swapKiB));
+}
+
+function readProcStatus(
+	runner: Awaited<ReturnType<typeof spawnRunner>>,
+): string {
+	const records = readFileSync(join(runner.captureDir, "upstream.json"), "utf8")
+		.trim()
+		.split("\n")
+		.filter(Boolean);
+	const latest = JSON.parse(records[records.length - 1]);
+	return readFileSync(
+		join(runner.captureDir, "proc", String(latest.pid), "status"),
+		"utf8",
+	);
 }
 
 async function stopRunner(
@@ -558,6 +580,69 @@ describe("run-ccflare-stack RSS containment behavior", () => {
 			expect(output).toContain("mem_bytes=21504");
 			expect(output).toContain("rss_bytes=1024");
 			expect(output).toContain("swap_bytes=20480");
+		} finally {
+			await stopRunner(runner);
+		}
+	}, 10_000);
+
+	test("treats a swapless host's absent VmSwap field as zero and still recycles", async () => {
+		const fixtureDir = tempDir("ccflare-stack-rss-swapless-");
+		const programs = writeFixturePrograms(fixtureDir);
+		const runner = await spawnRunner(programs, {
+			...rssPolicy({ RUNNER_RSS_POLL_INTERVAL_MS: "100" }),
+			FAKE_PROC_OMIT_SWAP: "1",
+		});
+		try {
+			setRssKiB(runner, 1);
+			await waitForOutput(runner, "ccflare stack ready");
+			expect(generationCount(runner)).toBe(1);
+			// The field must be genuinely absent, not written as "VmSwap: 0". A
+			// fixture that always emits the key would let this test pass against a
+			// proc_mem_bytes that discards every sample when the key is missing --
+			// the silent loss of containment docs/systemd.md promises swapless
+			// hosts will not suffer.
+			expect(readProcStatus(runner)).not.toContain("VmSwap");
+			setRssKiB(runner, 20);
+			await waitForOutput(runner, "RSS recycle trigger");
+			await waitForGenerationCount(runner, 2);
+			const output = runner.getOutput().stdout;
+			expect(output).toContain("mem_bytes=20480");
+			expect(output).toContain("rss_bytes=20480");
+			expect(output).toContain("swap_bytes=0");
+		} finally {
+			await stopRunner(runner);
+		}
+	}, 10_000);
+
+	test("discards a malformed VmSwap line and recovers on the next clean sample", async () => {
+		const fixtureDir = tempDir("ccflare-stack-rss-swap-malformed-");
+		const programs = writeFixturePrograms(fixtureDir);
+		const runner = await spawnRunner(
+			programs,
+			rssPolicy({ RUNNER_RSS_POLL_INTERVAL_MS: "100" }),
+		);
+		try {
+			setRssKiB(runner, 1);
+			setSwapKiB(runner, 0);
+			await waitForOutput(runner, "ccflare stack ready");
+			expect(generationCount(runner)).toBe(1);
+			// Corrupt swap BEFORE raising RSS, so no poll can observe a well-formed
+			// over-threshold sample in the gap between the two writes.
+			setSwapRaw(runner, "abc");
+			setRssKiB(runner, 20);
+			// VmRSS alone is over the 10240-byte threshold now. The sample must
+			// still be discarded whole while any field is unparseable: fail closed,
+			// no recycle, and no errexit trip under `set -Eeuo pipefail`.
+			await Bun.sleep(500);
+			expect(runner.getOutput().stdout).not.toContain("RSS recycle trigger");
+			expect(generationCount(runner)).toBe(1);
+			// One well-formed sample must resume containment immediately.
+			setSwapKiB(runner, 0);
+			await waitForOutput(runner, "RSS recycle trigger");
+			await waitForGenerationCount(runner, 2);
+			const output = runner.getOutput().stdout;
+			expect(output).toContain("mem_bytes=20480");
+			expect(output).toContain("swap_bytes=0");
 		} finally {
 			await stopRunner(runner);
 		}
