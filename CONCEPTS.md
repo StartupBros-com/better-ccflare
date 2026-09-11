@@ -140,6 +140,12 @@ the current source expects, and not every verification path inspects every value
 so confirming a specific policy value means reading the pin rather than trusting a green
 pre-flight check.
 
+Merging does not move the pin. Deployment is a separate, deliberate act, so the pinned build
+routinely lags the default branch — which makes the pin, not the branch, the correct answer to
+"what produced this behavior." Any measurement taken against the running system is scoped to
+the pinned build and can already be stale with respect to fixes that have merged but not
+shipped.
+
 ## Flagged ambiguities
 
 - *Active* on a usage window means "currently binding" only in the shapes that report an
