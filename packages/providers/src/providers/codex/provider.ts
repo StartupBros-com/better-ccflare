@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { appendFileSync } from "node:fs";
 import { getCodexReasoningRetention } from "@better-ccflare/config";
 import {
 	BUFFER_SIZES,
@@ -727,6 +728,15 @@ interface CodexRequest {
 	 * caller-supplied value.
 	 */
 	previous_response_id?: string;
+	/**
+	 * DISPOSABLE PROBE field, not the real feature (see
+	 * `CODEX_COMPACTION_PROBE_THRESHOLD_ENV`'s own doc comment and
+	 * docs/plans/2026-09-10-codex-server-side-compaction-spec.md). Only ever
+	 * set when `CCFLARE_CODEX_COMPACTION_PROBE_THRESHOLD` is a positive
+	 * integer and this attempt is not response-id-owned (§4's interlock).
+	 * Never populated from a caller-supplied value.
+	 */
+	context_management?: [{ type: "compaction"; compact_threshold: number }];
 }
 
 export interface CodexPromptCacheKeyDecision {
@@ -983,6 +993,16 @@ interface StreamState {
 	// path (completed, failed, abrupt EOF, read error, downstream cancel).
 	terminalTraceWritten: boolean;
 	/**
+	 * DISPOSABLE PROBE (see CODEX_COMPACTION_PROBE_THRESHOLD_ENV's own doc
+	 * comment): set only when CCFLARE_CODEX_COMPACTION_PROBE_CAPTURE is a
+	 * file path AND this attempt's requestId was flagged by the probe attach
+	 * block in transformRequestBody. When set, the raw upstream SSE bytes
+	 * for THIS attempt are teed here, verbatim, before any parsing --
+	 * undefined for every other attempt, which makes the tee a complete
+	 * no-op unless both probe env vars are set for this exact attempt.
+	 */
+	probeCaptureFilePath?: string;
+	/**
 	 * Staged by the "response.completed" case only (never "response.incomplete")
 	 * when this attempt is response-id-owned. Consumed by the tail validator
 	 * after the client-facing stream has already reached its terminal boundary;
@@ -1193,6 +1213,76 @@ export const CODEX_MESSAGES_CONTINUATION_ENV =
  */
 export const CODEX_MESSAGES_CONTINUATION_MODELS_ENV =
 	"CCFLARE_CODEX_MESSAGES_CONTINUATION_MODELS";
+
+/**
+ * DISPOSABLE PROBE, not the real feature. See
+ * docs/plans/2026-09-10-codex-server-side-compaction-spec.md §5/§10 for why
+ * the real `CCFLARE_CODEX_COMPACTION` feature is not yet enabled: source
+ * research found the reference Codex CLI does not send `context_management`
+ * on the wire at all, so whether the ChatGPT/OpenAI backend honors, ignores,
+ * or rejects this field is an open, unverified question (PRE-ENABLE GATE).
+ * This env var exists solely to answer that question with one manually
+ * issued, force-routed probe request (never scripted-in-a-loop, never sent
+ * to an Anthropic-backed account). Unset: completely inert, zero behavior
+ * change. Set to a positive integer N: attach `context_management: [{
+ * type: "compaction", compact_threshold: N }]` at the exact attachment
+ * point (§1 of the spec) the real feature would use, gated by the same
+ * `responseIdOwns` hard interlock (§4) the real feature would honor, so the
+ * probe exercises the real code path. Never wired to any config UI, model
+ * catalog, or default; delete this env var and its call site once the
+ * PRE-ENABLE GATE is closed and the real feature (or its rejection) ships.
+ */
+export const CODEX_COMPACTION_PROBE_THRESHOLD_ENV =
+	"CCFLARE_CODEX_COMPACTION_PROBE_THRESHOLD";
+/**
+ * DISPOSABLE PROBE, not the real feature. File path; unset = inert. When
+ * set, the raw upstream Codex SSE bytes for probe-flagged attempts (see
+ * `CODEX_COMPACTION_PROBE_THRESHOLD_ENV`) are teed to this path *before* any
+ * translation back to Anthropic shape -- a compaction output item would
+ * otherwise be translated away or dropped by the existing SSE handling
+ * before we could ever observe it. On a non-2xx upstream response for a
+ * probe-flagged attempt, the full error body is appended instead (there is
+ * no SSE body to tee in that case). Never intercepts or consumes the
+ * stream/response the client actually receives -- append-only side effect.
+ */
+export const CODEX_COMPACTION_PROBE_CAPTURE_ENV =
+	"CCFLARE_CODEX_COMPACTION_PROBE_CAPTURE";
+
+/**
+ * Parses `CODEX_COMPACTION_PROBE_THRESHOLD_ENV` into a positive integer, or
+ * returns undefined for unset/invalid values (fails closed: never attaches
+ * the probe field on a malformed value). DISPOSABLE PROBE helper.
+ */
+function readCodexCompactionProbeThreshold(): number | undefined {
+	const raw = process.env[CODEX_COMPACTION_PROBE_THRESHOLD_ENV];
+	if (!raw) return undefined;
+	const parsed = Number(raw);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/**
+ * DISPOSABLE PROBE helper: best-effort, synchronous append. A probe run is a
+ * single manually-issued request (never a loop), so blocking I/O here is
+ * fine and keeps chunk write order trivially correct without threading
+ * additional async state through the existing stream-processing loop. Never
+ * throws into the caller -- a capture failure must not affect the real
+ * response the client receives.
+ */
+function appendCodexCompactionProbeCapture(
+	filePath: string,
+	chunk: string | Uint8Array,
+): void {
+	try {
+		appendFileSync(
+			filePath,
+			typeof chunk === "string" ? chunk : Buffer.from(chunk),
+		);
+	} catch (error) {
+		log.warn(
+			`[codex-compaction-probe] failed to write capture chunk to ${filePath}: ${String(error)}`,
+		);
+	}
+}
 
 type CodexContinuationOwner = "response-id" | "turn-state" | "none";
 /** Protocol lane discriminator, hashed into every response-id lane key so a
@@ -2352,6 +2442,25 @@ export class CodexProvider extends BaseProvider {
 		}
 	}
 
+	// DISPOSABLE PROBE (see CODEX_COMPACTION_PROBE_THRESHOLD_ENV's own doc
+	// comment): requestId -> ts for attempts that had the probe field
+	// attached, so the raw-capture tee (processEvents / processResponse) can
+	// tell "this attempt asked for compaction" apart from ordinary traffic
+	// without threading new parameters through every intervening call site.
+	// Same 30s TTL sweep pattern as requestStreamById above. Always empty
+	// (and therefore inert) unless CCFLARE_CODEX_COMPACTION_PROBE_THRESHOLD
+	// is set.
+	private compactionProbeFlaggedRequestIds = new Map<string, number>();
+
+	private sweepCompactionProbeFlaggedRequestIds(): void {
+		const cutoff = Date.now() - 30_000;
+		for (const [id, ts] of this.compactionProbeFlaggedRequestIds) {
+			if (ts < cutoff) {
+				this.compactionProbeFlaggedRequestIds.delete(id);
+			}
+		}
+	}
+
 	// Per-request, per-tool schema info derived from the Anthropic request's
 	// tools[].input_schema, used to decide whether a ""-valued tool-call
 	// argument is a genuinely-omitted optional string (safe to strip) versus
@@ -2870,6 +2979,23 @@ export class CodexProvider extends BaseProvider {
 					ts: Date.now(),
 				});
 			}
+			// DISPOSABLE PROBE (see CODEX_COMPACTION_PROBE_THRESHOLD_ENV's own doc
+			// comment): the exact attachment point the real feature would use
+			// (spec §1) -- immediately after responseIdOwns resolves, gated by
+			// the same hard interlock (spec §4) -- so the probe exercises the
+			// real code path. Zero effect unless the env var is a positive
+			// integer. Delete this block and the field on CodexRequest once the
+			// PRE-ENABLE GATE this probe answers is closed.
+			const compactionProbeThreshold = readCodexCompactionProbeThreshold();
+			if (compactionProbeThreshold !== undefined && !responseIdOwns) {
+				codexBody.context_management = [
+					{ type: "compaction", compact_threshold: compactionProbeThreshold },
+				];
+				if (requestId) {
+					this.sweepCompactionProbeFlaggedRequestIds();
+					this.compactionProbeFlaggedRequestIds.set(requestId, Date.now());
+				}
+			}
 			// KTD6 owner exclusivity: response-id and turn-state never both own
 			// the same physical attempt. When response-id owns it, turn-state's
 			// own beginAttempt (percentage/cohort gating, token issuance, replay
@@ -3075,6 +3201,41 @@ export class CodexProvider extends BaseProvider {
 
 		const contentType = response.headers.get("content-type");
 		const requestId = response.headers.get("x-better-ccflare-request-id");
+		// DISPOSABLE PROBE (see CODEX_COMPACTION_PROBE_CAPTURE_ENV's own doc
+		// comment): record status always, and the full error body on a
+		// non-2xx, for a probe-flagged attempt only. Reads via `.clone()`
+		// (same idiom as transformModelsListResponse's own error-tolerant
+		// read above) so the response object every branch below still
+		// forwards to the client is completely untouched. No-op unless both
+		// probe env vars are set for this exact requestId.
+		const probeCaptureFilePath =
+			process.env[CODEX_COMPACTION_PROBE_CAPTURE_ENV];
+		if (
+			probeCaptureFilePath &&
+			requestId &&
+			this.compactionProbeFlaggedRequestIds.has(requestId)
+		) {
+			appendCodexCompactionProbeCapture(
+				probeCaptureFilePath,
+				`\n[[codex-compaction-probe]] requestId=${requestId} status=${response.status} statusText=${response.statusText} content-type=${contentType ?? "<missing>"}\n`,
+			);
+			if (!response.ok) {
+				void response
+					.clone()
+					.text()
+					.then((body) => {
+						appendCodexCompactionProbeCapture(
+							probeCaptureFilePath,
+							`[[codex-compaction-probe:error-body]]\n${body}\n[[/codex-compaction-probe:error-body]]\n`,
+						);
+					})
+					.catch((error) => {
+						log.warn(
+							`[codex-compaction-probe] failed to read error body for capture: ${String(error)}`,
+						);
+					});
+			}
+		}
 		const fallbackEntry = requestId
 			? this.requestStreamById.get(requestId)
 			: undefined;
@@ -4894,6 +5055,14 @@ export class CodexProvider extends BaseProvider {
 			traceResponseId: null,
 			lastProgressPingAt: null,
 			terminalTraceWritten: false,
+			// DISPOSABLE PROBE: undefined (inert) unless both
+			// CCFLARE_CODEX_COMPACTION_PROBE_CAPTURE is set AND this exact
+			// requestId was flagged by the probe attach block above.
+			probeCaptureFilePath:
+				process.env[CODEX_COMPACTION_PROBE_CAPTURE_ENV] &&
+				this.compactionProbeFlaggedRequestIds.has(requestId)
+					? process.env[CODEX_COMPACTION_PROBE_CAPTURE_ENV]
+					: undefined,
 		};
 
 		const headers = sanitizeResponseHeaders(response.headers);
@@ -5160,6 +5329,22 @@ export class CodexProvider extends BaseProvider {
 
 					const { value, done } = outcome.result;
 					if (done) break;
+
+					// DISPOSABLE PROBE tee (see CODEX_COMPACTION_PROBE_CAPTURE_ENV's
+					// own doc comment): append the raw upstream bytes for THIS chunk
+					// verbatim, before SseFrameBuffer/handleCodexEvent see them --
+					// a compaction output item would otherwise be translated away or
+					// dropped by the existing translation before we could observe
+					// it. Read-only w.r.t. `value`; never mutates it, never delays or
+					// intercepts the real frame/event processing below. No-op unless
+					// state.probeCaptureFilePath was set (both probe env vars set AND
+					// this attempt's requestId was flagged at request-transform time).
+					if (state.probeCaptureFilePath) {
+						appendCodexCompactionProbeCapture(
+							state.probeCaptureFilePath,
+							value,
+						);
+					}
 
 					// Frame boundary detection and cap enforcement live in
 					// SseFrameBuffer (CRLF-tolerant, bounds both a single oversized
