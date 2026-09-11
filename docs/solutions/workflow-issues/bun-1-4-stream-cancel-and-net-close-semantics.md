@@ -127,7 +127,8 @@ the suite starts failing. Grep for near-future ISO dates before they expire:
 `grep -rn "2026-1[0-2]-\|2027-" --include='*.test.ts' packages apps scripts tests`.
 
 **5. Non-atomic `/proc` reads re-check identity after the sample.** The watchdog now
-re-reads the start-time identity after `VmRSS` and discards the sample on mismatch, which also
+re-reads the start-time identity after the memory sample (`proc_mem_bytes`, which sums `VmRSS` and
+`VmSwap`) and discards the sample on mismatch, which also
 makes the stale-PID test deterministic because its stale write strictly precedes its RSS bump.
 
 **6. Bun version bumps: run the gate's own loop, not `bun test`.** A single `bun test` over
