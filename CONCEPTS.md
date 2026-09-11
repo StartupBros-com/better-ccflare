@@ -99,6 +99,47 @@ thinned — and the response says what was omitted. A budgeted response must be 
 a partial view, because rendering it as a complete one would tell an operator the fleet has
 no data when in fact the read was truncated.
 
+## Process supervision
+
+### Memory recycle
+
+A deliberate stop-and-restart of the supervised upstream, triggered because its own memory
+footprint stayed above a configured ceiling for a sustained run of consecutive samples —
+not because it crashed and not because an operator asked.
+
+A recycle drains before it stops (see *Guard-first drain*) and deliberately does not consume
+the ordinary child-failure circuit, so it never feeds restart backoff: a recycled process
+returns immediately, while a crash-looping one is held off. Recycles are bounded per rolling
+window. Exhausting that budget is recorded and then leaves the process uncontained rather
+than restarting forever, which makes budget exhaustion an incident signal rather than routine
+noise. The counter lives in the supervisor process itself, so a supervisor restart resets the
+window — a subtlety worth remembering before reading a low recycle count as evidence of a
+quiet day.
+
+### Guard-first drain
+
+The shutdown ordering a memory recycle follows: the admission guard sitting in front of the
+upstream is stopped first so it admits no new work, and the upstream is stopped only once
+in-flight requests have settled.
+
+The reverse order would destroy work the guard could have let finish. A drain that completes
+on its own is recorded distinctly from one that hit its deadline and was forced, and the two
+are never collapsed into one outcome, because a forced drain means clients saw errors while a
+natural one means they did not.
+
+### Managed pin
+
+The deploy-owned block of service configuration binding a running deployment to one exact
+build, guard, runner, and policy set, written and replaced only by the deploy tool.
+
+Operator policy belongs in a separate, later-loading fragment; anything an operator writes
+inside the managed block is overwritten by the next deploy without warning. The pin is what
+makes a deployment verifiable after the fact — the running service is checked against the
+exact artifacts the pin names rather than inferred from a filename. A pin can drift from what
+the current source expects, and not every verification path inspects every value it carries,
+so confirming a specific policy value means reading the pin rather than trusting a green
+pre-flight check.
+
 ## Flagged ambiguities
 
 - *Active* on a usage window means "currently binding" only in the shapes that report an
