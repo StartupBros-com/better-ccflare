@@ -200,7 +200,18 @@ uptime, 5 consecutive high samples, `3600000` ms cooldown, and at most 8
 recycles per `86400000` ms window. The recycle budget is sized from the
 observed growth rate: at roughly 1 GiB/hour a fresh process reaches the
 4 GiB threshold in about four hours, so a 24-hour window needs about six
-recycles. The cap stays finite rather than unlimited so a runaway leak
+recycles. **Treat that rate as a superseded upper bound, not a current
+property.** It was measured on pin `v3.5.70-0471bb24`, which predates the
+`Request.clone().json()` native-buffer fix described in
+[troubleshooting.md](troubleshooting.md); that fix accounts for roughly half
+the measured rate and is already deployed, so the real current rate is lower
+and the cap has more headroom than this paragraph implies. Re-measure on the
+running build before retuning the cap down — the practice and the ancestry
+check are written up in
+[docs/solutions/workflow-issues/verify-fix-ancestry-before-citing-a-measured-rate.md](solutions/workflow-issues/verify-fix-ancestry-before-citing-a-measured-rate.md).
+The cap itself is independently justified by production evidence that the
+previous cap of 3 was exhausted 38 times across two days, so it does not rest
+on the rate figure. The cap stays finite rather than unlimited so a runaway leak
 still surfaces as `RSS recycle suppressed; cap exhausted` instead of being
 masked by endless restarts. Source defaults remain disabled
 (`RUNNER_RSS_THRESHOLD_BYTES=0`). The watchdog reads only the exact supervised
