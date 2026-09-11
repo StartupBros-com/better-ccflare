@@ -4,13 +4,36 @@ type: chore
 date: 2026-09-09
 deepened: 2026-09-09
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: implementation-ready
+artifact_readiness: implemented
+completed: 2026-09-10
 product_contract_source: ce-plan-bootstrap
 execution: code
 tracking_issue: "https://github.com/StartupBros-com/better-ccflare/issues/338"
 ---
 
 # Upstream v3.5.78 Fork-Preserving Integration - Plan
+
+> **Status: implemented and merged 2026-09-10.** Shipped as PR #339 (the
+> integration, carrying genuine two-parent ancestry to upstream `dfcb724f`),
+> PR #340 (client forwarding headers no longer reach provider upstreams,
+> `CODEX_VERSION` 0.154.0, manifests synced to the contained release) and
+> PR #341 (replayed custom tool calls keep their input; pricing suite no longer
+> leaks a global `fetch`). Tracking issue #338 is left open deliberately per the
+> repository rule that issues are not auto-closed.
+>
+> Verification on the merged tree: 575 of 576 test files pass under pinned Bun
+> 1.4.2 with one file per process, plus every PostgreSQL-gated suite and the
+> static gates. The single failure and one flake are both proven pre-existing by
+> running them at the pre-session baseline. Five suites run zero tests and are
+> recorded as skipped, not passed. **Not deployed** — that remains the manual
+> `scripts/deploy-ccflare.sh` step.
+>
+> Deliberately deferred: upstream v3.5.79's Codex VS Code custom-tool support
+> (the inbound `/v1/responses` surface has served one request ever), and
+> server-side Codex compaction, which is specced and probed on the unmerged
+> branch `feat/codex-server-side-compaction` and blocked on account quota.
+>
+> Learnings compounded to `docs/solutions/workflow-issues/`.
 
 ## Goal Capsule
 
