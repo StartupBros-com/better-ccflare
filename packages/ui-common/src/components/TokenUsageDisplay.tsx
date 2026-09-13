@@ -14,7 +14,8 @@ export interface TokenUsageData {
 	cacheReadInputTokens?: number;
 	cacheCreationInputTokens?: number;
 	totalTokens?: number;
-	costUsd?: number;
+	costUsd?: number | null;
+	pending?: boolean;
 	responseTimeMs?: number;
 	tokensPerSecond?: number;
 }
@@ -43,7 +44,7 @@ export interface TokenUsageInfo {
 export function processTokenUsage(
 	data: TokenUsageData | undefined,
 ): TokenUsageInfo {
-	if (!data || (!data.inputTokens && !data.outputTokens)) {
+	if (!data) {
 		return {
 			hasData: false,
 			sections: {},
@@ -98,11 +99,12 @@ export function processTokenUsage(
 		};
 	}
 
-	// Cost
-	if (data.costUsd !== undefined && data.costUsd > 0) {
+	// A loaded, completed summary can have an unknown cost or a recorded zero.
+	// Neither is proof of upstream billing; pending values are not final yet.
+	if (!data.pending) {
 		sections.cost = {
 			label: "Cost",
-			value: formatCost(data.costUsd),
+			value: data.costUsd == null ? "Unknown" : formatCost(data.costUsd),
 		};
 	}
 
@@ -123,7 +125,7 @@ export function processTokenUsage(
 	}
 
 	return {
-		hasData: true,
+		hasData: Object.keys(sections).length > 0,
 		sections,
 	};
 }

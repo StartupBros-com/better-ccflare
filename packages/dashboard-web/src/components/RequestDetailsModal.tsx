@@ -1,15 +1,12 @@
 import { HttpError } from "@better-ccflare/http-common";
-import {
-	formatCost,
-	formatTimestamp,
-	formatTokens,
-} from "@better-ccflare/ui-common";
+import { formatTimestamp, formatTokens } from "@better-ccflare/ui-common";
 import { Eye } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, type RequestPayload, type RequestSummary } from "../api";
 import { attributionSourceLabel } from "../lib/attribution";
 import { ConversationView } from "./ConversationView";
 import { CopyButton } from "./CopyButton";
+import { RequestCostBadge } from "./RequestCostBadge";
 import { TokenUsageDisplay } from "./TokenUsageDisplay";
 import { Badge } from "./ui/badge";
 import {
@@ -170,9 +167,10 @@ export function RequestDetailsModal({
 									{formatTokens(summary.totalTokens)} tokens
 								</Badge>
 							)}
-							{summary?.costUsd && summary.costUsd > 0 && (
-								<Badge variant="default">{formatCost(summary.costUsd)}</Badge>
-							)}
+							<RequestCostBadge
+								summary={summary}
+								pending={request.meta.pending}
+							/>
 							{summary?.rateLimited && (
 								<Badge variant="warning">Rate Limited</Badge>
 							)}
@@ -350,7 +348,10 @@ export function RequestDetailsModal({
 						value="tokens"
 						className="mt-4 overflow-y-auto max-h-[60vh]"
 					>
-						<TokenUsageDisplay summary={summary} />
+						<TokenUsageDisplay
+							summary={summary}
+							pending={request.meta.pending}
+						/>
 					</TabsContent>
 				</Tabs>
 			</DialogContent>
