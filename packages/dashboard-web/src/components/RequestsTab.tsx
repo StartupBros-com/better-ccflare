@@ -738,11 +738,11 @@ export function RequestsTab() {
 									? ""
 									: statusCode >= 200 && statusCode < 300
 										? "bg-green-500/10 text-green-600 dark:text-green-400"
-									: statusCode >= 400 && statusCode < 500
-										? "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400"
-										: statusCode >= 500
-											? "bg-red-500/10 text-red-600 dark:text-red-400"
-											: "bg-muted text-muted-foreground";
+										: statusCode >= 400 && statusCode < 500
+											? "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400"
+											: statusCode >= 500
+												? "bg-red-500/10 text-red-600 dark:text-red-400"
+												: "bg-muted text-muted-foreground";
 
 							return (
 								<div

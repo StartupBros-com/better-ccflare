@@ -1,4 +1,7 @@
-import { type TokenUsageData, processTokenUsage } from "@better-ccflare/ui-common";
+import {
+	processTokenUsage,
+	type TokenUsageData,
+} from "@better-ccflare/ui-common";
 import { Badge } from "./ui/badge";
 
 interface RequestCostBadgeProps {

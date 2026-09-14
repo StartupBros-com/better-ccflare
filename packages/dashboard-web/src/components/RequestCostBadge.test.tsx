@@ -4,9 +4,9 @@ import { RequestCostBadge } from "./RequestCostBadge";
 
 describe("RequestCostBadge", () => {
 	it("does not imply a final cost while the summary is loading", () => {
-		expect(
-			renderToStaticMarkup(<RequestCostBadge summary={undefined} />),
-		).toBe("");
+		expect(renderToStaticMarkup(<RequestCostBadge summary={undefined} />)).toBe(
+			"",
+		);
 	});
 
 	for (const costUsd of [undefined, null]) {
