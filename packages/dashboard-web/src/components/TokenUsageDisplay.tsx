@@ -3,9 +3,13 @@ import type { RequestSummary } from "../api";
 
 interface TokenUsageDisplayProps {
 	summary: RequestSummary | undefined;
+	pending?: boolean;
 }
 
-export function TokenUsageDisplay({ summary }: TokenUsageDisplayProps) {
+export function TokenUsageDisplay({
+	summary,
+	pending,
+}: TokenUsageDisplayProps) {
 	// Convert RequestSummary to TokenUsageData format, handling null -> undefined conversion
 	const tokenData = summary
 		? {
@@ -15,6 +19,7 @@ export function TokenUsageDisplay({ summary }: TokenUsageDisplayProps) {
 				cacheCreationInputTokens: summary.cacheCreationInputTokens,
 				totalTokens: summary.totalTokens,
 				costUsd: summary.costUsd,
+				pending,
 				responseTimeMs: summary.responseTimeMs ?? undefined,
 				tokensPerSecond: summary.tokensPerSecond,
 			}
@@ -80,12 +85,16 @@ export function TokenUsageDisplay({ summary }: TokenUsageDisplayProps) {
 					<p className="text-3xl font-mono font-bold">
 						{sections.totalTokens.value}
 					</p>
-					{sections.cost && (
-						<p className="mt-2 text-lg text-muted-foreground">
-							{sections.cost.label}: {sections.cost.value}
-						</p>
-					)}
 				</div>
+			)}
+
+			{sections.cost && (
+				<p
+					className="text-lg text-muted-foreground"
+					title="Recorded cost may be an estimate; it is not proof of an upstream charge."
+				>
+					{sections.cost.label}: {sections.cost.value}
+				</p>
 			)}
 
 			{sections.responseTime && (

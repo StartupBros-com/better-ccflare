@@ -1,5 +1,4 @@
 import {
-	formatCost,
 	formatDuration,
 	formatTokens,
 	formatTokensPerSecond,
@@ -26,6 +25,7 @@ import { useRequestStream } from "../hooks/useRequestStream";
 import { attributionSourceLabel } from "../lib/attribution";
 import { isAnthropicPeakHour, isZaiPeakHour } from "../utils/provider-utils";
 import { CopyButton } from "./CopyButton";
+import { RequestCostBadge } from "./RequestCostBadge";
 import { RequestDetailsModal } from "./RequestDetailsModal";
 import { TokenUsageDisplay } from "./TokenUsageDisplay";
 import { Badge } from "./ui/badge";
@@ -854,7 +854,7 @@ export function RequestsTab() {
 										summary?.comboName ||
 										summary?.apiKeyName ||
 										summary?.totalTokens != null ||
-										summary?.costUsd != null ||
+										(summary != null && !request.meta.pending) ||
 										summary?.billingType ||
 										(summary?.tokensPerSecond ?? 0) > 0 ||
 										accountLabel ||
@@ -907,11 +907,11 @@ export function RequestsTab() {
 													{formatTokens(summary.totalTokens)} tokens
 												</Badge>
 											)}
-											{summary?.costUsd != null && summary.costUsd > 0 && (
-												<Badge variant="default" className="text-xs">
-													{formatCost(summary.costUsd)}
-												</Badge>
-											)}
+											<RequestCostBadge
+												summary={summary}
+												pending={request.meta.pending}
+												className="text-xs"
+											/>
 											{summary?.billingType === "overage" && (
 												<Badge
 													variant="outline"
@@ -963,7 +963,10 @@ export function RequestsTab() {
 
 									{isExpanded && (
 										<div className="px-3 pb-3 pl-9 space-y-3">
-											<TokenUsageDisplay summary={summary} />
+											<TokenUsageDisplay
+												summary={summary}
+												pending={request.meta.pending}
+											/>
 											<Button
 												variant="outline"
 												size="sm"
@@ -984,7 +987,10 @@ export function RequestsTab() {
 
 			{modalRequest && (
 				<RequestDetailsModal
-					request={modalRequest}
+					request={
+						data?.requests.find((request) => request.id === modalRequest.id) ??
+						modalRequest
+					}
 					summary={data?.summaries.get(modalRequest.id)}
 					isOpen={true}
 					onClose={() => setModalRequest(null)}
