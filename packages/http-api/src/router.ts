@@ -29,8 +29,10 @@ import {
 	createAccountReloadHandler,
 	createAccountRemoveHandler,
 	createAccountRenameHandler,
+	createAccountRequestTransformerUpdateHandler,
 	createAccountResumeHandler,
 	createAccountsListHandler,
+	createAccountUsagePauseThresholdsHandler,
 	createAlibabaCodingPlanAccountAddHandler,
 	createAnthropicCompatibleAccountAddHandler,
 	createAwsProfilesListHandler,
@@ -806,6 +808,15 @@ export class APIRouter {
 				)(req, url);
 			}
 
+			// Account usage-window pause thresholds
+			if (path.endsWith("/usage-pause-thresholds") && method === "POST") {
+				const usagePauseThresholdsHandler =
+					createAccountUsagePauseThresholdsHandler(this.context.dbOps);
+				return await this.wrapHandler((req) =>
+					usagePauseThresholdsHandler(req, accountId),
+				)(req, url);
+			}
+
 			// Account peak-hours-pause toggle (Zai accounts only)
 			if (path.endsWith("/peak-hours-pause") && method === "POST") {
 				const peakHoursPauseHandler = createAccountPeakHoursPauseHandler(
@@ -853,6 +864,15 @@ export class APIRouter {
 				);
 				return await this.wrapHandler((req) =>
 					modelMappingsHandler(req, accountId),
+				)(req, url);
+			}
+
+			// Account request transformer update
+			if (path.endsWith("/request-transformer") && method === "POST") {
+				const requestTransformerHandler =
+					createAccountRequestTransformerUpdateHandler(this.context.dbOps);
+				return await this.wrapHandler((req) =>
+					requestTransformerHandler(req, accountId),
 				)(req, url);
 			}
 

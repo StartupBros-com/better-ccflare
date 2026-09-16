@@ -18,6 +18,7 @@ import {
 } from "../anthropic-precommit-rescue";
 import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
+import { INTERNAL_PROBE_SECRET_HEADER } from "../handlers/proxy-types";
 
 // Loading proxy.ts in a focused unit test must not require ignored embedded
 // worker artifacts from the CLI build.
@@ -127,8 +128,14 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 
 function makeContext(
 	accounts: Account[],
-	providerName = "codex",
+	providerNameOrOverrides: string | Partial<Provider> = "codex",
 ): ProxyContext {
+	const providerName =
+		typeof providerNameOrOverrides === "string"
+			? providerNameOrOverrides
+			: "codex";
+	const providerOverrides =
+		typeof providerNameOrOverrides === "string" ? {} : providerNameOrOverrides;
 	const anthropicDegradedMode = new AnthropicDegradedModeCoordinator({
 		config: {
 			...ANTHROPIC_DEGRADED_MODE_DEFAULTS,
@@ -177,6 +184,7 @@ function makeContext(
 			prepareHeaders: (headers: Headers) => new Headers(headers),
 			processResponse: async (response: Response) => response,
 			parseRateLimit: () => ({ isRateLimited: false, resetTime: null }),
+			...providerOverrides,
 		} as never,
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => {}) } as never,
@@ -1158,4 +1166,168 @@ describe("pool exhausted — CCFLARE_PASSTHROUGH_ON_EMPTY_POOL=1 escape hatch", 
 		).toBeNull();
 		expect(await response.text()).toBe(expectedBody);
 	});
+	// An internal probe is exempt from the escape hatch. Passing it through
+	// unauthenticated earns a 401 from upstream, which the auto-refresh
+	// scheduler reads as "this account's tokens are dead" — a verdict about an
+	// account the request never carried.
+	it("keeps an internal auto-refresh probe on the 503 answer even with the flag set", async () => {
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+
+		const ctx = makeContext([]);
+		(
+			ctx as ProxyContext & { internalProbeSecret?: string }
+		).internalProbeSecret = "test-secret";
+
+		const request = makeRequest();
+		request.headers.set("x-better-ccflare-auto-refresh", "true");
+		request.headers.set("x-better-ccflare-bypass-session", "true");
+		request.headers.set(INTERNAL_PROBE_SECRET_HEADER, "test-secret");
+
+		const response = await handleProxy(
+			request,
+			new URL("https://proxy.local/v1/messages"),
+			ctx,
+		);
+
+		// proxyUnauthenticated never produces this body, so a pool_exhausted 503
+		// is proof the passthrough branch was skipped.
+		expect(response.status).toBe(503);
+		const body = (await response.json()) as Record<string, unknown>;
+		const error = body.error as Record<string, unknown>;
+		expect(error.type).toBe("service_unavailable");
+		expect(error.code).toBe("route_unavailable");
+	});
+
+	// The escape hatch only earns its name if the request actually leaves the
+	// proxy, so this asserts the dispatch itself. proxyUnauthenticated reaches
+	// upstream through the provider's buildUrl/prepareHeaders, which a
+	// `{ name, canHandle }` stub does not have: it threw "buildUrl is not a
+	// function" before any fetch, and a try/catch around the call swallowed
+	// that into a green, assertion-free pass.
+	it("forwards upstream without credentials and returns the upstream answer", async () => {
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+
+		const outbound: {
+			url: string;
+			method: string;
+			headers: Headers;
+			body: string;
+		}[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: string | URL | Request,
+			init?: RequestInit,
+		) => {
+			const asRequest = input instanceof Request ? input : null;
+			const rawBody = asRequest ? asRequest.body : (init?.body ?? null);
+			outbound.push({
+				url: asRequest ? asRequest.url : String(input),
+				method: asRequest ? asRequest.method : (init?.method ?? "GET"),
+				headers: new Headers(asRequest ? asRequest.headers : init?.headers),
+				body:
+					rawBody instanceof ReadableStream
+						? await new Response(rawBody).text()
+						: typeof rawBody === "string"
+							? rawBody
+							: "",
+			});
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: {
+						type: "authentication_error",
+						message: "marker-from-upstream",
+					},
+				}),
+				{ status: 401, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof globalThis.fetch;
+
+		try {
+			const ctx = makeContext([], {
+				buildUrl: (path, query) => `https://upstream.test${path}${query}`,
+				prepareHeaders: (headers) => {
+					// A token-less dispatch: the caller's own credential must not
+					// be reused as if it were an account's.
+					const prepared = new Headers(headers);
+					prepared.delete("authorization");
+					return prepared;
+				},
+			});
+			const request = makeRequest();
+			request.headers.set("authorization", "Bearer caller-token");
+
+			const response = await handleProxy(
+				request,
+				new URL("https://proxy.local/v1/messages"),
+				ctx,
+			);
+
+			expect(outbound.length).toBe(1);
+			expect(outbound[0].url).toStartWith("https://upstream.test/v1/messages");
+			expect(outbound[0].method).toBe("POST");
+			expect(outbound[0].headers.get("authorization")).toBeNull();
+			expect(JSON.parse(outbound[0].body)).toMatchObject({
+				model: "claude-sonnet-4-5",
+				messages: [{ role: "user", content: "hello" }],
+			});
+
+			// The client gets upstream's own answer, not our local refusal.
+			expect(response.status).toBe(401);
+			const body = (await response.json()) as Record<string, unknown>;
+			const error = body.error as Record<string, unknown>;
+			expect(error.type).toBe("authentication_error");
+			expect(error.type).not.toBe("pool_exhausted");
+			expect(error.message).toBe("marker-from-upstream");
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+	});
+});
+
+it("records a joined local refusal without inventing an upstream attempt", async () => {
+	const saved = process.env.CCFLARE_CODEX_CACHE_DIAGNOSTICS;
+	const events: Record<string, unknown>[] = [];
+	const listener = (event: { msg: string; data?: Record<string, unknown> }) => {
+		if (event.msg === "Codex cache observation lifecycle" && event.data)
+			events.push(event.data);
+	};
+	logBus.on("log", listener);
+	process.env.CCFLARE_CODEX_CACHE_DIAGNOSTICS = "1";
+	try {
+		const ctx = makeContext([]);
+		ctx.provider = { name: "anthropic", canHandle: () => true } as never;
+		const request = makeRequest();
+		request.headers.set(
+			"x-better-ccflare-gateway-request-digest",
+			"a".repeat(64),
+		);
+		request.headers.set(
+			"x-better-ccflare-gateway-attempt-digest",
+			"b".repeat(64),
+		);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		expect(response.status).toBe(503);
+		expect((await response.json()).error.code).toBe("route_unavailable");
+		expect(events.map((row) => row.event)).toEqual([
+			"request_received",
+			"request_identified",
+			"request_headers",
+		]);
+		expect(events.at(-1)).toMatchObject({
+			status_code: 503,
+			// The fork reserves this diagnostic enum for known pool exhaustion.
+			// An empty/unresolved route stays unclassified in cache telemetry.
+			refusal_reason: null,
+			gateway_request_digest: "a".repeat(64),
+			gateway_attempt_digest: "b".repeat(64),
+		});
+		expect(events.at(-1)?.request_digest).toMatch(/^[0-9a-f]{64}$/);
+		expect(events.at(-1)?.ingress_digest).toBe(events[0].ingress_digest);
+		expect(JSON.stringify(events)).not.toContain("hello");
+	} finally {
+		if (saved === undefined) delete process.env.CCFLARE_CODEX_CACHE_DIAGNOSTICS;
+		else process.env.CCFLARE_CODEX_CACHE_DIAGNOSTICS = saved;
+		logBus.off("log", listener);
+	}
 });

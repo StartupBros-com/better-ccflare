@@ -15,7 +15,11 @@ import {
 } from "@better-ccflare/openai-formats";
 import type { Account } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
-import type { RateLimitInfo, TokenRefreshResult } from "../../types";
+import type {
+	ProviderResponseContext,
+	RateLimitInfo,
+	TokenRefreshResult,
+} from "../../types";
 import {
 	applySkillElision,
 	resolveSkillElisionBlockedSkills,
@@ -157,6 +161,9 @@ export class OpenAICompatibleProvider extends BaseProvider {
 	async processResponse(
 		response: Response,
 		account: Account | null,
+		_requestHeaders?: Headers,
+		_drainAbort?: AbortController,
+		context?: ProviderResponseContext,
 	): Promise<Response> {
 		// Convert OpenAI response format back to Anthropic format
 		const contentType = response.headers.get("content-type");
@@ -165,7 +172,12 @@ export class OpenAICompatibleProvider extends BaseProvider {
 			try {
 				const clone = response.clone();
 				const data = await clone.json();
-				const anthropicData = convertOpenAIResponseToAnthropic(data);
+				const anthropicData = convertOpenAIResponseToAnthropic(
+					data,
+					context?.requestModel ||
+						response.headers.get("x-better-ccflare-final-model") ||
+						undefined,
+				);
 
 				// Success path: callers receive the converted response, so the
 				// original is discarded here. `clone()` teed the body — leaving
@@ -199,6 +211,10 @@ export class OpenAICompatibleProvider extends BaseProvider {
 			const transformed = transformStreamingResponse(response, {
 				contextWindowForModel: (model) =>
 					this.resolveStreamContextWindow(model, account),
+				fallbackModel:
+					context?.requestModel ||
+					response.headers.get("x-better-ccflare-final-model") ||
+					undefined,
 			});
 			transferResponseDrainTransport(response, transformed);
 			return transformed;

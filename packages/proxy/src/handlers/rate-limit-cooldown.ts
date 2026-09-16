@@ -2,12 +2,15 @@ import {
 	computeOverloadCooldownMs,
 	computeOverloadWithResetCapMs,
 	computeRateLimitBackoffMs,
+	computeServerErrorCooldownMs,
 	getRateLimitMaxCooldownMs,
 	isOverloadReason,
+	isServerErrorReason,
 	logError,
 	RateLimitError,
 	resolveCooldownUntil,
 } from "@better-ccflare/core";
+import type { MarkAccountRateLimitedResult } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import type { Account, RateLimitReason } from "@better-ccflare/types";
 import {
@@ -37,6 +40,18 @@ function getRateLimitPersistAwaitTimeoutMs(): number {
 	return Number.isFinite(raw) && raw >= 0
 		? raw
 		: DEFAULT_RATE_LIMIT_PERSIST_AWAIT_TIMEOUT_MS;
+}
+
+/**
+ * True for reasons where the upstream, not the account's quota, is what went
+ * wrong: both 529 overload variants and a transient 5xx server error. These
+ * share three behaviours — `consecutive_rate_limits` stays frozen, the cooldown
+ * write is forward-guarded so it can never shorten a longer active bench, and
+ * the single-flight recovery probe arms on the reason alone (a frozen streak
+ * can never reach MATURE_COOLDOWN_STREAK by itself).
+ */
+function isTransientUpstreamReason(reason: RateLimitReason): boolean {
+	return isOverloadReason(reason) || isServerErrorReason(reason);
 }
 
 export type RateLimitProbeAdmission =
@@ -72,22 +87,24 @@ function pruneProbeLeases(now: number): void {
  * candidate ungated instead (see proxy.ts's "every candidate suppressed"
  * fallback), and this gate suppresses nothing for that request.
  *
- * The gate also arms for any 529 overload cooldown, regardless of streak
- * depth. consecutive_rate_limits is frozen for 529s (see applyRateLimitCooldown)
- * so an account whose failures are exclusively 529s never reaches
- * MATURE_COOLDOWN_STREAK on its own — without this, the single-flight
- * protection could never engage for an all-overload account, and every
- * concurrently selected request would hit it again the instant its (short)
- * cooldown expires.
+ * The gate also arms for any 529 overload cooldown and for a transient 5xx
+ * server-error cooldown, regardless of streak depth. consecutive_rate_limits is
+ * frozen for both (see applyRateLimitCooldown) so an account whose failures are
+ * exclusively upstream-side never reaches MATURE_COOLDOWN_STREAK on its own —
+ * without this, the single-flight protection could never engage for such an
+ * account, and every concurrently selected request would hit it again the
+ * instant its (short) cooldown expires.
  */
 export function getRateLimitProbeAdmission(
 	account: Account,
 	now: number = Date.now(),
 ): RateLimitProbeAdmission {
 	const reason = account.rate_limited_reason;
-	const isOverload = reason != null && isOverloadReason(reason);
+	const isTransientUpstream =
+		reason != null && isTransientUpstreamReason(reason);
 	const expiredMatureCooldown =
-		(account.consecutive_rate_limits >= MATURE_COOLDOWN_STREAK || isOverload) &&
+		(account.consecutive_rate_limits >= MATURE_COOLDOWN_STREAK ||
+			isTransientUpstream) &&
 		account.rate_limited_until != null &&
 		account.rate_limited_until <= now;
 	if (!expiredMatureCooldown) return "not_required";
@@ -123,9 +140,11 @@ export function wouldSuppressProbe(
 	now: number = Date.now(),
 ): boolean {
 	const reason = account.rate_limited_reason;
-	const isOverload = reason != null && isOverloadReason(reason);
+	const isTransientUpstream =
+		reason != null && isTransientUpstreamReason(reason);
 	const expiredMatureCooldown =
-		(account.consecutive_rate_limits >= MATURE_COOLDOWN_STREAK || isOverload) &&
+		(account.consecutive_rate_limits >= MATURE_COOLDOWN_STREAK ||
+			isTransientUpstream) &&
 		account.rate_limited_until != null &&
 		account.rate_limited_until <= now;
 	if (!expiredMatureCooldown) return false;
@@ -203,6 +222,7 @@ function applyRateLimitCooldownInMemory(
 	cooldownUntil: number;
 	reason: RateLimitReason;
 	isOverload: boolean;
+	isTransientUpstream: boolean;
 	skipped: boolean;
 } {
 	const now = Date.now();
@@ -212,6 +232,7 @@ function applyRateLimitCooldownInMemory(
 			? "upstream_429_with_reset"
 			: "upstream_429_no_reset_probe_cooldown");
 	const isOverload = isOverloadReason(reason);
+	const isTransientUpstream = isTransientUpstreamReason(reason);
 	// Only the reset-less 529 gets the fixed short cooldown. A 529-with-reset
 	// gets its own capped duration below — see the doc comment above.
 	const isOverloadNoReset = reason === "upstream_529_overloaded_no_reset";
@@ -226,6 +247,12 @@ function applyRateLimitCooldownInMemory(
 	let cooldownUntil: number;
 	if (isOverloadNoReset) {
 		cooldownUntil = now + computeOverloadCooldownMs();
+	} else if (isServerErrorReason(reason)) {
+		const capUntil = now + computeServerErrorCooldownMs();
+		cooldownUntil =
+			rateLimitInfo.resetTime != null
+				? Math.min(rateLimitInfo.resetTime, capUntil)
+				: capUntil;
 	} else if (isOverload) {
 		const capUntil = now + computeOverloadWithResetCapMs();
 		cooldownUntil =
@@ -255,7 +282,7 @@ function applyRateLimitCooldownInMemory(
 	}
 
 	if (
-		isOverload &&
+		isTransientUpstream &&
 		account.rate_limited_until != null &&
 		account.rate_limited_until > cooldownUntil
 	) {
@@ -276,14 +303,20 @@ function applyRateLimitCooldownInMemory(
 		log.warn(
 			`[ccflare] account=${account.name} upstream_overloaded reason=${reason} found longer active cooldown until=${new Date(account.rate_limited_until).toISOString()} — not overwriting with the shorter 529 cooldown (would have been until=${new Date(cooldownUntil).toISOString()})`,
 		);
-		return { cooldownUntil, reason, isOverload, skipped: true };
+		return {
+			cooldownUntil,
+			reason,
+			isOverload,
+			isTransientUpstream,
+			skipped: true,
+		};
 	}
 
 	// In-memory update so the rest of this request sees consistent state.
 	account.rate_limited_until = cooldownUntil;
 	account.rate_limited_at = now;
 	account.rate_limited_reason = reason;
-	if (!isOverload) {
+	if (!isTransientUpstream) {
 		account.consecutive_rate_limits = nextCount;
 	}
 	const wasRecoveryProbe = probeLeases.has(account.id);
@@ -294,12 +327,19 @@ function applyRateLimitCooldownInMemory(
 		);
 	}
 
-	return { cooldownUntil, reason, isOverload, skipped: false };
+	return {
+		cooldownUntil,
+		reason,
+		isOverload,
+		isTransientUpstream,
+		skipped: false,
+	};
 }
 
 /**
  * Single entry point for applying an upstream-driven cooldown to an account
- * after a 429 (quota) or 529 (transient overload) response.
+ * after a 429 (quota), a 529 (transient overload) or a transient 5xx server
+ * error response.
  *
  * Cooldown DURATION:
  * - A 429 uses the exponential-backoff ramp capped by the upstream reset (if
@@ -318,9 +358,18 @@ function applyRateLimitCooldownInMemory(
  *   drift as more 529s arrive. The cap guards against `resetTime` coming from
  *   the anthropic-ratelimit-unified-reset header — a quota window that can be
  *   hours away (provider.ts:368-380) — rather than a short, real retry-after.
+ * - A transient server error (`upstream_5xx_server_error`) uses
+ *   `min(retryAfter, now + computeServerErrorCooldownMs())`, or the fixed
+ *   cooldown when the response carried no usable `Retry-After`. The cap is
+ *   separate from the 529 one because the two failure modes have different
+ *   shapes: a 529 clears in seconds, whereas the 500s this exists for lasted
+ *   minutes at a time on one organization while sibling accounts were healthy.
  *
- * Streak (`consecutive_rate_limits`): incremented for 429s only. BOTH 529
- * variants (`isOverloadReason`) leave it untouched — the streak also gates
+ * Streak (`consecutive_rate_limits`): incremented for 429s only. Both 529
+ * variants AND `upstream_5xx_server_error` (`isTransientUpstreamReason`) leave
+ * it untouched — none of them is the account hitting its own quota, and a
+ * transient upstream failure must not leave the account throttled once the
+ * upstream recovers. The streak also gates
  * `getRateLimitProbeAdmission`'s single-flight recovery probe (which
  * additionally arms on the overload reason directly, see that function's doc
  * comment), so letting a run of transient overloads inflate it would keep
@@ -328,19 +377,22 @@ function applyRateLimitCooldownInMemory(
  * overload) has cleared, even though the account itself never hit its own
  * quota.
  *
- * Forward guard: a 529 (either variant) never shortens an active cooldown
- * that already extends past the newly computed one — e.g. a real 429 quota
- * bench that's still running when a 529 arrives mid-window. The longer,
+ * Forward guard: a transient upstream cooldown (either 529 variant or a 5xx
+ * server error) never shortens an active cooldown that already extends past the
+ * newly computed one — e.g. a real 429 quota bench that's still running when a
+ * 529 or a 500 arrives mid-window. The longer,
  * already-active bench carries more information than a transient overload
  * does. In that case this function skips every write (in-memory and DB)
- * entirely and only releases the probe lease. This guard is 529-only: the
- * 429 path keeps its existing last-writer-wins behavior. "Never shorten an
+ * entirely and only releases the probe lease. The guard covers exactly the
+ * transient upstream reasons (both 529 variants and upstream_5xx_server_error);
+ * the 429 path keeps its existing last-writer-wins behavior. "Never shorten an
  * active cooldown" is not a project-wide invariant to begin with — the
  * successful-response clear in response-processor.ts unconditionally nulls
  * rate_limited_until (even a future one) the moment a response succeeds.
  *
- * Must be called from every 429/529 path (response-processor, model_fallback_429,
- * all_models_exhausted_429, mid-stream sniffer) — never reach into rate_limited_until manually.
+ * Must be called from every 429/529/5xx path (response-processor, model_fallback_429,
+ * all_models_exhausted_429, mid-stream sniffer, the transient-5xx failover in
+ * proxy-operations) — never reach into rate_limited_until manually.
  *
  * @param account - The account that just received a 429/529 (mutated in place).
  * @param rateLimitInfo - For a 429, `resetTime` (if known) is honored as the cooldown target,
@@ -362,7 +414,7 @@ export function applyRateLimitCooldown(
 	ctx: ProxyContext,
 	breaker: CircuitBreaker = getDefaultCircuitBreaker(),
 ): boolean {
-	const { cooldownUntil, reason, isOverload, skipped } =
+	const { cooldownUntil, reason, isTransientUpstream, skipped } =
 		applyRateLimitCooldownInMemory(account, rateLimitInfo);
 	if (skipped) return false;
 
@@ -387,17 +439,17 @@ export function applyRateLimitCooldown(
 				account.id,
 				cooldownUntil,
 				reason,
-				!isOverload,
+				!isTransientUpstream,
 			);
 		// Reconcile in-memory counter with the authoritative DB value (may differ
-		// under concurrent 429s for the same account). Skipped for overload: the
-		// streak is not touched by a 529 (with or without reset), so there is
-		// nothing to reconcile.
-		if (!isOverload) {
+		// under concurrent 429s for the same account). Skipped for the transient
+		// upstream reasons: the streak is not touched by a 529 (with or without
+		// reset) or a 5xx, so there is nothing to reconcile.
+		if (!isTransientUpstream) {
 			account.consecutive_rate_limits = persistedCount;
 		}
 		// Log AFTER the DB write so the reported consecutive= reflects the persisted
-		// value, and log the outcome the write actually had. A guarded 529 write
+		// value, and log the outcome the write actually had. A guarded transient write
 		// can be rejected by the repository's forward guard (a concurrent request
 		// already set a longer-lived cooldown) — asserting `cooldown_applied` for
 		// a write that was in fact skipped left two contradictory log lines for
@@ -413,12 +465,12 @@ export function applyRateLimitCooldown(
 		}
 	});
 
-	if (isOverload) {
-		// A 529 is a transient upstream server state, not a quota signal —
-		// emitting a RateLimitError here would misdiagnose it as account
-		// exhaustion. Log honestly instead.
+	if (isTransientUpstream) {
+		// A 529 or a 5xx is a transient upstream server state, not a quota
+		// signal — emitting a RateLimitError here would misdiagnose it as
+		// account exhaustion. Log honestly instead.
 		log.warn(
-			`[ccflare] account=${account.name} upstream_overloaded reason=${reason} until=${new Date(cooldownUntil).toISOString()} (529 — transient, streak untouched)`,
+			`[ccflare] account=${account.name} upstream_transient_failure reason=${reason} until=${new Date(cooldownUntil).toISOString()} (transient upstream failure — streak untouched)`,
 		);
 		return circuitCounted;
 	}
@@ -445,7 +497,9 @@ export function applyRateLimitCooldown(
  * promise instead avoids the pile-up. Calls whose deadline is already covered
  * by the active write reuse it. Calls with a later deadline share one pending
  * follow-up write, whose payload is updated to the maximum observed deadline;
- * equal deadlines retain the first observed reason, matching the database's
+ * Only the caller that supplied the eventual write payload owns its applied
+ * receipt; coalesced followers receive the count with applied=false.
+ * Equal deadlines retain the first observed reason, matching the database's
  * strict-greater monotonic clamp. This intentionally adds no process-local
  * selection breaker: selection still always reads fresh account state from
  * the DB.
@@ -458,14 +512,15 @@ interface RateLimitPersistPayload {
 }
 
 interface PendingRateLimitWrite extends RateLimitPersistPayload {
-	promise: Promise<number>;
-	resolve: (persistedCount: number) => void;
+	receiptOwner: symbol;
+	promise: Promise<MarkAccountRateLimitedResult>;
+	resolve: (result: MarkAccountRateLimitedResult) => void;
 	reject: (error: unknown) => void;
 }
 
 interface RateLimitWriteState {
 	active: RateLimitPersistPayload;
-	activePromise: Promise<number>;
+	activePromise: Promise<MarkAccountRateLimitedResult>;
 	pending: PendingRateLimitWrite | null;
 }
 
@@ -474,7 +529,7 @@ const inFlightRateLimitWrites = new Map<string, RateLimitWriteState>();
 function invokeMarkAccountRateLimited(
 	accountId: string,
 	payload: RateLimitPersistPayload,
-): Promise<number> {
+): Promise<MarkAccountRateLimitedResult> {
 	try {
 		return Promise.resolve(
 			payload.ctx.dbOps.markAccountRateLimited(
@@ -483,7 +538,7 @@ function invokeMarkAccountRateLimited(
 				payload.reason,
 				payload.incrementStreak,
 			),
-		).then((result) => result.consecutiveRateLimits);
+		);
 	} catch (error) {
 		return Promise.reject(error);
 	}
@@ -492,13 +547,13 @@ function invokeMarkAccountRateLimited(
 function observeRateLimitWrite(
 	accountId: string,
 	state: RateLimitWriteState,
-	writePromise: Promise<number>,
+	writePromise: Promise<MarkAccountRateLimitedResult>,
 	completion?: PendingRateLimitWrite,
 ): void {
 	void writePromise
 		.then(
-			(persistedCount) => {
-				completion?.resolve(persistedCount);
+			(result) => {
+				completion?.resolve(result);
 				advanceRateLimitWrite(accountId, state, writePromise);
 			},
 			(error) => {
@@ -517,7 +572,7 @@ function observeRateLimitWrite(
 function advanceRateLimitWrite(
 	accountId: string,
 	state: RateLimitWriteState,
-	settledPromise: Promise<number>,
+	settledPromise: Promise<MarkAccountRateLimitedResult>,
 ): void {
 	if (
 		inFlightRateLimitWrites.get(accountId) !== state ||
@@ -541,14 +596,17 @@ function advanceRateLimitWrite(
 
 function createPendingRateLimitWrite(
 	payload: RateLimitPersistPayload,
+	receiptOwner: symbol,
 ): PendingRateLimitWrite {
-	let resolve!: (persistedCount: number) => void;
+	let resolve!: (result: MarkAccountRateLimitedResult) => void;
 	let reject!: (error: unknown) => void;
-	const promise = new Promise<number>((resolvePromise, rejectPromise) => {
-		resolve = resolvePromise;
-		reject = rejectPromise;
-	});
-	return { ...payload, promise, resolve, reject };
+	const promise = new Promise<MarkAccountRateLimitedResult>(
+		(resolvePromise, rejectPromise) => {
+			resolve = resolvePromise;
+			reject = rejectPromise;
+		},
+	);
+	return { ...payload, receiptOwner, promise, resolve, reject };
 }
 
 function getOrStartMarkAccountRateLimited(
@@ -557,23 +615,37 @@ function getOrStartMarkAccountRateLimited(
 	cooldownUntil: number,
 	reason: RateLimitReason,
 	incrementStreak: boolean,
-): Promise<number> {
+): Promise<MarkAccountRateLimitedResult> {
 	const payload = { ctx, cooldownUntil, reason, incrementStreak };
 	const existing = inFlightRateLimitWrites.get(account.id);
 	if (existing) {
 		if (cooldownUntil <= existing.active.cooldownUntil) {
-			return existing.activePromise;
+			// This call is covered by another writer, so only its count is
+			// authoritative for the follower; it did not apply this mutation.
+			return existing.activePromise.then((result) => ({
+				...result,
+				applied: false,
+			}));
 		}
 
+		const receiptOwner = Symbol();
 		if (!existing.pending) {
-			existing.pending = createPendingRateLimitWrite(payload);
+			existing.pending = createPendingRateLimitWrite(payload, receiptOwner);
 		} else if (cooldownUntil > existing.pending.cooldownUntil) {
 			existing.pending.ctx = ctx;
 			existing.pending.cooldownUntil = cooldownUntil;
 			existing.pending.reason = reason;
 			existing.pending.incrementStreak = incrementStreak;
+			existing.pending.receiptOwner = receiptOwner;
 		}
-		return existing.pending.promise;
+		const pending = existing.pending;
+		// A stronger pending payload supersedes its previous owner. Tied or
+		// weaker followers await the same write without claiming its mutation.
+		return pending.promise.then((result) =>
+			pending.receiptOwner === receiptOwner
+				? result
+				: { ...result, applied: false },
+		);
 	}
 
 	const writePromise = invokeMarkAccountRateLimited(account.id, payload);
@@ -600,6 +672,9 @@ function getOrStartMarkAccountRateLimited(
  * account. Callers on this path must await this function before treating
  * failover as safe to proceed.
  *
+ * Returns the durable write receipt, or null when persistence failed/timed out.
+ * A false applied flag includes the in-memory or database forward guard.
+ *
  * @param account - The account that just received a directly-observed rate
  *   limit / capacity signal (mutated in place).
  * @param rateLimitInfo - Same shape and semantics as applyRateLimitCooldown.
@@ -610,10 +685,15 @@ export async function applyRateLimitCooldownAwaitingPersist(
 	account: Account,
 	rateLimitInfo: RateLimitCooldownInput,
 	ctx: ProxyContext,
-): Promise<void> {
-	const { cooldownUntil, reason, isOverload, skipped } =
+): Promise<MarkAccountRateLimitedResult | null> {
+	const { cooldownUntil, reason, isTransientUpstream, skipped } =
 		applyRateLimitCooldownInMemory(account, rateLimitInfo);
-	if (skipped) return;
+	if (skipped) {
+		return {
+			consecutiveRateLimits: account.consecutive_rate_limits ?? 0,
+			applied: false,
+		};
+	}
 
 	// The durable single-row UPDATE is awaited (not enqueued) so failover
 	// selection -- which reads fresh account state from the DB on every request,
@@ -630,15 +710,15 @@ export async function applyRateLimitCooldownAwaitingPersist(
 	// background. Do not try to abort/cancel the underlying SQLite call --
 	// there is nothing to cancel it with, and a second timer layered on top
 	// would only orphan the original promise without shortening the real wait.
-	let persistedCount: number | null = null;
+	let persistedResult: MarkAccountRateLimitedResult | null = null;
 	try {
-		persistedCount = await raceWithTimeout(
+		persistedResult = await raceWithTimeout(
 			getOrStartMarkAccountRateLimited(
 				ctx,
 				account,
 				cooldownUntil,
 				reason,
-				!isOverload,
+				!isTransientUpstream,
 			),
 			getRateLimitPersistAwaitTimeoutMs(),
 		);
@@ -649,31 +729,39 @@ export async function applyRateLimitCooldownAwaitingPersist(
 		);
 	}
 
-	if (persistedCount !== null) {
+	if (persistedResult !== null) {
 		// Reconcile in-memory counter with the authoritative DB value (may differ
 		// under concurrent 402/429s for the same account). Skipped for overload:
 		// the streak is not touched by a 529 (with or without reset), so there is
 		// nothing to reconcile.
-		if (!isOverload) {
-			account.consecutive_rate_limits = persistedCount;
+		if (!isTransientUpstream) {
+			account.consecutive_rate_limits = persistedResult.consecutiveRateLimits;
 		}
 	} else {
 		log.warn(
 			`[ccflare] account=${account.name} cooldown_persist_deferred reason=${reason} -- proceeding with in-memory streak=${account.consecutive_rate_limits}`,
 		);
 	}
-	log.warn(
-		`[ccflare] account=${account.name} cooldown_applied reason=${reason} until=${new Date(cooldownUntil).toISOString()} consecutive=${account.consecutive_rate_limits}`,
-	);
+	if (persistedResult?.applied === false) {
+		log.warn(
+			`[ccflare] account=${account.name} cooldown_write_skipped reason=${reason} candidate_until=${new Date(cooldownUntil).toISOString()} consecutive=${persistedResult.consecutiveRateLimits} (existing later cooldown or row absent)`,
+		);
+		return persistedResult;
+	}
+	if (persistedResult?.applied) {
+		log.warn(
+			`[ccflare] account=${account.name} cooldown_applied reason=${reason} until=${new Date(cooldownUntil).toISOString()} consecutive=${account.consecutive_rate_limits}`,
+		);
+	}
 
-	if (isOverload) {
-		// A 529 is a transient upstream server state, not a quota signal —
+	if (isTransientUpstream) {
+		// A 529 or 5xx is a transient upstream server state, not a quota signal —
 		// emitting a RateLimitError here would misdiagnose it as account
 		// exhaustion. Log honestly instead.
 		log.warn(
-			`[ccflare] account=${account.name} upstream_overloaded reason=${reason} until=${new Date(cooldownUntil).toISOString()} (529 — transient, streak untouched)`,
+			`[ccflare] account=${account.name} upstream_transient_failure reason=${reason} until=${new Date(cooldownUntil).toISOString()} (transient upstream failure — streak untouched)`,
 		);
-		return;
+		return persistedResult;
 	}
 
 	const rateLimitError = new RateLimitError(
@@ -682,6 +770,7 @@ export async function applyRateLimitCooldownAwaitingPersist(
 		rateLimitInfo.remaining,
 	);
 	logError(rateLimitError, log);
+	return persistedResult;
 }
 
 /**

@@ -1,7 +1,7 @@
 import type { AccountRoutingOverview } from "@better-ccflare/types";
 import { AlertCircle, Plus } from "lucide-react";
 import { useState } from "react";
-import { type Account, api } from "../api";
+import { type Account, api, type RequestTransformer } from "../api";
 import {
 	ACCOUNT_ROUTING_INVALIDATION,
 	FULL_MANAGED_ROUTING_INVALIDATION,
@@ -27,6 +27,8 @@ import {
 	AccountList,
 	AccountModelMappingsDialog,
 	AccountPriorityDialog,
+	AccountRequestTransformerDialog,
+	AccountUsageThresholdsDialog,
 	AnthropicReauthDialog,
 	CodexReauthDialog,
 	DeleteConfirmationDialog,
@@ -284,7 +286,21 @@ export function AccountsTab() {
 		isOpen: false,
 		account: null,
 	});
+	const [usageThresholdsDialog, setUsageThresholdsDialog] = useState<{
+		isOpen: boolean;
+		account: Account | null;
+	}>({
+		isOpen: false,
+		account: null,
+	});
 	const [modelMappingsDialog, setModelMappingsDialog] = useState<{
+		isOpen: boolean;
+		account: Account | null;
+	}>({
+		isOpen: false,
+		account: null,
+	});
+	const [requestTransformerDialog, setRequestTransformerDialog] = useState<{
 		isOpen: boolean;
 		account: Account | null;
 	}>({
@@ -641,12 +657,37 @@ export function AccountsTab() {
 		}
 	};
 
+	const handleUsageThresholdsChange = (account: Account) => {
+		setUsageThresholdsDialog({ isOpen: true, account });
+	};
+
+	const handleUpdateUsageThresholds = async (
+		accountId: string,
+		fiveHour: { enabled: boolean; percent: number | null },
+		weekly: { enabled: boolean; percent: number | null },
+	) => {
+		try {
+			await api.updateAccountUsagePauseThresholds(accountId, fiveHour, weekly);
+			await loadAccounts();
+		} catch (err) {
+			setActionError(formatError(err));
+			// Rethrow so the dialog stays open on a failed save. Swallowing it
+			// here would close the dialog as if the write had landed, throwing
+			// away what was typed.
+			throw err;
+		}
+	};
+
 	const handleCustomEndpointChange = (account: Account) => {
 		setCustomEndpointDialog({ isOpen: true, account });
 	};
 
 	const handleModelMappingsChange = (account: Account) => {
 		setModelMappingsDialog({ isOpen: true, account });
+	};
+
+	const handleRequestTransformerChange = (account: Account) => {
+		setRequestTransformerDialog({ isOpen: true, account });
 	};
 
 	const handleReauth = (account: Account) => {
@@ -701,6 +742,20 @@ export function AccountsTab() {
 	) => {
 		try {
 			await updateModelMappings.mutateAsync({ accountId, modelMappings });
+		} catch (err) {
+			setActionError(formatError(err));
+			throw err;
+		}
+	};
+
+	const handleUpdateRequestTransformer = async (
+		accountId: string,
+		requestTransformer: RequestTransformer | null,
+	) => {
+		try {
+			await api.updateAccountRequestTransformer(accountId, requestTransformer);
+			await loadAccounts();
+			setActionError(null);
 		} catch (err) {
 			setActionError(formatError(err));
 			throw err;
@@ -797,8 +852,10 @@ export function AccountsTab() {
 						onBillingTypeToggle={handleBillingTypeToggle}
 						onAutoPauseOnOverageToggle={handleAutoPauseOnOverageToggle}
 						onPeakHoursPauseToggle={handlePeakHoursPauseToggle}
+						onUsageThresholdsChange={handleUsageThresholdsChange}
 						onCustomEndpointChange={handleCustomEndpointChange}
 						onModelMappingsChange={handleModelMappingsChange}
+						onRequestTransformerChange={handleRequestTransformerChange}
 						onReauth={handleReauth}
 						onAnthropicReauth={handleAnthropicReauth}
 						onCodexReauth={handleCodexReauth}
@@ -853,6 +910,20 @@ export function AccountsTab() {
 				/>
 			)}
 
+			{usageThresholdsDialog.isOpen && usageThresholdsDialog.account && (
+				<AccountUsageThresholdsDialog
+					account={usageThresholdsDialog.account}
+					isOpen={usageThresholdsDialog.isOpen}
+					onOpenChange={(open) =>
+						setUsageThresholdsDialog({
+							isOpen: open,
+							account: open ? usageThresholdsDialog.account : null,
+						})
+					}
+					onUpdateThresholds={handleUpdateUsageThresholds}
+				/>
+			)}
+
 			{customEndpointDialog.isOpen && customEndpointDialog.account && (
 				<AccountCustomEndpointDialog
 					isOpen={customEndpointDialog.isOpen}
@@ -877,6 +948,19 @@ export function AccountsTab() {
 						})
 					}
 					onUpdateModelMappings={handleUpdateModelMappings}
+				/>
+			)}
+			{requestTransformerDialog.isOpen && requestTransformerDialog.account && (
+				<AccountRequestTransformerDialog
+					isOpen={requestTransformerDialog.isOpen}
+					account={requestTransformerDialog.account}
+					onOpenChange={(open) =>
+						setRequestTransformerDialog({
+							isOpen: open,
+							account: open ? requestTransformerDialog.account : null,
+						})
+					}
+					onUpdateRequestTransformer={handleUpdateRequestTransformer}
 				/>
 			)}
 			<QwenReauthDialog

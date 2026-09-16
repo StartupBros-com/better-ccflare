@@ -30,6 +30,9 @@ mock.module("@better-ccflare/openai-responses-adapter", () => ({
 mock.module("@better-ccflare/providers", () => ({
 	CODEX_DEFAULT_ENDPOINT: "https://example.invalid",
 	CODEX_PING_MODEL: "test-model",
+	codexWindowRolledOver: () => false,
+	pickCodexRolloverSlot: () => "seven_day",
+	extractChatgptAccountId: () => null,
 	fetchCodexUsageData: async () => null,
 	fetchCodexUsageOnDemand: async () => null,
 	extractWeeklyResetTime: () => null,
@@ -90,6 +93,7 @@ mock.module("@better-ccflare/proxy", () => {
 		ModelRouteSessionRegistry: class {},
 		parseModelRouteProfiles: () => [],
 		recordCodexUsageSnapshot: async () => {},
+		earliestCodexResetMs: () => null,
 		refreshModelCatalog: async () => ({ success: true }),
 		registerAutoRefreshTrackingClearer: () => {},
 		registerCodexUsageRefresher: () => {},

@@ -16,7 +16,7 @@ better-ccflare supports four load-balancing strategies for distributing requests
 
 ### Key Features
 - **Account Health Monitoring**: Automatically filters out rate-limited or paused accounts
-- **Failover Support**: Returns ordered lists of accounts for automatic failover
+- **Failover Support**: Returns ordered lists of accounts for automatic failover, including opt-in transient upstream server error handling (500/502/503/504) when `CCFLARE_SERVER_ERROR_RETRY_ENABLED=true` (default `false` in this fork), subject to the authorized candidate plan and replay budget
 - **Session Persistence**: Maintains configurable sessions on specific accounts
 - **Account Priorities**: Supports prioritized account selection for better control over load distribution
 - **Auto-Fallback**: Automatically switches back to higher priority accounts when their usage windows reset

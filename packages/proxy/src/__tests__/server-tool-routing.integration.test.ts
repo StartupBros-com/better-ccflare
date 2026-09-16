@@ -205,7 +205,10 @@ function makeContext(
 	const refreshCalls = { value: 0 };
 	const mutations = {
 		pauseAccount: mock(async () => undefined),
-		markAccountRateLimited: mock(async () => undefined),
+		markAccountRateLimited: mock(async () => ({
+			consecutiveRateLimits: 1,
+			applied: true,
+		})),
 		updateAccountUsage: mock(async () => undefined),
 		asyncWrite: mock(() => undefined),
 		reportFailure: mock(

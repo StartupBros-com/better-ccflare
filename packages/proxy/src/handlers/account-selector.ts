@@ -2736,7 +2736,9 @@ async function selectAccountsForRequestInternal(
 				// flag is enabled, because the auto-resume guard would never un-pause those accounts.
 				// This mirrors the scheduler eligibility query and the sendDummyMessage resume guard
 				// (auto_pause_on_overage_enabled=1 AND pause_reason IN (NULL,'overage')).
-				const isAutoRefreshBypass = meta.trustedInternalAutoRefresh === true;
+				const isAutoRefreshBypass =
+					meta.trustedInternalAutoRefresh === true ||
+					isInternalProbe(meta.headers, ctx, "auto-refresh");
 				const available = isAccountAvailable(forcedAccount);
 				const isOveragePaused =
 					forcedAccount.paused &&
@@ -2757,7 +2759,12 @@ async function selectAccountsForRequestInternal(
 				// unavailable or capacity-exhausted forced account, regardless of
 				// provider, custom-endpoint status, or the xaiCacheNativeActive flag.
 				const mayProbeUnavailableAccount =
-					isAutoRefreshBypass && (isOveragePaused || isRateLimited);
+					isAutoRefreshBypass &&
+					!forcedAccount.requires_reauth &&
+					(isOveragePaused ||
+						isRateLimited ||
+						(forcedAccount.paused &&
+							forcedAccount.pause_reason === "failure_threshold"));
 				if (!available && !mayProbeUnavailableAccount) {
 					throw new ForceRouteUnavailableError(
 						forcedAccountId,

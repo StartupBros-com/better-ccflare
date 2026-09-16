@@ -162,4 +162,6 @@ The model mappings include both current and legacy model versions:
 
 better-ccflare supports agent-specific model preferences through the agent system. When an agent is detected in a request, the system can automatically override the model selection based on the agent's configured preference.
 
+When explicitly enabled with `CCFLARE_RESPONSE_MODEL_ALIAS_ENABLED=true`, Anthropic Messages-compatible responses retain the original request model in the client-facing `model` field, including when the account translates to another provider or backend model. The flag defaults to `false` in this fork so the physical served-model identity remains visible by default. This is an API-compatibility alias only: it is not proof of backend identity. Provider processing, pricing, usage accounting, and logs continue to use the actual upstream model and response before the alias is applied. Non-streaming response bodies larger than 256 KiB are passed through without this alias to keep proxy memory bounded.
+
 See the [Agents Package section](./architecture.md#3-agents-package-packagesagents) in the architecture docs for more details on how agents work with model preferences.

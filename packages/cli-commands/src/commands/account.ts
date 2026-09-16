@@ -6,7 +6,10 @@ import type { Config } from "@better-ccflare/config";
 import type { ModelMapping } from "@better-ccflare/core";
 import {
 	PAUSE_REASON_NEEDS_REAUTH,
+	parseUsagePauseThreshold,
 	REAUTHENTICATION_REQUIRED_CODE,
+	supportsUsagePauseThreshold,
+	type UsagePauseSetting,
 	validateAndSanitizeModelFallbacks,
 	validateAndSanitizeModelMappings,
 	validateApiKey,
@@ -16,8 +19,10 @@ import {
 import type { DatabaseOperations } from "@better-ccflare/database";
 import { createOAuthFlow } from "@better-ccflare/oauth-flow";
 import {
+	CODEX_DEFAULT_ENDPOINT,
 	generatePKCE,
 	getOAuthProvider,
+	isCodexSubscriptionEndpoint,
 	type TokenRefreshResult as TokenResult,
 	XAI_DEFAULT_ENDPOINT,
 	XAI_MODEL_MAPPINGS,
@@ -2289,6 +2294,99 @@ export async function setAccountPriority(
 }
 
 /**
+ * Set an account's usage-window pause settings by account name.
+ *
+ * Each argument is a whole percentage (as a number, or the raw CLI token so
+ * malformed input like "80.5" or "80junk" is rejected rather than truncated),
+ * or null to switch that window off. Switching a window off keeps the
+ * percentage already stored for it, so turning it back on does not mean typing
+ * the number again. Both windows are written on every call.
+ */
+export async function setUsagePauseThresholds(
+	dbOps: DatabaseOperations,
+	name: string,
+	fiveHour: string | number | null,
+	weekly: string | number | null,
+): Promise<{ success: boolean; message: string }> {
+	const adapter = dbOps.getAdapter();
+
+	const account = await adapter.get<{
+		id: string;
+		provider: string | null;
+		usage_pause_five_hour_threshold: number | null;
+		usage_pause_weekly_threshold: number | null;
+		custom_endpoint: string | null;
+	}>(
+		"SELECT id, provider, custom_endpoint, usage_pause_five_hour_threshold, usage_pause_weekly_threshold FROM accounts WHERE name = ?",
+		[name],
+	);
+
+	if (!account) {
+		return {
+			success: false,
+			message: `Account '${name}' not found`,
+		};
+	}
+
+	if (
+		!supportsUsagePauseThreshold(account.provider) ||
+		(account.provider === "codex" &&
+			!isCodexSubscriptionEndpoint(
+				account.custom_endpoint ?? CODEX_DEFAULT_ENDPOINT,
+			))
+	) {
+		return {
+			success: false,
+			message: `Usage pause thresholds are not supported for provider '${account.provider}'`,
+		};
+	}
+
+	const validated = (():
+		| { fiveHour: UsagePauseSetting; weekly: UsagePauseSetting }
+		| string => {
+		try {
+			const five = parseUsagePauseThreshold(fiveHour);
+			const week = parseUsagePauseThreshold(weekly);
+			return {
+				fiveHour: {
+					enabled: five !== null,
+					// Keep the stored number when switching the window off.
+					percent: five ?? account.usage_pause_five_hour_threshold ?? null,
+				},
+				weekly: {
+					enabled: week !== null,
+					percent: week ?? account.usage_pause_weekly_threshold ?? null,
+				},
+			};
+		} catch (err) {
+			return err instanceof Error ? err.message : String(err);
+		}
+	})();
+
+	if (typeof validated === "string") {
+		return { success: false, message: validated };
+	}
+
+	await dbOps.setUsagePauseThresholds(
+		account.id,
+		validated.fiveHour,
+		validated.weekly,
+	);
+
+	const describe = (setting: UsagePauseSetting) =>
+		setting.enabled && setting.percent !== null
+			? `${setting.percent}%`
+			: setting.percent !== null
+				? `off (${setting.percent}% remembered)`
+				: "off";
+
+	return {
+		success: true,
+		message: `Account '${name}' usage pause thresholds set to 5h=${describe(validated.fiveHour)}, weekly=${describe(validated.weekly)}`,
+	};
+}
+
+/**
  * Force reset account rate-limit state by account name.
  * Clears persisted lock fields and then best-effort notifies running local servers
  * to trigger immediate usage polling.
@@ -2786,19 +2884,22 @@ export async function reauthenticateAccount(
 	console.log("Updating OAuth tokens...");
 
 	try {
+		const reauthTimestamp = Date.now();
 		await db.run(
 			`UPDATE accounts SET
 				refresh_token = ?,
 				access_token = ?,
 				expires_at = ?,
 				refresh_token_issued_at = ?,
+				last_manual_reauth_at = ?,
 				requires_reauth = 0
 			WHERE id = ?`,
 			[
 				tokens.refreshToken,
 				tokens.accessToken,
 				tokens.expiresAt,
-				Date.now(),
+				reauthTimestamp,
+				reauthTimestamp,
 				account.id,
 			],
 		);

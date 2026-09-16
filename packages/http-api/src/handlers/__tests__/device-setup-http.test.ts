@@ -20,6 +20,7 @@ import {
 
 mock.module("@better-ccflare/proxy", () => ({
 	clearAccountRefreshCache: () => {},
+	restartUsagePollingForAccount: async () => false,
 }));
 mock.module("@better-ccflare/oauth-flow", () => ({
 	createOAuthFlow: async () => ({ complete: async () => undefined }),

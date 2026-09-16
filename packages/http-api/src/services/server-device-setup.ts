@@ -12,6 +12,7 @@ import {
 	createDeviceSetupCoordinator,
 	type DeviceSetupCoordinator,
 } from "./device-setup-jobs";
+import { startUsagePollingForNewAccount } from "./usage-polling-start";
 
 function normalizeQwenBaseUrl(url: string): string {
 	let normalized = url.trim();
@@ -167,6 +168,7 @@ export function createServerDeviceSetupCoordinator(
 					null,
 				],
 			);
+			void startUsagePollingForNewAccount(accountId, name);
 		},
 		accountExists: async (accountId) =>
 			Boolean(

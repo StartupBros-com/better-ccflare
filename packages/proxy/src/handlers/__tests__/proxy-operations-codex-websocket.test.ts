@@ -101,7 +101,9 @@ function makeProxyContext(): ProxyContext {
 	return {
 		strategy: { getNextAccount: () => null } as never,
 		dbOps: {
-			markAccountRateLimited: mock(() => Promise.resolve(1)),
+			markAccountRateLimited: mock(() =>
+				Promise.resolve({ consecutiveRateLimits: 1, applied: true }),
+			),
 			saveRequest: mock(() => Promise.resolve()),
 			saveRoutingAttempt: mock(() => Promise.resolve()),
 			updateAccountUsage: mock(() => Promise.resolve()),
@@ -2705,7 +2707,7 @@ describe("proxyWithAccount: verified Codex 429 recovery provenance", () => {
 				persistedAccount.rate_limited_reason = reason as never;
 				persistedAccount.rate_limited_at = Date.now();
 				persistedAccount.consecutive_rate_limits = 1;
-				return 1;
+				return { consecutiveRateLimits: 1, applied: true };
 			},
 		) as never;
 
@@ -2810,7 +2812,7 @@ describe("proxyWithAccount: verified Codex 429 recovery provenance", () => {
 			async (_accountId: string, until: number, reason: string) => {
 				persistedAccount.rate_limited_until = until;
 				persistedAccount.rate_limited_reason = reason as never;
-				return 1;
+				return { consecutiveRateLimits: 1, applied: true };
 			},
 		) as never;
 		const bodyBuffer = makeRequestBody();

@@ -1,13 +1,16 @@
+import { supportsUsagePauseThreshold } from "@better-ccflare/core";
 import { AccountPresenter } from "@better-ccflare/ui-common";
 import {
 	AlertCircle,
 	Edit2,
+	Gauge,
 	Globe,
 	Hash,
 	KeyRound,
 	Pause,
 	Play,
 	RefreshCw,
+	Replace,
 	Trash2,
 	Zap,
 } from "lucide-react";
@@ -105,8 +108,10 @@ interface AccountListItemProps {
 	onBillingTypeToggle: (account: Account) => void;
 	onAutoPauseOnOverageToggle?: (account: Account) => void;
 	onPeakHoursPauseToggle?: (account: Account) => void;
+	onUsageThresholdsChange?: (account: Account) => void;
 	onCustomEndpointChange?: (account: Account) => void;
 	onModelMappingsChange?: (account: Account) => void;
+	onRequestTransformerChange?: (account: Account) => void;
 	onReauth?: (account: Account) => void;
 	onAnthropicReauth?: (account: Account) => void;
 	onCodexReauth?: (account: Account) => void;
@@ -127,8 +132,10 @@ export function AccountListItem({
 	onBillingTypeToggle,
 	onAutoPauseOnOverageToggle,
 	onPeakHoursPauseToggle,
+	onUsageThresholdsChange,
 	onCustomEndpointChange,
 	onModelMappingsChange,
+	onRequestTransformerChange,
 	onReauth,
 	onAnthropicReauth,
 	onCodexReauth,
@@ -191,6 +198,16 @@ export function AccountListItem({
 		}
 		bedrockCrossRegionMode = account.crossRegionMode || "geographic";
 	}
+
+	const activeUsageThresholds = [
+		account.usagePauseFiveHourEnabled && account.usagePauseFiveHourThreshold
+			? `${account.usagePauseFiveHourThreshold}% of the 5-hour window`
+			: null,
+		account.usagePauseWeeklyEnabled && account.usagePauseWeeklyThreshold
+			? `${account.usagePauseWeeklyThreshold}% of the weekly window`
+			: null,
+	].filter((entry): entry is string => entry !== null);
+	const hasUsageThreshold = activeUsageThresholds.length > 0;
 
 	return (
 		<div
@@ -357,6 +374,23 @@ export function AccountListItem({
 								</span>
 							)
 						)}
+						{!account.requiresReauth &&
+							(account.reauthDeadlineStatus === "warning" ||
+								account.reauthDeadlineStatus === "critical" ||
+								account.reauthDeadlineStatus === "expired") && (
+								<span
+									className="text-sm text-amber-600"
+									title={`Empirically observed ~28-day OAuth reauthentication deadline. Run: bun run cli --reauthenticate "${account.name}"`}
+								>
+									{account.reauthDeadlineStatus === "expired"
+										? Math.abs(account.hoursUntilReauthRequired ?? 0) < 24
+											? `Reauth overdue by ${Math.abs(account.hoursUntilReauthRequired ?? 0)}h`
+											: `Reauth overdue by ${Math.abs(account.daysUntilReauthRequired ?? 0)}d`
+										: (account.hoursUntilReauthRequired ?? Infinity) < 24
+											? `Reauth in ${account.hoursUntilReauthRequired}h`
+											: `Reauth in ${account.daysUntilReauthRequired}d`}
+								</span>
+							)}
 						{!presenter.isPaused && presenter.rateLimitStatus !== "OK" && (
 							<span
 								className={`text-sm ${
@@ -427,6 +461,32 @@ export function AccountListItem({
 							/>
 						</Button>
 					)}
+					{(account.usagePauseSupported ??
+						supportsUsagePauseThreshold(account.provider)) &&
+						onUsageThresholdsChange && (
+							<Button
+								variant="ghost"
+								size="sm"
+								// The tint goes on the button, not on the icon: this theme
+								// sets --accent to the same orange as --primary, so a
+								// primary-coloured icon disappears into the ghost button's
+								// hover background and the control reads as a solid orange
+								// square. On the button, the hover's accent-foreground wins.
+								className={
+									hasUsageThreshold
+										? "text-primary hover:text-accent-foreground"
+										: ""
+								}
+								onClick={() => onUsageThresholdsChange(account)}
+								title={
+									hasUsageThreshold
+										? `Pauses at ${activeUsageThresholds.join(", ")}`
+										: "Set usage pause thresholds"
+								}
+							>
+								<Gauge className="h-4 w-4" />
+							</Button>
+						)}
 					{onModelMappingsChange && (
 						<Button
 							variant="ghost"
@@ -445,6 +505,27 @@ export function AccountListItem({
 							/>
 						</Button>
 					)}
+					{account.provider === "openai-compatible" &&
+						onRequestTransformerChange && (
+							<Button
+								variant="ghost"
+								size="sm"
+								onClick={() => onRequestTransformerChange(account)}
+								aria-label="Configure request transformer"
+								aria-pressed={account.requestTransformer !== null}
+								title={
+									account.requestTransformer
+										? "Request transformer: Max Tokens → Max Completion Tokens"
+										: "Configure request transformer"
+								}
+							>
+								<Replace
+									className={`h-4 w-4 ${
+										account.requestTransformer ? "text-primary" : ""
+									}`}
+								/>
+							</Button>
+						)}
 					{account.provider === "qwen" && onReauth && (
 						<Button
 							variant={reauthRequired ? "default" : "ghost"}
@@ -679,6 +760,20 @@ export function AccountListItem({
 					usageThrottledWindows={account.usageThrottledWindows}
 					provider={account.provider}
 					showWeekly={providerShowsWeeklyUsage(account.provider)}
+					pauseThresholdFiveHour={
+						(account.usagePauseSupported ??
+							supportsUsagePauseThreshold(account.provider)) &&
+						account.usagePauseFiveHourEnabled
+							? account.usagePauseFiveHourThreshold
+							: null
+					}
+					pauseThresholdWeekly={
+						(account.usagePauseSupported ??
+							supportsUsagePauseThreshold(account.provider)) &&
+						account.usagePauseWeeklyEnabled
+							? account.usagePauseWeeklyThreshold
+							: null
+					}
 				/>
 			)}
 		</div>

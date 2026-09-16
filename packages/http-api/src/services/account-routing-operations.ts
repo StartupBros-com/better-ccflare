@@ -285,6 +285,12 @@ function draftToAccount(draft: ComboRoutingAccountDraft): Account {
 		pause_reason: null,
 		refresh_token_issued_at: null,
 		consecutive_rate_limits: 0,
+		request_transformer: null,
+		last_manual_reauth_at: null,
+		usage_pause_five_hour_threshold: null,
+		usage_pause_weekly_threshold: null,
+		usage_pause_five_hour_enabled: false,
+		usage_pause_weekly_enabled: false,
 	};
 	if (deriveComboRouteClass(account) !== draft.auth_shape) {
 		throw BadRequest("draft auth shape is incompatible with the provider");

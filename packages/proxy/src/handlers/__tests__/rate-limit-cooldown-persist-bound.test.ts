@@ -109,7 +109,7 @@ describe("applyRateLimitCooldownAwaitingPersist: bounded persist (P0)", () => {
 				},
 				ctx,
 			),
-		).resolves.toBeUndefined();
+		).resolves.toBeNull();
 
 		// The in-memory nextCount (3 + 1 = 4) computed by
 		// applyRateLimitCooldownInMemory must stand -- it must NOT be overwritten
@@ -199,9 +199,53 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 		await Promise.resolve();
 		expect(callCount).toBe(1);
 
-		resolveWrite?.(markResult(7));
-		await Promise.all([p1, p2]);
+		resolveWrite?.({ consecutiveRateLimits: 7, applied: false });
+		expect(await Promise.all([p1, p2])).toEqual([
+			{ consecutiveRateLimits: 7, applied: false },
+			{ consecutiveRateLimits: 7, applied: false },
+		]);
 		expect(callCount).toBe(1);
+	});
+
+	it("does not give a shorter 5xx follower ownership of an active quota write", async () => {
+		Date.now = () => NOW;
+		const ownerAccount = makeAccount({ id: "acc-mixed-active-owner" });
+		const staleFollower = makeAccount({ id: ownerAccount.id });
+		let resolveWrite!: (value: MarkAccountRateLimitedResult) => void;
+		let calls = 0;
+		const ctx = {
+			dbOps: {
+				markAccountRateLimited: () => {
+					calls++;
+					return new Promise<MarkAccountRateLimitedResult>((resolve) => {
+						resolveWrite = resolve;
+					});
+				},
+			},
+		} as unknown as ProxyContext;
+		const owner = applyRateLimitCooldownAwaitingPersist(
+			ownerAccount,
+			{
+				resetTime: NOW + 60 * 60 * 1000,
+				reason: "upstream_429_with_reset",
+			},
+			ctx,
+		);
+		const follower = applyRateLimitCooldownAwaitingPersist(
+			staleFollower,
+			{
+				reason: "upstream_5xx_server_error",
+			},
+			ctx,
+		);
+		expect(calls).toBe(1);
+		resolveWrite(markResult(4));
+		expect(await owner).toEqual({ consecutiveRateLimits: 4, applied: true });
+		expect(await follower).toEqual({
+			consecutiveRateLimits: 4,
+			applied: false,
+		});
+		expect(calls).toBe(1);
 	});
 
 	it("raises an already-pending intermediate deadline to the maximum and keeps the maximum's paired reason", async () => {
@@ -272,7 +316,7 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 		});
 
 		calls[0]?.resolve(markResult(7));
-		await first;
+		expect(await first).toEqual(markResult(7));
 		await Promise.resolve();
 
 		expect(calls).toHaveLength(2);
@@ -283,7 +327,11 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 		});
 
 		calls[1]?.resolve(markResult(8));
-		await Promise.all([intermediate, maximum, tiedMaximum]);
+		expect(await Promise.all([intermediate, maximum, tiedMaximum])).toEqual([
+			{ consecutiveRateLimits: 8, applied: false },
+			{ consecutiveRateLimits: 8, applied: true },
+			{ consecutiveRateLimits: 8, applied: false },
+		]);
 		expect(calls).toHaveLength(2);
 	});
 
