@@ -86,7 +86,7 @@ The configuration file is stored at:
 
 ### Load Balancing Strategy
 
-⚠️ **WARNING**: Prefer `session`, `session-affinity`, or the opt-in `session-drain-soonest` for Anthropic OAuth traffic because they preserve account stickiness. `least-used` can spread individual requests across accounts and may trigger Claude's anti-abuse systems; reserve it for providers and credentials where per-request balancing is safe. `session-drain-soonest` only changes fresh-session/failover ordering within the authorized structural routing class when a known future all-model weekly reset is available; explicit retain-owner and route-circuit decisions remain authoritative.
+⚠️ **WARNING**: Prefer `session`, `session-affinity`, or the opt-in `session-drain-soonest` for Anthropic OAuth traffic because they preserve account stickiness. `least-used` can spread individual requests across accounts and may trigger Claude's anti-abuse systems; reserve it for providers and credentials where per-request balancing is safe. `session-drain-soonest` uses quota-aware fresh-session/failover ordering within the authorized structural routing class. Existing eligible Codex owners and temporary fallbacks also retain affinity across same-tier/rung quota-pressure changes and usage-window rollovers, while account session counters still reset. Explicit retain-owner, exclusions, route circuits, and better-tier/rung recovery remain authoritative. Other providers and `session-drain-soonest-strict` keep their existing behavior; see [affinity lifetime limits](load-balancing.md#account-and-client-stickiness).
 
 | Strategy | Description | Use Case |
 |----------|-------------|----------|

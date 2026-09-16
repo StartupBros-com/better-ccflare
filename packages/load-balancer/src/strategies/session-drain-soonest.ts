@@ -8,6 +8,7 @@ import {
 } from "@better-ccflare/types";
 import {
 	compareStrategyCandidates,
+	isSameStrategyCandidateRouteClass,
 	type StrategyCandidate,
 } from "./routing-metadata";
 import {
@@ -25,7 +26,9 @@ import { codexWindowHasReset } from "./session-window-reset";
  * Structural routing metadata (tier, quota-pressure class, combo identity)
  * remains authoritative. Weekly-reset ordering is applied only within that
  * same structural class, then account priority, utilization, and the base
- * strategy's bounded recency score provide deterministic tie-breaks.
+ * strategy's bounded recency score provide deterministic tie-breaks. In sticky
+ * mode, an eligible existing Codex owner survives same-tier/rung quota-pressure
+ * changes and usage-window rollovers to preserve its warmed prompt cache.
  */
 export type SessionDrainSoonestMode = "sticky" | "strict";
 
@@ -62,11 +65,30 @@ export class SessionDrainSoonestStrategy extends SessionAffinityStrategy {
 		return super.selectionAffinityKey(meta);
 	}
 
+	protected override preservesAffinityAcrossQuotaPressure(
+		owner: StrategyCandidate,
+		challenger: StrategyCandidate,
+	): boolean {
+		// Weekly burn urgency is a placement policy, not a reason to discard a
+		// healthy Codex conversation's cache. Route tier/rung recovery still wins.
+		return (
+			this.mode === "sticky" &&
+			owner.account.provider === PROVIDER_NAMES.CODEX &&
+			isSameStrategyCandidateRouteClass(owner, challenger)
+		);
+	}
+
 	protected override canRetainAffinityOwner(
 		candidate: StrategyCandidate,
 		now: number,
 	): boolean {
-		return !codexWindowHasReset(candidate.account, now);
+		// A usage window rollover resets accounting, not the client's cache owner.
+		// resetSelectedSession still advances the selected account's counters.
+		return (
+			(this.mode === "sticky" &&
+				candidate.account.provider === PROVIDER_NAMES.CODEX) ||
+			!codexWindowHasReset(candidate.account, now)
+		);
 	}
 
 	private hasActiveSession(account: Account, now: number): boolean {

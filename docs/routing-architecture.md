@@ -252,9 +252,20 @@ and per-lane owner map, temporary failover/snapback behavior, anti-thrash
 guard, route circuits, and candidate sidecar identity. A request with no
 `clientSessionId` still receives a fresh order and records no sticky owner.
 
-Only a fresh assignment or an account-level failover invokes the drain ranking. Structural routing classes remain authoritative: reset urgency cannot cross a provider/model/tier or route-profile boundary. Within one authorized class, eligible auto-fallback candidates are considered first; otherwise candidates are ordered by the earliest known **future** all-model weekly reset, then account priority, utilization, the bounded recency score, and stable candidate identity. Missing, malformed, stale, or past reset telemetry is unknown and sorts after a known future reset; if every reset is unknown, the ordinary affinity ordering is effectively retained. Explicit retain-owner and route-circuit decisions remain authoritative. The provider-neutral usage helper accepts only the
+Fresh assignments and account-level failovers use drain ranking. Structural routing classes remain authoritative for placement: reset urgency cannot cross a provider/model/tier or route-profile boundary. Within one authorized class, candidates are ordered by the earliest known **future** all-model weekly reset, then account priority, utilization, the bounded recency score, and stable candidate identity. Missing, malformed, stale, or past reset telemetry is unknown and sorts after a known future reset; if every reset is unknown, the ordinary affinity ordering is effectively retained. Explicit retain-owner and route-circuit decisions remain authoritative. The provider-neutral usage helper accepts only the
 canonical flat `seven_day` or `limits[].weekly_all` shapes, so unrelated
 provider credit windows cannot become drain signals.
+
+In sticky mode, an existing eligible Codex owner or temporary fallback retains
+its exact candidate identity despite a more urgent quota-pressure band within
+the same tier and fallback rung. A pressure-only recovered route cannot take a
+probe ahead of that healthy owner. Usage-window rollovers reset account session
+counters without releasing the conversation's owner. New placement remains
+quota-aware; exclusions, unavailable owners, and existing better-tier/rung
+recovery rules still apply. Non-Codex behavior and `session-drain-soonest-strict`
+are unchanged. The map remains process-local with an idle TTL; restarts and new
+session/lane identities can produce new assignments (see [affinity lifetime
+limits](load-balancing.md#account-and-client-stickiness)).
 
 For Anthropic accounts specifically, a past-reset `rate_limit_reset` that would otherwise sort as "stale telemetry" is also cleared proactively: `accounts.rate_limit_reset_at` (set whenever `rate_limit_reset` is written) lets a compare-and-set update (`clearStaleRateLimitReset`) reset `rate_limit_status`/`rate_limit_reset` back to `allowed` the moment usage polling observes zero utilization with no active weekly window — an out-of-band weekly reset the account's own reset timestamp hadn't caught up to yet. This reduces how often the ranking above has to fall back to "unknown" for an Anthropic account whose window has genuinely rolled over. See [Automatic Recovery](auto-refresh.md#troubleshooting) for the polling side of this.
 
