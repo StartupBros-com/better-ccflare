@@ -107,6 +107,7 @@ export {
 	lowestTierCodexModel,
 } from "./codex-model-catalog";
 export {
+	earliestCodexResetMs,
 	recordCodexUsageSnapshot,
 	resetCodexUsageHistoryThrottle,
 } from "./codex-usage-history";
@@ -120,9 +121,11 @@ export {
 export {
 	type CodexUsageRefreshOutcome,
 	checkAllAccountsHealth,
+	checkReauthDeadline,
 	checkRefreshTokenHealth,
 	clearAccountRefreshCache,
 	clearAutoRefreshTrackingForAccount,
+	computeReauthDeadline,
 	createGuardCorrelationVerifier,
 	createUsageThrottledResponse,
 	formatTokenHealthReport,
@@ -134,6 +137,7 @@ export {
 	getValidAccessToken,
 	isRefreshTokenLikelyExpired,
 	markAccountTokensFresh,
+	type ReauthDeadlineStatus,
 	refreshCodexUsageForAccount,
 	registerAutoRefreshTrackingClearer,
 	registerCodexUsageRefresher,

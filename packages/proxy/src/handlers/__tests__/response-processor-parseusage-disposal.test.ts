@@ -110,7 +110,10 @@ function makeCtx(opts: {
 			extractUsageInfo: undefined,
 		},
 		dbOps: {
-			markAccountRateLimited: () => {},
+			markAccountRateLimited: async () => ({
+				consecutiveRateLimits: 1,
+				applied: true,
+			}),
 			updateAccountUsage: () => {},
 			updateAccountRateLimitMeta: () => {},
 			getAdapter: () => ({

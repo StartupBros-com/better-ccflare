@@ -1096,7 +1096,10 @@ describe("post-combo normal fallback", () => {
 				consecutive_rate_limits: 0,
 			},
 		]);
-		ctx.dbOps.markAccountRateLimited = mock(async () => 1);
+		ctx.dbOps.markAccountRateLimited = mock(async () => ({
+			consecutiveRateLimits: 1,
+			applied: true,
+		}));
 
 		let fetchCount = 0;
 		globalThis.fetch = mock(async () => {
@@ -1265,7 +1268,10 @@ describe("post-combo normal fallback", () => {
 					: accounts.filter((account) => account.id === throttledFallback.id),
 		);
 		ctx.config.getUsageThrottlingFiveHourEnabled = () => true;
-		ctx.dbOps.markAccountRateLimited = mock(async () => 1);
+		ctx.dbOps.markAccountRateLimited = mock(async () => ({
+			consecutiveRateLimits: 1,
+			applied: true,
+		}));
 		usageCache.set(throttledFallback.id, {
 			five_hour: {
 				utilization: 80,

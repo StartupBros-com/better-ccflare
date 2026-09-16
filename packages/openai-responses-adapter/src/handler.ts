@@ -14,6 +14,7 @@ import {
 	RECOVERY_STATUS_HEADER,
 	recoveryScopeForCode,
 } from "@better-ccflare/types/routing-recovery";
+import { getRequestTools, isNamedToolChoice } from "./custom-tools";
 import {
 	MAX_RESPONSES_CONTENT_PARTS,
 	MAX_RESPONSES_INPUT_ITEMS,
@@ -21,6 +22,7 @@ import {
 } from "./request-limits";
 import {
 	InvalidInstructionError,
+	type NativeToolReplayMetadata,
 	translateRequestToAnthropic,
 } from "./request-translator";
 import { translateAnthropicResponseToResponses } from "./response-translator";
@@ -108,9 +110,7 @@ function openAiRequestError(status: 400 | 413, message: string): Response {
 	);
 }
 
-function oversizedContentItemType(
-	input: unknown,
-): "message" | "agent_message" | undefined {
+function oversizedContentItemType(input: unknown): string | undefined {
 	if (!Array.isArray(input)) return undefined;
 	let totalContentParts = 0;
 	for (const rawItem of input) {
@@ -122,13 +122,22 @@ function oversizedContentItemType(
 			continue;
 		}
 		const item = rawItem as Record<string, unknown>;
-		if (item.type !== "message" && item.type !== "agent_message") continue;
+		if (
+			item.type !== undefined &&
+			item.type !== "message" &&
+			item.type !== "agent_message" &&
+			item.type !== "function_call_output" &&
+			item.type !== "custom_tool_call_output"
+		)
+			continue;
+		if (Array.isArray(item.output)) totalContentParts += item.output.length;
 		if (Array.isArray(item.content)) {
 			totalContentParts += item.content.length;
 		} else if (item.type === "message" && typeof item.content === "string") {
 			totalContentParts += 1;
 		}
-		if (totalContentParts > MAX_RESPONSES_CONTENT_PARTS) return item.type;
+		if (totalContentParts > MAX_RESPONSES_CONTENT_PARTS)
+			return String(item.type ?? "message");
 	}
 	return undefined;
 }
@@ -153,10 +162,12 @@ function hasMalformedFunctionTool(tools: unknown[]): boolean {
 			return false;
 		}
 		const tool = rawTool as Record<string, unknown>;
-		if (tool.type !== "function") return false;
+		if (tool.type !== "function" && tool.type !== "custom") return false;
 		return (
 			typeof tool.name !== "string" ||
 			tool.name.length === 0 ||
+			(tool.namespace !== undefined &&
+				(typeof tool.namespace !== "string" || tool.namespace.length === 0)) ||
 			(tool.description !== undefined &&
 				typeof tool.description !== "string") ||
 			(tool.parameters !== undefined &&
@@ -181,7 +192,8 @@ function hasCompatibleFunctionTool(
 			}
 			const tool = rawTool as Record<string, unknown>;
 			return (
-				tool.type === "function" && (name === undefined || tool.name === name)
+				(tool.type === "function" || tool.type === "custom") &&
+				(name === undefined || tool.name === name)
 			);
 		}) ?? false
 	);
@@ -193,18 +205,28 @@ function hasUnsatisfiedToolChoice(
 ): boolean {
 	if (toolChoice === "required") return !hasCompatibleFunctionTool(tools);
 	if (
-		toolChoice === null ||
-		typeof toolChoice !== "object" ||
-		Array.isArray(toolChoice)
-	) {
+		toolChoice === undefined ||
+		toolChoice === "auto" ||
+		toolChoice === "none"
+	)
 		return false;
-	}
-	const choice = toolChoice as Record<string, unknown>;
-	if (choice.type !== "function") return false;
-	return (
-		typeof choice.name !== "string" ||
-		!hasCompatibleFunctionTool(tools, choice.name)
-	);
+	if (!isNamedToolChoice(toolChoice)) return true;
+	// Check the post-flattening declaration, before hashing its identity. A
+	// name alone must not authorize another namespace or the other tool kind.
+	return !tools?.some((rawTool) => {
+		if (
+			rawTool === null ||
+			typeof rawTool !== "object" ||
+			Array.isArray(rawTool)
+		)
+			return false;
+		const tool = rawTool as Record<string, unknown>;
+		return (
+			tool.type === toolChoice.type &&
+			tool.name === toolChoice.name &&
+			tool.namespace === toolChoice.namespace
+		);
+	});
 }
 
 async function decompressWithRuntimeStream(
@@ -417,7 +439,41 @@ export async function handleResponsesRequest(
 	if (body.tools && hasMalformedFunctionTool(body.tools)) {
 		return openAiRequestError(400, "Invalid function tool definition");
 	}
-	if (hasUnsatisfiedToolChoice(body.tools, body.tool_choice)) {
+	// Nested namespace and Responses Lite declarations share the same admission
+	// budget as top-level tools, including declarations overwritten by deduplication.
+	const declarations: unknown[] = [...(body.tools ?? [])];
+	for (const item of body.input as ResponseItem[]) {
+		if (item && item.type === "additional_tools" && Array.isArray(item.tools))
+			for (const tool of item.tools) {
+				if (declarations.length >= MAX_RESPONSES_TOOLS)
+					return openAiRequestError(413, "Too many tools");
+				declarations.push(tool);
+			}
+	}
+	for (let i = 0; i < declarations.length; i++) {
+		if (declarations.length > MAX_RESPONSES_TOOLS)
+			return openAiRequestError(413, "Too many tools");
+		const tool = declarations[i];
+		if (hasInvalidToolEntry([tool]) || hasMalformedFunctionTool([tool]))
+			return openAiRequestError(400, "Invalid tool definition");
+		const definition = tool as Record<string, unknown>;
+		if (definition.type === "namespace") {
+			if (
+				typeof definition.name !== "string" ||
+				!definition.name ||
+				!Array.isArray(definition.tools)
+			)
+				return openAiRequestError(400, "Invalid namespace tool definition");
+			for (const nested of definition.tools) declarations.push(nested);
+		}
+	}
+	let requestTools: ReturnType<typeof getRequestTools>;
+	try {
+		requestTools = getRequestTools(body);
+	} catch {
+		return openAiRequestError(400, "Invalid tool namespace nesting");
+	}
+	if (hasUnsatisfiedToolChoice(requestTools, body.tool_choice)) {
 		return openAiRequestError(
 			400,
 			"tool_choice requires a compatible function tool",
@@ -434,9 +490,14 @@ export async function handleResponsesRequest(
 
 	// 4. Translate to Anthropic format
 	let anthropicBody: ReturnType<typeof translateRequestToAnthropic>;
+	const nativeReplay: NativeToolReplayMetadata = {
+		calls: [],
+		custom_output_ids: [],
+	};
 	try {
 		anthropicBody = translateRequestToAnthropic(
 			body as typeof body & { input: ResponseItem[] },
+			nativeReplay,
 		);
 	} catch (error) {
 		if (error instanceof InvalidInstructionError) {
@@ -483,9 +544,21 @@ export async function handleResponsesRequest(
 	if (body.model !== undefined) codexPassthrough.model = body.model;
 	if (body.reasoning !== undefined) codexPassthrough.reasoning = body.reasoning;
 	if (body.tools !== undefined) codexPassthrough.tools = body.tools;
+	if (body.tool_choice !== undefined)
+		codexPassthrough.tool_choice = body.tool_choice;
+	if (nativeReplay.calls.length || nativeReplay.custom_output_ids.length) {
+		codexPassthrough.tool_replay = nativeReplay;
+	}
 	if (body.parallel_tool_calls !== undefined)
 		codexPassthrough.parallel_tool_calls = body.parallel_tool_calls;
 	if (body.store !== undefined) codexPassthrough.store = body.store;
+	for (const field of [
+		"stream_options",
+		"client_metadata",
+		"access_programs",
+	] as const) {
+		if (body[field] !== undefined) codexPassthrough[field] = body[field];
+	}
 	// Opt-in only: this header selects the response-id continuation strategy
 	// (KTD6/KTD7/KTD13) for this request's lane. Any other value, or absence
 	// of the header, leaves `continuation_strategy` unset and the Codex
@@ -605,58 +678,44 @@ export async function handleResponsesRequest(
 		);
 	}
 
-	// 7. Translate non-200 Anthropic errors to OpenAI error shape
+	// 7. Normalize upstream errors, including native Codex/FastAPI errors.
 	if (anthropicResp.status !== 200) {
-		let errorBody: {
-			error: Record<string, unknown> & {
-				message: string;
-				type: string;
-				code: string;
-			};
-		};
-		let stableCode = "api_error";
+		let errorExtras: Record<string, unknown> = {};
 		const contentType = anthropicResp.headers.get("content-type") ?? "";
-		if (contentType.includes("application/json")) {
+		let message = `Upstream request failed with HTTP ${anthropicResp.status}. Check the proxy request logs for the upstream account and response.`;
+		let type = "api_error";
+		let code = type;
+		if (
+			contentType.includes("application/json") ||
+			contentType.includes("+json")
+		) {
 			try {
-				const anthropicError = (await anthropicResp.json()) as {
-					type?: string;
-					error?: Record<string, unknown> & {
-						type?: string;
-						code?: string;
-						message?: string;
-					};
-				};
-				const errType = anthropicError?.error?.type ?? "api_error";
-				stableCode = anthropicError?.error?.code ?? errType;
-				errorBody = {
-					error: {
-						...anthropicError?.error,
-						message: anthropicError?.error?.message ?? "Unknown error",
-						type: errType,
-						code: stableCode,
-					},
-				};
+				const upstream = (await anthropicResp.json()) as Record<
+					string,
+					unknown
+				> | null;
+				const nested = upstream?.error;
+				const error =
+					nested !== null && typeof nested === "object"
+						? (nested as Record<string, unknown>)
+						: undefined;
+				const candidate =
+					error?.message ?? upstream?.detail ?? upstream?.message ?? nested;
+				if (typeof candidate === "string" && candidate.trim())
+					message = candidate;
+				if (typeof error?.type === "string") type = error.type;
+				code = typeof error?.code === "string" ? error.code : type;
+				errorExtras = error ?? {};
 			} catch {
-				errorBody = {
-					error: {
-						message: "Unknown error",
-						type: "api_error",
-						code: "api_error",
-					},
-				};
+				// Keep a useful status-based error when the upstream body is malformed.
 			}
-		} else {
-			errorBody = {
-				error: {
-					message: "Unknown error",
-					type: "api_error",
-					code: "api_error",
-				},
-			};
 		}
 		const responseHeaders = new Headers({
 			"content-type": "application/json",
 		});
+		const upstreamRequestId = anthropicResp.headers.get("x-request-id");
+		if (upstreamRequestId)
+			responseHeaders.set("x-request-id", upstreamRequestId);
 		// The local guard must only hold requests for positively recoverable
 		// terminals. A finite model lane can recover on a different compatible
 		// account just like the whole pool can. Preserve status, scope, and delay
@@ -664,7 +723,7 @@ export async function handleResponsesRequest(
 		const retryAfter = anthropicResp.headers.get("retry-after");
 		const poolStatus = anthropicResp.headers.get(RECOVERY_STATUS_HEADER);
 		const recoveryScope = anthropicResp.headers.get(RECOVERY_SCOPE_HEADER);
-		const expectedScope = recoveryScopeForCode(stableCode);
+		const expectedScope = recoveryScopeForCode(code);
 		if (
 			anthropicResp.status === 503 &&
 			expectedScope !== undefined &&
@@ -676,10 +735,13 @@ export async function handleResponsesRequest(
 			responseHeaders.set(RECOVERY_STATUS_HEADER, RECOVERY_STATUS_EXHAUSTED);
 			responseHeaders.set(RECOVERY_SCOPE_HEADER, recoveryScope);
 		}
-		return new Response(JSON.stringify(errorBody), {
-			status: anthropicResp.status,
-			headers: responseHeaders,
-		});
+		return new Response(
+			JSON.stringify({ error: { ...errorExtras, message, type, code } }),
+			{
+				status: anthropicResp.status,
+				headers: responseHeaders,
+			},
+		);
 	}
 
 	// Codex custom tools emit native Responses frames. Do not route those frames
@@ -724,6 +786,7 @@ export async function handleResponsesRequest(
 			anthropicResp,
 			responseId,
 			body.model,
+			getRequestTools(body),
 		);
 	}
 
@@ -743,11 +806,27 @@ export async function handleResponsesRequest(
 			{ status: 502, headers: { "Content-Type": "application/json" } },
 		);
 	}
-	const translated = translateAnthropicResponseToResponses(
-		respBody as Parameters<typeof translateAnthropicResponseToResponses>[0],
-		responseId,
-		body.model,
-	);
+	let translated: ReturnType<typeof translateAnthropicResponseToResponses>;
+	try {
+		translated = translateAnthropicResponseToResponses(
+			respBody as Parameters<typeof translateAnthropicResponseToResponses>[0],
+			responseId,
+			body.model,
+			getRequestTools(body),
+		);
+	} catch {
+		return new Response(
+			JSON.stringify({
+				error: {
+					message:
+						"Failed to translate upstream response: invalid tool input or response body",
+					type: "invalid_response_error",
+					code: "invalid_response_error",
+				},
+			}),
+			{ status: 502, headers: { "Content-Type": "application/json" } },
+		);
+	}
 	return new Response(JSON.stringify(translated), {
 		status: 200,
 		headers: { "Content-Type": "application/json" },

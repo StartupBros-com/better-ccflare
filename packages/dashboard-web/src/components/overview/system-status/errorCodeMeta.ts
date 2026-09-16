@@ -77,6 +77,14 @@ const KNOWN_ERROR_META: Record<
 			"Cooldown defaults to 10s and pairs with a single-flight recovery probe (only one request re-probes the account once it expires, as long as another account is available to defer to — if every account is currently suppressed, the request runs ungated instead). Set `CCFLARE_OVERLOAD_COOLDOWN_MS` in your environment to change it.",
 		severity: "warning",
 	},
+	upstream_5xx_server_error: {
+		title: "Provider server error (5xx)",
+		description:
+			"Upstream returned 500/502/503/504. The account received a short server-error cooldown under the optional retry policy. This status does not establish whether quota is also exhausted.",
+		suggestion:
+			"The retry policy is opt-in with `CCFLARE_SERVER_ERROR_RETRY_ENABLED=true`. Authorized retries and failover remain subject to the request budget. The cooldown defaults to 60s, or a shorter upstream Retry-After; set `CCFLARE_SERVER_ERROR_COOLDOWN_MS` to change it.",
+		severity: "warning",
+	},
 	out_of_credits: {
 		title: "Account out of credits",
 		description:

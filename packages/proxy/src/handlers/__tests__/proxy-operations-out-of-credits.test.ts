@@ -7,6 +7,7 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
+import type { MarkAccountRateLimitedResult } from "@better-ccflare/database";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import type { ProxyContext } from "../proxy-types";
 
@@ -1268,7 +1269,7 @@ describe("proxyWithAccount — durable account cooldown ordering", () => {
 	});
 
 	it("waits for generic non-xAI 402 cooldown persistence while request audit stays async", async () => {
-		const cooldownPersist = deferred<number>();
+		const cooldownPersist = deferred<MarkAccountRateLimitedResult>();
 		const cooldownStarted = deferred<void>();
 		const auditPersist = deferred<void>();
 		const ctx = makeProxyContextWithAsyncExec();
@@ -1303,7 +1304,7 @@ describe("proxyWithAccount — durable account cooldown ordering", () => {
 		expect(operationSettled).toBe(false);
 		expect(ctx.dbOps.saveRoutingAttempt).not.toHaveBeenCalled();
 
-		cooldownPersist.resolve(1);
+		cooldownPersist.resolve({ consecutiveRateLimits: 1, applied: true });
 		await expect(operation).resolves.toBeNull();
 		expect(ctx.dbOps.saveRoutingAttempt).toHaveBeenCalledTimes(1);
 		let auditSettled = false;
@@ -1318,7 +1319,7 @@ describe("proxyWithAccount — durable account cooldown ordering", () => {
 	});
 
 	it("waits for hard account-scoped Anthropic 429 cooldown persistence while request audit stays async", async () => {
-		const cooldownPersist = deferred<number>();
+		const cooldownPersist = deferred<MarkAccountRateLimitedResult>();
 		const cooldownStarted = deferred<void>();
 		const auditPersist = deferred<void>();
 		const ctx = makeProxyContextWithAsyncExec();
@@ -1356,7 +1357,7 @@ describe("proxyWithAccount — durable account cooldown ordering", () => {
 		expect(operationSettled).toBe(false);
 		expect(ctx.dbOps.saveRoutingAttempt).not.toHaveBeenCalled();
 
-		cooldownPersist.resolve(1);
+		cooldownPersist.resolve({ consecutiveRateLimits: 1, applied: true });
 		await expect(operation).resolves.toBeNull();
 		expect(ctx.dbOps.saveRoutingAttempt).toHaveBeenCalledTimes(1);
 		let auditSettled = false;

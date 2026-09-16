@@ -818,7 +818,10 @@ describe.skipIf(!livePgAvailable)(
 			}
 		});
 
-		it("merges duplicate-account credentials from a single consistent row, not independently per column", async () => {
+		it.each([
+			null,
+			12345,
+		])("merges duplicate-account credentials and manual reauth from a single consistent row (%s)", async (manualReauth) => {
 			// Regression test for a bug where collapseAccountDuplicatesPreservingStatePg
 			// computed refresh_token/refresh_token_issued_at, access_token, and
 			// expires_at via three INDEPENDENTLY-filtered subqueries. Each could
@@ -898,6 +901,15 @@ describe.skipIf(!livePgAvailable)(
 					],
 				);
 
+				await adapter.unsafe(
+					"UPDATE accounts SET last_manual_reauth_at = $1, last_used = $2 WHERE id = $3",
+					[manualReauth, now - 100_000, "pg-dedup-newer"],
+				);
+				await adapter.unsafe(
+					"UPDATE accounts SET last_manual_reauth_at = $1 WHERE id = $2",
+					[99999, "pg-dedup-older"],
+				);
+
 				// Directly invoke the collapse (see the note above on why —
 				// runMigrationsPg's own retriggering of it is gated on the
 				// UNIQUE index not existing yet, which is no longer true
@@ -906,12 +918,13 @@ describe.skipIf(!livePgAvailable)(
 
 				const rows = await adapter.query<{
 					id: string;
+					last_manual_reauth_at: string | number | null;
 					refresh_token: string | null;
 					access_token: string | null;
 					expires_at: string | number | null;
 					refresh_token_issued_at: string | number | null;
 				}>(
-					`SELECT id, refresh_token, access_token, expires_at, refresh_token_issued_at
+					`SELECT id, refresh_token, access_token, expires_at, refresh_token_issued_at, last_manual_reauth_at
 					 FROM accounts WHERE name = $1`,
 					["pg-dedup-cred-test"],
 				);
@@ -928,6 +941,12 @@ describe.skipIf(!livePgAvailable)(
 				// "older"'s unrelated access_token/expires_at.
 				expect(survivor?.access_token).toBeNull();
 				expect(survivor?.expires_at).toBeNull();
+				expect(survivor?.id).toBe("pg-dedup-older");
+				expect(
+					survivor?.last_manual_reauth_at == null
+						? null
+						: Number(survivor.last_manual_reauth_at),
+				).toBe(manualReauth);
 			} finally {
 				// Clean up so a re-run of this test (or others sharing the
 				// database) doesn't see a stale duplicate-free leftover row.

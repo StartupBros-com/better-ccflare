@@ -1,6 +1,7 @@
 import {
 	BUFFER_SIZES,
 	type CacheFlightCohortSealReceipt,
+	getResponseModelAliasEnabled,
 	requestEvents,
 	SseFrameBuffer,
 	TIME_CONSTANTS,
@@ -41,6 +42,10 @@ import {
 } from "./handlers/rate-limit-scope";
 import { createSseRateLimitSniffer } from "./handlers/sse-rate-limit-sniffer";
 import { ingestModelsListing } from "./model-catalog";
+import {
+	rewriteAnthropicMessageJsonModelStream,
+	rewriteAnthropicMessageSseModel,
+} from "./response-model-alias";
 import {
 	getRequestLifecycleCoordinator,
 	type RequestLifecycleCoordinator,
@@ -1447,17 +1452,31 @@ export async function forwardToClient(
 			onError,
 			onCancel,
 		});
+		// Keep provider/accounting observers on the unmodified upstream bytes.
+		// Only the final client-facing stream presents the model id requested by
+		// the client. This alias is wire compatibility, not evidence that the
+		// upstream backend ran that model.
+		const clientBody =
+			getResponseModelAliasEnabled() &&
+			isAnthropicMessagesSseResponse &&
+			originalModel
+				? rewriteAnthropicMessageSseModel(passthroughBody, originalModel)
+				: passthroughBody;
 
-		const clientResponse = new Response(passthroughBody, {
+		const headers = withResponseMetadataHeaders(response.headers, {
+			originalModel,
+			appliedModel,
+			cacheFlightRecorderConversationId,
+			cacheFlightRecorderEligible,
+			routeProvenance,
+		});
+		headers.delete("x-better-ccflare-request-path");
+		if (clientBody !== passthroughBody) headers.delete("content-length");
+
+		const clientResponse = new Response(clientBody, {
 			status: response.status,
 			statusText: response.statusText,
-			headers: withResponseMetadataHeaders(response.headers, {
-				originalModel,
-				appliedModel,
-				cacheFlightRecorderConversationId,
-				cacheFlightRecorderEligible,
-				routeProvenance,
-			}),
+			headers,
 		});
 		anthropicDegradedLifecycle?.transferToResponse();
 		return clientResponse;
@@ -1626,16 +1645,38 @@ export async function forwardToClient(
 		},
 	});
 
-	const clientResponse = new Response(passthroughBody, {
+	const isAnthropicMessagesJsonResponse =
+		method === "POST" &&
+		path === "/v1/messages" &&
+		response.ok &&
+		(response.headers
+			.get("content-type")
+			?.toLowerCase()
+			.includes("application/json") ??
+			false);
+	// As with SSE above, this transform is downstream of analytics so logs,
+	// pricing and usage retain the provider's real response model.
+	const clientBody =
+		getResponseModelAliasEnabled() &&
+		isAnthropicMessagesJsonResponse &&
+		originalModel
+			? rewriteAnthropicMessageJsonModelStream(passthroughBody, originalModel)
+			: passthroughBody;
+
+	const headers = withResponseMetadataHeaders(response.headers, {
+		originalModel,
+		appliedModel,
+		cacheFlightRecorderConversationId,
+		cacheFlightRecorderEligible,
+		routeProvenance,
+	});
+	headers.delete("x-better-ccflare-request-path");
+	if (clientBody !== passthroughBody) headers.delete("content-length");
+
+	const clientResponse = new Response(clientBody, {
 		status: response.status,
 		statusText: response.statusText,
-		headers: withResponseMetadataHeaders(response.headers, {
-			originalModel,
-			appliedModel,
-			cacheFlightRecorderConversationId,
-			cacheFlightRecorderEligible,
-			routeProvenance,
-		}),
+		headers,
 	});
 	anthropicDegradedLifecycle?.transferToResponse();
 	return clientResponse;

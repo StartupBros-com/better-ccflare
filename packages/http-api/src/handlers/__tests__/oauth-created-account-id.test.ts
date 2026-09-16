@@ -44,6 +44,7 @@ mock.module("@better-ccflare/providers/codex", () => ({
 }));
 mock.module("@better-ccflare/proxy", () => ({
 	clearAccountRefreshCache: () => {},
+	restartUsagePollingForAccount: async () => false,
 }));
 
 async function handlers() {

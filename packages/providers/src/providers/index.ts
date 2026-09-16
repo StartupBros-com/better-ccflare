@@ -15,7 +15,14 @@ export {
 	AnthropicCompatibleProvider,
 } from "./anthropic-compatible/index";
 export { BedrockProvider, parseBedrockConfig } from "./bedrock/index";
-export type { CodexUsageRefreshFetchResult } from "./codex/index";
+export type {
+	CodexUsageFetchResult,
+	CodexUsagePayload,
+	CodexUsageRefreshFetchResult,
+	CodexUsageWindowPayload,
+	CodexWindowSlot,
+	FetchCodexUsageOptions,
+} from "./codex/index";
 export {
 	CODEX_AUTHENTICATED_CALLER_HEADER,
 	CODEX_CACHE_KEY_MODE_ENV,
@@ -28,14 +35,17 @@ export {
 	CODEX_PING_MODEL,
 	CODEX_PROMPT_CACHE_KEY_ENV,
 	CODEX_TURN_STATE_HEADER,
+	CODEX_USAGE_ENDPOINT,
 	CODEX_VERSION,
 	CODEX_WHAM_USAGE_ENDPOINT,
 	CODEX_WHAM_USAGE_FALLBACK_ENDPOINT,
 	CodexOAuthProvider,
 	CodexProvider,
 	classifyCodexModelFamily,
+	codexWindowRolledOver,
 	deriveCodexExplicitBreakpointBucket,
 	extractChatGptAccountId,
+	extractChatgptAccountId,
 	fetchCodexUsageData,
 	fetchCodexUsageOnDemand,
 	getCodexExplicitCacheBreakpointSuppressionCount,
@@ -44,10 +54,13 @@ export {
 	isCodexSubscriptionEndpoint,
 	mapWhamUsageResponse,
 	parseCodexUsageHeaders,
+	parseCodexUsagePayload,
+	pickCodexRolloverSlot,
 	readCodexCacheKeyContinuityPercent,
 	readCodexCacheKeyPrefixShardPercent,
 	readCodexCacheKeySessionPercent,
 	readCodexExplicitCacheBreakpointPercent,
+	readCodexPlanType,
 	readCodexTurnStateConfig,
 	resetCodexExplicitBreakpointSuppressionsForTest,
 	resetCodexUsageEndpointForTest,

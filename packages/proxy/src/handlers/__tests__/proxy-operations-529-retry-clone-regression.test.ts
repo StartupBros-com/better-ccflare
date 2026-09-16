@@ -2,7 +2,12 @@
  * Regression test for issue #382 — the in-place 529 retry previously sent a
  * pre-cloned `transformedRequestForRetry` Request whose tee branch was never
  * read, retaining its native off-heap buffer. The retry must instead rebuild
- * its Request from the buffered `retryBodyText`.
+ * its Request from a buffered body text.
+ *
+ * That buffered text now lives on the `outgoing` descriptor, the single source
+ * of truth for the request in flight, so that a recovery which changed the
+ * request (model fallback, cache-control strip, thinking-block filter) cannot
+ * leave the replay holding a stale body.
  *
  * Static/structural check, same convention as the issue #354 test
  * (proxy-operations-529-parselimit-clones.test.ts) — proxy-operations.ts is
@@ -27,11 +32,12 @@ describe("issue #382 — 529 in-place retry Request clone", () => {
 		expect(source).not.toMatch(/transformedRequestForRetry/);
 	});
 
-	it("rebuilds the retry Request from retryBodyText instead of a clone", () => {
+	it("rebuilds the retry Request from the buffered body text instead of a clone", () => {
 		const source = readSource();
-		expect(source).toMatch(
-			/const retryRequest = new Request\(transformedRequest\.url, \{[\s\S]*?body: retryBodyText \|\| undefined,/,
-		);
+		expect(source).toMatch(/const adoptRetryTemplate = async/);
+		expect(source).toMatch(/const bodyText = await request.text\(\)/);
+		expect(source).toMatch(/body: bodyText \|\| undefined/);
+		expect(source).not.toMatch(/retryTransformedTemplate = \w+\.clone\(\)/);
 	});
 
 	it("releases every bounded Codex retry drain reader and aborts only its registered transport", () => {

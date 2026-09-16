@@ -142,7 +142,8 @@ describe("issue #273 — Group A: helper contract", () => {
 //     in this file, not a double-drain of one response.
 // This specifically guards outer winner arbitration and request-budget
 // exits from regressing to Bun's ineffective direct body.cancel path.
-const EXPECTED_DRAIN_INVOCATION_COUNT = 21;
+// The composed server-error failover adds one owned response drain.
+const EXPECTED_DRAIN_INVOCATION_COUNT = 23;
 
 describe("issue #273 — Group B: call-site coverage in proxy-operations.ts", () => {
 	it("proxy-operations.ts has the expected drain-backed helper invocations", () => {

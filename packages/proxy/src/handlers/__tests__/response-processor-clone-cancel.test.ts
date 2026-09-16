@@ -121,7 +121,10 @@ function makeCtx(opts: {
 			extractUsageInfo: readUsage,
 		},
 		dbOps: {
-			markAccountRateLimited: () => {},
+			markAccountRateLimited: async () => ({
+				consecutiveRateLimits: 1,
+				applied: true,
+			}),
 			updateAccountUsage: () => {},
 			updateAccountRateLimitMeta: () => {},
 			getAdapter: () => ({
@@ -320,7 +323,10 @@ describe("updateAccountMetadata — extractUsageInfo clone lifecycle", () => {
 				},
 			},
 			dbOps: {
-				markAccountRateLimited: () => {},
+				markAccountRateLimited: async () => ({
+					consecutiveRateLimits: 1,
+					applied: true,
+				}),
 				updateAccountUsage: () => {},
 				updateAccountRateLimitMeta: () => {},
 				getAdapter: () => ({

@@ -64,6 +64,7 @@ test("labels Responses Lite additional tools as native passthrough", async () =>
 		headers: {
 			"content-type": "application/json",
 			"x-better-ccflare-request-id": requestId,
+			"x-better-ccflare-native-responses": "1",
 		},
 		body: JSON.stringify({
 			model: "claude-opus-4-8",

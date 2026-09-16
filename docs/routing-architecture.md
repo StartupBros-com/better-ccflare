@@ -59,7 +59,10 @@ flowchart TD
     P -->|"No"| P3["Apply account cooldown,<br/>fail over to next candidate"]
     P2 --> N
     P3 --> N
-    O -->|"No"| Q["Return response to client"]
+    O -->|"No"| R{"Upstream 500/502/503/504?"}
+    R -->|"Yes"| R2["Retry once in place;<br/>if it persists, bench<br/>(upstream_5xx_server_error)<br/>and fail over"]
+    R2 --> N
+    R -->|"No"| Q["Return response to client"]
 ```
 
 Three classes of 429 are narrower than the account and therefore fail over per
@@ -69,6 +72,22 @@ request with the account left in rotation — no cooldown, no
 - **`out_of_credits`** — credits/overage depleted for one model or beta (e.g. context-1m); the account's other models still work.
 - **`windowless_429`** — `x-should-retry: true` with no rate-limit metadata at all (no `retry-after`, no `anthropic-ratelimit-*` / `x-ratelimit-*` header). Measured on a production install as **request**-scoped: the same account served 200s two seconds before and 38 seconds after on the same model, retries spanning 11.2s returned identical bare 429s without ever clearing, and the next account rejected the same client request the same way. Benching for it drained the pool one account per failover attempt. The check is fail-closed — any header that reports window state, known name or not, is treated as a real limit and benched as before.
 - **Synthetic keepalive replays** — the keepalive scheduler's own parallel burst trips a per-IP limit; no request-history row is written either.
+
+Transient upstream HTTP **500/502/503/504** retries are opt-in in this fork:
+set `CCFLARE_SERVER_ERROR_RETRY_ENABLED=true` to enable them. The default is
+`false`, which preserves the existing terminal response behavior. When enabled,
+the same account can receive one authorized reissue before a short
+`upstream_5xx_server_error` bench and account failover. The bench uses
+`CCFLARE_SERVER_ERROR_COOLDOWN_MS` (60s), honors a shorter upstream
+`Retry-After`, never ramps, and does not increment `consecutive_rate_limits`.
+A longer existing quota hold is preserved. On the last candidate, the real
+upstream response remains available instead of a synthetic `pool_exhausted`.
+
+The fork's physical-attempt budget, replay policy, exact-account boundaries,
+and authorized account/model plan still govern each send. A hosted operation
+that has already claimed dispatch cannot retry or fail over. Failed physical
+attempts are routing evidence; they do not create duplicate inbound request
+analytics.
 
 The `windowless_429` exemption is not universal: it is evaluated only on the
 no-fallback path (the requested model has no multi-entry mapping). An account

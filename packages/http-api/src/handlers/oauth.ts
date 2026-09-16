@@ -32,6 +32,7 @@ import {
 	DeviceSetupIdempotencyConflictError,
 	DeviceSetupValidationError,
 } from "../services/device-setup-jobs";
+import { startUsagePollingForNewAccount } from "../services/usage-polling-start";
 
 const log = new Logger("OAuthHandler");
 
@@ -883,6 +884,10 @@ export function createOAuthCallbackHandler(dbOps: DatabaseOperations) {
 				dbOps.deleteOAuthSession(sessionId);
 
 				log.info(`Successfully added account '${name}' via OAuth`);
+
+				// Accounts created at runtime are invisible to the boot-time
+				// polling setup, so ask the server to start polling now.
+				await startUsagePollingForNewAccount(createdAccount.id, name);
 
 				return jsonResponse({
 					success: true,

@@ -6,6 +6,7 @@ import {
 	getModelFamily,
 	getModelList,
 	getOverloadRetryConfig,
+	getServerErrorRetryEnabled,
 	isOfficialXaiEndpoint,
 	isUsageExhausted,
 	logError,
@@ -96,6 +97,7 @@ import {
 	stageCacheBodyForTransportAttempt,
 	stripCacheControlFromReplayBody,
 } from "../cache-transport-staging";
+import { circuitKeyFor, getDefaultCircuitBreaker } from "../circuit-breaker";
 import { isClaudeCodeSubagent } from "../claude-code-request";
 import { ensureCodexModelDefaults } from "../codex-model-catalog";
 import {
@@ -137,6 +139,7 @@ import {
 } from "../session-account-observer";
 import { combineChunks } from "../stream-tee";
 import { isModelRewrite } from "../worker-messages";
+import { applyAccountRequestTransformer } from "./account-request-transformer";
 import {
 	ForceRouteUnavailableError,
 	getRouteProfileConstraintViolation,
@@ -190,6 +193,23 @@ import {
 import { peekSseForZai1305 } from "./zai-1305";
 
 const log = new Logger("ProxyOperations");
+
+const TRANSIENT_SERVER_ERROR_STATUSES = new Set([500, 502, 503, 504]);
+function isTransientServerErrorStatus(status: number): boolean {
+	return TRANSIENT_SERVER_ERROR_STATUSES.has(status);
+}
+function parseRetryAfterUntil(
+	response: Response,
+	nowMs: number,
+): number | null {
+	const raw = response.headers.get("retry-after");
+	if (!raw) return null;
+	const seconds = Number(raw);
+	if (Number.isFinite(seconds))
+		return seconds > 0 ? nowMs + seconds * 1000 : null;
+	const dateMs = Date.parse(raw);
+	return Number.isFinite(dateMs) && dateMs > nowMs ? dateMs : null;
+}
 
 type RoutingAttemptWrite = Omit<RoutingAttemptData, "id">;
 
@@ -1362,6 +1382,7 @@ export function extractCooldownUntil(
 	response: Response,
 	accountId: string,
 	getRateLimitedUntil: (accountId: string) => number | null,
+	providerResetTime?: number | null,
 ): number {
 	const MIN_COOLDOWN_MS = 60 * 1000; // 60 seconds floor
 	// Use `||` (not `??`) so empty-string and non-numeric env values
@@ -1381,7 +1402,19 @@ export function extractCooldownUntil(
 		return Math.max(upstreamReset, now + MIN_COOLDOWN_MS);
 	}
 
-	// 2. Fall back to usage-window reset time if available
+	// The responding provider owns this refusal; cached usage may describe a different window.
+	if (
+		typeof providerResetTime === "number" &&
+		Number.isFinite(providerResetTime) &&
+		providerResetTime > now
+	) {
+		return Math.max(
+			Math.min(providerResetTime, now + 8 * 24 * 60 * 60 * 1000),
+			now + MIN_COOLDOWN_MS,
+		);
+	}
+
+	// 3. Fall back to usage-window reset time if available
 	const rateLimitedUntil = getRateLimitedUntil(accountId);
 	if (rateLimitedUntil !== null && rateLimitedUntil > now) {
 		return Math.max(rateLimitedUntil, now + MIN_COOLDOWN_MS);
@@ -3249,7 +3282,10 @@ export async function proxyWithAccount(
 			request: Request,
 		): Promise<Request> => {
 			assertAttemptPlanCapabilityIsCurrent(plan);
-			return plan.transformRequestBody(request);
+			return applyAccountRequestTransformer(
+				await plan.transformRequestBody(request),
+				account,
+			);
 		};
 		const preflightEndpoint =
 			provider.name === "codex" && account.provider === "codex"
@@ -4876,7 +4912,28 @@ export async function proxyWithAccount(
 			signal: req.signal,
 		});
 		let retrySourceRequest = providerRequest;
-		let retryTransformedTemplate = retryRequest;
+		// Consume each rebuilt transport once and retain only its scalar replay
+		// snapshot. A Request clone retained as a template leaves an unread tee
+		// branch on Bun; every physical send must get an independent body.
+		const adoptRetryTemplate = async (request: Request) => {
+			const bodyText = await request.text();
+			retryBodyText = bodyText;
+			currentCacheIdentityHasCacheControl =
+				hasCacheControlHintInJsonText(bodyText);
+			const requestUrl = request.url;
+			const requestMethod = request.method;
+			const requestHeaders = new Headers(request.headers);
+			return {
+				clone: () =>
+					new Request(requestUrl, {
+						method: requestMethod,
+						headers: requestHeaders,
+						body: bodyText || undefined,
+						signal: req.signal,
+					}),
+			};
+		};
+		let retryTransformedTemplate = await adoptRetryTemplate(retryRequest);
 
 		// Make the request, or unwrap a provider response produced during transform.
 		// Both paths first replace/discard cache staging for this physical attempt.
@@ -5034,7 +5091,9 @@ export async function proxyWithAccount(
 					retryTransformedRequest,
 					currentTransportModel,
 				);
-				retryTransformedTemplate = retryTransformedRequest.clone();
+				retryTransformedTemplate = await adoptRetryTemplate(
+					retryTransformedRequest,
+				);
 
 				const retryTransportRequest = retryTransformedTemplate.clone();
 				currentReplayBody = filteredBodyBuffer;
@@ -5095,7 +5154,9 @@ export async function proxyWithAccount(
 					retryTransformedRequest,
 					currentTransportModel,
 				);
-				retryTransformedTemplate = retryTransformedRequest.clone();
+				retryTransformedTemplate = await adoptRetryTemplate(
+					retryTransformedRequest,
+				);
 
 				const retryTransportRequest = retryTransformedTemplate.clone();
 				currentReplayBody = strippedBodyBuffer;
@@ -5154,7 +5215,9 @@ export async function proxyWithAccount(
 					retryTransformedRequest,
 					currentTransportModel,
 				);
-				retryTransformedTemplate = retryTransformedRequest.clone();
+				retryTransformedTemplate = await adoptRetryTemplate(
+					retryTransformedRequest,
+				);
 
 				const retryTransportRequest = retryTransformedTemplate.clone();
 				currentReplayBody = strippedBodyBuffer;
@@ -5226,11 +5289,13 @@ export async function proxyWithAccount(
 				// Materialize two independent requests. Reusing nested clone branches here
 				// can leave Bun waiting on tee bookkeeping after the compatibility probe.
 				const retryTransformedBody = await retryTransformed.text();
-				retryTransformedTemplate = new Request(retryTransformed.url, {
-					method: retryTransformed.method,
-					headers: retryTransformed.headers,
-					body: retryTransformedBody,
-				});
+				retryTransformedTemplate = await adoptRetryTemplate(
+					new Request(retryTransformed.url, {
+						method: retryTransformed.method,
+						headers: retryTransformed.headers,
+						body: retryTransformedBody,
+					}),
+				);
 				const retryTransport = new Request(retryTransformed.url, {
 					method: retryTransformed.method,
 					headers: retryTransformed.headers,
@@ -5288,7 +5353,7 @@ export async function proxyWithAccount(
 						attemptPlan,
 						retrySource,
 					);
-					retryTransformedTemplate = retryTransformed.clone();
+					retryTransformedTemplate = await adoptRetryTemplate(retryTransformed);
 					retryRequest = retryTransformedTemplate.clone();
 				} else {
 					const retryBodyText = JSON.stringify(retryBodyJson);
@@ -5307,7 +5372,8 @@ export async function proxyWithAccount(
 						stripCacheControlFromReplayBody(currentReplayBody);
 					currentCacheIdentityHasCacheControl =
 						hasCacheControlHintInJsonText(retryBodyText);
-					retryTransformedTemplate = retryRequest.clone();
+					retryTransformedTemplate = await adoptRetryTemplate(retryRequest);
+					retryRequest = retryTransformedTemplate.clone();
 					// The codex branch above already drains the pre-retry rawResponse
 					// via discardUpstreamBody; this branch has no equivalent call, so
 					// drain it here before the reassignment below drops the reference.
@@ -5387,7 +5453,7 @@ export async function proxyWithAccount(
 					retryTransformed,
 					currentTransportModel,
 				);
-				retryTransformedTemplate = retryTransformed.clone();
+				retryTransformedTemplate = await adoptRetryTemplate(retryTransformed);
 				const retryTransport = retryTransformedTemplate.clone();
 				rawResponse = await executeCacheAwareProviderAttempt(
 					retryTransport,
@@ -5528,6 +5594,7 @@ export async function proxyWithAccount(
 				failureResponse,
 				account.id,
 				usageCache.getRateLimitedUntil.bind(usageCache),
+				attemptPlan.parseRateLimit(failureResponse).resetTime,
 			);
 			const cooldownBefore = captureCooldownState(account);
 			await applyRateLimitCooldownAwaitingPersist(
@@ -5748,6 +5815,7 @@ export async function proxyWithAccount(
 					failureResponse,
 					account.id,
 					usageCache.getRateLimitedUntil.bind(usageCache),
+					attemptPlan.parseRateLimit(failureResponse).resetTime,
 				);
 				const auditReason = "model_fallback_429";
 				// Read the header directly, never extractCooldownUntil's output: that
@@ -6286,6 +6354,7 @@ export async function proxyWithAccount(
 								rawResponse,
 								account.id,
 								usageCache.getRateLimitedUntil.bind(usageCache),
+								attemptPlan.parseRateLimit(rawResponse).resetTime,
 							);
 							const reason = "model_fallback_429";
 							const upstreamEvidence = await captureSanitizedUpstreamEvidence(
@@ -6699,9 +6768,11 @@ export async function proxyWithAccount(
 						headers = fallbackHeaders;
 						currentTransportModel = nextModel;
 						targetUrl = fallbackPlan.targetUrl;
-						retryTransformedTemplate = retryTransformedRequest.clone();
+						retryTransformedTemplate = await adoptRetryTemplate(
+							retryTransformedRequest,
+						);
 
-						const retryTransportRequest = retryTransformedRequest;
+						const retryTransportRequest = retryTransformedTemplate.clone();
 						currentReplayBody = patchedBody;
 						currentCacheIdentityHasCacheControl = undefined;
 						// Attribution advances only once a concrete request is ready to
@@ -6787,6 +6858,7 @@ export async function proxyWithAccount(
 								rawResponse,
 								account.id,
 								usageCache.getRateLimitedUntil.bind(usageCache),
+								attemptPlan.parseRateLimit(rawResponse).resetTime,
 							);
 							const reason = "all_models_exhausted_429";
 							const upstreamEvidence = await captureSanitizedUpstreamEvidence(
@@ -6913,227 +6985,308 @@ export async function proxyWithAccount(
 		// full-jitter exponential backoff before applying account cooldown. This prevents
 		// all accounts cooling simultaneously under concurrency spikes. Skipped for
 		// synthetic (keepalive / auto-refresh) requests to avoid loop amplification.
-		if (
-			response.status === 529 &&
-			!hostedDispatchCommitted() &&
-			!isSyntheticInternal &&
-			!wasProtectedLifecycleForLatestResponse()
-		) {
-			// No clone: parseRateLimit is synchronous (providers/types.ts) and
-			// reads only headers and status, so it cannot touch the body. Cloning
-			// here teed the body into a second stream that nothing ever read or
-			// disposed of — one orphan per 529, plus one per in-place retry
-			// below. See issue #354.
-			const rlInfo = attemptPlan.parseRateLimit(response);
-			// Do NOT gate on rlInfo.isRateLimited: providers such as
-			// ZaiProvider.parseRateLimit only classify isRateLimited=true for a
-			// 429, so on a 529 it always answers false and this whole branch
-			// was dead for zai-shaped accounts — the very overload case it
-			// exists for. We are already inside `status === 529`; resetTime
-			// alone decides in-place retry vs. cooldown.
-			if (!rlInfo.resetTime) {
-				const retryCfg = getOverloadRetryConfig();
-				if (retryCfg.enabled && retryCfg.maxAttempts > 1) {
-					for (let attempt = 1; attempt < retryCfg.maxAttempts; attempt++) {
-						try {
-							routingAttemptLedger?.assertPhysicalAttemptAvailable(
-								physicalAttemptVetoContext(),
-							);
-						} catch (error) {
-							// The current 529 is local ownership: the request terminalizer
-							// cannot see it after the budget veto crosses this account seam.
-							await discardUpstreamBody(response);
-							throw error;
-						}
-						let retryTransport = retryTransformedTemplate.clone();
-						// Reserve before backoff or touching the trusted 529. A denied
-						// follower returns it untouched to the outer terminal authority.
-						const degradedReservation = reservePhysicalSend(
-							retryTransport,
-							currentTransportModel,
-							response,
-						);
-						// Full-jitter backoff: sleep in [0, min(base * 2^attempt, max)]
-						const cap = Math.min(
-							retryCfg.baseMs * 2 ** attempt,
-							retryCfg.maxMs,
-						);
-						const delayMs = Math.random() * cap;
-						try {
-							await new Promise<void>((resolve) =>
-								setTimeout(resolve, delayMs),
-							);
-						} catch (error) {
-							cancelPhysicalSendReservation(degradedReservation);
-							throw error;
-						}
-
-						log.info(
-							`Account ${account.name}: in-place retry ${attempt}/${retryCfg.maxAttempts - 1} after ${Math.round(delayMs)}ms for 529 overloaded_error`,
-						);
-
-						// Commit is noncontending and synchronous. It precedes every
-						// destructive drain below and the cache staging/fetch in the
-						// shared executor.
-						commitPhysicalSendReservation(degradedReservation, response);
-						if (attemptPlan.providerName === "codex") {
-							const retryHeaders = new Headers(retrySourceRequest.headers);
-							await drainSupersededResponse(response);
-							stampCodexAttempt(
-								retryHeaders,
-								"overload_529",
-								currentTransportModel ?? undefined,
-							);
-							const retrySourceInit: RequestInit & { duplex?: "half" } = {
-								method: retrySourceRequest.method,
-								headers: retryHeaders,
-							};
-							if (currentReplayBody) {
-								retrySourceInit.body = new Uint8Array(currentReplayBody);
-								retrySourceInit.duplex = "half";
+		for (const retryKind of ["overload", "server-error"] as const) {
+			const serverErrorPhase = retryKind === "server-error";
+			if (
+				(serverErrorPhase
+					? getServerErrorRetryEnabled() &&
+						isTransientServerErrorStatus(response.status)
+					: response.status === 529) &&
+				!hostedDispatchCommitted() &&
+				!isSyntheticInternal &&
+				!wasProtectedLifecycleForLatestResponse()
+			) {
+				// No clone: parseRateLimit is synchronous (providers/types.ts) and
+				// reads only headers and status, so it cannot touch the body. Cloning
+				// here teed the body into a second stream that nothing ever read or
+				// disposed of — one orphan per 529, plus one per in-place retry
+				// below. See issue #354.
+				const rlInfo = attemptPlan.parseRateLimit(response);
+				// Do NOT gate on rlInfo.isRateLimited: providers such as
+				// ZaiProvider.parseRateLimit only classify isRateLimited=true for a
+				// 429, so on a 529 it always answers false and this whole branch
+				// was dead for zai-shaped accounts — the very overload case it
+				// exists for. We are already inside `status === 529`; resetTime
+				// alone decides in-place retry vs. cooldown.
+				if (serverErrorPhase || !rlInfo.resetTime) {
+					const retryCfg = getOverloadRetryConfig();
+					if (retryCfg.enabled && retryCfg.maxAttempts > 1) {
+						for (let attempt = 1; attempt < retryCfg.maxAttempts; attempt++) {
+							if (
+								serverErrorPhase &&
+								response.headers.get("x-should-retry") === "false"
+							)
+								break;
+							try {
+								routingAttemptLedger?.assertPhysicalAttemptAvailable(
+									physicalAttemptVetoContext(),
+								);
+							} catch (error) {
+								// The current 529 is local ownership: the request terminalizer
+								// cannot see it after the budget veto crosses this account seam.
+								await discardUpstreamBody(response);
+								throw error;
 							}
-							const retrySource = new Request(
-								retrySourceRequest.url,
-								retrySourceInit,
+							let retryTransport = retryTransformedTemplate.clone();
+							// Reserve before backoff or touching the trusted 529. A denied
+							// follower returns it untouched to the outer terminal authority.
+							const degradedReservation = reservePhysicalSend(
+								retryTransport,
+								currentTransportModel,
+								response,
 							);
-							let retryTransformed = await transformWithCurrentAttemptPlan(
-								attemptPlan,
-								retrySource,
+							// Full-jitter backoff: sleep in [0, min(base * 2^attempt, max)]
+							const cap = Math.min(
+								retryCfg.baseMs * 2 ** attempt,
+								retryCfg.maxMs,
 							);
+							const delayMs = Math.random() * cap;
+							try {
+								await new Promise<void>((resolve) =>
+									setTimeout(resolve, delayMs),
+								);
+							} catch (error) {
+								cancelPhysicalSendReservation(degradedReservation);
+								throw error;
+							}
+
+							log.info(
+								`Account ${account.name}: in-place retry ${attempt}/${retryCfg.maxAttempts - 1} after ${Math.round(delayMs)}ms for upstream ${response.status}`,
+							);
+
+							// Commit is noncontending and synchronous. It precedes every
+							// destructive drain below and the cache staging/fetch in the
+							// shared executor.
+							commitPhysicalSendReservation(degradedReservation, response);
+							if (attemptPlan.providerName === "codex") {
+								const retryHeaders = new Headers(retrySourceRequest.headers);
+								await drainSupersededResponse(response);
+								stampCodexAttempt(
+									retryHeaders,
+									serverErrorPhase ? "other_retry" : "overload_529",
+									currentTransportModel ?? undefined,
+								);
+								const retrySourceInit: RequestInit & { duplex?: "half" } = {
+									method: retrySourceRequest.method,
+									headers: retryHeaders,
+								};
+								if (currentReplayBody) {
+									retrySourceInit.body = new Uint8Array(currentReplayBody);
+									retrySourceInit.duplex = "half";
+								}
+								const retrySource = new Request(
+									retrySourceRequest.url,
+									retrySourceInit,
+								);
+								let retryTransformed = await transformWithCurrentAttemptPlan(
+									attemptPlan,
+									retrySource,
+								);
+								if (currentTransportModel) {
+									retryTransformed = await forceModelInTransformedRequest(
+										retryTransformed,
+										currentTransportModel,
+									);
+								}
+								retryTransport = retryTransformed;
+							} else {
+								// Non-codex providers reach this loop too (the anthropic
+								// provider marks bare 529 overloaded_error responses as rate
+								// limited with no reset), and their superseded response would
+								// otherwise be abandoned with a live body when `response` is
+								// reassigned below.
+								await discardUpstreamBody(response);
+							}
+							const retryRaw = await executeCacheAwareProviderAttempt(
+								retryTransport,
+								currentReplayBody,
+								currentCacheIdentityHasCacheControl,
+								currentTransportModel,
+								degradedReservation,
+							);
+							const retryFailureClassification = await handleRawAttemptFailure(
+								retryRaw,
+								currentTransportModel || effectiveBodyContext.getModel(),
+							);
+							if (retryFailureClassification.returnOriginalResponse) {
+								return withSanitizedProxyHeaders(retryRaw);
+							}
+							if (retryFailureClassification.scope !== "not-classified") {
+								return null;
+							}
+
+							// A Codex retry re-transforms its reconstructed body. Read the
+							// transport's final metadata so the response tags describe the
+							// actual retry rather than the superseded first attempt.
+							const retryRequestStream = retryTransport.headers.get(
+								"x-better-ccflare-request-stream",
+							);
+							const retryCustomTools = retryTransport.headers.get(
+								"x-better-ccflare-codex-custom-tools",
+							);
+
+							// Mirror the first response's metadata tagging: providers read
+							// stream intent / custom-tool state from these headers, and the
+							// map fallback behind them has a 30s TTL a long backoff can
+							// outlive — the request ID alone is not enough.
+							const retryTaggedHeaders = new Headers(retryRaw.headers);
+							retryTaggedHeaders.set(
+								"x-better-ccflare-request-id",
+								requestMeta.id,
+							);
+							if (currentTransportAttemptId) {
+								retryTaggedHeaders.set(
+									"x-better-ccflare-attempt-id",
+									currentTransportAttemptId,
+								);
+							}
 							if (currentTransportModel) {
-								retryTransformed = await forceModelInTransformedRequest(
-									retryTransformed,
+								retryTaggedHeaders.set(
+									"x-better-ccflare-final-model",
 									currentTransportModel,
 								);
 							}
-							retryTransport = retryTransformed;
-						} else {
-							// Non-codex providers reach this loop too (the anthropic
-							// provider marks bare 529 overloaded_error responses as rate
-							// limited with no reset), and their superseded response would
-							// otherwise be abandoned with a live body when `response` is
-							// reassigned below.
-							await discardUnusedResponse(
-								response,
-								"in_place_529_retry_superseded",
-							);
-						}
-						const retryRaw = await executeCacheAwareProviderAttempt(
-							retryTransport,
-							currentReplayBody,
-							currentCacheIdentityHasCacheControl,
-							currentTransportModel,
-							degradedReservation,
-						);
-						const retryFailureClassification = await handleRawAttemptFailure(
-							retryRaw,
-							currentTransportModel || effectiveBodyContext.getModel(),
-						);
-						if (retryFailureClassification.scope !== "not-classified") {
-							return null;
-						}
-
-						// A Codex retry re-transforms its reconstructed body. Read the
-						// transport's final metadata so the response tags describe the
-						// actual retry rather than the superseded first attempt.
-						const retryRequestStream = retryTransport.headers.get(
-							"x-better-ccflare-request-stream",
-						);
-						const retryCustomTools = retryTransport.headers.get(
-							"x-better-ccflare-codex-custom-tools",
-						);
-
-						// Mirror the first response's metadata tagging: providers read
-						// stream intent / custom-tool state from these headers, and the
-						// map fallback behind them has a 30s TTL a long backoff can
-						// outlive — the request ID alone is not enough.
-						const retryTaggedHeaders = new Headers(retryRaw.headers);
-						retryTaggedHeaders.set(
-							"x-better-ccflare-request-id",
-							requestMeta.id,
-						);
-						if (currentTransportAttemptId) {
+							if (
+								retryRequestStream === "true" ||
+								retryRequestStream === "false"
+							) {
+								retryTaggedHeaders.set(
+									"x-better-ccflare-request-stream",
+									retryRequestStream,
+								);
+							}
+							if (retryCustomTools === "true" || retryCustomTools === "false") {
+								retryTaggedHeaders.set(
+									"x-better-ccflare-codex-custom-tools",
+									retryCustomTools,
+								);
+							}
 							retryTaggedHeaders.set(
-								"x-better-ccflare-attempt-id",
-								currentTransportAttemptId,
+								"x-better-ccflare-request-path",
+								requestMeta.path,
 							);
-						}
-						if (currentTransportModel) {
-							retryTaggedHeaders.set(
-								"x-better-ccflare-final-model",
-								currentTransportModel,
+							const retryTaggedRaw = new Response(retryRaw.body, {
+								status: retryRaw.status,
+								statusText: retryRaw.statusText,
+								headers: retryTaggedHeaders,
+							});
+							transferResponseDrainTransport(retryRaw, retryTaggedRaw);
+							const retryResponse = await attemptPlan.processResponse(
+								retryTaggedRaw,
+								req.headers,
+								getResponseDrainTransport(retryTaggedRaw),
 							);
-						}
-						if (
-							retryRequestStream === "true" ||
-							retryRequestStream === "false"
-						) {
-							retryTaggedHeaders.set(
-								"x-better-ccflare-request-stream",
-								retryRequestStream,
-							);
-						}
-						if (retryCustomTools === "true" || retryCustomTools === "false") {
-							retryTaggedHeaders.set(
-								"x-better-ccflare-codex-custom-tools",
-								retryCustomTools,
-							);
-						}
-						retryTaggedHeaders.set(
-							"x-better-ccflare-request-path",
-							requestMeta.path,
-						);
-						const retryTaggedRaw = new Response(retryRaw.body, {
-							status: retryRaw.status,
-							statusText: retryRaw.statusText,
-							headers: retryTaggedHeaders,
-						});
-						transferResponseDrainTransport(retryRaw, retryTaggedRaw);
-						const retryResponse = await attemptPlan.processResponse(
-							retryTaggedRaw,
-							req.headers,
-							getResponseDrainTransport(retryTaggedRaw),
-						);
 
-						await discardUpstreamBody(response);
-						response = retryResponse;
-						if (await handleProcessedCodexContextOverflow(retryResponse)) {
-							return null;
-						}
+							await discardUpstreamBody(response);
+							response = retryResponse;
+							if (await handleProcessedCodexContextOverflow(retryResponse)) {
+								return null;
+							}
 
-						// If credentials expired mid-retry, break out and let the 401
-						// failover guard below handle it (return null → try next account).
-						if (retryResponse.status === 401) {
-							break;
-						}
+							// If credentials expired mid-retry, break out and let the 401
+							// failover guard below handle it (return null → try next account).
+							if (retryResponse.status === 401) {
+								break;
+							}
 
-						if (retryResponse.status !== 529) {
-							log.info(
-								`Account ${account.name}: 529 resolved on retry ${attempt} (status ${retryResponse.status})`,
+							if (
+								serverErrorPhase
+									? !isTransientServerErrorStatus(retryResponse.status)
+									: retryResponse.status !== 529
+							) {
+								log.info(
+									`Account ${account.name}: ${retryKind} resolved on retry ${attempt} (status ${retryResponse.status})`,
+								);
+								break;
+							}
+
+							// Header-only read, see the note on the first parseRateLimit
+							// call above — the retry response must not be teed either.
+							// Same reason as the entry guard above: isRateLimited is
+							// always false here for zai-shaped providers, so this broke
+							// out after a single retry and silently capped the budget
+							// at 1. Status is known to be 529 here (checked below);
+							// only a reset hint stops the loop.
+							const retryRlInfo = attemptPlan.parseRateLimit(retryResponse);
+							if (!serverErrorPhase && retryRlInfo.resetTime) {
+								// Got a reset hint on retry — stop; let processProxyResponse apply cooldown
+								break;
+							}
+						}
+						if (response.status === 529) {
+							log.warn(
+								`Account ${account.name}: all ${retryCfg.maxAttempts - 1} in-place 529 retries exhausted, applying cooldown and failing over`,
 							);
-							break;
 						}
-
-						// Header-only read, see the note on the first parseRateLimit
-						// call above — the retry response must not be teed either.
-						// Same reason as the entry guard above: isRateLimited is
-						// always false here for zai-shaped providers, so this broke
-						// out after a single retry and silently capped the budget
-						// at 1. Status is known to be 529 here (checked below);
-						// only a reset hint stops the loop.
-						const retryRlInfo = attemptPlan.parseRateLimit(retryResponse);
-						if (retryRlInfo.resetTime) {
-							// Got a reset hint on retry — stop; let processProxyResponse apply cooldown
-							break;
-						}
-					}
-					if (response.status === 529) {
-						log.warn(
-							`Account ${account.name}: all ${retryCfg.maxAttempts - 1} in-place 529 retries exhausted, applying cooldown and failing over`,
-						);
 					}
 				}
 			}
+		}
+
+		let terminalServerErrorBenched = false;
+		if (
+			isTransientServerErrorStatus(response.status) &&
+			getServerErrorRetryEnabled() &&
+			!isSyntheticInternal &&
+			!hostedDispatchCommitted() &&
+			!wasProtectedLifecycleForLatestResponse()
+		) {
+			const reason = "upstream_5xx_server_error" as const;
+			const before = captureCooldownState(account);
+			const persistence = await applyRateLimitCooldownAwaitingPersist(
+				account,
+				{
+					reason,
+					resetTime: parseRetryAfterUntil(response, Date.now()) ?? undefined,
+				},
+				ctx,
+			);
+			const accountBenched =
+				persistence?.applied !== false && appliedCooldown(account, before);
+			// The awaited writer does not feed the breaker. Count this physical
+			// account failure once, unless a stronger local or durable bench
+			// suppressed it. A timed-out write retains the existing memory fallback.
+			const circuitCounted = accountBenched
+				? getDefaultCircuitBreaker().recordFailure(
+						circuitKeyFor(account),
+						reason,
+					)
+				: false;
+			const terminal = returnRateLimitedResponseOnExhaustion;
+			if (!terminal) routingAttemptLedger?.blockAccount(account.id);
+			recordRoutingAttempt({
+				parentRequestId: requestMeta.id,
+				timestamp: Date.now(),
+				provider: account.provider,
+				accountId: account.id,
+				attemptedModel: currentTransportModel,
+				modelFamily: currentTransportModel
+					? getModelFamily(currentTransportModel)
+					: null,
+				statusCode: response.status,
+				reason,
+				scope: "account",
+				// A rejected durable write does not prove the candidate expiry.
+				availableAt:
+					persistence?.applied === false
+						? before.rate_limited_until
+						: account.rate_limited_until,
+				failoverAttempts,
+				physicalAttempt: routingAttemptLedger?.physicalAttemptCount ?? null,
+				accountBenched,
+				routeSuppressed: !terminal && routingAttemptLedger !== undefined,
+				circuitCounted,
+				upstreamEvidence: await captureSanitizedUpstreamEvidence(
+					ctx,
+					response,
+					{ consumeOriginalBody: !terminal },
+				),
+			});
+			if (!terminal) {
+				await discardUpstreamBody(response);
+				return null;
+			}
+			terminalServerErrorBenched = true;
 		}
 
 		// Re-check 401 after an in-place 529 retry. The same bounded auth handler
@@ -7481,11 +7634,13 @@ export async function proxyWithAccount(
 						rescueTransformedRequest,
 						currentTransportModel,
 					);
-					retryTransformedTemplate = rescueTransformedRequest.clone();
-					const rescueBodyText = await rescueTransformedRequest.clone().text();
+					retryTransformedTemplate = await adoptRetryTemplate(
+						rescueTransformedRequest,
+					);
+					const rescueBodyText = retryBodyText;
 					currentCacheIdentityHasCacheControl =
 						hasCacheControlHintInJsonText(rescueBodyText);
-					const rescueTransportRequest = rescueTransformedRequest;
+					const rescueTransportRequest = retryTransformedTemplate.clone();
 					rawResponse = await executeCacheAwareProviderAttempt(
 						rescueTransportRequest,
 						currentReplayBody,
@@ -7701,6 +7856,7 @@ export async function proxyWithAccount(
 			(observation) => {
 				rateLimitObservation = observation;
 			},
+			{ serverErrorBenchApplied: terminalServerErrorBenched },
 		);
 		if (responseForRateLimitCheck !== response) {
 			// The rate-limit check ran on a clone whose header-only use is done.

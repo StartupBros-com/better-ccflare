@@ -2935,20 +2935,9 @@ describe("proxyWithAccount — 529 in-place retry", () => {
 
 describe("proxyWithAccount — non-codex 529 in-place retry releases superseded responses (P1)", () => {
 	let originalFetch: typeof globalThis.fetch;
-	let originalStreamCancel: typeof ReadableStream.prototype.cancel;
-	let cancelReasons: string[];
 
 	beforeEach(() => {
 		originalFetch = globalThis.fetch;
-		cancelReasons = [];
-		originalStreamCancel = ReadableStream.prototype.cancel;
-		ReadableStream.prototype.cancel = function (
-			this: ReadableStream,
-			reason?: unknown,
-		) {
-			cancelReasons.push(String(reason));
-			return originalStreamCancel.call(this, reason);
-		};
 		process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS = "0";
 		process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS = "0";
 		process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS = "3";
@@ -2957,23 +2946,62 @@ describe("proxyWithAccount — non-codex 529 in-place retry releases superseded 
 
 	afterEach(() => {
 		globalThis.fetch = originalFetch;
-		ReadableStream.prototype.cancel = originalStreamCancel;
 		delete process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS;
 		delete process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS;
 		delete process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS;
 		delete process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
 	});
 
-	it("cancels both superseded 529 response bodies for a non-codex (anthropic) account, and still forwards the eventual success to the client", async () => {
+	it("fully drains and unlocks both superseded non-Codex 529 bodies before forwarding eventual success", async () => {
 		const overloadBody =
 			'{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
 		const successBody =
 			'{"id":"msg_1","type":"message","content":[],"model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}';
+		const drains: Array<{
+			completeReads: number;
+			acquisitions: number;
+			releases: number;
+			stream: ReadableStream<Uint8Array>;
+		}> = [];
 		let callCount = 0;
 		globalThis.fetch = mock(async () => {
 			callCount++;
 			if (callCount <= 2) {
-				return new Response(overloadBody, {
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new TextEncoder().encode(overloadBody));
+						controller.close();
+					},
+				});
+				const observed = {
+					completeReads: 0,
+					acquisitions: 0,
+					releases: 0,
+					stream,
+				};
+				drains.push(observed);
+				const getReader = stream.getReader.bind(stream);
+				// Observe actual disposal, not a cancel(reason) mechanism: native
+				// body.cancel() can leave retained tee buffers on affected Bun builds.
+				Object.defineProperty(stream, "getReader", {
+					value: () => {
+						observed.acquisitions++;
+						const reader = getReader();
+						const read = reader.read.bind(reader);
+						const release = reader.releaseLock.bind(reader);
+						reader.read = async () => {
+							const result = await read();
+							if (result.done) observed.completeReads++;
+							return result;
+						};
+						reader.releaseLock = () => {
+							observed.releases++;
+							release();
+						};
+						return reader;
+					},
+				});
+				return new Response(stream, {
 					status: 529,
 					headers: { "content-type": "application/json" },
 				});
@@ -2990,8 +3018,9 @@ describe("proxyWithAccount — non-codex 529 in-place retry releases superseded 
 		// UsageCollector initialization (not wired in unit tests). Catch that
 		// specific error while still verifying both superseded 529 responses
 		// were released.
+		let successReached = false;
 		try {
-			await proxyWithAccount(
+			const response = await proxyWithAccount(
 				req,
 				new URL("https://proxy.local/v1/messages"),
 				makeAccount({
@@ -3005,17 +3034,25 @@ describe("proxyWithAccount — non-codex 529 in-place retry releases superseded 
 				0,
 				makeProxyContext(),
 			);
+			expect(response?.status).toBe(200);
+			if (response) await response.text();
+			successReached = true;
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			if (!msg.includes("UsageCollector not initialized")) throw e;
+			successReached = true;
 		}
 
 		// Initial 529 + 2 in-place retries (the second retry succeeds).
 		expect(callCount).toBe(3);
-		const supersededCancels = cancelReasons.filter(
-			(r) => r === "in_place_529_retry_superseded",
-		);
-		expect(supersededCancels.length).toBe(2);
+		expect(successReached).toBe(true);
+		expect(drains).toHaveLength(2);
+		for (const observed of drains) {
+			expect(observed.acquisitions).toBeGreaterThan(0);
+			expect(observed.completeReads).toBe(observed.acquisitions);
+			expect(observed.releases).toBe(observed.acquisitions);
+			expect(observed.stream.locked).toBe(false);
+		}
 	});
 });
 

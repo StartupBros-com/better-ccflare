@@ -140,12 +140,14 @@ describe("OAuthFlow.completeReauth", () => {
 		expect(sql).toMatch(/access_token/i);
 		expect(sql).toMatch(/expires_at/i);
 		expect(sql).toMatch(/requires_reauth\s*=\s*0/i);
-		// Params: [refreshToken, accessToken, expiresAt, refreshTokenIssuedAt, accountId]
+		// Both issue-time and manual-reauth timestamps refer to this manual authorization.
 		expect(params[0]).toBe("new-refresh-token");
 		expect(params[1]).toBe("new-access-token");
 		expect(typeof params[2]).toBe("number");
 		expect(typeof params[3]).toBe("number");
-		expect(params[4]).toBe(accountId);
+		expect(sql).toMatch(/last_manual_reauth_at/i);
+		expect(params[4]).toBe(params[3]);
+		expect(params[5]).toBe(accountId);
 	});
 
 	it("should UPDATE api_key for console mode (no refreshToken)", async () => {

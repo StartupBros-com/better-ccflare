@@ -149,6 +149,44 @@ function customPlan(
 }
 
 describe("materializeProviderAttemptPlan", () => {
+	test("defaults absent upgrade fields and preserves a scalar request transformer", () => {
+		for (const configured of [false, true]) {
+			const account = accountFixture();
+			if (configured)
+				account.request_transformer = "max-tokens-to-max-completion-tokens";
+			let view: Account | undefined;
+			materializeProviderAttemptPlan(
+				baseProvider({
+					prepareRequest(_request, _body, captured) {
+						view = captured;
+					},
+				}),
+				context(account),
+			);
+			expect(view?.request_transformer).toBe(
+				configured ? "max-tokens-to-max-completion-tokens" : null,
+			);
+			expect(view?.usage_pause_five_hour_enabled).toBe(false);
+			expect(view?.last_manual_reauth_at).toBeNull();
+		}
+	});
+
+	test("rejects upgrade field accessors and malformed values without reading getters", () => {
+		for (const descriptor of [
+			{
+				get: () => {
+					throw new Error("getter must never run");
+				},
+			},
+			{ value: {} },
+		]) {
+			const account = accountFixture();
+			Object.defineProperty(account, "request_transformer", descriptor);
+			expect(() =>
+				materializeProviderAttemptPlan(baseProvider(), context(account)),
+			).toThrow("Invalid provider attempt account field request_transformer");
+		}
+	});
 	test("bypasses custom planning for proof-null ordinary attempts", () => {
 		let plannerCalls = 0;
 		let legacyBuildCalls = 0;

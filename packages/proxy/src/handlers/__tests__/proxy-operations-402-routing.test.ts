@@ -194,7 +194,7 @@ function makeContext(
 	const markAccountRateLimited = mock(
 		async (accountId: string, until: number, reason: string) => {
 			persistedCooldowns.set(accountId, { until, reason });
-			return 1;
+			return { consecutiveRateLimits: 1, applied: true };
 		},
 	);
 	const saveRequest = mock(async (..._args: unknown[]) => undefined);

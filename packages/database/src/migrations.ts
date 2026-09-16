@@ -414,7 +414,13 @@ export function ensureSchema(db: Database): void {
 			rate_limit_reset INTEGER,
 			rate_limit_reset_at INTEGER,
 			consecutive_rate_limits INTEGER NOT NULL DEFAULT 0,
-			requires_reauth INTEGER DEFAULT 0
+			requires_reauth INTEGER DEFAULT 0,
+			last_manual_reauth_at INTEGER,
+			request_transformer TEXT,
+			usage_pause_five_hour_threshold INTEGER,
+			usage_pause_weekly_threshold INTEGER,
+			usage_pause_five_hour_enabled INTEGER NOT NULL DEFAULT 0,
+			usage_pause_weekly_enabled INTEGER NOT NULL DEFAULT 0
 		)
 	`);
 
@@ -1055,6 +1061,14 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 		      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, id ASC
 		      LIMIT 1
 		    )) AS merged_refresh_token_issued_at,
+		   (SELECT last_manual_reauth_at FROM accounts
+		    WHERE rowid = (
+		      SELECT rowid FROM accounts
+		      WHERE name = ? AND ${canonicalProvider} = ? AND COALESCE(custom_endpoint, '') = ?
+		        AND refresh_token IS NOT NULL AND refresh_token != ''
+		      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, id ASC
+		      LIMIT 1
+		    )) AS merged_last_manual_reauth_at,
 		   (SELECT api_key FROM accounts
 		    WHERE name = ? AND ${canonicalProvider} = ? AND COALESCE(custom_endpoint, '') = ?
 		      AND api_key IS NOT NULL AND api_key != ''
@@ -1110,6 +1124,7 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 		   access_token = $access_token,
 		   expires_at = $expires_at,
 		   refresh_token_issued_at = $refresh_token_issued_at,
+		   last_manual_reauth_at = $last_manual_reauth_at,
 		   api_key = COALESCE(api_key, $api_key),
 		   last_used = ${agg("MAX", "last_used")},
 		   created_at = (SELECT MIN(created_at) FROM accounts ${groupScope}),
@@ -1135,8 +1150,13 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 		   pause_reason = COALESCE(pause_reason, ${freshest("pause_reason")}),
 		   rate_limited_reason = COALESCE(rate_limited_reason, ${freshest("rate_limited_reason")}),
 		   model_mappings = COALESCE(model_mappings, ${freshest("model_mappings")}),
+		   request_transformer = COALESCE(request_transformer, ${freshest("request_transformer")}),
 		   model_fallbacks = COALESCE(model_fallbacks, ${freshest("model_fallbacks")}),
 		   cross_region_mode = COALESCE(cross_region_mode, ${freshest("cross_region_mode")}),
+		   usage_pause_five_hour_threshold = COALESCE(usage_pause_five_hour_threshold, ${freshest("usage_pause_five_hour_threshold")}),
+		   usage_pause_weekly_threshold = COALESCE(usage_pause_weekly_threshold, ${freshest("usage_pause_weekly_threshold")}),
+		   usage_pause_five_hour_enabled = ${agg("MAX", "usage_pause_five_hour_enabled")},
+		   usage_pause_weekly_enabled = ${agg("MAX", "usage_pause_weekly_enabled")},
 		   billing_type = COALESCE(billing_type, ${freshest("billing_type")})
 		 WHERE id = $survivor_id`,
 	);
@@ -1362,12 +1382,16 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 			grp.ep, // refresh_token_issued_at subquery
 			grp.name,
 			grp.provider,
+			grp.ep, // last_manual_reauth_at from the same selected credential row
+			grp.name,
+			grp.provider,
 			grp.ep, // api_key subquery
 		) as {
 			merged_refresh_token: string | null;
 			merged_access_token: string | null;
 			merged_expires_at: number | null;
 			merged_refresh_token_issued_at: number | null;
+			merged_last_manual_reauth_at: number | null;
 			merged_api_key: string | null;
 		};
 
@@ -1381,6 +1405,7 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 			$access_token: merged.merged_access_token,
 			$expires_at: merged.merged_expires_at,
 			$refresh_token_issued_at: merged.merged_refresh_token_issued_at,
+			$last_manual_reauth_at: merged.merged_last_manual_reauth_at,
 			$api_key: merged.merged_api_key,
 			$name: grp.name,
 			$provider: grp.provider,
@@ -2031,6 +2056,13 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			log.info("Added model_mappings column to accounts table");
 		}
 
+		if (!initialAccountsColumnNames.includes("request_transformer")) {
+			db.prepare(
+				"ALTER TABLE accounts ADD COLUMN request_transformer TEXT",
+			).run();
+			log.info("Added request_transformer column to accounts table");
+		}
+
 		// Add cross_region_mode column for Bedrock cross-region inference configuration
 		if (!initialAccountsColumnNames.includes("cross_region_mode")) {
 			db.prepare(
@@ -2060,6 +2092,16 @@ export function runMigrations(db: Database, dbPath?: string): void {
 				"ALTER TABLE accounts ADD COLUMN refresh_token_issued_at INTEGER",
 			).run();
 			log.info("Added refresh_token_issued_at column to accounts table");
+		}
+
+		// Add last_manual_reauth_at column to track when a human last manually reauthenticated
+		// (distinct from refresh_token_issued_at, which is also bumped by silent auto-refresh —
+		// see reauthenticateAccount() and OAuthFlow.completeReauth())
+		if (!initialAccountsColumnNames.includes("last_manual_reauth_at")) {
+			db.prepare(
+				"ALTER TABLE accounts ADD COLUMN last_manual_reauth_at INTEGER",
+			).run();
+			log.info("Added last_manual_reauth_at column to accounts table");
 		}
 
 		// Add auto_pause_on_overage_enabled column for Anthropic accounts
@@ -2123,6 +2165,72 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			log.info("Added consecutive_rate_limits column to accounts table");
 		}
 
+		// Add per-account usage-window pause thresholds. NULL = no threshold, so
+		// every existing account keeps its current behaviour until someone sets one.
+		//
+		// Materialize/backfill each independently missing flag before rebuilding
+		// accounts; both rebuild projections below preserve these stored values.
+		const accountsColumnsBeforeThresholds = db
+			.prepare("PRAGMA table_info(accounts)")
+			.all() as Array<{ name: string }>;
+		const thresholdColumnNames = accountsColumnsBeforeThresholds.map(
+			(col) => col.name,
+		);
+
+		if (!thresholdColumnNames.includes("usage_pause_five_hour_threshold")) {
+			db.prepare(
+				"ALTER TABLE accounts ADD COLUMN usage_pause_five_hour_threshold INTEGER",
+			).run();
+			log.info(
+				"Added usage_pause_five_hour_threshold column to accounts table",
+			);
+		}
+
+		if (!thresholdColumnNames.includes("usage_pause_weekly_threshold")) {
+			db.prepare(
+				"ALTER TABLE accounts ADD COLUMN usage_pause_weekly_threshold INTEGER",
+			).run();
+			log.info("Added usage_pause_weekly_threshold column to accounts table");
+		}
+
+		// The percentage and whether it is in force are stored separately, so
+		// switching a window off keeps the number the owner chose instead of
+		// making them type it again when they switch it back on.
+		if (!thresholdColumnNames.includes("usage_pause_five_hour_enabled")) {
+			db.prepare(
+				"ALTER TABLE accounts ADD COLUMN usage_pause_five_hour_enabled INTEGER NOT NULL DEFAULT 0",
+			).run();
+			log.info("Added usage_pause_five_hour_enabled column to accounts table");
+		}
+
+		if (!thresholdColumnNames.includes("usage_pause_weekly_enabled")) {
+			db.prepare(
+				"ALTER TABLE accounts ADD COLUMN usage_pause_weekly_enabled INTEGER NOT NULL DEFAULT 0",
+			).run();
+			log.info("Added usage_pause_weekly_enabled column to accounts table");
+		}
+
+		// A threshold written before this pair existed was in force by virtue of
+		// being set at all; keep it that way rather than silently switching it
+		// off. Each flag is backfilled only on the run that adds it: afterwards,
+		// `enabled = 0` with a percentage still stored is a deliberate "off",
+		// and rewriting it would switch a window back on behind its owner.
+		if (!thresholdColumnNames.includes("usage_pause_five_hour_enabled")) {
+			db.prepare(
+				`UPDATE accounts
+				 SET usage_pause_five_hour_enabled = 1
+				 WHERE usage_pause_five_hour_threshold IS NOT NULL`,
+			).run();
+		}
+
+		if (!thresholdColumnNames.includes("usage_pause_weekly_enabled")) {
+			db.prepare(
+				`UPDATE accounts
+				 SET usage_pause_weekly_enabled = 1
+				 WHERE usage_pause_weekly_threshold IS NOT NULL`,
+			).run();
+		}
+
 		// Make refresh_token nullable (was NOT NULL, causing API-key providers to need workarounds)
 		const refreshTokenCol = accountsInfo.find(
 			(col) => col.name === "refresh_token",
@@ -2155,11 +2263,23 @@ export function runMigrations(db: Database, dbPath?: string): void {
 					custom_endpoint TEXT,
 					auto_refresh_enabled INTEGER DEFAULT 0,
 					model_mappings TEXT,
+					request_transformer TEXT,
 					cross_region_mode TEXT DEFAULT 'geographic',
 					model_fallbacks TEXT,
 					auto_pause_on_overage_enabled INTEGER DEFAULT 0,
 					pause_reason TEXT,
-					requires_reauth INTEGER DEFAULT 0
+					requires_reauth INTEGER DEFAULT 0,
+					last_manual_reauth_at INTEGER,
+					usage_pause_five_hour_threshold INTEGER,
+					usage_pause_weekly_threshold INTEGER,
+					usage_pause_five_hour_enabled INTEGER NOT NULL DEFAULT 0,
+					usage_pause_weekly_enabled INTEGER NOT NULL DEFAULT 0,
+					billing_type TEXT,
+					refresh_token_issued_at INTEGER,
+					peak_hours_pause_enabled INTEGER NOT NULL DEFAULT 0,
+					rate_limited_reason TEXT,
+					rate_limited_at INTEGER,
+					consecutive_rate_limits INTEGER NOT NULL DEFAULT 0
 				)
 			`).run();
 
@@ -2174,8 +2294,12 @@ export function runMigrations(db: Database, dbPath?: string): void {
 					rate_limited_until, session_start, session_request_count,
 					paused, rate_limit_reset, rate_limit_reset_at, rate_limit_status, rate_limit_remaining,
 					auto_fallback_enabled, custom_endpoint, auto_refresh_enabled,
-					model_mappings, cross_region_mode, model_fallbacks,
-					auto_pause_on_overage_enabled, pause_reason, requires_reauth
+					model_mappings, request_transformer, cross_region_mode, model_fallbacks,
+					auto_pause_on_overage_enabled, pause_reason, requires_reauth,
+					last_manual_reauth_at, usage_pause_five_hour_threshold, usage_pause_weekly_threshold,
+					usage_pause_five_hour_enabled, usage_pause_weekly_enabled, billing_type,
+					refresh_token_issued_at, peak_hours_pause_enabled, rate_limited_reason,
+					rate_limited_at, consecutive_rate_limits
 				FROM accounts
 			`).run();
 
@@ -2509,8 +2633,12 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			       rate_limited_until, session_start, session_request_count, paused,
 			       rate_limit_reset, rate_limit_reset_at, rate_limit_status, rate_limit_remaining,
 			       auto_fallback_enabled, custom_endpoint, auto_refresh_enabled, model_mappings,
-			       cross_region_mode, model_fallbacks, billing_type, auto_pause_on_overage_enabled,
-			       pause_reason, requires_reauth
+			       request_transformer, cross_region_mode, model_fallbacks, billing_type, auto_pause_on_overage_enabled,
+			       pause_reason, requires_reauth, last_manual_reauth_at,
+			       usage_pause_five_hour_threshold, usage_pause_weekly_threshold,
+			       usage_pause_five_hour_enabled, usage_pause_weekly_enabled,
+			       refresh_token_issued_at, peak_hours_pause_enabled, rate_limited_reason,
+			       rate_limited_at, consecutive_rate_limits
 			FROM accounts
 		`).run();
 

@@ -30,7 +30,7 @@ describe("release lineage", () => {
 	});
 
 	it("uses the exact upstream Claude CLI fallback version", () => {
-		expect(CLAUDE_CLI_VERSION).toBe("2.1.250");
+		expect(CLAUDE_CLI_VERSION).toBe("2.1.272");
 	});
 
 	it("preserves runtime Git SHA fallback and explicit unknown behavior", () => {
