@@ -485,6 +485,16 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 
 	it("keeps ordinary Codex WebSocket success and HTTP fallback behavior on one coherent plan per request", async () => {
 		installUsageCollector();
+		const codex = getProvider("codex");
+		const anthropic = getProvider("anthropic");
+		if (!codex || !anthropic) throw new Error("Providers are not registered");
+		const proxyContext = { ...makeProxyContext(), provider: anthropic };
+		const observeResponse = mock((response: Response) => response);
+		const observeError = mock(() => undefined);
+		const observeUpstream = spyOn(codex, "observeUpstream").mockResolvedValue({
+			response: observeResponse,
+			error: observeError,
+		});
 		const plannedModels: Array<string | null> = [];
 		const restorePlanner = installCountingCodexAttemptPlanner((context) => {
 			plannedModels.push(context.physicalModel);
@@ -538,6 +548,11 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 					body,
 					makePolicy(1_000),
 					`codex-plan-transport-${index}`,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					proxyContext,
 				);
 				expect(response?.status).toBe(200);
 				expect(await response?.text()).toContain(expectedText);
@@ -551,6 +566,20 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(plannedModels).toEqual([]);
 		expect(websocketCalls).toBe(2);
 		expect(httpCalls).toBe(1);
+		// Anthropic-shaped ingress uses Codex's final-wire observer after HTTP
+		// fallback. A successful WebSocket send never invokes the HTTP observer.
+		expect(observeUpstream).toHaveBeenCalledTimes(1);
+		expect(observeResponse).toHaveBeenCalledTimes(1);
+		expect(observeError).not.toHaveBeenCalled();
+		const [wireRequest, observationContext] = observeUpstream.mock.calls[0];
+		expect(await wireRequest.clone().json()).toMatchObject({
+			model: "gpt-5.4",
+		});
+		expect(observationContext).toMatchObject({
+			requestId: "codex-plan-transport-1",
+			account: { id: "codex-ws-account", provider: "codex" },
+			nativeResponses: false,
+		});
 	});
 
 	it("aborts a Codex attempt when its commitment budget expires before dispatch", async () => {
@@ -2328,6 +2357,24 @@ describe("proxyWithAccount: GPT-5.6 explicit breakpoint compatibility retry", ()
 
 	it("retries one pre-content 400 without the marker and suppresses that account/model", async () => {
 		installUsageCollector();
+		const codex = getProvider("codex");
+		const anthropic = getProvider("anthropic");
+		if (!codex || !anthropic) throw new Error("Providers are not registered");
+		const proxyContext = { ...makeProxyContext(), provider: anthropic };
+		const observedBodies: unknown[] = [];
+		const observedStatuses: number[] = [];
+		const observeUpstream = spyOn(codex, "observeUpstream").mockImplementation(
+			async (request) => {
+				observedBodies.push(await request.clone().json());
+				return {
+					response: (response) => {
+						observedStatuses.push(response.status);
+						return response;
+					},
+					error: () => undefined,
+				};
+			},
+		);
 		process.env.CCFLARE_CODEX_CACHE_KEY_MODE = "session";
 		const websocketAttempts: Array<{
 			conversationIdentity: string | null | undefined;
@@ -2424,9 +2471,18 @@ describe("proxyWithAccount: GPT-5.6 explicit breakpoint compatibility retry", ()
 			makePolicy(1_000),
 			"codex-breakpoint-400",
 			account,
+			undefined,
+			undefined,
+			undefined,
+			proxyContext,
 		);
 
 		expect(outbound).toHaveLength(2);
+		// Both physical HTTP attempts use the selected provider's observer,
+		// including the repaired wire body produced by the compatibility retry.
+		expect(observeUpstream).toHaveBeenCalledTimes(2);
+		expect(observedBodies).toEqual(outbound);
+		expect(observedStatuses).toEqual([400, 200]);
 		expect(websocketAttempts).toHaveLength(2);
 		expect(websocketAttempts[0]?.conversationIdentity).toMatch(
 			/^[0-9a-f]{64}$/,
