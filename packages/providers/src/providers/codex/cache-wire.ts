@@ -2,6 +2,7 @@ import type {
 	UpstreamObservation,
 	UpstreamObservationContext,
 } from "../../types";
+import { transferResponseDrainTransport } from "../../utils/stream-drain";
 import type {
 	CacheObservationContext,
 	CodexCacheDiagnostics,
@@ -249,7 +250,7 @@ export async function observeCodexWire(
 				}
 				if (end) abort("truncated", "missing_terminal");
 			};
-			return new Response(
+			const observed = new Response(
 				new ReadableStream<Uint8Array>(
 					{
 						async pull(controller) {
@@ -284,6 +285,9 @@ export async function observeCodexWire(
 					headers: response.headers,
 				},
 			);
+			// This observer owns the original reader; preserve its exact fetch abort.
+			transferResponseDrainTransport(response, observed);
+			return observed;
 		},
 	};
 }
