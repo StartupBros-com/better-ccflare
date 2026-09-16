@@ -68,18 +68,25 @@ export function AccountUsageThresholdsDialog({
 	);
 	const [isUpdating, setIsUpdating] = useState(false);
 
-	// Reset the fields whenever the dialog is pointed at another account.
+	// Identity must reset drafts even when both accounts have the same settings.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: account.id resets the draft on account changes.
 	useEffect(() => {
 		setFiveHour(toField(account?.usagePauseFiveHourThreshold));
 		setFiveHourOn(account?.usagePauseFiveHourEnabled ?? false);
 	}, [
+		account?.id,
 		account?.usagePauseFiveHourThreshold,
 		account?.usagePauseFiveHourEnabled,
 	]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: account.id resets the draft on account changes.
 	useEffect(() => {
 		setWeekly(toField(account?.usagePauseWeeklyThreshold));
 		setWeeklyOn(account?.usagePauseWeeklyEnabled ?? false);
-	}, [account?.usagePauseWeeklyThreshold, account?.usagePauseWeeklyEnabled]);
+	}, [
+		account?.id,
+		account?.usagePauseWeeklyThreshold,
+		account?.usagePauseWeeklyEnabled,
+	]);
 
 	const parsedFiveHour = fromField(fiveHour);
 	const parsedWeekly = fromField(weekly);

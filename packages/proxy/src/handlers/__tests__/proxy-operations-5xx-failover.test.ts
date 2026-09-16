@@ -1,11 +1,22 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import {
 	getDefaultCircuitBreaker,
 	resetDefaultCircuitBreaker,
 } from "../../circuit-breaker";
 import * as responseHandlerModule from "../../response-handler";
-import { proxyWithAccount } from "../proxy-operations";
+import {
+	type AnthropicDegradedRequestSendState,
+	proxyWithAccount,
+} from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
 import { resetRateLimitProbeGatesForTests } from "../rate-limit-cooldown";
 import {
@@ -75,9 +86,9 @@ function makeRequestMeta(overrides: Partial<RequestMeta> = {}): RequestMeta {
 	};
 }
 
-function makeRequestBody(stream = false) {
+function makeRequestBody(stream = false, model = "claude-sonnet-4-5") {
 	const body = JSON.stringify({
-		model: "claude-sonnet-4-5",
+		model,
 		messages: [{ role: "user", content: "hello" }],
 		max_tokens: 10,
 		...(stream ? { stream: true } : {}),
@@ -268,6 +279,192 @@ describe("proxyWithAccount — transient upstream 5xx retry and failover", () =>
 		delete process.env.CCFLARE_SERVER_ERROR_COOLDOWN_MS;
 		resetRateLimitProbeGatesForTests();
 		resetDefaultCircuitBreaker();
+	});
+
+	it.each([
+		"before backoff",
+		"during backoff",
+	] as const)("cancels a reserved 5xx retry when the client aborts %s", async (abortAt) => {
+		process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS = "2000";
+		process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS = "4000";
+		const controller = new AbortController();
+		const bodyBuffer = makeRequestBody(false, "claude-opus-4-6");
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			body: bodyBuffer,
+			headers: { "Content-Type": "application/json" },
+			signal: controller.signal,
+		});
+		const account = makeAccount({
+			api_key: null,
+			refresh_token: "mock-refresh-token",
+			access_token: "mock-access-token",
+			expires_at: Date.now() + 3_600_000,
+			billing_type: "plan",
+		});
+		const retryPermit = {
+			kind: "recovery_send" as const,
+			leaseExpiresAt: null,
+			commit: mock(() => true),
+			cancel: mock(() => true),
+			complete: mock(() => true),
+			expire: mock(() => false),
+		};
+		let reserveCalls = 0;
+		const degradedState: AnthropicDegradedRequestSendState = {
+			admission: {
+				reserve: () => {
+					reserveCalls++;
+					if (reserveCalls === 1) return { action: "allow" };
+					if (abortAt === "before backoff") controller.abort();
+					return { action: "send", permit: retryPermit, enforced: true };
+				},
+			} as never,
+			lifecycle: null,
+		};
+		const ledger = new RoutingAttemptLedger();
+		let releaseLockCalls = 0;
+		const failedBody = new ReadableStream<Uint8Array>({
+			start(streamController) {
+				streamController.enqueue(new TextEncoder().encode(serverErrorBody));
+				streamController.close();
+			},
+		});
+		const getReader = failedBody.getReader.bind(failedBody);
+		Object.defineProperty(failedBody, "getReader", {
+			value: () => {
+				const reader = getReader();
+				const releaseLock = reader.releaseLock.bind(reader);
+				reader.releaseLock = () => {
+					releaseLockCalls++;
+					releaseLock();
+				};
+				return reader;
+			},
+		});
+		const failedResponse = new Response(failedBody, {
+			status: 503,
+			headers: { "content-type": "application/json" },
+		});
+		const ctx = makeProxyContext();
+		globalThis.fetch = mock(async () => failedResponse);
+		let backoffTimer: ReturnType<typeof setTimeout> | undefined;
+		let startedBackoff!: () => void;
+		const backoffStarted = new Promise<void>((resolve) => {
+			startedBackoff = resolve;
+		});
+		const realSetTimeout = globalThis.setTimeout;
+		const randomSpy = spyOn(Math, "random").mockReturnValue(0.5);
+		const clearTimerSpy = spyOn(globalThis, "clearTimeout");
+		const addListenerSpy = spyOn(request.signal, "addEventListener");
+		const removeListenerSpy = spyOn(request.signal, "removeEventListener");
+		const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: () => void,
+			delay?: number,
+		) => {
+			const timer = realSetTimeout(callback, delay);
+			if (delay === 2000) {
+				backoffTimer = timer;
+				startedBackoff();
+			}
+			return timer;
+		}) as typeof setTimeout);
+		try {
+			const startedAt = performance.now();
+			const resultPromise = proxyWithAccount(
+				request,
+				new URL(request.url),
+				account,
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				ledger,
+				undefined,
+				degradedState,
+			);
+			if (abortAt === "during backoff") {
+				await backoffStarted;
+				controller.abort();
+			}
+			const result = await resultPromise;
+			expect(performance.now() - startedAt).toBeLessThan(1000);
+			expect(result).toBeInstanceOf(Response);
+			expect((result as Response).status).toBe(499);
+			expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+			expect(ledger.physicalAttemptCount).toBe(1);
+			expect(reserveCalls).toBe(2);
+			expect(retryPermit.commit).not.toHaveBeenCalled();
+			expect(retryPermit.cancel).toHaveBeenCalledTimes(1);
+			expect(degradedState.lifecycle).toBeNull();
+			// Discard owns the same failed body through its response wrappers.
+			// It must drain it to EOF and release the reader, even on abort.
+			await new Promise<void>((resolve) => realSetTimeout(resolve, 0));
+			expect(failedResponse.bodyUsed).toBe(true);
+			expect(releaseLockCalls).toBe(1);
+			expect(failedBody.locked).toBe(false);
+			if (abortAt === "during backoff") {
+				expect(backoffTimer).toBeDefined();
+				expect(clearTimerSpy).toHaveBeenCalledWith(backoffTimer);
+				const abortListeners = addListenerSpy.mock.calls.filter(
+					([event]) => event === "abort",
+				);
+				expect(abortListeners.length).toBeGreaterThan(0);
+				for (const [, listener] of abortListeners) {
+					expect(removeListenerSpy).toHaveBeenCalledWith("abort", listener);
+				}
+			} else {
+				expect(backoffTimer).toBeUndefined();
+			}
+		} finally {
+			randomSpy.mockRestore();
+			clearTimerSpy.mockRestore();
+			addListenerSpy.mockRestore();
+			removeListenerSpy.mockRestore();
+			timerSpy.mockRestore();
+		}
+	});
+
+	it("removes the backoff abort listener when the retry timer completes", async () => {
+		captureForwardedResponse();
+		let calls = 0;
+		globalThis.fetch = mock(async () => {
+			calls++;
+			return calls === 1
+				? serverErrorResponse(503)
+				: new Response(successBody, { status: 200 });
+		});
+		const bodyBuffer = makeRequestBody();
+		const request = makeRequest(bodyBuffer);
+		const addListenerSpy = spyOn(request.signal, "addEventListener");
+		const removeListenerSpy = spyOn(request.signal, "removeEventListener");
+		try {
+			const { result } = await runProxy(
+				request,
+				makeAccount(),
+				bodyBuffer,
+				makeProxyContext(),
+			);
+			expect(result?.status).toBe(200);
+			expect(calls).toBe(2);
+			const abortListeners = addListenerSpy.mock.calls.filter(
+				([event]) => event === "abort",
+			);
+			expect(abortListeners.length).toBeGreaterThan(0);
+			for (const [, listener] of abortListeners) {
+				expect(removeListenerSpy).toHaveBeenCalledWith("abort", listener);
+			}
+		} finally {
+			addListenerSpy.mockRestore();
+			removeListenerSpy.mockRestore();
+		}
 	});
 
 	it("retries a 500 in place and forwards the succeeding response without benching", async () => {

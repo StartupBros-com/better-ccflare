@@ -19,6 +19,7 @@ import type {
 	AnthropicToolChoice,
 	ResponseItem,
 	ResponsesRequest,
+	ResponsesTool,
 } from "./types";
 
 const logger = new Logger("openai-responses-adapter");
@@ -403,6 +404,9 @@ export interface NativeToolReplayMetadata {
 export function translateRequestToAnthropic(
 	req: ResponsesRequest & { input: ResponseItem[] },
 	nativeReplay?: NativeToolReplayMetadata,
+	// Pass unchanged getRequestTools-validated declarations, or omit to prepare
+	// them here under the default byte limit.
+	preparedTools?: ResponsesTool[],
 ): AnthropicRequest {
 	const messages: AnthropicMessage[] = [];
 	const instructionBlocks: string[] = [];
@@ -844,7 +848,10 @@ export function translateRequestToAnthropic(
 	if (req.top_p !== undefined) result.top_p = req.top_p;
 	if (req.service_tier !== undefined) result.service_tier = req.service_tier;
 
-	const translatedTools = translateTools(getRequestTools(req), emitWarn);
+	const translatedTools = translateTools(
+		preparedTools ?? getRequestTools(req),
+		emitWarn,
+	);
 	if (translatedTools.length > 0) {
 		result.tools = translatedTools;
 		const toolChoice = translateToolChoice(req.tool_choice);

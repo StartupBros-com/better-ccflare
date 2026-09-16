@@ -7048,11 +7048,25 @@ export async function proxyWithAccount(
 							);
 							const delayMs = Math.random() * cap;
 							try {
-								await new Promise<void>((resolve) =>
-									setTimeout(resolve, delayMs),
-								);
+								req.signal.throwIfAborted();
+								await new Promise<void>((resolve, reject) => {
+									const onAbort = () => {
+										clearTimeout(timer);
+										req.signal.removeEventListener("abort", onAbort);
+										reject(req.signal.reason);
+									};
+									const timer = setTimeout(() => {
+										req.signal.removeEventListener("abort", onAbort);
+										resolve();
+									}, delayMs);
+									req.signal.addEventListener("abort", onAbort, { once: true });
+								});
+								// An abort can win after the timer resolves but before this
+								// continuation commits the reserved physical send.
+								req.signal.throwIfAborted();
 							} catch (error) {
 								cancelPhysicalSendReservation(degradedReservation);
+								await discardUpstreamBody(response);
 								throw error;
 							}
 

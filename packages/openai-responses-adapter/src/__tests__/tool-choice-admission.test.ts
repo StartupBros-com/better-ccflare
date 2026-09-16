@@ -68,7 +68,6 @@ for (const choice of [
 	{ type: "custom", name: "lookup", namespace: "tools" },
 	{ type: "custom", name: "exec" },
 	{ type: "function", name: "lookup" },
-	null,
 	[],
 	{},
 	4,
@@ -151,3 +150,15 @@ test("direct translator safely ignores malformed named-choice shapes", () => {
 		expect(translateRequestToAnthropic(input).tool_choice).toBeUndefined();
 	}
 });
+
+for (const tools of [[], declarations]) {
+	test(`null tool_choice dispatches with ${tools.length ? "declared" : "no"} tools`, async () => {
+		const { response, calls, outbound } = await requestWithChoice(null, tools);
+		expect(response.status).toBe(200);
+		expect(calls).toBe(1);
+		expect(outbound?.tool_choice).toBeUndefined();
+		expect(outbound?.__better_ccflare_codex_passthrough).toMatchObject({
+			tool_choice: null,
+		});
+	});
+}

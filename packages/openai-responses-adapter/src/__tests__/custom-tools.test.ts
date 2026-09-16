@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { BoundedJsonTooLargeError } from "@better-ccflare/core";
 import {
+	getCustomToolNames,
 	getRequestTools,
 	getResponseToolIdentity,
 	getTranslatedToolName,
 } from "../custom-tools";
 import { translateRequestToAnthropic } from "../request-translator";
 import { translateAnthropicResponseToResponses } from "../response-translator";
-import type { ResponsesRequest } from "../types";
+import type { ResponseItem, ResponsesRequest, ResponsesTool } from "../types";
 
 describe("Responses Lite tool declarations", () => {
 	test("extracts additional_tools namespaces and round-trips calls with their identities", () => {
@@ -163,4 +165,170 @@ describe("Responses Lite tool declarations", () => {
 			getResponseToolIdentity(alias, [{ type: "custom", name, namespace }]),
 		).toEqual({ name, namespace });
 	});
+});
+
+describe("bounded namespace expansion", () => {
+	test("rejects aggregate sibling expansion before copying any leaf", () => {
+		let payloadCopies = 0;
+		const leaf = (name: string): ResponsesTool => ({
+			type: "function",
+			name,
+			get parameters() {
+				payloadCopies++;
+				return { type: "object" };
+			},
+		});
+		const request = {
+			input: "hello",
+			tools: [
+				{
+					type: "namespace" as const,
+					name: "tools",
+					description: "x".repeat(80),
+					tools: [leaf("a"), leaf("b")],
+				},
+			],
+		};
+		// Each leaf fits; their combined inherited descriptions do not.
+		expect(() => getRequestTools(request, 100)).toThrow(
+			BoundedJsonTooLargeError,
+		);
+		expect(payloadCopies).toBe(0);
+	});
+
+	test("counts nested namespace names, UTF-8 descriptions and separators at the byte boundary", () => {
+		const request = {
+			input: "hello",
+			tools: [
+				{
+					type: "namespace" as const,
+					name: "tools",
+					description: "é",
+					tools: [
+						{
+							type: "namespace" as const,
+							name: "nested",
+							description: "子",
+							tools: [
+								{ type: "custom" as const, name: "exec", description: "🙂" },
+							],
+						},
+					],
+				},
+			],
+		};
+		const expectedBytes =
+			Buffer.byteLength("tools.nested") +
+			Buffer.byteLength("exec") +
+			Buffer.byteLength("é\n\n子\n\n🙂");
+		expect(() => getRequestTools(request, expectedBytes - 1)).toThrow(
+			BoundedJsonTooLargeError,
+		);
+		expect(getRequestTools(request, expectedBytes)).toEqual([
+			{
+				type: "custom",
+				name: "exec",
+				namespace: "tools.nested",
+				description: "é\n\n子\n\n🙂",
+			},
+		]);
+	});
+
+	test("budgets duplicate leaves before deduplication and inherited names without descriptions", () => {
+		const request = {
+			input: "hello",
+			tools: [
+				{
+					type: "namespace" as const,
+					name: "long_namespace",
+					tools: [
+						{ type: "function" as const, name: "exec" },
+						{ type: "function" as const, name: "exec" },
+					],
+				},
+			],
+		};
+		expect(() => getRequestTools(request, 20)).toThrow(
+			BoundedJsonTooLargeError,
+		);
+	});
+
+	test("translation and repeated response lookups reuse prepared declarations", () => {
+		const request: ResponsesRequest & { input: ResponseItem[] } = {
+			model: "test",
+			input: [{ type: "message", role: "user", content: "hello" }],
+			tools: [
+				{
+					type: "namespace",
+					name: "tools",
+					description: "Tools",
+					tools: [{ type: "custom", name: "exec", description: "Execute" }],
+				},
+			],
+		};
+		const prepared = getRequestTools(request, 1024);
+		Object.defineProperty(request, "tools", {
+			get() {
+				throw new Error("Repeated namespace expansion");
+			},
+		});
+		const translated = translateRequestToAnthropic(
+			request,
+			undefined,
+			prepared,
+		);
+		expect(translated.tools?.[0].description).toStartWith("Tools\n\nExecute");
+		Object.defineProperty(prepared[0], "description", {
+			get() {
+				throw new Error("Response lookup copied a declaration");
+			},
+		});
+		const alias = getTranslatedToolName("exec", "tools");
+		for (let i = 0; i < 3; i++) {
+			expect(getCustomToolNames(prepared)).toEqual(new Set([alias]));
+			expect(getResponseToolIdentity(alias, prepared)).toEqual({
+				name: "exec",
+				namespace: "tools",
+			});
+		}
+	});
+});
+
+test("direct translation and response helpers retain the default expansion ceiling", () => {
+	const tools: ResponsesTool[] = [
+		{
+			type: "namespace",
+			name: "tools",
+			description: "x".repeat(4096),
+			tools: Array.from({ length: 8193 }, () => ({
+				type: "custom",
+				name: "exec",
+			})),
+		},
+	];
+	const request: ResponsesRequest & { input: ResponseItem[] } = {
+		model: "test",
+		tools,
+		input: [{ type: "message", role: "user", content: "hello" }],
+	};
+	expect(() => translateRequestToAnthropic(request)).toThrow(
+		BoundedJsonTooLargeError,
+	);
+	expect(() => getCustomToolNames(tools)).toThrow(BoundedJsonTooLargeError);
+	expect(() => getResponseToolIdentity("exec", tools)).toThrow(
+		BoundedJsonTooLargeError,
+	);
+});
+
+test("unknown namespaced declarations cannot bypass the expansion ceiling", () => {
+	const tools = [
+		{
+			type: "namespace",
+			name: "x".repeat(80),
+			tools: [{ type: "web_search" }, { type: "web_search" }],
+		},
+	] as ResponsesTool[];
+	expect(() => getRequestTools({ input: "hello", tools }, 100)).toThrow(
+		BoundedJsonTooLargeError,
+	);
 });

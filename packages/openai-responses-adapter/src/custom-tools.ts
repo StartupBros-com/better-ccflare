@@ -1,9 +1,17 @@
 import { createHash } from "node:crypto";
+import {
+	BoundedJsonTooLargeError,
+	MAX_REQUEST_BODY_BYTES,
+} from "@better-ccflare/core";
+
 import type {
 	ResponsesRequest,
 	ResponsesTool,
 	ResponsesToolChoice,
 } from "./types";
+
+// Prepared arrays are request-scoped and reused unchanged by the translators.
+const flattenedToolSets = new WeakSet<ResponsesTool[]>();
 
 /** Shape validation shared by admission and direct translation; never coerces identity. */
 export function isNamedToolChoice(
@@ -24,6 +32,7 @@ export function isNamedToolChoice(
 /** Collect Responses Lite tool declarations without changing native input. */
 export function getRequestTools(
 	req: Pick<ResponsesRequest, "tools" | "input">,
+	byteLimit = MAX_REQUEST_BODY_BYTES,
 ): ResponsesTool[] {
 	const declarations: ResponsesTool[] = [];
 	if (Array.isArray(req.input)) {
@@ -46,18 +55,61 @@ export function getRequestTools(
 		}
 	}
 	if (Array.isArray(req.tools)) declarations.push(...req.tools);
-	return flattenTools(declarations);
+	return flattenTools(declarations, byteLimit);
 }
 
-function flattenTools(tools: ResponsesTool[]): ResponsesTool[] {
-	const result = new Map<string, ResponsesTool>();
-	const visit = (
+function flattenTools(
+	tools: ResponsesTool[],
+	byteLimit = MAX_REQUEST_BODY_BYTES,
+): ResponsesTool[] {
+	if (flattenedToolSets.has(tools)) return tools;
+
+	// First prove the total expanded strings fit, including overwritten leaves.
+	// Carry lengths down the tree: never concatenate or encode an inherited
+	// description per leaf just to measure it. Buffer.byteLength does not copy it.
+	let projectedBytes = 0;
+	const byteLength = (value: unknown): number =>
+		typeof value === "string" ? Buffer.byteLength(value, "utf8") : 0;
+	const measure = (
 		declarations: ResponsesTool[],
-		namespace?: string,
-		description?: string,
+		namespaceBytes = 0,
+		descriptionBytes = 0,
 		depth = 0,
 	): void => {
 		if (depth > 64) throw new Error("Tool namespace nesting exceeds the limit");
+		for (const tool of declarations) {
+			if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
+			const ownDescriptionBytes = byteLength(tool.description);
+			const inheritedDescriptionBytes =
+				descriptionBytes +
+				ownDescriptionBytes +
+				(descriptionBytes && ownDescriptionBytes ? 2 : 0);
+			if (tool.type === "namespace") {
+				if (!Array.isArray(tool.tools)) continue;
+				measure(
+					tool.tools,
+					namespaceBytes + byteLength(tool.name) + (namespaceBytes ? 1 : 0),
+					inheritedDescriptionBytes,
+					depth + 1,
+				);
+			} else if (tool.type === "function" || tool.type === "custom") {
+				projectedBytes +=
+					(namespaceBytes || byteLength(tool.namespace)) +
+					byteLength(tool.name) +
+					inheritedDescriptionBytes;
+			} else {
+				// Unknown/native declarations still create a namespace identity key.
+				projectedBytes += namespaceBytes + byteLength(tool.type);
+			}
+			if (projectedBytes > byteLimit) throw new BoundedJsonTooLargeError();
+		}
+	};
+	measure(tools);
+
+	const result = new Map<string, ResponsesTool>();
+	const namespaces: string[] = [];
+	const descriptions: string[] = [];
+	const visit = (declarations: ResponsesTool[]): void => {
 		for (const tool of declarations) {
 			if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
 				result.set(`malformed_${result.size}`, tool);
@@ -65,34 +117,43 @@ function flattenTools(tools: ResponsesTool[]): ResponsesTool[] {
 			}
 			if (tool.type === "namespace") {
 				if (!Array.isArray(tool.tools)) continue;
-				visit(
-					tool.tools,
-					namespace ? `${namespace}.${tool.name}` : tool.name,
-					[description, tool.description].filter(Boolean).join("\n\n"),
-					depth + 1,
-				);
+				namespaces.push(tool.name);
+				if (tool.description) descriptions.push(tool.description);
+				visit(tool.tools);
+				if (tool.description) descriptions.pop();
+				namespaces.pop();
 			} else if (tool.type === "function" || tool.type === "custom") {
-				const effectiveNamespace = namespace ?? tool.namespace;
+				const effectiveNamespace = namespaces.length
+					? namespaces.join(".")
+					: tool.namespace;
+				if (tool.description) descriptions.push(tool.description);
 				const effectiveTool = effectiveNamespace
 					? {
 							...tool,
 							namespace: effectiveNamespace,
-							description: [description, tool.description]
-								.filter(Boolean)
-								.join("\n\n"),
+							description: descriptions.join("\n\n"),
 						}
 					: tool;
+				if (tool.description) descriptions.pop();
 				result.set(
 					JSON.stringify([effectiveNamespace, tool.name]),
 					effectiveTool,
 				);
 			} else {
-				result.set(JSON.stringify([namespace, tool.type]), tool);
+				result.set(
+					JSON.stringify([
+						namespaces.length ? namespaces.join(".") : undefined,
+						tool.type,
+					]),
+					tool,
+				);
 			}
 		}
 	};
 	visit(tools);
-	return [...result.values()];
+	const flattened = [...result.values()];
+	flattenedToolSets.add(flattened);
+	return flattened;
 }
 
 /** Anthropic names are flat and limited to 64 ASCII identifier characters. */

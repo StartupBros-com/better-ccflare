@@ -7,7 +7,7 @@ export interface ResponsesRequest {
 	input: string | ResponseItem[];
 	instructions?: string;
 	tools?: ResponsesTool[];
-	tool_choice?: string | ResponsesToolChoice;
+	tool_choice?: string | ResponsesToolChoice | null;
 	parallel_tool_calls?: boolean;
 	stream?: boolean;
 	reasoning?: ResponsesReasoning;

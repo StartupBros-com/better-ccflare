@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { supportsUsagePauseThreshold } from "@better-ccflare/core";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import { BunSqlAdapter } from "@better-ccflare/database";
 import { RoutingTransitionRecorder } from "@better-ccflare/load-balancer";
@@ -77,6 +78,14 @@ describe("persistForwardOnlyCodexRateLimitReset", () => {
 });
 
 describe("supportsRefreshBackedUsagePolling", () => {
+	it("keeps xAI credits polling enabled independently of window pause controls", () => {
+		expect(supportsUsagePauseThreshold("xai")).toBe(false);
+		expect(supportsRefreshBackedUsagePolling("xai")).toBe(true);
+		expect(accountSupportsRefreshBackedUsagePolling({ provider: "xai" })).toBe(
+			true,
+		);
+	});
+
 	it("includes pollable OAuth providers that need token refresh", () => {
 		expect(supportsRefreshBackedUsagePolling("anthropic")).toBe(true);
 		expect(supportsRefreshBackedUsagePolling("xai")).toBe(true);

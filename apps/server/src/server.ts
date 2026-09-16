@@ -27,7 +27,6 @@ import {
 	setForceAccountModel,
 	setPricingLogger,
 	shutdown,
-	supportsUsagePauseThreshold,
 	TIME_CONSTANTS,
 	USAGE_THRESHOLD_PAUSE_REASON,
 } from "@better-ccflare/core";
@@ -218,15 +217,14 @@ const MEMORY_GROWTH_WARN_BYTES = 512 * 1024 * 1024;
 const MEMORY_GROWTH_ERROR_BYTES = 1024 * 1024 * 1024;
 
 /**
- * Also the set of providers whose usage poller evaluates pause thresholds
- * (`applyUsagePauseThresholds` below) — kept as one function,
- * `supportsUsagePauseThreshold` in @better-ccflare/core, so the dashboard/CLI/API
- * threshold controls and the poller that actually acts on them can't drift apart.
+ * Providers with refresh-backed free usage endpoints. This is independent of
+ * pause-threshold support: xAI reports credits rather than five-hour/weekly
+ * windows, but still needs usage polling and token refresh.
  */
 export function supportsRefreshBackedUsagePolling(
 	provider: string | null | undefined,
 ): boolean {
-	return supportsUsagePauseThreshold(provider);
+	return provider === "anthropic" || provider === "codex" || provider === "xai";
 }
 
 /**

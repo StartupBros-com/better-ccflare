@@ -206,6 +206,7 @@ function hasUnsatisfiedToolChoice(
 	if (toolChoice === "required") return !hasCompatibleFunctionTool(tools);
 	if (
 		toolChoice === undefined ||
+		toolChoice === null ||
 		toolChoice === "auto" ||
 		toolChoice === "none"
 	)
@@ -461,6 +462,8 @@ export async function handleResponsesRequest(
 			if (
 				typeof definition.name !== "string" ||
 				!definition.name ||
+				(definition.description !== undefined &&
+					typeof definition.description !== "string") ||
 				!Array.isArray(definition.tools)
 			)
 				return openAiRequestError(400, "Invalid namespace tool definition");
@@ -469,8 +472,11 @@ export async function handleResponsesRequest(
 	}
 	let requestTools: ReturnType<typeof getRequestTools>;
 	try {
-		requestTools = getRequestTools(body);
-	} catch {
+		requestTools = getRequestTools(body, requestBodyLimit);
+	} catch (error) {
+		if (error instanceof BoundedJsonTooLargeError) {
+			return openAiRequestError(413, "Request body too large");
+		}
 		return openAiRequestError(400, "Invalid tool namespace nesting");
 	}
 	if (hasUnsatisfiedToolChoice(requestTools, body.tool_choice)) {
@@ -498,6 +504,7 @@ export async function handleResponsesRequest(
 		anthropicBody = translateRequestToAnthropic(
 			body as typeof body & { input: ResponseItem[] },
 			nativeReplay,
+			requestTools,
 		);
 	} catch (error) {
 		if (error instanceof InvalidInstructionError) {
@@ -786,7 +793,7 @@ export async function handleResponsesRequest(
 			anthropicResp,
 			responseId,
 			body.model,
-			getRequestTools(body),
+			requestTools,
 		);
 	}
 
@@ -812,7 +819,7 @@ export async function handleResponsesRequest(
 			respBody as Parameters<typeof translateAnthropicResponseToResponses>[0],
 			responseId,
 			body.model,
-			getRequestTools(body),
+			requestTools,
 		);
 	} catch {
 		return new Response(

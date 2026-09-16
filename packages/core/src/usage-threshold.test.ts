@@ -4,6 +4,7 @@ import {
 	evaluateUsagePause,
 	parseUsagePauseThreshold,
 	readUsageUtilization,
+	supportsUsagePauseThreshold,
 	USAGE_THRESHOLD_PAUSE_REASON,
 } from "./usage-threshold";
 
@@ -350,5 +351,31 @@ describe("effectiveThreshold", () => {
 		expect(effectiveThreshold({ enabled: true, percent: null })).toBeNull();
 		expect(effectiveThreshold(null)).toBeNull();
 		expect(effectiveThreshold(undefined)).toBeNull();
+	});
+});
+
+describe("supportsUsagePauseThreshold", () => {
+	it("only exposes providers with supported five-hour and weekly snapshots", () => {
+		expect(supportsUsagePauseThreshold("anthropic")).toBe(true);
+		expect(supportsUsagePauseThreshold("codex")).toBe(true);
+		for (const provider of ["xai", "qwen", "nanogpt", null, undefined]) {
+			expect(supportsUsagePauseThreshold(provider)).toBe(false);
+		}
+	});
+
+	it("does not offer window thresholds for xAI's distinct credits payload", () => {
+		const utilization = readUsageUtilization({
+			credits: { utilization: 95, resets_at: "2026-09-16T12:00:00.000Z" },
+		});
+		expect(utilization).toEqual({ fiveHour: null, weekly: null });
+		expect(
+			evaluateUsagePause({
+				thresholds: { fiveHour: on(80), weekly: on(80) },
+				utilization,
+				paused: false,
+				pauseReason: null,
+			}),
+		).toEqual({ action: "none" });
+		expect(supportsUsagePauseThreshold("xai")).toBe(false);
 	});
 });
