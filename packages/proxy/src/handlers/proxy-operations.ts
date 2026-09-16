@@ -2670,6 +2670,7 @@ export async function proxyWithAccount(
 	 * budget and throw instead of returning.
 	 */
 	const makeAttemptRequest = async (
+		provider: Provider,
 		request: Request,
 		// This physical attempt's replay body, exactly as it will be sent (after
 		// model forcing and any retry-loop body mutation). `makeAttemptRequest`
@@ -2727,7 +2728,7 @@ export async function proxyWithAccount(
 				// websocket/optional-transport path above, which never reaches
 				// this line.
 				return await forwardObservedUpstream(
-					ctx.provider,
+					provider,
 					request,
 					{
 						requestId: requestMeta.id,
@@ -2847,8 +2848,11 @@ export async function proxyWithAccount(
 
 		// Get the provider for this account before applying the staging policy: the
 		// resolved provider (including ctx fallback) determines replay safety.
-		const provider = resolveProviderForAccount(account.provider, ctx.provider);
-		if (!provider) {
+		const resolvedProvider = resolveProviderForAccount(
+			account.provider,
+			ctx.provider,
+		);
+		if (!resolvedProvider) {
 			throw new ServerToolCandidateCapabilityError({
 				accountId: account.id,
 				candidateId:
@@ -2856,6 +2860,7 @@ export async function proxyWithAccount(
 				reason: "provider_unavailable",
 			});
 		}
+		const provider = resolvedProvider;
 		const requestedModelBeforeAdmission = effectiveBodyContext.getModel();
 		const cacheReplayPhysicalModel = req.headers.get(CACHE_REPLAY_MODEL_HEADER);
 		const requestedConfiguredModelMapping = requestedModelBeforeAdmission
@@ -4231,6 +4236,7 @@ export async function proxyWithAccount(
 					? new Request(transportRequest, { redirect: "manual" })
 					: transportRequest;
 				const response = await makeAttemptRequest(
+					provider,
 					httpTransportRequest,
 					replayBody,
 					attemptPlan.providerName === "codex" && !hasCodexTurnStateReplay
