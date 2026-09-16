@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { Account } from "@better-ccflare/types";
+import {
+	drainReaderWithDeadline,
+	getResponseDrainTransport,
+	registerResponseDrainTransport,
+} from "../../utils/stream-drain";
 import { CodexCacheDiagnostics } from "./cache-diagnostics";
 import {
 	type CacheFacts,
@@ -234,6 +239,58 @@ describe("cache capture at final wire boundary", () => {
 		]);
 		expect(rows.some((row) => row.gap_reason === "invalid_json")).toBe(true);
 		expect(JSON.stringify(rows)).not.toContain("PRIVATE-");
+	});
+
+	test("drain deadline aborts the exact stalled transport through the observer", async () => {
+		const { start, rows } = harness();
+		const observer = await start("stalled-transport", true);
+		const transportAbort = new AbortController();
+		const events: string[] = [];
+		const upstream = new Response(
+			new ReadableStream<Uint8Array>(
+				{
+					start(controller) {
+						transportAbort.signal.addEventListener(
+							"abort",
+							() => {
+								events.push("transport-aborted");
+								controller.error(transportAbort.signal.reason);
+							},
+							{ once: true },
+						);
+					},
+					pull() {
+						events.push("read-started");
+						// No EOF or bytes: only aborting this transport settles the read.
+					},
+				},
+				{ highWaterMark: 0 },
+			),
+			{ headers: { "content-type": "text/event-stream" } },
+		);
+		registerResponseDrainTransport(upstream, transportAbort);
+		const observed = observer.response(upstream);
+		const reader = observed.body?.getReader();
+		if (!reader) throw new Error("Expected observed response body");
+
+		try {
+			await drainReaderWithDeadline(reader, {
+				deadlineMs: 5,
+				drainAbort: getResponseDrainTransport(observed),
+				swallowErrors: true,
+			});
+
+			expect(transportAbort.signal.aborted).toBe(true);
+			expect(getResponseDrainTransport(observed)).toBe(transportAbort);
+			expect(events).toEqual(["read-started", "transport-aborted"]);
+			expect(transportAbort.signal.reason.message).toBe(
+				"Drain deadline exceeded",
+			);
+			expect(observed.body?.locked).toBe(false);
+			expect(rows.at(-1)?.event).toBe("transport_error");
+		} finally {
+			transportAbort.abort();
+		}
 	});
 
 	test("oversize observations are explicit while request and response remain usable", async () => {
