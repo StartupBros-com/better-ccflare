@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { SessionDrainSoonestStrategy } from "@better-ccflare/load-balancer";
 import type {
 	Account,
@@ -369,11 +369,329 @@ describe("SessionDrainSoonestStrategy", () => {
 		expect(ordered[0]?.id).toBe("no-reset");
 	});
 
-	describe("codex upstream window reset ends the session", () => {
-		// Fork stickiness is explicit per client/lane rather than inferred from
-		// the newest account.session_start. A crossed Codex window releases that
-		// ordinary owner so drain ranking can run, while an open window keeps it.
-		it("releases drain ranking once the reported window has reset", async () => {
+	describe("warm Codex session ownership", () => {
+		const pressureMeta = (clientSessionId = "warm-client"): RequestMeta => ({
+			...meta(clientSessionId),
+			quotaPressureByAccountId: new Map([
+				["owner", { band: "cold", comparisonKey: "weekly" }],
+				["urgent", { band: "critical", comparisonKey: "weekly" }],
+			]),
+		});
+
+		it("keeps an existing owner across burn bands while new sessions use quota ranking", async () => {
+			const owner = makeAccount({ id: "owner", provider: "codex" });
+			const urgent = makeAccount({ id: "urgent", provider: "codex" });
+			await strategy.select([owner], meta("warm-client"));
+
+			expect((await strategy.select([urgent, owner], pressureMeta()))[0]).toBe(
+				owner,
+			);
+			expect(
+				(await strategy.select([owner, urgent], pressureMeta("new-client")))[0],
+			).toBe(urgent);
+			expect(
+				strategy.snapshotAffinityOwner(meta("warm-client"))?.accountId,
+			).toBe(owner.id);
+			expect(
+				strategy.getRoutingHealth().transitions.outclassRemaps.sameTier,
+			).toBe(0);
+		});
+
+		it.each([
+			["strict Codex", "codex", "strict"],
+			["sticky Anthropic", "anthropic", "sticky"],
+		] as const)("preserves %s pressure remapping", async (_name, provider, mode) => {
+			const legacy = new SessionDrainSoonestStrategy(undefined, mode);
+			legacy.initialize(store);
+			const owner = makeAccount({ id: "owner", provider });
+			const urgent = makeAccount({ id: "urgent", provider });
+			await legacy.select([owner], meta("warm-client"));
+			expect((await legacy.select([owner, urgent], pressureMeta()))[0]).toBe(
+				urgent,
+			);
+		});
+
+		it("keeps a warmed temporary fallback across burn bands and still snaps back to its better tier", async () => {
+			const primary = makeAccount({
+				id: "primary",
+				provider: "codex",
+				priority: 0,
+			});
+			const owner = makeAccount({
+				id: "owner",
+				provider: "codex",
+				priority: 1,
+			});
+			const urgent = makeAccount({
+				id: "urgent",
+				provider: "codex",
+				priority: 1,
+			});
+			await strategy.select([primary, owner], meta("warm-client"));
+			const primaryDown = {
+				...primary,
+				rate_limited_until: Date.now() + 60_000,
+			};
+			expect(
+				(await strategy.select([primaryDown, owner], meta("warm-client")))[0],
+			).toBe(owner);
+			expect(
+				(
+					await strategy.select([primaryDown, urgent, owner], pressureMeta())
+				)[0],
+			).toBe(owner);
+			expect(
+				(await strategy.select([primary, urgent, owner], pressureMeta()))[0],
+			).toBe(primary);
+		});
+
+		it.each([
+			false,
+			true,
+		])("does not probe a pressure-only competitor ahead of a warm owner (temporary fallback: %s)", async (temporaryFallback) => {
+			let now = Date.now();
+			const clock = spyOn(Date, "now").mockImplementation(() => now);
+			try {
+				const clocked = new SessionDrainSoonestStrategy();
+				clocked.initialize(store);
+				const owner = makeAccount({
+					id: "owner",
+					provider: "codex",
+					priority: 1,
+				});
+				const urgent = makeAccount({
+					id: "urgent",
+					provider: "codex",
+					priority: 1,
+				});
+				const primary = makeAccount({
+					id: "primary",
+					provider: "codex",
+					priority: 0,
+				});
+				if (temporaryFallback) {
+					await clocked.select([primary, owner], meta("warm-client"));
+					primary.rate_limited_until = now + 60_000;
+				}
+				const accounts = temporaryFallback
+					? [primary, owner, urgent]
+					: [owner, urgent];
+				await clocked.select(
+					temporaryFallback ? [primary, owner] : [owner],
+					meta("warm-client"),
+				);
+				clocked.reportCandidateFailure(meta("warm-client"), {
+					candidateId: "account:urgent",
+					reason: "semantic_stream_stall",
+					suppressForMs: 100,
+				});
+				now += 100;
+				expect((await clocked.select(accounts, pressureMeta()))[0]).toBe(owner);
+				// Declining this unused probe must not consume its single-flight lease.
+				clocked.reportCandidateFailure(meta("warm-client"), {
+					candidateId: "account:owner",
+					reason: "semantic_stream_stall",
+					suppressForMs: 100,
+				});
+				expect((await clocked.select(accounts, pressureMeta()))[0]).toBe(
+					urgent,
+				);
+			} finally {
+				clock.mockRestore();
+			}
+		});
+
+		it("still probes a recovered better tier ahead of a Codex fallback", async () => {
+			let now = Date.now();
+			const clock = spyOn(Date, "now").mockImplementation(() => now);
+			try {
+				const clocked = new SessionDrainSoonestStrategy();
+				clocked.initialize(store);
+				const primary = makeAccount({
+					id: "primary",
+					provider: "codex",
+					priority: 0,
+				});
+				const owner = makeAccount({
+					id: "owner",
+					provider: "codex",
+					priority: 1,
+				});
+				await clocked.select([primary, owner], meta("warm-client"));
+				clocked.reportCandidateFailure(meta("warm-client"), {
+					candidateId: "account:primary",
+					reason: "semantic_stream_stall",
+					suppressForMs: 100,
+				});
+				expect(
+					(await clocked.select([primary, owner], meta("warm-client")))[0],
+				).toBe(owner);
+				now += 100;
+				expect(
+					(await clocked.select([primary, owner], meta("warm-client")))[0],
+				).toBe(primary);
+			} finally {
+				clock.mockRestore();
+			}
+		});
+
+		it.each([
+			false,
+			true,
+		])("preserves better fallback-rung recovery (circuit recovery: %s)", async (circuitRecovery) => {
+			let now = Date.now();
+			const clock = spyOn(Date, "now").mockImplementation(() => now);
+			try {
+				const clocked = new SessionDrainSoonestStrategy();
+				clocked.initialize(store);
+				const shared = makeAccount({ id: "shared", provider: "codex" });
+				const requested = {
+					candidateId: "shared:requested",
+					accountId: shared.id,
+					tier: 0,
+					ordinal: 0,
+					comboSlotId: null,
+					modelOverride: "gpt-6-astra",
+					quotaPressure: null,
+					routeFallbackRung: "profile_requested_model" as const,
+				};
+				const fallback = {
+					...requested,
+					candidateId: "shared:root",
+					ordinal: 1,
+					modelOverride: "gpt-5.6-sol",
+					routeFallbackRung: "profile_root_model" as const,
+				};
+				if (circuitRecovery) {
+					await clocked.select([shared], {
+						...meta("warm-client"),
+						routingCandidates: [requested],
+					});
+					clocked.reportCandidateFailure(meta("warm-client"), {
+						candidateId: requested.candidateId,
+						reason: "semantic_stream_stall",
+						suppressForMs: 100,
+					});
+				}
+				await clocked.select([shared], {
+					...meta("warm-client"),
+					routingCandidates: [fallback],
+				});
+				now += 100;
+				const recovered = {
+					...meta("warm-client"),
+					routingCandidates: [fallback, requested],
+				};
+				await clocked.select([shared, shared], recovered);
+				expect(recovered.routingCandidates[0]?.candidateId).toBe(
+					requested.candidateId,
+				);
+			} finally {
+				clock.mockRestore();
+			}
+		});
+
+		it("still upgrades a temporary Codex fallback when a better tier is available", async () => {
+			const primary = makeAccount({
+				id: "primary",
+				provider: "codex",
+				priority: 0,
+			});
+			const owner = makeAccount({
+				id: "owner",
+				provider: "codex",
+				priority: 2,
+			});
+			const better = makeAccount({
+				id: "better",
+				provider: "codex",
+				priority: 1,
+			});
+			await strategy.select([primary, owner], meta("warm-client"));
+			primary.rate_limited_until = Date.now() + 60_000;
+			expect(
+				(await strategy.select([primary, owner], meta("warm-client")))[0],
+			).toBe(owner);
+			expect(
+				(
+					await strategy.select([primary, owner, better], meta("warm-client"))
+				)[0],
+			).toBe(better);
+		});
+
+		it("preserves exact warm combo slot identity when sibling slots have higher pressure", async () => {
+			const shared = makeAccount({ id: "shared", provider: "codex" });
+			const owner = {
+				candidateId: "shared:astra",
+				accountId: shared.id,
+				tier: 0,
+				ordinal: 0,
+				comboSlotId: "astra",
+				modelOverride: "gpt-6-astra",
+				quotaPressure: { band: "cold" as const, comparisonKey: "weekly" },
+			};
+			const sibling = {
+				...owner,
+				candidateId: "shared:sol",
+				ordinal: 1,
+				comboSlotId: "sol",
+				modelOverride: "gpt-5.6-sol",
+				quotaPressure: { band: "critical" as const, comparisonKey: "weekly" },
+			};
+			await strategy.select([shared], {
+				...meta("warm-client"),
+				routingCandidates: [owner],
+			});
+			const followup = {
+				...meta("warm-client"),
+				routingCandidates: [sibling, owner],
+			};
+			await strategy.select([shared, shared], followup);
+			expect(
+				followup.routingCandidates.map((candidate) => candidate.candidateId),
+			).toEqual([owner.candidateId, sibling.candidateId]);
+			expect(followup.routingCandidates[0]?.modelOverride).toBe("gpt-6-astra");
+		});
+
+		it.each([
+			"paused",
+			"rate-limited",
+			"capacity-excluded",
+			"circuit-open",
+			"removed",
+		])("fails over from an owner that is %s", async (reason) => {
+			const owner = makeAccount({ id: "owner", provider: "codex" });
+			const urgent = makeAccount({ id: "urgent", provider: "codex" });
+			await strategy.select([owner], meta("warm-client"));
+			const request = pressureMeta();
+			if (reason === "paused") owner.paused = true;
+			if (reason === "rate-limited")
+				owner.rate_limited_until = Date.now() + 60_000;
+			// The request planner marks exhausted capacity as a hard exclusion.
+			if (reason === "capacity-excluded")
+				request.hardExcludedAccountIds = new Set([owner.id]);
+			if (reason === "circuit-open")
+				strategy.reportCandidateFailure(request, {
+					candidateId: "account:owner",
+					reason: "semantic_stream_stall",
+					suppressForMs: 60_000,
+				});
+			expect(
+				(
+					await strategy.select(
+						reason === "removed" ? [urgent] : [owner, urgent],
+						request,
+					)
+				)[0],
+			).toBe(urgent);
+			expect(
+				strategy.snapshotAffinityOwner(meta("warm-client"))?.accountId,
+			).toBe(urgent.id);
+		});
+	});
+
+	describe("codex upstream window reset preserves warm affinity", () => {
+		it("retains the healthy owner and resets its accounting after rollover", async () => {
 			const now = Date.now();
 			const requestMeta = meta("codex-window-client");
 			const rolledOver = makeAccount({
@@ -399,10 +717,38 @@ describe("SessionDrainSoonestStrategy", () => {
 				requestMeta,
 			);
 
-			expect(result[0]).toBe(drainsSooner);
+			expect(result[0]).toBe(rolledOver);
+			expect(store.resetCalls).toContain(rolledOver.id);
+			expect(rolledOver.session_request_count).toBe(0);
+			expect(rolledOver.session_start).toBeGreaterThanOrEqual(now);
 			expect(strategy.peek([rolledOver, drainsSooner])).toBe(
 				"codex-drains-sooner",
 			);
+		});
+
+		it("keeps strict Codex drain placement after a window rollover", async () => {
+			const strict = new SessionDrainSoonestStrategy(undefined, "strict");
+			strict.initialize(store);
+			const now = Date.now();
+			const previous = makeAccount({
+				id: "previous",
+				provider: "codex",
+				session_start: now - 60 * 60 * 1000,
+				rate_limit_reset: now + 60_000,
+			});
+			const sooner = makeAccount({ id: "sooner", provider: "codex" });
+			await strict.select([previous], meta("strict-window-client"));
+			previous.rate_limit_reset = now - 2000;
+			store.weeklyResets.set(previous.id, now + 5 * 24 * 60 * 60 * 1000);
+			store.weeklyResets.set(sooner.id, now + 30 * 60 * 1000);
+			expect(
+				(
+					await strict.select([previous, sooner], meta("strict-window-client"))
+				)[0],
+			).toBe(sooner);
+			expect(
+				strict.snapshotAffinityOwner(meta("strict-window-client")),
+			).toBeNull();
 		});
 
 		it("resets a rolled-over affinity owner when it is the only candidate", async () => {

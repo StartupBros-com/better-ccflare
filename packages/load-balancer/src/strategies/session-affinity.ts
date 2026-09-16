@@ -809,6 +809,14 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		return this.rankByLeastUsed(candidates, now, meta);
 	}
 
+	/** Opt-in cache policy; fresh ranking and unavailable-owner failover are unchanged. */
+	protected preservesAffinityAcrossQuotaPressure(
+		_owner: StrategyCandidate,
+		_challenger: StrategyCandidate,
+	): boolean {
+		return false;
+	}
+
 	/** Strategy variants may invalidate an ordinary sticky owner. */
 	protected canRetainAffinityOwner(
 		_candidate: StrategyCandidate,
@@ -878,7 +886,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		if (
 			fallback &&
 			best &&
-			isSameStrategyCandidateClass(fallback, best, meta)
+			(isSameStrategyCandidateClass(fallback, best, meta) ||
+				this.preservesAffinityAcrossQuotaPressure(fallback, best))
 		) {
 			return [
 				fallback,
@@ -1236,6 +1245,21 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 				mapping && now - mapping.assignedAt < this.affinityTtlMs
 					? mapping
 					: undefined;
+			// A healthy current owner (including a temporary fallback) must not lose
+			// its warm cache to a pressure-only recovery probe. Looking only at
+			// closed candidates preserves hard exclusions and route circuit safety.
+			const activeClosedOwner = activeMapping
+				? (closedCandidates.find(
+						(candidate) =>
+							candidate.routing.candidateId === activeMapping.candidateId &&
+							candidate.account.id === activeMapping.accountId,
+					) ??
+					closedCandidates.find(
+						(candidate) =>
+							candidate.routing.candidateId ===
+							activeMapping.fallbackCandidateId,
+					))
+				: undefined;
 			const upgradeSuppressed =
 				activeMapping !== undefined &&
 				activeMapping.suppressUpgradesUntil !== null &&
@@ -1253,7 +1277,16 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					now,
 					false,
 					(candidate) =>
-						compareStrategyCandidates(candidate, bestClosedCandidate, meta) < 0,
+						compareStrategyCandidates(candidate, bestClosedCandidate, meta) <
+							0 &&
+						!(
+							activeClosedOwner &&
+							this.canRetainAffinityOwner(activeClosedOwner, now, meta) &&
+							this.preservesAffinityAcrossQuotaPressure(
+								activeClosedOwner,
+								candidate,
+							)
+						),
 					(a, b) => compareStrategyCandidates(a, b, meta),
 				);
 				if (forcedPriorityProbe) {
@@ -1328,7 +1361,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					mapped &&
 					best &&
 					this.canRetainAffinityOwner(mapped, now, meta) &&
-					isSameStrategyCandidateClass(mapped, best, meta)
+					(isSameStrategyCandidateClass(mapped, best, meta) ||
+						this.preservesAffinityAcrossQuotaPressure(mapped, best))
 				) {
 					// STICKY hit: keep the client on its account (prompt-cache reuse).
 					// Refresh assignedAt so an active session keeps its mapping alive.

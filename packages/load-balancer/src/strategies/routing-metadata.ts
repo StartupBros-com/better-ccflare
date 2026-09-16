@@ -255,18 +255,24 @@ export function isSameRoutingClass(
 	return accountPressure.band === bestPressure.band;
 }
 
+/** Route tier and fallback rung, independent of account quota pressure. */
+export function isSameStrategyCandidateRouteClass(
+	candidate: StrategyCandidate,
+	other: StrategyCandidate,
+): boolean {
+	return (
+		routeFallbackRank(candidate.routing) === routeFallbackRank(other.routing) &&
+		candidate.routing.tier === other.routing.tier
+	);
+}
+
 /** Whether two exact candidates remain in the same sticky routing class. */
 export function isSameStrategyCandidateClass(
 	candidate: StrategyCandidate,
 	best: StrategyCandidate,
 	meta?: RequestMeta,
 ): boolean {
-	if (
-		routeFallbackRank(candidate.routing) !== routeFallbackRank(best.routing)
-	) {
-		return false;
-	}
-	if (candidate.routing.tier !== best.routing.tier) return false;
+	if (!isSameStrategyCandidateRouteClass(candidate, best)) return false;
 
 	const candidatePressure =
 		candidate.routing.quotaPressure ??

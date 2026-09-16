@@ -456,11 +456,13 @@ The active strategy then applies its routing semantics:
   lane. Each client/lane stays on its owner until expiry; a temporary fallback
   can serve while the preferred owner is unavailable without deleting the
   preferred mapping.
-- `session-drain-soonest` uses the same sticky-owner lifecycle as
-  `session-affinity`. It changes only fresh-assignment and account-failover
-  ordering, preferring the earliest known future all-model weekly reset within
-  the same structural route class. Unknown or stale reset telemetry fails open
-  to ordinary affinity ordering.
+- `session-drain-soonest` prefers the earliest known future all-model weekly
+  reset for fresh assignments and account failover within the same structural
+  route class. Unknown or stale reset telemetry fails open to ordinary affinity
+  ordering. Existing eligible Codex owners, including temporary fallbacks, stay
+  sticky across quota-pressure changes within the same tier and fallback rung,
+  and across usage-window rollovers. Account session counters still reset when
+  their usage window rolls over.
 - `least-used` has no sticky owner. It orders available accounts by priority and
   utilization for each request and uses a bounded recency penalty to spread
   concurrent bursts.
@@ -541,13 +543,25 @@ the provider and credential type benefit from account stickiness:
 - `session-affinity` keeps a separate sticky owner for each client session or
   affinity lane. This spreads concurrent clients across healthy accounts while
   preserving prompt-cache locality within each client.
-- `session-drain-soonest` is deliberately opt-in. It inherits the
-  `session-affinity` owner lifecycle, so it never displaces an existing owner
-  just because another account has an earlier reset. On a fresh assignment or
-  account-level failover only, a known future all-model weekly reset is used to
-  order candidates within the same structural route class, followed by normal
-  priority and utilization tie-breakers. Missing, malformed, or past reset
-  telemetry is unknown and fails open to ordinary affinity ordering.
+- `session-drain-soonest` is deliberately opt-in. A healthy existing Codex owner
+  or temporary fallback keeps its current route to preserve cache locality when
+  a same-tier, same-rung account enters a more urgent quota-pressure band,
+  including when that other route becomes eligible for a recovery probe. A normal usage-window rollover
+  resets the owner's account session counters without moving the conversation.
+  New assignments and necessary failovers still use quota-aware ranking and
+  earliest known future all-model weekly reset ordering within one structural
+  class. Missing, malformed, or past reset telemetry is unknown and fails open
+  to ordinary affinity ordering. Unavailable or excluded owners still fail over;
+  existing better-tier and fallback-rung recovery rules remain in effect.
+  Other providers and the per-request `session-drain-soonest-strict` mode keep
+  their existing behavior.
+
+Client/lane affinity is held in a bounded, process-local map, separate from the
+account session counters in the database. An active lane refreshes its idle TTL
+(default five hours), but a restart, strategy replacement, expired or evicted
+entry, or changed session/lane identity can require a new assignment. Sticky
+routing therefore preserves an eligible owner within that lifetime; it is not a
+durable account lock or a guarantee that the upstream still has a cached prefix.
 
 ### Per-request spreading
 
