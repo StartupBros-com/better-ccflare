@@ -6334,7 +6334,7 @@ describe("Anthropic stream runtime configuration", () => {
 });
 
 describe("Anthropic precommit rescue runtime configuration", () => {
-	it("restores the bounded eight-minute commitment only for Claude Code clients", () => {
+	it("restores the bounded fourteen-minute commitment only for Claude Code clients", () => {
 		delete process.env[MEANINGFUL_PROGRESS_ENV];
 		delete process.env[RESCUE_ACTIVATION_ENV];
 		delete process.env[RESCUE_PING_ENV];
@@ -6358,7 +6358,7 @@ describe("Anthropic precommit rescue runtime configuration", () => {
 		expect(getAnthropicPreCommitRescueConfig(claudeCodeRequest)).toEqual({
 			activationGraceMs: ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
 			pingIntervalMs: ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS,
-			commitmentDeadlineMs: 8 * 60 * 1000,
+			commitmentDeadlineMs: 14 * 60 * 1000,
 		});
 		expect(getAnthropicPreCommitRescueConfig(genericRequest)).toEqual({
 			activationGraceMs: ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,

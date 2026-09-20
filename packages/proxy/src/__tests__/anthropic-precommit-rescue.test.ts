@@ -1,11 +1,15 @@
-import { describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock } from "bun:test";
 import {
+	ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV,
+	ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV,
 	ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME,
 	ANTHROPIC_PRECOMMIT_RESCUE_PARTIAL_ERROR_FRAME,
 	ANTHROPIC_PRECOMMIT_RESCUE_PING_FRAME,
+	CLAUDE_CODE_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
 	coordinateAnthropicPreCommitRescue,
 	createAnthropicPreCommitRescueActivation,
 	createAnthropicPreCommitRescueRouteContext,
+	getAnthropicPreCommitRescueConfig,
 	markAnthropicContextOverflowTerminal,
 } from "../anthropic-precommit-rescue";
 
@@ -771,5 +775,52 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 		} finally {
 			process.off("unhandledRejection", unhandledRejection);
 		}
+	});
+});
+
+describe("getAnthropicPreCommitRescueConfig Claude Code budget (#356)", () => {
+	const CLAUDE_CODE_USER_AGENT = "claude-cli/2.1.277 (external, cli)";
+
+	function makeClaudeCodeRequest(): Request {
+		return new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: { "user-agent": CLAUDE_CODE_USER_AGENT },
+		});
+	}
+
+	afterEach(() => {
+		delete process.env[ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV];
+		delete process.env[ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV];
+	});
+
+	it("defaults to the 14-minute budget for a Claude Code client with no env set", () => {
+		delete process.env[ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV];
+		delete process.env[ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV];
+
+		expect(CLAUDE_CODE_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS).toBe(840_000);
+		expect(
+			getAnthropicPreCommitRescueConfig(makeClaudeCodeRequest())
+				.commitmentDeadlineMs,
+		).toBe(840_000);
+	});
+
+	it("caps the legacy rescue-deadline env at the 14-minute default via Math.min", () => {
+		delete process.env[ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV];
+		process.env[ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV] = "900000";
+
+		expect(
+			getAnthropicPreCommitRescueConfig(makeClaudeCodeRequest())
+				.commitmentDeadlineMs,
+		).toBe(840_000);
+	});
+
+	it("lets the canonical meaningful-progress env raise the budget above 14 minutes", () => {
+		process.env[ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV] = "900000";
+		delete process.env[ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV];
+
+		expect(
+			getAnthropicPreCommitRescueConfig(makeClaudeCodeRequest())
+				.commitmentDeadlineMs,
+		).toBe(900_000);
 	});
 });
