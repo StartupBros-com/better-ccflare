@@ -23,11 +23,15 @@ export const CLAUDE_CODE_SEMANTIC_WATCHDOG_HEADROOM_MS = 30_000;
 export const ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS =
 	CLAUDE_CODE_PRECOMMIT_WATCHDOG_MS - CLAUDE_CODE_SEMANTIC_WATCHDOG_HEADROOM_MS;
 // PR #70 makes rescue pings visible to Claude Code's stream iterator, so its
-// local watchdog no longer requires the proxy to terminate a protocol-live
-// response at 150s. Restore the former finite request budget for that client;
-// the independent 120s protocol-idle timer still fails truly silent streams.
+// local 180s watchdog stays satisfied by the 25s rescue-ping cadence once
+// activated at 135s; the client's real ceiling is its API_TIMEOUT_MS of 900s.
+// Issue #356 (2026-09-20: 374 frames, 0 meaningful, aborted at 480070ms) showed
+// an 8-minute budget aborts a legitimate long non-interactive thinking phase
+// well before that ceiling. Set the budget to 14 minutes, 60s of headroom
+// under the 900s client timeout; a stream that pings but never produces
+// content still fails over via the independent 420s protocol-idle timer.
 export const CLAUDE_CODE_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS =
-	8 * 60 * 1000;
+	14 * 60 * 1000;
 // A non-final stalled route cannot consume the entire request budget. Preserve
 // 30s at the production default and scale the reserve down for focused tests or
 // deliberately shorter operator overrides.
