@@ -28,8 +28,11 @@ export const ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS =
 // Issue #356 (2026-09-20: 374 frames, 0 meaningful, aborted at 480070ms) showed
 // an 8-minute budget aborts a legitimate long non-interactive thinking phase
 // well before that ceiling. Set the budget to 14 minutes, 60s of headroom
-// under the 900s client timeout; a stream that pings but never produces
-// content still fails over via the independent 420s protocol-idle timer.
+// under the 900s client timeout. True silence (no valid frames at all) is
+// still caught at 420s by the independent protocol-idle timer; a stream that
+// pings but never produces content is not, since pings refresh that timer's
+// deadline, so it now fails over at ~810s on the first candidate (840s minus
+// the 30s fallback reserve) instead of ~450s, still inside the 900s ceiling.
 export const CLAUDE_CODE_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS =
 	14 * 60 * 1000;
 // A non-final stalled route cannot consume the entire request budget. Preserve
