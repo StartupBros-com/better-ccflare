@@ -1,4 +1,4 @@
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TIME_CONSTANTS } from "./constants";
@@ -11,14 +11,41 @@ export interface TokenBreakdown {
 	cacheCreationInputTokens?: number;
 }
 
-interface ModelCost {
+/**
+ * Base per-1M-token rates, mirroring models.dev's `Cost` shape.
+ */
+export interface BaseModelCost {
 	input: number;
 	output: number;
 	cache_read?: number;
 	cache_write?: number;
 }
 
-interface ModelDef {
+/**
+ * A single long-context pricing tier, mirroring models.dev's `CostTier`
+ * (a `Cost` plus the context-length threshold it applies above).
+ */
+export interface ModelCostTier extends BaseModelCost {
+	tier: {
+		type?: "context";
+		size: number;
+	};
+}
+
+export interface ModelCost extends BaseModelCost {
+	/**
+	 * Legacy compatibility field: models.dev mechanically derives this from
+	 * `tiers` (the single tier entry with size >= 200_000) when generating its
+	 * catalogue - see `normalizeCost()` in models.dev's own generator. `tiers`
+	 * is therefore the authoritative shape; this is a fallback for catalogue
+	 * snapshots that only carry the legacy field.
+	 */
+	context_over_200k?: BaseModelCost;
+	/** Explicit long-context tiers, sorted by nothing in particular on read. */
+	tiers?: ModelCostTier[];
+}
+
+export interface ModelDef {
 	id: string;
 	name: string;
 	cost?: ModelCost;
@@ -29,9 +56,15 @@ interface ModelDef {
 	 * entries do not carry it.
 	 */
 	modalities?: { input?: string[]; output?: string[] };
+	/** Context/input/output token limits, when the catalogue publishes them. */
+	limit?: { context?: number; input?: number; output?: number };
+	/** ISO date (YYYY-MM or YYYY-MM-DD) the model was released, when known. */
+	release_date?: string;
+	/** Whether the model supports tool calling, when the catalogue declares it. */
+	tool_call?: boolean;
 }
 
-interface ApiResponse {
+export interface ApiResponse {
 	[provider: string]: {
 		models?: {
 			[modelId: string]: ModelDef;
@@ -361,6 +394,43 @@ let nanogptPricingLastFetch = 0;
 // Promise to prevent multiple concurrent fetches
 let nanogptPricingFetchPromise: Promise<ApiResponse | null> | null = null;
 
+/**
+ * Listeners notified whenever `PriceCatalogue.getPricing()` performs an actual
+ * load (remote fetch, disk-cache read, or bundled fallback) - never on the
+ * early return that serves an already-warm in-memory cache. Provider-specific
+ * derivation (e.g. xAI picking its newest model) subscribes here instead of
+ * polling, so it recomputes exactly once per catalogue refresh cycle rather
+ * than once per proxied request.
+ *
+ * Deliberately process-lifetime state, not part of the PriceCatalogue
+ * instance: `resetNanoGPTPricingCacheForTest()` swaps out the singleton for
+ * test isolation, and a subscriber's registration must survive that swap or
+ * every test after the first would silently stop deriving anything.
+ */
+const catalogLoadedListeners = new Set<(data: ApiResponse) => void>();
+
+/**
+ * Subscribe to catalogue loads. Returns an unsubscribe function.
+ * A throwing listener is caught and ignored - a subscriber bug must never
+ * break pricing for every other caller.
+ */
+export function onPricingCatalogLoaded(
+	listener: (data: ApiResponse) => void,
+): () => void {
+	catalogLoadedListeners.add(listener);
+	return () => catalogLoadedListeners.delete(listener);
+}
+
+function notifyCatalogLoaded(data: ApiResponse): void {
+	for (const listener of catalogLoadedListeners) {
+		try {
+			listener(data);
+		} catch {
+			// A subscriber's derivation bug must never break pricing itself.
+		}
+	}
+}
+
 class PriceCatalogue {
 	private static instance: PriceCatalogue;
 	private priceData: ApiResponse | null = null;
@@ -394,6 +464,38 @@ class PriceCatalogue {
 	private getCacheDurationMs(): number {
 		const hours = Number(process.env.CF_PRICING_REFRESH_HOURS) || 24;
 		return hours * TIME_CONSTANTS.HOUR;
+	}
+
+	/**
+	 * Synchronous best-effort snapshot of the catalogue for request-path code
+	 * that cannot await a fetch (e.g. resolving a context window mid-request).
+	 * Prefers the freshest source available without ever doing I/O that could
+	 * block or fail unpredictably beyond a single synchronous file read:
+	 *
+	 *   1. the in-memory copy from the most recent completed async load
+	 *      (remote fetch or disk-cache read, whichever `getPricing()` used)
+	 *   2. a synchronous read of the on-disk cache (ignores staleness - a
+	 *      stale disk cache is still far more accurate than the bundled
+	 *      fallback, and this path exists specifically for code that will not
+	 *      wait for a fresh fetch)
+	 *   3. the bundled fallback table
+	 *
+	 * Never throws and never performs network I/O.
+	 */
+	getCatalogSnapshotSync(): PricingCatalogSnapshot {
+		if (this.priceData) {
+			return { data: this.priceData, source: "memory" };
+		}
+		try {
+			const raw = readFileSync(this.getCachePath(), "utf-8");
+			const parsed = JSON.parse(raw) as ApiResponse;
+			if (parsed && typeof parsed === "object") {
+				return { data: parsed, source: "disk" };
+			}
+		} catch {
+			// No disk cache, or it is unreadable/corrupt - fall through.
+		}
+		return { data: BUNDLED_PRICING, source: "bundled" };
 	}
 
 	private async ensureCacheDir(): Promise<void> {
@@ -668,6 +770,7 @@ class PriceCatalogue {
 
 		this.priceData = finalData;
 		this.lastFetch = Date.now();
+		notifyCatalogLoaded(finalData);
 		return finalData;
 	}
 
@@ -951,6 +1054,60 @@ export function setPricingLogger(logger: Logger): void {
 	PriceCatalogue.get().setLogger(logger);
 }
 
+export interface PricingCatalogSnapshot {
+	data: ApiResponse;
+	/** Which tier of the fallback chain answered this snapshot. */
+	source: "memory" | "disk" | "bundled";
+}
+
+/**
+ * Synchronous snapshot of the most recently loaded pricing catalogue, for
+ * request-path code that must not await a fetch (e.g. resolving a model's
+ * context window while building a proxied request). See
+ * `PriceCatalogue.getCatalogSnapshotSync` for the fallback order.
+ */
+export function getPricingCatalogSnapshotSync(): PricingCatalogSnapshot {
+	return PriceCatalogue.get().getCatalogSnapshotSync();
+}
+
+export interface CatalogModelSummary {
+	id: string;
+	/** models.dev `limit.context`, when published. */
+	contextWindow?: number;
+	/** models.dev `release_date` (YYYY-MM or YYYY-MM-DD), when published. */
+	releaseDate?: string;
+	/** models.dev `tool_call`, when the catalogue declares it. */
+	toolCall?: boolean;
+	cost?: ModelCost;
+}
+
+/**
+ * Synchronous, metadata-only view of one provider section of the most
+ * recently loaded catalogue (see `getPricingCatalogSnapshotSync`). Built for
+ * request-path derivation (context windows, newest-model selection) that
+ * needs `limit.context` / `release_date` / `tool_call` without awaiting a
+ * fetch. Never throws; an unavailable or empty section returns [].
+ */
+export function getCatalogModelSummaries(
+	providerSection: string,
+): CatalogModelSummary[] {
+	try {
+		const snapshot = getPricingCatalogSnapshotSync();
+		const models = snapshot.data[providerSection]?.models;
+		if (!models) return [];
+		return Object.entries(models).map(([key, def]) => ({
+			id: def?.id || key,
+			contextWindow:
+				typeof def?.limit?.context === "number" ? def.limit.context : undefined,
+			releaseDate: def?.release_date,
+			toolCall: def?.tool_call,
+			cost: def?.cost,
+		}));
+	} catch {
+		return [];
+	}
+}
+
 export interface CatalogueModelEntry {
 	id: string;
 	name: string;
@@ -1012,13 +1169,75 @@ async function findModel(modelId: string): Promise<ModelDef | null> {
 }
 
 /**
+ * Normalize a model's long-context pricing tiers to a single sorted list.
+ *
+ * `tiers` is the authoritative shape (models.dev's `AuthoredCost`/`OutputCost`
+ * both accept it); `context_over_200k` is a legacy field models.dev mirrors
+ * mechanically from a single `tiers` entry with `size >= 200_000` at catalogue
+ * generation time (see models.dev's `normalizeCost()`). When both are absent
+ * this is a flat-rate model and the returned list is empty.
+ */
+function normalizeTiers(cost: ModelCost): ModelCostTier[] {
+	if (Array.isArray(cost.tiers) && cost.tiers.length > 0) {
+		return cost.tiers
+			.filter(
+				(candidateTier): candidateTier is ModelCostTier =>
+					!!candidateTier &&
+					typeof candidateTier === "object" &&
+					!!candidateTier.tier &&
+					typeof candidateTier.tier.size === "number" &&
+					Number.isFinite(candidateTier.tier.size),
+			)
+			.sort((a, b) => a.tier.size - b.tier.size);
+	}
+	if (cost.context_over_200k) {
+		return [
+			{ ...cost.context_over_200k, tier: { type: "context", size: 200_000 } },
+		];
+	}
+	return [];
+}
+
+/**
+ * Pick the applicable tier for a request's total prompt tokens: the highest
+ * threshold that `totalPromptTokens` exceeds. A request at or below every
+ * threshold gets no tier (flat rate). Ties can't occur - `normalizeTiers`
+ * sorts by size, and models.dev rejects duplicate tier sizes at generation
+ * time.
+ */
+function selectApplicableTier(
+	tiers: ModelCostTier[],
+	totalPromptTokens: number,
+): ModelCostTier | undefined {
+	let selected: ModelCostTier | undefined;
+	for (const candidateTier of tiers) {
+		if (totalPromptTokens > candidateTier.tier.size) {
+			selected = candidateTier;
+		}
+	}
+	return selected;
+}
+
+/**
  * Get the cost rate for a specific model and token type
+ *
+ * When `totalPromptTokens` (input + cache_read + cache_creation) exceeds a
+ * published long-context tier threshold, the WHOLE request prices at that
+ * tier's rates for every token kind - not just the tokens above the
+ * threshold. models.dev's schema and docs are silent on whole-request vs.
+ * excess-only billing; this matches xAI's and Anthropic's published
+ * long-context pricing (both bill the entire request at the higher tier once
+ * the threshold is crossed), so it is the safer default absent a documented
+ * alternative. A tier that omits a given kind (e.g. no distinct cache_write)
+ * falls back to the model's flat rate for that kind only.
+ *
  * @returns Cost in dollars per token (NOT per million)
  * @throws If model or cost type is unknown
  */
 async function getCostRate(
 	modelId: string,
 	kind: "input" | "output" | "cache_read" | "cache_write",
+	totalPromptTokens = 0,
 ): Promise<number> {
 	const model = await findModel(modelId);
 	if (!model) {
@@ -1028,7 +1247,16 @@ async function getCostRate(
 		throw new Error(`Model ${modelId} has no cost information`);
 	}
 
-	const costPerMillion = model.cost[kind];
+	const tiers = normalizeTiers(model.cost);
+	const applicableTier =
+		tiers.length > 0
+			? selectApplicableTier(tiers, totalPromptTokens)
+			: undefined;
+
+	const costPerMillion =
+		applicableTier?.[kind] !== undefined
+			? applicableTier[kind]
+			: model.cost[kind];
 
 	if (costPerMillion === undefined) {
 		throw new Error(`Model ${modelId} has no ${kind} cost`);
@@ -1088,23 +1316,33 @@ export async function estimateCostUSD(
 	try {
 		let totalCost = 0;
 
+		// "Prompt" tokens for long-context tier selection: input + everything
+		// cached, regardless of whether this call is billing that cache
+		// activity. Output tokens are never part of this sum - a tier applies
+		// because the request's context is long, not because it generated a
+		// lot of output.
+		const totalPromptTokens =
+			(tokens.inputTokens ?? 0) +
+			(tokens.cacheReadInputTokens ?? 0) +
+			(tokens.cacheCreationInputTokens ?? 0);
+
 		if (tokens.inputTokens) {
-			const rate = await getCostRate(modelId, "input");
+			const rate = await getCostRate(modelId, "input", totalPromptTokens);
 			totalCost += tokens.inputTokens * rate;
 		}
 
 		if (tokens.outputTokens) {
-			const rate = await getCostRate(modelId, "output");
+			const rate = await getCostRate(modelId, "output", totalPromptTokens);
 			totalCost += tokens.outputTokens * rate;
 		}
 
 		if (tokens.cacheReadInputTokens) {
-			const rate = await getCostRate(modelId, "cache_read");
+			const rate = await getCostRate(modelId, "cache_read", totalPromptTokens);
 			totalCost += tokens.cacheReadInputTokens * rate;
 		}
 
 		if (tokens.cacheCreationInputTokens) {
-			const rate = await getCostRate(modelId, "cache_write");
+			const rate = await getCostRate(modelId, "cache_write", totalPromptTokens);
 			totalCost += tokens.cacheCreationInputTokens * rate;
 		}
 
