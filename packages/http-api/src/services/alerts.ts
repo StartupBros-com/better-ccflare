@@ -8,6 +8,7 @@ import {
 	getModelFamily,
 	getModelRates,
 	isValidModelId,
+	isWellFormedConcreteClaudeModelId,
 	LATEST_MODEL_BY_FAMILY,
 	normalizeProviderUsageWindows,
 	type RequestEvt,
@@ -434,13 +435,23 @@ export function buildStalePolicyDriftAlert(
  * the request's own model — mirroring how `originalModel`/`model` are
  * persisted (see packages/types/src/request.ts).
  *
- * This is a catalog-completeness signal, not a routing failure: a bare
- * family-alias combo/managed policy already passes an unrecognized
- * same-family concrete id straight through to the account instead of
+ * This is primarily a catalog-completeness signal, not a routing failure —
+ * but ONLY when `requestedModel` is well-formed per
+ * isWellFormedConcreteClaudeModelId(): a bare family-alias combo/managed
+ * policy then passes it straight through to the account instead of
  * rewriting it (see combo-membership-resolver.ts's requestedModel
- * pass-through). What actually goes stale without the catalog bump is
- * offline pricing, list-price-era lookups, and dashboard/CLI model pickers,
- * which all key off CLAUDE_MODEL_IDS.
+ * pass-through). This function fires on the looser CLAUDE_MODEL_SHAPE_RE, so
+ * it also catches malformed ids (e.g. "claude-opus-6-preview") that fail
+ * that stricter shape guard — those are NOT passed through; a bare-alias
+ * route still rewrites them to LATEST_MODEL_BY_FAMILY, same as a well-formed
+ * id landing on a cross-family fallback slot or a version-pinned account
+ * (both of which also still rewrite to LATEST regardless of well-formedness;
+ * see docs/combos.md's documented residual gap). The message below branches
+ * on well-formedness so it never claims pass-through occurred for a request
+ * this feature does not actually pass through. What always goes stale
+ * without the catalog bump, in every branch, is offline pricing,
+ * list-price-era lookups, and dashboard/CLI model pickers, which all key off
+ * CLAUDE_MODEL_IDS.
  */
 export function buildUnknownModelDriftAlert(
 	request: RequestResponse,
@@ -453,6 +464,10 @@ export function buildUnknownModelDriftAlert(
 	if (isValidModelId(requestedModel)) return null;
 	const family = getModelFamily(requestedModel);
 	if (!family) return null;
+	const catalogGapMessage = `offline pricing, list-price eras, and pickers don't recognize it yet; bump CLAUDE_MODEL_IDS/LATEST_* in packages/core/src/models.ts and deploy`;
+	const message = isWellFormedConcreteClaudeModelId(requestedModel)
+		? `clients are requesting ${requestedModel} (family ${family}) which is missing from the bundled model catalog — a same-family bare-alias route now passes a well-formed id like this straight through instead of downgrading it, though a cross-family fallback slot or a version-pinned account can still send an older model instead; ${catalogGapMessage}`
+		: `clients are requesting ${requestedModel} (family ${family}) which is missing from the bundled model catalog and doesn't match the pass-through shape guard, so a bare-alias route can still silently rewrite it to the family's latest model; ${catalogGapMessage}`;
 	return {
 		id: buildThresholdAlertId(
 			"model_routing_drift",
@@ -464,7 +479,7 @@ export function buildUnknownModelDriftAlert(
 		type: "model_routing_drift",
 		severity: "warning",
 		title: "Unknown model requested",
-		message: `clients are requesting ${requestedModel} (family ${family}) which is missing from the bundled model catalog — routing already passes this id straight through to the account, but offline pricing, list-price eras, and pickers don't recognize it yet; bump CLAUDE_MODEL_IDS/LATEST_* in packages/core/src/models.ts and deploy`,
+		message,
 		value: null,
 		threshold: null,
 		account: request.accountUsed,

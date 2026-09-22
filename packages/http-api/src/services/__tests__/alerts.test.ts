@@ -384,7 +384,16 @@ describe("model_routing_drift: unknown_model (day-0 catalog gap)", () => {
 			"clients are requesting claude-opus-6 (family opus)",
 		);
 		expect(alert.message).toContain("missing from the bundled model catalog");
+		// Well-formed ids get the pass-through wording, but it must not overclaim:
+		// a cross-family fallback slot or a version-pinned account can still send
+		// an older model instead of this one (see PR #362 review finding).
 		expect(alert.message).toContain(
+			"a same-family bare-alias route now passes a well-formed id like this straight through",
+		);
+		expect(alert.message).toContain(
+			"a cross-family fallback slot or a version-pinned account can still send an older model instead",
+		);
+		expect(alert.message).not.toContain(
 			"routing already passes this id straight through to the account",
 		);
 		expect(alert.message).toContain(
@@ -394,6 +403,39 @@ describe("model_routing_drift: unknown_model (day-0 catalog gap)", () => {
 			"bump CLAUDE_MODEL_IDS/LATEST_* in packages/core/src/models.ts and deploy",
 		);
 		expect(alert.model).toBe("claude-opus-6");
+	});
+
+	test("malformed id does not claim pass-through occurred (PR #362 review finding)", () => {
+		// claude-opus-6-preview fires the (looser) CLAUDE_MODEL_SHAPE_RE alert
+		// trigger but fails isWellFormedConcreteClaudeModelId, so the
+		// pass-through feature itself still rewrites it to LATEST_MODEL_BY_FAMILY
+		// — the alert text must say so, not claim the id reaches the account
+		// unmodified.
+		const request = baseRequest({ model: "claude-opus-6-preview" });
+		const alert = buildUnknownModelDriftAlert(
+			request,
+			CONFIG,
+			DRIFT_TIMESTAMP,
+		) as AlertEvent;
+
+		expect(alert).not.toBeNull();
+		expect(alert.message).toContain(
+			"clients are requesting claude-opus-6-preview (family opus)",
+		);
+		expect(alert.message).toContain("missing from the bundled model catalog");
+		expect(alert.message).not.toContain(
+			"routing already passes this id straight through to the account",
+		);
+		expect(alert.message).not.toContain("passes a well-formed id");
+		expect(alert.message).toContain(
+			"doesn't match the pass-through shape guard",
+		);
+		expect(alert.message).toContain(
+			"a bare-alias route can still silently rewrite it to the family's latest model",
+		);
+		expect(alert.message).toContain(
+			"bump CLAUDE_MODEL_IDS/LATEST_* in packages/core/src/models.ts and deploy",
+		);
 	});
 
 	test("dedupes distinct unknown model strings in the same family into one cooldown bucket", () => {

@@ -208,7 +208,7 @@ describe("AlertService model_routing_drift alerts", () => {
 		expect(alert.type).toBe("model_routing_drift");
 		expect(alert.severity).toBe("warning");
 		expect(alert.message).toContain("clients are requesting claude-opus-6");
-		expect(alert.message).toContain("not in the bundled model catalog");
+		expect(alert.message).toContain("missing from the bundled model catalog");
 	});
 
 	it("dedupes distinct unknown model strings in the same family into one persisted alert", async () => {
