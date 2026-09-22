@@ -106,6 +106,25 @@ export function setDerivedProviderModelDefaults(
 	derivedByProvider[provider] = { ...families };
 }
 
+/**
+ * Record the provider-wide default directly, with no per-account listing
+ * behind it.
+ *
+ * `setDerivedProviderModelDefaults` above always requires an `accountId`
+ * because its callers derive from one account's own listing. Catalog-driven
+ * derivation (e.g. xai's "newest released model" pick from models.dev) has no
+ * such account context — the catalog is provider-wide by nature — so it needs
+ * a setter that writes only `derivedByProvider` and leaves `derivedByAccount`
+ * untouched. An account's own derived map (if any) still wins over this via
+ * `resolveProviderModelDefault`'s precedence order.
+ */
+export function setDerivedProviderWideModelDefaults(
+	provider: string,
+	families: Record<string, string>,
+): void {
+	derivedByProvider[provider] = { ...families };
+}
+
 /** True when this account already has a derived map — no listing needed. */
 export function hasDerivedProviderModelDefaults(
 	provider: string,

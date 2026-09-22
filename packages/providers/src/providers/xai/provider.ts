@@ -26,6 +26,11 @@ import {
 	isXaiCacheNativeEnabled,
 	XAI_CONV_ID_HEADER,
 } from "./cache-native";
+// Side-effect import: subscribes xai's provider-wide model defaults to
+// models.dev catalog loads (newest released grok-<N>[.<N>] model by
+// release_date). See catalog-defaults.ts's module doc for why this is
+// reactive rather than eagerly warmed at import time.
+import "./catalog-defaults";
 
 const log = new Logger("XaiProvider");
 const cacheLog = new Logger("XaiCacheNative");
@@ -35,10 +40,10 @@ export const XAI_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token";
 export const XAI_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
 
 export const XAI_MODEL_MAPPINGS = {
-	opus: "grok-4.5",
-	sonnet: "grok-4.5",
-	haiku: "grok-4.5",
-	fable: "grok-4.5",
+	opus: "grok-4.7",
+	sonnet: "grok-4.7",
+	haiku: "grok-4.7",
+	fable: "grok-4.7",
 };
 
 registerProviderModelDefaultFactory("xai", XAI_MODEL_MAPPINGS);

@@ -1,15 +1,58 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	estimateCostUSD,
 	fetchNanoGPTPricingData,
 	getCachedNanoGPTPricing,
+	getCatalogModelSummaries,
 	getModelRates,
+	getPricingCatalogSnapshotSync,
 	initializeNanoGPTPricingRefresh,
+	onPricingCatalogLoaded,
 	resetNanoGPTPricingCacheForTest,
 	setPricingLogger,
 	stopNanoGPTPricingRefresh,
 	type TokenBreakdown,
 } from "./pricing";
+
+/**
+ * The pricing catalogue's on-disk cache is a fixed, shared path
+ * (`{tmpdir()}/better-ccflare/models.dev.json`) rather than a per-test
+ * scratch file, because it is also the real runtime cache for this machine.
+ * Tests that need to control what the synchronous disk-cache fallback sees
+ * must save/restore whatever was already there instead of clobbering it.
+ */
+const DISK_CACHE_PATH = join(tmpdir(), "better-ccflare", "models.dev.json");
+
+async function withDiskCache<T>(
+	content: unknown | null,
+	fn: () => Promise<T>,
+): Promise<T> {
+	let existed = true;
+	let original = "";
+	try {
+		original = await readFile(DISK_CACHE_PATH, "utf-8");
+	} catch {
+		existed = false;
+	}
+	try {
+		if (content === null) {
+			await rm(DISK_CACHE_PATH, { force: true });
+		} else {
+			await mkdir(join(tmpdir(), "better-ccflare"), { recursive: true });
+			await writeFile(DISK_CACHE_PATH, JSON.stringify(content));
+		}
+		return await fn();
+	} finally {
+		if (existed) {
+			await writeFile(DISK_CACHE_PATH, original);
+		} else {
+			await rm(DISK_CACHE_PATH, { force: true });
+		}
+	}
+}
 
 /**
  * Build a mock fetch that serves a synthetic models.dev catalogue for
@@ -651,5 +694,313 @@ describe("getModelRates", () => {
 			"Price for model %s not found - cache savings reported as unknown",
 			"unknown-model-warn-dedup",
 		);
+	});
+});
+
+describe("catalog metadata retention and synchronous accessors", () => {
+	let originalFetch: typeof global.fetch;
+
+	beforeEach(() => {
+		originalFetch = global.fetch;
+		resetNanoGPTPricingCacheForTest();
+		vi.clearAllMocks();
+	});
+
+	afterEach(() => {
+		global.fetch = originalFetch;
+		resetNanoGPTPricingCacheForTest();
+		vi.restoreAllMocks();
+	});
+
+	it("prefers the in-memory catalogue once an async load has completed", async () => {
+		global.fetch = mockModelsDevFetch({
+			xai: {
+				models: {
+					"grok-4.7": {
+						id: "grok-4.7",
+						name: "Grok 4.7",
+						cost: { input: 1, output: 1 },
+						limit: { context: 2_000_000, output: 1 },
+						release_date: "2026-09-01",
+					},
+				},
+			},
+		}) as typeof global.fetch;
+
+		await estimateCostUSD("grok-4.7", { inputTokens: 1 });
+
+		const snapshot = getPricingCatalogSnapshotSync();
+		expect(snapshot.source).toBe("memory");
+		expect(snapshot.data.xai?.models?.["grok-4.7"]?.limit?.context).toBe(
+			2_000_000,
+		);
+	});
+
+	it("reads the on-disk cache directly when nothing has loaded into memory yet", async () => {
+		await withDiskCache(
+			{ xai: { models: { "grok-9": { id: "grok-9", name: "Grok 9" } } } },
+			async () => {
+				resetNanoGPTPricingCacheForTest();
+				const snapshot = getPricingCatalogSnapshotSync();
+				expect(snapshot.source).toBe("disk");
+				expect(snapshot.data.xai?.models?.["grok-9"]).toBeTruthy();
+			},
+		);
+	});
+
+	it("falls back to the bundled table when neither memory nor a disk cache is available", async () => {
+		await withDiskCache(null, async () => {
+			resetNanoGPTPricingCacheForTest();
+			const snapshot = getPricingCatalogSnapshotSync();
+			expect(snapshot.source).toBe("bundled");
+			// The bundled fallback table has no xai section at all.
+			expect(snapshot.data.xai).toBeUndefined();
+		});
+	});
+
+	it("getCatalogModelSummaries retains limit.context, release_date, and tool_call", async () => {
+		global.fetch = mockModelsDevFetch({
+			xai: {
+				models: {
+					"grok-4.7": {
+						id: "grok-4.7",
+						name: "Grok 4.7",
+						cost: { input: 1, output: 1 },
+						limit: { context: 2_000_000, output: 1 },
+						release_date: "2026-09-01",
+						tool_call: true,
+					},
+					"grok-legacy": {
+						id: "grok-legacy",
+						name: "Grok Legacy",
+						cost: { input: 0.5, output: 0.5 },
+					},
+				},
+			},
+		}) as typeof global.fetch;
+
+		await estimateCostUSD("grok-4.7", { inputTokens: 1 });
+		const summaries = getCatalogModelSummaries("xai");
+
+		expect(summaries.find((entry) => entry.id === "grok-4.7")).toMatchObject({
+			id: "grok-4.7",
+			contextWindow: 2_000_000,
+			releaseDate: "2026-09-01",
+			toolCall: true,
+		});
+		const legacy = summaries.find((entry) => entry.id === "grok-legacy");
+		expect(legacy?.contextWindow).toBeUndefined();
+		expect(legacy?.releaseDate).toBeUndefined();
+		expect(legacy?.toolCall).toBeUndefined();
+	});
+
+	it("getCatalogModelSummaries returns [] for an unknown or absent provider section", async () => {
+		await withDiskCache(null, async () => {
+			resetNanoGPTPricingCacheForTest();
+			expect(getCatalogModelSummaries("nonexistent-provider")).toEqual([]);
+		});
+	});
+
+	it("onPricingCatalogLoaded fires once per actual load, never on a warm-cache return", async () => {
+		global.fetch = mockModelsDevFetch({
+			xai: {
+				models: {
+					"grok-4.7": {
+						id: "grok-4.7",
+						name: "Grok 4.7",
+						cost: { input: 1, output: 1 },
+					},
+				},
+			},
+		}) as typeof global.fetch;
+
+		const loads: unknown[] = [];
+		const unsubscribe = onPricingCatalogLoaded((data) => loads.push(data));
+		try {
+			await estimateCostUSD("grok-4.7", { inputTokens: 1 });
+			expect(loads.length).toBe(1);
+
+			// Second call within the cache window must serve memory, not reload.
+			await estimateCostUSD("grok-4.7", { inputTokens: 1 });
+			expect(loads.length).toBe(1);
+		} finally {
+			unsubscribe();
+		}
+	});
+});
+
+describe("long-context tier pricing", () => {
+	const TIERED_MODEL_ID = "grok-tier-test";
+	const tieredCatalogue = (overrides: Record<string, unknown> = {}) => ({
+		xai: {
+			models: {
+				[TIERED_MODEL_ID]: {
+					id: TIERED_MODEL_ID,
+					name: "Grok Tier Test",
+					cost: {
+						input: 3,
+						output: 15,
+						cache_read: 0.3,
+						cache_write: 3.75,
+						tiers: [
+							{
+								tier: { type: "context", size: 200_000 },
+								input: 6,
+								output: 30,
+								cache_read: 0.6,
+								cache_write: 7.5,
+							},
+						],
+						...overrides,
+					},
+				},
+			},
+		},
+	});
+
+	let originalFetch: typeof global.fetch;
+
+	beforeEach(() => {
+		originalFetch = global.fetch;
+		resetNanoGPTPricingCacheForTest();
+		vi.clearAllMocks();
+	});
+
+	afterEach(() => {
+		global.fetch = originalFetch;
+		resetNanoGPTPricingCacheForTest();
+		vi.restoreAllMocks();
+	});
+
+	it("prices the whole request at the tier rate once total prompt tokens exceed the threshold", async () => {
+		global.fetch = mockModelsDevFetch(tieredCatalogue()) as typeof global.fetch;
+
+		const cost = await estimateCostUSD(TIERED_MODEL_ID, {
+			inputTokens: 250_000,
+			outputTokens: 1_000,
+		});
+
+		const expected = 250_000 * (6 / 1_000_000) + 1_000 * (30 / 1_000_000);
+		expect(cost).toBeCloseTo(expected, 10);
+	});
+
+	it("keeps flat-rate pricing, byte-for-byte, at or below the tier threshold", async () => {
+		global.fetch = mockModelsDevFetch(tieredCatalogue()) as typeof global.fetch;
+
+		const atThreshold = await estimateCostUSD(TIERED_MODEL_ID, {
+			inputTokens: 200_000,
+		});
+		expect(atThreshold).toBeCloseTo(200_000 * (3 / 1_000_000), 10);
+
+		const belowThreshold = await estimateCostUSD(TIERED_MODEL_ID, {
+			inputTokens: 50_000,
+		});
+		expect(belowThreshold).toBeCloseTo(50_000 * (3 / 1_000_000), 10);
+	});
+
+	it("counts cache_read and cache_creation tokens toward the tier threshold, not just input", async () => {
+		global.fetch = mockModelsDevFetch(tieredCatalogue()) as typeof global.fetch;
+
+		const cost = await estimateCostUSD(TIERED_MODEL_ID, {
+			inputTokens: 50_000,
+			cacheReadInputTokens: 100_000,
+			cacheCreationInputTokens: 60_000, // 50k+100k+60k = 210k > 200k threshold
+			outputTokens: 100,
+		});
+
+		const expected =
+			50_000 * (6 / 1_000_000) +
+			100_000 * (0.6 / 1_000_000) +
+			60_000 * (7.5 / 1_000_000) +
+			100 * (30 / 1_000_000);
+		expect(cost).toBeCloseTo(expected, 10);
+	});
+
+	it("treats a legacy context_over_200k cost block as an implicit 200k tier", async () => {
+		global.fetch = mockModelsDevFetch({
+			xai: {
+				models: {
+					"grok-legacy-tier": {
+						id: "grok-legacy-tier",
+						name: "Grok Legacy Tier",
+						cost: {
+							input: 3,
+							output: 15,
+							context_over_200k: { input: 6, output: 30 },
+						},
+					},
+				},
+			},
+		}) as typeof global.fetch;
+
+		const cost = await estimateCostUSD("grok-legacy-tier", {
+			inputTokens: 250_000,
+		});
+		expect(cost).toBeCloseTo(250_000 * (6 / 1_000_000), 10);
+	});
+
+	it("prefers explicit tiers over a legacy context_over_200k block when both are present", async () => {
+		global.fetch = mockModelsDevFetch({
+			xai: {
+				models: {
+					"grok-both-shapes": {
+						id: "grok-both-shapes",
+						name: "Grok Both Shapes",
+						cost: {
+							input: 3,
+							output: 15,
+							// Deliberately implausible rates: proves this block is ignored
+							// in favor of `tiers` when both are present.
+							context_over_200k: { input: 999, output: 999 },
+							tiers: [
+								{
+									tier: { type: "context", size: 200_000 },
+									input: 6,
+									output: 30,
+								},
+							],
+						},
+					},
+				},
+			},
+		}) as typeof global.fetch;
+
+		const cost = await estimateCostUSD("grok-both-shapes", {
+			inputTokens: 250_000,
+		});
+		expect(cost).toBeCloseTo(250_000 * (6 / 1_000_000), 10);
+	});
+
+	it("falls back to the model's flat rate for a cost kind the tier does not define", async () => {
+		global.fetch = mockModelsDevFetch({
+			xai: {
+				models: {
+					"grok-partial-tier": {
+						id: "grok-partial-tier",
+						name: "Grok Partial Tier",
+						cost: {
+							input: 3,
+							output: 15,
+							cache_write: 3.75,
+							tiers: [
+								{
+									tier: { type: "context", size: 200_000 },
+									input: 6,
+									output: 30,
+									// No cache_write override at this tier.
+								},
+							],
+						},
+					},
+				},
+			},
+		}) as typeof global.fetch;
+
+		const cost = await estimateCostUSD("grok-partial-tier", {
+			inputTokens: 250_000,
+			cacheCreationInputTokens: 10_000,
+		});
+		const expected = 250_000 * (6 / 1_000_000) + 10_000 * (3.75 / 1_000_000);
+		expect(cost).toBeCloseTo(expected, 10);
 	});
 });

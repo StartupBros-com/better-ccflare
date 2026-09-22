@@ -116,13 +116,18 @@ export {
 	uninstallOutboundProxy,
 } from "./outbound-proxy";
 export {
+	type CatalogModelSummary,
 	type CatalogueModelEntry,
 	estimateCostUSD,
+	getCatalogModelSummaries,
 	getModelRates,
+	getPricingCatalogSnapshotSync,
 	initializeNanoGPTPricingIfAccountsExist,
 	isModelPriced,
 	listCatalogueModels,
 	type ModelRates,
+	onPricingCatalogLoaded,
+	type PricingCatalogSnapshot,
 	resetNanoGPTPricingCacheForTest,
 	setPricingLogger,
 	type TokenBreakdown,

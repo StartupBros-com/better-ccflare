@@ -179,7 +179,7 @@ describe("provider model defaults", () => {
 	});
 
 	it("resolver returns factory when no override exists", () => {
-		expect(resolveProviderModelDefault("xai", "sonnet")).toBe("grok-4.5");
+		expect(resolveProviderModelDefault("xai", "sonnet")).toBe("grok-4.7");
 	});
 
 	it("GET lists only codex by default (CCFLARE_MODEL_DEFAULTS_PROVIDERS unset)", async () => {
@@ -239,7 +239,7 @@ describe("provider model defaults", () => {
 		await handlers.setProviderModelDefaults(
 			request([{ provider: "codex", family: "opus", model: "gpt-custom" }]),
 		);
-		expect(resolveProviderModelDefault("xai", "sonnet")).toBe("grok-4.5");
+		expect(resolveProviderModelDefault("xai", "sonnet")).toBe("grok-4.7");
 	});
 
 	it("an account-only derived map stays private to its own account", () => {

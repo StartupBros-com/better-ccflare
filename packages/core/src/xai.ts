@@ -1,5 +1,6 @@
 import type { Account } from "@better-ccflare/types";
 import { getEndpointUrl } from "./model-mappings";
+import { getCatalogModelSummaries } from "./pricing";
 
 const OFFICIAL_XAI_HOSTS = new Set(["api.x.ai"]);
 
@@ -7,6 +8,12 @@ const OFFICIAL_XAI_HOSTS = new Set(["api.x.ai"]);
  * Official xAI context windows for Grok 4.5 / 4.6 / 4.7 (docs.x.ai: 500,000 tokens).
  * Original grok-4 is intentionally absent — it is a different, smaller window
  * and must not inherit 500k via a `grok-4` prefix match on `grok-4.6`.
+ *
+ * This bundled table is now the fallback, not the primary source: a new xAI
+ * release's window comes from the models.dev catalog first (see
+ * `resolveXaiContextWindowFromCatalog`), so a future model needs no edit
+ * here. This table only matters when the catalog has no usable entry for a
+ * given model (offline, unfetched, or the model simply predates this table).
  */
 const XAI_CONTEXT_WINDOW_BY_FAMILY: Readonly<Record<string, number>> = {
 	"grok-4.7": 500_000,
@@ -17,16 +24,88 @@ const XAI_CONTEXT_WINDOW_FAMILIES = Object.keys(
 	XAI_CONTEXT_WINDOW_BY_FAMILY,
 ).sort((a, b) => b.length - a.length);
 
+/**
+ * Sanity bounds for a catalog-published `limit.context` value. models.dev is
+ * an unvalidated, community-editable document; a context window outside
+ * these bounds is treated as a data error rather than trusted verbatim -
+ * bounds chosen well outside any real model's window (smallest published
+ * context windows are in the low tens of thousands; no model publishes a
+ * window anywhere near 10M).
+ */
+const XAI_CATALOG_CONTEXT_WINDOW_MIN = 8_000;
+const XAI_CATALOG_CONTEXT_WINDOW_MAX = 10_000_000;
+
+function isSaneCatalogContextWindow(
+	value: number | undefined,
+): value is number {
+	return (
+		typeof value === "number" &&
+		Number.isFinite(value) &&
+		value >= XAI_CATALOG_CONTEXT_WINDOW_MIN &&
+		value <= XAI_CATALOG_CONTEXT_WINDOW_MAX
+	);
+}
+
 export interface XaiContextWindowResolution {
 	family: string;
 	contextWindow: number;
-	match: "exact" | "prefix";
+	match: "exact" | "prefix" | "catalog-exact" | "catalog-prefix";
+}
+
+/**
+ * Catalog-first context window lookup: consults the most recently loaded
+ * models.dev "xai" section (synchronously, via `getCatalogModelSummaries` -
+ * see its own doc comment for the memory/disk/bundled fallback order) before
+ * ever touching the bundled table. An exact catalog id wins outright; failing
+ * that, the longest catalog id that `model` extends by a `-` boundary wins.
+ * A catalog value outside the sanity bounds is treated as absent so a bad
+ * catalog entry cannot silently ship: the caller falls through to the
+ * bundled table.
+ */
+function resolveXaiContextWindowFromCatalog(
+	model: string,
+): XaiContextWindowResolution | undefined {
+	const summaries = getCatalogModelSummaries("xai");
+	if (summaries.length === 0) return undefined;
+
+	const exactEntry = summaries.find((entry) => entry.id === model);
+	if (exactEntry && isSaneCatalogContextWindow(exactEntry.contextWindow)) {
+		return {
+			family: exactEntry.id,
+			contextWindow: exactEntry.contextWindow,
+			match: "catalog-exact",
+		};
+	}
+
+	let bestPrefixEntry: (typeof summaries)[number] | undefined;
+	for (const entry of summaries) {
+		if (!entry.id || !model.startsWith(`${entry.id}-`)) continue;
+		if (!bestPrefixEntry || entry.id.length > bestPrefixEntry.id.length) {
+			bestPrefixEntry = entry;
+		}
+	}
+	if (
+		bestPrefixEntry &&
+		isSaneCatalogContextWindow(bestPrefixEntry.contextWindow)
+	) {
+		return {
+			family: bestPrefixEntry.id,
+			contextWindow: bestPrefixEntry.contextWindow,
+			match: "catalog-prefix",
+		};
+	}
+
+	return undefined;
 }
 
 export function resolveXaiContextWindow(
 	model: string,
 ): XaiContextWindowResolution | undefined {
 	if (typeof model !== "string" || model.length === 0) return undefined;
+
+	const catalogResolution = resolveXaiContextWindowFromCatalog(model);
+	if (catalogResolution) return catalogResolution;
+
 	const exact = XAI_CONTEXT_WINDOW_BY_FAMILY[model];
 	if (exact !== undefined) {
 		return { family: model, contextWindow: exact, match: "exact" };
