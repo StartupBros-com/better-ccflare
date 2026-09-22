@@ -254,6 +254,16 @@ export const LIST_PRICE_ERAS: Record<string, ListPriceEra[]> = {
 			// source: BUNDLED_PRICING[anthropic].models[CLAUDE_MODEL_IDS.OPUS_5].cost in packages/core/src/pricing.ts
 		},
 	],
+	[CLAUDE_MODEL_IDS.OPUS_5_5]: [
+		{
+			sinceMs: INITIAL_ERA_FLOOR_MS,
+			inputPerM: 4,
+			cacheReadPerM: 0.2,
+			cacheCreationPerM: 5,
+			outputPerM: 20,
+			// source: BUNDLED_PRICING[anthropic].models[CLAUDE_MODEL_IDS.OPUS_5_5].cost in packages/core/src/pricing.ts
+		},
+	],
 	[CLAUDE_MODEL_IDS.FABLE_5]: [
 		{
 			sinceMs: INITIAL_ERA_FLOOR_MS,

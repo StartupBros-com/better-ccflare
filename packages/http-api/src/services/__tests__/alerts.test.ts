@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { Config } from "@better-ccflare/config";
-import { CLAUDE_MODEL_IDS } from "@better-ccflare/core";
+import { CLAUDE_MODEL_IDS, LATEST_MODEL_BY_FAMILY } from "@better-ccflare/core";
 import { BunSqlAdapter, ensureSchema } from "@better-ccflare/database";
 import type {
 	AlertEvent,
@@ -278,7 +278,11 @@ describe("model_routing_drift: stale_policy (Opus 5 incident)", () => {
 	test("fires when the stored policy pins the family's current latest model away from itself", () => {
 		const request = baseRequest({
 			comboModelOverride: {
-				from: CLAUDE_MODEL_IDS.OPUS_5,
+				// Must be whatever is CURRENTLY the latest opus: the predicate
+				// under test only fires when `from` is the family's latest, so
+				// pinning a released ID here silently stops testing anything
+				// the next time LATEST_MODEL_BY_FAMILY advances.
+				from: LATEST_MODEL_BY_FAMILY.opus,
 				to: CLAUDE_MODEL_IDS.OPUS_4_8,
 			},
 		});
@@ -302,10 +306,10 @@ describe("model_routing_drift: stale_policy (Opus 5 incident)", () => {
 			),
 		);
 		expect(alert.message).toContain(
-			`opus routing policy rewrites ${CLAUDE_MODEL_IDS.OPUS_5} -> ${CLAUDE_MODEL_IDS.OPUS_4_8}`,
+			`opus routing policy rewrites ${LATEST_MODEL_BY_FAMILY.opus} -> ${CLAUDE_MODEL_IDS.OPUS_4_8}`,
 		);
 		expect(alert.message).toContain(
-			`${CLAUDE_MODEL_IDS.OPUS_5} is the current latest opus model`,
+			`${LATEST_MODEL_BY_FAMILY.opus} is the current latest opus model`,
 		);
 		// The message must NOT assert staleness as fact: a deliberate pinned
 		// fallback slot produces this exact shape, so the wording has to offer
