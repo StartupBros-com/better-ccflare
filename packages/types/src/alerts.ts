@@ -42,6 +42,35 @@ export type AlertType =
 	| "usage_window_value_drop";
 
 /**
+ * Every known `AlertType` value, in the same order as the union above. The
+ * single source of truth for validating a caller-supplied alert type name
+ * (e.g. `ALERT_WEBHOOK_TYPES` / `alert_webhook_types`, see
+ * packages/config/src/index.ts's parseAlertWebhookTypes) — a hand-maintained
+ * duplicate list would silently drift the day a new AlertType is added.
+ */
+export const ALERT_TYPES: readonly AlertType[] = [
+	"daily_spend",
+	"tokens_per_hour",
+	"request_tokens",
+	"anomaly_token_outlier",
+	"anomaly_output_blowup",
+	"anomaly_runaway_loop",
+	"anomaly_model_misrouting",
+	"auth_failure",
+	"model_routing_drift",
+	"usage_window_threshold",
+	"usage_window_exhaustion_projected",
+	"usage_window_value_drop",
+];
+
+const ALERT_TYPE_SET: ReadonlySet<string> = new Set(ALERT_TYPES);
+
+/** Type guard: is `value` one of the known `AlertType` names? */
+export function isAlertType(value: string): value is AlertType {
+	return ALERT_TYPE_SET.has(value);
+}
+
+/**
  * Discriminates the two staleness classes detected under the
  * `model_routing_drift` alert type (see AlertService.buildModelRoutingDriftAlerts
  * in packages/http-api/src/services/alerts.ts):

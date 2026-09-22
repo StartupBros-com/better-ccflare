@@ -12,6 +12,7 @@
 	"dependencies": {
 		"@better-ccflare/core": "workspace:*",
 		"@better-ccflare/logger": "workspace:*",
-		"@better-ccflare/security": "workspace:*"
+		"@better-ccflare/security": "workspace:*",
+		"@better-ccflare/types": "workspace:*"
 	}
 }

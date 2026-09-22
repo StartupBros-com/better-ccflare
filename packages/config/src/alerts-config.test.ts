@@ -15,6 +15,7 @@ const ENV_KEYS = [
 	"ALERT_ANOMALY_LOOP_MIN_REQUESTS",
 	"ALERT_COOLDOWN_MINUTES",
 	"ALERT_WEBHOOK_URL",
+	"ALERT_WEBHOOK_TYPES",
 ] as const;
 
 const ORIGINAL_ENV: Record<string, string | undefined> = {};
@@ -59,6 +60,7 @@ describe("alert config settings", () => {
 			expect(config.getAlertAnomalyLoopMinRequests()).toBe(25);
 			expect(config.getAlertCooldownMinutes()).toBe(60);
 			expect(config.getAlertWebhookUrl()).toBe("");
+			expect(config.getAlertWebhookTypes()).toEqual([]);
 		} finally {
 			cleanup();
 		}
@@ -75,6 +77,7 @@ describe("alert config settings", () => {
 		process.env.ALERT_ANOMALY_LOOP_MIN_REQUESTS = "40";
 		process.env.ALERT_COOLDOWN_MINUTES = "120";
 		process.env.ALERT_WEBHOOK_URL = "https://example.com/hook";
+		process.env.ALERT_WEBHOOK_TYPES = "auth_failure, model_routing_drift";
 		const { config, cleanup } = makeConfig();
 
 		try {
@@ -88,6 +91,10 @@ describe("alert config settings", () => {
 			expect(config.getAlertAnomalyLoopMinRequests()).toBe(40);
 			expect(config.getAlertCooldownMinutes()).toBe(120);
 			expect(config.getAlertWebhookUrl()).toBe("https://example.com/hook");
+			expect(config.getAlertWebhookTypes()).toEqual([
+				"auth_failure",
+				"model_routing_drift",
+			]);
 		} finally {
 			cleanup();
 		}
@@ -237,6 +244,126 @@ describe("alert config settings", () => {
 			expect(settings.alert_anomaly_loop_min_requests).toBe(25);
 			expect(settings.alert_cooldown_minutes).toBe(60);
 			expect(settings.alert_webhook_url).toBe("");
+			expect(settings.alert_webhook_types).toBe("");
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("alert webhook type allowlist", () => {
+	afterEach(() => {
+		for (const key of ENV_KEYS) {
+			const original = ORIGINAL_ENV[key];
+			if (original === undefined) {
+				delete process.env[key];
+			} else {
+				process.env[key] = original;
+			}
+		}
+	});
+
+	it("defaults to delivering all types (empty allowlist)", () => {
+		for (const key of ENV_KEYS) {
+			delete process.env[key];
+		}
+		const { config, cleanup } = makeConfig();
+
+		try {
+			expect(config.getAlertWebhookTypes()).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("persists a setter value readable by the getter, normalized and de-duplicated", () => {
+		for (const key of ENV_KEYS) {
+			delete process.env[key];
+		}
+		const { config, cleanup } = makeConfig();
+
+		try {
+			config.setAlertWebhookTypes(
+				"Auth_Failure, model_routing_drift,auth_failure",
+			);
+			expect(config.getAlertWebhookTypes()).toEqual([
+				"auth_failure",
+				"model_routing_drift",
+			]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("clearing to an empty string re-enables delivering all types", () => {
+		for (const key of ENV_KEYS) {
+			delete process.env[key];
+		}
+		const { config, cleanup } = makeConfig();
+
+		try {
+			config.setAlertWebhookTypes("auth_failure");
+			expect(config.getAlertWebhookTypes()).toEqual(["auth_failure"]);
+
+			config.setAlertWebhookTypes("");
+			expect(config.getAlertWebhookTypes()).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("rejects an unknown alert type name", () => {
+		for (const key of ENV_KEYS) {
+			delete process.env[key];
+		}
+		const { config, cleanup } = makeConfig();
+
+		try {
+			expect(() =>
+				config.setAlertWebhookTypes("auth_failure,not_a_real_alert_type"),
+			).toThrow();
+			// The rejected write must not have partially applied.
+			expect(config.getAlertWebhookTypes()).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("rejects an oversized list containing an unknown type instead of silently allowing all", () => {
+		for (const key of ENV_KEYS) {
+			delete process.env[key];
+		}
+		const { config, cleanup } = makeConfig();
+
+		try {
+			// 65 comma-separated tokens (one past the internal 64-token cap),
+			// padded with a valid, repeated type plus one unknown name. The
+			// write path must still fail loudly on the unknown name rather
+			// than silently short-circuiting the oversized list to "deliver
+			// all" (the getter's safe fallback, not the setter's contract).
+			const tokens = Array.from({ length: 64 }, () => "auth_failure");
+			tokens.push("not_a_real_alert_type");
+			expect(() => config.setAlertWebhookTypes(tokens.join(","))).toThrow();
+			// The rejected write must not have partially applied.
+			expect(config.getAlertWebhookTypes()).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("env var overrides the file value, including an explicit empty override", () => {
+		for (const key of ENV_KEYS) {
+			delete process.env[key];
+		}
+		const { config, cleanup } = makeConfig();
+
+		try {
+			config.setAlertWebhookTypes("auth_failure");
+			process.env.ALERT_WEBHOOK_TYPES = "model_routing_drift";
+			expect(config.getAlertWebhookTypes()).toEqual(["model_routing_drift"]);
+
+			process.env.ALERT_WEBHOOK_TYPES = "";
+			expect(config.getAlertWebhookTypes()).toEqual([]);
 		} finally {
 			cleanup();
 		}

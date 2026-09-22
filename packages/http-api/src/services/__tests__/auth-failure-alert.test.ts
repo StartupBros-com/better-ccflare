@@ -49,6 +49,7 @@ function makeConfig(
 		getAlertCooldownMinutes: () => 60,
 		getAlertWebhookUrl: () =>
 			overrides.webhookUrl ?? "http://127.0.0.1:9999/webhook",
+		getAlertWebhookTypes: () => [],
 		get: (
 			key: string,
 			defaultValue?: string | number | boolean,
