@@ -533,6 +533,169 @@ function toAnomalyRow(row: AnomalySqlRow): AnomalyRequestRow {
 	};
 }
 
+/**
+ * Discord identifies a webhook by host + `/api/webhooks/<id>/<token>` path;
+ * everything else (including the media CDN `cdn.discordapp.com` and
+ * lookalike hosts like `evil-discord.com`) is treated as a generic webhook
+ * and keeps the legacy body. See deliverAlertWebhook.
+ */
+const DISCORD_WEBHOOK_HOSTS: ReadonlySet<string> = new Set([
+	"discord.com",
+	"discordapp.com",
+	"ptb.discord.com",
+	"canary.discord.com",
+]);
+const DISCORD_WEBHOOK_PATH_PREFIX = "/api/webhooks/";
+
+/** Discord's edge returns 403 to a generic/default fetch User-Agent. */
+const ALERT_WEBHOOK_USER_AGENT = "better-ccflare-alerts/1.0";
+
+/** Discord hard-caps message `content` at 2000 codepoints. A byte- or
+ * UTF-16-unit-based cut can split a surrogate pair; see
+ * truncateToCodepoints. */
+const DISCORD_CONTENT_MAX_CODEPOINTS = 2000;
+
+export function isDiscordWebhookUrl(url: URL): boolean {
+	return (
+		DISCORD_WEBHOOK_HOSTS.has(url.hostname) &&
+		url.pathname.startsWith(DISCORD_WEBHOOK_PATH_PREFIX)
+	);
+}
+
+function buildTruncationMarker(omittedCount: number): string {
+	const noun = omittedCount === 1 ? "character" : "characters";
+	return `\n[truncated — ${omittedCount} ${noun} omitted]`;
+}
+
+/**
+ * Truncate `text` to at most `maxCodepoints` Unicode codepoints (not bytes,
+ * not UTF-16 code units — `Array.from`/the string iterator splits on
+ * codepoints, so a surrogate pair is never cut in half), appending an
+ * explicit marker stating how many codepoints were omitted. The marker
+ * itself counts against the cap: this iterates the reservation to a fixed
+ * point (converges in a handful of steps — the marker's length only changes
+ * when the omitted count's digit count crosses a power of ten) so the
+ * returned text is never longer than `maxCodepoints`.
+ */
+export function truncateToCodepoints(
+	text: string,
+	maxCodepoints: number,
+): { text: string; omittedCount: number } {
+	const codepoints = Array.from(text);
+	if (codepoints.length <= maxCodepoints) {
+		return { text, omittedCount: 0 };
+	}
+	let keep = maxCodepoints;
+	for (let i = 0; i < 20; i++) {
+		const omitted = codepoints.length - keep;
+		const markerLen = Array.from(buildTruncationMarker(omitted)).length;
+		const nextKeep = Math.max(0, maxCodepoints - markerLen);
+		if (nextKeep === keep) break;
+		keep = nextKeep;
+	}
+	const omittedCount = codepoints.length - keep;
+	const marker = buildTruncationMarker(omittedCount);
+	return { text: codepoints.slice(0, keep).join("") + marker, omittedCount };
+}
+
+/**
+ * Concise markdown rendering of an alert for Discord: severity + type +
+ * title in bold on the first line, then the message, then account / model /
+ * value-vs-threshold when present — bounded to Discord's 2000-codepoint
+ * `content` limit.
+ */
+export function buildDiscordAlertContent(alert: AlertEvent): string {
+	const lines: string[] = [
+		`**${alert.severity.toUpperCase()} · ${alert.type}: ${alert.title}**`,
+		alert.message,
+	];
+	const details: string[] = [];
+	if (alert.account) details.push(`Account: ${alert.account}`);
+	if (alert.model) details.push(`Model: ${alert.model}`);
+	if (alert.value !== null && alert.threshold !== null) {
+		details.push(`Value: ${alert.value} / Threshold: ${alert.threshold}`);
+	} else if (alert.value !== null) {
+		details.push(`Value: ${alert.value}`);
+	}
+	if (details.length > 0) {
+		lines.push(details.join(" · "));
+	}
+	return truncateToCodepoints(lines.join("\n"), DISCORD_CONTENT_MAX_CODEPOINTS)
+		.text;
+}
+
+/** Discord's webhook body shape: `allowed_mentions: {parse: []}` suppresses
+ * every mention type so an account/model name containing `@everyone`-shaped
+ * text can never actually ping. */
+export function buildDiscordWebhookBody(alert: AlertEvent): {
+	content: string;
+	allowed_mentions: { parse: never[] };
+} {
+	return {
+		content: buildDiscordAlertContent(alert),
+		allowed_mentions: { parse: [] },
+	};
+}
+
+/** Empty allowlist = deliver every type (today's behaviour, unchanged). */
+export function isAlertTypeAllowedForWebhook(
+	type: AlertType,
+	allowedTypes: readonly AlertType[],
+): boolean {
+	return allowedTypes.length === 0 || allowedTypes.includes(type);
+}
+
+/**
+ * POST one alert to a configured webhook. Fire-and-forget: every failure
+ * mode (a malformed URL, a network error, a non-2xx response) is caught and
+ * logged here, never thrown, because the caller (persistAndEmit) invokes
+ * this with `void` from inside a synchronous event-handler path where an
+ * unhandled rejection would crash the proxy.
+ *
+ * Discord's webhook endpoint rejects the legacy `{type:"alert", alert}`
+ * body (it needs `content` or `embeds`); a Discord URL gets a Discord-shaped
+ * body instead. Every other URL keeps the legacy body unchanged
+ * (backward-compatible) but also gets the explicit User-Agent Discord's edge
+ * requires — harmless for non-Discord receivers.
+ *
+ * The webhook URL is never logged: Discord webhook URLs embed a bearer
+ * token in the path.
+ */
+export async function deliverAlertWebhook(
+	webhookUrl: string,
+	alert: AlertEvent,
+): Promise<void> {
+	let parsed: URL;
+	try {
+		parsed = new URL(webhookUrl);
+	} catch (error) {
+		log.warn(
+			`Alert webhook delivery skipped: configured URL failed to parse: ${(error as Error).message}`,
+		);
+		return;
+	}
+	const body = isDiscordWebhookUrl(parsed)
+		? buildDiscordWebhookBody(alert)
+		: { type: "alert" as const, alert };
+	try {
+		const response = await fetch(webhookUrl, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"User-Agent": ALERT_WEBHOOK_USER_AGENT,
+			},
+			body: JSON.stringify(body),
+		});
+		if (!response.ok) {
+			log.warn(
+				`Alert webhook delivery received non-2xx status: ${response.status}`,
+			);
+		}
+	} catch (error) {
+		log.warn(`Alert webhook delivery failed: ${(error as Error).message}`);
+	}
+}
+
 export class AlertService {
 	private readonly db: BunSqlAdapter;
 	private readonly config: Config;
@@ -1350,23 +1513,14 @@ export class AlertService {
 		}
 		const event: AlertEvt = { type: "alert", payload: alert };
 		alertEvents.emit("event", event);
-		if (webhookUrl) {
-			void this.deliverWebhook(webhookUrl, alert);
-		}
-	}
-
-	private async deliverWebhook(
-		webhookUrl: string,
-		alert: AlertEvent,
-	): Promise<void> {
-		try {
-			await fetch(webhookUrl, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ type: "alert", alert }),
-			});
-		} catch (error) {
-			log.warn(`Alert webhook delivery failed: ${(error as Error).message}`);
+		if (
+			webhookUrl &&
+			isAlertTypeAllowedForWebhook(
+				alert.type,
+				this.config.getAlertWebhookTypes(),
+			)
+		) {
+			void deliverAlertWebhook(webhookUrl, alert);
 		}
 	}
 }

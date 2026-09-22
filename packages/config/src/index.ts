@@ -27,6 +27,7 @@ import {
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import { validatePathOrThrow } from "@better-ccflare/security";
+import { type AlertType, isAlertType } from "@better-ccflare/types";
 import { resolveConfigPath } from "./paths";
 
 const log = new Logger("Config");
@@ -924,6 +925,11 @@ export interface ConfigData {
 	alert_anomaly_loop_min_requests?: number;
 	alert_cooldown_minutes?: number;
 	alert_webhook_url?: string;
+	/** Comma-separated allowlist of AlertType names restricting which alert
+	 * types are delivered to the webhook; "" or unset = deliver all (see
+	 * getAlertWebhookTypes below). Only gates webhook delivery — the DB
+	 * insert and dashboard SSE emission always happen regardless. */
+	alert_webhook_types?: string;
 	combos_enabled?: boolean;
 	combo_session_fallback?: boolean;
 	outbound_proxy?: string;
@@ -1164,6 +1170,58 @@ export function parseSkillElisionBlockedSkills(
 		}
 	}
 	return Object.freeze(normalized);
+}
+
+const MAX_ALERT_WEBHOOK_TYPES = 64;
+
+/**
+ * Parse the CSV config-file or env value for `ALERT_WEBHOOK_TYPES` /
+ * `alert_webhook_types` into de-duplicated, lowercased, known `AlertType`
+ * values plus whatever unrecognized names it saw. Splitting recognition from
+ * rejection lets the read path (getAlertWebhookTypes) warn-and-drop while the
+ * write path (setAlertWebhookTypes) throws — both from one implementation.
+ * Never throws. `undefined`/`null`/`""` (nothing configured) and an
+ * oversized list both resolve to `{ types: [], invalidNames: [] }` — "deliver
+ * all", the same default as today.
+ */
+export function parseAlertWebhookTypes(value: unknown): {
+	types: readonly AlertType[];
+	invalidNames: readonly string[];
+} {
+	if (value === undefined || value === null || value === "") {
+		return { types: Object.freeze([]), invalidNames: Object.freeze([]) };
+	}
+	const rawValues =
+		typeof value === "string"
+			? value.split(",")
+			: Array.isArray(value)
+				? value
+				: null;
+	if (rawValues === null || rawValues.length > MAX_ALERT_WEBHOOK_TYPES) {
+		return { types: Object.freeze([]), invalidNames: Object.freeze([]) };
+	}
+
+	const seenValid = new Set<AlertType>();
+	const seenInvalid = new Set<string>();
+	const types: AlertType[] = [];
+	const invalidNames: string[] = [];
+	for (const raw of rawValues) {
+		const candidate = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+		if (!candidate) continue;
+		if (isAlertType(candidate)) {
+			if (!seenValid.has(candidate)) {
+				seenValid.add(candidate);
+				types.push(candidate);
+			}
+		} else if (!seenInvalid.has(candidate)) {
+			seenInvalid.add(candidate);
+			invalidNames.push(candidate);
+		}
+	}
+	return {
+		types: Object.freeze(types),
+		invalidNames: Object.freeze(invalidNames),
+	};
 }
 
 /**
@@ -2191,6 +2249,43 @@ export class Config extends EventEmitter {
 		this.set("alert_webhook_url", value);
 	}
 
+	/**
+	 * Restart-scoped allowlist of alert types delivered to the webhook (DB
+	 * insert and SSE emission are unaffected — see AlertService.persistAndEmit
+	 * in packages/http-api/src/services/alerts.ts). Unrecognized names in the
+	 * env/file value are dropped and logged rather than rejected here (this
+	 * is a hot read path called on every alert): reject-on-write happens in
+	 * setAlertWebhookTypes instead. Empty or unset (either source) means
+	 * "deliver all types" — today's behaviour — which is also the safe
+	 * fallback for malformed input, since fail-closed here would mean
+	 * silently swallowing every alert.
+	 */
+	getAlertWebhookTypes(): readonly AlertType[] {
+		const fromEnv = process.env.ALERT_WEBHOOK_TYPES;
+		const raw = fromEnv !== undefined ? fromEnv : this.data.alert_webhook_types;
+		const { types, invalidNames } = parseAlertWebhookTypes(raw);
+		if (invalidNames.length > 0) {
+			log.warn(
+				`Ignoring unknown alert webhook type(s) in ALERT_WEBHOOK_TYPES/alert_webhook_types: ${invalidNames.join(", ")}`,
+			);
+		}
+		return types;
+	}
+
+	/** Throws ValidationError if `value` contains any name that isn't a known
+	 * AlertType (see @better-ccflare/types ALERT_TYPES) — unlike the getter,
+	 * a config write is a good moment to fail loudly. */
+	setAlertWebhookTypes(value: string): void {
+		const { types, invalidNames } = parseAlertWebhookTypes(value);
+		if (invalidNames.length > 0) {
+			throw new ValidationError(
+				`Unknown alert type(s): ${invalidNames.join(", ")}`,
+				"alert_webhook_types",
+			);
+		}
+		this.set("alert_webhook_types", types.join(","));
+	}
+
 	getAllSettings(): Record<string, string | number | boolean | undefined> {
 		const anthropicDegradedMode = this.getAnthropicDegradedModeConfig();
 		// Include current strategy (which might come from env)
@@ -2250,6 +2345,7 @@ export class Config extends EventEmitter {
 			alert_anomaly_loop_min_requests: this.getAlertAnomalyLoopMinRequests(),
 			alert_cooldown_minutes: this.getAlertCooldownMinutes(),
 			alert_webhook_url: this.getAlertWebhookUrl(),
+			alert_webhook_types: this.getAlertWebhookTypes().join(","),
 		};
 	}
 
