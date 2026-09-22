@@ -16,6 +16,7 @@ import {
 	isValidClaudeModel,
 	LATEST_FABLE_MODEL,
 	LATEST_MODEL_BY_FAMILY,
+	LATEST_OPUS_MODEL,
 	MAX_MODEL_MAPPING_CANDIDATES,
 	mapModelName,
 	parseCustomEndpointData,
@@ -42,7 +43,7 @@ describe("Fable 5.1 registry metadata", () => {
 		expect(getModelShortName(CLAUDE_MODEL_IDS.FABLE_5_1)).toBe(
 			"claude-fable-5.1",
 		);
-		expect(BUNDLED_MODELS_AS_OF).toBe("2026-09-01");
+		expect(BUNDLED_MODELS_AS_OF).toBe("2026-09-22");
 	});
 
 	test("advances bare Fable aliases without rewriting concrete legacy pins", () => {
@@ -54,6 +55,36 @@ describe("Fable 5.1 registry metadata", () => {
 		expect(resolveFamilyAliasModel(CLAUDE_MODEL_IDS.FABLE_5, "fable")).toBe(
 			CLAUDE_MODEL_IDS.FABLE_5,
 		);
+	});
+});
+
+describe("Opus 5.5 registry metadata", () => {
+	test("registers Opus 5.5 while preserving the explicit Opus 5 legacy pin", () => {
+		expect(CLAUDE_MODEL_IDS.OPUS_5_5).toBe("claude-opus-5-5");
+		expect(CLAUDE_MODEL_IDS.OPUS_5).toBe("claude-opus-5");
+		expect(getModelDisplayName(CLAUDE_MODEL_IDS.OPUS_5_5)).toBe(
+			"Claude Opus 5.5",
+		);
+		expect(getModelShortName(CLAUDE_MODEL_IDS.OPUS_5_5)).toBe(
+			"claude-opus-5.5",
+		);
+	});
+
+	test("advances bare Opus aliases without rewriting concrete legacy pins", () => {
+		expect(LATEST_OPUS_MODEL).toBe(CLAUDE_MODEL_IDS.OPUS_5_5);
+		expect(LATEST_MODEL_BY_FAMILY.opus).toBe(CLAUDE_MODEL_IDS.OPUS_5_5);
+		expect(resolveFamilyAliasModel("opus", "opus")).toBe(
+			CLAUDE_MODEL_IDS.OPUS_5_5,
+		);
+		expect(resolveFamilyAliasModel(CLAUDE_MODEL_IDS.OPUS_5, "opus")).toBe(
+			CLAUDE_MODEL_IDS.OPUS_5,
+		);
+	});
+
+	test("classifies Opus 5.5 into the opus family for routing", () => {
+		expect(getModelFamily(CLAUDE_MODEL_IDS.OPUS_5_5)).toBe("opus");
+		expect(getStrictClaudeModelFamily(CLAUDE_MODEL_IDS.OPUS_5_5)).toBe("opus");
+		expect(isValidClaudeModel(CLAUDE_MODEL_IDS.OPUS_5_5)).toBe(true);
 	});
 });
 

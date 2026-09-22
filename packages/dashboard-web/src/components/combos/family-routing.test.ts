@@ -285,7 +285,7 @@ describe("family model options", () => {
 		];
 		const latestDisplayNames: Record<ComboFamily, string> = {
 			fable: "Claude Fable 5.1",
-			opus: "Claude Opus 5",
+			opus: "Claude Opus 5.5",
 			sonnet: "Claude Sonnet 5",
 			haiku: "Claude Haiku 4.5",
 		};
@@ -320,7 +320,7 @@ describe("family model options", () => {
 		).toEqual([
 			{
 				id: "opus",
-				displayName: "Latest opus (tracks Claude Opus 5)",
+				displayName: "Latest opus (tracks Claude Opus 5.5)",
 			},
 			{ id: latest, displayName: "Live latest" },
 		]);

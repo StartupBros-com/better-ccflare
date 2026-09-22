@@ -20,7 +20,11 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { Config } from "@better-ccflare/config";
-import { CLAUDE_MODEL_IDS, requestEvents } from "@better-ccflare/core";
+import {
+	CLAUDE_MODEL_IDS,
+	LATEST_MODEL_BY_FAMILY,
+	requestEvents,
+} from "@better-ccflare/core";
 import { BunSqlAdapter, ensureSchema } from "@better-ccflare/database";
 import type { AlertEvent, RequestResponse } from "@better-ccflare/types";
 import { AlertService } from "../alerts";
@@ -107,7 +111,7 @@ describe("AlertService model_routing_drift alerts", () => {
 			baseRequest({
 				id: "req-incident",
 				comboModelOverride: {
-					from: CLAUDE_MODEL_IDS.OPUS_5,
+					from: LATEST_MODEL_BY_FAMILY.opus,
 					to: CLAUDE_MODEL_IDS.OPUS_4_8,
 				},
 			}),
@@ -119,7 +123,7 @@ describe("AlertService model_routing_drift alerts", () => {
 		expect(alert.type).toBe("model_routing_drift");
 		expect(alert.severity).toBe("warning");
 		expect(alert.message).toContain(
-			`opus routing policy rewrites ${CLAUDE_MODEL_IDS.OPUS_5} -> ${CLAUDE_MODEL_IDS.OPUS_4_8}`,
+			`opus routing policy rewrites ${LATEST_MODEL_BY_FAMILY.opus} -> ${CLAUDE_MODEL_IDS.OPUS_4_8}`,
 		);
 		expect(alert.model).toBe(CLAUDE_MODEL_IDS.OPUS_4_8);
 	});
@@ -181,7 +185,7 @@ describe("AlertService model_routing_drift alerts", () => {
 
 		const request = baseRequest({
 			comboModelOverride: {
-				from: CLAUDE_MODEL_IDS.OPUS_5,
+				from: LATEST_MODEL_BY_FAMILY.opus,
 				to: CLAUDE_MODEL_IDS.OPUS_4_8,
 			},
 		});
@@ -248,7 +252,7 @@ describe("AlertService model_routing_drift alerts", () => {
 			payload: baseRequest({
 				id: "req-via-event",
 				comboModelOverride: {
-					from: CLAUDE_MODEL_IDS.OPUS_5,
+					from: LATEST_MODEL_BY_FAMILY.opus,
 					to: CLAUDE_MODEL_IDS.OPUS_4_8,
 				},
 			}),

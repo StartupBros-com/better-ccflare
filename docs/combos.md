@@ -167,7 +167,7 @@ A family's `managed_model`, and an individual Manual slot's `model`, can hold ei
 
 Generated Managed-routing defaults and reviewed proposals persist the canonical bare family alias. Their previews and effective routing views separately expose the concrete model currently resolved from that alias. An explicitly selected concrete `managed_model` remains an exact pin and is persisted verbatim. The dashboard labels its default choice as **Latest family**; every concrete catalog choice is an explicit pin.
 
-The dashboard and CLI always show what an alias currently resolves to alongside the stored literal (for example, `opus → claude-opus-5`) instead of displaying the bare word unexplained.
+The dashboard and CLI always show what an alias currently resolves to alongside the stored literal (for example, `opus → claude-opus-5-5`) instead of displaying the bare word unexplained.
 
 **Rollback caveat:** a binary built before family-alias support does not know how to resolve the alias literal — it would treat the stored word as a real (and nonsensical) model ID. Before rolling production back to a pre-alias-feature binary, run:
 
