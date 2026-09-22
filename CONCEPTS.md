@@ -5,6 +5,30 @@ vocabulary that `docs/` and `AGENTS.md` can cite without redefining.
 
 ## Routing
 
+### Route profile
+
+A named routing choice, offered to the client as a pickable model, that sends a Claude Code
+session tree to a chosen account or pool instead of ordinary routing. A pinned profile names
+one account; a capability profile admits every account that can serve it (see Root-capable
+pool). A profile names a logical model and may also assert the expected provider and physical
+model.
+
+Those assertions are checked when an account is selected, against the account's own configured
+model mapping. They are not checked against a default the provider fills in later, when it
+builds the upstream request. An account that relies on its provider's default model therefore
+fails a physical-model assertion even when the model it would send is right. A pinned profile
+meant to follow a provider's newest model should assert only the provider.
+
+### Logical model
+
+The model a request names in Claude's vocabulary, before any account or provider translates
+it. Distinct from the physical model an upstream serves.
+
+### Physical model
+
+The model an upstream provider actually serves for a request, after the account's model
+mapping or the provider's default has translated the logical model.
+
 ### Root-capable pool
 
 The accounts admitted by a capability profile because each can serve the profile's root
