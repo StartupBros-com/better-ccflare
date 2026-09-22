@@ -493,7 +493,7 @@ describe("AlertService fire-and-forget failures", () => {
 		);
 		try {
 			service.start();
-			expect(callbacks).toHaveLength(1);
+			expect(callbacks).toHaveLength(2);
 			expect(requestEvents.listenerCount("event")).toBe(
 				requestListenersBefore + 1,
 			);
@@ -518,21 +518,21 @@ describe("AlertService fire-and-forget failures", () => {
 			await waitFor(() => adapter.queryCalls === 2);
 
 			service.stop();
-			expect(cleared).toEqual([handles[0]]);
+			expect(cleared).toEqual([handles[0], handles[1]]);
 			expect(requestEvents.listenerCount("event")).toBe(requestListenersBefore);
 			expect(authFailureEvents.listenerCount("event")).toBe(
 				authListenersBefore,
 			);
 
 			service.start();
-			expect(callbacks).toHaveLength(2);
+			expect(callbacks).toHaveLength(4);
 			expect(requestEvents.listenerCount("event")).toBe(
 				requestListenersBefore + 1,
 			);
 			expect(authFailureEvents.listenerCount("event")).toBe(
 				authListenersBefore + 1,
 			);
-			callbacks[1]?.();
+			callbacks[2]?.();
 			await waitFor(() => adapter.queryCalls === 3);
 		} finally {
 			service.stop();

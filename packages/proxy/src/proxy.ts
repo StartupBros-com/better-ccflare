@@ -491,6 +491,8 @@ function createComboSessionFallbackDisabledResponse(
 		JSON.stringify({
 			type: "error",
 			error: {
+				// Listed in LOCAL_REFUSAL_ERROR_TYPES — the auto-refresh scheduler
+				// recognises this shape as a local refusal, so keep the two in sync.
 				type: "service_unavailable_error",
 				message: "Service temporarily unavailable. Please try again later.",
 				code: "combo_session_fallback_disabled",
@@ -2446,7 +2448,8 @@ async function handleProxyCoreImpl(
 			requestMeta.routingSelectionDiagnostics.eligibleCandidateCount === 0;
 		if (
 			process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL === "1" &&
-			!policyExcludedByImplicitFallback
+			!policyExcludedByImplicitFallback &&
+			!isInternalProbe(req.headers, ctx)
 		) {
 			// An unauthenticated passthrough cannot supply independent account
 			// evidence and must never claim the protected cohort's recovery lease.

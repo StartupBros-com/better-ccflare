@@ -6,11 +6,19 @@ import {
 	DatabaseOperations as DirectDbOps,
 } from "@better-ccflare/database";
 import {
+	registerPollingRestarter,
+	unregisterPollingRestarter,
+} from "@better-ccflare/proxy";
+import type { DeviceSetupCoordinator } from "../../services/device-setup-jobs";
+import { createServerDeviceSetupCoordinator } from "../../services/server-device-setup";
+import {
 	createAnthropicReauthCallbackHandler,
 	createAnthropicReauthInitHandler,
+	createCodexDeviceFlowInitHandler,
 	createCodexDeviceFlowStatusHandler,
 	createCodexReauthHandler,
 	createOAuthInitHandler,
+	createQwenDeviceFlowInitHandler,
 	createQwenDeviceFlowStatusHandler,
 	createQwenReauthHandler,
 } from "../oauth";
@@ -764,5 +772,138 @@ describe("createAnthropicReauthCallbackHandler", () => {
 		expect(res.status).toBe(400);
 		const data = await res.json();
 		expect(data.error).toMatch(/session/i);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Device-flow adds must start usage polling for the account they just created
+// ---------------------------------------------------------------------------
+
+const DEVICE_FLOW_POLLING_DB_PATH = `${process.env.TMPDIR || "/tmp"}/test-device-flow-polling.db`;
+const DEVICE_FLOW_SERVER_ID = "test-device-flow-polling-server";
+
+describe("device flow adds start usage polling", () => {
+	let coordinator: DeviceSetupCoordinator;
+	let dbOps: DatabaseOperations;
+	let seen: string[];
+
+	beforeAll(async () => {
+		try {
+			if (existsSync(DEVICE_FLOW_POLLING_DB_PATH)) {
+				unlinkSync(DEVICE_FLOW_POLLING_DB_PATH);
+			}
+		} catch {
+			// ignore
+		}
+		dbOps = new DirectDbOps(DEVICE_FLOW_POLLING_DB_PATH);
+		coordinator = createServerDeviceSetupCoordinator(dbOps);
+		seen = [];
+		registerPollingRestarter(DEVICE_FLOW_SERVER_ID, async (id: string) => {
+			seen.push(id);
+			return true;
+		});
+	});
+
+	/**
+	 * The device flows start usage polling fire-and-forget, so the restarter may
+	 * run a tick after the session reports "complete". Poll until it has been
+	 * called instead of asserting immediately.
+	 */
+	async function waitForRestarter(
+		ids: string[],
+		id: string,
+		timeoutMs = 2000,
+	): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (!ids.includes(id)) {
+			if (Date.now() > deadline) {
+				throw new Error(`restarter not called for ${id} within ${timeoutMs}ms`);
+			}
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+	}
+
+	afterAll(async () => {
+		coordinator.dispose();
+		await coordinator.drain();
+		unregisterPollingRestarter(DEVICE_FLOW_SERVER_ID);
+		await dbOps.close();
+		try {
+			if (existsSync(DEVICE_FLOW_POLLING_DB_PATH)) {
+				unlinkSync(DEVICE_FLOW_POLLING_DB_PATH);
+			}
+		} catch {
+			// ignore
+		}
+	});
+
+	it("starts polling for a Codex account added via the web device flow", async () => {
+		const handler = createCodexDeviceFlowInitHandler(coordinator);
+		const res = await handler(
+			new Request("http://localhost/api/oauth/codex/device", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					name: "codex-device-flow-add",
+					priority: 0,
+					idempotencyKey: "codex-polling",
+					reviewed: [],
+				}),
+			}),
+		);
+		expect(res.status).toBe(200);
+		const data = await res.json();
+
+		let status = "";
+		for (let attempt = 0; attempt < 100; attempt++) {
+			status = (await coordinator.get(data.job.id))?.status ?? "";
+			if (status === "complete" || status === "authorization_error") break;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		expect(status).toBe("complete");
+
+		const row = await dbOps
+			.getAdapter()
+			.get<{ id: string }>("SELECT id FROM accounts WHERE name = ?", [
+				"codex-device-flow-add",
+			]);
+		expect(row?.id).toBeDefined();
+		await waitForRestarter(seen, row?.id as string);
+		expect(seen).toContain(row?.id as string);
+	});
+
+	it("starts polling for a Qwen account added via the web device flow", async () => {
+		const handler = createQwenDeviceFlowInitHandler(coordinator);
+		const res = await handler(
+			new Request("http://localhost/api/oauth/qwen/device", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					name: "qwen-device-flow-add",
+					priority: 0,
+					idempotencyKey: "qwen-polling",
+					reviewed: [],
+				}),
+			}),
+		);
+		expect(res.status).toBe(200);
+		const data = await res.json();
+
+		let status = "";
+		for (let attempt = 0; attempt < 100; attempt++) {
+			status = (await coordinator.get(data.job.id))?.status ?? "";
+			if (status === "complete" || status === "authorization_error") break;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		expect(status).toBe("complete");
+
+		const row = await dbOps
+			.getAdapter()
+			.get<{ id: string }>("SELECT id FROM accounts WHERE name = ?", [
+				"qwen-device-flow-add",
+			]);
+		expect(row?.id).toBeDefined();
+		await waitForRestarter(seen, row?.id as string);
+		expect(seen).toContain(row?.id as string);
 	});
 });

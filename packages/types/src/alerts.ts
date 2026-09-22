@@ -19,6 +19,7 @@ export type AlertType =
 	| "anomaly_runaway_loop"
 	| "anomaly_model_misrouting"
 	| "auth_failure"
+	| "reauth_deadline_warning"
 	| "model_routing_drift"
 	/** A usage window's (e.g. five_hour, seven_day) utilization crossed the
 	 * configured threshold percent. See AlertService.evaluateUsageSnapshot in

@@ -11,6 +11,7 @@ const MAX_STREAM_ERROR_MESSAGE_LENGTH = 1_024;
 
 export interface TransformStreamingResponseOptions {
 	contextWindowForModel?: (model: string) => number | undefined;
+	fallbackModel?: string;
 }
 
 /**
@@ -318,7 +319,7 @@ export function transformStreamingResponse(
 				streamContext = {
 					buffer: "",
 					hasStarted: false,
-					extractedModel: "unknown",
+					extractedModel: options.fallbackModel || "unknown",
 					contextWindowSize: undefined,
 					hasSentStart: false,
 					hasSentContentBlockStart: false,

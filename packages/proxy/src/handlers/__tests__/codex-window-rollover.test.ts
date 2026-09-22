@@ -139,7 +139,7 @@ describe("Codex usage-window session rollover", () => {
 	it("resets the session from the weekly window when the default flag is false and no 5-hour window is reported", async () => {
 		const account = makeAccount();
 		seedUsage(account.id, {
-			seven_day: { utilization: 20, resets_at: PREVIOUS_WEEKLY_RESET },
+			seven_day: { utilization: 60, resets_at: PREVIOUS_WEEKLY_RESET },
 		});
 		const { ctx, calls, flush } = makeCtx();
 		expect(ctx.config.getCodexFiveHourWindowEnabled()).toBe(false);
@@ -158,7 +158,7 @@ describe("Codex usage-window session rollover", () => {
 	it("resets the session from the reported 5-hour window when the default flag is false", async () => {
 		const account = makeAccount();
 		seedUsage(account.id, {
-			five_hour: { utilization: 20, resets_at: PREVIOUS_FIVE_HOUR_RESET },
+			five_hour: { utilization: 60, resets_at: PREVIOUS_FIVE_HOUR_RESET },
 			seven_day: { utilization: 15, resets_at: NEXT_WEEKLY_RESET },
 		});
 		const { ctx, calls, flush } = makeCtx();
@@ -179,7 +179,7 @@ describe("Codex usage-window session rollover", () => {
 	it("does not reset the session from the weekly window when the flag is true and no 5-hour window is reported", async () => {
 		const account = makeAccount();
 		seedUsage(account.id, {
-			seven_day: { utilization: 20, resets_at: PREVIOUS_WEEKLY_RESET },
+			seven_day: { utilization: 60, resets_at: PREVIOUS_WEEKLY_RESET },
 		});
 		const { ctx, calls, flush } = makeCtx(true);
 

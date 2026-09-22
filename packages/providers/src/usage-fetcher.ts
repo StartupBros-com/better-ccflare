@@ -1,4 +1,5 @@
 import {
+	type AccountUsageSnapshot,
 	CLAUDE_CLI_VERSION,
 	getModelFamily,
 	normalizeProviderUsageWindows,
@@ -32,7 +33,12 @@ import {
 	getRepresentativeNanoGPTWindow,
 	type NanoGPTUsageData,
 } from "./nanogpt-usage-fetcher";
-import { fetchCodexUsageData } from "./providers/codex/api-usage";
+import { extractChatgptAccountId } from "./providers/codex/account-id";
+import { fetchCodexUsageData } from "./providers/codex/usage-endpoint";
+import {
+	codexWindowRolledOver,
+	pickCodexRolloverSlot,
+} from "./providers/codex/window-rollover";
 import {
 	fetchXaiUsageData,
 	getRepresentativeXaiUtilization,
@@ -823,26 +829,78 @@ export function getRepresentativeUsageResetMs(
 }
 
 /**
- * Representative utilization paired with the reset that belongs to the same
- * winning window. Zai needs special handling because its utilization is the
- * max of time_limit and tokens_limit while getRepresentativeUsageResetMs is
- * intentionally tokens_limit-only for display surfaces. Other providers keep
- * their existing representative-reset behavior unchanged.
+ * The representative usage snapshot for one account's cached payload: the
+ * utilization of the window that is closest to its cap, paired with THAT
+ * window's own reset. The single helper for every consumer — account
+ * selection, the auto-refresh probe skip, the /health usage_exhausted counter
+ * and the pool-exhausted response body — so no two surfaces can disagree about
+ * whether an account is exhausted or when it comes back.
+ *
+ * Utilization and reset must always come from the same window. Pairing them
+ * across windows breaks `isUsageExhausted`'s staleness guard in both
+ * directions: a stale 100% whose window has since rolled over is held against
+ * the account because some other window's reset is still in the future, and a
+ * genuinely capped window is cleared early because an unrelated window reset.
+ *
+ * Zai is the provider where those two can differ. Its utilization is the max
+ * of `time_limit`, `tokens_limit` and `tokens_limit_weekly`, while
+ * {@link getRepresentativeUsageResetMs} deliberately looks at the token
+ * windows only (the display label "five_hour" maps to the `tokens_limit`
+ * payload key). So the zai branch here picks the winning window across all
+ * three and takes its `resetAt`. On a tie the LATER reset wins: the account is
+ * not available again until every capped window clears.
+ *
+ * Null means "no opinion" in two distinct cases the callers treat alike —
+ * nothing was ever polled (or the cache dropped a stale entry), and the
+ * provider exposes no utilization surface at all. Callers must fall back to
+ * the usage-free check rather than read null as "not exhausted by telemetry".
+ *
+ * `provider` is taken as given: callers holding a nullable `account.provider`
+ * apply their own `?? "anthropic"` default before calling.
  */
 export function getRepresentativeUsageSnapshotForProvider(
-	data: AnyUsageData,
+	data: AnyUsageData | null | undefined,
 	provider: string,
-): { utilization: number; resetMs: number | null } | null {
+): AccountUsageSnapshot | null {
+	if (!data) return null;
 	if (provider === "zai") {
-		const winning = getWinningZaiTokenWindow(data as ZaiUsageData);
+		const zai = data as ZaiUsageData;
+		const windows = [
+			zai.time_limit,
+			zai.tokens_limit,
+			zai.tokens_limit_weekly,
+		].filter((window) => window != null);
+		const winning = windows.reduce<(typeof windows)[number] | null>(
+			(prev, window) => {
+				if (!prev || window.percentage > prev.percentage) return window;
+				if (
+					window.percentage === prev.percentage &&
+					prev.resetAt !== null &&
+					(window.resetAt === null || window.resetAt > prev.resetAt)
+				)
+					return window;
+				return prev;
+			},
+			null,
+		);
 		return winning
-			? {
-					utilization: winning.window.percentage,
-					resetMs: winning.window.resetAt,
-				}
+			? { utilization: winning.percentage, resetMs: winning.resetAt }
 			: null;
 	}
+	return plainUsageSnapshot(data, provider);
+}
 
+/**
+ * The straight pairing of {@link getRepresentativeUtilizationForProvider} with
+ * {@link getRepresentativeUsageResetMs}, for every provider whose two helpers
+ * already agree on the representative window. Not exported: callers must go
+ * through {@link getRepresentativeUsageSnapshotForProvider} so zai's
+ * cross-window rule can never be skipped by accident.
+ */
+function plainUsageSnapshot(
+	data: AnyUsageData,
+	provider: string,
+): AccountUsageSnapshot | null {
 	const utilization = getRepresentativeUtilizationForProvider(data, provider);
 	if (utilization === null) return null;
 	return {
@@ -893,6 +951,7 @@ class UsageCache {
 	 */
 	private registrations = new Map<string, PollRegistration>();
 	private nextEpoch = 0;
+	private generations = new Map<string, number>();
 	private usageRateLimitedUntil = new Map<string, number>(); // Tracks when usage API 429 clears
 	private modelScopedDepletions = new Map<
 		string,
@@ -909,6 +968,26 @@ class UsageCache {
 			promise: Promise<{ success: boolean; retryAfterMs: number | null }>;
 		}
 	>();
+	/**
+	 * Which Codex window a session rides, mirroring
+	 * `CODEX_FIVE_HOUR_WINDOW_ENABLED`. Config lives outside this package, so
+	 * the server injects the reader once at startup; the default matches an
+	 * unset flag. The traffic path in response-processor.ts reads the same
+	 * setting, and both sides of a rollover comparison must agree on the slot.
+	 */
+	private codexRolloverPolicy: { pinFiveHour: () => boolean } = {
+		pinFiveHour: () => false,
+	};
+
+	/** Point the Codex rollover slot at the configured window. */
+	setCodexRolloverPolicy(policy: { pinFiveHour: () => boolean }): void {
+		this.codexRolloverPolicy = policy;
+	}
+
+	/** Restore the unconfigured default (tests). */
+	resetCodexRolloverPolicy(): void {
+		this.codexRolloverPolicy = { pinFiveHour: () => false };
+	}
 
 	/** True only while this exact registration still owns its account. */
 	private isCurrent(registration: PollRegistration): boolean {
@@ -1324,10 +1403,13 @@ class UsageCache {
 				// Codex/ChatGPT subscription usage via the free wham/usage
 				// introspection endpoint — no quota consumed, unlike the
 				// quota-consuming ping in on-demand-fetch.ts.
-				const result = await fetchCodexUsageData(
-					token,
-					registration.abortController.signal,
-				);
+				const generationBefore = this.generations.get(accountId) ?? 0;
+				const result = await fetchCodexUsageData(token, {
+					chatgptAccountId: extractChatgptAccountId(token),
+					signal: registration.abortController.signal,
+				});
+				if ((this.generations.get(accountId) ?? 0) !== generationBefore)
+					return { success: true, retryAfterMs: null };
 				if (!this.isCurrent(registration)) {
 					// Polling was stopped while this fetch was in flight (e.g. the
 					// account's endpoint changed away from the subscription
@@ -1338,11 +1420,15 @@ class UsageCache {
 				if (result.data) {
 					if (this.isCurrent(registration))
 						this.usageRateLimitedUntil.delete(accountId);
-					this.notifyRegistrationWindowReset(
-						registration,
+					const previous = this.cache.get(accountId)?.data as
+						| UsageData
+						| undefined;
+					const slot = pickCodexRolloverSlot(
 						result.data,
-						"codex",
+						this.codexRolloverPolicy.pinFiveHour(),
 					);
+					if (codexWindowRolledOver(previous, result.data, Date.now(), slot))
+						registration.onWindowReset?.(accountId);
 					this.setRegistrationCache(registration, result.data);
 					this.notifySnapshot(registration, result.data);
 					const utilization = getRepresentativeUtilization(
@@ -1699,6 +1785,7 @@ class UsageCache {
 	 */
 	private setAuthoritative(accountId: string, data: AnyUsageData): void {
 		this.cache.set(accountId, { data, timestamp: Date.now() });
+		this.invalidateInFlight(accountId);
 		// Ordinary usage snapshots do not prove a recent model+client-beta-specific
 		// out_of_credits condition has cleared, and an older in-flight poll can
 		// complete after newer direct failure evidence. Keep reactive markers for
@@ -1786,10 +1873,15 @@ class UsageCache {
 	/**
 	 * Clear cached data for a specific account
 	 */
+	private invalidateInFlight(accountId: string): void {
+		this.generations.set(accountId, (this.generations.get(accountId) ?? 0) + 1);
+	}
+
 	delete(accountId: string): void {
 		this.cache.delete(accountId);
 		this.modelScopedDepletions.delete(accountId);
 		this.familyScopedDepletions.delete(accountId);
+		this.invalidateInFlight(accountId);
 		log.debug(`Cleared usage cache for account ${accountId}`);
 	}
 
@@ -1801,6 +1893,11 @@ class UsageCache {
 			this.stopPolling(accountId);
 		}
 		this.cache.clear();
+		// Advance, never drop: a poll still on the wire has to see a different
+		// generation when it returns (see {@link generations}).
+		for (const accountId of this.generations.keys()) {
+			this.invalidateInFlight(accountId);
+		}
 		this.usageRateLimitedUntil.clear();
 		this.modelScopedDepletions.clear();
 		this.familyScopedDepletions.clear();

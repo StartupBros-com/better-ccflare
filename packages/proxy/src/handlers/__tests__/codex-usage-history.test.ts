@@ -3,6 +3,7 @@ import type { DatabaseOperations } from "@better-ccflare/database";
 import { usageCache } from "@better-ccflare/providers";
 import type { Account, CanonicalUsageWindow } from "@better-ccflare/types";
 import {
+	earliestCodexResetMs,
 	recordCodexUsageSnapshot,
 	resetCodexUsageHistoryThrottle,
 } from "../../codex-usage-history";
@@ -208,6 +209,7 @@ function makeCodexAccount(): Account {
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
+		requires_reauth: false,
 		rate_limit_reset: null,
 		rate_limit_status: null,
 		rate_limit_remaining: null,
@@ -310,5 +312,36 @@ describe("updateAccountMetadata — Codex usage persistence", () => {
 		expect(
 			usage.find((window) => window.windowKey === "seven_day"),
 		).toMatchObject({ utilization: 63, scope: "account", active: true });
+	});
+});
+
+describe("earliestCodexResetMs", () => {
+	it("returns the soonest reset among real windows", () => {
+		const soon = new Date(Date.now() + 60_000).toISOString();
+		const later = new Date(Date.now() + 600_000).toISOString();
+
+		expect(
+			earliestCodexResetMs({
+				five_hour: { utilization: 1, resets_at: soon },
+				seven_day: { utilization: 2, resets_at: later },
+			}),
+		).toBe(new Date(soon).getTime());
+	});
+
+	it("ignores windows without a reset or without a numeric percentage", () => {
+		const later = new Date(Date.now() + 600_000).toISOString();
+
+		expect(
+			earliestCodexResetMs({
+				five_hour: { utilization: 0, resets_at: null },
+				seven_day: { utilization: 2, resets_at: later },
+			}),
+		).toBe(new Date(later).getTime());
+		expect(
+			earliestCodexResetMs({
+				five_hour: { utilization: null, resets_at: later },
+			}),
+		).toBeNull();
+		expect(earliestCodexResetMs({})).toBeNull();
 	});
 });

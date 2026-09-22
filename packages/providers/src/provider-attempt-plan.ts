@@ -471,7 +471,39 @@ function readAccountBoolean(account: Account, field: keyof Account): boolean {
 }
 
 function createScalarAccountView(account: Account): Account {
+	const requestTransformer = Object.hasOwn(account, "request_transformer")
+		? readAccountNullableString(account, "request_transformer")
+		: null;
 	const accountView: Account = {
+		last_manual_reauth_at: Object.hasOwn(account, "last_manual_reauth_at")
+			? readAccountNullableNumber(account, "last_manual_reauth_at")
+			: null,
+		// Unknown stored transformer IDs remain inert in the transformer dispatcher.
+		request_transformer: requestTransformer as Account["request_transformer"],
+		usage_pause_five_hour_threshold: Object.hasOwn(
+			account,
+			"usage_pause_five_hour_threshold",
+		)
+			? readAccountNullableNumber(account, "usage_pause_five_hour_threshold")
+			: null,
+		usage_pause_weekly_threshold: Object.hasOwn(
+			account,
+			"usage_pause_weekly_threshold",
+		)
+			? readAccountNullableNumber(account, "usage_pause_weekly_threshold")
+			: null,
+		usage_pause_five_hour_enabled: Object.hasOwn(
+			account,
+			"usage_pause_five_hour_enabled",
+		)
+			? readAccountBoolean(account, "usage_pause_five_hour_enabled")
+			: false,
+		usage_pause_weekly_enabled: Object.hasOwn(
+			account,
+			"usage_pause_weekly_enabled",
+		)
+			? readAccountBoolean(account, "usage_pause_weekly_enabled")
+			: false,
 		id: readAccountString(account, "id"),
 		name: readAccountString(account, "name"),
 		provider: readAccountString(account, "provider"),

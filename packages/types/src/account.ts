@@ -1,4 +1,85 @@
 import type { ComboFamily } from "./combo";
+// Manual reauthentication deadline thresholds. This is the canonical source
+// for this arithmetic — packages/proxy/src/handlers/token-health-monitor.ts
+// imports computeReauthDeadline / isEligibleForReauthDeadline from here
+// rather than maintaining its own copy.
+export const REAUTH_MANUAL_DEADLINE_MS = 28 * 24 * 60 * 60 * 1000; // 28 days
+export const REAUTH_DEADLINE_WARNING_THRESHOLD_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+export const REAUTH_DEADLINE_CRITICAL_THRESHOLD_MS = 12 * 60 * 60 * 1000; // 12 hours
+
+export interface ReauthDeadlineStatus {
+	status: "ok" | "warning" | "critical" | "expired";
+	message: string;
+	deadlineAt: number;
+	daysUntilDeadline: number;
+	hoursUntilDeadline: number;
+}
+
+/**
+ * True only for a genuine Claude OAuth account: provider is "anthropic",
+ * both a refresh_token and access_token are present, and they're not the
+ * same value (excludes API-key-in-both-fields accounts created for
+ * zai/minimax/deepseek/etc via the dashboard's "add account" flow).
+ */
+export function isEligibleForReauthDeadline(fields: {
+	provider: string | null;
+	refreshToken: string | null;
+	accessToken: string | null;
+}): boolean {
+	return (
+		(fields.provider ?? "anthropic") === "anthropic" &&
+		!!fields.refreshToken &&
+		!!fields.accessToken &&
+		fields.refreshToken !== fields.accessToken
+	);
+}
+
+/**
+ * Predicts when a Claude OAuth account will need its next MANUAL
+ * reauthentication, based on the empirically observed ~28-day deadline
+ * from the last manual reauth. Returns null when not eligible (not a
+ * Claude OAuth account) OR when lastManualReauthAt is null — there is
+ * deliberately NO fallback to account creation date: an account that
+ * hasn't been manually reauthenticated since this feature shipped has
+ * an unknown deadline, not an assumed-expired one.
+ */
+export function computeReauthDeadline(params: {
+	eligible: boolean;
+	lastManualReauthAt: number | null;
+	now?: number;
+}): ReauthDeadlineStatus | null {
+	if (!params.eligible || params.lastManualReauthAt == null) return null;
+	const now = params.now ?? Date.now();
+	const deadlineAt = params.lastManualReauthAt + REAUTH_MANUAL_DEADLINE_MS;
+	const msLeft = deadlineAt - now;
+	const daysUntilDeadline = Math.ceil(msLeft / (24 * 60 * 60 * 1000));
+	const hoursUntilDeadline = Math.ceil(msLeft / (60 * 60 * 1000));
+
+	let status: ReauthDeadlineStatus["status"];
+	let message: string;
+	if (msLeft <= 0) {
+		status = "expired";
+		const daysOverdue = Math.floor(-msLeft / (24 * 60 * 60 * 1000));
+		message = `Manual reauthentication deadline passed ~${daysOverdue} day(s) ago — re-authenticate immediately`;
+	} else if (msLeft <= REAUTH_DEADLINE_CRITICAL_THRESHOLD_MS) {
+		status = "critical";
+		message = `Re-authentication required within ~${hoursUntilDeadline} hour(s)`;
+	} else if (msLeft <= REAUTH_DEADLINE_WARNING_THRESHOLD_MS) {
+		status = "warning";
+		message = `Re-authentication required within ~${daysUntilDeadline} day(s)`;
+	} else {
+		status = "ok";
+		message = `Re-authentication not required for ~${daysUntilDeadline} day(s)`;
+	}
+
+	return {
+		status,
+		message,
+		deadlineAt,
+		daysUntilDeadline,
+		hoursUntilDeadline,
+	};
+}
 
 export type RateLimitReason =
 	| "upstream_429_with_reset"
@@ -51,7 +132,22 @@ export type RateLimitReason =
 	 *  scoped to a model or surface, so it DOES count as a circuit failure.
 	 *  Not time-bounded: the bench will expire and the single-flight recovery
 	 *  probe will rediscover the 403 until the org setting actually changes. */
-	| "org_permission_denied";
+	| "org_permission_denied"
+	/** Transient upstream server error — HTTP 500/502/503/504 from any provider.
+	 *  Not a quota signal and not specific to the account, but in production a
+	 *  single organization returned 500 for a minute at a time while sibling
+	 *  accounts served the same traffic, so the request is re-issued once in
+	 *  place and, if the error survives that, the account is benched briefly
+	 *  (`CCFLARE_SERVER_ERROR_COOLDOWN_MS`, or a shorter upstream `Retry-After`)
+	 *  and the request fails over. Like the 529 reasons it leaves
+	 *  `consecutive_rate_limits` untouched; unlike them it DOES count as a
+	 *  circuit failure. */
+	| "upstream_5xx_server_error";
+
+export const REQUEST_TRANSFORMERS = [
+	"max-tokens-to-max-completion-tokens",
+] as const;
+export type RequestTransformer = (typeof REQUEST_TRANSFORMERS)[number];
 
 // Usage data types for Anthropic accounts
 export interface UsageWindowData {
@@ -227,13 +323,19 @@ export interface AccountRow {
 	auto_refresh_enabled?: boolean | number | null;
 	auto_pause_on_overage_enabled?: boolean | number | null;
 	peak_hours_pause_enabled?: boolean | number | null;
+	usage_pause_five_hour_threshold?: number | null;
+	usage_pause_weekly_threshold?: number | null;
+	usage_pause_five_hour_enabled?: boolean | number | null;
+	usage_pause_weekly_enabled?: boolean | number | null;
 	custom_endpoint?: string | null;
 	model_mappings?: string | null; // JSON string for OpenAI-compatible providers
+	request_transformer?: RequestTransformer | null;
 	cross_region_mode?: string | null; // Bedrock cross-region inference mode
 	model_fallbacks?: string | null; // JSON string for model family fallback mappings
 	billing_type?: string | null; // Per-account billing override
 	pause_reason?: string | null; // null=not paused, 'manual'=user paused, 'failure_threshold'=auto-refresh failures, 'overage'=billing overage
 	refresh_token_issued_at?: number | null; // Timestamp when the current refresh token was issued (updated on each token refresh)
+	last_manual_reauth_at?: number | null; // Timestamp of the last MANUAL reauthentication (CLI --reauthenticate or dashboard OAuth callback); NOT updated by automatic token refresh
 	consecutive_rate_limits?: number | null;
 }
 
@@ -265,13 +367,23 @@ export interface Account {
 	auto_refresh_enabled: boolean;
 	auto_pause_on_overage_enabled: boolean;
 	peak_hours_pause_enabled: boolean;
+	/** Pause the account when 5-hour utilization reaches this percent. null = unset. */
+	usage_pause_five_hour_threshold: number | null;
+	/** Pause the account when weekly utilization reaches this percent. null = unset. */
+	usage_pause_weekly_threshold: number | null;
+	/** Whether the 5-hour threshold above is in force. */
+	usage_pause_five_hour_enabled: boolean;
+	/** Whether the weekly threshold above is in force. */
+	usage_pause_weekly_enabled: boolean;
 	custom_endpoint: string | null;
 	model_mappings: string | null; // JSON string for OpenAI-compatible providers
+	request_transformer: RequestTransformer | null;
 	cross_region_mode: string | null; // Bedrock cross-region inference mode
 	model_fallbacks: string | null; // JSON string for model family fallback mappings
 	billing_type: string | null;
 	pause_reason: string | null; // null=not paused, 'manual'=user paused, 'failure_threshold'=auto-refresh failures, 'overage'=billing overage
 	refresh_token_issued_at: number | null; // Timestamp when the current refresh token was issued (updated on each token refresh)
+	last_manual_reauth_at: number | null; // Timestamp of the last MANUAL reauthentication; NOT updated by automatic token refresh
 	consecutive_rate_limits: number;
 }
 
@@ -339,8 +451,15 @@ export interface AccountResponse {
 	autoRefreshEnabled: boolean;
 	autoPauseOnOverageEnabled?: boolean;
 	peakHoursPauseEnabled?: boolean;
+	usagePauseFiveHourThreshold: number | null; // Stored 5-hour percentage; null = never set
+	usagePauseWeeklyThreshold: number | null; // Stored weekly percentage; null = never set
+	usagePauseFiveHourEnabled: boolean; // Whether the 5-hour threshold is in force
+	usagePauseWeeklyEnabled: boolean; // Whether the weekly threshold is in force
+	/** Whether this account has a poller that can evaluate and resume thresholds. */
+	usagePauseSupported?: boolean;
 	customEndpoint: string | null;
 	modelMappings: { [key: string]: string | string[] } | null; // Parsed model mappings (arrays = cycling models)
+	requestTransformer: RequestTransformer | null;
 	usageUtilization: number | null; // Percentage utilization (0-100) from API
 	usageWindow: string | null; // Most restrictive window (e.g., "five_hour")
 	/**
@@ -359,6 +478,10 @@ export interface AccountResponse {
 	billingType?: string | null;
 	sessionStats: SessionStats | null;
 	isPrimary: boolean; // True if this is the account the load balancer would pick next
+	lastManualReauthAt: number | null;
+	reauthDeadlineStatus: "ok" | "warning" | "critical" | "expired" | null;
+	daysUntilReauthRequired: number | null;
+	hoursUntilReauthRequired: number | null;
 }
 
 // UI display type - used in CLI and web dashboard
@@ -491,13 +614,21 @@ export function toAccount(row: AccountRow): Account {
 		auto_refresh_enabled: !!row.auto_refresh_enabled,
 		auto_pause_on_overage_enabled: !!row.auto_pause_on_overage_enabled,
 		peak_hours_pause_enabled: !!row.peak_hours_pause_enabled,
+		usage_pause_five_hour_threshold: toNumOrNull(
+			row.usage_pause_five_hour_threshold,
+		),
+		usage_pause_weekly_threshold: toNumOrNull(row.usage_pause_weekly_threshold),
+		usage_pause_five_hour_enabled: !!row.usage_pause_five_hour_enabled,
+		usage_pause_weekly_enabled: !!row.usage_pause_weekly_enabled,
 		custom_endpoint: row.custom_endpoint || null,
 		model_mappings: row.model_mappings || null,
+		request_transformer: row.request_transformer ?? null,
 		cross_region_mode: row.cross_region_mode || null,
 		model_fallbacks: row.model_fallbacks || null,
 		billing_type: row.billing_type || null,
 		pause_reason: row.pause_reason || null,
 		refresh_token_issued_at: toNumOrNull(row.refresh_token_issued_at),
+		last_manual_reauth_at: toNumOrNull(row.last_manual_reauth_at),
 		consecutive_rate_limits: toNum(row.consecutive_rate_limits),
 	};
 }
@@ -550,6 +681,19 @@ export function toAccountResponse(account: Account): AccountResponse {
 		}
 	}
 
+	// Manual reauthentication deadline (Claude OAuth accounts only, and only
+	// once they've been manually reauthenticated at least once under this
+	// feature — see computeReauthDeadline's doc comment for why there is no
+	// createdAt fallback).
+	const reauthDeadline = computeReauthDeadline({
+		eligible: isEligibleForReauthDeadline({
+			provider: account.provider,
+			refreshToken: account.refresh_token,
+			accessToken: account.access_token,
+		}),
+		lastManualReauthAt: account.last_manual_reauth_at,
+	});
+
 	return {
 		id: account.id,
 		name: account.name,
@@ -583,8 +727,13 @@ export function toAccountResponse(account: Account): AccountResponse {
 		autoRefreshEnabled: account.auto_refresh_enabled,
 		autoPauseOnOverageEnabled: account.auto_pause_on_overage_enabled,
 		peakHoursPauseEnabled: account.peak_hours_pause_enabled,
+		usagePauseFiveHourThreshold: account.usage_pause_five_hour_threshold,
+		usagePauseWeeklyThreshold: account.usage_pause_weekly_threshold,
+		usagePauseFiveHourEnabled: account.usage_pause_five_hour_enabled,
+		usagePauseWeeklyEnabled: account.usage_pause_weekly_enabled,
 		customEndpoint: account.custom_endpoint,
 		modelMappings,
+		requestTransformer: account.request_transformer,
 		usageUtilization: null, // Will be filled in by API handler from cache
 		usageWindow: null, // Will be filled in by API handler from cache
 		usageData: null, // Will be filled in by API handler from cache
@@ -597,6 +746,10 @@ export function toAccountResponse(account: Account): AccountResponse {
 		billingType: account.billing_type,
 		sessionStats: null,
 		isPrimary: false,
+		lastManualReauthAt: account.last_manual_reauth_at,
+		reauthDeadlineStatus: reauthDeadline?.status ?? null,
+		daysUntilReauthRequired: reauthDeadline?.daysUntilDeadline ?? null,
+		hoursUntilReauthRequired: reauthDeadline?.hoursUntilDeadline ?? null,
 	};
 }
 

@@ -1481,13 +1481,37 @@ describe.skipIf(!livePgAvailable)(
 						now + HOUR,
 						"upstream_429_with_reset",
 					);
-					expect(result).toBeDefined();
+					expect(result).toEqual({ consecutiveRateLimits: 1, applied: true });
 
 					const row = await adapter.get<{ rate_limited_until: number | null }>(
 						"SELECT rate_limited_until FROM accounts WHERE id = ?",
 						["acct-1"],
 					);
 					expect(Number(row?.rate_limited_until)).toBe(now + HOUR);
+
+					// A transient failure racing a stronger durable quota hold must
+					// report the PG row-count rejection without incrementing its streak.
+					const suppressed = await dbOps.markAccountRateLimited(
+						"acct-1",
+						now + 60_000,
+						"upstream_5xx_server_error",
+						false,
+					);
+					expect(suppressed).toEqual({
+						consecutiveRateLimits: 1,
+						applied: false,
+					});
+					const guardedRow = await adapter.get<{
+						rate_limited_until: number;
+						rate_limited_reason: string;
+					}>(
+						"SELECT rate_limited_until, rate_limited_reason FROM accounts WHERE id = ?",
+						["acct-1"],
+					);
+					expect(Number(guardedRow?.rate_limited_until)).toBe(now + HOUR);
+					expect(guardedRow?.rate_limited_reason).toBe(
+						"upstream_429_with_reset",
+					);
 				},
 			);
 

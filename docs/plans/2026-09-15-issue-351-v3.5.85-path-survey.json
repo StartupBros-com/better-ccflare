@@ -1,0 +1,1138 @@
+[
+  {
+    "path": ".github/workflows/release.yml",
+    "forkOid": "4f3ac65817559c34633126a235e098636f11468b",
+    "upstreamOid": "0803f7f71a28841ab4033f3f7c93dbdb304da822",
+    "candidateOid": "e65ac8167e00d7ddd61e2c3c3fdb11f8a90aa0d7",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "README.md",
+    "forkOid": "2f536a3e205dab17d1419973082a0a445b22a342",
+    "upstreamOid": "093eca00709cf9cd84baeabb6500e3442f0ad255",
+    "candidateOid": "955dfea4db13dc59ac5f3737c87c4209de3a2158",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "apps/cli/README.md",
+    "forkOid": "183d55783b91dbd0f533f328be0c57b2c0cdac8a",
+    "upstreamOid": "093eca00709cf9cd84baeabb6500e3442f0ad255",
+    "candidateOid": "183d55783b91dbd0f533f328be0c57b2c0cdac8a",
+    "comparison": "unchanged-fork",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "apps/cli/package.json",
+    "forkOid": "364f36d832ddef7b752f8ef06834fec5ef060ebe",
+    "upstreamOid": "0634bd091e76dc3c5a0a384997be50fb3eed6ffa",
+    "candidateOid": "364f36d832ddef7b752f8ef06834fec5ef060ebe",
+    "comparison": "unchanged-fork",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "apps/cli/src/main.ts",
+    "forkOid": "e162b430f2abcbb4493da8bc2332f7d0f88a0980",
+    "upstreamOid": "53ba4fb4fd0b29e4acaf204182c2b8a23a3a39e5",
+    "candidateOid": "06ba2c6b94babaee5720be07dc209e64dada20b9",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "apps/server/src/codex-usage-refresher.test.ts",
+    "forkOid": null,
+    "upstreamOid": "0d0c08a766c1889f5d8e7ee9a2f03ad237cb95af",
+    "candidateOid": "f20d3dd3f87d26939510d63ab730af7e47200637",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "apps/server/src/codex-usage-refresher.ts",
+    "forkOid": null,
+    "upstreamOid": "d6aa2ebe5e47cc39d6472c4f3ca1b4cd429d1f6e",
+    "candidateOid": "09df98b4a6ec66a5254cca36c09a3940189d0bc6",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "apps/server/src/server.test.ts",
+    "forkOid": "85c32ff553c24a7c7bd046f142d90661a8600419",
+    "upstreamOid": "40142815fb3cc1192ce108c8719fe4658321a25a",
+    "candidateOid": "1528a291e2f59c785afb3dcd109a26b12f005e3a",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "apps/server/src/server.ts",
+    "forkOid": "f234a44ee50220e1702b966effed263b28594db0",
+    "upstreamOid": "6f5dae24ff86eb65fdbebfdef6557eb67d7eeb87",
+    "candidateOid": "b161dbebc60845ab19b534315d99b7da716d6652",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "docs/acknowledgements.md",
+    "forkOid": "9129f3c6b03563ba1ad32b9f2b0d4c18d07828dd",
+    "upstreamOid": "f066a77eb03fac462c119e1b9feeb9dac94a6d46",
+    "candidateOid": "f066a77eb03fac462c119e1b9feeb9dac94a6d46",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "docs/api-http.md",
+    "forkOid": "e14d44e419e86caee49a36fb4df045bf7ebc1a00",
+    "upstreamOid": "4c0ca9df9596ed7c16f997d744ba7e54d398562f",
+    "candidateOid": "53ab69149143e1e7874212f8862323adbd0e5752",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "docs/auto-refresh.md",
+    "forkOid": "17830be4f82658d99584bbbebbccca410ca22a89",
+    "upstreamOid": "89eafe0c3e61f668142981463c6c367940608d2c",
+    "candidateOid": "7609a725a8422681006eb25d0a6168f2f92bd068",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "docs/cli.md",
+    "forkOid": "1760902258a824c03b0c85d9ed1bbf5cda910708",
+    "upstreamOid": "2e436e5ed75af9f5330c7a8f1254d683ec4cf0f9",
+    "candidateOid": "fe900bb01cec859c98357a2e4fc8bf77e4a3866f",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "docs/codex-vscode.md",
+    "forkOid": null,
+    "upstreamOid": "795d2d5c48325ffafcada8610cfe2f8f3367f64d",
+    "candidateOid": "b2179b376a82f6aff3ff78fc015e15a54a3b5a7d",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "docs/configuration.md",
+    "forkOid": "e325f0114caafb9b8e44d1e4dd62e4dbedecb56a",
+    "upstreamOid": "939c9ee23cb01b967235832bbaaca905e9de8d58",
+    "candidateOid": "15cabac57f8d9c85063c0f44f1db149123e65bd8",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "docs/load-balancing.md",
+    "forkOid": "ca039000dd445ee2018dee30a5103dd7e726e725",
+    "upstreamOid": "c3a6e345147582e816ec2db7222e87005f267fbb",
+    "candidateOid": "e2463caa9bc2c0ad97aa3880d6b58e15d4d084dc",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "docs/models.md",
+    "forkOid": "52c4037b217dbe6c6db81a110452c614fe3547cd",
+    "upstreamOid": "9164bbae831016c5c70b40c011e206599729c874",
+    "candidateOid": "626d76cfff6e5589ad716b34c7c513e65917bc56",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "docs/providers.md",
+    "forkOid": "c22ca9ea84d2077d2f419986cdc0f1f61991eb56",
+    "upstreamOid": "88383c5c09382436c39c5dc648bfbef4420ce51f",
+    "candidateOid": "ba230734b706e86fa7299a2e0cb94ec57337ef8c",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "docs/routing-architecture.md",
+    "forkOid": "0cfa1f803d53d54551290af4c17f648cf248b907",
+    "upstreamOid": "f9a537d658de08b1cf66b7d0b178ecc603864cb6",
+    "candidateOid": "0d7484813a4c2a328eaa0321bc040be6e1e0aacc",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "package.json",
+    "forkOid": "7b9483c1dcab03bbfec005d03301ff481eaaf7b7",
+    "upstreamOid": "6cbb9d654761cb9c02b84f8f70e50fe6bd860161",
+    "candidateOid": "7b9483c1dcab03bbfec005d03301ff481eaaf7b7",
+    "comparison": "unchanged-fork",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/cli-commands/src/commands/account.ts",
+    "forkOid": "98545af618a2128ab7775256e80425392ffae67e",
+    "upstreamOid": "ba678ec2f60ea8313963b6fd706676e775848219",
+    "candidateOid": "218ece60baa651890b32203dcd89371a07c6eba8",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/core/src/constants.test.ts",
+    "forkOid": "2122484ed862e6f02db5779fc520a97cde477227",
+    "upstreamOid": "c4a2773373fddac0862afbdd4662fccb505651e9",
+    "candidateOid": "a3697b2dfb9f11e9f352842b14dce386ff28eba9",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/core/src/constants.ts",
+    "forkOid": "46fd91cf1c6441124c11304025684aee11df98ab",
+    "upstreamOid": "94270f944bab858bb6d7a0591fcf56ab7cff40bd",
+    "candidateOid": "0ae20da576da6b93e3297f9ddc503614e65eece5",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/core/src/index.ts",
+    "forkOid": "1428dee72762d42d339b9d59a4838763e71f26dc",
+    "upstreamOid": "27fb16c9de8fa47dd1d1f0505f9cbfed5beaba9a",
+    "candidateOid": "c239cc889dab1b923705b052f55e975c68b8c6eb",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/core/src/usage-threshold.test.ts",
+    "forkOid": null,
+    "upstreamOid": "8e2d0d05b9039df1c521ce102f49d1bbb2908b99",
+    "candidateOid": "8e2d0d05b9039df1c521ce102f49d1bbb2908b99",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/core/src/usage-threshold.ts",
+    "forkOid": null,
+    "upstreamOid": "877bb00d67b20a78a72ca28f080cc802d68e8654",
+    "candidateOid": "877bb00d67b20a78a72ca28f080cc802d68e8654",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/core/src/version.ts",
+    "forkOid": "98050c2a7e19228dd04cedfd1145f7c45dcd1d31",
+    "upstreamOid": "9175769dc7fc3e26a16c5a40ffbdbd117721fb65",
+    "candidateOid": "c01fe2d495b0ecb92c1f29d58dbb8687ea804c66",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/api.ts",
+    "forkOid": "84a4c1571e3fba02ba88f681d495e0e7ecb4ad86",
+    "upstreamOid": "d996ad62b870be3d9d90facab62b268bf7d1e9c0",
+    "candidateOid": "3bf3f0d84ff82548180eac6a56540f38a01b6c2e",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/AccountsTab.tsx",
+    "forkOid": "157233ee7c282749d5bb944615ecb6180e2c4627",
+    "upstreamOid": "24df0f9dbba892fd84bc656afaef7c14759aac85",
+    "candidateOid": "fad4fb934b519962f489d401381b1ec850ccbae5",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/accounts/AccountList.tsx",
+    "forkOid": "e5d0de5b09d87e79eb7c5bd673191b6ef5a627d4",
+    "upstreamOid": "5c0c3117257ca5683491ac6c90d70cb83ea22097",
+    "candidateOid": "eb58dd1e890c71ebe6cc651034d383835a55e15b",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/accounts/AccountListItem.test.tsx",
+    "forkOid": "e52b1f1a5a2a7040045aa0203b205188450095ce",
+    "upstreamOid": "c08939dc35180c1473c67e182fe57d3fc2dfbe3f",
+    "candidateOid": "4e9a16597736110a9ceb3abc3dd00511e35caf54",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/accounts/AccountListItem.tsx",
+    "forkOid": "5ed07304fa154166965a91cbf1b8db27642f76f1",
+    "upstreamOid": "da90db0ce5b122f58aac29646f04b63e5daf1f7b",
+    "candidateOid": "13af3f38838725c4169031f319f5e53fa5bd8eb2",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/accounts/AccountRequestTransformerDialog.test.tsx",
+    "forkOid": null,
+    "upstreamOid": "bbd6b0d08f8af64e2b9414b6d3bab0a32c4cdc59",
+    "candidateOid": "bbd6b0d08f8af64e2b9414b6d3bab0a32c4cdc59",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/accounts/AccountRequestTransformerDialog.tsx",
+    "forkOid": null,
+    "upstreamOid": "1c35ca019ac57c3ff05ef7181c58aadfda5c0d57",
+    "candidateOid": "1c35ca019ac57c3ff05ef7181c58aadfda5c0d57",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/accounts/AccountUsageThresholdsDialog.tsx",
+    "forkOid": null,
+    "upstreamOid": "f47c28fc593dd796370a0cd17a2c5d99b9c5602a",
+    "candidateOid": "f47c28fc593dd796370a0cd17a2c5d99b9c5602a",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/accounts/RateLimitProgress.test.tsx",
+    "forkOid": "c00990bc3dfe284e252b1d0dae9897afba833746",
+    "upstreamOid": "8c92949e789c1180666f475a4a5fb114fb2b2134",
+    "candidateOid": "59ac7e926bbb3f52660e1255970d15ec41f298fe",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/accounts/RateLimitProgress.tsx",
+    "forkOid": "8e7f14dc65f25b05b67f1519d2f9bdca1a6dfd0b",
+    "upstreamOid": "83d384c3fc5c124ee7da8117e7dfdae9c6f3741b",
+    "candidateOid": "f955c779250163554cbcfdb999c92ee1e8ee207a",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/accounts/index.ts",
+    "forkOid": "f798730ac94ba2c5746ec04dc4e19bb3a0a04533",
+    "upstreamOid": "0b37fb9fac0a3964746ecf7ee2821ee42a4c80e3",
+    "candidateOid": "0b37fb9fac0a3964746ecf7ee2821ee42a4c80e3",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/overview/system-status/__tests__/errorCodeMeta.test.ts",
+    "forkOid": "c39bb396f084a0e7eeae2f22c407691f294cda10",
+    "upstreamOid": "08a6d33d0dcfe97b370857339cb0af785b652fa9",
+    "candidateOid": "7b94a8854a360b17970b5b30ef7eefc4bd9aed2a",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/components/overview/system-status/errorCodeMeta.ts",
+    "forkOid": "9d3c45229764f8781d7b5a795bbd6ced4c2991d0",
+    "upstreamOid": "1089c070c8a0a4aef320ee6d3592371f7a534d1d",
+    "candidateOid": "6e92e1e68f463ace55749138922e239ab56d35c9",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/dashboard-web/src/lib/__tests__/pool-usage.test.ts",
+    "forkOid": "447f793f519f87b9086e8d745cbd32da6561421c",
+    "upstreamOid": "73064c53f1fc252338162f42ce4713e79ca35dfe",
+    "candidateOid": "73064c53f1fc252338162f42ce4713e79ca35dfe",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/database/src/database-operations.ts",
+    "forkOid": "7f25824059ab6abbc8ecdd54ff9df774503ff730",
+    "upstreamOid": "ae70f9ec3570dc3bc9a562a3fa44fe32ab04ac7c",
+    "candidateOid": "626a711ca860ad89619d28eab1f086dbd858e5bc",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/database/src/migrations-dedup-preserving-state.test.ts",
+    "forkOid": "e4d1041dab1cc5be75a4e9ec785da893aa8d7138",
+    "upstreamOid": "c675bc09014e555ee058e06bb3d909a22916aee1",
+    "candidateOid": "b3b93f10870a81f3452ddbdf33dbaff0215983f0",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/database/src/migrations-pg.ts",
+    "forkOid": "2673623f4fb4239e7dadbd583b89d0d92234b3b5",
+    "upstreamOid": "2e876972980eea61fbc915c3b08b37de705ac847",
+    "candidateOid": "d5a29c82ccb553b341811731c49358827fc6c629",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/database/src/migrations.test.ts",
+    "forkOid": "2f9a2fece60122eb6a447dfd49acab2cdfc53226",
+    "upstreamOid": "9040f19ca3af0b1e9ffb1095a2f2e9c60a08891c",
+    "candidateOid": "9c85125d0436f077d502dbeb7ad26f2be76a7825",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/database/src/migrations.ts",
+    "forkOid": "c8c67881876dfc4d73a3e1942f57a441fd777fcd",
+    "upstreamOid": "0ce40b1e4b1d06edcc54ccba717acedd80217852",
+    "candidateOid": "edbc35d0c2de5a3c9818056681b19e79b91a988e",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/database/src/repositories/__tests__/account-rate-limit-forward-guard.test.ts",
+    "forkOid": "707a5d6251dd898f80ab4ae177c5ecb20ade119b",
+    "upstreamOid": "aa1cccfdee0f88e0c944b7610c333d1c6e1eca1c",
+    "candidateOid": "aa1cccfdee0f88e0c944b7610c333d1c6e1eca1c",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/database/src/repositories/__tests__/account-usage-threshold-pause.test.ts",
+    "forkOid": null,
+    "upstreamOid": "a8c92b1cfa2720094628fe61c34ddc90ef672e59",
+    "candidateOid": "43d27388bb6598689b95cb05970d9e141a185622",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/database/src/repositories/account.repository.ts",
+    "forkOid": "5e797dff80f2dc607494efc77e98d969e6e9007b",
+    "upstreamOid": "b7acbedf4b0ec2a754843eb621cd0cfc622b874e",
+    "candidateOid": "064ffb4405314b4b0e64cee4a2674b0c54298b3c",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/database/src/usage-threshold-migration.test.ts",
+    "forkOid": null,
+    "upstreamOid": "3885786609735cd56ccee201b834ed183505e0cf",
+    "candidateOid": "3885786609735cd56ccee201b834ed183505e0cf",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/handlers/__tests__/account-add-starts-usage-polling.test.ts",
+    "forkOid": null,
+    "upstreamOid": "cc17fd60de38b823bf13a605341e3fe3fde7e909",
+    "candidateOid": "cc17fd60de38b823bf13a605341e3fe3fde7e909",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/handlers/__tests__/account-refresh-usage.test.ts",
+    "forkOid": "9e21a1374794ddd71071be2baf5a5f378d196cfb",
+    "upstreamOid": "23ac155745742b699c17f06211a48e0ba5c01a8d",
+    "candidateOid": "23ac155745742b699c17f06211a48e0ba5c01a8d",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/handlers/__tests__/accounts-codex-usage-history.test.ts",
+    "forkOid": "ff17cf5a71a246326aee0551b2e6215f1387ac92",
+    "upstreamOid": "e9c2aa97ae24a4ab6b0a208a8dfad9165235dda5",
+    "candidateOid": "e9c2aa97ae24a4ab6b0a208a8dfad9165235dda5",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/handlers/__tests__/oauth.test.ts",
+    "forkOid": "671da1442425242efcd242843b146d28c4089271",
+    "upstreamOid": "0ee831388dfbfc4aadad33c8b2b1f0fc7f44cb05",
+    "candidateOid": "2ddfdd73cf2e3abb656077f204d55863a155fb68",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/handlers/__tests__/request-transformer-update.test.ts",
+    "forkOid": null,
+    "upstreamOid": "4291794e59732c3ff3975ea173f8495e4cc7af59",
+    "candidateOid": "aebcaf7681744940c44a9f762ad8c4714a6ef07f",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/handlers/__tests__/usage-polling-start.test.ts",
+    "forkOid": null,
+    "upstreamOid": "8f7bd2f772de02882797a97e3fd01ebef2478f01",
+    "candidateOid": "8f7bd2f772de02882797a97e3fd01ebef2478f01",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/handlers/accounts.ts",
+    "forkOid": "426232e7db6efa02d4d348109e81beaab1bb97a7",
+    "upstreamOid": "7c8cfa4afd32f330064dcee2186505ee23d0ec2d",
+    "candidateOid": "db6000ae051fc36efd43fc80d09c4f7ec5b3739c",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/handlers/health.ts",
+    "forkOid": "93b5e1358dcea9b3ca7e23690007e41d18a56bc7",
+    "upstreamOid": "1d4521935ac45e4de78ce6020e0858d286a4b47e",
+    "candidateOid": "96b1a4e3b9a2ee28a8357cf135bff40321bbc357",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/handlers/oauth.ts",
+    "forkOid": "e2dc5e98f9d132c6424e8037eb9d3452f47ce4d8",
+    "upstreamOid": "a7d019aed28a31dc162760c7bc1eb2fe80a42421",
+    "candidateOid": "6982c654221b7b02ebf5a1ce9f1f575faff161bb",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/handlers/usage-polling-start.ts",
+    "forkOid": null,
+    "upstreamOid": "ab85c93f2d826ec7feae03102923ee00def8b3de",
+    "candidateOid": "6a709dcc0e29c1055f58ee98bb02e13528aedde1",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/index.ts",
+    "forkOid": "06ce235ee7f8e77a950a6ce432e4fcedc0687c97",
+    "upstreamOid": "fbfebb366a674cda30b0adc97919e1752feefc40",
+    "candidateOid": "46f975558fd177ea46161e8a419f9daba9f1583e",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/router.ts",
+    "forkOid": "a0ba809bf4b476607252229e8a227581ef27295d",
+    "upstreamOid": "c594a6c73ce23e4852d869eeba87917e0ed80329",
+    "candidateOid": "9b4cf1f42e07e9a1cf145f1ca0e2b29bb1a60ba9",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/services/__tests__/reauth-deadline-alert.test.ts",
+    "forkOid": null,
+    "upstreamOid": "783e2fcd5724b845f7eee715976bde1282f6b04e",
+    "candidateOid": "8ba6f84a2feeb96efadd15752715007b182b66f7",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/http-api/src/services/alerts.ts",
+    "forkOid": "31f2be3c09a573c64c34420b7c8d85bc550f6c6b",
+    "upstreamOid": "c3ad4af8c2faf6c73b09daaa79760a42ff728af9",
+    "candidateOid": "fe80adceba32afb96e379a69362d13b3703d0bd2",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/oauth-flow/src/index.ts",
+    "forkOid": "27b71ad5bda071c7d6ba4a4b46a728adc0194d27",
+    "upstreamOid": "d22c5eed9b2809f748709d65942f88c70157bee2",
+    "candidateOid": "b140f83a617e37a28b4c9c1886b126f6c4b520ef",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-formats/src/__tests__/stream.test.ts",
+    "forkOid": "50d35e1559b3cf9a99d7d6851462ffff625e10d0",
+    "upstreamOid": "aaea8cd3c68cec4dd49fb7fd380edcda8ab1a7bc",
+    "candidateOid": "9c2e9671cc7760b5c1eb106e497a65a4699299cf",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-formats/src/converters.ts",
+    "forkOid": "b4ff3b3c6df13c6486bfed9cd6c1194196a8d569",
+    "upstreamOid": "92e9b7da63eb266a5ceb8b0b41e94efed4b60592",
+    "candidateOid": "d0ce4ff9880b92830f07d4dbabda7aa6f006b221",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-formats/src/stream.ts",
+    "forkOid": "6736867f8c571653e1697d8a247b3cb38b33d925",
+    "upstreamOid": "ef089391d8bd1522376a7fd6e9d873b05274fca2",
+    "candidateOid": "593d68b5a56fd22b79f6ca33e2fe6e7f2a034d58",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-responses-adapter/src/__tests__/custom-tools.test.ts",
+    "forkOid": null,
+    "upstreamOid": "f0bc7c7fa4f6311fdfb2c88fe4e0f2c076d80256",
+    "candidateOid": "f0bc7c7fa4f6311fdfb2c88fe4e0f2c076d80256",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-responses-adapter/src/__tests__/handler.test.ts",
+    "forkOid": "90740305c2bba807d17883e2fcedc732c80a074d",
+    "upstreamOid": "e0af58c4beb09a37d3b7086c9cd14a0eea6998ba",
+    "candidateOid": "d91de190496c5194fbfc169516ef5a6d9ac68453",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-responses-adapter/src/__tests__/request-translator.test.ts",
+    "forkOid": "0f689368d6de95308bbda2d1d410168bb10b50b1",
+    "upstreamOid": "d10f34363ea0a64d436aadc9907ef4713f0fc2a4",
+    "candidateOid": "9046276c6852d2fc7122d3f1408e36f78860095c",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-responses-adapter/src/__tests__/response-translator.test.ts",
+    "forkOid": "a641e67e69f41d8fa5cf44494e9d9af8f432b6d9",
+    "upstreamOid": "de9781f189197c7d061373f70dc78b1e512e57e3",
+    "candidateOid": "de9781f189197c7d061373f70dc78b1e512e57e3",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-responses-adapter/src/__tests__/stream-translator.test.ts",
+    "forkOid": "c1850e59c3f128dae273d09212b103e2817bba65",
+    "upstreamOid": "f441218c74c89021a1ca585c80a6136c30f8f9a3",
+    "candidateOid": "30b20a33873e3982975f2e9d52312ef3434b71bb",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-responses-adapter/src/custom-tools.ts",
+    "forkOid": null,
+    "upstreamOid": "abc814f3a118a23bda54555b33194fd42179c445",
+    "candidateOid": "d37e71ac5dcdf023fc3dd8f718ecbd5eff9c963f",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-responses-adapter/src/handler.ts",
+    "forkOid": "de04803fb0ab4a385b6b221028c70090d9750dc0",
+    "upstreamOid": "a4b14a4070ffe1ec4aa86c421cf8c9edf93166c5",
+    "candidateOid": "723d8dfbd987369c9722ca73a2572c69cfb126eb",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-responses-adapter/src/request-translator.ts",
+    "forkOid": "a294aedbf3183ee3d48309cdcd6771d255fedba1",
+    "upstreamOid": "e989018d06cae7e00f1c248b14b3d610e9424402",
+    "candidateOid": "8d097c963c79906ce0a8c0bb38ab87f0e7801369",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-responses-adapter/src/response-translator.ts",
+    "forkOid": "77c9d24b95c2c71b1e9ff468726f19944207f280",
+    "upstreamOid": "3879731bfb3fb12135cbd6f2f32d4999c5d6e7a1",
+    "candidateOid": "3879731bfb3fb12135cbd6f2f32d4999c5d6e7a1",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-responses-adapter/src/stream-translator.ts",
+    "forkOid": "d6cde74edd396ae21e793cd42ddfe8e9a7771c7b",
+    "upstreamOid": "1d39195b14277f6c5eb438af1615d6ee9867fb24",
+    "candidateOid": "b518eda8e615b9cb9ee6e2ad6ed8a2f924444f89",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/openai-responses-adapter/src/types.ts",
+    "forkOid": "b6d8b002f06966e3d2a897576b43c5ab5d975cfa",
+    "upstreamOid": "261bd7bdb294548932fba716a5dbda7c98cf3f24",
+    "candidateOid": "e67f1506a404411667b2ac619bee53267df331e9",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/__tests__/codex-usage-polling.test.ts",
+    "forkOid": null,
+    "upstreamOid": "8d5ced2ee42dbfae567139af3d3c4e92c18794fc",
+    "candidateOid": "107b39c4d5edcab22f0117bd93566e643f8c97a8",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/__tests__/usage-snapshot.test.ts",
+    "forkOid": null,
+    "upstreamOid": "231beb46e5dc4122de1f6dcacb12cfbf3941be34",
+    "candidateOid": "231beb46e5dc4122de1f6dcacb12cfbf3941be34",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/codex/account-id.test.ts",
+    "forkOid": null,
+    "upstreamOid": "f8ba0eda75b2514fae91102c5e8aabaa24ff59e3",
+    "candidateOid": "f8ba0eda75b2514fae91102c5e8aabaa24ff59e3",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/codex/account-id.ts",
+    "forkOid": null,
+    "upstreamOid": "706b19e94600ce6e4744f093597db07ea2d09918",
+    "candidateOid": "706b19e94600ce6e4744f093597db07ea2d09918",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/codex/index.ts",
+    "forkOid": "d7f88bb915f4ab2dcefe57bcbe8498daa7edc4bf",
+    "upstreamOid": "396c80cbb285969d29eb65567ed088c2cf831d3a",
+    "candidateOid": "69ef397114e8b08f9eebbeb030174d83ed5be42d",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/codex/on-demand-fetch.ts",
+    "forkOid": "95e35adf95fe9d29f29fb93d74bcde3ff7ebfb29",
+    "upstreamOid": "6ed13e28355927a12718d52c7a1adbf2f7a9cd1a",
+    "candidateOid": "95e35adf95fe9d29f29fb93d74bcde3ff7ebfb29",
+    "comparison": "unchanged-fork",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/codex/provider.test.ts",
+    "forkOid": "df789cd22facdfde454ae05b9b2a2525d5b25865",
+    "upstreamOid": "7ad26e77c9e7536e12f9ee8f9f0be059f700d1c8",
+    "candidateOid": "2c5b724c459cb528d71a47493576a69ee9eb0605",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/codex/provider.ts",
+    "forkOid": "2a3bbfa57a0b737783e45f23303bf1e1860a7766",
+    "upstreamOid": "6b3d016ac97c7446cdb5495dcabc54b2dcf5fdcd",
+    "candidateOid": "2ed2b986ec4f32356b95291676863ef91f5bcc12",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/codex/usage-endpoint.test.ts",
+    "forkOid": null,
+    "upstreamOid": "a011aeb8753663c290bd734b029946bac001c241",
+    "candidateOid": "a011aeb8753663c290bd734b029946bac001c241",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/codex/usage-endpoint.ts",
+    "forkOid": null,
+    "upstreamOid": "e5e1c9e1536335776cbfdd51712b75610850275a",
+    "candidateOid": "f87849c9749ac8a98e5a4be2c8a99c3480d65e40",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/codex/usage.ts",
+    "forkOid": "a50807a374d41da71ed08bf2673c97a8f3b332f3",
+    "upstreamOid": "d6ca802450537c3f94016fcd2bbe2d719777329f",
+    "candidateOid": "e6a5da138ae6d036e5bcdfd6319be7347a0f3d30",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/codex/window-rollover.test.ts",
+    "forkOid": null,
+    "upstreamOid": "7d5e4e4b9118fa57f5aad96ec5c7906ecb8f4d0b",
+    "candidateOid": "7d5e4e4b9118fa57f5aad96ec5c7906ecb8f4d0b",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/codex/window-rollover.ts",
+    "forkOid": null,
+    "upstreamOid": "db03fd44070cbf03ac14779d3f04a5f8c0a9a682",
+    "candidateOid": "db03fd44070cbf03ac14779d3f04a5f8c0a9a682",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/index.ts",
+    "forkOid": "186a09517bb7998be4961735bc3b483d26e466bf",
+    "upstreamOid": "f8186f99557ef91b68cabe48e6557ee114ffe328",
+    "candidateOid": "776107ba78538a46df51fbbad93035bb5c491148",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/openai/__tests__/process-response.test.ts",
+    "forkOid": "e7c06f6ca5e36db62c11107e11c15ed679ba2f8f",
+    "upstreamOid": "97810ee9cff60be4ff0c9f596b123401290ab6ed",
+    "candidateOid": "653602c239c371933c3113d3d3a0aabe3f0085fe",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/providers/openai/provider.ts",
+    "forkOid": "3ae09125f1a555177c3a7107a362afe4030c0305",
+    "upstreamOid": "8c9d50e19fbfc7da79afa159400c503abdac78fb",
+    "candidateOid": "3eaf642cd7ee9339d28ce43c4f5a70c157277bb3",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/types.ts",
+    "forkOid": "719a9a1f8915f00cc6dcd4c7ece8aac9e899980a",
+    "upstreamOid": "919df2b6aa3da6babfe70f46fc677ee470da9343",
+    "candidateOid": "242c13ee9d5fb7cbcee662409ce05220b0ca84a2",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/providers/src/usage-fetcher.ts",
+    "forkOid": "562a64608d8f20823dce9efbcf14e0c913e886b2",
+    "upstreamOid": "0da6e699054127633b060c63d14b6affda709322",
+    "candidateOid": "73269b40153f6f8991d30dd8a17d77aa7f0c4f4b",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/__tests__/auto-refresh-rate-limited-probe-not-counted.test.ts",
+    "forkOid": null,
+    "upstreamOid": "3b9b3f4201af7f287f32398cae0cfc2178113b0c",
+    "candidateOid": "60fb0aa55c36c33e1ce71d81a77bf8f1f53f32f7",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/__tests__/auto-refresh-usage-exhausted-skip.test.ts",
+    "forkOid": null,
+    "upstreamOid": "f2210e26f2598189a227e3025c9eec4dabfe1125",
+    "candidateOid": "f2210e26f2598189a227e3025c9eec4dabfe1125",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/__tests__/bun-leak-273-regression.test.ts",
+    "forkOid": "dc8201e05dda9cfe152081412e7dd97421ffbe67",
+    "upstreamOid": "327049ee92f2e52976f75a64c4c3d3332d422793",
+    "candidateOid": "cbcf515739333d3410efb61a1640912dbbd9a40f",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/__tests__/circuit-breaker.test.ts",
+    "forkOid": "000712387180e14ab271c02756c7d90b9498fe8f",
+    "upstreamOid": "c60b6edcf201662eb5b922746daf9da80aab2365",
+    "candidateOid": "051762c0b41606983791af94b7d2d4dcdb5da25d",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/__tests__/local-refusal-error-types.test.ts",
+    "forkOid": null,
+    "upstreamOid": "8e6a03d93ad23ddf016f5f3f5a81917f2ad2598d",
+    "candidateOid": "c49b893b8a90d299e842cfb11b2f02c151af6c1b",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/__tests__/pool-exhausted.test.ts",
+    "forkOid": "32940c3f97652df226ffbfc9ad1bcd011345ce1c",
+    "upstreamOid": "43d9bde5b27d6e9effcd53219cc68aeb85217625",
+    "candidateOid": "9d5bada338cda5b1b7fdd8250a181d8e39d6f543",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/__tests__/reauth-deadline-monitor.test.ts",
+    "forkOid": null,
+    "upstreamOid": "d30a3357f828b51d366f5df8f5d386db260ef3f4",
+    "candidateOid": "1b24538c26adb66abad912689053f0bdbc321b39",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/__tests__/response-handler-worker-protocol.test.ts",
+    "forkOid": "3046dd2dd6ce8028cbd246197c3dcd79d5ae19dc",
+    "upstreamOid": "937731f155be9ab8a8a595955bc96134bf5a59a1",
+    "candidateOid": "ce7b9df9b5c9e396c0eaeb48f27fe04782c3da68",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/__tests__/response-model-alias.test.ts",
+    "forkOid": null,
+    "upstreamOid": "d9811468acf302824462313821a0cf7c4c18fe5f",
+    "candidateOid": "3ccc71afa0a68294ba87676db027bb94bbe6e0e1",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/auto-refresh-scheduler.ts",
+    "forkOid": "ca9ad1217b09f53985b28178ea8c19bf2f407ab7",
+    "upstreamOid": "beefa826d783e504152c63b4f427d0089ff4ed4a",
+    "candidateOid": "68ea3a22d906de3ed66e0c109a8dee96339f8337",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/circuit-breaker.ts",
+    "forkOid": "97584395a7e2d86667023bb739bc87c7eb5d1118",
+    "upstreamOid": "3fb28a670b1db98acd78d19f3e873d7c6984ced9",
+    "candidateOid": "29f9157ee97537effc8eea0e15a62c7f1d69fcb8",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/codex-usage-history.ts",
+    "forkOid": "f95afbe8a86533c762a40154bc32d3d0cddc4f4b",
+    "upstreamOid": "dca8ed4a4ad798dfea11e6a3c0090cd37dfa29b9",
+    "candidateOid": "328b218337c34d9022c73959abaadcd1259be64d",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/constants.ts",
+    "forkOid": "64e2465e496adc783d2bbaaf4782455d6759c354",
+    "upstreamOid": "107c5c86c52ee687e1462aa5ddbaef1d51ce79aa",
+    "candidateOid": "107c5c86c52ee687e1462aa5ddbaef1d51ce79aa",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/account-request-transformer-integration.test.ts",
+    "forkOid": null,
+    "upstreamOid": "1f37d950d594aa3da955ffe0a09adc2b2f06be3b",
+    "candidateOid": "1f37d950d594aa3da955ffe0a09adc2b2f06be3b",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/account-request-transformer.test.ts",
+    "forkOid": null,
+    "upstreamOid": "f7258bef9c6e1032d2e27abc89acfe19404a1190",
+    "candidateOid": "f7258bef9c6e1032d2e27abc89acfe19404a1190",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/account-selector.test.ts",
+    "forkOid": "fab9edf00f7dc3629e1fe5a2b10806d9074b202d",
+    "upstreamOid": "4b354368549b2e4fd70777ff33dae4a93ce71523",
+    "candidateOid": "f34b42815579cc28136c09bea58aecbaeb46c37f",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/codex-usage-history.test.ts",
+    "forkOid": "c45339ed7f7b1558771e3f9a531cee0f24e6b680",
+    "upstreamOid": "257d654b1d55a025f30981e8405fabc59821b0ab",
+    "candidateOid": "2833d47d096a521c4ed20f9177d3f538747e03bb",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/extract-cooldown-until.test.ts",
+    "forkOid": "5fa70b014e4a622c833aab2dfd28b12c2956cd65",
+    "upstreamOid": "18041bbea84f5e69243907b0b2b536cf99521088",
+    "candidateOid": "d41753a1764c3fa2769e596eba4c59f56523a021",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/proxy-operations-429-provider-reset.test.ts",
+    "forkOid": null,
+    "upstreamOid": "e6297cc904f0812a2c5f482c63e61679f8069255",
+    "candidateOid": "cfe371ef076ac373fa9fc39b47564ddc43e4803c",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/proxy-operations-529-retry-clone-regression.test.ts",
+    "forkOid": "4a9ea6bf260a5b10aa50786d73130593b241e571",
+    "upstreamOid": "706e915bd9aaed32a0efff56fe5e897866477f49",
+    "candidateOid": "e6cc95f2b3d5b2aca2058f9d4dd3c7bed0c46259",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/proxy-operations-5xx-failover.test.ts",
+    "forkOid": null,
+    "upstreamOid": "5adb72a9badfc55ffa33bd7bd45e63d9eadbba1c",
+    "candidateOid": "9ebd81533de3ad65c9b06a5d88c21e6d4b973363",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/proxy-operations-retry-drain-order.test.ts",
+    "forkOid": null,
+    "upstreamOid": "f955456d641281dca47c83715a2ebf0e76933dc9",
+    "candidateOid": "03f754caff2cedecd4978a0804f34255e5d073d3",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/proxy-operations-retry-reclassification.test.ts",
+    "forkOid": null,
+    "upstreamOid": "309dca9e0cb1f8848309e50f891e9ab6224fd851",
+    "candidateOid": "97f655046e9fbe0ffeef83a3ae8e63b57de13fa1",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/proxy-operations-retry-replay-body.test.ts",
+    "forkOid": null,
+    "upstreamOid": "e52029951a6bdddfba4bff2b41cb0f7f96bdb3f3",
+    "candidateOid": "b1e4ad9fd3b2fe25289416fec4166f0cc4552e7a",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/rate-limit-cooldown-reentry.test.ts",
+    "forkOid": "a064dacaaa356e793ad2bd97048d9506d198afa0",
+    "upstreamOid": "82088c7ce5452b96eee87f59ac59c9db07452dac",
+    "candidateOid": "69ff2cc4000718b21479479a54ec985400337ae7",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/response-processor.test.ts",
+    "forkOid": "2133f9434b1708736b68e672abbe8a56e55325f0",
+    "upstreamOid": "22c38c0d17c7875f4ddd873a750d1709deb375de",
+    "candidateOid": "b8e4b64bf4cc9aa37fa82e7294ad9d41e835ba49",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/__tests__/usage-throttling.test.ts",
+    "forkOid": "e45ffbafecf02fa62b48ec64130950b28c42d4b5",
+    "upstreamOid": "a5a05437d4a37eb18841e7c8136e320ef77eb267",
+    "candidateOid": "af8cc87a5465e4c66a16a06027a7e0c774ffb59b",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/account-request-transformer.ts",
+    "forkOid": null,
+    "upstreamOid": "ccd071f20808d045ab72cb13da5c8348195c3032",
+    "candidateOid": "dc51317925977b788ca1e6596dd7cc486c9fcd6e",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/account-selector.ts",
+    "forkOid": "4eae7cbd6027cef1285560d78720df6723a74565",
+    "upstreamOid": "6d22f13050f9683a8b1324c27d05f862c5880759",
+    "candidateOid": "47461112a03fe433142340cf83454af79bea5c12",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/index.ts",
+    "forkOid": "b858f61bf1ba4615042bc245c2086124dc66bac2",
+    "upstreamOid": "b57e9b41af3791bbc3e1e813543c42d0679dafcf",
+    "candidateOid": "87a9391149d915505ea75a1bd5ebb3f76fd7c2b5",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/proxy-operations.ts",
+    "forkOid": "e43e7e7642331cb469c3e0c88e8979ad7fcd14c4",
+    "upstreamOid": "364ee12050ab5ce78dd313e9c5095c8febd527ec",
+    "candidateOid": "cd8ae84c6ab551a81cb6b64b7289285bafc0a843",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/proxy-types.ts",
+    "forkOid": "198f9c38929b7b1565f022b80f8472553143850a",
+    "upstreamOid": "6cee360932181afa4135bb9a2a34808c6852ef75",
+    "candidateOid": "687b1655675cb385d991c65b58fa72a4b20f4bfe",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/rate-limit-cooldown.ts",
+    "forkOid": "b72320cfe77ee87d85ad50882d299084f26b3c75",
+    "upstreamOid": "ed2fbaf895ede059661bfb1a888bbebdcf62daf1",
+    "candidateOid": "7e7d7ff71ec18ee89c4a9d8dbabc7974965ab6f4",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/response-processor.ts",
+    "forkOid": "e7cd4c6e925dd047dfe512b608ae931660b4603a",
+    "upstreamOid": "3f22d3053a8da8c7cc51de776b2159946436d023",
+    "candidateOid": "6350f8fec38ad0fb7317bb00e2777644b3014321",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/token-health-monitor.ts",
+    "forkOid": "a04a6b4cc61f015657807030fd36706ff95c9a46",
+    "upstreamOid": "4953c0c88c19c36d72926b051d45781302023f60",
+    "candidateOid": "4953c0c88c19c36d72926b051d45781302023f60",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/handlers/usage-throttling.ts",
+    "forkOid": "046d4cc3e26d148b662966e5596fb097351021a5",
+    "upstreamOid": "6bf59411f5789b26d7cb9d823734f01038e6a16d",
+    "candidateOid": "ed670e36297d5836e3d501a02d450dc654c446fa",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/index.ts",
+    "forkOid": "eb97ca873f1c4096e75a472aeeeaf4cf4303ae98",
+    "upstreamOid": "015579393f48d92b922346acb82572911a90d78e",
+    "candidateOid": "35696eba0fd7f89171cbc912326970de2d7d256f",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/proxy.ts",
+    "forkOid": "b77713e2acbc1031252cae48f33297feef3b02c2",
+    "upstreamOid": "97f60f0580711a5c3508cfda01132e126239d11c",
+    "candidateOid": "444c584fba4c719ac7acbc153edc6a4ddefdb03b",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/response-handler.ts",
+    "forkOid": "9235b765a25e2dd374f7392a57a0a35ce0cdc882",
+    "upstreamOid": "5f04a872c4826e0f303f3c499956661a688ad975",
+    "candidateOid": "57a2bc314549622c10935a1ba8f3f3481369b473",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/proxy/src/response-model-alias.ts",
+    "forkOid": null,
+    "upstreamOid": "a1455679294205630143af720875f0451c9b5d74",
+    "candidateOid": "f50f63a6b877cb537df7cd957857769ddee86bbc",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/types/src/account.ts",
+    "forkOid": "7cd7dfa88ae7cb2ac4137f89e5acc37187b11159",
+    "upstreamOid": "c86b190add9fab2adfff39d884cd5c418c0b1fe1",
+    "candidateOid": "05d15eaa0ff6fe2badfc886e85cbbd122919eea1",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/types/src/alerts.ts",
+    "forkOid": "3a5d0abe09c034caa69955856fb256af0f1053b7",
+    "upstreamOid": "f8e9eca620c45c8d269dbff13caae83cfe784df6",
+    "candidateOid": "20dfaef5da9f773d1d40591ce1b50d7b29bfe59d",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/types/src/provider-config.ts",
+    "forkOid": "5eacb41a58ccaf3ef4ccc4f8a6f3fff992abb28e",
+    "upstreamOid": "93ccf41c4abb60c4397700073b86edb109ab4812",
+    "candidateOid": "8e85cf091dc3ed15e48d547c1f5d6e1e7c36c026",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "packages/types/src/rate-limit-reason.ts",
+    "forkOid": "150d197e1962e2f5035f30a29eaafc7ff398fa20",
+    "upstreamOid": "0eb11f6936fbc10d1dc9c97ccfbab50cdbada040",
+    "candidateOid": "935b6c6da885be453b877c13e250f1a065d9ff27",
+    "comparison": "adapted",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  },
+  {
+    "path": "scripts/smoke-codex-vscode.ts",
+    "forkOid": null,
+    "upstreamOid": "eeaf59e4f504b72f3daa54e17c398d42453b2f52",
+    "candidateOid": "eeaf59e4f504b72f3daa54e17c398d42453b2f52",
+    "comparison": "exact-upstream",
+    "method": "committed tree metadata at 33dd9c5b; prohibited blob content excluded"
+  }
+]

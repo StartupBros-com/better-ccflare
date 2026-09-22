@@ -4,14 +4,22 @@ import {
 	LATEST_SONNET_MODEL,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
+import {
+	getRequestTools,
+	getTranslatedToolName,
+	isNamedToolChoice,
+} from "./custom-tools";
 import type {
 	AnthropicContent,
+	AnthropicImageContent,
 	AnthropicMessage,
 	AnthropicRequest,
+	AnthropicTextContent,
 	AnthropicTool,
 	AnthropicToolChoice,
 	ResponseItem,
 	ResponsesRequest,
+	ResponsesTool,
 } from "./types";
 
 const logger = new Logger("openai-responses-adapter");
@@ -113,6 +121,43 @@ function translateTools(
 			continue;
 		}
 		const tool = rawTool as Record<string, unknown>;
+		if (tool.type === "custom") {
+			if (
+				typeof tool.name !== "string" ||
+				!tool.name ||
+				(tool.description !== undefined && typeof tool.description !== "string")
+			) {
+				emitWarn("Dropping malformed custom tool definition");
+				continue;
+			}
+			const description = [
+				tool.description,
+				"Pass the tool's complete raw text in the input string.",
+				(
+					tool.format as
+						| { type?: string; syntax?: string; definition?: string }
+						| undefined
+				)?.type === "grammar"
+					? `The input must follow this ${(tool.format as { syntax: string }).syntax} grammar:\n${(tool.format as { definition: string }).definition}`
+					: undefined,
+			]
+				.filter(Boolean)
+				.join("\n\n");
+			result.push({
+				name: getTranslatedToolName(
+					String(tool.name),
+					typeof tool.namespace === "string" ? tool.namespace : undefined,
+				),
+				description,
+				input_schema: {
+					type: "object",
+					properties: { input: { type: "string" } },
+					required: ["input"],
+					additionalProperties: false,
+				},
+			});
+			continue;
+		}
 		if (tool.type !== "function") {
 			emitWarn(`Skipping unsupported/built-in tool type: ${String(tool.type)}`);
 			continue;
@@ -137,7 +182,10 @@ function translateTools(
 			continue;
 		}
 		result.push({
-			name: tool.name,
+			name: getTranslatedToolName(
+				tool.name,
+				typeof tool.namespace === "string" ? tool.namespace : undefined,
+			),
 			description: tool.description,
 			input_schema:
 				(tool.parameters as Record<string, unknown> | undefined) ?? {},
@@ -153,8 +201,11 @@ function translateToolChoice(
 	if (choice === "auto") return { type: "auto" };
 	if (choice === "required") return { type: "any" };
 	if (choice === "none") return { type: "none" };
-	if (typeof choice === "object" && choice.type === "function") {
-		return { type: "tool", name: choice.name };
+	if (isNamedToolChoice(choice)) {
+		return {
+			type: "tool",
+			name: getTranslatedToolName(choice.name, choice.namespace),
+		};
 	}
 	return undefined;
 }
@@ -285,6 +336,28 @@ function translateInstructionContent(
 	return textBlocks;
 }
 
+function translateToolOutput(
+	parts: unknown,
+	emitWarn: (message: string) => void,
+): (AnthropicTextContent | AnthropicImageContent)[] {
+	if (!Array.isArray(parts)) {
+		emitWarn("Dropping malformed tool output content");
+		return [];
+	}
+	const blocks: (AnthropicTextContent | AnthropicImageContent)[] = [];
+	for (const part of parts) {
+		if (part === null || typeof part !== "object" || Array.isArray(part))
+			continue;
+		const result = translateContentItem(part as { type: unknown });
+		if (
+			result.ok &&
+			(result.block.type === "text" || result.block.type === "image")
+		)
+			blocks.push(result.block);
+	}
+	return blocks;
+}
+
 function mergeConsecutiveSameRole(
 	messages: AnthropicMessage[],
 ): AnthropicMessage[] {
@@ -316,8 +389,24 @@ function appendAssistantBlock(
 	}
 }
 
+/** Only identities that survived normal input validation and ID deduplication. */
+export interface NativeToolReplayMetadata {
+	calls: {
+		call_id: string;
+		bridge_name: string;
+		type: "function" | "custom";
+		name: string;
+		namespace?: string;
+	}[];
+	custom_output_ids: string[];
+}
+
 export function translateRequestToAnthropic(
 	req: ResponsesRequest & { input: ResponseItem[] },
+	nativeReplay?: NativeToolReplayMetadata,
+	// Pass unchanged getRequestTools-validated declarations, or omit to prepare
+	// them here under the default byte limit.
+	preparedTools?: ResponsesTool[],
 ): AnthropicRequest {
 	const messages: AnthropicMessage[] = [];
 	const instructionBlocks: string[] = [];
@@ -355,7 +444,7 @@ export function translateRequestToAnthropic(
 		// properties to read from.
 		const itemType = item.type;
 
-		if (item.type === "message") {
+		if (item.type === "message" || item.type === undefined) {
 			const role: unknown = item.role;
 			if (
 				role !== "user" &&
@@ -478,23 +567,25 @@ export function translateRequestToAnthropic(
 			// freeform string (the model's freeform-grammar output, not JSON) —
 			// Anthropic's tool_use.input must be an object, so wrap the raw
 			// string under a stable `input` key rather than JSON.parse-ing text
-			// that usually isn't JSON. This fork doesn't declare custom tools
-			// yet (translateTools drops non-function tool types), so no code
-			// path builds one of these from a live model turn today; this only
-			// affects history replay of an item recorded by a different
-			// backend. The `{ input: <raw string> }` wrapper keeps the raw
-			// content losslessly round-trippable under a name that matches
-			// OpenAI's own field, so future custom-tool support can unwrap it
-			// the same way.
+			// that usually isn't JSON. The native Codex path unwraps this after
+			// ordinary provider conversion; compatible backends use the same
+			// schema bridge as current custom-tool declarations.
 			const toolUseBlock: AnthropicContent = {
 				type: "tool_use",
 				id: mapToolId(toolUseId),
-				name: item.name,
+				name: getTranslatedToolName(item.name, item.namespace),
 				input:
 					item.type === "function_call"
 						? parseArguments(item.arguments)
 						: { input: item.input },
 			};
+			nativeReplay?.calls.push({
+				call_id: mapToolId(toolUseId),
+				bridge_name: toolUseBlock.name,
+				type: item.type === "custom_tool_call" ? "custom" : "function",
+				name: item.name,
+				...(item.namespace ? { namespace: item.namespace } : {}),
+			});
 			appendAssistantBlock(messages, toolUseBlock);
 			continue;
 		}
@@ -519,13 +610,19 @@ export function translateRequestToAnthropic(
 				continue;
 			}
 			consumedResultIds.add(toolUseId);
+			if (item.type === "custom_tool_call_output") {
+				nativeReplay?.custom_output_ids.push(mapToolId(toolUseId));
+			}
 			messages.push({
 				role: "user",
 				content: [
 					{
 						type: "tool_result",
 						tool_use_id: mapToolId(toolUseId),
-						content: item.output,
+						content:
+							typeof item.output === "string"
+								? item.output
+								: translateToolOutput(item.output, emitWarn),
 					},
 				],
 			});
@@ -751,10 +848,10 @@ export function translateRequestToAnthropic(
 	if (req.top_p !== undefined) result.top_p = req.top_p;
 	if (req.service_tier !== undefined) result.service_tier = req.service_tier;
 
-	const translatedTools =
-		Array.isArray(req.tools) && req.tools.length > 0
-			? translateTools(req.tools, emitWarn)
-			: [];
+	const translatedTools = translateTools(
+		preparedTools ?? getRequestTools(req),
+		emitWarn,
+	);
 	if (translatedTools.length > 0) {
 		result.tools = translatedTools;
 		const toolChoice = translateToolChoice(req.tool_choice);

@@ -35,6 +35,7 @@ import type {
 	ModelCatalogResponse,
 	RequestPayload,
 	RequestResponse,
+	RequestTransformer,
 	RoutingAttemptSummaryResponse,
 	RoutingAttemptSummaryWindow,
 	StatsWithAccounts,
@@ -148,6 +149,7 @@ export type {
 	AgentWorkspace,
 	RequestPayload,
 	RequestResponse,
+	RequestTransformer,
 	RoutingAttemptSummaryResponse,
 	RoutingAttemptSummaryWindow,
 } from "@better-ccflare/types";
@@ -1524,6 +1526,31 @@ class API extends HttpClient {
 		}
 	}
 
+	/**
+	 * Write the account's usage-window pause settings: the chosen percentage and
+	 * whether that window is in force. Both windows are always sent together.
+	 */
+	async updateAccountUsagePauseThresholds(
+		accountId: string,
+		fiveHour: { enabled: boolean; percent: number | null },
+		weekly: { enabled: boolean; percent: number | null },
+	): Promise<void> {
+		const url = `/api/accounts/${accountId}/usage-pause-thresholds`;
+		this.logger.debug(`→ POST ${url}`, { fiveHour, weekly });
+		try {
+			await this.post(url, { fiveHour, weekly });
+			this.logger.debug(`← POST ${url} - 200`);
+		} catch (error) {
+			this.logger.error(`✗ POST ${url} - ERROR`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			if (error instanceof HttpError) {
+				throw new Error(error.message);
+			}
+			throw error;
+		}
+	}
+
 	async updateAccountAutoPauseOnOverage(
 		accountId: string,
 		enabled: boolean,
@@ -1599,6 +1626,32 @@ class API extends HttpClient {
 			await this.post(url, {
 				modelMappings,
 			});
+			const duration = Date.now() - startTime;
+			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
+		} catch (error) {
+			const duration = Date.now() - startTime;
+			this.logger.error(`✗ POST ${url} - ERROR (${duration}ms)`, {
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
+			if (error instanceof HttpError) {
+				throw new Error(error.message);
+			}
+			throw error;
+		}
+	}
+
+	async updateAccountRequestTransformer(
+		accountId: string,
+		requestTransformer: RequestTransformer | null,
+	): Promise<void> {
+		const startTime = Date.now();
+		const url = `/api/accounts/${accountId}/request-transformer`;
+
+		this.logger.debug(`→ POST ${url}`, { requestTransformer });
+
+		try {
+			await this.post(url, { requestTransformer });
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 		} catch (error) {

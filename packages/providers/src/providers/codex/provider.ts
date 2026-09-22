@@ -78,6 +78,14 @@ import {
 } from "./cache-telemetry";
 import { observeCodexWire } from "./cache-wire";
 import {
+	type CodexCustomToolCall,
+	type CodexCustomToolOutput,
+	filterNativeTools,
+	type NativeToolChoice,
+	nativeToolChoice,
+	restoreNativeToolReplay,
+} from "./native-tools";
+import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
 	deriveConversationIdentity,
 	electOrchestrationRoot,
@@ -645,6 +653,7 @@ interface CodexFunctionCallItem {
 	type: "function_call";
 	call_id: string;
 	name: string;
+	namespace?: string;
 	arguments: string;
 	status?: "in_progress" | "completed" | "incomplete";
 }
@@ -675,8 +684,9 @@ interface CodexMessage {
 }
 
 interface CodexTool {
-	type: "function";
+	type: "function" | "custom" | "namespace";
 	name: string;
+	namespace?: string;
 	description?: string;
 	parameters?: Record<string, unknown>;
 }
@@ -704,6 +714,8 @@ interface CodexRequest {
 		| CodexMessage
 		| CodexFunctionCallItem
 		| CodexFunctionCallOutputItem
+		| CodexCustomToolCall
+		| CodexCustomToolOutput
 		| CodexReasoningItem
 		| CodexAdditionalToolsItem
 	)[];
@@ -714,11 +726,7 @@ interface CodexRequest {
 	instructions?: string;
 	prompt_cache_key?: string;
 	tools?: CodexTool[];
-	tool_choice?:
-		| "auto"
-		| "required"
-		| "none"
-		| { type: "function"; name: string };
+	tool_choice?: NativeToolChoice;
 	parallel_tool_calls?: boolean;
 	max_output_tokens?: number;
 	/**
@@ -727,6 +735,9 @@ interface CodexRequest {
 	 * caller-supplied value.
 	 */
 	previous_response_id?: string;
+	stream_options?: unknown;
+	client_metadata?: unknown;
+	access_programs?: unknown;
 }
 
 export interface CodexPromptCacheKeyDecision {
@@ -2563,9 +2574,18 @@ export class CodexProvider extends BaseProvider {
 		newHeaders.delete("host");
 		newHeaders.delete(CODEX_TURN_STATE_HEADER);
 
+		// Ingress-only connection details must never reach the provider.
+		newHeaders.delete("cookie");
+		newHeaders.delete("cdn-loop");
+		newHeaders.delete("forwarded");
+		newHeaders.delete("x-real-ip");
 		// Remove internal proxy headers.
 		for (const key of [...newHeaders.keys()]) {
-			if (key.startsWith("x-better-ccflare-")) {
+			if (
+				key.startsWith("x-better-ccflare-") ||
+				key.startsWith("cf-") ||
+				key.startsWith("x-forwarded-")
+			) {
 				newHeaders.delete(key);
 			}
 		}
@@ -2723,12 +2743,28 @@ export class CodexProvider extends BaseProvider {
 			this.sweepRequestStreamById();
 			this.sweepRequestToolSchemasById();
 			const rawBody = (await request.json()) as AnthropicRequest;
-			const passthrough = rawBody.__better_ccflare_codex_passthrough as
+			let passthrough = rawBody.__better_ccflare_codex_passthrough as
 				| Record<string, unknown>
 				| undefined;
 			// This carrier is private proxy metadata, never part of the upstream
 			// Responses schema. Consume it before serializing the Codex request.
 			delete rawBody.__better_ccflare_codex_passthrough;
+			if (
+				passthrough &&
+				request.headers.get(CODEX_NATIVE_RESPONSES_HEADER) !== "1"
+			) {
+				// The proxy sets this marker only after checking its process-local
+				// adapter secret. Plain Messages callers cannot supply native tools,
+				// choices or replay identities through the private body carrier.
+				const {
+					tools: _tools,
+					additional_tools: _additionalTools,
+					tool_choice: _toolChoice,
+					tool_replay: _toolReplay,
+					...otherFields
+				} = passthrough;
+				passthrough = otherFields;
+			}
 			const body = applySkillElision(
 				this.name,
 				rawBody,
@@ -2817,7 +2853,7 @@ export class CodexProvider extends BaseProvider {
 			// have sliced away the declaring "additional_tools" item.
 			const hasCustomTools =
 				(codexBody.tools?.some(
-					(t) => (t as { type?: string }).type !== "function",
+					(t) => t.type !== "function" || t.namespace !== undefined,
 				) ??
 					false) ||
 				codexBody.input.some(
@@ -4347,6 +4383,7 @@ export class CodexProvider extends BaseProvider {
 				],
 			});
 		}
+		restoreNativeToolReplay(input, passthrough?.tool_replay);
 
 		const finalInstructions = instructions || "You are a helpful assistant.";
 		const orchestrationToolNames = new Set(["Agent", "Task"]);
@@ -4485,7 +4522,30 @@ export class CodexProvider extends BaseProvider {
 			},
 		};
 
-		const passthroughAdditionalTools = passthrough?.additional_tools;
+		const passthroughTools = Array.isArray(passthrough?.tools)
+			? filterNativeTools(passthrough.tools, filteredToolNames)
+			: undefined;
+		const passthroughAdditionalTools = Array.isArray(
+			passthrough?.additional_tools,
+		)
+			? passthrough.additional_tools.map((item) => ({
+					...item,
+					...(Array.isArray(item?.tools)
+						? { tools: filterNativeTools(item.tools, filteredToolNames) }
+						: {}),
+				}))
+			: undefined;
+		const hasNativeToolDeclarations =
+			passthroughTools !== undefined ||
+			(passthroughAdditionalTools?.length ?? 0) > 0;
+		for (const field of [
+			"stream_options",
+			"client_metadata",
+			"access_programs",
+		] as const) {
+			if (passthrough?.[field] !== undefined)
+				codexRequest[field] = passthrough[field];
+		}
 		if (
 			Array.isArray(passthroughAdditionalTools) &&
 			passthroughAdditionalTools.length > 0
@@ -4529,13 +4589,16 @@ export class CodexProvider extends BaseProvider {
 				body.system.some((block) => block.cache_control?.type === "ephemeral"),
 			Boolean(cacheLaneRescueSalt),
 		);
-		const explicitToolChoice = this.convertToolChoice(
-			body.tool_choice,
-			tools ?? [],
-		);
+		const explicitToolChoice = hasNativeToolDeclarations
+			? nativeToolChoice(passthrough?.tool_choice, filteredToolNames)
+			: this.convertToolChoice(body.tool_choice, tools ?? []);
 		if (explicitToolChoice) {
 			codexRequest.tool_choice = explicitToolChoice;
-		} else if (tools?.length === 1 && tools[0].name === "StructuredOutput") {
+		} else if (
+			!hasNativeToolDeclarations &&
+			tools?.length === 1 &&
+			tools[0].name === "StructuredOutput"
+		) {
 			// Claude Code schema agents provide a StructuredOutput tool but do not set
 			// Anthropic tool_choice. Native Claude reliably follows the hidden schema
 			// instruction; Codex models often end_turn with text instead. Force the
@@ -4554,10 +4617,13 @@ export class CodexProvider extends BaseProvider {
 		if (passthrough?.parallel_tool_calls === false) {
 			codexRequest.parallel_tool_calls = false;
 		}
-		const passthroughTools = passthrough?.tools;
-		if (Array.isArray(passthroughTools) && passthroughTools.length > 0) {
+		if (passthroughTools !== undefined) {
 			codexRequest.tools = passthroughTools as CodexTool[];
-		} else if (tools && (body.tools?.length ?? 0) > 0) {
+		} else if (
+			!hasNativeToolDeclarations &&
+			tools &&
+			(body.tools?.length ?? 0) > 0
+		) {
 			codexRequest.tools = tools;
 		}
 

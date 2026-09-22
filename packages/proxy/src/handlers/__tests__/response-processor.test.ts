@@ -27,6 +27,7 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
+		requires_reauth: false,
 		rate_limit_reset: null,
 		rate_limit_status: null,
 		rate_limit_remaining: null,
@@ -679,6 +680,51 @@ describe("processProxyResponse — in-memory cooldown mutation", () => {
 		expect(account.rate_limited_until).toBeNull();
 	});
 
+	it("does not clear an existing bench when the upstream returns 5xx", async () => {
+		// A server error is not evidence that the account recovered. Clearing
+		// the bench here took an account straight back off the cooldown a 5xx
+		// failover had just applied, so the next request hit the same broken
+		// upstream org again.
+		const benchedUntil = Date.now() + 60_000;
+		const account = makeAccount({ rate_limited_until: benchedUntil });
+		const { ctx } = makeCtx({
+			isStream: false,
+			rateLimited: false,
+		});
+		const response = new Response(
+			'{"type":"error","error":{"type":"api_error"}}',
+			{
+				status: 500,
+				headers: { "content-type": "application/json" },
+			},
+		);
+
+		await processProxyResponse(response, account, ctx);
+
+		expect(account.rate_limited_until).toBe(benchedUntil);
+	});
+
+	it("preserves an existing bench until a successful response (4xx is not recovery)", async () => {
+		// Only status >= 500 is exempt: a 4xx still reached the account's own
+		// quota accounting upstream, so the pre-5xx behaviour is kept.
+		const account = makeAccount({ rate_limited_until: Date.now() + 60_000 });
+		const { ctx } = makeCtx({
+			isStream: false,
+			rateLimited: false,
+		});
+		const response = new Response(
+			'{"type":"error","error":{"type":"invalid_request_error"}}',
+			{
+				status: 400,
+				headers: { "content-type": "application/json" },
+			},
+		);
+
+		await processProxyResponse(response, account, ctx);
+
+		expect(account.rate_limited_until).not.toBeNull();
+	});
+
 	it("does not clear account.rate_limited_until when already null on success", async () => {
 		const account = makeAccount(); // rate_limited_until is null by default
 		const { ctx } = makeCtx({
@@ -793,7 +839,7 @@ function makeXaiCtx(opts: {
 				}
 				dbWriteCompleted = true;
 				calls.markRateLimited.push({ accountId, resetTime, reason });
-				return 1;
+				return { consecutiveRateLimits: 1, applied: true };
 			},
 			updateAccountUsage: () => {},
 			updateAccountRateLimitMeta: () => {},

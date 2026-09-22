@@ -113,6 +113,7 @@ describe("AutoRefreshScheduler account-generation fences", () => {
 			lastFailureProbeAt: new Map([["account-1", 3]]),
 			uncountedProbeFailures: new Map([["account-1", { at: 4, streak: 5 }]]),
 			accountTokens: new Map([["account-1", {}]]),
+			usageExhaustedAnnouncedFor: new Map([["account-1", 123]]),
 		};
 
 		scheduler.clearAccountTracking("account-1");
@@ -122,6 +123,7 @@ describe("AutoRefreshScheduler account-generation fences", () => {
 		expect(scheduler.lastFailureProbeAt.has("account-1")).toBe(false);
 		expect(scheduler.uncountedProbeFailures.has("account-1")).toBe(false);
 		expect(scheduler.accountTokens.has("account-1")).toBe(false);
+		expect(scheduler.usageExhaustedAnnouncedFor.has("account-1")).toBe(false);
 	});
 
 	it("refreshes an expiring ordinary token for its current generation", async () => {

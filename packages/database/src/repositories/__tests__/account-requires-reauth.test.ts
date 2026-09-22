@@ -44,6 +44,11 @@ describe("AccountRepository requires_reauth", () => {
 				auto_refresh_enabled INTEGER DEFAULT 0,
 				auto_pause_on_overage_enabled INTEGER DEFAULT 0,
 				peak_hours_pause_enabled INTEGER DEFAULT 0,
+				usage_pause_five_hour_threshold INTEGER,
+				usage_pause_weekly_threshold INTEGER,
+				usage_pause_five_hour_enabled INTEGER DEFAULT 0,
+				usage_pause_weekly_enabled INTEGER DEFAULT 0,
+				request_transformer TEXT,
 				custom_endpoint TEXT,
 				model_mappings TEXT,
 				cross_region_mode TEXT,
@@ -51,6 +56,7 @@ describe("AccountRepository requires_reauth", () => {
 				billing_type TEXT,
 				pause_reason TEXT,
 				refresh_token_issued_at INTEGER,
+				last_manual_reauth_at INTEGER,
 				consecutive_rate_limits INTEGER DEFAULT 0
 			)
 		`);

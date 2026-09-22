@@ -44,6 +44,7 @@ const expectedReasons = [
 	"upstream_429_with_reset",
 	"xai_capacity_402",
 	"upstream_429_no_reset_probe_cooldown",
+	"upstream_5xx_server_error",
 	"upstream_529_overloaded_with_reset",
 	"upstream_529_overloaded_no_reset",
 	"all_models_exhausted_429",

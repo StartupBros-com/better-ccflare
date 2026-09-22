@@ -45,6 +45,9 @@
  *   be isolated to one model family. Does NOT trip the breaker.
  * - `xai_capacity_402` — native xAI capacity 402; account-wide cooldown.
  *   Counts as a circuit failure.
+ * - `upstream_5xx_server_error` — transient upstream server error
+ *   (500/502/503/504) that survived an in-place retry. The account is
+ *   benched briefly and the request fails over. Counts as a circuit failure.
  * - `org_permission_denied` — 403 `permission_error`: the account's
  *   organization forbids the request (OAuth disabled org-wide, Claude Code
  *   subscription access turned off). Account-wide and not quota-related, but
@@ -68,6 +71,7 @@ export const RATE_LIMIT_REASONS: readonly RateLimitReason[] = [
 	"xai_capacity_402",
 	"windowless_429",
 	"org_permission_denied",
+	"upstream_5xx_server_error",
 ] as const;
 
 export function isRateLimitReason(value: string): value is RateLimitReason {
