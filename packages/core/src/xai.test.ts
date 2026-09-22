@@ -16,6 +16,19 @@ describe("resolveXaiContextWindow", () => {
 		});
 	});
 
+	it("resolves grok-4.7 at the official 500k window", () => {
+		expect(resolveXaiContextWindow("grok-4.7")).toEqual({
+			family: "grok-4.7",
+			contextWindow: 500_000,
+			match: "exact",
+		});
+		expect(resolveXaiContextWindow("grok-4.7-beta")).toEqual({
+			family: "grok-4.7",
+			contextWindow: 500_000,
+			match: "prefix",
+		});
+	});
+
 	it("resolves dated or suffixed grok-4.6 variants by the longest family prefix", () => {
 		expect(resolveXaiContextWindow("grok-4.6-beta")).toEqual({
 			family: "grok-4.6",
