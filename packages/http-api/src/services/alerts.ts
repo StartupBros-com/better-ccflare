@@ -668,10 +668,14 @@ export async function deliverAlertWebhook(
 	let parsed: URL;
 	try {
 		parsed = new URL(webhookUrl);
-	} catch (error) {
-		log.warn(
-			`Alert webhook delivery skipped: configured URL failed to parse: ${(error as Error).message}`,
-		);
+	} catch (_error) {
+		// Do not interpolate the caught error's message: both Bun's and
+		// Node's WHATWG URL parser embed the entire original input string in
+		// it, which would leak a Discord webhook's secret token into the log
+		// stream (logBus is unconditionally emitted and streamed to the
+		// dashboard's live log viewer regardless of console-silence
+		// settings).
+		log.warn("Alert webhook delivery skipped: configured URL failed to parse");
 		return;
 	}
 	const body = isDiscordWebhookUrl(parsed)

@@ -2273,9 +2273,19 @@ export class Config extends EventEmitter {
 	}
 
 	/** Throws ValidationError if `value` contains any name that isn't a known
-	 * AlertType (see @better-ccflare/types ALERT_TYPES) — unlike the getter,
-	 * a config write is a good moment to fail loudly. */
+	 * AlertType (see @better-ccflare/types ALERT_TYPES), or has more entries
+	 * than MAX_ALERT_WEBHOOK_TYPES — unlike the getter, a config write is a
+	 * good moment to fail loudly. Without this explicit oversized-list check,
+	 * a write past that cap would fall through to parseAlertWebhookTypes's
+	 * fail-safe "deliver all" result (types: [], invalidNames: []), silently
+	 * accepting an invalid-name-bearing list instead of rejecting it. */
 	setAlertWebhookTypes(value: string): void {
+		if (value !== "" && value.split(",").length > MAX_ALERT_WEBHOOK_TYPES) {
+			throw new ValidationError(
+				`Too many alert types (max ${MAX_ALERT_WEBHOOK_TYPES})`,
+				"alert_webhook_types",
+			);
+		}
 		const { types, invalidNames } = parseAlertWebhookTypes(value);
 		if (invalidNames.length > 0) {
 			throw new ValidationError(

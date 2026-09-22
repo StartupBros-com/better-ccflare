@@ -286,6 +286,35 @@ describe("deliverAlertWebhook", () => {
 			deliverAlertWebhook("https://example.com/hook", BASE_ALERT),
 		).resolves.toBeUndefined();
 	});
+
+	it("does not leak the configured URL or its secret token when the URL fails to parse", async () => {
+		const fetchMock = mock(
+			async () => new Response(null, { status: 204 }),
+		) as unknown as typeof fetch;
+		globalThis.fetch = fetchMock;
+		const { logs, stop } = collectWarnLogs();
+
+		try {
+			// Missing scheme: WHATWG URL parsing throws, and both Bun's and
+			// Node's error message embeds the entire original input string —
+			// including the secret token in the path.
+			await expect(
+				deliverAlertWebhook(
+					"discord.com/api/webhooks/123/SUPER-SECRET-TOKEN-ABC",
+					BASE_ALERT,
+				),
+			).resolves.toBeUndefined();
+
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(logs.length).toBeGreaterThan(0);
+			for (const l of logs) {
+				expect(l.msg).not.toContain("SUPER-SECRET-TOKEN-ABC");
+				expect(l.msg).not.toContain("discord.com/api/webhooks");
+			}
+		} finally {
+			stop();
+		}
+	});
 });
 
 describe("AlertService webhook wiring (end-to-end)", () => {

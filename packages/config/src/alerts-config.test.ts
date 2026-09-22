@@ -329,6 +329,28 @@ describe("alert webhook type allowlist", () => {
 		}
 	});
 
+	it("rejects an oversized list containing an unknown type instead of silently allowing all", () => {
+		for (const key of ENV_KEYS) {
+			delete process.env[key];
+		}
+		const { config, cleanup } = makeConfig();
+
+		try {
+			// 65 comma-separated tokens (one past the internal 64-token cap),
+			// padded with a valid, repeated type plus one unknown name. The
+			// write path must still fail loudly on the unknown name rather
+			// than silently short-circuiting the oversized list to "deliver
+			// all" (the getter's safe fallback, not the setter's contract).
+			const tokens = Array.from({ length: 64 }, () => "auth_failure");
+			tokens.push("not_a_real_alert_type");
+			expect(() => config.setAlertWebhookTypes(tokens.join(","))).toThrow();
+			// The rejected write must not have partially applied.
+			expect(config.getAlertWebhookTypes()).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
 	it("env var overrides the file value, including an explicit empty override", () => {
 		for (const key of ENV_KEYS) {
 			delete process.env[key];
