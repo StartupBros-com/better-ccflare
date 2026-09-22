@@ -3147,6 +3147,7 @@ async function selectAccountsForRequestInternal(
 						deriveRouteClass: deriveComboRouteClass,
 						resolveCapability: resolveAccountLogicalModelCapability,
 					},
+					{ requestedModel: effectiveModel },
 				);
 				if (!resolution.active) {
 					log.debug(

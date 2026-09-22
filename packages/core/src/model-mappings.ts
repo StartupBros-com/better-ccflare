@@ -50,6 +50,23 @@ export function getStrictClaudeModelFamily(
 }
 
 /**
+ * A well-formed concrete Claude model id: `claude-<family>-<digits>[-<digits>...][-<YYYYMMDD>]`.
+ * Matches ids Claude Code actually sends (e.g. claude-opus-5-5, claude-fable-5-1,
+ * claude-sonnet-4-5-20250929) while rejecting bare family aliases and
+ * malformed/preview-style ids like "claude-opus-preview-xyz" or bare "claude-opus".
+ * Deliberately does NOT check membership in CLAUDE_MODEL_IDS/any catalog — a
+ * model released today must still shape-match so same-family pass-through
+ * routing (see combo-membership-resolver.ts) doesn't silently downgrade it to
+ * LATEST_MODEL_BY_FAMILY just because the bundled catalog hasn't caught up yet.
+ */
+export const CONCRETE_CLAUDE_MODEL_ID_PATTERN =
+	/^claude-(?:fable|opus|sonnet|haiku)-\d+(?:-\d+)*(?:-\d{8})?$/i;
+
+export function isWellFormedConcreteClaudeModelId(value: string): boolean {
+	return CONCRETE_CLAUDE_MODEL_ID_PATTERN.test(value.trim());
+}
+
+/**
  * Check whether a stored value is a bare "family alias" — the literal family
  * name itself (e.g. "opus") used as a placeholder meaning "resolve to the
  * latest model in this family at read time", instead of a concrete model ID.
@@ -66,14 +83,31 @@ export function isFamilyAliasModel(
  * Resolve a stored managed-model/slot-model value that may be a bare family
  * alias into a concrete model ID. If `value` (trimmed) equals the family name
  * itself, returns the currently-latest model for that family
- * (LATEST_MODEL_BY_FAMILY). Otherwise returns the trimmed value unchanged.
+ * (LATEST_MODEL_BY_FAMILY) — UNLESS `requestedModel` is a well-formed concrete
+ * Claude id of that same family, in which case the client's own requested id
+ * is passed through untouched instead. This is the "anthropic-passthrough"
+ * fix: a bare alias means "track this family", not "always rewrite to the
+ * newest release", so an older client (entitled only to an older version) or
+ * a request for a model newer than the bundled catalog both keep their own
+ * id rather than being silently upgraded or downgraded. A malformed id, or
+ * one whose family doesn't match, falls back to today's LATEST behavior.
+ * Otherwise (not a bare alias) returns the trimmed value unchanged — a
+ * concrete pin always wins over pass-through.
  */
 export function resolveFamilyAliasModel(
 	value: string,
 	family: ComboFamily,
+	requestedModel?: string | null,
 ): string {
 	const trimmed = value.trim();
 	if (trimmed.toLowerCase() === family) {
+		if (
+			requestedModel &&
+			isWellFormedConcreteClaudeModelId(requestedModel) &&
+			getStrictClaudeModelFamily(requestedModel) === family
+		) {
+			return requestedModel;
+		}
 		return LATEST_MODEL_BY_FAMILY[family];
 	}
 	return trimmed;
@@ -83,14 +117,21 @@ export function resolveFamilyAliasModel(
  * Resolve a stored policy or slot model that is exactly a supported bare family
  * alias. Unlike resolveFamilyAliasModel(), this derives the alias family from
  * the stored value itself so a manual combo slot may intentionally target a
- * different family than its combo assignment.
+ * different family than its combo assignment. `requestedModel`, when given, is
+ * forwarded to resolveFamilyAliasModel so a same-family concrete request can
+ * pass through instead of being rewritten to LATEST_MODEL_BY_FAMILY.
  */
-export function resolveStoredPolicyAliasModel(value: string): string {
+export function resolveStoredPolicyAliasModel(
+	value: string,
+	requestedModel?: string | null,
+): string {
 	const trimmed = value.trim();
 	const family = KNOWN_PATTERNS.find(
 		(candidate) => candidate === trimmed.toLowerCase(),
 	);
-	return family ? LATEST_MODEL_BY_FAMILY[family] : trimmed;
+	return family
+		? resolveFamilyAliasModel(trimmed, family, requestedModel)
+		: trimmed;
 }
 
 /**

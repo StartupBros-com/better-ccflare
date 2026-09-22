@@ -70,6 +70,7 @@ export {
 	registerUIRefresh,
 } from "./interval-manager";
 export {
+	CONCRETE_CLAUDE_MODEL_ID_PATTERN,
 	createCustomEndpointData,
 	getAccountOwnedModelMappings,
 	getAllowedModelsMessage,
@@ -81,6 +82,7 @@ export {
 	getStrictClaudeModelFamily,
 	isFamilyAliasModel,
 	isValidClaudeModel,
+	isWellFormedConcreteClaudeModelId,
 	KNOWN_PATTERNS,
 	mapModelName,
 	parseCustomEndpointData,

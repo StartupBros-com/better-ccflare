@@ -16,7 +16,7 @@ import {
 	resolveComboProposalPolicyModel,
 	resolveEffectiveComboMembership,
 } from "./combo-membership-resolver";
-import { LATEST_MODEL_BY_FAMILY } from "./models";
+import { CLAUDE_MODEL_IDS, LATEST_MODEL_BY_FAMILY } from "./models";
 
 function account(overrides: Partial<Account> = {}): Account {
 	return {
@@ -615,6 +615,244 @@ describe("resolveEffectiveComboMembership", () => {
 		);
 		expect(result.members).toHaveLength(2);
 		expect(result.decisions).toHaveLength(2);
+	});
+});
+
+describe("resolveEffectiveComboMembership — anthropic-passthrough (requestedModel)", () => {
+	const OLDER_OPUS = CLAUDE_MODEL_IDS.OPUS_5; // older than LATEST_MODEL_BY_FAMILY.opus
+	const NEWER_UNKNOWN_OPUS = "claude-opus-5-6"; // well-formed, not in any catalog
+
+	function manualPolicy(
+		model: string,
+		overrides: Partial<ComboRoutingPolicySnapshot> = {},
+	): ComboRoutingPolicySnapshot {
+		return snapshot("opus", {
+			assignment: { ...snapshot().assignment, membership_mode: "manual" },
+			slots: [
+				{
+					id: "slot-alias",
+					combo_id: "combo-1",
+					account_id: "account-1",
+					model,
+					priority: 5,
+					enabled: true,
+				},
+			],
+			...overrides,
+		});
+	}
+
+	function managedPolicy(
+		managedModel: string,
+		overrides: Partial<ComboRoutingPolicySnapshot> = {},
+	): ComboRoutingPolicySnapshot {
+		return snapshot("opus", {
+			assignment: { ...snapshot().assignment, managed_model: managedModel },
+			...overrides,
+		});
+	}
+
+	describe("(a) bare-alias same-family pass-through", () => {
+		for (const [label, requestedModel] of [
+			["an older id", OLDER_OPUS],
+			["the latest id", LATEST_MODEL_BY_FAMILY.opus],
+			["an unknown well-formed newer id", NEWER_UNKNOWN_OPUS],
+		] as const) {
+			it(`manual mode passes through ${label}`, () => {
+				const result = resolveEffectiveComboMembership(
+					manualPolicy("opus"),
+					[account()],
+					dependencies(),
+					{ requestedModel },
+				);
+				expect(result.members).toHaveLength(1);
+				expect(result.members[0]).toMatchObject({
+					logical_model: requestedModel,
+					source: "manual",
+				});
+			});
+
+			it(`managed mode passes through ${label}`, () => {
+				const result = resolveEffectiveComboMembership(
+					managedPolicy("opus"),
+					[account()],
+					dependencies(),
+					{ requestedModel },
+				);
+				expect(result.members).toHaveLength(1);
+				expect(result.members[0]).toMatchObject({
+					logical_model: requestedModel,
+					source: "managed",
+				});
+			});
+		}
+	});
+
+	describe("(b) malformed requested id keeps today's rewrite to LATEST", () => {
+		const malformed = "claude-opus-preview-xyz";
+
+		it("manual mode", () => {
+			const result = resolveEffectiveComboMembership(
+				manualPolicy("opus"),
+				[account()],
+				dependencies(),
+				{ requestedModel: malformed },
+			);
+			expect(result.members[0]).toMatchObject({
+				logical_model: LATEST_MODEL_BY_FAMILY.opus,
+			});
+		});
+
+		it("managed mode", () => {
+			const result = resolveEffectiveComboMembership(
+				managedPolicy("opus"),
+				[account()],
+				dependencies(),
+				{ requestedModel: malformed },
+			);
+			expect(result.members[0]).toMatchObject({
+				logical_model: LATEST_MODEL_BY_FAMILY.opus,
+			});
+		});
+	});
+
+	describe("(c) a stored concrete pin wins over the requested id", () => {
+		it("manual mode", () => {
+			const result = resolveEffectiveComboMembership(
+				manualPolicy("claude-opus-4-8"),
+				[account()],
+				dependencies(),
+				{ requestedModel: NEWER_UNKNOWN_OPUS },
+			);
+			expect(result.members[0]).toMatchObject({
+				logical_model: "claude-opus-4-8",
+			});
+		});
+
+		it("managed mode", () => {
+			const result = resolveEffectiveComboMembership(
+				managedPolicy("claude-opus-4-8"),
+				[account()],
+				dependencies(),
+				{ requestedModel: NEWER_UNKNOWN_OPUS },
+			);
+			expect(result.members[0]).toMatchObject({
+				logical_model: "claude-opus-4-8",
+			});
+		});
+	});
+
+	describe("(d) a version-pinned account plus an older client falls back to LATEST instead of zero members", () => {
+		function pinnedCapability(counters?: { capability: number }) {
+			return {
+				...dependencies(),
+				resolveCapability(
+					_current: Account,
+					logicalModel: string,
+				): LogicalModelCapability {
+					if (counters) counters.capability++;
+					return logicalModel === LATEST_MODEL_BY_FAMILY.opus
+						? supported
+						: {
+								status: "unsupported",
+								provenance: "explicit_account_mapping",
+								reason: "unsupported",
+							};
+				},
+			};
+		}
+
+		it("managed mode", () => {
+			const result = resolveEffectiveComboMembership(
+				managedPolicy("opus"),
+				[account()],
+				pinnedCapability(),
+				{ requestedModel: OLDER_OPUS },
+			);
+			expect(result.members).toHaveLength(1);
+			expect(result.members[0]).toMatchObject({
+				logical_model: LATEST_MODEL_BY_FAMILY.opus,
+				source: "managed",
+			});
+		});
+
+		it("manual mode", () => {
+			const counters = { capability: 0 };
+			const result = resolveEffectiveComboMembership(
+				manualPolicy("opus"),
+				[account()],
+				pinnedCapability(counters),
+				{ requestedModel: OLDER_OPUS },
+			);
+			expect(result.members).toHaveLength(1);
+			expect(result.members[0]).toMatchObject({
+				logical_model: LATEST_MODEL_BY_FAMILY.opus,
+				source: "manual",
+			});
+			// Capability was consulted once for the rejected pass-through
+			// candidate; the retry without requestedModel never substitutes,
+			// so it never calls capability again for the manual slot.
+			expect(counters.capability).toBe(1);
+		});
+	});
+
+	it("(e) a cross-family fallback slot never passes through a different-family request (documented stale-client gap)", () => {
+		// Fable primary family with a manual Opus-family backup slot (see
+		// docs/combos.md "Family-alias managed models" — Fable routes can
+		// carry Opus backup slots as a documented cross-family fallback). The
+		// client requested a Fable model, so the Opus slot's own family
+		// (derived from its own alias, "opus") never matches the requested
+		// model's family ("fable") — pass-through cannot apply, and the slot
+		// keeps resolving to LATEST_MODEL_BY_FAMILY.opus exactly like before
+		// this feature. Documented residual gap (docs/combos.md): a stale
+		// client whose build cannot use the latest Opus model has no
+		// cross-family escape hatch here — only a same-family alias slot can
+		// pass the client's own requested id through.
+		const policy = snapshot("fable", {
+			assignment: {
+				...snapshot("fable").assignment,
+				membership_mode: "manual",
+			},
+			slots: [
+				{
+					id: "slot-opus-backup",
+					combo_id: "combo-1",
+					account_id: "account-1",
+					model: "opus",
+					priority: 10,
+					enabled: true,
+				},
+			],
+		});
+		const result = resolveEffectiveComboMembership(
+			policy,
+			[account()],
+			dependencies(),
+			{ requestedModel: CLAUDE_MODEL_IDS.FABLE_5 },
+		);
+		expect(result.members[0]).toMatchObject({
+			logical_model: LATEST_MODEL_BY_FAMILY.opus,
+			source: "manual",
+		});
+	});
+
+	it("(f) callers that omit requestedModel are unaffected (non-live callers)", () => {
+		const policy = manualPolicy("opus");
+		const withoutOptions = resolveEffectiveComboMembership(
+			policy,
+			[account()],
+			dependencies(),
+		);
+		const withNullRequestedModel = resolveEffectiveComboMembership(
+			policy,
+			[account()],
+			dependencies(),
+			{ requestedModel: null },
+		);
+		expect(withoutOptions).toEqual(withNullRequestedModel);
+		expect(withoutOptions.members[0]?.logical_model).toBe(
+			LATEST_MODEL_BY_FAMILY.opus,
+		);
 	});
 });
 
