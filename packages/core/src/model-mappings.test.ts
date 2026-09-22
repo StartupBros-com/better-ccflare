@@ -14,6 +14,7 @@ import {
 	getStrictClaudeModelFamily,
 	isFamilyAliasModel,
 	isValidClaudeModel,
+	isWellFormedConcreteClaudeModelId,
 	LATEST_FABLE_MODEL,
 	LATEST_MODEL_BY_FAMILY,
 	LATEST_OPUS_MODEL,
@@ -658,6 +659,93 @@ describe("Family alias helpers", () => {
 		]) {
 			expect(resolveStoredPolicyAliasModel(value)).toBe(value);
 		}
+	});
+});
+
+describe("isWellFormedConcreteClaudeModelId (anthropic-passthrough shape guard)", () => {
+	test("accepts every bundled CLAUDE_MODEL_IDS value", () => {
+		for (const modelId of Object.values(CLAUDE_MODEL_IDS)) {
+			expect(isWellFormedConcreteClaudeModelId(modelId)).toBe(true);
+		}
+	});
+
+	test("accepts an unrecognized but well-formed newer id (day-0 release)", () => {
+		expect(isWellFormedConcreteClaudeModelId("claude-opus-5-6")).toBe(true);
+		expect(isWellFormedConcreteClaudeModelId("claude-fable-6")).toBe(true);
+	});
+
+	test("rejects bare family aliases", () => {
+		for (const alias of ["opus", "sonnet", "haiku", "fable", "OPUS"]) {
+			expect(isWellFormedConcreteClaudeModelId(alias)).toBe(false);
+		}
+	});
+
+	test("rejects malformed / preview-style ids", () => {
+		expect(isWellFormedConcreteClaudeModelId("claude-opus-preview-xyz")).toBe(
+			false,
+		);
+		expect(isWellFormedConcreteClaudeModelId("claude-opus")).toBe(false);
+		expect(isWellFormedConcreteClaudeModelId("claude-opus-")).toBe(false);
+		expect(isWellFormedConcreteClaudeModelId("not-a-claude-model")).toBe(false);
+	});
+});
+
+describe("resolveFamilyAliasModel / resolveStoredPolicyAliasModel — requestedModel pass-through", () => {
+	test("resolveFamilyAliasModel passes through an older same-family concrete request instead of LATEST", () => {
+		expect(
+			resolveFamilyAliasModel("opus", "opus", CLAUDE_MODEL_IDS.OPUS_5),
+		).toBe(CLAUDE_MODEL_IDS.OPUS_5);
+	});
+
+	test("resolveFamilyAliasModel passes through the latest same-family concrete request", () => {
+		expect(
+			resolveFamilyAliasModel("opus", "opus", LATEST_MODEL_BY_FAMILY.opus),
+		).toBe(LATEST_MODEL_BY_FAMILY.opus);
+	});
+
+	test("resolveFamilyAliasModel passes through an unknown but well-formed newer same-family request", () => {
+		expect(resolveFamilyAliasModel("opus", "opus", "claude-opus-5-6")).toBe(
+			"claude-opus-5-6",
+		);
+	});
+
+	test("resolveFamilyAliasModel falls back to LATEST for a malformed requested id", () => {
+		expect(
+			resolveFamilyAliasModel("opus", "opus", "claude-opus-preview-xyz"),
+		).toBe(LATEST_MODEL_BY_FAMILY.opus);
+	});
+
+	test("resolveFamilyAliasModel falls back to LATEST when the requested model belongs to a different family", () => {
+		expect(
+			resolveFamilyAliasModel("opus", "opus", CLAUDE_MODEL_IDS.SONNET_5),
+		).toBe(LATEST_MODEL_BY_FAMILY.opus);
+	});
+
+	test("resolveFamilyAliasModel ignores requestedModel for a stored concrete pin", () => {
+		expect(
+			resolveFamilyAliasModel("claude-opus-4-8", "opus", "claude-opus-5-6"),
+		).toBe("claude-opus-4-8");
+	});
+
+	test("resolveFamilyAliasModel treats a null/undefined requestedModel exactly like the 2-arg call", () => {
+		expect(resolveFamilyAliasModel("opus", "opus", null)).toBe(
+			resolveFamilyAliasModel("opus", "opus"),
+		);
+		expect(resolveFamilyAliasModel("opus", "opus", undefined)).toBe(
+			resolveFamilyAliasModel("opus", "opus"),
+		);
+	});
+
+	test("resolveStoredPolicyAliasModel passes through a same-family requested id", () => {
+		expect(
+			resolveStoredPolicyAliasModel("  OPUS  ", CLAUDE_MODEL_IDS.OPUS_5),
+		).toBe(CLAUDE_MODEL_IDS.OPUS_5);
+	});
+
+	test("resolveStoredPolicyAliasModel ignores requestedModel for a non-alias value", () => {
+		expect(
+			resolveStoredPolicyAliasModel("claude-opus-4-8", "claude-opus-5-6"),
+		).toBe("claude-opus-4-8");
 	});
 });
 

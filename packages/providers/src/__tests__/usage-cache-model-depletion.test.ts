@@ -182,6 +182,51 @@ describe("UsageCache model-scoped depletion", () => {
 		).toBeNull();
 	});
 
+	// anthropic-passthrough (requirement 5): same-family pass-through routing
+	// (combo-membership-resolver.ts) can now send an OLDER or a not-yet-
+	// cataloged NEWER concrete id upstream instead of always the family's
+	// LATEST. Genuinely family-scoped 429 evidence must still cover every
+	// concrete id of that family regardless of which one triggered it —
+	// verifying no code change was needed here: getModelFamily() is already a
+	// substring match, so markFamilyScopedExhausted keyed off ANY concrete id
+	// (old, latest, or unrecognized-newer) already collapses onto the same
+	// family lane and blocks every sibling. Exact-model markers
+	// (markModelScopedExhausted) intentionally stay per-id — see "marks an
+	// exact model without blocking versions or other families" above — so a
+	// narrow-scope 429 evidenced against one pass-through id still never
+	// blocks its siblings.
+	it("family-scoped exhaustion marked against a pass-through id (older or unrecognized-newer) still blocks every sibling concrete id", () => {
+		usageCache.markFamilyScopedExhausted(
+			ACCOUNT,
+			"claude-opus-5",
+			NOW + 10_000,
+		);
+		expect(
+			usageCache.getFamilyScopedExhaustion(
+				ACCOUNT,
+				"claude-opus-5-5", // the family's current LATEST
+				NOW,
+			),
+		).toMatchObject({ exhausted: true, family: "opus" });
+		expect(
+			usageCache.getFamilyScopedExhaustion(
+				ACCOUNT,
+				"claude-opus-5-6", // a hypothetical newer id, not in any catalog
+				NOW,
+			),
+		).toMatchObject({ exhausted: true, family: "opus" });
+		usageCache.delete(ACCOUNT);
+
+		usageCache.markFamilyScopedExhausted(
+			ACCOUNT,
+			"claude-opus-5-6",
+			NOW + 10_000,
+		);
+		expect(
+			usageCache.getFamilyScopedExhaustion(ACCOUNT, "claude-opus-5", NOW),
+		).toMatchObject({ exhausted: true, family: "opus" });
+	});
+
 	it("clears only the successful exact beta and matching family", () => {
 		usageCache.markModelScopedExhausted(
 			ACCOUNT,

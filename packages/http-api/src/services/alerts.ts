@@ -433,6 +433,14 @@ export function buildStalePolicyDriftAlert(
  * (client-requested) model when any rewrite occurred (combo or agent), else
  * the request's own model — mirroring how `originalModel`/`model` are
  * persisted (see packages/types/src/request.ts).
+ *
+ * This is a catalog-completeness signal, not a routing failure: a bare
+ * family-alias combo/managed policy already passes an unrecognized
+ * same-family concrete id straight through to the account instead of
+ * rewriting it (see combo-membership-resolver.ts's requestedModel
+ * pass-through). What actually goes stale without the catalog bump is
+ * offline pricing, list-price-era lookups, and dashboard/CLI model pickers,
+ * which all key off CLAUDE_MODEL_IDS.
  */
 export function buildUnknownModelDriftAlert(
 	request: RequestResponse,
@@ -456,7 +464,7 @@ export function buildUnknownModelDriftAlert(
 		type: "model_routing_drift",
 		severity: "warning",
 		title: "Unknown model requested",
-		message: `clients are requesting ${requestedModel} (family ${family}) which is not in the bundled model catalog — bump CLAUDE_MODEL_IDS/LATEST_* in packages/core/src/models.ts and deploy`,
+		message: `clients are requesting ${requestedModel} (family ${family}) which is missing from the bundled model catalog — routing already passes this id straight through to the account, but offline pricing, list-price eras, and pickers don't recognize it yet; bump CLAUDE_MODEL_IDS/LATEST_* in packages/core/src/models.ts and deploy`,
 		value: null,
 		threshold: null,
 		account: request.accountUsed,

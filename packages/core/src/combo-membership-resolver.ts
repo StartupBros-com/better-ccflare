@@ -46,23 +46,76 @@ export function createManagedComboMemberId({
 	return `combo:${comboId}:managed:${family}:rule:${ruleId}:account:${accountId}`;
 }
 
+interface ManualMemberResolution {
+	member: EffectiveComboMember;
+	/** Non-null when pass-through substitution applied but the account's
+	 * capability check rejected the substituted model — the member must be
+	 * excluded (not merely marked unsupported) so it participates correctly
+	 * in the zero-eligible retry in resolveEffectiveComboMembership. */
+	rejected: ComboMembershipDecision | null;
+}
+
+/**
+ * Build a manual slot's effective member. When `requestedModel` is given and
+ * the slot's stored model is a bare family alias, resolveStoredPolicyAliasModel
+ * may substitute the client's own same-family requested id in place of
+ * LATEST_MODEL_BY_FAMILY (see model-mappings.ts). Manual slots never checked
+ * account capability before this feature (every existing caller/test relies
+ * on that — see the `counters.capability === 0` assertions in
+ * combo-membership-resolver.test.ts); pass-through must not change that for
+ * ordinary alias resolution. Capability is only ever consulted here when
+ * pass-through actually substituted a *different* model than the no-pass-
+ * through resolution would have produced, gating the one new failure mode
+ * this introduces: routing a client's own requested id to an account whose
+ * model_mappings can't serve it.
+ */
 function createManualMember(
 	snapshot: ComboRoutingPolicySnapshot,
 	slot: ComboRoutingPolicySnapshot["slots"][number],
-): EffectiveComboMember {
-	return {
+	requestedModel: string | null,
+	resolveCapability: ComboResolverDependencies["resolveCapability"],
+	accountsById: ReadonlyMap<string, Account>,
+): ManualMemberResolution {
+	const withoutPassThrough = resolveStoredPolicyAliasModel(slot.model);
+	const logicalModel = resolveStoredPolicyAliasModel(
+		slot.model,
+		requestedModel,
+	);
+	const member: EffectiveComboMember = {
 		id: `combo:${slot.combo_id}:slot:${slot.id}`,
 		account_id: slot.account_id,
 		combo_id: slot.combo_id,
 		family: snapshot.assignment.family,
 		included: true,
-		logical_model: resolveStoredPolicyAliasModel(slot.model),
+		logical_model: logicalModel,
 		tier: slot.priority,
 		source: "manual",
 		reason: "included",
 		slot_id: slot.id,
 		rule_id: null,
 	};
+	if (logicalModel === withoutPassThrough) {
+		return { member, rejected: null };
+	}
+	const account = accountsById.get(slot.account_id);
+	// The account isn't in the resolvable set — can't verify capability, so
+	// don't newly block on it; this mirrors manual mode's pre-existing
+	// behavior of never needing account lookups to build a member.
+	if (!account) {
+		return { member, rejected: null };
+	}
+	const capability = resolveCapability(account, logicalModel);
+	if (capability.status !== "supported") {
+		return {
+			member,
+			rejected: rejectedDecision(snapshot, slot.account_id, capability.reason, {
+				logicalModel,
+				tier: slot.priority,
+				slotId: slot.id,
+			}),
+		};
+	}
+	return { member, rejected: null };
 }
 
 function toDecision(member: EffectiveComboMember): ComboMembershipDecision {
@@ -120,18 +173,36 @@ function rejectedDecision(
 
 function resolveManagedModel(
 	snapshot: ComboRoutingPolicySnapshot,
+	requestedModel: string | null,
 ): string | null {
 	const raw =
 		snapshot.assignment.managed_model ??
 		LATEST_MODEL_BY_FAMILY[snapshot.assignment.family];
-	const model = resolveFamilyAliasModel(raw, snapshot.assignment.family);
+	const model = resolveFamilyAliasModel(
+		raw,
+		snapshot.assignment.family,
+		requestedModel,
+	);
 	return getModelFamily(model) === snapshot.assignment.family ? model : null;
+}
+
+export interface ResolveEffectiveComboMembershipOptions {
+	/**
+	 * The client's own requested model, used ONLY to let a bare family alias
+	 * pass through a well-formed same-family concrete id instead of always
+	 * rewriting to LATEST_MODEL_BY_FAMILY (see model-mappings.ts
+	 * resolveFamilyAliasModel). Pass this only from the live account-selector
+	 * request path — every other caller (previews, proposals, onboarding)
+	 * omits it and gets today's alias-to-LATEST behavior unchanged.
+	 */
+	requestedModel?: string | null;
 }
 
 export function resolveEffectiveComboMembership(
 	snapshot: ComboRoutingPolicySnapshot,
 	accounts: readonly Account[],
 	deps: ComboResolverDependencies,
+	options: ResolveEffectiveComboMembershipOptions = {},
 ): ComboMembershipResolution {
 	const comboId = snapshot.assignment.combo_id;
 	const inactive =
@@ -156,6 +227,36 @@ export function resolveEffectiveComboMembership(
 		};
 	}
 
+	const requestedModel = options.requestedModel ?? null;
+	const primary = computeActiveMembership(
+		snapshot,
+		accounts,
+		deps,
+		comboId,
+		requestedModel,
+	);
+	// Zero-eligible guard: a version-pinned account's model_mappings may only
+	// list the newest id, so passing through an older (or a not-yet-mapped
+	// newer) client model can leave a combo with zero eligible candidates.
+	// Re-resolve once without the requested model — today's LATEST behavior —
+	// rather than falling all the way through to ordinary-stock routing.
+	if (requestedModel && primary.members.length === 0) {
+		return computeActiveMembership(snapshot, accounts, deps, comboId, null);
+	}
+	return primary;
+}
+
+function computeActiveMembership(
+	snapshot: ComboRoutingPolicySnapshot,
+	accounts: readonly Account[],
+	deps: ComboResolverDependencies,
+	comboId: string,
+	requestedModel: string | null,
+): ComboMembershipResolution {
+	const accountsById = new Map(
+		accounts.map((current) => [current.id, current]),
+	);
+
 	// Two manual slots for the same account can resolve to the same concrete
 	// model (e.g. one stored as a literal model ID, another as a bare family
 	// alias that resolves to that same latest model). Dedupe by
@@ -163,14 +264,26 @@ export function resolveEffectiveComboMembership(
 	// existing compare order and demoting the rest to a rejected
 	// "manual_override" decision so every enabled slot still yields exactly
 	// one decision entry.
-	const manualCandidates = snapshot.slots
+	const manualResolutions = snapshot.slots
 		.filter((slot) => slot.enabled && slot.combo_id === comboId)
-		.map((slot) => createManualMember(snapshot, slot))
-		.sort(compareMembers);
+		.map((slot) =>
+			createManualMember(
+				snapshot,
+				slot,
+				requestedModel,
+				deps.resolveCapability,
+				accountsById,
+			),
+		)
+		.sort((a, b) => compareMembers(a.member, b.member));
 	const members: EffectiveComboMember[] = [];
 	const decisions: ComboMembershipDecision[] = [];
 	const seenManualKeys = new Set<string>();
-	for (const candidate of manualCandidates) {
+	for (const { member: candidate, rejected } of manualResolutions) {
+		if (rejected) {
+			decisions.push(rejected);
+			continue;
+		}
 		const key = `${candidate.account_id}\u0000${candidate.logical_model}`;
 		if (seenManualKeys.has(key)) {
 			decisions.push(
@@ -209,7 +322,7 @@ export function resolveEffectiveComboMembership(
 		};
 	}
 
-	const managedModel = resolveManagedModel(snapshot);
+	const managedModel = resolveManagedModel(snapshot, requestedModel);
 	if (!managedModel) {
 		return {
 			family: snapshot.assignment.family,

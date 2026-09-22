@@ -383,7 +383,13 @@ describe("model_routing_drift: unknown_model (day-0 catalog gap)", () => {
 		expect(alert.message).toContain(
 			"clients are requesting claude-opus-6 (family opus)",
 		);
-		expect(alert.message).toContain("not in the bundled model catalog");
+		expect(alert.message).toContain("missing from the bundled model catalog");
+		expect(alert.message).toContain(
+			"routing already passes this id straight through to the account",
+		);
+		expect(alert.message).toContain(
+			"offline pricing, list-price eras, and pickers don't recognize it yet",
+		);
 		expect(alert.message).toContain(
 			"bump CLAUDE_MODEL_IDS/LATEST_* in packages/core/src/models.ts and deploy",
 		);
