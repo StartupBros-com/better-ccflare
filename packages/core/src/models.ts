@@ -19,6 +19,7 @@ export const CLAUDE_MODEL_IDS = {
 	OPUS_4_7: "claude-opus-4-7",
 	OPUS_4_8: "claude-opus-4-8",
 	OPUS_5: "claude-opus-5",
+	OPUS_5_5: "claude-opus-5-5",
 	FABLE_5: "claude-fable-5",
 	FABLE_5_1: "claude-fable-5-1",
 } as const;
@@ -28,7 +29,7 @@ export const CLAUDE_MODEL_IDS = {
 // `fetchedAt` for the fallback catalog (packages/proxy/src/model-catalog.ts)
 // so a fresh install without a live-refreshable account shows an honest
 // "as of <date>" provenance instead of a misleading "just now".
-export const BUNDLED_MODELS_AS_OF = "2026-09-01";
+export const BUNDLED_MODELS_AS_OF = "2026-09-22";
 
 // Model display names
 export const MODEL_DISPLAY_NAMES: Record<string, string> = {
@@ -44,6 +45,7 @@ export const MODEL_DISPLAY_NAMES: Record<string, string> = {
 	[CLAUDE_MODEL_IDS.OPUS_4_7]: "Claude Opus 4.7",
 	[CLAUDE_MODEL_IDS.OPUS_4_8]: "Claude Opus 4.8",
 	[CLAUDE_MODEL_IDS.OPUS_5]: "Claude Opus 5",
+	[CLAUDE_MODEL_IDS.OPUS_5_5]: "Claude Opus 5.5",
 	[CLAUDE_MODEL_IDS.FABLE_5]: "Claude Fable 5",
 	[CLAUDE_MODEL_IDS.FABLE_5_1]: "Claude Fable 5.1",
 };
@@ -62,6 +64,7 @@ export const MODEL_SHORT_NAMES: Record<string, string> = {
 	[CLAUDE_MODEL_IDS.OPUS_4_7]: "claude-opus-4.7",
 	[CLAUDE_MODEL_IDS.OPUS_4_8]: "claude-opus-4.8",
 	[CLAUDE_MODEL_IDS.OPUS_5]: "claude-opus-5",
+	[CLAUDE_MODEL_IDS.OPUS_5_5]: "claude-opus-5.5",
 	[CLAUDE_MODEL_IDS.FABLE_5]: "claude-fable-5",
 	[CLAUDE_MODEL_IDS.FABLE_5_1]: "claude-fable-5.1",
 };
@@ -69,7 +72,7 @@ export const MODEL_SHORT_NAMES: Record<string, string> = {
 // Latest model aliases — update these when Anthropic releases new models.
 // Check https://docs.anthropic.com/en/docs/about-claude/models for the current list.
 export const LATEST_FABLE_MODEL = CLAUDE_MODEL_IDS.FABLE_5_1;
-export const LATEST_OPUS_MODEL = CLAUDE_MODEL_IDS.OPUS_5;
+export const LATEST_OPUS_MODEL = CLAUDE_MODEL_IDS.OPUS_5_5;
 export const LATEST_SONNET_MODEL = CLAUDE_MODEL_IDS.SONNET_5;
 export const LATEST_HAIKU_MODEL = CLAUDE_MODEL_IDS.HAIKU_4_5;
 
