@@ -1,5 +1,29 @@
-import { describe, expect, it } from "bun:test";
-import { formatWalCheckpointLog, WAL_SIZE_WARN_MIB } from "./server";
+import { describe, expect, it, mock } from "bun:test";
+import { IntervalManager } from "../../../packages/core/src/interval-manager";
+
+// Fresh worktrees omit generated embedded-worker modules. Keep this focused
+// server test on the source fallback without generating or reading them.
+mock.module(
+	"../../../packages/database/src/inline-incremental-vacuum-worker",
+	() => ({
+		EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE: "",
+	}),
+);
+mock.module("../../../packages/database/src/inline-vacuum-worker", () => ({
+	EMBEDDED_VACUUM_WORKER_CODE: "",
+}));
+mock.module(
+	"../../../packages/database/src/inline-integrity-check-worker",
+	() => ({
+		EMBEDDED_INTEGRITY_CHECK_WORKER_CODE: "",
+	}),
+);
+
+const {
+	createWalCheckpointCleanupConfig,
+	formatWalCheckpointLog,
+	WAL_SIZE_WARN_MIB,
+} = await import("./server");
 
 describe("formatWalCheckpointLog", () => {
 	it("logs at debug when the WAL stays small after a successful run", () => {
@@ -74,5 +98,72 @@ describe("formatWalCheckpointLog", () => {
 		);
 		expect(message).not.toContain(" in ");
 		expect(message).not.toContain("undefinedms");
+	});
+});
+
+describe("wal-checkpoint cleanup registration", () => {
+	it("prevents a scheduled run from overlapping through IntervalManager", async () => {
+		let markOptimizeStarted!: () => void;
+		const optimizeStarted = new Promise<void>((resolve) => {
+			markOptimizeStarted = resolve;
+		});
+		let resolveOptimize!: (result: {
+			ok: true;
+			skipped: false;
+			durationMs: number;
+		}) => void;
+		const optimizeResult = new Promise<{
+			ok: true;
+			skipped: false;
+			durationMs: number;
+		}>((resolve) => {
+			resolveOptimize = resolve;
+		});
+		const optimizeAsync = mock(() => {
+			markOptimizeStarted();
+			return optimizeResult;
+		});
+		let markCallbackFinished!: () => void;
+		const callbackFinished = new Promise<void>((resolve) => {
+			markCallbackFinished = resolve;
+		});
+		const debugMessages: string[] = [];
+		const config = createWalCheckpointCleanupConfig(
+			{
+				optimizeAsync,
+				getWalSizeBytes: async () => 1024,
+			},
+			{
+				debug: (message: string) => {
+					debugMessages.push(message);
+					markCallbackFinished();
+				},
+				warn: () => undefined,
+				error: () => undefined,
+			},
+		);
+
+		const manager = new IntervalManager();
+		const unregister = manager.register({
+			...config,
+			intervalMs: 1,
+		});
+		let overlappingRun!: Promise<boolean>;
+		try {
+			await optimizeStarted;
+			overlappingRun = manager.runNow(config.id);
+			await Promise.resolve();
+
+			expect(optimizeAsync).toHaveBeenCalledTimes(1);
+		} finally {
+			unregister();
+			resolveOptimize({ ok: true, skipped: false, durationMs: 7 });
+			await callbackFinished;
+			manager.shutdown();
+		}
+
+		expect(await overlappingRun).toBe(false);
+		expect(optimizeAsync).toHaveBeenCalledTimes(1);
+		expect(debugMessages).toHaveLength(1);
 	});
 });
