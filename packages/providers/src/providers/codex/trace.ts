@@ -49,8 +49,10 @@ export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 // epoch — GPT-5.6 moved from the invented 372k window to the catalog max
 // 872k, and gpt-5.4 to 1M (issue #205). Percentages are not comparable
 // across the v18/v19 boundary. Schema 20 adds pacing role/release/wait receipts
-// without changing cache denominators.
-const TRACE_SCHEMA_VERSION = 20;
+// without changing cache denominators. Schema 21 adds the subscription-backend
+// affinity header receipts (session-id source, routing hint) so a cache-read
+// regression can be split by whether the wire carried them.
+const TRACE_SCHEMA_VERSION = 21;
 const DEFAULT_FANOUT_WARN = 8;
 const TURN_STATE_COHORT_PATTERN = /^[0-9a-f]{16}$/;
 // Derived from the canonical vocabularies so a new category cannot be emitted
@@ -261,6 +263,14 @@ interface TraceInputs {
 	 * and measure hit rate by turn within one conversation.
 	 */
 	promptCacheKeyId?: string | null;
+	/**
+	 * Where the outbound `session-id`/`thread-id` affinity headers came from:
+	 * "derived" from the prompt cache key, "client" for a native Responses
+	 * client's own identity, null when none were sent.
+	 */
+	affinitySessionIdentity?: "derived" | "client" | null;
+	/** Whether `x-codex-routing-hint` was attached to the outbound request. */
+	affinityRoutingHint?: boolean;
 	/** Key derivation mode: "conversation" | "session" (see provider). */
 	cacheKeyMode?: "conversation" | "session" | null;
 	/** Intended experiment arm for eligible cache-key canary traffic. */
@@ -515,6 +525,8 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		session_key_hash: inputs.sessionKeyHash ?? null,
 		prompt_cache_key_set: inputs.promptCacheKeySet ?? false,
 		prompt_cache_key_id: inputs.promptCacheKeyId ?? null,
+		affinity_session_identity: inputs.affinitySessionIdentity ?? null,
+		affinity_routing_hint: inputs.affinityRoutingHint ?? false,
 		cache_key_mode: inputs.cacheKeyMode ?? null,
 		cache_key_assignment: inputs.cacheKeyAssignment ?? null,
 		cache_key_cohort_id: inputs.cacheKeyCohortId ?? null,

@@ -84,6 +84,8 @@ export interface TraceRecord {
 	session_key_hash?: string | null;
 	prompt_cache_key_set?: boolean;
 	prompt_cache_key_id?: string | null;
+	affinity_session_identity?: "derived" | "client" | null;
+	affinity_routing_hint?: boolean;
 	instructions_hmac?: string | null;
 	tools_hmac?: string | null;
 	new_tool_call_count?: number;
