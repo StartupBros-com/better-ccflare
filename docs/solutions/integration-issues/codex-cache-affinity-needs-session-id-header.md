@@ -53,7 +53,27 @@ ccflare's `prepareHeaders` only set `Version`, `Openai-Beta`, `User-Agent`, and 
 ## Verification
 
 - `packages/providers/src/providers/codex/affinity-headers.test.ts`, `provider.affinity-headers.test.ts`, `packages/proxy/src/codex-websocket-wire.test.ts`.
-- Post-deploy: rerun the index-aligned pair analysis on the day's `codex-trace-*.jsonl`; the append-only zero-hit rate should return to the single digits and `affinity_session_identity` should read `derived` on Claude Code traffic.
+- Post-deploy, on naturally initiated traffic only (never scripted traffic against Codex accounts). Durable usage, additive formula, replace the epoch with the deploy time in ms:
+
+  ```sql
+  SELECT model, COUNT(*) AS n,
+    ROUND(100.0 * SUM(cache_read_input_tokens)
+      / NULLIF(SUM(input_tokens + cache_read_input_tokens + cache_creation_input_tokens), 0), 1) AS weighted_pct,
+    ROUND(100.0 * SUM(cache_read_input_tokens = 0) / COUNT(*), 1) AS zero_hit_pct
+  FROM requests
+  -- 1790208000000 is 2026-09-24T00:00:00Z; use the actual deploy time
+  WHERE model LIKE 'gpt%' AND success = 1 AND timestamp > 1790208000000
+  GROUP BY model;
+  ```
+
+  Baseline, 7 days to 2026-09-23 (all pre-fix):
+
+  | model | weighted cache read | zero-hit requests |
+  |---|---|---|
+  | gpt-6-astra | 32.0% | 65.9% |
+  | gpt-5.6-sol | 40.7% | 26.9% |
+
+  The fix works if both models return above 90% weighted. Confirm the wire carried the headers with `jq -r 'select(.phase=="request") | .affinity_session_identity' codex-trace-<date>.jsonl | sort | uniq -c` (expect `derived` for Claude Code traffic). If weighted share stays low while `derived` is present, the header is not the whole contract; roll back with `CCFLARE_CODEX_AFFINITY_HEADERS=0` and compare.
 
 ## Prevention
 
