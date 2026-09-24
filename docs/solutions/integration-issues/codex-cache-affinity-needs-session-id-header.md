@@ -45,10 +45,14 @@ From 2026-09-20 the Codex lane's cache-read share collapsed from 80-90% to 26-45
 
 The official client documents the contract in `openai/codex` `core/src/client.rs` (`responses_session_id`) and commit `bc5957ea` ("ChatGPT derives Responses cache affinity from the `session-id` header"). Codex CLI sends, on every Responses request and WebSocket handshake:
 
-- `session-id` = its prompt cache key (root threads), `thread-id` = the thread id (`codex-api/src/requests/headers.rs`)
+- `session-id` = its prompt cache key, `thread-id` = the thread id (`codex-api/src/requests/headers.rs`)
 - `x-codex-routing-hint: model=<model>[;tier=<tier>]`
 
 ccflare's `prepareHeaders` only set `Version`, `Openai-Beta`, `User-Agent`, and `originator`. `packages/providers/src/providers/codex/affinity-headers.ts` now owns the contract: `applyCodexAffinityHeaders` is called once in `CodexProvider.transformRequestBody` (the same place the per-turn `x-codex-turn-state` header is set), so the HTTP request and the WebSocket handshake copy both carry `session-id`/`thread-id` = `prompt_cache_key` and the routing hint for the resolved physical model. A native `/v1/responses` client keeps its own identity; legacy clients cannot steer affinity. `CCFLARE_CODEX_AFFINITY_HEADERS=0` restores pass-through. Schema-21 traces record `affinity_session_identity` and `affinity_routing_hint`.
+
+### Design note: header granularity
+
+In the reference client `session_id` is "the identity shared by the root thread and all descendant threads" (`core/src/session/session.rs`): a root thread uses its own id, a subagent thread inherits the root's, and in both cases the `session-id` header equals the body `prompt_cache_key` (only internal threads such as compaction send a composite key under the root's header). The invariant ccflare preserves is header = key. ccflare does not copy the CLI's one-key-per-session-plus-subagents granularity: a Claude Code session fans out far more conversations than a Codex session does, and the per-conversation key exists because one shared key measurably thrashed a single cache machine under that fan-out. If the coarse shape ever needs testing, `CCFLARE_CODEX_CACHE_KEY_MODE=session` moves the key and the header together; do not point `session-id` at one identity and `prompt_cache_key` at another, a shape the CLI never produces for user threads.
 
 ## Verification
 
