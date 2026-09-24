@@ -4,12 +4,19 @@ type: perf
 date: 2026-08-20
 deepened: 2026-08-20
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: implementation-ready
 product_contract_source: ce-plan-bootstrap
 execution: code
 ---
 
 # OpenAI Prompt-Cache Parity Control Plane - Plan
+
+## Current disposition (2026-09-24)
+
+**Implementation delivered; sustained parity validation remains open.** U1-U4 shipped in [PR #230](https://github.com/StartupBros-com/better-ccflare/pull/230), commit `b54fa8d7549208f406ee108d87538ed46b31232a`. The closeout audit recorded planning issue [#228](https://github.com/StartupBros-com/better-ccflare/issues/228) as closed; parent [#174](https://github.com/StartupBros-com/better-ccflare/issues/174) remains open for natural-traffic validation and reporter confirmation. The contracts and implementation units below are the **original August design**, not an unstarted implementation queue.
+
+- **Later affinity remediation:** [PR #367](https://github.com/StartupBros-com/better-ccflare/pull/367) added the missing subscription-backend affinity headers. Its [initial natural-traffic check](../solutions/integration-issues/codex-cache-affinity-needs-session-id-header.md#initial-natural-traffic-check-historical-observation) recorded 92.46% weighted reuse across 431 measured successful requests on one account, and 95.66% on 370 strict preserved-prefix continuations. This supports recovery, not a randomized causal conclusion, an optimal-granularity claim, or sustained multi-account parity. The August backend-only interpretation is therefore historical, not a blanket limit on client-side remediation. The explicit-breakpoint rejection remains a separate observed capability constraint.
+- **Later degradation alerts:** [PR #369](https://github.com/StartupBros-com/better-ccflare/pull/369), commit `66eaa49296229839e0f260b057a5782477aafc8c`, added account/provider cache-health monitoring and was deployed at **2026-09-24T07:22:08Z**. Its **90% warning threshold does not replace or validate the 96% seven-day parity floor**; alert silence is not a parity verdict.
+- **Unchanged acceptance bar:** The [Success Criteria](#success-criteria) still require a qualified rolling seven-day follow-up cohort, >=96% weighted reuse, >=99% positive hits, <=1% zero hits, qualified physical-model and contemporaneous Anthropic comparisons, and no success/fallback/context-overflow regression. Neither later delivery closes #174 or unrelated provider work.
 
 ## Goal Capsule
 
@@ -34,7 +41,7 @@ The remaining gap is real and not explained by the usual local causes. In the se
 
 Current schema-19 traces show `prompt_cache_key` on all eligible Codex traffic, no instruction changes, tool stability on all but a small fraction of turns, and no key above OpenAI's approximate 15 requests/minute guidance. They also show 1,402 zero-cache responses while runtime pacing recorded only seven cap releases. Key absence, ordinary idle expiry, instruction drift, account remapping, key concentration, and follower-cap release therefore cannot explain most of the residual loss.
 
-The remaining causal boundary is the private backend. A 26-request natural-traffic treatment proved that `chatgpt.com/backend-api/codex/responses` rejects GPT-5.6 explicit breakpoints on Sol and Terra. Same-key, same-model, same-account, exact-prefix turns can still miss between highly cached neighbors. Public OpenAI documentation describes the missing explicit-boundary remedy, but public API support does not prove support on the ChatGPT subscription endpoint.
+The August investigation treated the private backend as the remaining causal boundary; the later affinity-header remediation above shows why that was not an exhaustive conclusion about client-side controls. A 26-request natural-traffic treatment showed that `chatgpt.com/backend-api/codex/responses` rejects GPT-5.6 explicit breakpoints on Sol and Terra. Same-key, same-model, same-account, exact-prefix turns can still miss between highly cached neighbors. Public OpenAI documentation describes the missing explicit-boundary remedy, but public API support does not prove support on the ChatGPT subscription endpoint.
 
 ### Key Decisions
 

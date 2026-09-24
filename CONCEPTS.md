@@ -64,6 +64,33 @@ route must still hold an exact reviewed proof.
 
 ## Usage measurement
 
+### Cache parity
+
+A sustained cache-reuse verdict for qualified Codex follow-up traffic, requiring the
+project's cache-read and hit-rate floors, physical-model checks, a contemporaneous Anthropic
+comparison when sufficiently sampled, and non-regressing request outcomes.
+
+A short-window recovery or absence of a degradation alert is not parity. First-observed
+turns remain visible but do not determine the follow-up verdict; insufficient evidence is
+not success.
+
+### Logical-final usage
+
+Usage attributed to a client request's final accounted result, rather than to every upstream
+attempt made while serving it.
+
+Retries and failovers can produce several physical attempts for one logical request, so
+logical-final usage and physical-attempt usage are not interchangeable populations.
+
+### Physical-attempt usage
+
+Usage reported for one upstream dispatch, including attempts that a retry or failover may
+hide from a logical request's final accounted result.
+
+Comparing it with logical-final usage requires matching the populations and respecting each
+source's token semantics: a cache-inclusive input total already includes cache reads, while
+an additive input count must be combined with the separate cache-read and cache-write counts.
+
 ### Canonical usage window
 
 One provider-reported capacity measurement, normalized into the single shape the rest of
