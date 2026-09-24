@@ -693,7 +693,7 @@ describe("analyzeCodexCacheExperiments", () => {
 	test("attributes follower cap receipts and observed wait time", () => {
 		const report = analyzeCodexCacheExperiments([
 			{
-				trace_schema_version: 20,
+				trace_schema_version: 21,
 				phase: "request",
 				ts: "2026-08-20T00:00:00Z",
 				request_id: "cap-request",
@@ -707,7 +707,7 @@ describe("analyzeCodexCacheExperiments", () => {
 				pacing_release_reason: "cap",
 			},
 			{
-				trace_schema_version: 20,
+				trace_schema_version: 21,
 				phase: "response",
 				ts: "2026-08-20T00:00:01Z",
 				request_id: "cap-request",

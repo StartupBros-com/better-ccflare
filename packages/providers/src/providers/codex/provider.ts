@@ -66,6 +66,7 @@ import {
 	getResponseDrainTransport,
 	transferResponseDrainTransport,
 } from "../../utils/stream-drain";
+import { applyCodexAffinityHeaders } from "./affinity-headers";
 import {
 	CODEX_CACHE_DIAGNOSTICS_ENV,
 	CodexCacheDiagnostics,
@@ -2900,6 +2901,17 @@ export class CodexProvider extends BaseProvider {
 							codexBody.input,
 						),
 					});
+			// The subscription backend derives prompt-cache affinity from the
+			// `session-id` request header (see affinity-headers.ts), so the same
+			// headers ride on the HTTP request and the WebSocket handshake copy.
+			// Applied before the trace so the record can prove what went on the wire.
+			const newHeaders = new Headers(request.headers);
+			const affinityDecision = applyCodexAffinityHeaders(newHeaders, {
+				promptCacheKey: codexBody.prompt_cache_key,
+				physicalModel: codexBody.model,
+				subscriptionEndpoint: isSubscriptionEndpoint,
+				preserveClientSessionIdentity: nativeResponses,
+			});
 			// Best-effort, env-gated observability (no-op unless CCFLARE_CODEX_TRACE_DIR set).
 			writeCodexTrace({
 				requestId: requestId ?? undefined,
@@ -2920,6 +2932,8 @@ export class CodexProvider extends BaseProvider {
 				promptCacheKeyId: codexBody.prompt_cache_key
 					? codexBody.prompt_cache_key.slice(-16)
 					: null,
+				affinitySessionIdentity: affinityDecision.sessionIdentity,
+				affinityRoutingHint: affinityDecision.routingHint,
 				cacheKeyMode: cacheKeyDecision.effectiveMode,
 				cacheKeyAssignment: cacheKeyDecision.assignment,
 				cacheKeyCohortId: cacheKeyDecision.cohortId,
@@ -2980,7 +2994,6 @@ export class CodexProvider extends BaseProvider {
 				});
 			}
 
-			const newHeaders = new Headers(request.headers);
 			newHeaders.set("content-type", "application/json");
 			newHeaders.delete(CODEX_TURN_STATE_HEADER);
 			if (turnStateDecision.turnState) {
