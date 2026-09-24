@@ -680,6 +680,7 @@ interface CodexTool {
 	name: string;
 	description?: string;
 	parameters?: Record<string, unknown>;
+	strict?: boolean;
 }
 
 interface CodexAdditionalToolsItem {
@@ -4455,6 +4456,8 @@ export class CodexProvider extends BaseProvider {
 				parameters: sanitizeSchemaForOpenAI(t.input_schema) as
 					| Record<string, unknown>
 					| undefined,
+				// Opt out of Responses strict normalization so optional keys stay optional.
+				strict: false,
 			}));
 		}
 
