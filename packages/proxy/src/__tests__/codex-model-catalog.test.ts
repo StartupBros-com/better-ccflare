@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
+	CodexProvider,
 	clearDerivedAccountModelDefaults,
 	clearDerivedProviderModelDefaults,
 	hasDerivedProviderModelDefaults,
@@ -136,6 +137,44 @@ afterEach(() => {
 });
 
 describe("getCodexModels", () => {
+	it("uses the current inference version when discovering Sol and Luna", async () => {
+		const requests: Request[] = [];
+		globalThis.fetch = (async (input, init) => {
+			requests.push(new Request(input, init));
+			return new Response(
+				JSON.stringify({
+					models: [
+						{ slug: "gpt-6-sol", visibility: "list", priority: 1 },
+						{ slug: "gpt-6-luna", visibility: "list", priority: 2 },
+					],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof globalThis.fetch;
+
+		const listing = await getCodexModels("acc-codex", makeCtx(makeAccount()));
+		const inferenceHeaders = new CodexProvider().prepareHeaders(
+			new Headers(),
+			"test-token",
+		);
+
+		expect(requests).toHaveLength(1);
+		expect(requests[0].url).toBe(
+			"https://chatgpt.com/backend-api/codex/models?client_version=0.156.0",
+		);
+		expect(requests[0].headers.get("User-Agent")).toBe("codex_cli_rs/0.156.0");
+		expect(requests[0].headers.get("originator")).toBe("codex_cli_rs");
+		expect(inferenceHeaders.get("Version")).toBe("0.156.0");
+		expect(new URL(requests[0].url).searchParams.get("client_version")).toBe(
+			inferenceHeaders.get("Version"),
+		);
+		expect(listing?.source).toBe("live");
+		expect(listing?.models.map((model) => model.id)).toEqual([
+			"gpt-6-sol",
+			"gpt-6-luna",
+		]);
+	});
+
 	it("reads the subscription's own list and keeps the useful fields", async () => {
 		globalThis.fetch = (async () =>
 			new Response(JSON.stringify(LIVE_BODY), {
