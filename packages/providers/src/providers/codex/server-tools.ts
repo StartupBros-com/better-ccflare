@@ -320,6 +320,7 @@ export interface CodexFunctionTool {
 	readonly name: string;
 	readonly description?: string;
 	readonly parameters: UnknownRecord;
+	readonly strict: false;
 }
 
 export interface CodexWebSearchTool {
@@ -535,6 +536,8 @@ function snapshotClientFunction(tool: UnknownRecord): {
 			name: name.value,
 			description: description.value as string | undefined,
 			parameters: sanitized,
+			// Match ordinary Codex translation without making optional keys required.
+			strict: false,
 		},
 	};
 }

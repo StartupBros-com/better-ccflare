@@ -1,6 +1,46 @@
 import { expect, test } from "bun:test";
 import { CodexProvider } from "./provider";
 
+test.each([
+	true,
+	false,
+	undefined,
+])("preserves native Responses function strict=%p and parameters unchanged", async (strict) => {
+	const tools = [
+		{
+			type: "function",
+			name: "NativeFunction",
+			parameters: {
+				type: "object",
+				properties: {
+					value: { type: ["string", "null"] },
+				},
+				required: ["value"],
+				additionalProperties: false,
+			},
+			...(strict === undefined ? {} : { strict }),
+		},
+	];
+	const provider = new CodexProvider();
+	const transformed = await provider.transformRequestBody(
+		new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				messages: [{ role: "user", content: "Use the native tool" }],
+				tools: [{ name: "NativeFunction", input_schema: { type: "object" } }],
+				__better_ccflare_codex_passthrough: { tools },
+			}),
+		}),
+	);
+	const mapped = (await transformed.json()) as Record<string, unknown>;
+
+	expect(mapped.tools).toEqual(tools);
+	expect(mapped).not.toHaveProperty("__better_ccflare_codex_passthrough");
+});
+
 test("preserves custom tool calls in labeled Codex SSE", async () => {
 	const provider = new CodexProvider();
 	const stream = [

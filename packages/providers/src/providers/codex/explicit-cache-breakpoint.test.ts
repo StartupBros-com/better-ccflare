@@ -209,6 +209,7 @@ describe("Codex GPT-5.6 explicit prompt-cache breakpoint canary", () => {
 				type: "function",
 				name: "Lookup",
 				description: "Lookup a value",
+				strict: false,
 				parameters: {
 					type: "object",
 					properties: { id: { type: "string" } },

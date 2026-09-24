@@ -110,6 +110,67 @@ afterEach(() => {
 	resetOrchestrationElectionForTest();
 });
 
+describe("Codex transform, function schema optionality", () => {
+	test.each([
+		{
+			name: "EnterWorktree",
+			description: "Enter by name or path, never both",
+			input_schema: {
+				type: "object",
+				properties: {
+					name: { type: "string" },
+					path: { type: "string" },
+				},
+				oneOf: [{ required: ["name"] }, { required: ["path"] }],
+				additionalProperties: false,
+			},
+		},
+		{
+			name: "Read",
+			description: "Read a file with an optional numeric limit",
+			input_schema: {
+				type: "object",
+				properties: {
+					file_path: { type: "string" },
+					limit: { type: "number", minimum: 1 },
+				},
+				required: ["file_path"],
+			},
+		},
+		{
+			name: "NullableInput",
+			description:
+				"Keep required nullable fields distinct from optional fields",
+			input_schema: {
+				type: "object",
+				properties: {
+					value: { type: ["string", "null"] },
+					limit: { anyOf: [{ type: "integer" }, { type: "null" }] },
+				},
+				required: ["value"],
+				additionalProperties: false,
+			},
+		},
+	])("emits non-strict $name without changing its schema", async (tool) => {
+		const body = await transform({
+			model: "claude-opus-4-8",
+			max_tokens: 10,
+			messages: [{ role: "user", content: "Use the supplied tool" }],
+			tools: [tool],
+		});
+
+		expect(body.tools).toEqual([
+			{
+				type: "function",
+				name: tool.name,
+				description: tool.description,
+				parameters: tool.input_schema,
+				strict: false,
+			},
+		]);
+	});
+});
+
 describe("Codex transform, tool_result content robustness", () => {
 	test("missing content field degrades to empty output, not a dropped translation", async () => {
 		const body = await transform(taskTurn("__omit__"));

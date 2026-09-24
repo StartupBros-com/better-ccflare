@@ -948,6 +948,7 @@ describe("Codex strict hosted-search request mapper", () => {
 						type: "object",
 						properties: { value: { type: "string" } },
 					},
+					strict: false,
 				},
 				{
 					type: "web_search",
@@ -967,6 +968,7 @@ describe("Codex strict hosted-search request mapper", () => {
 					name: "After",
 					description: undefined,
 					parameters: { type: "object" },
+					strict: false,
 				},
 			],
 		});
@@ -1124,6 +1126,51 @@ describe("Codex strict hosted-search request mapper", () => {
 });
 
 describe("Codex exact hosted-search attempt plan", () => {
+	test("emits non-strict client functions beside hosted search without changing their schemas", async () => {
+		const inputSchema = {
+			type: "object",
+			properties: {
+				file_path: { type: "string" },
+				limit: { type: "number", minimum: 1 },
+				label: { type: ["string", "null"] },
+			},
+			required: ["file_path", "label"],
+			additionalProperties: false,
+		};
+		const body = hostedRequestBody();
+		body.tools = [
+			{
+				type: "web_search_20250305",
+				name: "web_search",
+				max_uses: 2,
+				allowed_domains: ["openai.com/docs"],
+			},
+			{ name: "Read", input_schema: inputSchema },
+		];
+		const plan = materializeHostedPlan(body);
+		const transformed = await plan.transformRequestBody(
+			new Request(CODEX_DEFAULT_ENDPOINT, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			}),
+		);
+		const mapped = (await transformed.json()) as Record<string, unknown>;
+
+		expect(mapped.tools).toEqual([
+			{
+				type: "web_search",
+				filters: { allowed_domains: ["openai.com/docs"] },
+			},
+			{
+				type: "function",
+				name: "Read",
+				parameters: inputSchema,
+				strict: false,
+			},
+		]);
+	});
+
 	test("maps Claude Code's forced WebSearch choice to native Codex fields", async () => {
 		const body = claudeCodeForcedSearchBody();
 		const plan = materializeHostedPlan(body);
