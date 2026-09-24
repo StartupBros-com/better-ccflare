@@ -96,7 +96,7 @@
     <div class="stat"><div class="v">428</div><div class="l">Claude Code sessions compared over 21 days (377 Anthropic, 51 Codex), labeled by exact request-to-transcript join</div></div>
     <div class="stat"><div class="v">1,691 vs 0</div><div class="l">Agent tool calls, Anthropic vs Codex turns</div></div>
     <div class="stat"><div class="v">0 vs 6</div><div class="l">EnterPlanMode calls, Anthropic vs Codex</div></div>
-    <div class="stat"><div class="v">46 → 7</div><div class="l">raw ideas from 6 frames, verified and cut to 7 survivors</div></div>
+    <div class="stat"><div class="v">46 → 6</div><div class="l">raw ideas from 6 frames, verified and cut to 6 survivors after one merge</div></div>
   </div>
 </header>
 
@@ -152,11 +152,10 @@
     <ol>
       <li><a href="#idea-1">De-ratchet orchestration-root demotion and announce it</a></li>
       <li><a href="#idea-2">Plan-mode belt and suspenders</a></li>
-      <li><a href="#idea-3">Translation-loss ledger</a></li>
+      <li><a href="#idea-3">Codex behavior ledger and parity floors</a></li>
       <li><a href="#idea-4">Map Claude Code's thinking budget to Codex reasoning effort</a></li>
-      <li><a href="#idea-5">Behavioral-parity floors and alerts</a></li>
-      <li><a href="#idea-6">Codex-aware authority and persistence layer</a></li>
-      <li><a href="#idea-7">Codex conformance harness under the scripting carve-out</a></li>
+      <li><a href="#idea-5">Codex-aware authority and persistence layer</a></li>
+      <li><a href="#idea-6">Codex conformance harness under the scripting carve-out</a></li>
     </ol>
   </nav>
 
@@ -253,20 +252,20 @@
   </article>
 
   <article class="idea" id="idea-3">
-    <div class="head"><span class="chip id">3.</span><h3>Translation-loss ledger</h3></div>
-    <div class="head"><span class="chip axis">Parity measurement and evidence</span><span class="chip conf">Confidence 85%</span><span class="chip cx">Complexity Medium</span><span class="chip">better-ccflare</span></div>
+    <div class="head"><span class="chip id">3.</span><h3>Codex behavior ledger and parity floors</h3></div>
+    <div class="head"><span class="chip axis">Parity measurement and evidence</span><span class="chip conf">Confidence 85%</span><span class="chip cx">Complexity High</span><span class="chip">better-ccflare</span></div>
     <dl>
       <dt>Description</dt>
-      <dd>Telephony interworking functions silently dropped unsupported features until carriers standardized per-call loss codes in the call detail record. Add the equivalent to the <code>requests</code> table, in both migration files per the repo rule: compact flags and counters written by the Codex provider for every silent degradation and decision it makes on a turn. Image content replaced by a placeholder; oversized structured block replaced; reasoning item dropped; orchestration-admission state and whether Agent and Task were stripped; byte-cap trips; the raw Responses <code>incomplete</code> reason before it collapses to <code>max_tokens</code>; the resolved reasoning effort; and whether the "successful response without SSE" path fired. Every row is joinable on <code>client_session_id</code>, so any Claude Code session can be asked "what did the proxy do to you" in one query.</dd>
+      <dd>One direction in two phases. <strong>Phase one, the ledger.</strong> Telephony interworking functions silently dropped unsupported features until carriers standardized per-call loss codes in the call detail record. Add the equivalent to the <code>requests</code> table, in both migration files per the repo rule: compact flags and counters written by the Codex provider for every silent degradation and decision it makes on a turn. Image content replaced by a placeholder; oversized structured block replaced; reasoning item dropped; orchestration-admission state and whether Agent and Task were stripped; byte-cap trips; the raw Responses <code>incomplete</code> reason before it collapses to <code>max_tokens</code>; the resolved reasoning effort; whether the "successful response without SSE" path fired; and counts of EnterPlanMode calls and merge-refusal phrases observed in the response. Every row is joinable on <code>client_session_id</code>, so any Claude Code session can be asked "what did the proxy do to you" in one query. <strong>Phase two, the floors.</strong> better-ccflare already ships a cache-parity verdict subsystem (declared floors; insufficient, below-parity, and at-parity verdicts; declared-versus-live drift) and per-provider cache-health alerting to Discord. Generalize the same policy-object and verdict shape to the ledger columns: tool-result error rate by tool name (including Bash results carrying command-shape refusals), malformed tool-input rate, EnterPlanMode rate, merge-refusal phrase rate, and stream-terminal error rate. Declare a floor and a minimum sample size per metric rather than one "match Anthropic" target, because Codex is not worse everywhere: its Workflow error rate is comparable and its unfulfilled-promise rate is lower. Turn the Codex trace writer on by default as the enabler, after settling whether full prompt-content capture should default on.</dd>
       <dt>Axis</dt><dd>Parity measurement and evidence</dd>
       <dt>Basis</dt>
-      <dd><code>direct:</code> the degradation sites at <code>provider.ts:3895-3898</code> (image replaced), <code>:3904-3910</code> (oversized replaced), <code>:4005-4012</code> (reasoning "dropped with no fallback branch"), <code>:6151-6159</code> (incomplete collapsed), and <code>:5330-5345</code> (cap trips routed through the close-block-then-error helper); verifier-confirmed against the full <code>CREATE TABLE requests</code> column list that none of them write a column, and that <code>orchestrationAdmission</code> never appears in <code>packages/proxy/</code>; <code>migrations-pg.ts:1768-1769</code> column-add pattern. Telemetry: stream terminal errors 0.078% versus 0.0027%, and 16,225 "successful response without SSE" warnings in 21 days.</dd>
+      <dd><code>direct:</code> the degradation sites at <code>provider.ts:3895-3898</code> (image replaced), <code>:3904-3910</code> (oversized replaced), <code>:4005-4012</code> (reasoning "dropped with no fallback branch"), <code>:6151-6159</code> (incomplete collapsed), and <code>:5330-5345</code> (cap trips routed through the close-block-then-error helper); verifier-confirmed against the full <code>CREATE TABLE requests</code> column list that none of them write a column, and that <code>orchestrationAdmission</code> never appears in <code>packages/proxy/</code>; <code>migrations-pg.ts:1768-1769</code> column-add pattern; <code>cache-parity.ts:180-229</code> verdict state machine, <code>cache-health.ts:78-90</code> per-provider policy, and <code>cache-metrics.ts:30-165</code> normalization, verifier-confirmed as templates; the parity dossier's statement that "no equivalent floor/verdict/drift-report system" exists for error or tool-success rates; <code>trace.ts:1-19</code> env-gated, fail-swallowed writer. Telemetry: stream terminal errors 0.078% versus 0.0027%, 16,225 "successful response without SSE" warnings in 21 days, and the deltas in the chart below.</dd>
       <dt>Rationale</dt>
-      <dd>The "stops early" complaint does not look like conversational abandonment in the data: Codex's end-turn share is lower and the unfulfilled-promise heuristic fires less. It looks like stream truncation. Today, attributing a bad turn to any of the six silent sites requires transcript archaeology; with the ledger it is a query, and every other idea on this list becomes measurable per request rather than per anecdote. The chart under idea 5 was hand-built for this run; the ledger is what makes it a standing view.</dd>
+      <dd>The floors cannot run without the ledger: none of the behavioral metrics they would judge exist as columns today, which is why the two are one direction rather than two ideas. The "stops early" complaint does not look like conversational abandonment in the data (Codex's end-turn share is lower and the unfulfilled-promise heuristic fires less); it looks like stream truncation, and only per-request flags can say which of the six silent sites is responsible. This run had to hand-build every comparison from raw SQL and gigabyte-scale transcript mining; the design cost of floors and alerts was already paid in the cache work and is reusable. With both phases in place, the next regression on the Codex lane is found by a Discord message rather than by a user noticing agents refusing to merge, and every other idea on this list becomes measurable per request.</dd>
       <dt>Downsides</dt>
-      <dd>A schema change across two migration files and the usage collector, adding a handful of columns to a hot table. The flags describe what the proxy did, not what the model experienced, so correlating with session outcome still needs the transcript-side join. The 198 <code>context_length_exceeded</code> rows come from a separate upstream-error path and belong in their own column rather than the incomplete-reason one.</dd>
+      <dd>The largest unit on the list: two migration files, the usage collector, a policy object, and alert wiring. Metrics derived from response text are heuristics and need a documented denominator and countermetric; Codex sample sizes are small, so verdicts must wait for a minimum n. The flags describe what the proxy did, not what the model experienced, so correlating with session outcome still needs the transcript-side join. The 198 <code>context_length_exceeded</code> rows come from a separate upstream-error path and belong in their own column rather than the incomplete-reason one. Adds a second metric family to tune in the alerting pipeline.</dd>
       <dt>Confidence</dt><dd>85%</dd>
-      <dt>Complexity</dt><dd>Medium</dd>
+      <dt>Complexity</dt><dd>High</dd>
     </dl>
     <figure>
       <svg viewBox="0 0 800 215" role="img" aria-label="Six silent degradation sites in the Codex provider feed a set of ledger columns on the requests row, which joins to the Claude Code transcript on client_session_id">
@@ -288,58 +287,12 @@
         <text class="t" x="435" y="158" text-anchor="middle">+ client_session_id (exists)</text>
         <path class="arrow" d="M540,114 L578,114"/>
         <rect class="box ok" x="580" y="76" width="210" height="76" rx="8"/>
-        <text class="t" x="685" y="100" text-anchor="middle" font-weight="700">one SQL join</text>
-        <text class="t" x="685" y="120" text-anchor="middle">to the Claude Code transcript</text>
-        <text class="t" x="685" y="138" text-anchor="middle">"what did the proxy do to me?"</text>
+        <text class="t" x="685" y="100" text-anchor="middle" font-weight="700">floors, verdicts, alerts</text>
+        <text class="t" x="685" y="120" text-anchor="middle">per metric, per provider</text>
+        <text class="t" x="685" y="138" text-anchor="middle">(cache-parity pattern reused)</text>
       </svg>
-      <figcaption>Loss codes, not perfect parity: record what the translation did to each turn so the question becomes a query.</figcaption>
+      <figcaption>Phase one records what the translation did to each turn; phase two judges the rates against declared floors and alerts on them.</figcaption>
     </figure>
-  </article>
-
-  <article class="idea" id="idea-4">
-    <div class="head"><span class="chip id">4.</span><h3>Map Claude Code's thinking budget to Codex reasoning effort</h3></div>
-    <div class="head"><span class="chip axis">Wire translation fidelity</span><span class="chip conf mid">Confidence 75%</span><span class="chip cx">Complexity Low</span><span class="chip">better-ccflare</span></div>
-    <dl>
-      <dt>Description</dt>
-      <dd>Every Claude Code turn routed to Codex is sent at reasoning effort <code>medium</code> (the gpt-5.6 family gets <code>xhigh</code>), regardless of what the client asked for. The request-side path never reads <code>thinking.budget_tokens</code>; <code>resolveAnthropicReasoningEffort</code> accepts only the non-standard <code>reasoning.effort</code> and <code>output_config.effort</code> passthrough fields. Map the budget the client actually sends onto the Codex effort tiers, keep the current defaults as the fallback when no budget is present, and record the resolved effort in the ledger so the effect can be read back.</dd>
-      <dt>Axis</dt><dd>Wire translation fidelity</dd>
-      <dt>Basis</dt>
-      <dd><code>direct:</code> <code>provider.ts:4485-4489</code> default branch; <code>packages/openai-formats/src/reasoning.ts</code> <code>TARGET_REASONING_EFFORTS</code> with no thinking-budget input; grep for <code>budget_tokens</code> and <code>body.thinking</code> in the Codex provider returns zero hits (verifier-confirmed; another provider in the repo does handle <code>budget_tokens</code>, corroborating it as the client's real wire field). <code>external:</code> OpenAI's GPT-5 prompting guide states that persistence reminders matter most at low reasoning effort because the model is more prone to end turns early.</dd>
-      <dt>Rationale</dt>
-      <dd>The operator runs sessions at high effort; those turns arrive at Codex flattened to medium. Reasoning effort is the one vendor-documented lever on the GPT family's stop-versus-continue tendency, and it is currently discarded at the wire. It is a bounded mapping change that can be reverted in one line.</dd>
-      <dt>Downsides</dt>
-      <dd>Higher effort costs latency and Codex quota, and the thresholds are a guess until the ledger and parity floors show whether early stops move. Claude Code budgets are token counts and Codex tiers are labels, so the mapping is monotone, not linear.</dd>
-      <dt>Confidence</dt><dd>75%</dd>
-      <dt>Complexity</dt><dd>Low</dd>
-    </dl>
-    <table>
-      <thead><tr><th>Client thinking budget (illustrative tiers)</th><th>Codex reasoning effort</th><th>Today</th></tr></thead>
-      <tbody>
-        <tr><td>no thinking block</td><td><code>medium</code> (unchanged default)</td><td><code>medium</code></td></tr>
-        <tr><td>budget below 8k tokens</td><td><code>low</code></td><td><code>medium</code></td></tr>
-        <tr><td>8k to 32k tokens</td><td><code>medium</code></td><td><code>medium</code></td></tr>
-        <tr><td>32k tokens and above</td><td><code>high</code></td><td><code>medium</code></td></tr>
-        <tr><td>gpt-5.6 family, any budget</td><td><code>xhigh</code> (unchanged)</td><td><code>xhigh</code></td></tr>
-      </tbody>
-    </table>
-  </article>
-
-  <article class="idea" id="idea-5">
-    <div class="head"><span class="chip id">5.</span><h3>Behavioral-parity floors and alerts</h3></div>
-    <div class="head"><span class="chip axis">Parity measurement and evidence</span><span class="chip conf">Confidence 80%</span><span class="chip cx">Complexity Medium</span><span class="chip">better-ccflare</span></div>
-    <dl>
-      <dt>Description</dt>
-      <dd>better-ccflare already ships a cache-parity verdict subsystem (declared floors; insufficient, below-parity, and at-parity verdicts; declared-versus-live drift) and per-provider cache-health alerting to Discord. Generalize the same policy-object and verdict shape to behavioral metrics the proxy can compute from request and response bodies: tool-result error rate by tool name (including Bash results carrying command-shape refusals), malformed tool-input rate, EnterPlanMode call rate, merge-refusal phrase rate, and stream-terminal error rate. Declare a floor per metric rather than one "match Anthropic" target, because Codex is not worse everywhere: its Workflow error rate is comparable and its unfulfilled-promise rate is lower. Turn the Codex trace writer on by default as the enabler, after settling whether full prompt-content capture should default on.</dd>
-      <dt>Axis</dt><dd>Parity measurement and evidence</dd>
-      <dt>Basis</dt>
-      <dd><code>direct:</code> <code>cache-parity.ts:180-229</code> verdict state machine, <code>cache-health.ts:78-90</code> per-provider policy, <code>cache-metrics.ts:30-165</code> normalization, verifier-confirmed as templates; the parity dossier's statement that "no equivalent floor/verdict/drift-report system" exists for error or tool-success rates; <code>trace.ts:1-19</code> env-gated, fail-swallowed writer; the telemetry deltas in the chart below.</dd>
-      <dt>Rationale</dt>
-      <dd>This run had to hand-build every comparison from raw SQL and gigabyte-scale transcript mining. The design cost was already paid in the cache work, and it is reusable. With floors and alerts, the next regression on the Codex lane is found by a Discord message, not by a user noticing agents refusing to merge.</dd>
-      <dt>Downsides</dt>
-      <dd>Metrics derived from response text are heuristics and need a documented denominator and countermetric. Codex sample sizes are small, so floors must encode a minimum n before issuing a verdict. It adds a second metric family to tune in the alerting pipeline.</dd>
-      <dt>Confidence</dt><dd>80%</dd>
-      <dt>Complexity</dt><dd>Medium</dd>
-    </dl>
     <figure>
       <svg viewBox="0 0 800 265" role="img" aria-label="Bar chart of tool error rates, Anthropic versus Codex: Bash 4.6 vs 9.1 percent, EnterWorktree 10.8 vs 61.7, Monitor 4.7 vs 83.3, malformed tool input 0.5 vs 1.4">
         <line class="grid" x1="60" y1="200" x2="780" y2="200"/>
@@ -378,14 +331,42 @@
         <text class="lbl" x="690" y="238" text-anchor="middle">n = 131k / 12k blocks</text>
         <rect class="bar-a" x="600" y="8" width="12" height="12" rx="2"/><text class="lbl" x="618" y="18">Anthropic</text>
         <rect class="bar-c" x="690" y="8" width="12" height="12" rx="2"/><text class="lbl" x="708" y="18">Codex</text>
-        <text class="lbl" x="420" y="258" text-anchor="middle">Hand-built for this run from 21 days of transcripts; a parity floor per metric would make this a standing, alerting view.</text>
+        <text class="lbl" x="420" y="258" text-anchor="middle">Hand-built for this run from 21 days of transcripts; phase two makes this a standing, alerting view.</text>
       </svg>
-      <figcaption>The gap is not uniform: two tools fail most of the time under Codex while the malformed-input delta is small. Floors should be declared per metric.</figcaption>
+      <figcaption>The gap is not uniform: two tools fail most of the time under Codex while the malformed-input delta is small. Floors are declared per metric.</figcaption>
     </figure>
   </article>
 
-  <article class="idea" id="idea-6">
-    <div class="head"><span class="chip id">6.</span><h3>Codex-aware authority and persistence layer</h3></div>
+  <article class="idea" id="idea-4">
+    <div class="head"><span class="chip id">4.</span><h3>Map Claude Code's thinking budget to Codex reasoning effort</h3></div>
+    <div class="head"><span class="chip axis">Wire translation fidelity</span><span class="chip conf mid">Confidence 75%</span><span class="chip cx">Complexity Low</span><span class="chip">better-ccflare</span></div>
+    <dl>
+      <dt>Description</dt>
+      <dd>Every Claude Code turn routed to Codex is sent at reasoning effort <code>medium</code> (the gpt-5.6 family gets <code>xhigh</code>), regardless of what the client asked for. The request-side path never reads <code>thinking.budget_tokens</code>; <code>resolveAnthropicReasoningEffort</code> accepts only the non-standard <code>reasoning.effort</code> and <code>output_config.effort</code> passthrough fields. Map the budget the client actually sends onto the Codex effort tiers, keep the current defaults as the fallback when no budget is present, and record the resolved effort in the ledger so the effect can be read back.</dd>
+      <dt>Axis</dt><dd>Wire translation fidelity</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> <code>provider.ts:4485-4489</code> default branch; <code>packages/openai-formats/src/reasoning.ts</code> <code>TARGET_REASONING_EFFORTS</code> with no thinking-budget input; grep for <code>budget_tokens</code> and <code>body.thinking</code> in the Codex provider returns zero hits (verifier-confirmed; another provider in the repo does handle <code>budget_tokens</code>, corroborating it as the client's real wire field). <code>external:</code> OpenAI's GPT-5 prompting guide states that persistence reminders matter most at low reasoning effort because the model is more prone to end turns early.</dd>
+      <dt>Rationale</dt>
+      <dd>The operator runs sessions at high effort; those turns arrive at Codex flattened to medium. Reasoning effort is the one vendor-documented lever on the GPT family's stop-versus-continue tendency, and it is currently discarded at the wire. It is a bounded mapping change that can be reverted in one line.</dd>
+      <dt>Downsides</dt>
+      <dd>Higher effort costs latency and Codex quota, and the thresholds are a guess until the ledger and parity floors show whether early stops move. Claude Code budgets are token counts and Codex tiers are labels, so the mapping is monotone, not linear.</dd>
+      <dt>Confidence</dt><dd>75%</dd>
+      <dt>Complexity</dt><dd>Low</dd>
+    </dl>
+    <table>
+      <thead><tr><th>Client thinking budget (illustrative tiers)</th><th>Codex reasoning effort</th><th>Today</th></tr></thead>
+      <tbody>
+        <tr><td>no thinking block</td><td><code>medium</code> (unchanged default)</td><td><code>medium</code></td></tr>
+        <tr><td>budget below 8k tokens</td><td><code>low</code></td><td><code>medium</code></td></tr>
+        <tr><td>8k to 32k tokens</td><td><code>medium</code></td><td><code>medium</code></td></tr>
+        <tr><td>32k tokens and above</td><td><code>high</code></td><td><code>medium</code></td></tr>
+        <tr><td>gpt-5.6 family, any budget</td><td><code>xhigh</code> (unchanged)</td><td><code>xhigh</code></td></tr>
+      </tbody>
+    </table>
+  </article>
+
+  <article class="idea" id="idea-5">
+    <div class="head"><span class="chip id">5.</span><h3>Codex-aware authority and persistence layer</h3></div>
     <div class="head"><span class="chip axis">Authority and persistence framing</span><span class="chip conf mid">Confidence 60%</span><span class="chip cx">Complexity Low</span><span class="chip">better-ccflare + dotfiles</span></div>
     <dl>
       <dt>Description</dt>
@@ -402,12 +383,12 @@
     </dl>
   </article>
 
-  <article class="idea" id="idea-7">
-    <div class="head"><span class="chip id">7.</span><h3>Codex conformance harness under the scripting carve-out</h3></div>
+  <article class="idea" id="idea-6">
+    <div class="head"><span class="chip id">6.</span><h3>Codex conformance harness under the scripting carve-out</h3></div>
     <div class="head"><span class="chip axis">Wire translation fidelity</span><span class="chip conf">Confidence 80%</span><span class="chip cx">Complexity Medium</span><span class="chip">better-ccflare</span></div>
     <dl>
       <dt>Description</dt>
-      <dd>The repo bans scripted traffic to Anthropic-backed accounts and names <code>x-better-ccflare-account-id</code> force-routing as the sanctioned way to script against everything else. Build a regression suite that sends real Claude-Code-shaped requests to a Codex account and asserts the documented edge cases: empty-string optional arguments, positional tool-call-id pairing, <code>incomplete</code> reason handling, reasoning-item round-trip across turns, oversized and image tool-result replacement, tool-array filtering for Agent, Task, and EnterPlanMode, and reasoning-effort mapping. Each ledger flag from idea 3 and each parity regression from idea 5 becomes a replayable case.</dd>
+      <dd>The repo bans scripted traffic to Anthropic-backed accounts and names <code>x-better-ccflare-account-id</code> force-routing as the sanctioned way to script against everything else. Build a regression suite that sends real Claude-Code-shaped requests to a Codex account and asserts the documented edge cases: empty-string optional arguments, positional tool-call-id pairing, <code>incomplete</code> reason handling, reasoning-item round-trip across turns, oversized and image tool-result replacement, tool-array filtering for Agent, Task, and EnterPlanMode, and reasoning-effort mapping. Each ledger flag and each parity floor from idea 3 becomes a replayable case.</dd>
       <dt>Axis</dt><dd>Wire translation fidelity</dd>
       <dt>Basis</dt>
       <dd><code>direct:</code> the AGENTS.md testing restriction, verifier-confirmed verbatim; <code>provider.ts:4053-4090</code> empty-string normalization as a first case; currently zero regression coverage short of production telemetry weeks later. <code>external:</code> anyclaude issues #18 and #22 show the same failure class going unfixed for months in a sibling proxy that has no such suite.</dd>
@@ -421,8 +402,14 @@
   </article>
 
   <div class="callout">
-    <div class="eyebrow">Sequencing note</div>
-    <p>Ideas 1 and 2 fix the two most concrete complaints and need no new measurement. Idea 3 is what turns every later question into a query; ideas 4 and 6 are the levers whose effect it would read back. Idea 5 makes regressions self-reporting and idea 7 makes each fix a guard. Structural ideas rank above the prose one on purpose: for this model family, configuration and tool surface have moved behavior where instructions have not.</p>
+    <div class="eyebrow">Sequencing</div>
+    <p>Three waves, chosen so the cheap structural fixes land first and the measurement exists before the prose and effort levers are pulled.</p>
+    <ol>
+      <li><strong>Close the two loudest complaints, with no measurement dependency.</strong> Idea 2's proxy half (a few lines beside the Agent/Task filter), then its harness half once the provider-signal helper exists. Idea 1, preceded by one day with the Codex trace env vars on to confirm demotion events precede the zero-Agent sessions before the election logic changes. The dotfiles half of idea 5, the one-line restore of the concrete merge grant, since it helps every model and carries no risk.</li>
+      <li><strong>Measurement.</strong> Idea 3, ledger columns first and floors second. This is what tells you whether wave 1 moved anything and whether wave 3 is needed at all.</li>
+      <li><strong>Levers read back through the ledger.</strong> Idea 4 and the proxy half of idea 5 as separate flags, so the ledger can attribute any movement to one of them. Idea 6 once a test-account and quota decision exists, with each wave-1 and wave-3 change added as a case.</li>
+    </ol>
+    <p>Ideas 1 and 2 touch the same tool-filter block in the provider, so one PR can carry both proxy changes; the harness half of idea 2 is a dotfiles change. Idea 6 could move to wave 1 if live-account regression cover is wanted before the provider changes; the existing Codex unit suite covers the filter code without spending quota, so it stays in wave 3 by default. Structural ideas rank above the prose one on purpose: for this model family, configuration and tool surface have moved behavior where instructions have not.</p>
   </div>
 </section>
 
@@ -431,22 +418,23 @@
   <table>
     <thead><tr><th>#</th><th>Idea</th><th>Reason Rejected</th></tr></thead>
     <tbody>
-      <tr><td>1</td><td>Reactive refusal-detection nudge (proxy detects "cannot merge" phrases in output and injects a corrective turn)</td><td>Weak basis: a symptom patch on ten samples; matching model output with regexes and injecting synthetic turns is an inference layer with false-positive risk. Revisit only if idea 6 fails to move the refusal rate.</td></tr>
+      <tr><td>1</td><td>Reactive refusal-detection nudge (proxy detects "cannot merge" phrases in output and injects a corrective turn)</td><td>Weak basis: a symptom patch on ten samples; matching model output with regexes and injecting synthetic turns is an inference layer with false-positive risk. Revisit only if idea 5 fails to move the refusal rate.</td></tr>
       <tr><td>2</td><td>Restore a root-scoped <code>parallel_tool_calls:false</code> guard and replace the strip with a fan-out cap</td><td>Citation mischaracterized: no commit ever conditioned parallel tool calls on Agent/Task presence, so the "July permanent fix" recorded in memory never shipped as described. Fan-out capping is covered by idea 1 plus the existing fanout-admission hook.</td></tr>
       <tr><td>3</td><td>Preserve native stop reasons as a standalone fix</td><td>Merged into idea 3 as a ledger column. The 198 <code>context_length_exceeded</code> rows come from a separate error-classification path, not the collapse site.</td></tr>
       <tr><td>4</td><td>Reframe "stops early" as stream truncation and instrument it</td><td>Merged into idea 3; its counter-finding is carried in that card's rationale.</td></tr>
-      <tr><td>5</td><td>Standing transcript-parity report script in dotfiles</td><td>Process artifact with no named consumer or gate. Idea 5 covers the same metrics with an alert as the consumer.</td></tr>
+      <tr><td>5</td><td>Standing transcript-parity report script in dotfiles</td><td>Process artifact with no named consumer or gate. Idea 3 covers the same metrics with an alert as the consumer.</td></tr>
       <tr><td>6</td><td>Provider-signal hook helper as a standalone item</td><td>Merged into idea 2 as its enabling step; it has standalone value for any future provider-conditional hook.</td></tr>
-      <tr><td>7</td><td>Session circuit breaker on EnterWorktree and Monitor failure streaks</td><td>Symptom-first on n = 60 and n = 24. The root cause is unestablished and may be the worktree command-shape verifier refusing Codex-generated shell syntax; measure through idea 5 first.</td></tr>
+      <tr><td>7</td><td>Session circuit breaker on EnterWorktree and Monitor failure streaks</td><td>Symptom-first on n = 60 and n = 24. The root cause is unestablished and may be the worktree command-shape verifier refusing Codex-generated shell syntax; measure through idea 3 first.</td></tr>
       <tr><td>8</td><td>Schema-driven tool-argument repair pass</td><td>Refuted: <code>provider.ts:4053-4090</code> already applies a generic schema-driven empty-string and optional-parameter pass to every tool with a registered schema; only the Read and WebSearch blocks are name-gated.</td></tr>
-      <tr><td>9</td><td>Always-on Codex tracing as a standalone item</td><td>Folded into idea 5 as its enabler. The open question is whether full prompt-content capture should default on.</td></tr>
+      <tr><td>9</td><td>Always-on Codex tracing as a standalone item</td><td>Folded into idea 3 as its enabler. The open question is whether full prompt-content capture should default on.</td></tr>
       <tr><td>10</td><td>"Weigh structural fixes above prose fixes" as an idea</td><td>Not an idea but a ranking heuristic; applied, so the structural survivors rank above the prose one.</td></tr>
-      <tr><td>11</td><td>Full instruction rewrite for Codex (replace Claude-native phrasing wholesale)</td><td>Maximal variant of idea 6; carried as an option inside that card rather than ranked separately.</td></tr>
+      <tr><td>11</td><td>Full instruction rewrite for Codex (replace Claude-native phrasing wholesale)</td><td>Maximal variant of idea 5; carried as an option inside that card rather than ranked separately.</td></tr>
       <tr><td>12</td><td>Explicit "you have the controls" callout as a standalone item</td><td>Merged into idea 1.</td></tr>
       <tr><td>13</td><td>Instrument 64 KiB byte-cap trips before touching cap values</td><td>Folded into idea 3 as a ledger flag. The verifier's read confirmed cap trips already raise an explicit error rather than silently truncating.</td></tr>
-      <tr><td>14</td><td>Parity flywheel bundle (ledger plus floors plus harness)</td><td>Overstated coupling; the three pieces stand alone as ideas 3, 5, and 7.</td></tr>
-      <tr><td>15</td><td>Codex-only alert on the "successful response without SSE" path</td><td>Folded into idea 3 as a flag and idea 5 as a floor.</td></tr>
-      <tr><td>16</td><td>Instrument EnterWorktree and Monitor argument shapes as a standalone item</td><td>Merged into the refuted repair idea's evidence and into idea 5's per-tool error floors.</td></tr>
+      <tr><td>14</td><td>Parity flywheel bundle (ledger plus floors plus harness)</td><td>Overstated coupling at verification time; the ledger and floors were later merged into idea 3 on the operator's call, and the harness stands alone as idea 6.</td></tr>
+      <tr><td>15</td><td>Codex-only alert on the "successful response without SSE" path</td><td>Folded into idea 3 as a flag and a floor.</td></tr>
+      <tr><td>16</td><td>Instrument EnterWorktree and Monitor argument shapes as a standalone item</td><td>Merged into the refuted repair idea's evidence and into idea 3's per-tool error floors.</td></tr>
+      <tr><td>17</td><td>Behavioral-parity floors and alerts as a separate idea</td><td>Merged into idea 3 during refinement: the behavioral floors need the ledger's columns to exist, so the two are one direction in two phases.</td></tr>
     </tbody>
   </table>
   <p>Every axis kept at least one survivor; no coverage gap remains.</p>
@@ -488,7 +476,7 @@
   </ul>
 </section>
 
-<footer class="composition-signal">Composed <time datetime="2026-09-24T21:10Z">2026-09-24T21:10Z</time> by ce-ideate from the operator's focus prompt on Codex-routed Claude Code behavior, grounded in 21 days of better-ccflare telemetry and six evidence dossiers.</footer>
+<footer class="composition-signal">Composed <time datetime="2026-09-24T21:10Z">2026-09-24T21:10Z</time>, refined <time datetime="2026-09-24T21:45Z">2026-09-24T21:45Z</time>, by ce-ideate from the operator's focus prompt on Codex-routed Claude Code behavior, grounded in 21 days of better-ccflare telemetry and six evidence dossiers.</footer>
 </main>
 </body>
 </html>
