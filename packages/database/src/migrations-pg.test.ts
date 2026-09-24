@@ -18,8 +18,9 @@
  *    environment, so `migrations-pg.ts` is read as source text and its
  *    `CREATE TABLE IF NOT EXISTS` blocks (from both `ensureSchemaPg` and the
  *    upgrade-safety re-creates inside `runMigrationsPg`) plus the
- *    `columnsToAdd` array are parsed for table/column names. This mirrors
- *    the existing static-parity pattern already used for the attribution
+ *    `columnsToAdd` array are parsed for table/column names. Known shared
+ *    DDL is resolved from its real constant only when called in PG source.
+ *    This mirrors the existing static-parity pattern used for the attribution
  *    source columns at the bottom of `migrations.test.ts`.
  *
  * Only column *names* are compared, never types — SQLite is dynamically
@@ -35,6 +36,7 @@ import type {
 	CacheFlightKeepalivePolicySnapshot,
 	TurnEvidence,
 } from "@better-ccflare/core";
+import { CACHE_HEALTH_STATE_SCHEMA } from "./cache-health-schema";
 import { ensureSchema, runMigrations } from "./migrations";
 import { runMigrationsPg } from "./migrations-pg";
 
@@ -223,7 +225,16 @@ function _extractCreateTableBody(source: string, tableName: string): string {
 }
 
 function buildPgInventory(source: string): SchemaInventory {
-	const tables = parsePgCreateTables(source);
+	// Resolve this known shared DDL at its execution site, not merely its
+	// import. A removed or commented-out call must still produce a parity gap.
+	const uncommented = source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "");
+	const sharedDdl =
+		/^\s*await adapter\.unsafe\(\s*CACHE_HEALTH_STATE_SCHEMA\s*\);/m.test(
+			uncommented,
+		)
+			? CACHE_HEALTH_STATE_SCHEMA
+			: "";
+	const tables = parsePgCreateTables(`${source}\n${sharedDdl}`);
 
 	for (const { table, column } of parsePgColumnsToAdd(source)) {
 		const existing = tables.get(table) ?? new Set<string>();
@@ -253,6 +264,26 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 			10,
 		);
 		expect(pgInventory.tables.get("accounts")?.size ?? 0).toBeGreaterThan(10);
+	});
+
+	it("includes the executed shared cache-health DDL and its real column names", () => {
+		const db = new Database(":memory:");
+		try {
+			db.run(CACHE_HEALTH_STATE_SCHEMA);
+			const columns = db
+				.query<{ name: string }, []>("PRAGMA table_info(cache_health_state)")
+				.all()
+				.map(({ name }) => name);
+			expect(columns.length).toBeGreaterThan(0);
+			expect(sqliteInventory.tables.get("cache_health_state")).toEqual(
+				new Set(columns),
+			);
+			expect(pgInventory.tables.get("cache_health_state")).toEqual(
+				new Set(columns),
+			);
+		} finally {
+			db.close();
+		}
 	});
 
 	it("every SQLite table has a matching PostgreSQL table", () => {
@@ -317,6 +348,22 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 		expect(pgInventory.tables.get("strategies")).toEqual(
 			new Set(["name", "config", "updated_at"]),
 		);
+	});
+
+	it("detects the missing cache table when shared DDL calls are removed or commented out", () => {
+		const call = "await adapter.unsafe(CACHE_HEALTH_STATE_SCHEMA);";
+		// Both fresh-schema and upgrade entry points currently invoke this DDL.
+		expect(pgSource.split(call)).toHaveLength(3);
+		for (const replacement of ["", `// ${call}`, `/*\n${call}\n*/`]) {
+			const withoutCalls = pgSource.replaceAll(call, replacement);
+			// An import (or a commented call) must not count as executed DDL.
+			expect(withoutCalls).toContain('from "./cache-health-schema"');
+			const inventory = buildPgInventory(withoutCalls);
+			const missingOnPg = [...sqliteInventory.tables.keys()].filter(
+				(table) => !inventory.tables.has(table),
+			);
+			expect(missingOnPg).toEqual(["cache_health_state"]);
+		}
 	});
 
 	it("uses a database sequence to generate durable usage snapshot append order", () => {

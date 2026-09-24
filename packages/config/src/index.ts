@@ -27,7 +27,12 @@ import {
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import { validatePathOrThrow } from "@better-ccflare/security";
-import { type AlertType, isAlertType } from "@better-ccflare/types";
+import {
+	type AlertType,
+	CACHE_HEALTH_BUCKET_MS,
+	CACHE_HEALTH_DEFAULT_POLICY,
+	isAlertType,
+} from "@better-ccflare/types";
 import { resolveConfigPath } from "./paths";
 
 const log = new Logger("Config");
@@ -919,6 +924,12 @@ export interface ConfigData {
 	alert_tokens_per_hour?: number;
 	alert_request_tokens?: number;
 	alert_usage_window_threshold_percent?: number;
+	alert_cache_health_enabled?: boolean;
+	alert_cache_health_threshold_percent?: number;
+	alert_cache_health_duration_minutes?: number;
+	alert_cache_health_min_requests?: number;
+	alert_cache_health_min_input_tokens?: number;
+	alert_cache_health_reminder_minutes?: number;
 	alert_anomaly_enabled?: boolean;
 	alert_anomaly_interval_minutes?: number;
 	alert_anomaly_baseline_window_minutes?: number;
@@ -2140,6 +2151,171 @@ export class Config extends EventEmitter {
 		this.set("alert_usage_window_threshold_percent", this.clamp(value, 0, 100));
 	}
 
+	getAlertCacheHealthEnabled(): boolean {
+		const fromEnv = parseEnabledEnvFlag(process.env.ALERT_CACHE_HEALTH_ENABLED);
+		if (fromEnv !== undefined) return fromEnv;
+		return typeof this.data.alert_cache_health_enabled === "boolean"
+			? this.data.alert_cache_health_enabled
+			: true;
+	}
+
+	setAlertCacheHealthEnabled(value: boolean): void {
+		this.set("alert_cache_health_enabled", value === true);
+	}
+
+	/** Strict numeric parsing: malformed env values use the policy default,
+	 * never a partially parsed number or an incompatible file override. */
+	private getCacheHealthNumber(
+		key: keyof ConfigData & string,
+		fallback: number,
+	): number {
+		const env = process.env[key.toUpperCase()];
+		const raw =
+			env === undefined
+				? this.data[key]
+				: env.trim() === ""
+					? undefined
+					: Number(env);
+		return typeof raw === "number" && Number.isFinite(raw) ? raw : fallback;
+	}
+
+	private cacheHealthInteger(
+		value: number,
+		fallback: number,
+		min: number,
+		max: number,
+	): number {
+		return this.clamp(
+			Math.floor(Number.isFinite(value) ? value : fallback),
+			min,
+			max,
+		);
+	}
+
+	getAlertCacheHealthThresholdPercent(): number {
+		return this.cacheHealthInteger(
+			this.getCacheHealthNumber(
+				"alert_cache_health_threshold_percent",
+				CACHE_HEALTH_DEFAULT_POLICY.warningPercent,
+			),
+			CACHE_HEALTH_DEFAULT_POLICY.warningPercent,
+			1,
+			100,
+		);
+	}
+
+	setAlertCacheHealthThresholdPercent(value: number): void {
+		this.set(
+			"alert_cache_health_threshold_percent",
+			this.cacheHealthInteger(
+				value,
+				CACHE_HEALTH_DEFAULT_POLICY.warningPercent,
+				1,
+				100,
+			),
+		);
+	}
+
+	private cacheHealthDuration(value: number): number {
+		const bucketMinutes = CACHE_HEALTH_BUCKET_MS / 60_000;
+		const fallback = CACHE_HEALTH_DEFAULT_POLICY.warningBuckets * bucketMinutes;
+		return this.clamp(
+			Math.ceil((Number.isFinite(value) ? value : fallback) / bucketMinutes) *
+				bucketMinutes,
+			bucketMinutes,
+			1440,
+		);
+	}
+
+	getAlertCacheHealthDurationMinutes(): number {
+		return this.cacheHealthDuration(
+			this.getCacheHealthNumber(
+				"alert_cache_health_duration_minutes",
+				(CACHE_HEALTH_DEFAULT_POLICY.warningBuckets * CACHE_HEALTH_BUCKET_MS) /
+					60_000,
+			),
+		);
+	}
+
+	setAlertCacheHealthDurationMinutes(value: number): void {
+		this.set(
+			"alert_cache_health_duration_minutes",
+			this.cacheHealthDuration(value),
+		);
+	}
+
+	getAlertCacheHealthMinRequests(): number {
+		return this.cacheHealthInteger(
+			this.getCacheHealthNumber(
+				"alert_cache_health_min_requests",
+				CACHE_HEALTH_DEFAULT_POLICY.minimumRequests,
+			),
+			CACHE_HEALTH_DEFAULT_POLICY.minimumRequests,
+			1,
+			1_000_000,
+		);
+	}
+
+	setAlertCacheHealthMinRequests(value: number): void {
+		this.set(
+			"alert_cache_health_min_requests",
+			this.cacheHealthInteger(
+				value,
+				CACHE_HEALTH_DEFAULT_POLICY.minimumRequests,
+				1,
+				1_000_000,
+			),
+		);
+	}
+
+	getAlertCacheHealthMinInputTokens(): number {
+		return this.cacheHealthInteger(
+			this.getCacheHealthNumber(
+				"alert_cache_health_min_input_tokens",
+				CACHE_HEALTH_DEFAULT_POLICY.minimumInputTokens,
+			),
+			CACHE_HEALTH_DEFAULT_POLICY.minimumInputTokens,
+			1,
+			1_000_000_000,
+		);
+	}
+
+	setAlertCacheHealthMinInputTokens(value: number): void {
+		this.set(
+			"alert_cache_health_min_input_tokens",
+			this.cacheHealthInteger(
+				value,
+				CACHE_HEALTH_DEFAULT_POLICY.minimumInputTokens,
+				1,
+				1_000_000_000,
+			),
+		);
+	}
+
+	getAlertCacheHealthReminderMinutes(): number {
+		return this.cacheHealthInteger(
+			this.getCacheHealthNumber(
+				"alert_cache_health_reminder_minutes",
+				CACHE_HEALTH_DEFAULT_POLICY.reminderMs / 60_000,
+			),
+			CACHE_HEALTH_DEFAULT_POLICY.reminderMs / 60_000,
+			1,
+			43200,
+		);
+	}
+
+	setAlertCacheHealthReminderMinutes(value: number): void {
+		this.set(
+			"alert_cache_health_reminder_minutes",
+			this.cacheHealthInteger(
+				value,
+				CACHE_HEALTH_DEFAULT_POLICY.reminderMs / 60_000,
+				1,
+				43200,
+			),
+		);
+	}
+
 	getAlertAnomalyEnabled(): boolean {
 		const fromEnv = parseEnabledEnvFlag(process.env.ALERT_ANOMALY_ENABLED);
 		if (fromEnv !== undefined) {
@@ -2349,6 +2525,16 @@ export class Config extends EventEmitter {
 			alert_usage_window_threshold_percent:
 				this.getAlertUsageWindowThresholdPercent(),
 			alert_anomaly_enabled: this.getAlertAnomalyEnabled(),
+			alert_cache_health_enabled: this.getAlertCacheHealthEnabled(),
+			alert_cache_health_threshold_percent:
+				this.getAlertCacheHealthThresholdPercent(),
+			alert_cache_health_duration_minutes:
+				this.getAlertCacheHealthDurationMinutes(),
+			alert_cache_health_min_requests: this.getAlertCacheHealthMinRequests(),
+			alert_cache_health_min_input_tokens:
+				this.getAlertCacheHealthMinInputTokens(),
+			alert_cache_health_reminder_minutes:
+				this.getAlertCacheHealthReminderMinutes(),
 			alert_anomaly_interval_minutes: this.getAlertAnomalyIntervalMinutes(),
 			alert_anomaly_baseline_window_minutes:
 				this.getAlertAnomalyBaselineWindowMinutes(),

@@ -1,6 +1,7 @@
 import {
 	BUFFER_SIZES,
 	type CacheFlightCohortSealReceipt,
+	isOfficialXaiEndpoint,
 	requestEvents,
 	SseFrameBuffer,
 	TIME_CONSTANTS,
@@ -11,13 +12,14 @@ import {
 } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import { usageCache } from "@better-ccflare/providers";
-import type {
-	Account,
-	AgentAttributionSource,
-	ProjectAttributionSource,
-	RateLimitReason,
-	RequestMeta,
-	RouteProvenance,
+import {
+	type Account,
+	type AgentAttributionSource,
+	isNativeCacheHealthRoute,
+	type ProjectAttributionSource,
+	type RateLimitReason,
+	type RequestMeta,
+	type RouteProvenance,
 } from "@better-ccflare/types";
 import type { AnthropicDegradedResponseLifecycle } from "./anthropic-degraded-response-lifecycle";
 import { createAnthropicSemanticLivenessStream } from "./anthropic-semantic-liveness";
@@ -935,6 +937,16 @@ export async function forwardToClient(
 			ctx,
 		);
 		const startMessage: StartMessage = {
+			accounting: {
+				accountGeneration: account?.created_at ?? null,
+				provider: ctx.provider.name,
+				model: attemptedModel ?? routeProvenance?.routedModel ?? null,
+				nativeCache: isNativeCacheHealthRoute(
+					ctx.provider.name,
+					isOfficialXaiEndpoint(account),
+				),
+				internal: isInternalProbe(requestHeaders, ctx),
+			},
 			type: "start",
 			messageId: crypto.randomUUID(),
 			requestId,

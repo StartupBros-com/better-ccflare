@@ -71,6 +71,32 @@ export function createAlertsConfigSetHandler(context: APIContext) {
 					body.cooldownMinutes ?? current.cooldownMinutes,
 				),
 				webhookUrl: String(body.webhookUrl ?? current.webhookUrl),
+				// Omitted cache fields remain omitted: copying the effective current
+				// value here would write env overrides into the saved file.
+				cacheHealthEnabled:
+					body.cacheHealthEnabled === undefined
+						? undefined
+						: parseBoolean(body.cacheHealthEnabled),
+				cacheHealthThresholdPercent:
+					body.cacheHealthThresholdPercent === undefined
+						? undefined
+						: Number(body.cacheHealthThresholdPercent),
+				cacheHealthDurationMinutes:
+					body.cacheHealthDurationMinutes === undefined
+						? undefined
+						: Number(body.cacheHealthDurationMinutes),
+				cacheHealthMinRequests:
+					body.cacheHealthMinRequests === undefined
+						? undefined
+						: Number(body.cacheHealthMinRequests),
+				cacheHealthMinInputTokens:
+					body.cacheHealthMinInputTokens === undefined
+						? undefined
+						: Number(body.cacheHealthMinInputTokens),
+				cacheHealthReminderMinutes:
+					body.cacheHealthReminderMinutes === undefined
+						? undefined
+						: Number(body.cacheHealthReminderMinutes),
 			};
 			setAlertsConfig(context.config, next);
 			return jsonResponse(getAlertsConfig(context.config));

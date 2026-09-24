@@ -1480,6 +1480,7 @@ OAuth tokens will need to be re-authenticated.
 			| null,
 		clientSessionId?: string | null,
 		routeProvenance?: RouteProvenance | null,
+		accounting?: RequestData["accounting"],
 	): Promise<void> {
 		await withDatabaseRetry(
 			() =>
@@ -1507,6 +1508,7 @@ OAuth tokens will need to be re-authenticated.
 					streamTerminalState,
 					clientSessionId,
 					routeProvenance,
+					accounting,
 				}),
 			this.retryConfig,
 			"saveRequest",

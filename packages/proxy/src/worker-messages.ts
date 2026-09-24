@@ -7,12 +7,14 @@ import type { CacheFlightCohortSealReceipt } from "@better-ccflare/core";
 import type {
 	AgentAttributionSource,
 	ProjectAttributionSource,
+	RequestAccountingContext,
 	RouteProvenance,
 } from "@better-ccflare/types";
 
 // ===== MAIN THREAD → WORKER =====
 
 export interface StartMessage {
+	accounting?: RequestAccountingContext;
 	type: "start";
 	messageId: string; // envelope ID for ack tracking
 	requestId: string;

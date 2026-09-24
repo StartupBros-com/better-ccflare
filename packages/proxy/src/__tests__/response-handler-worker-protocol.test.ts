@@ -10,6 +10,7 @@ import {
 	ANTHROPIC_PRE_COMMIT_TIMEOUT_ENV,
 	ANTHROPIC_TERMINAL_GRACE_ENV,
 } from "../anthropic-semantic-preflight";
+import { INTERNAL_PROBE_SECRET_HEADER } from "../handlers";
 import * as modelCatalogModule from "../model-catalog";
 import { forwardToClient } from "../response-handler";
 import { clearSession, getServedAccount } from "../session-account-observer";
@@ -147,6 +148,46 @@ describe("forwardToClient usage-collector protocol", () => {
 			unavailableDimensions: Object.freeze([]),
 		});
 	}
+
+	it("captures generation and native capability, trusting only authenticated keepalive provenance", async () => {
+		for (const authenticated of [false, true]) {
+			const { starts, spy } = createMockCollector();
+			try {
+				const ctx = createCtx(false);
+				ctx.provider.name = "xai";
+				ctx.internalProbeSecret = "fixture-process-secret";
+				const headers = new Headers({ "x-better-ccflare-keepalive": "true" });
+				if (authenticated)
+					headers.set(INTERNAL_PROBE_SECRET_HEADER, ctx.internalProbeSecret);
+				const response = await forwardToClient(
+					{
+						requestId: `origin-${authenticated}`,
+						method: "POST",
+						path: "/v1/messages",
+						account: makeXaiAccount({ created_at: 123 }),
+						requestHeaders: headers,
+						attemptedModel: "physical-model",
+						requestBody: null,
+						response: new Response('{"ok":true}'),
+						timestamp: Date.now(),
+						retryAttempt: 0,
+						failoverAttempts: 0,
+					},
+					ctx,
+				);
+				await response.text();
+				expect(starts[0].accounting).toEqual({
+					accountGeneration: 123,
+					provider: "xai",
+					model: "physical-model",
+					nativeCache: true,
+					internal: authenticated,
+				});
+			} finally {
+				spy.mockRestore();
+			}
+		}
+	});
 
 	it("calls handleStart with messageId", async () => {
 		const { starts } = createMockCollector();
@@ -377,9 +418,22 @@ describe("forwardToClient usage-collector protocol", () => {
 		expect("attemptedModel" in starts[0]).toBe(false);
 		expect("routeCandidateId" in starts[0]).toBe(false);
 
+		// Private accounting retains the attempted model for missing-usage attribution;
+		// the rest of this envelope and the frozen recorder receipt must not carry it.
+		const { accounting, ...nonAccountingEnvelope } = starts[0];
+		expect(accounting).toEqual({
+			accountGeneration: account.created_at,
+			provider: "xai",
+			model: "grok-4-final-attempt",
+			nativeCache: true,
+			internal: false,
+		});
+		expect(JSON.stringify(nonAccountingEnvelope)).not.toContain(
+			"grok-4-final-attempt",
+		);
+
 		const serialized = JSON.stringify(starts[0]);
 		expect(serialized).toContain("cacheFlightCohortSealReceipt");
-		expect(serialized).not.toContain("grok-4-final-attempt");
 		expect(serialized).not.toContain("raw-route-candidate-final");
 		expect(serialized).not.toContain("sk-redacted");
 		const serializedReceipt = JSON.stringify(
