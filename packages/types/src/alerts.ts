@@ -39,7 +39,11 @@ export type AlertType =
 	 * (alerts.ts, usage-window-ledger.ts), issue #252's Window Value
 	 * Ledger. Needs at least two priced prior closed windows to have a
 	 * baseline; with fewer, it never fires. */
-	| "usage_window_value_drop";
+	| "usage_window_value_drop"
+	| "cache_efficiency_low"
+	| "cache_efficiency_critical"
+	| "cache_telemetry_gap"
+	| "cache_efficiency_recovered";
 
 /**
  * Every known `AlertType` value, in the same order as the union above. The
@@ -61,6 +65,10 @@ export const ALERT_TYPES: readonly AlertType[] = [
 	"usage_window_threshold",
 	"usage_window_exhaustion_projected",
 	"usage_window_value_drop",
+	"cache_efficiency_low",
+	"cache_efficiency_critical",
+	"cache_telemetry_gap",
+	"cache_efficiency_recovered",
 ];
 
 const ALERT_TYPE_SET: ReadonlySet<string> = new Set(ALERT_TYPES);
@@ -137,6 +145,14 @@ export interface AlertsConfigPayload {
 	 * still satisfies this type; getAlertsConfig always populates a real
 	 * number (default 0.25). See AlertService.evaluateClosedWindow. */
 	usageWindowValueDropThreshold?: number;
+	/** Optional so older settings clients preserve the saved cache policy. */
+	cacheHealthEnabled?: boolean;
+	cacheHealthThresholdPercent?: number;
+	/** Whole ten-minute buckets; the default is thirty minutes. */
+	cacheHealthDurationMinutes?: number;
+	cacheHealthMinRequests?: number;
+	cacheHealthMinInputTokens?: number;
+	cacheHealthReminderMinutes?: number;
 	anomalyEnabled: boolean;
 	anomalyIntervalMinutes: number;
 	/**

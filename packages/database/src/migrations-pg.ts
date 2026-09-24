@@ -1,5 +1,6 @@
 import { Logger } from "@better-ccflare/logger";
 import type { BunSqlAdapter } from "./adapters/bun-sql-adapter";
+import { CACHE_HEALTH_STATE_SCHEMA } from "./cache-health-schema";
 // Both ROUTING_ATTEMPT_REASON_SQL and ROUTING_ATTEMPT_REASONS come from the
 // shared taxonomy module (not hardcoded locally) so this file's reason
 // allowlist can't drift from the SQLite side. The migration-parity check in
@@ -580,6 +581,7 @@ async function ensureRoutingAttemptsReasonConstraintPg(
  * Ensure the full schema exists for PostgreSQL
  */
 export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
+	await adapter.unsafe(CACHE_HEALTH_STATE_SCHEMA);
 	// Create accounts table
 	await adapter.unsafe(`
 		CREATE TABLE IF NOT EXISTS accounts (
@@ -655,6 +657,9 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			project_attribution_source TEXT,
 			agent_attribution_source TEXT,
 			stream_terminal_state TEXT,
+			account_generation BIGINT,
+			cache_health_native INTEGER,
+			internal_origin INTEGER,
 			client_session_id TEXT,
 			route_profile_id TEXT,
 			requested_route_model TEXT,
@@ -1544,6 +1549,7 @@ export async function collapseAccountDuplicatesPreservingStatePg(
  * Run PostgreSQL-specific migrations
  */
 export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
+	await adapter.unsafe(CACHE_HEALTH_STATE_SCHEMA);
 	// Repair an interrupted additive routing-attempt migration independently.
 	await ensureRoutingAttemptsSchemaPg(adapter);
 	// Bring an existing table's reason CHECK constraint up to the current
@@ -1566,6 +1572,15 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 
 	// Add columns that might be missing from older schema versions
 	const columnsToAdd: ColumnToAdd[] = [
+		...[
+			["account_generation", "BIGINT"],
+			["cache_health_native", "INTEGER"],
+			["internal_origin", "INTEGER"],
+		].map(([column, type]) => ({
+			table: "requests",
+			column,
+			definition: `ALTER TABLE requests ADD COLUMN ${column} ${type}`,
+		})),
 		{
 			table: "combo_family_assignments",
 			column: "exhaustion_policy",

@@ -3,6 +3,7 @@ import { Logger } from "@better-ccflare/logger";
 import type {
 	AgentAttributionSource,
 	ProjectAttributionSource,
+	RequestAccountingContext,
 	RouteProvenance,
 } from "@better-ccflare/types";
 import { getCleanupBatchSize } from "../adapters/bun-sql-adapter";
@@ -91,6 +92,7 @@ async function decryptForList(id: string, json: string): Promise<string> {
 }
 
 export interface RequestData {
+	accounting?: RequestAccountingContext;
 	id: string;
 	method: string;
 	path: string;
@@ -182,9 +184,10 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				project_attribution_source, agent_attribution_source,
 				stream_terminal_state, client_session_id,
 				route_profile_id, requested_route_model, routed_provider, routed_model,
-				route_fallback_rung, route_home_action, route_repin_reason, route_candidate_id
+				route_fallback_rung, route_home_action, route_repin_reason, route_candidate_id,
+				account_generation, cache_health_native, internal_origin
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (id) DO UPDATE SET
 				timestamp = EXCLUDED.timestamp,
 				method = EXCLUDED.method,
@@ -241,7 +244,10 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				route_fallback_rung = COALESCE(EXCLUDED.route_fallback_rung, requests.route_fallback_rung),
 				route_home_action = COALESCE(EXCLUDED.route_home_action, requests.route_home_action),
 				route_repin_reason = COALESCE(EXCLUDED.route_repin_reason, requests.route_repin_reason),
-				route_candidate_id = COALESCE(EXCLUDED.route_candidate_id, requests.route_candidate_id)
+				route_candidate_id = COALESCE(EXCLUDED.route_candidate_id, requests.route_candidate_id),
+				account_generation = COALESCE(requests.account_generation, EXCLUDED.account_generation),
+				cache_health_native = COALESCE(requests.cache_health_native, EXCLUDED.cache_health_native),
+				internal_origin = COALESCE(requests.internal_origin, EXCLUDED.internal_origin)
 		`,
 			[
 				data.id,
@@ -278,12 +284,17 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				sanitizeClientSessionId(data.clientSessionId),
 				data.routeProvenance?.profileId ?? null,
 				data.routeProvenance?.requestedModel ?? null,
-				data.routeProvenance?.routedProvider ?? null,
-				data.routeProvenance?.routedModel ?? null,
+				data.accounting?.provider ??
+					data.routeProvenance?.routedProvider ??
+					null,
+				data.accounting?.model ?? data.routeProvenance?.routedModel ?? null,
 				data.routeProvenance?.fallbackRung ?? null,
 				data.routeProvenance?.homeAction ?? null,
 				data.routeProvenance?.repinReason ?? null,
 				data.routeProvenance?.candidateId ?? null,
+				data.accounting?.accountGeneration ?? null,
+				data.accounting ? (data.accounting.nativeCache ? 1 : 0) : null,
+				data.accounting ? (data.accounting.internal ? 1 : 0) : null,
 			],
 		);
 	}

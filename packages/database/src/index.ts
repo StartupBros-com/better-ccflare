@@ -52,6 +52,7 @@ export {
 	type CacheFlightRecorderTimeline,
 	type MarkIncompleteOptions,
 } from "./repositories/cache-flight-recorder.repository";
+export { CacheHealthRepository } from "./repositories/cache-health.repository";
 export {
 	type CreateDeviceSetupJobInput,
 	type CreateDeviceSetupJobResult,

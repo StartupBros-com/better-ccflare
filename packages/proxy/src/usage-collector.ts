@@ -5,6 +5,7 @@ import {
 	estimateCostUSD,
 	formatXaiCacheCanary,
 	isModelPriced,
+	SseFrameBuffer,
 	TIME_CONSTANTS,
 	type TurnEvidence,
 } from "@better-ccflare/core";
@@ -42,11 +43,18 @@ interface UsageIteration {
 	cache_creation_input_tokens: number | undefined;
 }
 
+interface NativeResponsesState {
+	frames: SseFrameBuffer | null;
+	terminalState?: "complete" | "error" | "truncated" | "client_cancelled";
+	invalid?: boolean;
+}
+
 interface RequestState {
 	startMessage: StartMessage;
 	cacheFlightCohortSealReceipt?: CacheFlightCohortSealReceipt | null;
 	buffer: string;
 	streamDecoder: TextDecoder;
+	nativeResponses?: NativeResponsesState;
 	chunks: Uint8Array[];
 	chunksBytes: number;
 	chunksTruncated: boolean;
@@ -444,16 +452,18 @@ function extractUsageFromJson(
 		}
 	}
 
+	// The serving model is authoritative even when telemetry is missing.
+	// Keep the fallback rewrite/usage sequence unchanged for pricing below.
+	state.usage.model = normalizedModel ?? state.usage.model;
+	if (normalizedModel) {
+		state.servingModelAuthoritative = true;
+	}
+
 	const usageObj = json.usage;
 	if (!usageObj) return;
 
 	state.usagePayloadSeq = (state.usagePayloadSeq ?? 0) + 1;
 	captureUsageIterations(usageObj, state);
-	// The non-stream response model is authoritative over both fallback signals.
-	state.usage.model = normalizedModel ?? state.usage.model;
-	if (normalizedModel) {
-		state.servingModelAuthoritative = true;
-	}
 
 	if (usageObj.input_tokens !== undefined) {
 		state.usage.inputTokens = usageObj.input_tokens;
@@ -484,6 +494,9 @@ function extractUsageFromData(
 ): void {
 	try {
 		const parsed = JSON.parse(data);
+		if (state.nativeResponses) {
+			observeNativeResponsesOutcome(parsed, eventType, state);
+		}
 		let usagePayloadCounted = false;
 		const countUsagePayload = () => {
 			if (usagePayloadCounted) return;
@@ -620,9 +633,11 @@ function extractUsageFromData(
 			parsed.type === "response.completed" ||
 			parsed.type === "response.incomplete" ||
 			parsed.type === "response.failed" ||
+			parsed.type === "response.cancelled" ||
 			eventType === "response.completed" ||
 			eventType === "response.incomplete" ||
-			eventType === "response.failed";
+			eventType === "response.failed" ||
+			eventType === "response.cancelled";
 		if (isResponsesTerminal && parsed.response) {
 			state.lastTokenTimestamp = Date.now();
 			if (parsed.response.model && !state.usage.model) {
@@ -693,7 +708,97 @@ function extractUsageFromData(
 			}
 		}
 	} catch {
+		// Malformed native frames cannot establish successful completion.
+		if (state.nativeResponses) state.nativeResponses.invalid = true;
 		// Silent fail for non-JSON lines
+	}
+}
+
+/** Observe only parsed upstream protocol evidence, never request headers. */
+function observeNativeResponsesOutcome(
+	parsed: Record<string, unknown>,
+	eventType: string,
+	state: RequestState,
+): void {
+	const native = state.nativeResponses;
+	if (!native) return;
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		native.invalid = true;
+		return;
+	}
+	if (
+		eventType &&
+		typeof parsed.type === "string" &&
+		eventType !== parsed.type
+	) {
+		native.invalid = true;
+		return;
+	}
+	const type = typeof parsed.type === "string" ? parsed.type : eventType;
+	const response =
+		parsed.response &&
+		typeof parsed.response === "object" &&
+		!Array.isArray(parsed.response)
+			? (parsed.response as Record<string, unknown>)
+			: undefined;
+	if (type.startsWith("response.")) {
+		state.usage.model =
+			normalizeNonEmptyString(response?.model) ?? state.usage.model;
+	}
+	let terminal: NativeResponsesState["terminalState"];
+	if (type === "error" || type === "response.failed") terminal = "error";
+	else if (type === "response.incomplete") terminal = "truncated";
+	else if (type === "response.cancelled") terminal = "client_cancelled";
+	else if (type === "response.completed") {
+		if (response?.status === "failed" || response?.error != null) {
+			terminal = "error";
+		} else if (response?.status === "cancelled") {
+			terminal = "client_cancelled";
+		} else if (
+			!response ||
+			response.incomplete_details != null ||
+			(response.status != null && response.status !== "completed")
+		) {
+			terminal = "truncated";
+		} else {
+			terminal = "complete";
+		}
+	}
+	// Failure is sticky: a contradictory later completion cannot heal it.
+	if (
+		terminal &&
+		(!native.terminalState || native.terminalState === "complete")
+	) {
+		native.terminalState = terminal;
+	}
+}
+
+function processNativeResponsesChunk(
+	chunk: Uint8Array,
+	state: RequestState,
+): void {
+	const native = state.nativeResponses;
+	state.lastActivity = Date.now();
+	if (!native?.frames) return;
+	try {
+		// Unlike usage's line scanner, terminal evidence requires a complete
+		// frame. Reuse the bounded parser for split/CRLF/multiline SSE data.
+		for (const frame of native.frames.push(chunk)) {
+			let eventType = "";
+			const dataLines: string[] = [];
+			for (const line of frame.split(/\r?\n/)) {
+				const parsed = parseSSELine(line);
+				if (parsed.event) eventType = parsed.event;
+				if (parsed.data !== undefined) dataLines.push(parsed.data);
+			}
+			const data = dataLines.join("\n");
+			if (!data || data === "[DONE]") continue;
+			extractUsageFromData(data, eventType, state);
+		}
+	} catch {
+		// Accounting limits must not abort or penalize the delivered stream.
+		native.invalid = true;
+		native.frames = null; // Release the oversized buffer; never grow it again.
 	}
 }
 
@@ -741,6 +846,7 @@ function freeRequestState(state: RequestState): void {
 	state.chunks.length = 0;
 	state.chunksBytes = 0;
 	state.buffer = "";
+	state.nativeResponses = undefined;
 	state.usage.iterations = undefined;
 	state.usage.iterationsSeq = undefined;
 	state.usage.fallbackIterationSeen = undefined;
@@ -857,6 +963,20 @@ export class UsageCollector {
 			cacheFlightCohortSealReceipt: msg.cacheFlightCohortSealReceipt ?? null,
 			buffer: "",
 			streamDecoder: new TextDecoder(),
+			// This RESPONSE marker is authored by CodexProvider after native
+			// passthrough selection. A client-supplied request header is not used.
+			nativeResponses:
+				msg.isStream &&
+				msg.providerName === "codex" &&
+				msg.responseHeaders["x-better-ccflare-codex-response-format"] ===
+					"responses-api"
+					? {
+							frames: new SseFrameBuffer({
+								maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+								maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
+							}),
+						}
+					: undefined,
 			chunks: [],
 			chunksBytes: 0,
 			chunksTruncated: false,
@@ -989,7 +1109,8 @@ export class UsageCollector {
 		}
 
 		// Always process for usage extraction regardless of truncation
-		processStreamChunk(data, state, this.maxBufferSize);
+		if (state.nativeResponses) processNativeResponsesChunk(data, state);
+		else processStreamChunk(data, state, this.maxBufferSize);
 	}
 
 	handleEnd(msg: EndMessage): Promise<void> {
@@ -1065,6 +1186,33 @@ export class UsageCollector {
 			} catch {
 				// Ignore parse errors
 			}
+		}
+
+		if (state.nativeResponses) {
+			const native = state.nativeResponses;
+			try {
+				if (native.frames?.flush().trim()) native.invalid = true;
+			} catch {
+				native.invalid = true;
+			}
+			// Transport failures stay failures, including downstream cancellation.
+			// Only native SSE requires a completed protocol boundary; a missing
+			// terminal state remains legitimate for ordinary non-stream responses.
+			const terminal = !msg.success
+				? msg.error === "downstream_cancelled"
+					? "client_cancelled"
+					: "error"
+				: native.invalid
+					? "truncated"
+					: (native.terminalState ?? "truncated");
+			msg = {
+				...msg,
+				success: msg.success && terminal === "complete",
+				streamTerminalState: terminal,
+				...(terminal !== "complete" && !msg.error
+					? { error: `responses_${terminal}` }
+					: {}),
+			};
 		}
 
 		// The streaming message_start names the REQUESTED model; a fallback content
@@ -1208,7 +1356,11 @@ export class UsageCollector {
 				iterations.length > 0) ||
 			seamRealContentUnaccounted ||
 			iterationAttributionAmbiguous;
-		if (state.usage.model) {
+		// Capturing a JSON model without usage must not manufacture zero counts
+		// or a price. Existing streaming/provider compatibility defaults stay intact.
+		const modelOnlyJson =
+			!startMessage.isStream && state.usagePayloadSeq === undefined;
+		if (state.usage.model && !modelOnlyJson) {
 			const model = state.usage.model;
 			// Use provider's authoritative count if available, fallback to computed
 			const finalOutputTokens =
@@ -1654,6 +1806,7 @@ export class UsageCollector {
 					msg.streamTerminalState ?? null,
 					startMessage.clientSessionId ?? null,
 					startMessage.routeProvenance ?? null,
+					startMessage.accounting,
 				);
 			} catch (error) {
 				log.error(

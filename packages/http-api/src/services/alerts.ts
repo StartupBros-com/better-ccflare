@@ -14,7 +14,11 @@ import {
 	type RequestEvt,
 	requestEvents,
 } from "@better-ccflare/core";
-import type { BunSqlAdapter, UsageWindow } from "@better-ccflare/database";
+import {
+	type BunSqlAdapter,
+	CacheHealthRepository,
+	type UsageWindow,
+} from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import type {
 	AlertEvent,
@@ -26,11 +30,27 @@ import type {
 	RunawayLoopGroup,
 } from "@better-ccflare/types";
 import {
+	CACHE_HEALTH_BUCKET_MS,
+	CACHE_HEALTH_DEFAULT_POLICY,
+	CACHE_HEALTH_INTERVAL_MS,
+	type CacheHealthAlertDecision,
+	type CacheHealthPolicy,
+	type CacheHealthState,
+	cacheHealthScopeKey,
+} from "@better-ccflare/types";
+import {
 	type AnomalyRequestRow,
 	buildAnomalyInsightsResponse,
 	GROUP_KEY_SEPARATOR,
 	sanitizeProjectForDisplay,
 } from "./anomaly-insights";
+import {
+	advanceCacheHealth,
+	aggregateProviderCacheBuckets,
+	cacheHealthQueryWindow,
+	createCacheHealthState,
+	isRedundantProviderCacheAlert,
+} from "./cache-health";
 import { computeUsagePrediction } from "./usage-prediction";
 
 const log = new Logger("AlertsService");
@@ -172,6 +192,24 @@ export function getAlertsConfig(config: Config): AlertsConfigPayload {
 		loopMinRequests: config.getAlertAnomalyLoopMinRequests(),
 		cooldownMinutes: config.getAlertCooldownMinutes(),
 		webhookUrl: config.getAlertWebhookUrl(),
+		// Legacy Config doubles implement only the older alert getters.
+		cacheHealthEnabled: config.getAlertCacheHealthEnabled?.() ?? true,
+		cacheHealthThresholdPercent:
+			config.getAlertCacheHealthThresholdPercent?.() ??
+			CACHE_HEALTH_DEFAULT_POLICY.warningPercent,
+		cacheHealthDurationMinutes:
+			config.getAlertCacheHealthDurationMinutes?.() ??
+			(CACHE_HEALTH_DEFAULT_POLICY.warningBuckets * CACHE_HEALTH_BUCKET_MS) /
+				60_000,
+		cacheHealthMinRequests:
+			config.getAlertCacheHealthMinRequests?.() ??
+			CACHE_HEALTH_DEFAULT_POLICY.minimumRequests,
+		cacheHealthMinInputTokens:
+			config.getAlertCacheHealthMinInputTokens?.() ??
+			CACHE_HEALTH_DEFAULT_POLICY.minimumInputTokens,
+		cacheHealthReminderMinutes:
+			config.getAlertCacheHealthReminderMinutes?.() ??
+			CACHE_HEALTH_DEFAULT_POLICY.reminderMs / 60_000,
 	};
 }
 
@@ -202,6 +240,24 @@ export function setAlertsConfig(
 	);
 	config.setAlertAnomalyLoopMinRequests(payload.loopMinRequests);
 	config.setAlertCooldownMinutes(payload.cooldownMinutes);
+	if (payload.cacheHealthEnabled !== undefined)
+		config.setAlertCacheHealthEnabled(payload.cacheHealthEnabled);
+	if (payload.cacheHealthThresholdPercent !== undefined)
+		config.setAlertCacheHealthThresholdPercent(
+			payload.cacheHealthThresholdPercent,
+		);
+	if (payload.cacheHealthDurationMinutes !== undefined)
+		config.setAlertCacheHealthDurationMinutes(
+			payload.cacheHealthDurationMinutes,
+		);
+	if (payload.cacheHealthMinRequests !== undefined)
+		config.setAlertCacheHealthMinRequests(payload.cacheHealthMinRequests);
+	if (payload.cacheHealthMinInputTokens !== undefined)
+		config.setAlertCacheHealthMinInputTokens(payload.cacheHealthMinInputTokens);
+	if (payload.cacheHealthReminderMinutes !== undefined)
+		config.setAlertCacheHealthReminderMinutes(
+			payload.cacheHealthReminderMinutes,
+		);
 }
 
 export function shouldFireAlert(threshold: number, value: number): boolean {
@@ -687,6 +743,7 @@ export function isAlertTypeAllowedForWebhook(
 export async function deliverAlertWebhook(
 	webhookUrl: string,
 	alert: AlertEvent,
+	signal?: AbortSignal,
 ): Promise<void> {
 	let parsed: URL;
 	try {
@@ -705,6 +762,7 @@ export async function deliverAlertWebhook(
 		? buildDiscordWebhookBody(alert)
 		: { type: "alert" as const, alert };
 	try {
+		if (signal?.aborted) return;
 		const response = await fetch(webhookUrl, {
 			method: "POST",
 			headers: {
@@ -712,15 +770,85 @@ export async function deliverAlertWebhook(
 				"User-Agent": ALERT_WEBHOOK_USER_AGENT,
 			},
 			body: JSON.stringify(body),
+			signal: signal
+				? AbortSignal.any([signal, AbortSignal.timeout(10_000)])
+				: AbortSignal.timeout(10_000),
 		});
 		if (!response.ok) {
 			log.warn(
 				`Alert webhook delivery received non-2xx status: ${response.status}`,
 			);
 		}
-	} catch (error) {
-		log.warn(`Alert webhook delivery failed: ${(error as Error).message}`);
+	} catch (_error) {
+		// Fetch exception strings can contain the complete secret-bearing URL.
+		log.warn("Alert webhook delivery failed or timed out");
 	}
+}
+
+interface CacheHealthAccountLabel {
+	id: string;
+	name: string;
+	created_at: number;
+}
+
+interface CacheHealthEvaluationConfig {
+	enabled: boolean;
+	policy: CacheHealthPolicy;
+	webhookUrl: string;
+	allowedTypes: readonly AlertType[];
+}
+
+function cacheHealthAlertEvent(
+	decision: CacheHealthAlertDecision,
+	accounts: ReadonlyMap<string, CacheHealthAccountLabel>,
+): AlertEvent {
+	const { scope, evidence } = decision;
+	const label = (id: string, generation: number | null): string => {
+		const account = accounts.get(id);
+		return account && Number(account.created_at) === generation
+			? account.name
+			: "Unknown account";
+	};
+	const account =
+		scope.accountId === null
+			? null
+			: label(scope.accountId, scope.accountGeneration);
+	const contributors = evidence.contributors.map((c) =>
+		label(c.accountId, c.accountGeneration),
+	);
+	const percent = (value: number | null): string =>
+		value === null ? "unavailable" : `${value.toFixed(2)}%`;
+	const telemetry = decision.reason === "telemetry";
+	const recovered = decision.phase === "recovered";
+	const symptom = telemetry
+		? recovered
+			? "Cache usage records available again"
+			: "Cache usage unavailable in request records"
+		: recovered
+			? "RECORDED cache reuse recovered"
+			: "RECORDED cache reuse low";
+	return {
+		id: decision.id,
+		timestamp: decision.timestamp,
+		type: decision.type,
+		severity: decision.severity,
+		title: `${symptom} (${decision.phase})`,
+		message: [
+			`${symptom}. Provider: ${scope.provider}; model: ${scope.model}; ${account === null ? `accounts: ${contributors.join(", ")}` : `account: ${account}`}.`,
+			`UTC evidence: ${new Date(evidence.startMs).toISOString()} to ${new Date(evidence.endMs).toISOString()} (end exclusive).`,
+			`RECORDED reuse: ${percent(decision.reusePercent)}; ${telemetry ? "coverage" : "reuse"} threshold: ${decision.threshold}%; stored coverage: ${percent(decision.coveragePercent)}; zero-hit share: ${percent(decision.zeroHitPercent)}.`,
+			`Requests: ${evidence.measured} measured / ${evidence.eligible} eligible; missing ${evidence.missing}, invalid ${evidence.invalid}; excluded zero-input ${evidence.zeroInput}, failed ${evidence.failed}, internal ${evidence.internal}.`,
+			`Input tokens: ${evidence.inputTokens + evidence.cacheReadTokens + evidence.cacheWriteTokens} total (uncached ${evidence.inputTokens}, read ${evidence.cacheReadTokens}, creation ${evidence.cacheWriteTokens}).`,
+			"Recorded usage does not establish a warmed prefix or a cache-backend cause.",
+		].join("\n"),
+		value: telemetry ? decision.coveragePercent : decision.reusePercent,
+		threshold: decision.threshold,
+		account,
+		model: scope.model,
+		project: null,
+		requestId: null,
+		acknowledged: false,
+	};
 }
 
 export class AlertService {
@@ -730,6 +858,11 @@ export class AlertService {
 	private readonly authFailureListener: (event: AuthFailureEvt) => void;
 	private readonly configChangeListener: ({ key }: { key: string }) => void;
 	private anomalyTimer: ReturnType<typeof setInterval> | null = null;
+	private cacheHealthTimer: ReturnType<typeof setInterval> | null = null;
+	private cacheHealthFlight: Promise<void> | null = null;
+	private cacheHealthEpoch = 0;
+	private cacheHealthDelivery = new AbortController();
+	private started = false;
 	/** Last exhaustion-projection evaluation per `${accountId}:${windowKey}`
 	 * — in-memory rate limit on the history+regression work (see
 	 * buildUsageWindowExhaustionAlert). Reset on restart is fine: one extra
@@ -767,23 +900,231 @@ export class AlertService {
 			) {
 				this.restartAnomalyTimer();
 			}
+			if (
+				key.startsWith("alert_cache_health_") ||
+				key === "alert_webhook_url" ||
+				key === "alert_webhook_types"
+			) {
+				this.restartCacheHealthTimer();
+			}
 		};
 	}
 
 	start(): void {
+		if (this.started) return;
+		this.started = true;
 		requestEvents.on("event", this.requestListener);
 		this.config.on("change", this.configChangeListener);
 		authFailureEvents.on("event", this.authFailureListener);
 		this.restartAnomalyTimer();
+		this.restartCacheHealthTimer();
 	}
 
-	stop(): void {
+	stop(): Promise<void> {
+		this.started = false;
 		requestEvents.off("event", this.requestListener);
 		this.config.off("change", this.configChangeListener);
 		authFailureEvents.off("event", this.authFailureListener);
 		if (this.anomalyTimer) {
 			clearInterval(this.anomalyTimer);
 			this.anomalyTimer = null;
+		}
+		this.invalidateCacheHealth();
+		// Synchronous callers still detach listeners/timers immediately. The
+		// existing disposal registry can await an already-admitted DB batch.
+		return this.cacheHealthFlight ?? Promise.resolve();
+	}
+
+	private invalidateCacheHealth(): void {
+		this.cacheHealthEpoch++;
+		this.cacheHealthDelivery.abort();
+		this.cacheHealthDelivery = new AbortController();
+		if (this.cacheHealthTimer) clearInterval(this.cacheHealthTimer);
+		this.cacheHealthTimer = null;
+	}
+
+	private restartCacheHealthTimer(): void {
+		this.invalidateCacheHealth();
+		// Older Config test doubles deliberately have no cache accessors. They
+		// keep their original timer/query behavior; real Config defaults on.
+		if (!this.started || !this.config.getAlertCacheHealthEnabled?.()) return;
+		this.cacheHealthTimer = setInterval(() => {
+			void this.evaluateCacheHealth();
+		}, CACHE_HEALTH_INTERVAL_MS);
+		this.cacheHealthTimer.unref?.();
+	}
+
+	private cacheHealthConfig(): CacheHealthEvaluationConfig {
+		const settings = getAlertsConfig(this.config);
+		const warningPercent =
+			settings.cacheHealthThresholdPercent ??
+			CACHE_HEALTH_DEFAULT_POLICY.warningPercent;
+		return {
+			enabled: this.config.getAlertCacheHealthEnabled?.() ?? false,
+			policy: {
+				...CACHE_HEALTH_DEFAULT_POLICY,
+				warningPercent,
+				criticalPercent: Math.min(
+					CACHE_HEALTH_DEFAULT_POLICY.criticalPercent,
+					warningPercent,
+				),
+				recoveryPercent: Math.min(100, warningPercent + 2),
+				warningBuckets:
+					((settings.cacheHealthDurationMinutes ??
+						(CACHE_HEALTH_DEFAULT_POLICY.warningBuckets *
+							CACHE_HEALTH_BUCKET_MS) /
+							60_000) *
+						60_000) /
+					CACHE_HEALTH_BUCKET_MS,
+				minimumRequests:
+					settings.cacheHealthMinRequests ??
+					CACHE_HEALTH_DEFAULT_POLICY.minimumRequests,
+				minimumInputTokens:
+					settings.cacheHealthMinInputTokens ??
+					CACHE_HEALTH_DEFAULT_POLICY.minimumInputTokens,
+				reminderMs:
+					(settings.cacheHealthReminderMinutes ??
+						CACHE_HEALTH_DEFAULT_POLICY.reminderMs / 60_000) * 60_000,
+			},
+			webhookUrl: settings.webhookUrl,
+			allowedTypes: [...this.config.getAlertWebhookTypes()],
+		};
+	}
+
+	/** A clock-injected entry point for fixture evaluation and the five-minute
+	 * timer. A concurrent tick joins the existing scan; every later tick loads
+	 * persisted revisions again, including after a CAS loss or failed batch. */
+	evaluateCacheHealth(nowMs = Date.now()): Promise<void> {
+		if (!this.started) return Promise.resolve();
+		if (this.cacheHealthFlight) return this.cacheHealthFlight;
+		const epoch = this.cacheHealthEpoch;
+		const flight = this.scanCacheHealth(nowMs, epoch)
+			.catch(() => {
+				// Do not log query/config/transport exception contents or account data.
+				log.warn("Cache health evaluation failed; retrying on a later tick");
+			})
+			.finally(() => {
+				if (this.cacheHealthFlight === flight) this.cacheHealthFlight = null;
+			});
+		this.cacheHealthFlight = flight;
+		return flight;
+	}
+
+	private async scanCacheHealth(nowMs: number, epoch: number): Promise<void> {
+		if (!this.config.getAlertCacheHealthEnabled?.()) return;
+		const configuration = this.cacheHealthConfig();
+		if (!configuration.enabled) return;
+		const signature = JSON.stringify(configuration);
+		const current = () =>
+			this.started &&
+			epoch === this.cacheHealthEpoch &&
+			signature === JSON.stringify(this.cacheHealthConfig());
+		const signal = this.cacheHealthDelivery.signal;
+		const repository = new CacheHealthRepository(this.db);
+		const loaded = await repository.loadStates(nowMs); // includes repository cleanup
+		if (!current()) return;
+		// Labels only: never select a credential-bearing Account row.
+		const labels = await this.db.query<CacheHealthAccountLabel>(
+			"SELECT id, name, created_at FROM accounts",
+		);
+		if (!current()) return;
+		const accounts = new Map(labels.map((account) => [account.id, account]));
+		const states = new Map<string, CacheHealthState>();
+		for (const state of loaded) {
+			const key = cacheHealthScopeKey(state.scope);
+			const invalid = state.contributors.filter(
+				(c) =>
+					Number(accounts.get(c.accountId)?.created_at) !== c.accountGeneration,
+			);
+			if (state.scope.kind === "provider" && invalid.length > 0) {
+				// Repository cleanup handles account scopes. Provider evidence can
+				// span several generations; retire it only if still invalid and at
+				// the loaded revision, so concurrent fresh evidence cannot be lost.
+				if (!current()) return;
+				const removed = await this.db.runWithChanges(
+					`DELETE FROM cache_health_state WHERE scope_key = ? AND revision = ? AND (${invalid.map(() => "NOT EXISTS (SELECT 1 FROM accounts WHERE id = ? AND created_at = ?)").join(" OR ")})`,
+					[
+						key,
+						state.revision,
+						...invalid.flatMap((c) => [c.accountId, c.accountGeneration]),
+					],
+				);
+				if (!current() || removed === 0) return;
+				continue;
+			}
+			states.set(key, state);
+		}
+		const window = cacheHealthQueryWindow(nowMs);
+		const buckets = await repository.fetchBuckets(window.startMs, window.endMs);
+		if (!current()) return;
+		const enrolled = new Set(
+			[...states]
+				.filter(([, state]) => state.scope.kind === "account" && state.enrolled)
+				.map(([key]) => key),
+		);
+		// Aggregate the entire chronological window first. This carries newly
+		// learned enrollment into later zero buckets, before any volume floors.
+		const providers = aggregateProviderCacheBuckets(buckets, enrolled);
+		const ordered = [...buckets, ...providers].sort(
+			(left, right) =>
+				left.endMs - right.endMs ||
+				(left.scope.kind === right.scope.kind
+					? cacheHealthScopeKey(left.scope).localeCompare(
+							cacheHealthScopeKey(right.scope),
+						)
+					: left.scope.kind === "account"
+						? -1
+						: 1),
+		);
+		const accountDecisions: CacheHealthAlertDecision[] = [];
+		for (const bucket of ordered) {
+			if (!current()) return;
+			const key = cacheHealthScopeKey(bucket.scope);
+			const previous = states.get(key) ?? createCacheHealthState(bucket.scope);
+			const next = advanceCacheHealth(
+				previous,
+				bucket,
+				configuration.policy,
+				nowMs,
+			);
+			if (next.state === previous) continue;
+			const decisions = next.alerts.filter((decision) => {
+				if (
+					decision.phase !== "opened" ||
+					!isRedundantProviderCacheAlert(decision, accountDecisions, [
+						...states.values(),
+					])
+				)
+					return true;
+				// A suppressed parent must not retain an invisible incident that
+				// blocks a newly affected account. Only openings are suppressed;
+				// once a provider opening is real its recovery is always retained.
+				next.state[decision.reason].incident = null;
+				return false;
+			});
+			const alerts = decisions.map((decision) =>
+				cacheHealthAlertEvent(decision, accounts),
+			);
+			if (!current()) return;
+			const won = await repository.commit(
+				previous.revision,
+				next.state,
+				alerts,
+			);
+			// A submitted atomic batch can finish during stop; stop() awaits it.
+			// Never start another batch or publish from an invalidated evaluation.
+			if (!current() || !won) return;
+			states.set(key, next.state);
+			if (bucket.scope.kind === "account") accountDecisions.push(...decisions);
+			for (const alert of alerts) {
+				if (!current()) return;
+				this.publishPersistedAlert(
+					alert,
+					configuration.webhookUrl,
+					configuration.allowedTypes,
+					signal,
+				);
+			}
 		}
 	}
 
@@ -1538,16 +1879,29 @@ export class AlertService {
 			);
 			return;
 		}
+		this.publishPersistedAlert(alert, webhookUrl);
+	}
+
+	/** Both ordinary insert winners and atomic cache-state winners use this
+	 * publication boundary. Persistence is not a webhook delivery receipt. */
+	private publishPersistedAlert(
+		alert: AlertEvent,
+		webhookUrl: string,
+		allowedTypes?: readonly AlertType[],
+		signal?: AbortSignal,
+	): void {
+		if (signal?.aborted) return;
 		const event: AlertEvt = { type: "alert", payload: alert };
 		alertEvents.emit("event", event);
 		if (
+			!signal?.aborted &&
 			webhookUrl &&
 			isAlertTypeAllowedForWebhook(
 				alert.type,
-				this.config.getAlertWebhookTypes(),
+				allowedTypes ?? this.config.getAlertWebhookTypes(),
 			)
 		) {
-			void deliverAlertWebhook(webhookUrl, alert);
+			void deliverAlertWebhook(webhookUrl, alert, signal);
 		}
 	}
 }

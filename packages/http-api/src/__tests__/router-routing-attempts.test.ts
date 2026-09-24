@@ -8,6 +8,7 @@ import type { APIContext } from "../types";
 // loading DatabaseOperations and its generated worker dependencies.
 mock.module("@better-ccflare/database", () => ({
 	AsyncDbWriter: class AsyncDbWriter {},
+	CacheHealthRepository: class CacheHealthRepository {},
 	DatabaseFactory: class DatabaseFactory {},
 	DatabaseOperations: class DatabaseOperations {},
 	ModelTranslationRepository: class ModelTranslationRepository {},

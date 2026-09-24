@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Logger } from "@better-ccflare/logger";
+import { CACHE_HEALTH_STATE_SCHEMA } from "./cache-health-schema";
 import { addPerformanceIndexes } from "./performance-indexes";
 import { ROUTING_ATTEMPT_REASON_SQL } from "./routing-attempt-taxonomy";
 
@@ -449,6 +450,9 @@ export function ensureSchema(db: Database): void {
 			project_attribution_source TEXT,
 			agent_attribution_source TEXT,
 			stream_terminal_state TEXT,
+			account_generation BIGINT,
+			cache_health_native INTEGER,
+			internal_origin INTEGER,
 			client_session_id TEXT,
 			route_profile_id TEXT,
 			requested_route_model TEXT,
@@ -462,6 +466,7 @@ export function ensureSchema(db: Database): void {
 	`);
 
 	ensureRoutingAttemptsSchema(db);
+	db.run(CACHE_HEALTH_STATE_SCHEMA);
 
 	// Create indexes for faster queries
 	db.run(
@@ -1519,6 +1524,16 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 export function runMigrations(db: Database, dbPath?: string): void {
 	// Ensure base schema exists first (outside transaction as it creates tables)
 	ensureSchema(db);
+	db.run(CACHE_HEALTH_STATE_SCHEMA);
+	for (const [column, type] of [
+		["account_generation", "BIGINT"],
+		["cache_health_native", "INTEGER"],
+		["internal_origin", "INTEGER"],
+	]) {
+		if (!tableHasColumn(db, "requests", column)) {
+			db.run(`ALTER TABLE requests ADD COLUMN ${column} ${type}`);
+		}
+	}
 	// Repair an interrupted additive routing-attempt migration independently.
 	ensureRoutingAttemptsSchema(db);
 	if (!tableHasColumn(db, "routing_attempts", "upstream_evidence")) {
