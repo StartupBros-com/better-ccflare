@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ideation: Closing the Codex-routed Claude Code behavior gap</title>
+<style>
+  :root {
+    --bg: #fbfaf7; --fg: #1f2328; --muted: #5c6470; --line: #d9d5cc; --card: #ffffff;
+    --accent: #3b6ea5; --accent-soft: #e6eef7; --accent-text: #24507f;
+    --warn: #c8742a; --warn-soft: #fbeee2; --warn-text: #8a4a12;
+    --ok: #2f7d4f; --ok-soft: #e4f2e9; --ok-text: #1f5a37;
+    --chip: #eeece6; --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171b; --fg: #e6e8eb; --muted: #a0a8b3; --line: #2c333c; --card: #1c2127;
+      --accent: #7fb0e6; --accent-soft: #1d2d40; --accent-text: #b7d3f2;
+      --warn: #e59a5a; --warn-soft: #3a2816; --warn-text: #f0c39a;
+      --ok: #6fc292; --ok-soft: #173125; --ok-text: #a9dfc0; --chip: #262c34;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.55 var(--sans); }
+  main { max-width: 920px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  p, li, dd { max-width: 72ch; }
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: .25rem 0 .75rem; }
+  h2 { font-size: 1.35rem; margin: 2.75rem 0 .75rem; padding-top: .75rem; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.1rem; margin: 0 0 .5rem; }
+  h4 { font-size: .95rem; margin: 1.25rem 0 .35rem; }
+  .eyebrow { font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  header dl.meta { display: grid; grid-template-columns: max-content 1fr; gap: .2rem 1rem; margin: 0; font-size: .9rem; }
+  header dl.meta dt { color: var(--muted); font-weight: 600; }
+  header dl.meta dd { margin: 0; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .6rem; margin: 1.5rem 0 0; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: .7rem .9rem; }
+  .stat .v { font-size: 1.25rem; font-weight: 700; }
+  .stat .l { font-size: .78rem; color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; margin: .75rem 0 1rem; }
+  th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  code { font-family: var(--mono); font-size: .86em; background: var(--chip); padding: .05em .3em; border-radius: 4px; }
+  pre { background: var(--chip); padding: .75rem; border-radius: 8px; overflow-x: auto; font-size: .82rem; }
+  a { color: var(--accent-text); }
+  strong { color: inherit; }
+  .jump { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: .75rem 1rem; margin: .5rem 0 1.5rem; }
+  .jump ol { margin: .25rem 0 0; padding-left: 1.3rem; }
+  .jump li { margin: .15rem 0; }
+  article.idea { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 1.1rem 1.25rem 1.25rem; margin: 1.25rem 0; }
+  article.idea .head { display: flex; flex-wrap: wrap; gap: .5rem .75rem; align-items: baseline; margin-bottom: .4rem; }
+  .chip { display: inline-block; border-radius: 999px; padding: .12em .65em; font-size: .74rem; font-weight: 600; letter-spacing: .02em; background: var(--chip); color: var(--fg); }
+  .chip.id { background: var(--accent-soft); color: var(--accent-text); }
+  .chip.axis { background: var(--chip); }
+  .chip.conf { background: var(--ok-soft); color: var(--ok-text); }
+  .chip.conf.mid { background: var(--warn-soft); color: var(--warn-text); }
+  .chip.cx { background: var(--chip); }
+  article.idea dl { margin: .75rem 0 0; }
+  article.idea dt { font-size: .74rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); font-weight: 700; margin-top: .85rem; }
+  article.idea dd { margin: .2rem 0 0; }
+  figure { margin: 1rem 0 .25rem; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: .8rem; color: var(--muted); margin-top: .35rem; }
+  .callout { border-radius: 10px; padding: .75rem 1rem; margin: 1rem 0; background: var(--accent-soft); }
+  .callout .eyebrow { color: var(--accent-text); }
+  .callout.warn { background: var(--warn-soft); }
+  .callout.warn .eyebrow { color: var(--warn-text); }
+  footer.composition-signal { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--line); font-size: .8rem; color: var(--muted); }
+  svg text { font-family: var(--sans); fill: var(--fg); }
+  svg .box { fill: var(--card); stroke: var(--line); stroke-width: 1.2; }
+  svg .box.warn { fill: var(--warn-soft); stroke: var(--warn); }
+  svg .box.ok { fill: var(--ok-soft); stroke: var(--ok); }
+  svg .box.acc { fill: var(--accent-soft); stroke: var(--accent); }
+  svg .arrow { stroke: var(--muted); stroke-width: 1.5; fill: none; marker-end: url(#ah); }
+  svg .lbl { font-size: 11px; fill: var(--muted); paint-order: stroke fill; stroke: var(--bg); stroke-width: 3px; }
+  svg .t { font-size: 12px; }
+  svg .row { font-size: 10px; letter-spacing: .1em; fill: var(--muted); font-weight: 700; }
+  svg .bar-a { fill: var(--accent); }
+  svg .bar-c { fill: var(--warn); }
+  svg .grid { stroke: var(--line); stroke-width: 1; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div class="eyebrow">Ideation</div>
+  <h1>Closing the Codex-routed Claude Code behavior gap</h1>
+  <dl class="meta">
+    <dt>Date</dt><dd><time datetime="2026-09-24">2026-09-24</time></dd>
+    <dt>Topic</dt><dd>codex-routed-claude-code-parity</dd>
+    <dt>Mode</dt><dd>repo-grounded</dd>
+    <dt>Focus</dt><dd>Claude Code CLI is the daily driver and all inference goes through better-ccflare. Anthropic routing behaves perfectly; Codex routing produces merge refusals, early stops, Workflow and subagent launch trouble, and uninvited plan mode that strips <code>--dangerously-bypass-permissions</code>. Find where proxy translation, harness configuration, or observability can close the gap, using traces and telemetry rather than anecdote.</dd>
+  </dl>
+  <div class="stats">
+    <div class="stat"><div class="v">428</div><div class="l">Claude Code sessions compared over 21 days (377 Anthropic, 51 Codex), labeled by exact request-to-transcript join</div></div>
+    <div class="stat"><div class="v">1,691 vs 0</div><div class="l">Agent tool calls, Anthropic vs Codex turns</div></div>
+    <div class="stat"><div class="v">0 vs 6</div><div class="l">EnterPlanMode calls, Anthropic vs Codex</div></div>
+    <div class="stat"><div class="v">46 → 7</div><div class="l">raw ideas from 6 frames, verified and cut to 7 survivors</div></div>
+  </div>
+</header>
+
+<section id="grounding-context">
+  <h2>Grounding Context</h2>
+  <h4>Codebase Context</h4>
+  <p>better-ccflare is a load-balancing proxy in front of Anthropic, Codex, Grok, and mac-studio accounts. Claude Code traffic to Anthropic is a pass-through with no model rewriting. Traffic to Codex goes through the Codex provider, a 6,200-line translator from the Anthropic Messages API to the OpenAI Responses API with its own SSE parser, plus model mappings, route profiles, and combos. Production is a root systemd service deployed from <code>main</code> only. The provider already carries pinned client-identity headers (#377), session-id affinity headers (#367), an optional-argument preservation fix (#372), and cache-degradation alerts (#369).</p>
+  <p>On the wire, Claude Code's system blocks are joined verbatim into the Responses <code>instructions</code> field; tool schemas are lightly sanitized and sent non-strict; reasoning effort defaults to <code>medium</code> for every turn except the gpt-5.6 family, and the client's thinking budget is never read; reasoning items round-trip as prefixed <code>redacted_thinking</code> blocks; every non-content-filter <code>incomplete</code> reason collapses to <code>max_tokens</code>; image and oversized tool results become placeholder strings; and the response carries the raw GPT model id. A "single orchestration root" mechanism strips the Agent and Task tool declarations from any turn it classifies as non-root or attributed-descendant. The only instruction the provider ever adds is a one-line continuation nudge when a Skill result lands in the final turn, whose comment reads "Native Claude continues on its own; Codex often stops."</p>
+  <p>In the dotfiles harness, PreToolUse gates exist for EnterWorktree and for Task and Workflow fan-out, Stop hooks with block mechanics exist, but nothing gates Agent, Monitor, or EnterPlanMode, no permission mode is pinned, and hook input carries no provider or model. The proxy already exposes the provider per session through <code>GET /api/sessions/:id/account</code>, but the only consumer is the statusline, which fetches it and does not render it. The operator's concrete merge grant ("that is your job") was demoted out of the always-loaded CLAUDE.md and now reaches no model.</p>
+
+  <h4>Telemetry (21 days of production, exact provider labels)</h4>
+  <p>The proxy's <code>requests.client_session_id</code> column stores the Claude Code transcript filename, so every session can be labeled by the provider that served at least 90% of its requests. The Codex sample is 12.8 times smaller by turns, so its rates carry wider uncertainty.</p>
+  <table>
+    <thead><tr><th>Metric</th><th class="num">Anthropic</th><th class="num">Codex</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>Agent tool calls</td><td class="num">1,691</td><td class="num">0</td><td>grep-verified across all 51 Codex sessions</td></tr>
+      <tr><td>EnterPlanMode / ExitPlanMode calls</td><td class="num">0 / 0</td><td class="num">6 / 7</td><td>only ever appears under Codex</td></tr>
+      <tr><td>Merge-related assistant phrases</td><td class="num">75 turns</td><td class="num">10 turns</td><td>all 10 Codex hits are refusals; Anthropic hits are mixed</td></tr>
+      <tr><td>Bash tool error rate</td><td class="num">4.61%</td><td class="num">9.09%</td><td>n = 88,046 vs 4,457 results</td></tr>
+      <tr><td>EnterWorktree error rate</td><td class="num">10.8%</td><td class="num">61.7%</td><td>n = 713 vs 60</td></tr>
+      <tr><td>Monitor error rate</td><td class="num">4.7%</td><td class="num">83.3%</td><td>n = 898 vs 24</td></tr>
+      <tr><td>Malformed tool_use input</td><td class="num">0.50%</td><td class="num">1.41%</td><td>heuristic over 131k vs 12k blocks</td></tr>
+      <tr><td>Stream terminal state = error</td><td class="num">0.0027%</td><td class="num">0.078%</td><td>about 29x</td></tr>
+      <tr><td>HTTP status ≥ 400</td><td class="num">0.060%</td><td class="num">0.359%</td><td>about 6x</td></tr>
+      <tr><td>Workflow tool error rate</td><td class="num">2.50%</td><td class="num">2.37%</td><td>counter-finding: comparable</td></tr>
+      <tr><td>Turns ending with an unfulfilled promise and no tool call</td><td class="num">1.30%</td><td class="num">0.14%</td><td>counter-finding: fires less under Codex</td></tr>
+    </tbody>
+  </table>
+  <p>The proxy log carries one Codex-only warning, "Codex returned successful response without SSE", 16,225 times in the same window, and the Codex lane records exactly zero cache-creation tokens on every row because the field is structurally unreachable there.</p>
+
+  <h4>Past Learnings</h4>
+  <p>Thinking-only streams once scored zero progress at the gateway, causing a silent abort-and-retry that needed fixes in three layers at once. The Workflow relay-preamble defect and the worktree-pin smear onto subagents are CLI-internal and reproduce under Anthropic, so they are ruled out as Codex causes. The Codex SSE parser is deliberately separate from the adapter parser. The cache-affinity fix is recorded as an initial observed recovery, with parity still open. The evidence-regime doctrine applies: state what a comparison does not prove.</p>
+
+  <h4>External Context</h4>
+  <p>anyclaude, a structural twin proxy, has open bugs where Claude Code's Bash and Read calls arrive with empty required parameters, and no proxy project publishes a compatibility catalog. The native Codex CLI itself stops early with no blocker (openai/codex#42124), so part of the trait is inherent. OpenAI's GPT-5 prompting guide prescribes an explicit persistence block and notes it matters most at low reasoning effort; Cursor fixed the same deference behavior by telling the model actions are reversible and pre-authorized. Claude Code hooks can deny a named tool before it fires and block a stop with a reason, but receive no provider signal. OpenRouter normalizes finish reasons while preserving the provider's raw value.</p>
+</section>
+
+<section id="topic-axes">
+  <h2>Topic Axes</h2>
+  <ol>
+    <li><strong>Wire translation fidelity</strong> — what Codex receives and returns versus what Claude Code sent and expects.</li>
+    <li><strong>Tool surface and orchestration admission</strong> — which tools a Codex turn can see and call, and what gates them.</li>
+    <li><strong>Authority and persistence framing</strong> — the prompt-level text that tells the model it may merge, must keep going, and must not enter plan mode.</li>
+    <li><strong>Harness enforcement and the provider signal</strong> — deterministic Claude Code hooks and settings, and how they learn a session is Codex-routed.</li>
+    <li><strong>Parity measurement and evidence</strong> — what is recorded, gated, alerted, and testable, under the repo's scripted-traffic rule.</li>
+  </ol>
+</section>
+
+<section id="ranked-ideas">
+  <h2>Ranked Ideas</h2>
+  <nav class="jump" aria-label="Ranked ideas">
+    <div class="eyebrow">Jump to</div>
+    <ol>
+      <li><a href="#idea-1">De-ratchet orchestration-root demotion and announce it</a></li>
+      <li><a href="#idea-2">Plan-mode belt and suspenders</a></li>
+      <li><a href="#idea-3">Translation-loss ledger</a></li>
+      <li><a href="#idea-4">Map Claude Code's thinking budget to Codex reasoning effort</a></li>
+      <li><a href="#idea-5">Behavioral-parity floors and alerts</a></li>
+      <li><a href="#idea-6">Codex-aware authority and persistence layer</a></li>
+      <li><a href="#idea-7">Codex conformance harness under the scripting carve-out</a></li>
+    </ol>
+  </nav>
+
+  <article class="idea" id="idea-1">
+    <div class="head"><span class="chip id">1.</span><h3>De-ratchet orchestration-root demotion and announce it</h3></div>
+    <div class="head"><span class="chip axis">Tool surface and orchestration admission</span><span class="chip conf">Confidence 85%</span><span class="chip cx">Complexity Medium</span><span class="chip">better-ccflare</span></div>
+    <dl>
+      <dt>Description</dt>
+      <dd>The Codex provider elects a single orchestration root per session and strips the Agent and Task tool declarations from every turn it classifies as non-root or attributed-descendant. Root election in <code>orchestration-election.ts</code> requires an exact instruction-hash and conversation-id match, and a rejected turn mutates nothing, so any drift in the system prompt (compaction, a new system-reminder block, a skill load) permanently demotes a legitimate root conversation for the rest of the session's TTL. The demotion is logged but never told to the model. Key root identity on a stable session key or a normalized prompt fingerprint, allow re-promotion when the original root goes quiet, and inject a one-line announcement whenever the strip fires ("this turn runs as a worker; delegate through Workflow or do the work inline") so the model substitutes deliberately instead of guessing why Agent vanished.</dd>
+      <dt>Axis</dt><dd>Tool surface and orchestration admission</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> <code>orchestration-election.ts</code> <code>admit()</code> requires an exact <code>instructionHash</code> and <code>conversationId</code> match and performs "no mutation whatsoever" on rejection (verifier-confirmed by read). <code>provider.ts:4419-4429</code> logs the demotion without surfacing it; <code>provider.ts:4437-4446</code> is the <code>orchestrationToolNames</code> filter that removes the declarations. Telemetry: 1,691 Agent calls in 133,269 Anthropic turns versus 0 in 10,441 Codex turns, across every one of the 51 Codex sessions.</dd>
+      <dt>Rationale</dt>
+      <dd>Zero Agent calls across every Codex session is too absolute to be model preference alone, and a one-way ratchet keyed on an exact hash is precisely the mechanism that would produce it. Aviation crew-resource-management mandates a "you have the controls" callout because silent handoffs make both parties misjudge who is in charge; here the model loses a tool and is left to infer why. Fixing the ratchet addresses the user's subagent complaint at its most likely source; announcing the demotion makes the remaining, intentional strips survivable.</dd>
+      <dt>Downsides</dt>
+      <dd>The strip was built to contain a runaway fan-out incident, so loosening root demotion must leave the existing fan-out admission hook in force. A re-promotion rule needs a quiet-period heuristic that could misfire on long-running roots. Attribution of the zero-Agent finding to this bug is inferred from mechanism, not yet observed per request; idea 3 records the admission state that would settle it within a day of deploy.</dd>
+      <dt>Confidence</dt><dd>85%</dd>
+      <dt>Complexity</dt><dd>Medium</dd>
+    </dl>
+    <figure>
+      <svg viewBox="0 0 800 190" role="img" aria-label="Today a prompt-hash mismatch permanently demotes the root and silently strips Agent and Task; proposed: stable root identity, re-promotion, and an explicit callout">
+        <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+        <text class="row" x="10" y="14">TODAY</text>
+        <rect class="box acc" x="10" y="22" width="175" height="56" rx="8"/>
+        <text class="t" x="97" y="46" text-anchor="middle">Root elected</text><text class="t" x="97" y="64" text-anchor="middle">instruction hash H1</text>
+        <path class="arrow" d="M185,50 L208,50"/>
+        <rect class="box" x="210" y="22" width="175" height="56" rx="8"/>
+        <text class="t" x="297" y="46" text-anchor="middle">Prompt drifts</text><text class="t" x="297" y="64" text-anchor="middle">(compaction, reminder, skill)</text>
+        <path class="arrow" d="M385,50 L408,50"/>
+        <rect class="box" x="410" y="22" width="175" height="56" rx="8"/>
+        <text class="t" x="497" y="46" text-anchor="middle">admit() rejects H2</text><text class="t" x="497" y="64" text-anchor="middle">no mutation, no re-election</text>
+        <path class="arrow" d="M585,50 L608,50"/>
+        <rect class="box warn" x="610" y="22" width="180" height="56" rx="8"/>
+        <text class="t" x="700" y="46" text-anchor="middle">Demoted for session TTL</text><text class="t" x="700" y="64" text-anchor="middle">Agent/Task stripped, silently</text>
+        <text class="row" x="10" y="112">PROPOSED</text>
+        <rect class="box acc" x="10" y="120" width="175" height="56" rx="8"/>
+        <text class="t" x="97" y="144" text-anchor="middle">Root keyed on</text><text class="t" x="97" y="162" text-anchor="middle">stable session identity</text>
+        <path class="arrow" d="M185,148 L208,148"/>
+        <rect class="box" x="210" y="120" width="175" height="56" rx="8"/>
+        <text class="t" x="297" y="144" text-anchor="middle">Prompt drifts</text><text class="t" x="297" y="162" text-anchor="middle">(same events)</text>
+        <path class="arrow" d="M385,148 L408,148"/>
+        <rect class="box ok" x="410" y="120" width="175" height="56" rx="8"/>
+        <text class="t" x="497" y="144" text-anchor="middle">Still root, or</text><text class="t" x="497" y="162" text-anchor="middle">re-promoted after quiet period</text>
+        <path class="arrow" d="M585,148 L608,148"/>
+        <rect class="box ok" x="610" y="120" width="180" height="56" rx="8"/>
+        <text class="t" x="700" y="144" text-anchor="middle">If demoted: callout tells</text><text class="t" x="700" y="162" text-anchor="middle">the model it is a worker</text>
+      </svg>
+      <figcaption>Why the ratchet matters: one hash mismatch today is permanent and invisible; the proposal makes root identity stable and every demotion explicit.</figcaption>
+    </figure>
+  </article>
+
+  <article class="idea" id="idea-2">
+    <div class="head"><span class="chip id">2.</span><h3>Plan-mode belt and suspenders</h3></div>
+    <div class="head"><span class="chip axis">Harness enforcement and the provider signal</span><span class="chip conf">Confidence 90%</span><span class="chip cx">Complexity Low</span><span class="chip">better-ccflare + dotfiles</span></div>
+    <dl>
+      <dt>Description</dt>
+      <dd>Two layers, each sufficient alone. At the proxy, extend the per-request tool filter that already removes Agent and Task on Codex turns so it also drops the EnterPlanMode and ExitPlanMode declarations; the filter is recomputed from <code>body.tools</code> on every request, so it catches the tool whether it is declared up front or loaded later through ToolSearch. In the harness, add a PreToolUse hook that denies EnterPlanMode with a reason when the session is Codex-routed, and a hook on ExitPlanMode and SessionStart that reasserts the session's prior bypass-permissions state, provider-agnostically. The harness half needs to know the session's provider: ship a small shared helper that reads the existing <code>GET /api/sessions/:id/account</code> provider field using the statusline's file-cache pattern, and render the provider in the statusline while at it.</dd>
+      <dt>Axis</dt><dd>Harness enforcement and the provider signal</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> telemetry EnterPlanMode 0 of 133,269 Anthropic turns versus 6 of 10,441 Codex turns, ExitPlanMode 0 versus 7; grep-verified zero plan-mode handling in the Codex provider and zero EnterPlanMode footprint anywhere in dotfiles; <code>sessions.ts:49</code> declares <code>provider: string</code> and the handler returns it; <code>local-statusline.mjs</code> fetches that endpoint and never reads <code>.provider</code>; the settings.json hooks block (lines 529-813) has no EnterPlanMode matcher. <code>external:</code> Claude Code hooks reference, PreToolUse <code>permissionDecision: deny</code> with a reason.</dd>
+      <dt>Rationale</dt>
+      <dd>This is the user's most damaging complaint, because a stripped bypass flag persists for the instance, and every piece of the fix already exists unconnected. The two halves fail differently: the proxy half is stateless and needs no signal; the harness half explains itself to the model and protects against any model, including a future Anthropic one that decides to plan.</dd>
+      <dt>Downsides</dt>
+      <dd>A model that still tries to call a stripped tool gets an invalid-call error rather than a reason, which is why the harness deny is worth keeping alongside the proxy filter. An unconditional harness deny would also block legitimately requested plans; keying on provider avoids that, at the cost of the helper dependency. Reasserting bypass permissions after plan mode depends on what the CLI exposes to hooks and may need a version check.</dd>
+      <dt>Confidence</dt><dd>90%</dd>
+      <dt>Complexity</dt><dd>Low</dd>
+    </dl>
+    <figure>
+      <svg viewBox="0 0 800 175" role="img" aria-label="Two enforcement layers: the harness denies EnterPlanMode and reasserts bypass; the proxy drops the tool declaration; the provider signal flows back from the proxy to the harness">
+        <rect class="box acc" x="10" y="20" width="240" height="96" rx="8"/>
+        <text class="t" x="130" y="42" text-anchor="middle" font-weight="700">Claude Code + dotfiles hooks</text>
+        <text class="t" x="130" y="64" text-anchor="middle">PreToolUse: deny EnterPlanMode</text>
+        <text class="t" x="130" y="80" text-anchor="middle">when session is Codex-routed</text>
+        <text class="t" x="130" y="100" text-anchor="middle">ExitPlanMode: reassert bypass</text>
+        <path class="arrow" d="M250,50 L278,50"/>
+        <text class="lbl" x="264" y="42" text-anchor="middle">request</text>
+        <rect class="box acc" x="280" y="20" width="240" height="96" rx="8"/>
+        <text class="t" x="400" y="42" text-anchor="middle" font-weight="700">better-ccflare Codex provider</text>
+        <text class="t" x="400" y="64" text-anchor="middle">per-request tool filter drops</text>
+        <text class="t" x="400" y="80" text-anchor="middle">EnterPlanMode / ExitPlanMode</text>
+        <text class="t" x="400" y="100" text-anchor="middle">(same filter as Agent / Task)</text>
+        <path class="arrow" d="M520,50 L548,50"/>
+        <rect class="box" x="550" y="20" width="240" height="96" rx="8"/>
+        <text class="t" x="670" y="42" text-anchor="middle" font-weight="700">Codex</text>
+        <text class="t" x="670" y="70" text-anchor="middle">never sees a plan-mode tool</text>
+        <text class="t" x="670" y="88" text-anchor="middle">to call</text>
+        <path class="arrow" d="M400,150 L132,150"/>
+        <path d="M400,116 L400,150" stroke="var(--muted)" stroke-width="1.5" fill="none"/>
+        <path d="M130,116 L130,150" stroke="var(--muted)" stroke-width="1.5" fill="none"/>
+        <text class="lbl" x="265" y="143" text-anchor="middle">provider signal: GET /api/sessions/:id/account (already returns provider)</text>
+      </svg>
+      <figcaption>Belt (harness deny plus bypass reassert) and suspenders (proxy tool filter); the provider signal that already exists makes the harness half selective.</figcaption>
+    </figure>
+  </article>
+
+  <article class="idea" id="idea-3">
+    <div class="head"><span class="chip id">3.</span><h3>Translation-loss ledger</h3></div>
+    <div class="head"><span class="chip axis">Parity measurement and evidence</span><span class="chip conf">Confidence 85%</span><span class="chip cx">Complexity Medium</span><span class="chip">better-ccflare</span></div>
+    <dl>
+      <dt>Description</dt>
+      <dd>Telephony interworking functions silently dropped unsupported features until carriers standardized per-call loss codes in the call detail record. Add the equivalent to the <code>requests</code> table, in both migration files per the repo rule: compact flags and counters written by the Codex provider for every silent degradation and decision it makes on a turn. Image content replaced by a placeholder; oversized structured block replaced; reasoning item dropped; orchestration-admission state and whether Agent and Task were stripped; byte-cap trips; the raw Responses <code>incomplete</code> reason before it collapses to <code>max_tokens</code>; the resolved reasoning effort; and whether the "successful response without SSE" path fired. Every row is joinable on <code>client_session_id</code>, so any Claude Code session can be asked "what did the proxy do to you" in one query.</dd>
+      <dt>Axis</dt><dd>Parity measurement and evidence</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> the degradation sites at <code>provider.ts:3895-3898</code> (image replaced), <code>:3904-3910</code> (oversized replaced), <code>:4005-4012</code> (reasoning "dropped with no fallback branch"), <code>:6151-6159</code> (incomplete collapsed), and <code>:5330-5345</code> (cap trips routed through the close-block-then-error helper); verifier-confirmed against the full <code>CREATE TABLE requests</code> column list that none of them write a column, and that <code>orchestrationAdmission</code> never appears in <code>packages/proxy/</code>; <code>migrations-pg.ts:1768-1769</code> column-add pattern. Telemetry: stream terminal errors 0.078% versus 0.0027%, and 16,225 "successful response without SSE" warnings in 21 days.</dd>
+      <dt>Rationale</dt>
+      <dd>The "stops early" complaint does not look like conversational abandonment in the data: Codex's end-turn share is lower and the unfulfilled-promise heuristic fires less. It looks like stream truncation. Today, attributing a bad turn to any of the six silent sites requires transcript archaeology; with the ledger it is a query, and every other idea on this list becomes measurable per request rather than per anecdote. The chart under idea 5 was hand-built for this run; the ledger is what makes it a standing view.</dd>
+      <dt>Downsides</dt>
+      <dd>A schema change across two migration files and the usage collector, adding a handful of columns to a hot table. The flags describe what the proxy did, not what the model experienced, so correlating with session outcome still needs the transcript-side join. The 198 <code>context_length_exceeded</code> rows come from a separate upstream-error path and belong in their own column rather than the incomplete-reason one.</dd>
+      <dt>Confidence</dt><dd>85%</dd>
+      <dt>Complexity</dt><dd>Medium</dd>
+    </dl>
+    <figure>
+      <svg viewBox="0 0 800 215" role="img" aria-label="Six silent degradation sites in the Codex provider feed a set of ledger columns on the requests row, which joins to the Claude Code transcript on client_session_id">
+        <text class="row" x="10" y="14">SILENT SITES IN THE CODEX PROVIDER</text>
+        <rect class="box" x="10" y="22" width="250" height="24" rx="6"/><text class="t" x="20" y="38">image tool_result replaced</text>
+        <rect class="box" x="10" y="54" width="250" height="24" rx="6"/><text class="t" x="20" y="70">oversized block replaced</text>
+        <rect class="box" x="10" y="86" width="250" height="24" rx="6"/><text class="t" x="20" y="102">reasoning item dropped, no fallback</text>
+        <rect class="box" x="10" y="118" width="250" height="24" rx="6"/><text class="t" x="20" y="134">Agent / Task stripped by admission</text>
+        <rect class="box" x="10" y="150" width="250" height="24" rx="6"/><text class="t" x="20" y="166">incomplete reason collapsed</text>
+        <rect class="box" x="10" y="182" width="250" height="24" rx="6"/><text class="t" x="20" y="198">byte-cap trip / no-SSE response</text>
+        <path d="M260,34 L295,34 M260,66 L295,66 M260,98 L295,98 M260,130 L295,130 M260,162 L295,162 M260,194 L295,194" stroke="var(--muted)" stroke-width="1.5" fill="none"/>
+        <path d="M295,34 L295,194" stroke="var(--muted)" stroke-width="1.5" fill="none"/>
+        <path class="arrow" d="M295,114 L328,114"/>
+        <rect class="box acc" x="330" y="52" width="210" height="124" rx="8"/>
+        <text class="t" x="435" y="74" text-anchor="middle" font-weight="700">requests row (new columns)</text>
+        <text class="t" x="435" y="96" text-anchor="middle">loss flags · admission state</text>
+        <text class="t" x="435" y="114" text-anchor="middle">native stop reason · effort</text>
+        <text class="t" x="435" y="132" text-anchor="middle">cap trips · no-SSE flag</text>
+        <text class="t" x="435" y="158" text-anchor="middle">+ client_session_id (exists)</text>
+        <path class="arrow" d="M540,114 L578,114"/>
+        <rect class="box ok" x="580" y="76" width="210" height="76" rx="8"/>
+        <text class="t" x="685" y="100" text-anchor="middle" font-weight="700">one SQL join</text>
+        <text class="t" x="685" y="120" text-anchor="middle">to the Claude Code transcript</text>
+        <text class="t" x="685" y="138" text-anchor="middle">"what did the proxy do to me?"</text>
+      </svg>
+      <figcaption>Loss codes, not perfect parity: record what the translation did to each turn so the question becomes a query.</figcaption>
+    </figure>
+  </article>
+
+  <article class="idea" id="idea-4">
+    <div class="head"><span class="chip id">4.</span><h3>Map Claude Code's thinking budget to Codex reasoning effort</h3></div>
+    <div class="head"><span class="chip axis">Wire translation fidelity</span><span class="chip conf mid">Confidence 75%</span><span class="chip cx">Complexity Low</span><span class="chip">better-ccflare</span></div>
+    <dl>
+      <dt>Description</dt>
+      <dd>Every Claude Code turn routed to Codex is sent at reasoning effort <code>medium</code> (the gpt-5.6 family gets <code>xhigh</code>), regardless of what the client asked for. The request-side path never reads <code>thinking.budget_tokens</code>; <code>resolveAnthropicReasoningEffort</code> accepts only the non-standard <code>reasoning.effort</code> and <code>output_config.effort</code> passthrough fields. Map the budget the client actually sends onto the Codex effort tiers, keep the current defaults as the fallback when no budget is present, and record the resolved effort in the ledger so the effect can be read back.</dd>
+      <dt>Axis</dt><dd>Wire translation fidelity</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> <code>provider.ts:4485-4489</code> default branch; <code>packages/openai-formats/src/reasoning.ts</code> <code>TARGET_REASONING_EFFORTS</code> with no thinking-budget input; grep for <code>budget_tokens</code> and <code>body.thinking</code> in the Codex provider returns zero hits (verifier-confirmed; another provider in the repo does handle <code>budget_tokens</code>, corroborating it as the client's real wire field). <code>external:</code> OpenAI's GPT-5 prompting guide states that persistence reminders matter most at low reasoning effort because the model is more prone to end turns early.</dd>
+      <dt>Rationale</dt>
+      <dd>The operator runs sessions at high effort; those turns arrive at Codex flattened to medium. Reasoning effort is the one vendor-documented lever on the GPT family's stop-versus-continue tendency, and it is currently discarded at the wire. It is a bounded mapping change that can be reverted in one line.</dd>
+      <dt>Downsides</dt>
+      <dd>Higher effort costs latency and Codex quota, and the thresholds are a guess until the ledger and parity floors show whether early stops move. Claude Code budgets are token counts and Codex tiers are labels, so the mapping is monotone, not linear.</dd>
+      <dt>Confidence</dt><dd>75%</dd>
+      <dt>Complexity</dt><dd>Low</dd>
+    </dl>
+    <table>
+      <thead><tr><th>Client thinking budget (illustrative tiers)</th><th>Codex reasoning effort</th><th>Today</th></tr></thead>
+      <tbody>
+        <tr><td>no thinking block</td><td><code>medium</code> (unchanged default)</td><td><code>medium</code></td></tr>
+        <tr><td>budget below 8k tokens</td><td><code>low</code></td><td><code>medium</code></td></tr>
+        <tr><td>8k to 32k tokens</td><td><code>medium</code></td><td><code>medium</code></td></tr>
+        <tr><td>32k tokens and above</td><td><code>high</code></td><td><code>medium</code></td></tr>
+        <tr><td>gpt-5.6 family, any budget</td><td><code>xhigh</code> (unchanged)</td><td><code>xhigh</code></td></tr>
+      </tbody>
+    </table>
+  </article>
+
+  <article class="idea" id="idea-5">
+    <div class="head"><span class="chip id">5.</span><h3>Behavioral-parity floors and alerts</h3></div>
+    <div class="head"><span class="chip axis">Parity measurement and evidence</span><span class="chip conf">Confidence 80%</span><span class="chip cx">Complexity Medium</span><span class="chip">better-ccflare</span></div>
+    <dl>
+      <dt>Description</dt>
+      <dd>better-ccflare already ships a cache-parity verdict subsystem (declared floors; insufficient, below-parity, and at-parity verdicts; declared-versus-live drift) and per-provider cache-health alerting to Discord. Generalize the same policy-object and verdict shape to behavioral metrics the proxy can compute from request and response bodies: tool-result error rate by tool name (including Bash results carrying command-shape refusals), malformed tool-input rate, EnterPlanMode call rate, merge-refusal phrase rate, and stream-terminal error rate. Declare a floor per metric rather than one "match Anthropic" target, because Codex is not worse everywhere: its Workflow error rate is comparable and its unfulfilled-promise rate is lower. Turn the Codex trace writer on by default as the enabler, after settling whether full prompt-content capture should default on.</dd>
+      <dt>Axis</dt><dd>Parity measurement and evidence</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> <code>cache-parity.ts:180-229</code> verdict state machine, <code>cache-health.ts:78-90</code> per-provider policy, <code>cache-metrics.ts:30-165</code> normalization, verifier-confirmed as templates; the parity dossier's statement that "no equivalent floor/verdict/drift-report system" exists for error or tool-success rates; <code>trace.ts:1-19</code> env-gated, fail-swallowed writer; the telemetry deltas in the chart below.</dd>
+      <dt>Rationale</dt>
+      <dd>This run had to hand-build every comparison from raw SQL and gigabyte-scale transcript mining. The design cost was already paid in the cache work, and it is reusable. With floors and alerts, the next regression on the Codex lane is found by a Discord message, not by a user noticing agents refusing to merge.</dd>
+      <dt>Downsides</dt>
+      <dd>Metrics derived from response text are heuristics and need a documented denominator and countermetric. Codex sample sizes are small, so floors must encode a minimum n before issuing a verdict. It adds a second metric family to tune in the alerting pipeline.</dd>
+      <dt>Confidence</dt><dd>80%</dd>
+      <dt>Complexity</dt><dd>Medium</dd>
+    </dl>
+    <figure>
+      <svg viewBox="0 0 800 265" role="img" aria-label="Bar chart of tool error rates, Anthropic versus Codex: Bash 4.6 vs 9.1 percent, EnterWorktree 10.8 vs 61.7, Monitor 4.7 vs 83.3, malformed tool input 0.5 vs 1.4">
+        <line class="grid" x1="60" y1="200" x2="780" y2="200"/>
+        <line class="grid" x1="60" y1="155" x2="780" y2="155"/>
+        <line class="grid" x1="60" y1="110" x2="780" y2="110"/>
+        <line class="grid" x1="60" y1="65" x2="780" y2="65"/>
+        <line class="grid" x1="60" y1="20" x2="780" y2="20"/>
+        <text class="lbl" x="52" y="204" text-anchor="end">0%</text>
+        <text class="lbl" x="52" y="159" text-anchor="end">25%</text>
+        <text class="lbl" x="52" y="114" text-anchor="end">50%</text>
+        <text class="lbl" x="52" y="69" text-anchor="end">75%</text>
+        <text class="lbl" x="52" y="24" text-anchor="end">100%</text>
+        <rect class="bar-a" x="105" y="191.7" width="40" height="8.3" rx="2"/>
+        <rect class="bar-c" x="155" y="183.6" width="40" height="16.4" rx="2"/>
+        <text class="lbl" x="125" y="186" text-anchor="middle">4.6%</text>
+        <text class="lbl" x="175" y="178" text-anchor="middle">9.1%</text>
+        <text class="t" x="150" y="222" text-anchor="middle">Bash error</text>
+        <text class="lbl" x="150" y="238" text-anchor="middle">n = 88,046 / 4,457</text>
+        <rect class="bar-a" x="285" y="180.6" width="40" height="19.4" rx="2"/>
+        <rect class="bar-c" x="335" y="88.9" width="40" height="111.1" rx="2"/>
+        <text class="lbl" x="305" y="175" text-anchor="middle">10.8%</text>
+        <text class="lbl" x="355" y="83" text-anchor="middle">61.7%</text>
+        <text class="t" x="330" y="222" text-anchor="middle">EnterWorktree error</text>
+        <text class="lbl" x="330" y="238" text-anchor="middle">n = 713 / 60</text>
+        <rect class="bar-a" x="465" y="191.5" width="40" height="8.5" rx="2"/>
+        <rect class="bar-c" x="515" y="50.1" width="40" height="149.9" rx="2"/>
+        <text class="lbl" x="485" y="186" text-anchor="middle">4.7%</text>
+        <text class="lbl" x="535" y="44" text-anchor="middle">83.3%</text>
+        <text class="t" x="510" y="222" text-anchor="middle">Monitor error</text>
+        <text class="lbl" x="510" y="238" text-anchor="middle">n = 898 / 24</text>
+        <rect class="bar-a" x="645" y="198" width="40" height="2" rx="1"/>
+        <rect class="bar-c" x="695" y="197.5" width="40" height="2.5" rx="1"/>
+        <text class="lbl" x="665" y="192" text-anchor="middle">0.5%</text>
+        <text class="lbl" x="715" y="191" text-anchor="middle">1.4%</text>
+        <text class="t" x="690" y="222" text-anchor="middle">Malformed tool input</text>
+        <text class="lbl" x="690" y="238" text-anchor="middle">n = 131k / 12k blocks</text>
+        <rect class="bar-a" x="600" y="8" width="12" height="12" rx="2"/><text class="lbl" x="618" y="18">Anthropic</text>
+        <rect class="bar-c" x="690" y="8" width="12" height="12" rx="2"/><text class="lbl" x="708" y="18">Codex</text>
+        <text class="lbl" x="420" y="258" text-anchor="middle">Hand-built for this run from 21 days of transcripts; a parity floor per metric would make this a standing, alerting view.</text>
+      </svg>
+      <figcaption>The gap is not uniform: two tools fail most of the time under Codex while the malformed-input delta is small. Floors should be declared per metric.</figcaption>
+    </figure>
+  </article>
+
+  <article class="idea" id="idea-6">
+    <div class="head"><span class="chip id">6.</span><h3>Codex-aware authority and persistence layer</h3></div>
+    <div class="head"><span class="chip axis">Authority and persistence framing</span><span class="chip conf mid">Confidence 60%</span><span class="chip cx">Complexity Low</span><span class="chip">better-ccflare + dotfiles</span></div>
+    <dl>
+      <dt>Description</dt>
+      <dd>Claude Code's full system prompt reaches Codex byte-for-byte, and the only instruction the provider ever adds is a one-line continuation nudge when a Skill result lands in the final turn, whose own comment reads "Native Claude continues on its own; Codex often stops." Two moves. In dotfiles, restore the concrete operator grant that was demoted out of the always-loaded CLAUDE.md ("that is your job", now only in HARNESS.md) next to the background-job line that says never merge, so a literal reader sees the grant and its exception together. In better-ccflare, generalize the nudge into a cache-stable augmentation point on the Codex <code>instructions</code> and inject the already-written GPT-5 persistence and completeness blocks from the <code>gpt-5-4-prompting</code> skill, plus Cursor's framing that actions are pre-authorized and reversible so the model should not ask whether to proceed. A maximal variant rewrites Claude-native phrasing wholesale; the minimal variant appends only.</dd>
+      <dt>Axis</dt><dd>Authority and persistence framing</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> <code>provider.ts:3463-3473</code> verbatim system join; <code>provider.ts:4344-4363</code> is the sole injected instruction in the file; <code>HARNESS.md:52-55</code> "Demoted from claude/CLAUDE.md ... 'that is your job'"; three dated memory notes record operators correcting agents that deferred merges; telemetry: all 10 Codex merge-phrase hits are hard refusals with zero soft-defer variants, while Anthropic's 75 are mixed. <code>external:</code> OpenAI GPT-5 prompting guide persistence block; Cursor's act-first fix; openai/codex#42124 showing the native Codex CLI stopping early with no blocker.</dd>
+      <dt>Rationale</dt>
+      <dd>The refusal pattern is specific and unanimous in the Codex sample and absent in the Anthropic one, and the GPT family's own vendor documents both the trait and the prompt shape that counters it. The mechanism to inject it is already in production for one trigger; only its scope is narrow.</dd>
+      <dt>Downsides</dt>
+      <dd>Prose fixes are the least certain lever for this model family. Direct Codex delegation gets its authority from configuration (<code>approval: never</code>), which the ccflare path cannot reach, so the structural ideas above rank ahead of this one. "Pre-authorized, do not ask" framing must stay inside the operator's actual permission posture or it launders authority. A reactive variant that detects refusal phrases and injects corrective turns was considered and cut as a symptom patch on ten samples.</dd>
+      <dt>Confidence</dt><dd>60%</dd>
+      <dt>Complexity</dt><dd>Low</dd>
+    </dl>
+  </article>
+
+  <article class="idea" id="idea-7">
+    <div class="head"><span class="chip id">7.</span><h3>Codex conformance harness under the scripting carve-out</h3></div>
+    <div class="head"><span class="chip axis">Wire translation fidelity</span><span class="chip conf">Confidence 80%</span><span class="chip cx">Complexity Medium</span><span class="chip">better-ccflare</span></div>
+    <dl>
+      <dt>Description</dt>
+      <dd>The repo bans scripted traffic to Anthropic-backed accounts and names <code>x-better-ccflare-account-id</code> force-routing as the sanctioned way to script against everything else. Build a regression suite that sends real Claude-Code-shaped requests to a Codex account and asserts the documented edge cases: empty-string optional arguments, positional tool-call-id pairing, <code>incomplete</code> reason handling, reasoning-item round-trip across turns, oversized and image tool-result replacement, tool-array filtering for Agent, Task, and EnterPlanMode, and reasoning-effort mapping. Each ledger flag from idea 3 and each parity regression from idea 5 becomes a replayable case.</dd>
+      <dt>Axis</dt><dd>Wire translation fidelity</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> the AGENTS.md testing restriction, verifier-confirmed verbatim; <code>provider.ts:4053-4090</code> empty-string normalization as a first case; currently zero regression coverage short of production telemetry weeks later. <code>external:</code> anyclaude issues #18 and #22 show the same failure class going unfixed for months in a sibling proxy that has no such suite.</dd>
+      <dt>Rationale</dt>
+      <dd>Every earlier Codex fix in this repo (#367, #372, #377) was found in production. A suite that runs under the existing carve-out converts each fix into a guard that survives the next upstream sync or Codex client-identity bump.</dd>
+      <dt>Downsides</dt>
+      <dd>Spends real Codex quota per run and needs a dedicated test account or a budget rule. The Anthropic side of any parity assertion must come from recorded transcripts, never live traffic, so true A/B is out of scope by rule.</dd>
+      <dt>Confidence</dt><dd>80%</dd>
+      <dt>Complexity</dt><dd>Medium</dd>
+    </dl>
+  </article>
+
+  <div class="callout">
+    <div class="eyebrow">Sequencing note</div>
+    <p>Ideas 1 and 2 fix the two most concrete complaints and need no new measurement. Idea 3 is what turns every later question into a query; ideas 4 and 6 are the levers whose effect it would read back. Idea 5 makes regressions self-reporting and idea 7 makes each fix a guard. Structural ideas rank above the prose one on purpose: for this model family, configuration and tool surface have moved behavior where instructions have not.</p>
+  </div>
+</section>
+
+<section id="rejection-summary">
+  <h2>Rejection Summary</h2>
+  <table>
+    <thead><tr><th>#</th><th>Idea</th><th>Reason Rejected</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Reactive refusal-detection nudge (proxy detects "cannot merge" phrases in output and injects a corrective turn)</td><td>Weak basis: a symptom patch on ten samples; matching model output with regexes and injecting synthetic turns is an inference layer with false-positive risk. Revisit only if idea 6 fails to move the refusal rate.</td></tr>
+      <tr><td>2</td><td>Restore a root-scoped <code>parallel_tool_calls:false</code> guard and replace the strip with a fan-out cap</td><td>Citation mischaracterized: no commit ever conditioned parallel tool calls on Agent/Task presence, so the "July permanent fix" recorded in memory never shipped as described. Fan-out capping is covered by idea 1 plus the existing fanout-admission hook.</td></tr>
+      <tr><td>3</td><td>Preserve native stop reasons as a standalone fix</td><td>Merged into idea 3 as a ledger column. The 198 <code>context_length_exceeded</code> rows come from a separate error-classification path, not the collapse site.</td></tr>
+      <tr><td>4</td><td>Reframe "stops early" as stream truncation and instrument it</td><td>Merged into idea 3; its counter-finding is carried in that card's rationale.</td></tr>
+      <tr><td>5</td><td>Standing transcript-parity report script in dotfiles</td><td>Process artifact with no named consumer or gate. Idea 5 covers the same metrics with an alert as the consumer.</td></tr>
+      <tr><td>6</td><td>Provider-signal hook helper as a standalone item</td><td>Merged into idea 2 as its enabling step; it has standalone value for any future provider-conditional hook.</td></tr>
+      <tr><td>7</td><td>Session circuit breaker on EnterWorktree and Monitor failure streaks</td><td>Symptom-first on n = 60 and n = 24. The root cause is unestablished and may be the worktree command-shape verifier refusing Codex-generated shell syntax; measure through idea 5 first.</td></tr>
+      <tr><td>8</td><td>Schema-driven tool-argument repair pass</td><td>Refuted: <code>provider.ts:4053-4090</code> already applies a generic schema-driven empty-string and optional-parameter pass to every tool with a registered schema; only the Read and WebSearch blocks are name-gated.</td></tr>
+      <tr><td>9</td><td>Always-on Codex tracing as a standalone item</td><td>Folded into idea 5 as its enabler. The open question is whether full prompt-content capture should default on.</td></tr>
+      <tr><td>10</td><td>"Weigh structural fixes above prose fixes" as an idea</td><td>Not an idea but a ranking heuristic; applied, so the structural survivors rank above the prose one.</td></tr>
+      <tr><td>11</td><td>Full instruction rewrite for Codex (replace Claude-native phrasing wholesale)</td><td>Maximal variant of idea 6; carried as an option inside that card rather than ranked separately.</td></tr>
+      <tr><td>12</td><td>Explicit "you have the controls" callout as a standalone item</td><td>Merged into idea 1.</td></tr>
+      <tr><td>13</td><td>Instrument 64 KiB byte-cap trips before touching cap values</td><td>Folded into idea 3 as a ledger flag. The verifier's read confirmed cap trips already raise an explicit error rather than silently truncating.</td></tr>
+      <tr><td>14</td><td>Parity flywheel bundle (ledger plus floors plus harness)</td><td>Overstated coupling; the three pieces stand alone as ideas 3, 5, and 7.</td></tr>
+      <tr><td>15</td><td>Codex-only alert on the "successful response without SSE" path</td><td>Folded into idea 3 as a flag and idea 5 as a floor.</td></tr>
+      <tr><td>16</td><td>Instrument EnterWorktree and Monitor argument shapes as a standalone item</td><td>Merged into the refuted repair idea's evidence and into idea 5's per-tool error floors.</td></tr>
+    </tbody>
+  </table>
+  <p>Every axis kept at least one survivor; no coverage gap remains.</p>
+</section>
+
+<section id="sources-and-references">
+  <h2>Sources &amp; References</h2>
+  <h4>Repository (StartupBros-com/better-ccflare)</h4>
+  <ul>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/providers/src/providers/codex/provider.ts">packages/providers/src/providers/codex/provider.ts</a> — the Claude Code to Codex translator</li>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/providers/src/providers/codex/orchestration-election.ts">packages/providers/src/providers/codex/orchestration-election.ts</a> — root election and the one-way ratchet</li>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/providers/src/providers/codex/turn-state.ts">packages/providers/src/providers/codex/turn-state.ts</a> — cohort machinery (retire-flagged)</li>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/providers/src/providers/codex/trace.ts">packages/providers/src/providers/codex/trace.ts</a> — env-gated per-turn trace writer</li>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/openai-formats/src/reasoning.ts">packages/openai-formats/src/reasoning.ts</a> — reasoning-effort resolution</li>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/http-api/src/handlers/sessions.ts">packages/http-api/src/handlers/sessions.ts</a> — per-session provider endpoint</li>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/database/src/migrations.ts">packages/database/src/migrations.ts</a> and <a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/database/src/migrations-pg.ts">migrations-pg.ts</a> — requests table schema</li>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/proxy/src/usage-collector.ts">packages/proxy/src/usage-collector.ts</a> — writes the requests row</li>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/AGENTS.md">AGENTS.md</a> — testing restrictions and migration-parity rule</li>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/docs/solutions/integration-issues/codex-cache-affinity-needs-session-id-header.md">docs/solutions/integration-issues/codex-cache-affinity-needs-session-id-header.md</a> — precedent for silent Codex divergence</li>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/pull/367">PR #367</a> session-id affinity · <a href="https://github.com/StartupBros-com/better-ccflare/pull/369">PR #369</a> cache-degradation alerts · <a href="https://github.com/StartupBros-com/better-ccflare/pull/372">PR #372</a> optional-argument preservation · <a href="https://github.com/StartupBros-com/better-ccflare/pull/377">PR #377</a> client identity · <a href="https://github.com/StartupBros-com/better-ccflare/pull/288">PR #288</a> stream-drain settlement</li>
+    <li><a href="https://github.com/StartupBros-com/better-ccflare/commit/25377e00a">commit 25377e00a</a> — admission-strip mechanism</li>
+  </ul>
+  <h4>Harness (dotfiles, local)</h4>
+  <ul>
+    <li><code>claude/CLAUDE.md</code>, <code>claude/HARNESS.md:52-55</code> — merge authority and its demoted concrete form</li>
+    <li><code>claude/settings.json:529-813</code> — hooks block</li>
+    <li><code>claude/hooks/PreToolUse/</code> — fanout-admission, git-guard, settings-guard patterns</li>
+    <li><code>claude/statusline-stack/local-statusline.mjs:100-159</code> — provider endpoint fetch and file-cache pattern</li>
+    <li><code>claude/harness/worktree-command-shapes.md</code> — command-shape verifier refusals</li>
+  </ul>
+  <h4>External</h4>
+  <ul>
+    <li><a href="https://developers.openai.com/cookbook/examples/gpt-5/gpt-5_prompting_guide">OpenAI GPT-5 prompting guide</a> — persistence block, effort interaction, Cursor's act-first fix</li>
+    <li><a href="https://developers.openai.com/api/docs/guides/reasoning">OpenAI Responses API reasoning guide</a> — encrypted reasoning continuity, phase field</li>
+    <li><a href="https://github.com/openai/codex/issues/42124">openai/codex#42124</a> — native Codex CLI stopping early with no blocker</li>
+    <li><a href="https://github.com/coder/anyclaude/issues/18">coder/anyclaude#18</a> and <a href="https://github.com/coder/anyclaude/issues/22">#22</a> — sibling proxy tool-call failures</li>
+    <li><a href="https://openrouter.ai/docs/api-reference/overview">OpenRouter API overview</a> — native_finish_reason pattern</li>
+    <li><a href="https://code.claude.com/docs/en/hooks">Claude Code hooks reference</a> — PreToolUse deny, Stop block, SessionStart injection</li>
+  </ul>
+</section>
+
+<footer class="composition-signal">Composed <time datetime="2026-09-24T21:10Z">2026-09-24T21:10Z</time> by ce-ideate from the operator's focus prompt on Codex-routed Claude Code behavior, grounded in 21 days of better-ccflare telemetry and six evidence dossiers.</footer>
+</main>
+</body>
+</html>
