@@ -1,4 +1,7 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	CODEX_AFFINITY_HEADERS_ENV,
 	CODEX_ROUTING_HINT_HEADER,
@@ -11,6 +14,7 @@ import {
 	CODEX_NATIVE_RESPONSES_HEADER,
 	CodexProvider,
 } from "./provider";
+import { CODEX_TRACE_DIR_ENV, CODEX_TRACE_HMAC_KEY_ENV } from "./trace";
 
 const account = {
 	id: "account-a",
@@ -21,6 +25,8 @@ const account = {
 } as Parameters<CodexProvider["transformRequestBody"]>[1];
 const sessionId = "11111111-1111-4111-8111-111111111111";
 const physicalModel = "gpt-5.6-sol";
+
+let traceDir = "";
 
 function requestFor(
 	extraHeaders: Record<string, string> = {},
@@ -61,8 +67,41 @@ async function transform(request: Request) {
 	return { headers: transformed.headers, body };
 }
 
+/**
+ * The request-phase trace record the transform just wrote. Trace writes are
+ * synchronous, so the record is on disk by the time transformRequestBody
+ * resolves; the post-deploy verification recipe reads exactly these fields.
+ */
+function traceAffinity(): {
+	affinity_session_identity: unknown;
+	affinity_routing_hint: unknown;
+} {
+	const file = readdirSync(traceDir).find((f) => f.endsWith(".jsonl"));
+	if (!file) throw new Error("no trace file written");
+	const records = readFileSync(join(traceDir, file), "utf8")
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as Record<string, unknown>);
+	const request = records.filter((record) => record.phase === "request").pop();
+	if (!request) throw new Error("no request-phase trace record");
+	return {
+		affinity_session_identity: request.affinity_session_identity,
+		affinity_routing_hint: request.affinity_routing_hint,
+	};
+}
+
+beforeEach(() => {
+	traceDir = mkdtempSync(join(tmpdir(), "codex-affinity-headers-"));
+	process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+	process.env[CODEX_TRACE_HMAC_KEY_ENV] = "test-only-key";
+});
+
 afterEach(() => {
 	delete process.env[CODEX_AFFINITY_HEADERS_ENV];
+	delete process.env[CODEX_TRACE_DIR_ENV];
+	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
+	rmSync(traceDir, { recursive: true, force: true });
 	resetOrchestrationElectionForTest();
 });
 
@@ -76,6 +115,10 @@ describe("CodexProvider cache affinity headers", () => {
 		expect(headers.get(CODEX_ROUTING_HINT_HEADER)).toBe(
 			`model=${physicalModel}`,
 		);
+		expect(traceAffinity()).toEqual({
+			affinity_session_identity: "derived",
+			affinity_routing_hint: true,
+		});
 	});
 
 	test("consecutive turns of one conversation share the same session-id", async () => {
@@ -99,6 +142,7 @@ describe("CodexProvider cache affinity headers", () => {
 		expect(headers.get(CODEX_ROUTING_HINT_HEADER)).toBe(
 			`model=${physicalModel}`,
 		);
+		expect(traceAffinity().affinity_session_identity).toBe("derived");
 	});
 
 	test("native /v1/responses keeps the client's own identity while the hint follows the resolved model", async () => {
@@ -119,6 +163,10 @@ describe("CodexProvider cache affinity headers", () => {
 		expect(headers.get(CODEX_ROUTING_HINT_HEADER)).toBe(
 			`model=${physicalModel}`,
 		);
+		expect(traceAffinity()).toEqual({
+			affinity_session_identity: "client",
+			affinity_routing_hint: true,
+		});
 	});
 
 	test("without a session id there is no key and no session headers, but the hint still routes", async () => {
@@ -136,6 +184,10 @@ describe("CodexProvider cache affinity headers", () => {
 		expect(headers.get(CODEX_ROUTING_HINT_HEADER)).toBe(
 			`model=${physicalModel}`,
 		);
+		expect(traceAffinity()).toEqual({
+			affinity_session_identity: null,
+			affinity_routing_hint: true,
+		});
 	});
 
 	test("off the subscription endpoint the headers are left untouched", async () => {
@@ -147,6 +199,10 @@ describe("CodexProvider cache affinity headers", () => {
 		);
 		expect(headers.get(CODEX_SESSION_ID_HEADER)).toBe("client-session");
 		expect(headers.has(CODEX_ROUTING_HINT_HEADER)).toBe(false);
+		expect(traceAffinity()).toEqual({
+			affinity_session_identity: null,
+			affinity_routing_hint: false,
+		});
 	});
 
 	test("kill switch restores pass-through", async () => {
@@ -156,5 +212,9 @@ describe("CodexProvider cache affinity headers", () => {
 		);
 		expect(headers.get(CODEX_SESSION_ID_HEADER)).toBe("client-session");
 		expect(headers.has(CODEX_ROUTING_HINT_HEADER)).toBe(false);
+		expect(traceAffinity()).toEqual({
+			affinity_session_identity: null,
+			affinity_routing_hint: false,
+		});
 	});
 });
