@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { type CodexCatalogEvt, codexCatalogEvents } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
 	CodexProvider,
@@ -11,13 +15,18 @@ import {
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import {
+	CODEX_CATALOG_STALE_ALERT_MS,
 	clearCodexModelCacheForAccount,
 	clearCodexModelCacheForTests,
 	ensureCodexModelDefaults,
+	evaluateCodexCatalogStaleness,
+	evaluateCodexClientIdentityRecord,
 	getCodexModels,
 	getKnownCodexModels,
 	initCodexModelCatalogRefresh,
 	lowestTierCodexModel,
+	CATALOG_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS,
+	reportCatalogRoleRouteFailClosed,
 	revalidateUnknownCodexModel,
 } from "../codex-model-catalog";
 import type { ProxyContext } from "../handlers/proxy-types";
@@ -1254,5 +1263,457 @@ describe("ensureCodexModelDefaults", () => {
 		clearCodexModelCacheForTests();
 		await ensureCodexModelDefaults(account, makeCtx(account), () => 50_000);
 		expect(fetches).toBe(2);
+	});
+});
+
+/**
+ * The catalog side of the Codex alerts (issue #370 unit 6): the proxy only
+ * emits typed events on the core bus; AlertService turns them into alerts.
+ */
+type CatalogEventOf<T extends CodexCatalogEvt["type"]> = Extract<
+	CodexCatalogEvt,
+	{ type: T }
+>;
+
+function collectCatalogEvents() {
+	const events: CodexCatalogEvt[] = [];
+	const listener = (event: CodexCatalogEvt) => {
+		events.push(event);
+	};
+	codexCatalogEvents.on("event", listener);
+	return {
+		events,
+		of<T extends CodexCatalogEvt["type"]>(type: T): CatalogEventOf<T>[] {
+			return events.filter(
+				(event): event is CatalogEventOf<T> => event.type === type,
+			);
+		},
+		stop() {
+			codexCatalogEvents.off("event", listener);
+		},
+	};
+}
+
+function serve(body: unknown, status = 200): void {
+	globalThis.fetch = (async () =>
+		typeof body === "string"
+			? new Response(body, { status })
+			: new Response(JSON.stringify(body), {
+					status,
+					headers: { "content-type": "application/json" },
+				})) as unknown as typeof globalThis.fetch;
+}
+
+/** Bounded polling for a positive assertion; never a fixed real-time wait. */
+async function waitUntil(
+	predicate: () => boolean,
+	iterations = 400,
+): Promise<void> {
+	for (let i = 0; i < iterations && !predicate(); i++) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	expect(predicate()).toBe(true);
+}
+
+describe("Codex catalog alert events", () => {
+	let collected: ReturnType<typeof collectCatalogEvents>;
+
+	beforeEach(() => {
+		collected = collectCatalogEvents();
+	});
+
+	afterEach(() => {
+		collected.stop();
+	});
+
+	it("publishes a first own catalog without reporting a role change", async () => {
+		serve(LIVE_BODY);
+		await getCodexModels("acc-codex", makeCtx(makeAccount()));
+
+		expect(collected.of("role_target_changed")).toEqual([]);
+		expect(collected.of("own_catalog_published")).toEqual([
+			{
+				type: "own_catalog_published",
+				accountId: "acc-codex",
+				accountName: "codex-account",
+				models: ["gpt-5.6-sol", "gpt-5.4-mini"],
+				roleTargets: {
+					fable: "gpt-5.6-sol",
+					opus: "gpt-5.6-sol",
+					sonnet: "gpt-5.4-mini",
+					haiku: "gpt-5.4-mini",
+				},
+			},
+		]);
+	});
+
+	it("reports each changed role target exactly once and nothing on a same-value republish", async () => {
+		const ctx = makeCtx(makeAccount());
+		serve(LIVE_BODY);
+		await getCodexModels("acc-codex", ctx);
+		serve(NEW_FRONTIER_BODY);
+		await getCodexModels("acc-codex", ctx);
+
+		const changes = [
+			{ family: "fable", from: "gpt-5.6-sol", to: "gpt-6-codex" },
+			{ family: "opus", from: "gpt-5.6-sol", to: "gpt-6-codex" },
+			{ family: "sonnet", from: "gpt-5.4-mini", to: "gpt-5.6-sol" },
+			{ family: "haiku", from: "gpt-5.4-mini", to: "gpt-5.6-sol" },
+		] as const;
+		const expected = changes.map(
+			(change): CatalogEventOf<"role_target_changed"> => ({
+				type: "role_target_changed",
+				accountId: "acc-codex",
+				accountName: "codex-account",
+				...change,
+			}),
+		);
+		expect(collected.of("role_target_changed")).toEqual(expected);
+
+		await getCodexModels("acc-codex", ctx);
+		expect(collected.of("role_target_changed")).toEqual(expected);
+		expect(collected.of("own_catalog_published")).toHaveLength(3);
+	});
+
+	it("emits nothing for a failed, empty or malformed refresh", async () => {
+		const ctx = makeCtx(makeAccount());
+		serve(LIVE_BODY);
+		await getCodexModels("acc-codex", ctx);
+		collected.events.length = 0;
+
+		const replies: Array<[unknown, number]> = [
+			["unavailable", 503],
+			[{ models: [] }, 200],
+			["{not json", 200],
+			[{ models: "gpt-9" }, 200],
+			[null, 200],
+			[{ models: [{ slug: 42, visibility: "list" }] }, 200],
+		];
+		for (const [body, status] of replies) {
+			serve(body, status);
+			const listing = await getCodexModels("acc-codex", ctx);
+			expect(listing?.source).toBe("cached");
+		}
+
+		expect(collected.events).toEqual([]);
+		expect(
+			getKnownCodexModels("acc-codex")?.models.map((model) => model.id),
+		).toEqual(["gpt-5.6-sol", "gpt-5.4-mini"]);
+	});
+
+	it("never publishes a borrowed listing as the borrower's own", async () => {
+		serve(LIVE_BODY);
+		await getCodexModels("acc-codex", makeCtx(makeAccount()));
+		collected.events.length = 0;
+
+		serve("nope", 401);
+		const listing = await getCodexModels(
+			"acc-blind",
+			makeCtx(makeAccount({ id: "acc-blind" })),
+		);
+
+		expect(listing?.source).toBe("shared");
+		expect(collected.events).toEqual([]);
+	});
+
+	it("treats a recreated account's first publication as a first load", async () => {
+		const ctx = makeCtx(makeAccount());
+		serve(LIVE_BODY);
+		await getCodexModels("acc-codex", ctx);
+		clearCodexModelCacheForAccount("acc-codex");
+		serve(NEW_FRONTIER_BODY);
+		await getCodexModels("acc-codex", ctx);
+
+		expect(collected.of("role_target_changed")).toEqual([]);
+		expect(collected.of("own_catalog_published")).toHaveLength(2);
+	});
+
+	describe("stale own catalogs", () => {
+		const BASE_NOW = 1_800_000_000_000;
+
+		it("uses a conservative threshold of four refresh intervals", () => {
+			expect(CODEX_CATALOG_STALE_ALERT_MS).toBe(4 * REFRESH_INTERVAL_MS);
+		});
+
+		it("reports a stale own catalog only past the threshold after a failed attempt", async () => {
+			let now = BASE_NOW;
+			const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+			try {
+				const account = makeAccount({ expires_at: BASE_NOW + 10 * 3_600_000 });
+				const ctx = makeCtx(account);
+				serve(LIVE_BODY);
+				await getCodexModels(account.id, ctx);
+
+				// Old but healthy: the latest attempt succeeded.
+				evaluateCodexCatalogStaleness(
+					[account],
+					BASE_NOW + 10 * CODEX_CATALOG_STALE_ALERT_MS,
+				);
+				expect(collected.of("catalog_stale")).toEqual([]);
+
+				now = BASE_NOW + REFRESH_INTERVAL_MS + 1;
+				serve("unavailable", 503);
+				await getCodexModels(account.id, ctx);
+
+				// Failed, but not yet past the threshold.
+				evaluateCodexCatalogStaleness(
+					[account],
+					BASE_NOW + CODEX_CATALOG_STALE_ALERT_MS,
+				);
+				expect(collected.of("catalog_stale")).toEqual([]);
+
+				evaluateCodexCatalogStaleness(
+					[account],
+					BASE_NOW + CODEX_CATALOG_STALE_ALERT_MS + 1,
+				);
+				expect(collected.of("catalog_stale")).toEqual([
+					{
+						type: "catalog_stale",
+						accountId: account.id,
+						accountName: account.name,
+						ageMs: CODEX_CATALOG_STALE_ALERT_MS + 1,
+					},
+				]);
+
+				// An account the refresh would skip is never reported.
+				evaluateCodexCatalogStaleness(
+					[{ ...account, paused: true }],
+					BASE_NOW + 2 * CODEX_CATALOG_STALE_ALERT_MS,
+				);
+				expect(collected.of("catalog_stale")).toHaveLength(1);
+
+				// A later success clears the failed-attempt state.
+				serve(LIVE_BODY);
+				await getCodexModels(account.id, ctx);
+				evaluateCodexCatalogStaleness(
+					[account],
+					now + 2 * CODEX_CATALOG_STALE_ALERT_MS,
+				);
+				expect(collected.of("catalog_stale")).toHaveLength(1);
+			} finally {
+				nowSpy.mockRestore();
+			}
+		});
+
+		it("never reports an account that has no catalog of its own", async () => {
+			const account = makeAccount({ id: "acc-never-listed" });
+			serve("nope", 401);
+			await getCodexModels(account.id, makeCtx(account));
+
+			evaluateCodexCatalogStaleness(
+				[account],
+				Date.now() + 10 * CODEX_CATALOG_STALE_ALERT_MS,
+			);
+
+			expect(collected.events).toEqual([]);
+		});
+
+		it("is evaluated by the refresh heartbeat after its own attempt fails", async () => {
+			let now = BASE_NOW;
+			const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+			const randomSpy = spyOn(Math, "random").mockReturnValue(0);
+			const account = makeAccount({ expires_at: BASE_NOW + 10 * 3_600_000 });
+			const ctx = makeCtx(account);
+			ctx.dbOps.getAllAccounts = async () => [account];
+			let stop = (): void => {};
+			try {
+				serve(LIVE_BODY);
+				await getCodexModels(account.id, ctx);
+				serve("unavailable", 503);
+				now = BASE_NOW + CODEX_CATALOG_STALE_ALERT_MS + 60_000;
+
+				stop = initCodexModelCatalogRefresh(ctx, {
+					initialDelayMs: 1,
+					tickSeconds: 0.01,
+				});
+				await waitUntil(() => collected.of("catalog_stale").length > 0);
+
+				expect(collected.of("catalog_stale")[0]).toEqual({
+					type: "catalog_stale",
+					accountId: account.id,
+					accountName: account.name,
+					ageMs: CODEX_CATALOG_STALE_ALERT_MS + 60_000,
+				});
+			} finally {
+				stop();
+				nowSpy.mockRestore();
+				randomSpy.mockRestore();
+			}
+		});
+	});
+
+	describe("verified Codex CLI version record", () => {
+		const previousPath = process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
+		const previousVersion = process.env.CCFLARE_CODEX_CLIENT_VERSION;
+		let dir: string;
+
+		function writeRecord(name: string, verifiedAt: string): string {
+			const file = join(dir, name);
+			writeFileSync(
+				file,
+				JSON.stringify({
+					schemaVersion: 1,
+					packageName: "@openai/codex",
+					version: "0.190.0",
+					verifiedAt,
+				}),
+			);
+			return file;
+		}
+
+		beforeEach(() => {
+			dir = mkdtempSync(join(tmpdir(), "ccflare-codex-identity-alert-"));
+			delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			delete process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
+		});
+
+		afterEach(() => {
+			if (previousPath === undefined)
+				delete process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
+			else process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = previousPath;
+			if (previousVersion === undefined)
+				delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			else process.env.CCFLARE_CODEX_CLIENT_VERSION = previousVersion;
+			rmSync(dir, { recursive: true, force: true });
+		});
+
+		it("stays silent for an install without the updater", () => {
+			evaluateCodexClientIdentityRecord();
+			expect(collected.events).toEqual([]);
+		});
+
+		it("stays silent while a configured record is fresh", () => {
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = writeRecord(
+				"fresh",
+				new Date(Date.now() - 24 * 60 * 60_000).toISOString(),
+			);
+			evaluateCodexClientIdentityRecord();
+			expect(collected.events).toEqual([]);
+		});
+
+		it("reports a configured record that has gone stale", () => {
+			const verifiedAt = new Date(
+				Date.now() - 40 * 24 * 60 * 60_000,
+			).toISOString();
+			const file = writeRecord("stale", verifiedAt);
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = file;
+
+			evaluateCodexClientIdentityRecord();
+
+			expect(collected.of("identity_record_stale")).toEqual([
+				{
+					type: "identity_record_stale",
+					error: "stale_record",
+					version: "0.190.0",
+					verifiedAt,
+				},
+			]);
+			expect(JSON.stringify(collected.events)).not.toContain(dir);
+		});
+
+		it("reports a configured record that is missing", () => {
+			const file = join(dir, "missing");
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = file;
+
+			evaluateCodexClientIdentityRecord();
+
+			const [event] = collected.of("identity_record_stale");
+			expect(event).toMatchObject({
+				type: "identity_record_stale",
+				error: "unavailable_record",
+			});
+			expect(typeof event?.version).toBe("string");
+			expect(JSON.stringify(collected.events)).not.toContain(dir);
+		});
+
+		it("defers to an explicit client version", () => {
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.200.0";
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = join(dir, "missing");
+			evaluateCodexClientIdentityRecord();
+			expect(collected.events).toEqual([]);
+		});
+
+		it("is evaluated once per refresh cycle by the heartbeat, never per tick", async () => {
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = join(dir, "missing");
+			const ctx = makeCtx(null);
+			ctx.dbOps.getAllAccounts = async () => [];
+			const stop = initCodexModelCatalogRefresh(ctx, {
+				initialDelayMs: 1,
+				tickSeconds: 0.01,
+			});
+			try {
+				await waitUntil(() => collected.of("identity_record_stale").length > 0);
+				// Later heartbeat ticks inside the same refresh cycle stay quiet.
+				await waitRealMs(60);
+				expect(collected.of("identity_record_stale")).toHaveLength(1);
+			} finally {
+				stop();
+			}
+		});
+	});
+
+	describe("catalog-role route fail-closed reports", () => {
+		const T = 1_000_000;
+
+		it("reports each profile, account and reason once per throttle window", () => {
+			const mismatch = {
+				accountId: "acc-role",
+				reason: "catalog_role_mismatch",
+			};
+			reportCatalogRoleRouteFailClosed("codex-opus", mismatch, T);
+			reportCatalogRoleRouteFailClosed("codex-opus", mismatch, T + 1_000);
+			expect(collected.of("route_role_unavailable")).toEqual([
+				{
+					type: "route_role_unavailable",
+					profileId: "codex-opus",
+					accountId: "acc-role",
+					reason: "catalog_role_mismatch",
+				},
+			]);
+
+			reportCatalogRoleRouteFailClosed(
+				"codex-opus",
+				{ accountId: "acc-role", reason: "catalog_role_unavailable" },
+				T + 1_000,
+			);
+			expect(collected.of("route_role_unavailable")).toHaveLength(2);
+
+			reportCatalogRoleRouteFailClosed("codex-opus", mismatch, T + 60_001);
+			expect(collected.of("route_role_unavailable")).toHaveLength(3);
+		});
+
+		it("omits the account for a pool profile, whose error names the profile", () => {
+			reportCatalogRoleRouteFailClosed(
+				"codex-opus-pool",
+				{ accountId: "codex-opus-pool", reason: "catalog_role_unavailable" },
+				T,
+			);
+			expect(collected.of("route_role_unavailable")).toEqual([
+				{
+					type: "route_role_unavailable",
+					profileId: "codex-opus-pool",
+					reason: "catalog_role_unavailable",
+				},
+			]);
+		});
+
+		it("ignores other fail-closed reasons and routes without a profile", () => {
+			reportCatalogRoleRouteFailClosed(
+				"codex-opus",
+				{ accountId: "acc-role", reason: "paused" },
+				T,
+			);
+			reportCatalogRoleRouteFailClosed(
+				null,
+				{ accountId: "acc-role", reason: "catalog_role_mismatch" },
+				T,
+			);
+			reportCatalogRoleRouteFailClosed(
+				undefined,
+				{ accountId: "acc-role", reason: "catalog_role_unavailable" },
+				T,
+			);
+			expect(collected.events).toEqual([]);
+		});
 	});
 });

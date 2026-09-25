@@ -8,6 +8,7 @@ import {
 	spyOn,
 } from "bun:test";
 import { agentRegistry } from "@better-ccflare/agents";
+import { type CodexCatalogEvt, codexCatalogEvents } from "@better-ccflare/core";
 import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
 import { handleResponsesRequest } from "@better-ccflare/openai-responses-adapter";
 import {
@@ -3333,6 +3334,49 @@ describe("catalog-role Codex route profiles", () => {
 		expect(usageHandleEnd.mock.calls.at(-1)?.[0]).toMatchObject({
 			error: "force_route_catalog_role_unavailable",
 		});
+	});
+
+	it("reports each catalog-role fail-closed route on the Codex catalog event bus", async () => {
+		const events: CodexCatalogEvt[] = [];
+		const listener = (event: CodexCatalogEvt) => {
+			events.push(event);
+		};
+		codexCatalogEvents.on("event", listener);
+		try {
+			// Exact profile: its account's own target differs from its pin.
+			const account = makeRoleAccount();
+			const harness = makeRoleContext([account]);
+			const upstream = installCodexRoleUpstream();
+			await publish(upstream, account, harness.ctx, NEXT_GENERATION);
+			account.model_mappings = JSON.stringify({ opus: "gpt-7-luna" });
+			const exact = await send(harness.ctx, ROLE_PICKER);
+			expect(exact.response.status).toBe(503);
+
+			// Pool profile: no candidate has a catalog of its own.
+			const borrower = makeRoleAccount("role-pool-event-borrower");
+			const poolHarness = makeRoleContext([borrower]);
+			upstream.failCatalog("rejects");
+			const pool = await send(poolHarness.ctx, ROLE_POOL_PICKER);
+			expect(pool.response.status).toBe(503);
+
+			expect(
+				events.filter((event) => event.type === "route_role_unavailable"),
+			).toEqual([
+				{
+					type: "route_role_unavailable",
+					profileId: "codex-opus",
+					accountId: ROLE_ACCOUNT_ID,
+					reason: "catalog_role_mismatch",
+				},
+				{
+					type: "route_role_unavailable",
+					profileId: "codex-opus-pool",
+					reason: "catalog_role_unavailable",
+				},
+			]);
+		} finally {
+			codexCatalogEvents.off("event", listener);
+		}
 	});
 
 	it("discovers role pickers like any other profile without leaking route metadata", async () => {

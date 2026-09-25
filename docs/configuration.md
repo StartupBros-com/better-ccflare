@@ -732,7 +732,7 @@ better-ccflare can emit threshold and anomaly alerts and deliver them via webhoo
 | `ALERT_ANOMALY_LOOP_MIN_REQUESTS` | Minimum request count in the detection window before the runaway-loop detector will flag a burst, keyed per account + model + project + agent (with the `x-claude-code-session-id` header as an attribution fallback). Set above the rate a single legitimate worker reaches in the window so a true loop (50+ req/min) stands out. Clamped to `[5, 1000]` | `25` | `ALERT_ANOMALY_LOOP_MIN_REQUESTS=50` |
 | `ALERT_COOLDOWN_MINUTES` | Per-alert-type-and-scope cooldown bucket size in minutes — within a bucket, only the first alert is persisted and delivered (no SSE storms or duplicate webhooks). Clamped to `[1, 1440]` | `60` | `ALERT_COOLDOWN_MINUTES=120` |
 | `ALERT_WEBHOOK_URL` | `http(s)` URL to receive `POST` deliveries of alert payloads (see "Webhook delivery" below for the body shape). Unset = no webhook delivery. Must be a valid URL or the setter rejects it | unset | `ALERT_WEBHOOK_URL=https://example.com/alerts` |
-| `ALERT_WEBHOOK_TYPES` | Comma-separated allowlist of alert type names restricting which alert types are *delivered to the webhook*; the DB insert and dashboard SSE emission always happen regardless. Empty/unset = deliver every type (current default behavior). Unknown type names are rejected when the setting is written | unset (all types) | `ALERT_WEBHOOK_TYPES=auth_failure,model_routing_drift` |
+| `ALERT_WEBHOOK_TYPES` | Comma-separated allowlist of alert type names restricting which alert types are *delivered to the webhook*; the DB insert and dashboard SSE emission always happen regardless. Empty/unset = deliver every type except the informational opt-in types `codex_role_target_changed` and `codex_pin_superseded`, which stay in-app until named; a non-empty list delivers exactly the listed types, opt-in types included. Unknown type names are rejected when the setting is written | unset (all but opt-in types) | `ALERT_WEBHOOK_TYPES=auth_failure,model_routing_drift` |
 
 In addition to threshold alerts, an `auth_failure` alert (severity `critical`) fires automatically when an OAuth account's refresh token fails definitively (e.g. `invalid_grant`) and the account is marked `requires_reauth`. It is deduplicated by the same cooldown bucket as the threshold alerts.
 
@@ -742,7 +742,7 @@ Alerts are listed on the dashboard and via the API; unacknowledged counts surfac
 
 ### Recorded cache health
 
-Cache monitoring defaults to enabled in the application, independently of `ALERT_ANOMALY_ENABLED`. **This feature is not live in production until a separate approved deployment and webhook allowlist update.** Implementation or merge does not activate the running service. Keep the existing webhook destination and any nonempty `ALERT_WEBHOOK_TYPES` unchanged during implementation. At an approved rollout, deploy from main and add only the desired types: `cache_efficiency_low`, `cache_efficiency_critical`, `cache_telemetry_gap`, and `cache_efficiency_recovered`. An empty allowlist continues to allow all alert types.
+Cache monitoring defaults to enabled in the application, independently of `ALERT_ANOMALY_ENABLED`. **This feature is not live in production until a separate approved deployment and webhook allowlist update.** Implementation or merge does not activate the running service. Keep the existing webhook destination and any nonempty `ALERT_WEBHOOK_TYPES` unchanged during implementation. At an approved rollout, deploy from main and add only the desired types: `cache_efficiency_low`, `cache_efficiency_critical`, `cache_telemetry_gap`, and `cache_efficiency_recovered`. An empty allowlist continues to deliver all four cache alert types.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
@@ -766,6 +766,25 @@ Native Anthropic, Codex, and official xAI cache routes are eligible without requ
 Messages include account display names, provider, model, the UTC evidence window, request/token counts, recorded reuse, zero-hit share, and stored coverage. They contain no prompts or session identifiers. Sparse traffic, first-turn misses and cold traffic may not qualify; these sample and time guards do not prove a warmed prefix. Some adapters synthesize numeric compatibility zeros when cache fields are absent, so a recorded zero cannot distinguish a true miss from missing upstream cache telemetry. A telemetry alert means **cache usage is unavailable in request records**, not that the upstream stopped reporting. Neither alert proves a cache-backend cause.
 
 History persistence is not a delivery receipt. Webhooks remain best effort, with no outbox or delivery replay after an outage. Stop, disable, and reconfiguration invalidate pending evaluations and cancel pending cache webhook fetches. An atomic database batch already admitted can finish before awaited shutdown completes; an invalidated evaluation cannot publish it. A transport failure can therefore leave an alert in dashboard history without a delivered Discord message.
+
+### Codex catalog alerts
+
+Six alert types report on each Codex account's own model catalog, its family pins (fable, opus, sonnet, haiku), [catalog-role route profiles](#catalog-role-codex-profiles), and the verified Codex CLI version record. Messages carry account names, family names, route-profile ids, and model slugs; never credentials, file paths, or emails.
+
+| Type | Severity | Fires when | Dedup | Empty allowlist delivers |
+|------|----------|------------|-------|--------------------------|
+| `codex_role_target_changed` | `info` | A successful read of an account's own catalog puts a different model at a family's role than the previous own catalog in this process did. Unpinned families follow the new target | Content-addressed: once per account, family, and new target | No (opt-in) |
+| `codex_pin_superseded` | `info` | A family pinned on the account names a model the account's own fresh catalog still offers but no longer puts at that role | Content-addressed: once per account, family, pin, and role target | No (opt-in) |
+| `codex_pin_unavailable` | `warning` | A family pinned on the account names a model absent from the account's own fresh catalog; that family's requests on the account may fail until the pin changes | Content-addressed: once per account, family, and pin | Yes |
+| `codex_catalog_stale` | `warning` | The account's last successful own catalog is older than four refresh intervals (one hour at the 15-minute cadence) **and** its latest refresh attempt failed. Routing keeps serving the last-good catalog. An account that never loaded a catalog of its own is not reported. Checked once per refresh cycle | Cooldown bucket per account | Yes |
+| `codex_route_role_unavailable` | `warning` | A catalog-role route profile failed closed and refused the request: no own-catalog role target exists yet (`catalog_role_unavailable`), or the account's effective mapping pins a different model than the role target (`catalog_role_mismatch`) | At most one report per minute per profile, account, and reason, then a cooldown bucket per that scope | Yes |
+| `codex_identity_record_stale` | `warning` | Only when `CCFLARE_CODEX_VERIFIED_VERSION_FILE` is set: the record is older than its 30-day freshness window, missing, unreadable, or the configured path is not absolute, meaning the managed updater has stalled. A valid explicit `CCFLARE_CODEX_CLIENT_VERSION` takes precedence over the record and suppresses this alert. Checked once per refresh cycle | Cooldown bucket per failure kind | Yes |
+
+Content-addressed alerts derive their id from the state itself, so a standing condition is recorded and delivered once rather than on every 15-minute republication; only a change in the fields its Dedup cell lists produces a new alert. An intentional pin is never an error just because a newer model exists: a superseded pin is `info`, and only a pin the catalog no longer offers is a `warning`.
+
+Catalogs are held in memory only. The first own-catalog read after a restart, or after an account is recreated, is a baseline, so a role target that changed across a restart is not alerted. Pin alerts are still evaluated on that first read.
+
+An empty `ALERT_WEBHOOK_TYPES` delivers the four warning types and keeps the two `info` types in the dashboard, SSE stream, and alert history. An operator with a non-empty allowlist must add `codex_pin_unavailable`, `codex_catalog_stale`, `codex_route_role_unavailable`, and `codex_identity_record_stale` to receive them by webhook, plus either `info` type if wanted.
 
 ### Webhook delivery
 

@@ -1,6 +1,13 @@
-import { registerHeartbeat } from "@better-ccflare/core";
+import {
+	CODEX_CATALOG_FAMILIES,
+	type CodexCatalogFamily,
+	type CodexIdentityRecordError,
+	emitCodexCatalogEvent,
+	registerHeartbeat,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
+	CODEX_VERIFIED_VERSION_FILE_ENV,
 	clearCodexAccountModelContextMetadata,
 	clearDerivedAccountModelDefaults,
 	hasDerivedProviderModelDefaults,
@@ -140,6 +147,22 @@ let providerWide: CodexModelListing | null = null;
 /** Retry only unresolved accounts; exact live or cached-own evidence stops it. */
 const ensureRetryByAccount = new Map<string, EnsureRetryState>();
 
+/**
+ * Accounts whose most recently completed own-catalog read failed, with when.
+ * A success clears the entry. Only the staleness report reads it; retry
+ * scheduling keeps its own state above.
+ */
+const lastRefreshFailedAt = new Map<string, number>();
+
+/**
+ * A fail-closed catalog-role route is reported at most once per this window
+ * per (profile, account, reason). The AlertService dedupes by cooldown bucket
+ * anyway; this only keeps a client retry loop against a failing profile from
+ * turning every local 503 into an alert-table write.
+ */
+const CATALOG_ROLE_ROUTE_REPORT_INTERVAL_MS = 60_000;
+const lastCatalogRoleRouteReportAt = new Map<string, number>();
+
 /** One best-effort listing request per account at a time. */
 const ensureInFlight = new Map<string, Promise<void>>();
 const unknownRevalidationAt = new Map<string, number>();
@@ -172,6 +195,8 @@ export function clearCodexModelCacheForTests(): void {
 	ensureRetryByAccount.clear();
 	ensureInFlight.clear();
 	unknownRevalidationAt.clear();
+	lastRefreshFailedAt.clear();
+	lastCatalogRoleRouteReportAt.clear();
 	publishedProviderCatalogGeneration = 0;
 }
 
@@ -192,6 +217,7 @@ export function clearCodexModelCacheForAccount(accountId: string): void {
 	ensureRetryByAccount.delete(accountId);
 	ensureInFlight.delete(accountId);
 	unknownRevalidationAt.delete(accountId);
+	lastRefreshFailedAt.delete(accountId);
 	clearDerivedAccountModelDefaults("codex", accountId);
 	clearCodexAccountModelContextMetadata(accountId);
 }
@@ -500,6 +526,53 @@ export function deriveFamilyDefaults(
 }
 
 /**
+ * Tell the alert bus about one successful own-catalog publication.
+ *
+ * A role-target change is reported only against a previous own catalog in this
+ * process: the first read after start (or after an account is recreated) is a
+ * first load, not a change, and a republication with the same order changes
+ * nothing. Pin status is not decided here — the subscriber owns the
+ * pin-attribution resolver — so every publication is reported with its models
+ * and role targets for it to classify.
+ */
+function reportOwnCatalogPublication(
+	account: Account,
+	previous: CodexModelListing | null,
+	models: CodexModelEntry[],
+	families: Record<string, string>,
+): void {
+	const roleTargets: Partial<Record<CodexCatalogFamily, string>> = {};
+	for (const family of CODEX_CATALOG_FAMILIES) {
+		const target = families[family];
+		if (target) roleTargets[family] = target;
+	}
+	if (previous) {
+		const before = deriveFamilyDefaults(previous.models);
+		for (const family of CODEX_CATALOG_FAMILIES) {
+			const from = before[family];
+			const to = roleTargets[family];
+			if (from && to && from !== to) {
+				emitCodexCatalogEvent({
+					type: "role_target_changed",
+					accountId: account.id,
+					accountName: account.name,
+					family,
+					from,
+					to,
+				});
+			}
+		}
+	}
+	emitCodexCatalogEvent({
+		type: "own_catalog_published",
+		accountId: account.id,
+		accountName: account.name,
+		models: models.map((model) => model.id),
+		roleTargets,
+	});
+}
+
+/**
  * The model at a Claude family's role in this account's OWN catalog, or null.
  *
  * Only first-hand evidence counts: a listing borrowed from another account of
@@ -562,8 +635,11 @@ export async function getCodexModels(
 			source: "live",
 		};
 		const families = deriveFamilyDefaults(models);
-		const publishedAccountGeneration = lastGood.get(accountId)?.generation;
+		const previousOwn = lastGood.get(accountId);
+		const publishedAccountGeneration = previousOwn?.generation;
+		let publishedOwn = false;
 		if (isCurrentInvalidationGeneration(accountId, invalidationGeneration)) {
+			lastRefreshFailedAt.delete(accountId);
 			if (
 				publishedAccountGeneration === undefined ||
 				fetchGeneration > publishedAccountGeneration
@@ -573,6 +649,7 @@ export async function getCodexModels(
 				lastGood.set(accountId, { listing, generation: fetchGeneration });
 				setCodexAccountModelContextMetadata(accountId, models);
 				setDerivedAccountModelDefaults("codex", accountId, families);
+				publishedOwn = true;
 			}
 			if (fetchGeneration > publishedProviderCatalogGeneration) {
 				providerWide = listing;
@@ -580,9 +657,21 @@ export async function getCodexModels(
 				publishedProviderCatalogGeneration = fetchGeneration;
 			}
 		}
+		// Reported only after every registry above reflects the new catalog.
+		if (publishedOwn) {
+			reportOwnCatalogPublication(
+				account,
+				previousOwn?.listing ?? null,
+				models,
+				families,
+			);
+		}
 		return listing;
 	} catch (error) {
 		const cached = readCache(accountId);
+		if (isCurrentInvalidationGeneration(accountId, invalidationGeneration)) {
+			lastRefreshFailedAt.set(accountId, Date.now());
+		}
 		// The cached listing is still this account's own answer, just an older
 		// one — far better than a map compiled months ago.
 		if (
@@ -604,6 +693,129 @@ export async function getCodexModels(
 		);
 		return cached;
 	}
+}
+
+/**
+ * How old an account's last successful own catalog may get, while its latest
+ * refresh attempt has failed, before the refresh heartbeat reports it stale.
+ *
+ * Four refresh intervals (one hour at the fifteen-minute cadence) on purpose:
+ * one or two failed reads are routine — the endpoint is not part of OpenAI's
+ * public reference, and ensure-retries back off for up to one interval — while
+ * an hour without a single successful read means new or retired models are no
+ * longer being reflected. Routing keeps serving the last-good catalog either
+ * way; this only decides when that becomes worth an operator's attention.
+ */
+export const CODEX_CATALOG_STALE_ALERT_MS = 4 * CATALOG_REFRESH_INTERVAL_MS;
+
+/**
+ * Report every eligible account whose own catalog is older than
+ * {@link CODEX_CATALOG_STALE_ALERT_MS} while its latest refresh attempt
+ * failed. An account that never had a catalog of its own (some accounts only
+ * ever answer 401 here) is not reported: there is no last-good catalog to go
+ * stale, and borrowed listings are advisory. The refresh heartbeat calls this
+ * once per refresh cycle; AlertService buckets the resulting alerts.
+ */
+export function evaluateCodexCatalogStaleness(
+	accounts: readonly Account[],
+	now: number = Date.now(),
+): void {
+	for (const account of accounts) {
+		if (!isCodexCatalogRefreshEligible(account)) continue;
+		const own = lastGood.get(account.id)?.listing;
+		if (!own || !lastRefreshFailedAt.has(account.id)) continue;
+		const ageMs = now - own.fetchedAt;
+		if (ageMs <= CODEX_CATALOG_STALE_ALERT_MS) continue;
+		emitCodexCatalogEvent({
+			type: "catalog_stale",
+			accountId: account.id,
+			accountName: account.name,
+			ageMs,
+		});
+	}
+}
+
+const IDENTITY_RECORD_ALERT_ERRORS: ReadonlySet<string> =
+	new Set<CodexIdentityRecordError>([
+		"stale_record",
+		"unavailable_record",
+		"invalid_record",
+		"invalid_path",
+	]);
+
+/** Record problems only; an invalid explicit version is a separate setting. */
+function isIdentityRecordAlertError(
+	error: string | undefined,
+): error is CodexIdentityRecordError {
+	return error !== undefined && IDENTITY_RECORD_ALERT_ERRORS.has(error);
+}
+
+/**
+ * Report a configured verified Codex CLI version record that is stale or
+ * unreadable, which means the managed updater has stalled.
+ *
+ * The record is only read when `CCFLARE_CODEX_VERIFIED_VERSION_FILE` is set
+ * (there is no default path), so an install without the updater never alerts.
+ * A valid explicit `CCFLARE_CODEX_CLIENT_VERSION` wins over the record and is
+ * not reported either. Evaluated by the refresh heartbeat once per cycle,
+ * never per request.
+ */
+export function evaluateCodexClientIdentityRecord(
+	now: () => number = Date.now,
+): void {
+	if (!process.env[CODEX_VERIFIED_VERSION_FILE_ENV]) return;
+	const identity = resolveCodexClientIdentity(now);
+	if (!isIdentityRecordAlertError(identity.error)) return;
+	emitCodexCatalogEvent({
+		type: "identity_record_stale",
+		error: identity.error,
+		version: identity.version,
+		...(identity.verifiedAt ? { verifiedAt: identity.verifiedAt } : {}),
+	});
+}
+
+/**
+ * Report a catalog-role route profile that failed closed. Called from the one
+ * place the proxy turns a force-route failure into its terminal response, so
+ * every fail-closed path is covered. Other fail-closed reasons, and routes
+ * without a profile, are not catalog conditions and are ignored. For a pool
+ * profile the error names the profile rather than an account, and the report
+ * then carries no account.
+ */
+export function reportCatalogRoleRouteFailClosed(
+	profileId: string | null | undefined,
+	error: { accountId: string; reason: string },
+	now: number = Date.now(),
+): void {
+	const profile = profileId?.trim();
+	if (!profile) return;
+	if (
+		error.reason !== "catalog_role_unavailable" &&
+		error.reason !== "catalog_role_mismatch"
+	) {
+		return;
+	}
+	const accountId =
+		error.accountId && error.accountId !== profile ? error.accountId : null;
+	const key = `${profile}\0${accountId ?? ""}\0${error.reason}`;
+	const last = lastCatalogRoleRouteReportAt.get(key);
+	if (last !== undefined && now - last < CATALOG_ROLE_ROUTE_REPORT_INTERVAL_MS)
+		return;
+	if (
+		last === undefined &&
+		lastCatalogRoleRouteReportAt.size >= MAX_ENSURE_RETRY_ENTRIES
+	) {
+		const oldest = lastCatalogRoleRouteReportAt.keys().next().value;
+		if (oldest !== undefined) lastCatalogRoleRouteReportAt.delete(oldest);
+	}
+	lastCatalogRoleRouteReportAt.delete(key);
+	lastCatalogRoleRouteReportAt.set(key, now);
+	emitCodexCatalogEvent({
+		type: "route_role_unavailable",
+		profileId: profile,
+		...(accountId ? { accountId } : {}),
+		reason: error.reason,
+	});
 }
 
 /** Most accounts one refresh cycle, or one request-time prime, reads. */
@@ -635,6 +847,14 @@ export function initCodexModelCatalogRefresh(
 		if (stopped || running || Date.now() < nextRefreshAt) return;
 		running = true;
 		try {
+			// Once per refresh cycle, never per request, and independent of the
+			// account read below: a stalled updater matters even when it fails.
+			try {
+				evaluateCodexClientIdentityRecord();
+			} catch {
+				// Never interpolate the error: it could name the record's path.
+				log.warn("Could not evaluate the Codex client version record");
+			}
 			const eligible = (await ctx.dbOps.getAllAccounts()).filter(
 				isCodexCatalogRefreshEligible,
 			);
@@ -658,6 +878,7 @@ export function initCodexModelCatalogRefresh(
 					}
 				}),
 			);
+			if (!stopped) evaluateCodexCatalogStaleness(accounts, Date.now());
 		} catch (error) {
 			log.warn(`Could not schedule Codex model refresh: ${error}`);
 		} finally {

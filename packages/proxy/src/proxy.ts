@@ -72,6 +72,7 @@ import {
 	primeCatalogRoleCandidates,
 	resolveImplicitCodexRoute,
 } from "./codex-implicit-route";
+import { reportCatalogRoleRouteFailClosed } from "./codex-model-catalog";
 import {
 	type AgentInterceptResult,
 	createContextAdmissionTracker,
@@ -943,11 +944,15 @@ async function handleProxyCoreImpl(
 	};
 	const createRecordedForceRouteResponse = (
 		error: ForceRouteUnavailableError,
-	): Response =>
-		recordLocalRoutingTerminal(
+	): Response => {
+		// Every terminal force-route failure passes through here, so this is
+		// the one place a catalog-role profile's fail-closed is reported.
+		reportCatalogRoleRouteFailClosed(requestMeta.routeProfileId, error);
+		return recordLocalRoutingTerminal(
 			forceRouteUnavailableResponse(error, requestMeta.routeProfileId == null),
 			`force_route_${error.reason}`,
 		);
+	};
 	const createUnservedServerToolRoutingErrorResponse = (
 		error: ServerToolRoutingError,
 	): Response => {

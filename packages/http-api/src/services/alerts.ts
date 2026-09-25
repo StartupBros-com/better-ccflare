@@ -4,6 +4,14 @@ import {
 	type AuthFailureEvt,
 	alertEvents,
 	authFailureEvents,
+	CODEX_CATALOG_FAMILIES,
+	type CodexCatalogEvt,
+	type CodexCatalogStaleEvt,
+	type CodexIdentityRecordStaleEvt,
+	type CodexOwnCatalogPublishedEvt,
+	type CodexRoleTargetChangedEvt,
+	type CodexRouteRoleUnavailableEvt,
+	codexCatalogEvents,
 	computeWindowStartMs,
 	getModelFamily,
 	getModelRates,
@@ -20,7 +28,9 @@ import {
 	type UsageWindow,
 } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
+import { getProviderModelDefaultOverrides } from "@better-ccflare/providers";
 import type {
+	Account,
 	AlertEvent,
 	AlertsConfigPayload,
 	AlertType,
@@ -37,6 +47,7 @@ import {
 	type CacheHealthPolicy,
 	type CacheHealthState,
 	cacheHealthScopeKey,
+	isWebhookOptInAlertType,
 } from "@better-ccflare/types";
 import {
 	type AnomalyRequestRow,
@@ -51,6 +62,10 @@ import {
 	createCacheHealthState,
 	isRedundantProviderCacheAlert,
 } from "./cache-health";
+import {
+	type CodexAccountFamilySource,
+	resolveCodexAccountFamilyDefault,
+} from "./codex-effective-defaults";
 import { computeUsagePrediction } from "./usage-prediction";
 
 const log = new Logger("AlertsService");
@@ -565,6 +580,253 @@ export function buildModelRoutingDriftAlerts(
 	return alerts;
 }
 
+/*
+ * Codex catalog, pin and client-identity alerts (issue #370). The proxy emits
+ * typed events on codexCatalogEvents (packages/core/src/codex-catalog-events.ts);
+ * AlertService.evaluateCodexCatalogEvent turns each into zero or more alerts
+ * through the ordinary persistAndEmit dedup and delivery path.
+ *
+ * Messages carry account names/ids, family names, route-profile ids and model
+ * slugs only: never credentials, file paths or emails.
+ */
+
+/** Where a pinned Codex family's model came from, in operator words. */
+const CODEX_PIN_SOURCE_LABEL: Record<CodexAccountFamilySource, string> = {
+	account_mapping_pin: "account model mapping",
+	custom_endpoint_mapping: "custom endpoint model mapping",
+	model_fallbacks: "legacy model fallback",
+	environment_mapping: "environment model mapping",
+	global_provider_override: "provider-wide default override",
+	account_catalog: "account catalog",
+	provider_catalog_borrowed: "borrowed provider catalog",
+	compiled_default: "compiled default",
+};
+
+/**
+ * The account columns pin attribution reads. Deliberately excludes every
+ * credential column (api_key, refresh_token, access_token).
+ */
+export interface CodexPinAccountRow {
+	id: string;
+	name: string;
+	provider: string;
+	model_mappings: string | null;
+	custom_endpoint: string | null;
+	model_fallbacks: string | null;
+	created_at: number;
+}
+
+/**
+ * Content-addressed: one alert per (account, family, new target), whenever it
+ * is observed, rather than one per cooldown bucket.
+ */
+export function buildCodexRoleTargetChangedAlert(
+	event: CodexRoleTargetChangedEvt,
+	timestamp: number,
+): AlertEvent {
+	return {
+		id: `codex_role_target_changed:${event.accountId}:${event.family}:${event.to}`,
+		timestamp,
+		type: "codex_role_target_changed",
+		severity: "info",
+		title: "Codex automatic model target changed",
+		message: `Codex account ${event.accountName}'s own catalog now puts ${event.to} at the ${event.family} role, replacing ${event.from}. Families that follow the automatic target route to ${event.to} from now on; pinned families are unaffected.`,
+		value: null,
+		threshold: null,
+		account: event.accountName,
+		model: event.to,
+		project: null,
+		requestId: null,
+		acknowledged: false,
+	};
+}
+
+/**
+ * Classify every family pin of one account against a fresh publication of its
+ * OWN catalog, using the same attribution the effective-defaults API and the
+ * migration preview use (resolveCodexAccountFamilyDefault), so a family is a
+ * pin here exactly when routing treats it as one — including force-account-
+ * model mode, where account-level pins are not applied.
+ *
+ * - pinned model absent from the catalog: `codex_pin_unavailable` (warning);
+ * - pinned model offered but not the role target: `codex_pin_superseded`
+ *   (info — an intentional pin is never an error just because a newer model
+ *   exists);
+ * - pin equal to the role target, or an unpinned family: nothing.
+ *
+ * Content-addressed ids: a standing condition is reported once, not on every
+ * fifteen-minute republication.
+ */
+export function buildCodexPinAlerts(
+	row: CodexPinAccountRow,
+	event: CodexOwnCatalogPublishedEvt,
+	timestamp: number,
+	globalOverrides: Readonly<Record<string, string>> | undefined,
+): AlertEvent[] {
+	// Only the mapping columns are read by attribution (plus id and name for
+	// scoping and logs); a credential-free row is sufficient by construction.
+	const account = row as unknown as Account;
+	const offered = new Set(event.models);
+	const alerts: AlertEvent[] = [];
+	for (const family of CODEX_CATALOG_FAMILIES) {
+		const target = event.roleTargets[family];
+		if (!target) continue;
+		const attribution = resolveCodexAccountFamilyDefault(account, family, {
+			globalOverride: globalOverrides?.[family],
+			catalog: { source: "own" },
+		});
+		if (!attribution.pinned) continue;
+		const pin = attribution.effectiveModel;
+		if (pin === target) continue;
+		const source = CODEX_PIN_SOURCE_LABEL[attribution.source];
+		const common = {
+			timestamp,
+			value: null,
+			threshold: null,
+			account: row.name,
+			model: pin,
+			project: null,
+			requestId: null,
+			acknowledged: false,
+		};
+		if (!offered.has(pin)) {
+			alerts.push({
+				...common,
+				id: `codex_pin_unavailable:${row.id}:${family}:${pin}`,
+				type: "codex_pin_unavailable",
+				severity: "warning",
+				title: "Pinned Codex model is no longer offered",
+				message: `Codex account ${row.name} pins ${family} to ${pin} (${source}), but the account's own catalog no longer offers it. Requests for ${family} on this account may fail until the pin is updated or removed; the catalog's ${family} role target is ${target}.`,
+			});
+			continue;
+		}
+		alerts.push({
+			...common,
+			id: `codex_pin_superseded:${row.id}:${family}:${encodeScopePart(pin)}:${target}`,
+			type: "codex_pin_superseded",
+			severity: "info",
+			title: "Pinned Codex model is no longer the catalog default",
+			message: `Codex account ${row.name} pins ${family} to ${pin} (${source}). The account's own catalog still offers it but now puts ${target} at the ${family} role. No action is needed if the pin is intentional; remove it to follow the automatic target.`,
+		});
+	}
+	return alerts;
+}
+
+export function buildCodexCatalogStaleAlert(
+	event: CodexCatalogStaleEvt,
+	timestamp: number,
+	cooldownMinutes: number,
+): AlertEvent {
+	const minutes = Math.floor(event.ageMs / 60_000);
+	return {
+		id: buildThresholdAlertId(
+			"codex_catalog_stale",
+			event.accountId,
+			timestamp,
+			cooldownMinutes,
+		),
+		timestamp,
+		type: "codex_catalog_stale",
+		severity: "warning",
+		title: "Codex model catalog is stale",
+		message: `Codex account ${event.accountName}'s own model catalog was last read successfully ${minutes} minutes ago and its latest refresh failed. Routing keeps using that last-good catalog, so newly released or retired models are not reflected until a refresh succeeds.`,
+		value: minutes,
+		threshold: null,
+		account: event.accountName,
+		model: null,
+		project: null,
+		requestId: null,
+		acknowledged: false,
+	};
+}
+
+export function buildCodexRouteRoleUnavailableAlert(
+	event: CodexRouteRoleUnavailableEvt,
+	accountName: string | null,
+	timestamp: number,
+	cooldownMinutes: number,
+): AlertEvent {
+	const accountLabel = event.accountId
+		? (accountName ?? event.accountId)
+		: null;
+	let message: string;
+	if (event.reason === "catalog_role_unavailable") {
+		const subject = accountLabel
+			? `Codex account ${accountLabel} has`
+			: "no account in its pool has";
+		message = `Codex route profile ${event.profileId} failed closed: ${subject} a role target in a catalog of its own yet (its own model catalog has not loaded or could not be read), so the request was refused rather than routed to a different model.`;
+	} else {
+		message = accountLabel
+			? `Codex route profile ${event.profileId} failed closed: Codex account ${accountLabel}'s effective model mapping differs from the role target in its own catalog, so the request was refused. Remove the pin to follow the catalog, or use an exact-model profile.`
+			: `Codex route profile ${event.profileId} failed closed: no account in its pool both has a catalog of its own and follows that catalog's role target (at least one is pinned to a different model), so the request was refused.`;
+	}
+	return {
+		id: buildThresholdAlertId(
+			"codex_route_role_unavailable",
+			`${encodeScopePart(event.profileId)}:${encodeScopePart(event.accountId ?? null)}:${event.reason}`,
+			timestamp,
+			cooldownMinutes,
+		),
+		timestamp,
+		type: "codex_route_role_unavailable",
+		severity: "warning",
+		title: "Codex catalog-role route failed closed",
+		message,
+		value: null,
+		threshold: null,
+		account: accountLabel,
+		model: null,
+		project: null,
+		requestId: null,
+		acknowledged: false,
+	};
+}
+
+export function buildCodexIdentityRecordAlert(
+	event: CodexIdentityRecordStaleEvt,
+	timestamp: number,
+	cooldownMinutes: number,
+): AlertEvent {
+	const advertised = event.verifiedAt
+		? `ccflare advertises Codex client version ${event.version} from the last valid record (verified ${event.verifiedAt})`
+		: `ccflare advertises its compiled fallback Codex client version ${event.version}`;
+	let message: string;
+	switch (event.error) {
+		case "stale_record":
+			message = `The verified Codex CLI version record is past its freshness window${event.verifiedAt ? ` (last verified ${event.verifiedAt})` : ""}. ccflare still advertises Codex client version ${event.version}; the managed Codex updater appears to have stalled.`;
+			break;
+		case "unavailable_record":
+			message = `The configured verified Codex CLI version record is missing. ${advertised}; the managed Codex updater appears to have stalled or has not published a record yet.`;
+			break;
+		case "invalid_record":
+			message = `The configured verified Codex CLI version record could not be read as a valid record. ${advertised}; check the managed Codex updater.`;
+			break;
+		case "invalid_path":
+			message = `The configured location of the verified Codex CLI version record is not a valid absolute path, so the record is never read. ${advertised}.`;
+			break;
+	}
+	return {
+		id: buildThresholdAlertId(
+			"codex_identity_record_stale",
+			event.error,
+			timestamp,
+			cooldownMinutes,
+		),
+		timestamp,
+		type: "codex_identity_record_stale",
+		severity: "warning",
+		title: "Codex CLI version record is not current",
+		message,
+		value: null,
+		threshold: null,
+		account: null,
+		model: null,
+		project: null,
+		requestId: null,
+		acknowledged: false,
+	};
+}
+
 function toAlertEvent(row: AlertRow): AlertEvent {
 	return {
 		id: row.id,
@@ -716,12 +978,18 @@ export function buildDiscordWebhookBody(alert: AlertEvent): {
 	};
 }
 
-/** Empty allowlist = deliver every type (today's behaviour, unchanged). */
+/**
+ * Empty allowlist = deliver every type (today's behaviour, unchanged), except
+ * the informational types in WEBHOOK_OPT_IN_ALERT_TYPES, which an empty
+ * allowlist keeps in-app only. A non-empty allowlist delivers exactly the
+ * listed types, opt-in types included.
+ */
 export function isAlertTypeAllowedForWebhook(
 	type: AlertType,
 	allowedTypes: readonly AlertType[],
 ): boolean {
-	return allowedTypes.length === 0 || allowedTypes.includes(type);
+	if (allowedTypes.length === 0) return !isWebhookOptInAlertType(type);
+	return allowedTypes.includes(type);
 }
 
 /**
@@ -856,6 +1124,7 @@ export class AlertService {
 	private readonly config: Config;
 	private readonly requestListener: (event: RequestEvt) => void;
 	private readonly authFailureListener: (event: AuthFailureEvt) => void;
+	private readonly codexCatalogListener: (event: CodexCatalogEvt) => void;
 	private readonly configChangeListener: ({ key }: { key: string }) => void;
 	private anomalyTimer: ReturnType<typeof setInterval> | null = null;
 	private cacheHealthTimer: ReturnType<typeof setInterval> | null = null;
@@ -893,6 +1162,15 @@ export class AlertService {
 				);
 			});
 		};
+		this.codexCatalogListener = (event) => {
+			// Emitted synchronously from proxy catalog and routing paths; contain
+			// lookup and persistence failures here, as for auth failures.
+			this.evaluateCodexCatalogEvent(event).catch((error) => {
+				log.error(
+					`Codex catalog alert evaluation failed for ${event.type}: ${(error as Error).message}`,
+				);
+			});
+		};
 		this.configChangeListener = ({ key }: { key: string }) => {
 			if (
 				key === "alert_anomaly_enabled" ||
@@ -916,6 +1194,7 @@ export class AlertService {
 		requestEvents.on("event", this.requestListener);
 		this.config.on("change", this.configChangeListener);
 		authFailureEvents.on("event", this.authFailureListener);
+		codexCatalogEvents.on("event", this.codexCatalogListener);
 		this.restartAnomalyTimer();
 		this.restartCacheHealthTimer();
 	}
@@ -925,6 +1204,7 @@ export class AlertService {
 		requestEvents.off("event", this.requestListener);
 		this.config.off("change", this.configChangeListener);
 		authFailureEvents.off("event", this.authFailureListener);
+		codexCatalogEvents.off("event", this.codexCatalogListener);
 		if (this.anomalyTimer) {
 			clearInterval(this.anomalyTimer);
 			this.anomalyTimer = null;
@@ -1152,6 +1432,93 @@ export class AlertService {
 			acknowledged: false,
 		};
 		await this.persistAndEmit(alert, config.webhookUrl);
+	}
+
+	/**
+	 * Turn one Codex catalog event into alerts. Called from the codexCatalogEvents
+	 * listener; public (like evaluateUsageSnapshot) so callers and tests can
+	 * await one evaluation with an explicit clock.
+	 *
+	 * Role-target and pin alerts are content-addressed and fire once per real
+	 * change; stale-catalog, route-profile and identity-record alerts are
+	 * bucketed by the configured cooldown.
+	 */
+	async evaluateCodexCatalogEvent(
+		event: CodexCatalogEvt,
+		timestamp: number = Date.now(),
+	): Promise<void> {
+		const config = getAlertsConfig(this.config);
+		switch (event.type) {
+			case "role_target_changed":
+				await this.persistAndEmit(
+					buildCodexRoleTargetChangedAlert(event, timestamp),
+					config.webhookUrl,
+				);
+				return;
+			case "own_catalog_published": {
+				// Credential-free columns only, read fresh so attribution sees the
+				// account's current pins; a deleted account has nothing to report.
+				const row = await this.db.get<CodexPinAccountRow>(
+					`SELECT id, name, provider, model_mappings, custom_endpoint, model_fallbacks, created_at
+					 FROM accounts WHERE id = ?`,
+					[event.accountId],
+				);
+				if (!row || row.provider !== "codex") return;
+				const alerts = buildCodexPinAlerts(
+					row,
+					event,
+					timestamp,
+					getProviderModelDefaultOverrides().codex,
+				);
+				for (const alert of alerts) {
+					// Generation fence: a same-id replacement must not inherit these.
+					await this.persistAndEmit(
+						alert,
+						config.webhookUrl,
+						[],
+						row.id,
+						Number(row.created_at),
+					);
+				}
+				return;
+			}
+			case "catalog_stale":
+				await this.persistAndEmit(
+					buildCodexCatalogStaleAlert(event, timestamp, config.cooldownMinutes),
+					config.webhookUrl,
+				);
+				return;
+			case "route_role_unavailable": {
+				const accountName = event.accountId
+					? ((
+							await this.db.get<{ name: string }>(
+								"SELECT name FROM accounts WHERE id = ?",
+								[event.accountId],
+							)
+						)?.name ?? null)
+					: null;
+				await this.persistAndEmit(
+					buildCodexRouteRoleUnavailableAlert(
+						event,
+						accountName,
+						timestamp,
+						config.cooldownMinutes,
+					),
+					config.webhookUrl,
+				);
+				return;
+			}
+			case "identity_record_stale":
+				await this.persistAndEmit(
+					buildCodexIdentityRecordAlert(
+						event,
+						timestamp,
+						config.cooldownMinutes,
+					),
+					config.webhookUrl,
+				);
+				return;
+		}
 	}
 
 	private restartAnomalyTimer(): void {
