@@ -208,6 +208,7 @@
     <div class="callout warn">
       <p class="eyebrow">Outcome, same-day brainstorm</p>
       <p>The premise above is superseded. Production trace records for September 13 to 24 show the election never demoted a root (0 non_root, 15 root); 34,692 Agent-offering Codex requests were classified attributed_descendant because the July 31 session-id attribution fallback marks every Claude Code request as an agent and the Codex lane reads any agent as a subagent. The fix is that attribution regression (issue #380, PR #381, with its own requirements plan); the de-ratchet is deferred until post-fix demotion data exists.</p>
+      <p>Shipped 2026-09-25: PR #381 merged as b8276363 and deployed at 04:20Z. Verified on the deployed binary against the previous build on a mock Codex upstream: main conversations are admitted as root and keep Agent and Task, header-marked subagents stay contained. The measurement week on #380 starts at the first Codex weekly reset (2026-09-29 23:36Z), and the de-ratchet decision follows it.</p>
     </div>
   </article>
 
