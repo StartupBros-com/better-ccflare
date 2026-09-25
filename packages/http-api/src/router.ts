@@ -254,6 +254,7 @@ export class APIRouter {
 			config,
 			this.context.runtime,
 			this.context.modelCatalog,
+			dbOps,
 		);
 		const logsStreamHandler = createLogsStreamHandler();
 		const logsHistoryHandler = createLogsHistoryHandler();

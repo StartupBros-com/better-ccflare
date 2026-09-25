@@ -2287,7 +2287,18 @@ export class CodexProvider extends BaseProvider {
 	}
 
 	createAttemptPlan(context: ProviderAttemptPlanContext) {
-		const identity = this.captureAttemptIdentity();
+		// Prefer the identity captured with admission (before any later
+		// credential/catalog await) over a fresh capture at plan-creation time.
+		// A fresh capture here would re-read the live catalog snapshot, so a
+		// publication racing between admission and this call could silently
+		// change the capacity/reasoning metadata backing this attempt's
+		// telemetry. Falling back to a fresh (but still account-scoped) capture
+		// only covers callers that never captured one at admission.
+		const capturedIdentity = context.capturedAttemptIdentity as
+			| ReturnType<CodexProvider["captureAttemptIdentity"]>
+			| undefined;
+		const identity =
+			capturedIdentity ?? this.captureAttemptIdentity(context.account);
 		return createCodexHostedSearchAttemptPlan(context, {
 			prepareHeaders: (headers, accessToken) =>
 				this.prepareHeaders(headers, accessToken, undefined, identity),
@@ -2320,10 +2331,17 @@ export class CodexProvider extends BaseProvider {
 						// up an attempt the coordinator was never told about and report
 						// `unknown_attempt` -- a counter that otherwise means "we lost
 						// an attempt we should still have". Say `ineligible` instead,
-						// which is what this attempt actually was.
-						this.processResponse(response, context.account, undefined, {
-							hosted: true,
-						}),
+						// which is what this attempt actually was. Thread the identity
+						// captured (at admission, when available) into telemetry so a
+						// later catalog publication cannot change this attempt's
+						// reported capacity.
+						this.processResponse(
+							response,
+							context.account,
+							undefined,
+							{ hosted: true },
+							identity.modelContextSnapshot,
+						),
 				});
 			},
 			parseRateLimit: (response) => this.parseRateLimit(response),

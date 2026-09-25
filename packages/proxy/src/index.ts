@@ -102,8 +102,12 @@ export type {
 	CodexModelListing,
 } from "./codex-model-catalog";
 export {
+	CATALOG_REFRESH_INTERVAL_MS,
 	clearCodexModelCacheForAccount,
+	clearCodexModelCacheForTests,
 	getCodexModels,
+	getKnownCodexModels,
+	getKnownOrSharedCodexModels,
 	initCodexModelCatalogRefresh,
 	lowestTierCodexModel,
 } from "./codex-model-catalog";

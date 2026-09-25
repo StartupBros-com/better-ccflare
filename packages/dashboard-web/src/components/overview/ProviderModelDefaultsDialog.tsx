@@ -17,6 +17,11 @@ import {
 } from "../ui/dialog";
 import { Label } from "../ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../ui/tabs";
+import {
+	providerFieldHint,
+	providerFieldPlaceholder,
+	providerFieldResetTitle,
+} from "./provider-model-defaults-copy";
 
 // Display order for known families; any future family sent by the backend that
 // is unknown here goes last, alphabetically — it never disappears from the
@@ -52,12 +57,22 @@ function sortFamilies<T extends { family: string }>(fields: T[]): T[] {
  * only because one hardcoded map sent a Codex/ChatGPT account to a model its
  * subscription cannot use — and until now rebuilding was the only fix.
  *
- * Empty field == no override == use the factory value (shown in the
- * placeholder and hint below the field). This is NOT the ModelCombobox "use
- * the client model" (passthrough) option — that option is deliberately
- * hidden here with `hideClientModelOption`: this field exists specifically
- * for providers that do not speak Claude, so passthrough never makes sense
- * on this screen.
+ * Empty field == no override == this provider's current effective default
+ * (`field.effective`, shown in the placeholder and hint below the field) —
+ * NOT always the hardcoded factory value (`field.factory`): an unmapped
+ * family here can already reflect a provider-wide catalog default borrowed
+ * from one account's listing, ahead of the compiled factory value. A SAVED
+ * value here pins that family for every account with no mapping of its own,
+ * AHEAD of that account's own catalog default — it does not merely apply
+ * "after" the catalog. Mapping every family here is not required "to avoid"
+ * the factory value; only map a family when its current default is
+ * unsuitable — leaving a family unmapped lets each account follow its own
+ * current catalog default first, falling back to the shown value only when
+ * that account has none. This is NOT
+ * the ModelCombobox "use the client model" (passthrough) option — that
+ * option is deliberately hidden here with `hideClientModelOption`: this
+ * field exists specifically for providers that do not speak Claude, so
+ * passthrough never makes sense on this screen.
  *
  * It lives in a modal (opened from the SettingsTab "Advanced" card) because
  * it is rarely changed. One tab per provider deliberately keeps each tab
@@ -161,8 +176,12 @@ export function ProviderModelDefaultsDialog() {
 
 				<p className="flex items-start gap-1.5 text-xs text-muted-foreground">
 					<Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-					Last resort in the routing chain: only used when the requested model
-					has no slot in the combo and no mapping on the account.
+					Last resort in the routing chain: applies only when the requested
+					model has no slot in the combo and no mapping on the account. A value
+					set here pins that family for every such account, ahead of its own
+					catalog. Leave a field empty to let those accounts follow their own
+					current catalog default instead, falling back to the value shown here
+					only when they have none.
 				</p>
 
 				{query.isLoading && (
@@ -221,7 +240,7 @@ export function ProviderModelDefaultsDialog() {
 													onChange={(value) =>
 														handleChange(provider.provider, field.family, value)
 													}
-													placeholder={`${field.factory} (factory)`}
+													placeholder={providerFieldPlaceholder(field)}
 													hideClientModelOption
 													className="flex-1"
 													inputClassName="h-8"
@@ -232,7 +251,7 @@ export function ProviderModelDefaultsDialog() {
 														type="button"
 														variant="ghost"
 														size="sm"
-														title={`Reset to factory: ${field.factory}`}
+														title={providerFieldResetTitle(field)}
 														onClick={() =>
 															handleReset(provider.provider, field.family)
 														}
@@ -243,9 +262,7 @@ export function ProviderModelDefaultsDialog() {
 												)}
 											</div>
 											<p className="text-[11px] text-muted-foreground">
-												{customized
-													? `Customized. Factory: ${field.factory}`
-													: `Factory: ${field.factory}`}
+												{providerFieldHint(field, customized)}
 											</p>
 										</div>
 									);

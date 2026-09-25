@@ -72,7 +72,13 @@ export interface CodexModelListing {
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
-const CATALOG_REFRESH_INTERVAL_MS = 15 * 60_000;
+/**
+ * Exported so callers outside this module (e.g. the effective-defaults
+ * diagnostics API) can judge staleness against the exact same threshold this
+ * module refreshes against, instead of hardcoding a second copy that could
+ * silently drift from this one.
+ */
+export const CATALOG_REFRESH_INTERVAL_MS = 15 * 60_000;
 const ENSURE_RETRY_DELAYS_MS = [
 	60_000, 120_000, 240_000, 480_000, 900_000,
 ] as const;
@@ -219,6 +225,20 @@ export function getKnownCodexModels(
 ): CodexModelListing | null {
 	const own = lastGood.get(accountId)?.listing;
 	return own ? { ...own, source: "cached" } : null;
+}
+
+/**
+ * Same as {@link getKnownCodexModels}, but falls back to another account of
+ * the same provider's listing when this account has none of its own -- the
+ * same advisory fallback request-time routing already uses. Callers must
+ * read the returned `source` ("cached" for first-hand, "shared" for
+ * borrowed) rather than assuming every result is this account's own. Never
+ * triggers a fetch.
+ */
+export function getKnownOrSharedCodexModels(
+	accountId: string,
+): CodexModelListing | null {
+	return readCache(accountId);
 }
 
 function readCache(accountId: string): CodexModelListing | null {
@@ -577,21 +597,22 @@ export function initCodexModelCatalogRefresh(
 	const tick = async (): Promise<void> => {
 		if (stopped || running || Date.now() < nextRefreshAt) return;
 		running = true;
-		// Bound jitter to two minutes around the fifteen-minute cadence.
-		nextRefreshAt =
-			Date.now() +
-			CATALOG_REFRESH_INTERVAL_MS +
-			Math.floor(Math.random() * 120_000);
 		try {
-			const accounts = (await ctx.dbOps.getAllAccounts())
-				.filter(
-					(account) =>
-						account.provider === "codex" &&
-						!account.paused &&
-						!account.requires_reauth &&
-						!account.custom_endpoint,
-				)
-				.slice(0, 100);
+			const eligible = (await ctx.dbOps.getAllAccounts()).filter(
+				(account) =>
+					account.provider === "codex" &&
+					!account.paused &&
+					!account.requires_reauth &&
+					!account.custom_endpoint,
+			);
+			if (eligible.length > 100) {
+				log.warn(
+					`Codex model catalog refresh covers only 100 of ${eligible.length} eligible accounts this cycle; ${
+						eligible.length - 100
+					} were dropped.`,
+				);
+			}
+			const accounts = eligible.slice(0, 100);
 			let next = 0;
 			await Promise.all(
 				Array.from({ length: Math.min(2, accounts.length) }, async () => {
@@ -607,6 +628,19 @@ export function initCodexModelCatalogRefresh(
 		} catch (error) {
 			log.warn(`Could not schedule Codex model refresh: ${error}`);
 		} finally {
+			// Anchored to this tick's *completion*, not its start. An account
+			// whose own fetch finishes late within a tick (many eligible
+			// accounts, only two concurrent workers) still gets a full
+			// CATALOG_REFRESH_INTERVAL_MS measured from here, so
+			// ensureCodexModelDefaults's own fetchedAt-based due check for it
+			// can never already be satisfied by the time this fires again --
+			// which anchoring nextRefreshAt to tick *start* could cause,
+			// silently skipping that account for a whole extra cycle. Bound
+			// jitter to two minutes around the fifteen-minute cadence.
+			nextRefreshAt =
+				Date.now() +
+				CATALOG_REFRESH_INTERVAL_MS +
+				Math.floor(Math.random() * 120_000);
 			running = false;
 		}
 	};

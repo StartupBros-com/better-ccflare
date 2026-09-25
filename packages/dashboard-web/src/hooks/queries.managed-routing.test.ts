@@ -254,6 +254,16 @@ describe("canonical account mutation invalidation", () => {
 		queryKeys.routingEffective(),
 		queryKeys.accountRoutingOverview(),
 	];
+	// A saved account model mapping — or a saved custom endpoint, whose
+	// embedded `modelMappings` is the `custom_endpoint_mapping` pin source —
+	// can change which layer pins an account's family, so the Automatic/Pinned
+	// status AccountModelMappingsDialog/ProviderModelDefaultsDialog derive from
+	// `queryKeys.providerModelDefaults()` (`useCodexAccountEffectiveDefaults`)
+	// must also refresh — otherwise it keeps showing the pre-save source.
+	const pinSourceRoutingKeys = [
+		...fullRoutingKeys,
+		queryKeys.providerModelDefaults(),
+	];
 
 	for (const [name, getOptions, expectedKeys] of [
 		["pause", getPauseAccountMutationOptions, accountRoutingKeys],
@@ -268,12 +278,12 @@ describe("canonical account mutation invalidation", () => {
 		[
 			"custom endpoint",
 			getUpdateAccountCustomEndpointMutationOptions,
-			fullRoutingKeys,
+			pinSourceRoutingKeys,
 		],
 		[
 			"model mappings",
 			getUpdateAccountModelMappingsMutationOptions,
-			fullRoutingKeys,
+			pinSourceRoutingKeys,
 		],
 	] as const) {
 		it(`${name} uses its exact managed-routing invalidation scope`, async () => {

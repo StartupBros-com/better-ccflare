@@ -750,6 +750,20 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 				selectAdmittedCodexModel(first, "claude-opus-4-8", rejected).admitted,
 			).toBe(false);
 			expect(rejected.rejectedCount).toBe(1);
+			// Proves non-borrowing directly: `second` carries no metadata of its
+			// own, so if it inherited `first`'s 3.8M effective window (4M * 95%)
+			// this 3.9M estimate would be rejected just like `first`'s was above.
+			// Instead it must fail open (unknown capacity, admit).
+			expect(
+				selectAdmittedCodexModel(
+					second,
+					"claude-opus-4-8",
+					createContextAdmissionTracker(
+						calibratedAdmissionEstimate(3_900_000),
+						50_000,
+					),
+				),
+			).toEqual({ admitted: true, model: "gpt-6-wide" });
 		} finally {
 			clearCodexAccountModelContextMetadata(first.id);
 			clearCodexAccountModelContextMetadata(second.id);

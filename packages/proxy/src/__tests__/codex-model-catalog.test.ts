@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { Logger } from "@better-ccflare/logger";
 import {
 	CodexProvider,
 	clearDerivedAccountModelDefaults,
@@ -120,6 +121,34 @@ async function waitForFetchCount(
 		await new Promise((resolve) => setTimeout(resolve, 0));
 	}
 	expect(readCount()).toBe(expected);
+}
+
+// A real (unmocked) wall-clock wait, for tests that mock Date.now to control
+// application-level scheduling math while still needing the real
+// setInterval-backed heartbeat to actually fire between waypoints.
+async function waitRealMs(totalMs: number, stepMs = 5): Promise<void> {
+	const steps = Math.max(1, Math.ceil(totalMs / stepMs));
+	for (let i = 0; i < steps; i++) {
+		await new Promise((resolve) => setTimeout(resolve, stepMs));
+	}
+}
+
+async function waitForWarnCall(
+	warnSpy: { mock: { calls: unknown[][] } },
+	substring: string,
+	iterations = 20,
+): Promise<void> {
+	for (
+		let i = 0;
+		i < iterations &&
+		!warnSpy.mock.calls.some((call) => String(call[0]).includes(substring));
+		i++
+	) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	expect(
+		warnSpy.mock.calls.some((call) => String(call[0]).includes(substring)),
+	).toBe(true);
 }
 
 let originalFetch: typeof globalThis.fetch;
@@ -428,6 +457,126 @@ describe("periodic Codex catalog freshness", () => {
 			stop();
 		}
 		expect(calls).toHaveLength(1);
+	});
+
+	// nextRefreshAt used to be pinned at *tick-start* + 15min (+ jitter),
+	// independent of how long that tick's own fetch actually took. Any
+	// account whose fetch finishes late within its tick misses the next
+	// tick's own per-account freshness check (it isn't 15 real minutes
+	// stale *yet*, by ensureCodexModelDefaults's own fetchedAt-based
+	// clock) and then gets rescheduled a further 15 minutes out from that
+	// *skipped* tick's start -- silently doubling its true refresh
+	// interval. Anchoring nextRefreshAt to tick *completion* keeps the
+	// heartbeat's own due-check aligned with the per-account check it
+	// gates, for every account touched that tick.
+	it("does not skip an account's next refresh when its fetch finishes late in a tick", async () => {
+		const BASE_NOW = 1_800_000_000_000;
+		const CATALOG_REFRESH_INTERVAL_MS = 15 * 60_000;
+		const FETCH_DELAY_MS = 2 * 60_000;
+		let currentNow = BASE_NOW;
+		const nowSpy = spyOn(Date, "now").mockImplementation(() => currentNow);
+		const randomSpy = spyOn(Math, "random").mockReturnValue(0);
+		try {
+			const account = makeAccount({
+				expires_at: BASE_NOW + 10 * 3_600_000,
+			});
+			const ctx = makeCtx(account);
+			ctx.dbOps.getAllAccounts = async () => [account];
+			let fetchCount = 0;
+			globalThis.fetch = (async () => {
+				fetchCount++;
+				// This account's own fetch takes real (simulated) time; its
+				// fetchedAt is stamped only once this resolves, inside
+				// getCodexModels -- not at tick start.
+				currentNow += FETCH_DELAY_MS;
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+
+			const stop = initCodexModelCatalogRefresh(ctx, {
+				initialDelayMs: 1,
+				tickSeconds: 0.01,
+			});
+			try {
+				await waitForFetchCount(() => fetchCount, 1);
+				const firstFetchedAt = getKnownCodexModels(account.id)?.fetchedAt;
+				expect(firstFetchedAt).toBe(BASE_NOW + FETCH_DELAY_MS);
+
+				// The old tick-start-anchored nextRefreshAt would open here.
+				// The account is not yet 15 real minutes past its own
+				// fetchedAt, so a correct per-account check still holds it.
+				currentNow = BASE_NOW + CATALOG_REFRESH_INTERVAL_MS;
+				await waitRealMs(40);
+
+				// The account's true due point: 15 minutes after its own
+				// fetchedAt (not after tick start). Bounded polling (rather than a
+				// fixed real-time wait) for this positive assertion: it only needs
+				// the heartbeat to fire at least once more, so it should not force
+				// every run to pay a fixed 60ms regardless of how quickly that
+				// actually happens, nor risk flaking on a slower CI host.
+				currentNow = BASE_NOW + FETCH_DELAY_MS + CATALOG_REFRESH_INTERVAL_MS;
+				await waitForFetchCount(() => fetchCount, 2);
+
+				expect(getKnownCodexModels(account.id)?.fetchedAt).toBe(
+					BASE_NOW + CATALOG_REFRESH_INTERVAL_MS + 2 * FETCH_DELAY_MS,
+				);
+			} finally {
+				stop();
+			}
+		} finally {
+			nowSpy.mockRestore();
+			randomSpy.mockRestore();
+		}
+	});
+
+	it("warns when the eligible Codex account list exceeds the refresh cap", async () => {
+		const accounts = Array.from({ length: 103 }, (_, i) =>
+			makeAccount({ id: `acc-${i}` }),
+		);
+		const ctx = makeCtx(accounts[0]);
+		ctx.dbOps.getAllAccounts = async () => accounts;
+		globalThis.fetch = (async () =>
+			Response.json(LIVE_BODY)) as typeof globalThis.fetch;
+		const warnSpy = spyOn(Logger.prototype, "warn").mockImplementation(
+			() => undefined,
+		);
+		const stop = initCodexModelCatalogRefresh(ctx, {
+			initialDelayMs: 1,
+			tickSeconds: 1,
+		});
+		try {
+			await waitForWarnCall(warnSpy, "100 of 103");
+			const call = warnSpy.mock.calls.find((c) =>
+				String(c[0]).includes("100 of 103"),
+			);
+			expect(String(call?.[0])).toContain("3");
+		} finally {
+			stop();
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("does not warn when the eligible Codex account list is within the refresh cap", async () => {
+		const codex = makeAccount();
+		const ctx = makeCtx(codex);
+		ctx.dbOps.getAllAccounts = async () => [codex];
+		globalThis.fetch = (async () =>
+			Response.json(LIVE_BODY)) as typeof globalThis.fetch;
+		const warnSpy = spyOn(Logger.prototype, "warn").mockImplementation(
+			() => undefined,
+		);
+		const stop = initCodexModelCatalogRefresh(ctx, {
+			initialDelayMs: 1,
+			tickSeconds: 1,
+		});
+		try {
+			await waitRealMs(30);
+			expect(
+				warnSpy.mock.calls.some((c) => String(c[0]).includes("eligible")),
+			).toBe(false);
+		} finally {
+			stop();
+			warnSpy.mockRestore();
+		}
 	});
 	it("returns the warm listing without waiting for a stalled stale refresh and coalesces callers", async () => {
 		const account = makeAccount();

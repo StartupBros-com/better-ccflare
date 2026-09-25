@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type {
 	Account,
 	ServerToolCapabilityTuple,
@@ -9,12 +9,19 @@ import {
 	materializeProviderAttemptPlan,
 } from "../../provider-attempt-plan";
 import {
+	captureCodexModelContextSnapshot,
+	clearCodexAccountModelContextMetadata,
+	resolveModelContextCapability,
+	setCodexAccountModelContextMetadata,
+} from "../../request-capabilities";
+import {
 	buildServerToolCapabilityTupleKey,
 	deriveServerToolRequirement,
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
 } from "../../server-tool-capabilities";
 import type { ServerToolHistoryReplacement } from "../../server-tools/history-projection";
+import type { ProviderAttemptPlanContext } from "../../types";
 import officialSearchStream from "./__fixtures__/server-tools/official-search-stream.sanitized.json";
 import { CODEX_DEFAULT_ENDPOINT, CodexProvider } from "./provider";
 import {
@@ -1560,5 +1567,90 @@ describe("Codex exact hosted-search attempt plan", () => {
 		await reader.cancel("client-aborted");
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(upstreamCancelled).toBe(true);
+	});
+
+	test("a catalog publication after plan creation does not change the hosted fallback's telemetry capacity", async () => {
+		const provider = new CodexProvider();
+		const account = codexOAuthAccount();
+		setCodexAccountModelContextMetadata(account.id, [
+			{
+				id: "gpt-5.6-sol",
+				contextWindow: 200_000,
+				maxContextWindow: 200_000,
+				effectiveContextPercent: 90,
+			},
+		]);
+		try {
+			// Admission time: capture the identity (and its model-context snapshot)
+			// exactly once, the way proxy-operations.ts does before any later await.
+			const capturedIdentity = provider.captureAttemptIdentity(account);
+
+			// A catalog refresh races in after plan creation but before the
+			// response is processed -- this must not change this attempt's capacity.
+			setCodexAccountModelContextMetadata(account.id, [
+				{
+					id: "gpt-5.6-sol",
+					contextWindow: 999_000,
+					maxContextWindow: 999_000,
+					effectiveContextPercent: 50,
+				},
+			]);
+
+			const body = hostedRequestBody();
+			const sourceRequest = new Request(CODEX_DEFAULT_ENDPOINT, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+			const context: ProviderAttemptPlanContext = {
+				request: sourceRequest,
+				requestBodyBuffer: requestBodyBuffer(body),
+				account,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "gpt-5.6-sol",
+				capabilityProofKey: "codex-hosted-search-proof",
+				inputReplayMode: [],
+				outputReplayMode: ["proxy-evidence-v1"],
+				serverToolReplayIssuer: async () => "bccf2.fixture",
+				capturedAttemptIdentity: capturedIdentity,
+			};
+			const plan = provider.createAttemptPlan(context);
+			const processResponseSpy = spyOn(provider, "processResponse");
+
+			// A non-SSE, non-ok upstream response is exactly the shape that
+			// routes through the hosted plan's `fallback` into processResponse.
+			const errorResponse = new Response("upstream unavailable", {
+				status: 503,
+				statusText: "Service Unavailable",
+				headers: { "content-type": "text/plain" },
+			});
+			await plan.processResponse(errorResponse, undefined);
+
+			expect(processResponseSpy).toHaveBeenCalledTimes(1);
+			const passedSnapshot = processResponseSpy.mock.calls[0]?.[4];
+			expect(passedSnapshot).toBe(capturedIdentity.modelContextSnapshot);
+			expect(passedSnapshot).not.toBe(
+				captureCodexModelContextSnapshot(account.id),
+			);
+
+			const capacityAtResponseTime = resolveModelContextCapability(
+				"codex",
+				"gpt-5.6-sol",
+				account.id,
+				passedSnapshot,
+			);
+			expect(capacityAtResponseTime?.rawContextWindow).toBe(200_000);
+
+			const capacityIfRepublicationHadLeaked = resolveModelContextCapability(
+				"codex",
+				"gpt-5.6-sol",
+				account.id,
+				captureCodexModelContextSnapshot(account.id),
+			);
+			expect(capacityIfRepublicationHadLeaked?.rawContextWindow).toBe(999_000);
+		} finally {
+			clearCodexAccountModelContextMetadata(account.id);
+		}
 	});
 });
