@@ -270,6 +270,29 @@ export interface FamilyAliasPolicyApplyResult {
 	converted: number;
 }
 
+/**
+ * One account's full-field `model_mappings` replacement, guarded by the raw
+ * value the caller previewed. Values are the exact stored JSON strings; null
+ * means the column is NULL.
+ */
+export interface GuardedModelMappingsWrite {
+	account_id: string;
+	expected_old_value: string | null;
+	new_value: string | null;
+}
+
+/** A batch of guarded writes that also compare-and-sets the policy revision. */
+export interface GuardedModelMappingsWriteInput {
+	expected_revision: number;
+	/** At most one write per account; every write must change the value. */
+	writes: GuardedModelMappingsWrite[];
+}
+
+export interface GuardedModelMappingsWriteResult {
+	revision: number;
+	written: number;
+}
+
 export interface ComboRoutingPolicySnapshot {
 	assignment: ComboFamilyAssignment;
 	combo: Combo | null;

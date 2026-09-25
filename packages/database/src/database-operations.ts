@@ -34,6 +34,8 @@ import type {
 	FamilyAliasPolicyApplyResult,
 	FamilyAliasPolicyPreview,
 	FamilyAliasPolicyPreviewInput,
+	GuardedModelMappingsWriteInput,
+	GuardedModelMappingsWriteResult,
 	IntegrityStatus,
 	ProjectAttributionSource,
 	RateLimitReason,
@@ -2607,6 +2609,17 @@ OAuth tokens will need to be re-authenticated.
 		input: FamilyAliasPolicyApplyInput,
 	): Promise<FamilyAliasPolicyApplyResult> {
 		return this.combo.applyFamilyAliasPolicy(input);
+	}
+
+	/**
+	 * Revision-CAS plus per-row guarded `model_mappings` replacement, all in
+	 * one batch. Throws a `stale_model_mappings_write` conflict (with `reason`
+	 * "revision" or "row") and writes nothing when any guard is stale.
+	 */
+	async applyGuardedModelMappingsWrites(
+		input: GuardedModelMappingsWriteInput,
+	): Promise<GuardedModelMappingsWriteResult> {
+		return this.combo.applyGuardedModelMappingsWrites(input);
 	}
 
 	async applyFamilyPolicyChanges(

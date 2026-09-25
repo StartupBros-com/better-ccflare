@@ -105,6 +105,7 @@ export {
 	CATALOG_REFRESH_INTERVAL_MS,
 	clearCodexModelCacheForAccount,
 	clearCodexModelCacheForTests,
+	getCodexCatalogRoleTarget,
 	getCodexModels,
 	getKnownCodexModels,
 	getKnownOrSharedCodexModels,

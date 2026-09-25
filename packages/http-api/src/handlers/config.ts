@@ -26,13 +26,9 @@ import {
 	setProviderModelDefaultOverrides,
 } from "@better-ccflare/providers";
 import { resolveCodexClientIdentity } from "@better-ccflare/providers/codex";
-import {
-	CATALOG_REFRESH_INTERVAL_MS,
-	getKnownOrSharedCodexModels,
-} from "@better-ccflare/proxy";
 import type { APIContext } from "@better-ccflare/types";
 import {
-	type CodexAccountCatalogInfo,
+	describeCodexAccountCatalog,
 	resolveCodexAccountFamilyDefault,
 } from "../services/codex-effective-defaults";
 import {
@@ -73,26 +69,10 @@ export function createConfigHandlers(
 
 		const now = Date.now();
 		return accounts.map((account) => {
-			const known = getKnownOrSharedCodexModels(account.id);
-			const catalogSource: "own" | "borrowed" | "none" =
-				known === null
-					? "none"
-					: known.source === "cached"
-						? "own"
-						: "borrowed";
-			const catalogInfo: CodexAccountCatalogInfo =
-				catalogSource === "borrowed"
-					? { source: "borrowed", borrowedFrom: known?.borrowedFrom }
-					: { source: catalogSource };
-			const catalog = {
-				source: catalogSource,
-				fetchedAt: known?.fetchedAt ?? null,
-				stale:
-					known !== null && now - known.fetchedAt > CATALOG_REFRESH_INTERVAL_MS,
-				...(catalogInfo.source === "borrowed" && catalogInfo.borrowedFrom
-					? { borrowedFrom: catalogInfo.borrowedFrom }
-					: {}),
-			};
+			const { info: catalogInfo, view: catalog } = describeCodexAccountCatalog(
+				account.id,
+				now,
+			);
 
 			const families = CODEX_FAMILIES.map((family) =>
 				resolveCodexAccountFamilyDefault(account, family, {

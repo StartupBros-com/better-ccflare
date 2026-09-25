@@ -31,6 +31,8 @@ import {
 	type FamilyAliasPolicyPreview,
 	type FamilyAliasPolicyPreviewInput,
 	type FamilyAliasPolicySkipped,
+	type GuardedModelMappingsWriteInput,
+	type GuardedModelMappingsWriteResult,
 	toCombo,
 	toComboEnrollmentRule,
 	toComboFamilyAssignment,
@@ -49,6 +51,28 @@ export class RoutingPolicyRevisionConflictError extends Error {
 	constructor() {
 		super("Routing policy revision changed before apply");
 		this.name = "RoutingPolicyRevisionConflictError";
+	}
+}
+
+/**
+ * A guarded `model_mappings` batch lost a race: either the routing-policy
+ * revision moved (`reason: "revision"`) or one account row no longer held the
+ * value the caller previewed (`reason: "row"`, with that account's id). The
+ * whole batch was rolled back in both cases.
+ */
+export class ModelMappingsWriteConflictError extends Error {
+	readonly code = "stale_model_mappings_write";
+
+	constructor(
+		readonly reason: "revision" | "row",
+		readonly accountId: string | null = null,
+	) {
+		super(
+			reason === "revision"
+				? "Routing policy revision changed before the model_mappings write"
+				: `model_mappings changed for account ${accountId} before the write`,
+		);
+		this.name = "ModelMappingsWriteConflictError";
 	}
 }
 
@@ -870,6 +894,88 @@ export class ComboRepository extends BaseRepository<Combo> {
 		return {
 			revision: input.expected_revision + (converted > 0 ? 1 : 0),
 			converted,
+		};
+	}
+
+	/**
+	 * Replace whole `accounts.model_mappings` values in one adapter batch: a
+	 * routing-policy revision compare-and-set, then one write per account that
+	 * only lands while the row still holds the caller's previewed raw value.
+	 * `IS NOT DISTINCT FROM` keeps that comparison NULL-safe on SQLite and
+	 * PostgreSQL alike, where `=` would never match a NULL row. Any stale guard
+	 * rolls back every statement; nothing is partially written.
+	 */
+	async applyGuardedModelMappingsWrites(
+		input: GuardedModelMappingsWriteInput,
+	): Promise<GuardedModelMappingsWriteResult> {
+		if (
+			!Number.isSafeInteger(input.expected_revision) ||
+			input.expected_revision < 0
+		) {
+			throw new Error("expected_revision must be a non-negative safe integer");
+		}
+		if (!Array.isArray(input.writes) || input.writes.length === 0) {
+			throw new Error("at least one guarded model_mappings write is required");
+		}
+		const seen = new Set<string>();
+		for (const write of input.writes) {
+			if (typeof write.account_id !== "string" || !write.account_id) {
+				throw new Error("guarded model_mappings write needs an account id");
+			}
+			if (seen.has(write.account_id)) {
+				throw new Error(
+					"one guarded model_mappings write per account; group changes first",
+				);
+			}
+			seen.add(write.account_id);
+			for (const value of [write.expected_old_value, write.new_value]) {
+				if (value !== null && typeof value !== "string") {
+					throw new Error("model_mappings values must be strings or null");
+				}
+			}
+			// The revision trigger only fires on a real change, so a no-op write
+			// would break the single-advance normalization below.
+			if (write.new_value === write.expected_old_value) {
+				throw new Error("guarded model_mappings write must change the value");
+			}
+		}
+		const statements: BatchStatement[] = [
+			{
+				sql: "UPDATE routing_policy_revision SET revision = revision WHERE scope = 'global' AND revision = ?",
+				params: [input.expected_revision],
+				expectedChanges: 1,
+			},
+			...input.writes.map((write) => ({
+				sql: "UPDATE accounts SET model_mappings = ? WHERE id = ? AND model_mappings IS NOT DISTINCT FROM ?",
+				params: [write.new_value, write.account_id, write.expected_old_value],
+				expectedChanges: 1,
+			})),
+			// The account update trigger bumps the revision once per changed row.
+			// Normalize inside the same transaction so one apply is one
+			// externally visible advance, as applyFamilyAliasPolicy does.
+			{
+				sql: "UPDATE routing_policy_revision SET revision = ? WHERE scope = 'global' AND revision >= ?",
+				params: [input.expected_revision + 1, input.expected_revision],
+				expectedChanges: 1,
+			},
+		];
+		try {
+			await this.adapter.runBatchWithChanges(statements);
+		} catch (error) {
+			if (error instanceof BatchExpectedChangesError) {
+				if (error.statementIndex === 0) {
+					throw new ModelMappingsWriteConflictError("revision");
+				}
+				const write = input.writes[error.statementIndex - 1];
+				if (write) {
+					throw new ModelMappingsWriteConflictError("row", write.account_id);
+				}
+			}
+			throw error;
+		}
+		return {
+			revision: input.expected_revision + 1,
+			written: input.writes.length,
 		};
 	}
 

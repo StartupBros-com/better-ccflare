@@ -5,6 +5,10 @@ import {
 	parseModelMappings,
 } from "@better-ccflare/core";
 import { resolveCodexRequestModel } from "@better-ccflare/providers/codex";
+import {
+	CATALOG_REFRESH_INTERVAL_MS,
+	getKnownOrSharedCodexModels,
+} from "@better-ccflare/proxy";
 import type { Account } from "@better-ccflare/types";
 
 /**
@@ -43,6 +47,46 @@ export interface CodexAccountFamilyDefault {
 export interface CodexAccountCatalogInfo {
 	source: "own" | "borrowed" | "none";
 	borrowedFrom?: string;
+}
+
+/** The catalog freshness view reported next to an account's family defaults. */
+export interface CodexAccountCatalogView {
+	source: CodexAccountCatalogInfo["source"];
+	fetchedAt: number | null;
+	stale: boolean;
+	borrowedFrom?: string;
+}
+
+/**
+ * Read one Codex account's catalog evidence without triggering a fetch, as
+ * both the attribution input (`info`) and the freshness view (`view`). The
+ * effective-defaults metadata API and the migration preview share this so
+ * they cannot disagree about whether a listing is the account's own.
+ * Staleness uses the catalog module's own refresh threshold.
+ */
+export function describeCodexAccountCatalog(
+	accountId: string,
+	now: number = Date.now(),
+): { info: CodexAccountCatalogInfo; view: CodexAccountCatalogView } {
+	const known = getKnownOrSharedCodexModels(accountId);
+	const source: CodexAccountCatalogInfo["source"] =
+		known === null ? "none" : known.source === "cached" ? "own" : "borrowed";
+	const info: CodexAccountCatalogInfo =
+		source === "borrowed"
+			? { source, borrowedFrom: known?.borrowedFrom }
+			: { source };
+	return {
+		info,
+		view: {
+			source,
+			fetchedAt: known?.fetchedAt ?? null,
+			stale:
+				known !== null && now - known.fetchedAt > CATALOG_REFRESH_INTERVAL_MS,
+			...(info.source === "borrowed" && info.borrowedFrom
+				? { borrowedFrom: info.borrowedFrom }
+				: {}),
+		},
+	};
 }
 
 /**

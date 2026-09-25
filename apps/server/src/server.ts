@@ -1680,6 +1680,7 @@ export default async function startServer(options?: {
 			getStrategy: () => currentStrategy,
 			internalProbeSecret,
 			localControlSecret,
+			modelRouteProfiles,
 		},
 		{ deviceSetupCoordinator },
 	);
