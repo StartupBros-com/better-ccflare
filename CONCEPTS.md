@@ -65,6 +65,14 @@ A semantically ordered tier of authorized routes in a capability descendant's ca
 Ranking may reorder accounts within one rung but cannot move a lower-authority rung ahead of a
 higher-authority rung or add a route that authorization did not admit.
 
+### Attributed descendant
+
+A request the Codex provider contains as a subagent: it loses its Agent and Task tool
+declarations without entering orchestration election. A request earns this status only from a
+real agent identity, meaning a registered agent matched on its prompt, an explicit agent-id
+header, or Claude Code's own subagent markers. The proxy's session-id attribution fallback
+identifies a session, not an agent, and never confers it.
+
 ### Trusted internal helper
 
 A Claude Code side request, such as WebSearch, whose authenticated caller and session lineage
