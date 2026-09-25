@@ -83,11 +83,12 @@ identifies a session, not an agent, and never confers it.
 
 The Codex provider's per-session claim of the single conversation allowed to keep its
 orchestration tools. The first eligible request in a session becomes the root; a later request
-keeps root only when it continues that root's lineage with the same instructions, otherwise it
-is admitted as non-root and loses those tools for that turn. A rejected claim never renews the
-root, so the root lapses only when it goes idle past the session TTL, after which a new claim
-can win. Attributed descendants and requests that offer no orchestration tools never enter the
-election.
+keeps root when it continues as the same conversation the root already recognizes, or, as a new
+conversation, when it shares the root's instructions and continues its lineage; any other later
+request is admitted as non-root and loses those tools for that turn. A rejected claim never
+renews the root, so the root lapses only when it goes idle past the session TTL, after which a
+new claim can win. Attributed descendants and requests that offer no orchestration tools never
+enter the election.
 
 ### Trusted internal helper
 
