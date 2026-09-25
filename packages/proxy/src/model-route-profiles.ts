@@ -1,3 +1,6 @@
+import { getModelFamily } from "@better-ccflare/core";
+import type { RoutePhysicalModelPolicy } from "@better-ccflare/types";
+
 export const MODEL_ROUTE_PROFILES_ENV =
 	"CCFLARE_MODEL_ROUTE_PROFILES_JSON" as const;
 export const MODEL_ROUTE_PROFILE_MODEL_PREFIX = "claude-bccf-route-" as const;
@@ -26,11 +29,24 @@ const PROFILE_KEYS = new Set([
 	"contextWindow",
 	"maxOutputTokens",
 	"clientContextWindowHint",
+	"physicalModelPolicy",
 ]);
 
 const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 export type ModelRouteEffort = (typeof EFFORTS)[number];
+
+/**
+ * How a profile constrains the physical model. `exact` (the default when the
+ * field is absent) keeps the fixed `expectedPhysicalModel` contract.
+ * `catalog-role` follows whatever model sits at `logicalModel`'s family role
+ * in each Codex account's own catalog, so a new model generation needs no
+ * config edit. The role is always derived from `logicalModel`; there is no
+ * separate role key that could disagree with it.
+ */
+export type ModelRoutePhysicalModelPolicy = RoutePhysicalModelPolicy;
+
+const CATALOG_ROLE_PROVIDER = "codex";
 
 /**
  * How a route profile chooses its upstream account.  Profiles created before
@@ -62,6 +78,8 @@ export interface ModelRouteProfile {
 	readonly maxOutputTokens?: number;
 	/** Opt-in context-window capability advertised to supported clients. */
 	readonly clientContextWindowHint?: "1m";
+	/** Present only when configured; absent means `exact`. */
+	readonly physicalModelPolicy?: ModelRoutePhysicalModelPolicy;
 }
 
 export type BoundedModelRouteProfile = ModelRouteProfile & {
@@ -326,15 +344,60 @@ export function parseModelRouteProfiles(
 			index,
 			MAX_MODEL_ID_LENGTH,
 		);
+		const physicalModelPolicyValue = candidate.physicalModelPolicy;
+		let physicalModelPolicy: ModelRoutePhysicalModelPolicy | undefined;
+		if (physicalModelPolicyValue !== undefined) {
+			if (
+				physicalModelPolicyValue !== "exact" &&
+				physicalModelPolicyValue !== "catalog-role"
+			) {
+				throw configError(
+					`profile ${index} field physicalModelPolicy must be exact or catalog-role`,
+				);
+			}
+			physicalModelPolicy = physicalModelPolicyValue;
+		}
 		if (selection === "capability") {
 			if (!expectedProvider) {
 				throw configError(
 					`profile ${index} capability selection requires expectedProvider`,
 				);
 			}
-			if (!expectedPhysicalModel) {
+			// A catalog-role pool admits accounts by their own catalog evidence,
+			// so it deliberately has no fixed model to require here.
+			if (!expectedPhysicalModel && physicalModelPolicy !== "catalog-role") {
 				throw configError(
 					`profile ${index} capability selection requires expectedPhysicalModel`,
+				);
+			}
+		}
+		if (physicalModelPolicy === "catalog-role") {
+			if (expectedProvider !== CATALOG_ROLE_PROVIDER) {
+				throw configError(
+					`profile ${index} physicalModelPolicy catalog-role requires expectedProvider ${CATALOG_ROLE_PROVIDER}`,
+				);
+			}
+			if (expectedPhysicalModel !== undefined) {
+				throw configError(
+					`profile ${index} physicalModelPolicy catalog-role must omit expectedPhysicalModel`,
+				);
+			}
+			// The model moves with the catalog, so a fixed capacity claim would
+			// silently go stale; capacity comes from the catalog snapshot instead.
+			if (contextWindow !== undefined || maxOutputTokens !== undefined) {
+				throw configError(
+					`profile ${index} physicalModelPolicy catalog-role must omit contextWindow and maxOutputTokens`,
+				);
+			}
+			const roleLogicalModel = requiredString(
+				candidate,
+				"logicalModel",
+				index,
+				MAX_MODEL_ID_LENGTH,
+			);
+			if (getModelFamily(roleLogicalModel) === null) {
+				throw configError(
+					`profile ${index} physicalModelPolicy catalog-role requires a logicalModel in the fable, opus, sonnet or haiku family`,
 				);
 			}
 		}
@@ -374,6 +437,8 @@ export function parseModelRouteProfiles(
 			defaultEffort,
 			expectedProvider,
 			expectedPhysicalModel,
+			// Added only when configured so existing profiles stay byte-identical.
+			...(physicalModelPolicy === undefined ? {} : { physicalModelPolicy }),
 		};
 		return profile;
 	});

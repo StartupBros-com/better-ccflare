@@ -6,8 +6,10 @@ import {
 } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import {
+	CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT,
 	ensureCodexModelDefaults,
 	getKnownCodexModels,
+	isCodexCatalogRefreshEligible,
 	revalidateUnknownCodexModel,
 } from "./codex-model-catalog";
 import type { ProxyContext } from "./handlers/proxy-types";
@@ -67,6 +69,59 @@ async function primeBeforeDeadline(
 			() => finish(false),
 		);
 	});
+}
+
+export interface CatalogRolePrimeOptions {
+	/** The exact-account profile's account, or null for a capability pool. */
+	accountId: string | null;
+	/** Read only when some candidate may be cold. */
+	loadAccounts: () => Promise<readonly Account[]>;
+	ctx: ProxyContext;
+	/** Absolute account-selection deadline, in epoch milliseconds. */
+	deadlineAt: number;
+	signal?: AbortSignal;
+}
+
+/**
+ * Give each cold candidate of a catalog-role route one bounded read of its
+ * own listing before selection, which never fetches. Listings live in memory
+ * only, so after a restart this is what admits an account before the refresh
+ * heartbeat's first tick.
+ *
+ * Candidates are the accounts the heartbeat refreshes, under the same cap:
+ * the profile's account, or every such Codex account for a capability pool.
+ * An account with any listing of its own, even a stale one, is warm and adds
+ * no wait. The read goes through the catalog's shared ensure, so concurrent
+ * requests share one read per account and a failed read keeps its backoff. A
+ * failed or late read leaves the account cold, and selection fails closed.
+ */
+export async function primeCatalogRoleCandidates(
+	options: CatalogRolePrimeOptions,
+): Promise<void> {
+	const { accountId } = options;
+	if (accountId !== null && getKnownCodexModels(accountId) !== null) return;
+	const accounts = await options.loadAccounts();
+	const candidates =
+		accountId !== null
+			? accounts.filter(
+					(account) =>
+						account.id === accountId && isCodexCatalogRefreshEligible(account),
+				)
+			: accounts
+					.filter(isCodexCatalogRefreshEligible)
+					.slice(0, CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT);
+	await Promise.all(
+		candidates
+			.filter((account) => getKnownCodexModels(account.id) === null)
+			.map((account) =>
+				primeBeforeDeadline(
+					account,
+					options.ctx,
+					options.deadlineAt,
+					options.signal,
+				),
+			),
+	);
 }
 
 /** Read only the adapter's physical-model carrier, never the translated model. */

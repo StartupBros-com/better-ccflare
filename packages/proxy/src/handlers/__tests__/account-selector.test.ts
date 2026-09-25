@@ -25,6 +25,7 @@ import {
 	clearCodexModelCacheForTests,
 	getCodexModels,
 	getKnownCodexModels,
+	getKnownOrSharedCodexModels,
 } from "../../codex-model-catalog";
 import { DegradedOwnerOverlay } from "../../degraded-owner-overlay";
 import {
@@ -37,9 +38,11 @@ const {
 	clearDerivedProviderModelDefaults,
 	getProvider,
 	registerProvider,
+	setProviderModelDefaultOverrides,
 	usageCache,
 } = await import("@better-ccflare/providers");
 const { SessionStrategy } = await import("@better-ccflare/load-balancer");
+const { getCodexCatalogRoleTarget } = await import("../../codex-model-catalog");
 const {
 	ForceRouteUnavailableError,
 	deriveAffinityLaneKey,
@@ -47,6 +50,7 @@ const {
 	getCapacityDeferredModelRoutes,
 	getComboSlotInfo,
 	getReactiveModelCapacityBlocker,
+	getRouteProfileConstraintViolation,
 	getRoutingCapacityContext,
 	evaluateImplicitFallbackPolicy,
 	isImplicitFallbackAccountAllowed,
@@ -1832,6 +1836,522 @@ describe("selectAccountsForRequest — server-derived route profile", () => {
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-5");
 		expect(result).toEqual([account]);
+	});
+});
+
+describe("selectAccountsForRequest — catalog-role route profile", () => {
+	// A fictitious next generation: nothing here may be special-cased by name.
+	const NEXT_GENERATION = ["gpt-7-nova", "gpt-7-sol", "gpt-7-luna"] as const;
+	const LOGICAL_OPUS = "claude-opus-5";
+	const originalEnvMappings = process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS;
+
+	afterEach(() => {
+		clearCodexModelCacheForTests();
+		clearDerivedProviderModelDefaults();
+		setProviderModelDefaultOverrides(undefined);
+		if (originalEnvMappings === undefined) {
+			delete process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS;
+		} else {
+			process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS = originalEnvMappings;
+		}
+	});
+
+	function codexAccount(id: string, overrides: Partial<Account> = {}): Account {
+		return makeAccount({ id, name: id, provider: "codex", ...overrides });
+	}
+
+	function roleCtx(accounts: Account[]): ProxyContext {
+		const ctx = makeCtx({ accounts });
+		ctx.dbOps.getAccount = mock(
+			async (id: string) =>
+				accounts.find((account) => account.id === id) ?? null,
+		);
+		return ctx;
+	}
+
+	/** Publish one account's own listing through the real catalog path. */
+	async function publishOwnCatalog(
+		account: Account,
+		ctx: ProxyContext,
+		models: readonly string[] = NEXT_GENERATION,
+	): Promise<void> {
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = mock(async () =>
+			Response.json({
+				models: models.map((slug, index) => ({
+					slug,
+					visibility: "list",
+					priority: index + 1,
+				})),
+			}),
+		) as unknown as typeof fetch;
+		try {
+			const listing = await getCodexModels(account.id, ctx);
+			expect(listing?.source).toBe("live");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	}
+
+	function exactRoleMeta(
+		accountId: string,
+		overrides: Partial<RequestMeta> = {},
+	): RequestMeta {
+		return makeRequestMeta({
+			forcedAccountId: accountId,
+			routeProfileId: "codex-opus",
+			routeProfileLogicalModel: LOGICAL_OPUS,
+			routeProfilePhysicalModelPolicy: "catalog-role",
+			routePhysicalModelPolicy: "catalog-role",
+			routeExpectedProvider: "codex",
+			routeLineage: { kind: "root", childHomeKey: null },
+			...overrides,
+		});
+	}
+
+	function poolRoleMeta(overrides: Partial<RequestMeta> = {}): RequestMeta {
+		return makeRequestMeta({
+			routeProfileId: "codex-opus-pool",
+			routeProfileSelection: "capability",
+			routeProfileLogicalModel: LOGICAL_OPUS,
+			routeProfilePhysicalModelPolicy: "catalog-role",
+			routePhysicalModelPolicy: "catalog-role",
+			routeExpectedProvider: "codex",
+			routeLineage: { kind: "root", childHomeKey: null },
+			...overrides,
+		});
+	}
+
+	it("admits an exact-account route to the role target of the account's own catalog", async () => {
+		const account = codexAccount("role-own");
+		const ctx = roleCtx([account]);
+		await publishOwnCatalog(account, ctx);
+		const meta = exactRoleMeta(account.id);
+
+		await expect(
+			selectAccountsForRequest(meta, ctx, LOGICAL_OPUS),
+		).resolves.toEqual([account]);
+		expect(meta.routeCatalogRoleTargetByAccountId?.get(account.id)).toBe(
+			"gpt-7-nova",
+		);
+		expect(getCodexCatalogRoleTarget(account.id, "opus")).toBe("gpt-7-nova");
+		expect(getCodexCatalogRoleTarget(account.id, "fable")).toBe("gpt-7-nova");
+		expect(getCodexCatalogRoleTarget(account.id, "sonnet")).toBe("gpt-7-sol");
+		expect(getCodexCatalogRoleTarget(account.id, "haiku")).toBe("gpt-7-luna");
+	});
+
+	it("never takes a role target from a borrowed provider-wide listing", async () => {
+		const lender = codexAccount("role-lender");
+		const borrower = codexAccount("role-borrower");
+		const ctx = roleCtx([lender, borrower]);
+		await publishOwnCatalog(lender, ctx);
+		expect(getKnownOrSharedCodexModels(borrower.id)).toMatchObject({
+			source: "shared",
+			borrowedFrom: lender.id,
+		});
+		expect(getCodexCatalogRoleTarget(borrower.id, "opus")).toBeNull();
+
+		await expect(
+			selectAccountsForRequest(exactRoleMeta(borrower.id), ctx, LOGICAL_OPUS),
+		).rejects.toMatchObject({
+			name: "ForceRouteUnavailableError",
+			accountId: borrower.id,
+			reason: "catalog_role_unavailable",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("rejects an account with no listing at all as catalog_role_unavailable", async () => {
+		const account = codexAccount("role-unprimed");
+		const ctx = roleCtx([account]);
+
+		await expect(
+			selectAccountsForRequest(exactRoleMeta(account.id), ctx, LOGICAL_OPUS),
+		).rejects.toMatchObject({
+			name: "ForceRouteUnavailableError",
+			reason: "catalog_role_unavailable",
+		});
+	});
+
+	for (const pin of [
+		{
+			label: "an account family pin",
+			apply: (account: Account) => {
+				account.model_mappings = JSON.stringify({ opus: "gpt-7-sol" });
+			},
+		},
+		{
+			label: "an exact logical-model pin",
+			apply: (account: Account) => {
+				account.model_mappings = JSON.stringify({
+					[LOGICAL_OPUS]: "gpt-7-sol",
+				});
+			},
+		},
+		{
+			label: "a fallback list whose later entry differs",
+			apply: (account: Account) => {
+				account.model_mappings = JSON.stringify({
+					opus: ["gpt-7-nova", "gpt-7-sol"],
+				});
+			},
+		},
+		{
+			label: "a legacy model_fallbacks entry",
+			apply: (account: Account) => {
+				account.model_fallbacks = JSON.stringify({ opus: "gpt-7-sol" });
+			},
+		},
+		{
+			label: "an environment mapping",
+			apply: () => {
+				process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS = JSON.stringify({
+					opus: "gpt-7-sol",
+				});
+			},
+		},
+		{
+			label: "a global provider override",
+			apply: () => {
+				setProviderModelDefaultOverrides({ codex: { opus: "gpt-7-sol" } });
+			},
+		},
+	]) {
+		it(`rejects ${pin.label} that differs from the role target as catalog_role_mismatch`, async () => {
+			const account = codexAccount(
+				`role-pinned-${pin.label.replaceAll(" ", "-")}`,
+			);
+			const ctx = roleCtx([account]);
+			await publishOwnCatalog(account, ctx);
+			pin.apply(account);
+
+			await expect(
+				selectAccountsForRequest(exactRoleMeta(account.id), ctx, LOGICAL_OPUS),
+			).rejects.toMatchObject({
+				name: "ForceRouteUnavailableError",
+				accountId: account.id,
+				reason: "catalog_role_mismatch",
+			});
+			expect(ctx.strategy.select).not.toHaveBeenCalled();
+		});
+	}
+
+	it("admits a pin that happens to equal the role target", async () => {
+		const account = codexAccount("role-pinned-equal", {
+			model_mappings: JSON.stringify({ opus: "gpt-7-nova" }),
+		});
+		const ctx = roleCtx([account]);
+		await publishOwnCatalog(account, ctx);
+
+		await expect(
+			selectAccountsForRequest(exactRoleMeta(account.id), ctx, LOGICAL_OPUS),
+		).resolves.toEqual([account]);
+	});
+
+	it("admits a pin for another family because the role family stays unpinned", async () => {
+		const account = codexAccount("role-other-family-pin", {
+			model_mappings: JSON.stringify({ sonnet: "gpt-7-luna" }),
+		});
+		const ctx = roleCtx([account]);
+		await publishOwnCatalog(account, ctx);
+
+		await expect(
+			selectAccountsForRequest(exactRoleMeta(account.id), ctx, LOGICAL_OPUS),
+		).resolves.toEqual([account]);
+	});
+
+	it("keeps provider_mismatch for a non-Codex exact-account target", async () => {
+		const account = makeAccount({
+			id: "role-anthropic",
+			provider: "anthropic",
+			model_mappings: JSON.stringify({ opus: "gpt-7-nova" }),
+		});
+		const ctx = roleCtx([account]);
+
+		await expect(
+			selectAccountsForRequest(exactRoleMeta(account.id), ctx, LOGICAL_OPUS),
+		).rejects.toMatchObject({ reason: "provider_mismatch" });
+	});
+
+	it("follows the account's own catalog order without any config change", async () => {
+		const account = codexAccount("role-reordered");
+		const ctx = roleCtx([account]);
+		await publishOwnCatalog(account, ctx);
+		const before = exactRoleMeta(account.id);
+		await selectAccountsForRequest(before, ctx, LOGICAL_OPUS);
+
+		await publishOwnCatalog(account, ctx, [
+			"gpt-7-sol",
+			"gpt-7-nova",
+			"gpt-7-luna",
+		]);
+		const after = exactRoleMeta(account.id);
+		await selectAccountsForRequest(after, ctx, LOGICAL_OPUS);
+
+		expect(before.routeCatalogRoleTargetByAccountId?.get(account.id)).toBe(
+			"gpt-7-nova",
+		);
+		expect(after.routeCatalogRoleTargetByAccountId?.get(account.id)).toBe(
+			"gpt-7-sol",
+		);
+	});
+
+	it("checks a concrete attempt model against the admission target, not a later catalog", async () => {
+		const account = codexAccount("role-attempt-check");
+		const ctx = roleCtx([account]);
+		await publishOwnCatalog(account, ctx);
+		const meta = exactRoleMeta(account.id);
+		await selectAccountsForRequest(meta, ctx, LOGICAL_OPUS);
+		await publishOwnCatalog(account, ctx, [
+			"gpt-7-sol",
+			"gpt-7-nova",
+			"gpt-7-luna",
+		]);
+
+		expect(
+			getRouteProfileConstraintViolation(
+				account,
+				meta,
+				LOGICAL_OPUS,
+				"gpt-7-nova",
+			),
+		).toBeNull();
+		expect(
+			getRouteProfileConstraintViolation(
+				account,
+				meta,
+				LOGICAL_OPUS,
+				"gpt-7-sol",
+			),
+		).toBe("catalog_role_mismatch");
+		// The exact policy keeps comparing only its configured model.
+		expect(
+			getRouteProfileConstraintViolation(
+				account,
+				{
+					...meta,
+					routePhysicalModelPolicy: "exact",
+					routeExpectedPhysicalModel: "gpt-7-sol",
+				},
+				LOGICAL_OPUS,
+				"gpt-7-sol",
+			),
+		).toBeNull();
+	});
+
+	it("admits exactly the Codex accounts whose own catalog satisfies the role in a capability pool", async () => {
+		const ownUnpinned = codexAccount("pool-own-unpinned");
+		const ownOtherOrder = codexAccount("pool-own-other-order", {
+			priority: 1,
+		});
+		const ownPinnedEqual = codexAccount("pool-own-pinned-equal", {
+			priority: 2,
+			model_mappings: JSON.stringify({ opus: "gpt-7-nova" }),
+		});
+		const ownPinnedDifferent = codexAccount("pool-own-pinned-different", {
+			model_mappings: JSON.stringify({ opus: "gpt-7-luna" }),
+		});
+		const sharedOnly = codexAccount("pool-shared-only");
+		const pausedOwn = codexAccount("pool-paused-own", {
+			paused: true,
+			priority: 3,
+		});
+		const nonCodex = makeAccount({
+			id: "pool-non-codex",
+			provider: "openai-compatible",
+			model_mappings: JSON.stringify({ opus: "gpt-7-nova" }),
+		});
+		const accounts = [
+			ownUnpinned,
+			ownOtherOrder,
+			ownPinnedEqual,
+			ownPinnedDifferent,
+			sharedOnly,
+			pausedOwn,
+			nonCodex,
+		];
+		const ctx = roleCtx(accounts);
+		for (const account of [
+			ownUnpinned,
+			ownPinnedEqual,
+			ownPinnedDifferent,
+			pausedOwn,
+		]) {
+			await publishOwnCatalog(account, ctx);
+		}
+		await publishOwnCatalog(ownOtherOrder, ctx, [
+			"gpt-7-sol",
+			"gpt-7-nova",
+			"gpt-7-luna",
+		]);
+		expect(getKnownOrSharedCodexModels(sharedOnly.id)?.source).toBe("shared");
+		const meta = poolRoleMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, LOGICAL_OPUS);
+
+		expect(result.map(({ id }) => id)).toEqual([
+			ownUnpinned.id,
+			ownOtherOrder.id,
+			ownPinnedEqual.id,
+		]);
+		expect(
+			(ctx.strategy.select as ReturnType<typeof mock>).mock.calls[0]?.[0].map(
+				(account: Account) => account.id,
+			),
+		).toEqual([
+			ownUnpinned.id,
+			ownOtherOrder.id,
+			ownPinnedEqual.id,
+			pausedOwn.id,
+		]);
+		expect(meta.routeCatalogRoleTargetByAccountId?.get(ownUnpinned.id)).toBe(
+			"gpt-7-nova",
+		);
+		expect(meta.routeCatalogRoleTargetByAccountId?.get(ownOtherOrder.id)).toBe(
+			"gpt-7-sol",
+		);
+		expect(meta.routeCatalogRoleTargetByAccountId?.get(ownPinnedEqual.id)).toBe(
+			"gpt-7-nova",
+		);
+		for (const excluded of [ownPinnedDifferent, sharedOnly, nonCodex]) {
+			expect(meta.routeCatalogRoleTargetByAccountId?.has(excluded.id)).toBe(
+				false,
+			);
+		}
+	});
+
+	it("keeps a bench-limited role account out of the capability pool", async () => {
+		const benched = codexAccount("pool-benched", {
+			rate_limited_until: Date.now() + 60_000,
+		});
+		const healthy = codexAccount("pool-healthy", { priority: 1 });
+		const ctx = roleCtx([benched, healthy]);
+		await publishOwnCatalog(benched, ctx);
+		await publishOwnCatalog(healthy, ctx);
+
+		const result = await selectAccountsForRequest(
+			poolRoleMeta(),
+			ctx,
+			LOGICAL_OPUS,
+		);
+
+		expect(result.map(({ id }) => id)).toEqual([healthy.id]);
+	});
+
+	it("keeps an excluded provider out of a role pool", async () => {
+		const account = codexAccount("pool-provider-excluded");
+		const ctx = roleCtx([account]);
+		await publishOwnCatalog(account, ctx);
+
+		await expect(
+			selectAccountsForRequest(
+				poolRoleMeta({
+					headers: new Headers({
+						"x-better-ccflare-exclude-providers": "codex",
+					}),
+				}),
+				ctx,
+				LOGICAL_OPUS,
+			),
+		).rejects.toMatchObject({
+			name: "ForceRouteUnavailableError",
+			reason: "catalog_role_unavailable",
+		});
+	});
+
+	it("reports catalog_role_unavailable when no pool account has its own role target", async () => {
+		const lender = codexAccount("pool-lender-paused-out", {
+			model_mappings: JSON.stringify({ opus: "gpt-7-luna" }),
+		});
+		const borrower = codexAccount("pool-borrower");
+		const unprimed = codexAccount("pool-unprimed");
+		const ctx = roleCtx([borrower, unprimed]);
+		await publishOwnCatalog(lender, roleCtx([lender]));
+		expect(getKnownOrSharedCodexModels(borrower.id)?.source).toBe("shared");
+
+		await expect(
+			selectAccountsForRequest(poolRoleMeta(), ctx, LOGICAL_OPUS),
+		).rejects.toMatchObject({
+			name: "ForceRouteUnavailableError",
+			accountId: "codex-opus-pool",
+			reason: "catalog_role_unavailable",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("reports catalog_role_mismatch when every own target is overridden", async () => {
+		const pinned = codexAccount("pool-all-pinned", {
+			model_mappings: JSON.stringify({ opus: "gpt-7-luna" }),
+		});
+		const ctx = roleCtx([pinned]);
+		await publishOwnCatalog(pinned, ctx);
+
+		await expect(
+			selectAccountsForRequest(poolRoleMeta(), ctx, LOGICAL_OPUS),
+		).rejects.toMatchObject({
+			name: "ForceRouteUnavailableError",
+			reason: "catalog_role_mismatch",
+		});
+	});
+
+	it("keeps a native child inside the role-capable root pool", async () => {
+		const roleCapable = codexAccount("pool-child-role-capable");
+		const pinnedAway = codexAccount("pool-child-pinned-away", {
+			model_mappings: JSON.stringify({ opus: "gpt-7-luna" }),
+		});
+		const ctx = roleCtx([roleCapable, pinnedAway]);
+		await publishOwnCatalog(roleCapable, ctx);
+		await publishOwnCatalog(pinnedAway, ctx);
+		const meta = poolRoleMeta({
+			routePhysicalModelPolicy: null,
+			routeLineage: { kind: "descendant", childHomeKey: null },
+		});
+
+		const result = await selectAccountsForRequest(
+			meta,
+			ctx,
+			"claude-sonnet-4-5",
+		);
+
+		expect(result.map(({ id }) => id)).toEqual([
+			roleCapable.id,
+			roleCapable.id,
+		]);
+		expect(
+			meta.routingCandidates?.map((candidate) => [
+				candidate.accountId,
+				candidate.routeFallbackRung,
+				candidate.effectiveLogicalModel,
+			]),
+		).toEqual([
+			[roleCapable.id, "profile_requested_model", "claude-sonnet-4-5"],
+			[roleCapable.id, "profile_root_model", LOGICAL_OPUS],
+		]);
+		expect(meta.routeCatalogRoleTargetByAccountId?.get(roleCapable.id)).toBe(
+			"gpt-7-nova",
+		);
+	});
+
+	it("leaves an exact capability profile's null-mapping Codex accounts out of the pool", async () => {
+		const unmapped = codexAccount("exact-pool-unmapped");
+		const ctx = roleCtx([unmapped]);
+		await publishOwnCatalog(unmapped, ctx);
+
+		await expect(
+			selectAccountsForRequest(
+				poolRoleMeta({
+					routeProfilePhysicalModelPolicy: null,
+					routePhysicalModelPolicy: null,
+					routeProfileExpectedPhysicalModel: "gpt-7-nova",
+					routeExpectedPhysicalModel: "gpt-7-nova",
+				}),
+				ctx,
+				LOGICAL_OPUS,
+			),
+		).rejects.toMatchObject({
+			name: "ForceRouteUnavailableError",
+			reason: "model_mapping_mismatch",
+		});
 	});
 });
 

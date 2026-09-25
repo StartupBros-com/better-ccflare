@@ -147,6 +147,7 @@ import { combineChunks } from "../stream-tee";
 import { isModelRewrite } from "../worker-messages";
 import {
 	ForceRouteUnavailableError,
+	getConcreteCodexModelList,
 	getRouteProfileConstraintViolation,
 	getXaiConvId,
 } from "./account-selector";
@@ -1053,19 +1054,6 @@ export function admitConcreteCodexModel(
 		outcome: "capacity_rejected",
 	});
 	return false;
-}
-
-function getConcreteCodexModelList(
-	account: Account,
-	requestedModel: string,
-): string[] {
-	const configuredModels = getModelList(requestedModel, account);
-	if (!configuredModels) {
-		return [resolveCodexRequestModel(requestedModel, account)];
-	}
-	return configuredModels.map((model) =>
-		resolveCodexRequestModel(model, account),
-	);
 }
 
 function isKnownLargerCodexCandidate(
@@ -2929,8 +2917,27 @@ export async function proxyWithAccount(
 			account.provider === "codex"
 				? provider.captureAttemptIdentity?.(account, catalogContextSnapshot)
 				: undefined;
-		const concreteCodexModels =
-			account.provider === "codex" && requestedModelBeforeAdmission
+		// A catalog-role rung binds this attempt to the role target that admitted
+		// the account during selection. A catalog published since then governs
+		// the next request or attempt, never this one; materialization re-checks
+		// the bound model against that same carried target.
+		const requestedRoleFamily = requestedModelBeforeAdmission
+			? getModelFamily(requestedModelBeforeAdmission)
+			: null;
+		const catalogRoleAttemptTarget =
+			account.provider === "codex" &&
+			requestMeta.routeProfileId != null &&
+			requestMeta.routePhysicalModelPolicy === "catalog-role" &&
+			routeCandidateMetadata?.routeConstraintMode !== "ordinary" &&
+			requestedRoleFamily !== null &&
+			requestedRoleFamily ===
+				getModelFamily(requestMeta.routeProfileLogicalModel ?? "")
+				? (requestMeta.routeCatalogRoleTargetByAccountId?.get(account.id) ??
+					null)
+				: null;
+		const concreteCodexModels = catalogRoleAttemptTarget
+			? [catalogRoleAttemptTarget]
+			: account.provider === "codex" && requestedModelBeforeAdmission
 				? getConcreteCodexModelList(account, requestedModelBeforeAdmission)
 				: [];
 		const admissionEnabledForAttempt =
@@ -3043,8 +3050,9 @@ export async function proxyWithAccount(
 		}
 		const admittedRequestModel =
 			admission.model ?? requestedModelBeforeAdmission ?? null;
-		const preEnsureConcreteAttemptModel =
-			account.provider === "codex" && admittedRequestModel
+		const preEnsureConcreteAttemptModel = catalogRoleAttemptTarget
+			? catalogRoleAttemptTarget
+			: account.provider === "codex" && admittedRequestModel
 				? resolveCodexRequestModel(admittedRequestModel, account)
 				: admittedRequestModel
 					? (getModelList(admittedRequestModel, account)?.[0] ??
@@ -3239,6 +3247,9 @@ export async function proxyWithAccount(
 							routeExpectedProvider: null,
 							routeExpectedPhysicalModel: null,
 							routeProfileExpectedPhysicalModel: null,
+							routePhysicalModelPolicy: null,
+							routeProfileLogicalModel: null,
+							routeCatalogRoleTargetByAccountId: null,
 						}
 					: requestMeta;
 			const constraintViolation = getRouteProfileConstraintViolation(

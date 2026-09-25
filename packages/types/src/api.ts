@@ -172,6 +172,14 @@ export interface RoutingSelectionDiagnostics {
 	readonly routeProfile: boolean;
 }
 
+/**
+ * How a route profile constrains the physical model. "exact" (the default when
+ * a profile omits the policy) compares against a configured model string;
+ * "catalog-role" follows the model at the logical family's role in a Codex
+ * account's own catalog.
+ */
+export type RoutePhysicalModelPolicy = "exact" | "catalog-role";
+
 export interface RequestMeta {
 	id: string;
 	/** Authenticated guard attempt join key. Absent for direct or invalid traffic. */
@@ -206,10 +214,29 @@ export interface RequestMeta {
 	routeProfileLogicalModel?: string | null;
 	/** Physical model required by the capability profile's root predicate. */
 	routeProfileExpectedPhysicalModel?: string | null;
+	/**
+	 * Physical-model policy of the route profile's root predicate. Absent or
+	 * "exact" keeps the fixed routeProfileExpectedPhysicalModel contract;
+	 * "catalog-role" admits a Codex account by its own catalog's role target
+	 * for the family of routeProfileLogicalModel.
+	 */
+	routeProfilePhysicalModelPolicy?: RoutePhysicalModelPolicy | null;
 	/** Optional provider invariant for a route profile; mismatches fail closed. */
 	routeExpectedProvider?: string | null;
 	/** Optional first physical-model invariant for a route profile; mismatches fail closed. */
 	routeExpectedPhysicalModel?: string | null;
+	/**
+	 * Policy for the physical-model invariant of the current rung. Set exactly
+	 * where routeExpectedPhysicalModel is set; "catalog-role" replaces the fixed
+	 * model with the account's own catalog role target.
+	 */
+	routePhysicalModelPolicy?: RoutePhysicalModelPolicy | null;
+	/**
+	 * Catalog-role target that admitted each account during selection, keyed by
+	 * account id. An attempt sends exactly this model, and materialization checks
+	 * against it rather than a catalog published after admission.
+	 */
+	routeCatalogRoleTargetByAccountId?: ReadonlyMap<string, string> | null;
 	/** Authenticated in-process auto-refresh probe; never derived from public hint headers. */
 	trustedInternalAutoRefresh?: boolean;
 	/** Frozen content-minimal server-tool constraints derived from the final request body. */

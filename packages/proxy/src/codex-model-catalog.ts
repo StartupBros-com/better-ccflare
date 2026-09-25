@@ -500,6 +500,26 @@ export function deriveFamilyDefaults(
 }
 
 /**
+ * The model at a Claude family's role in this account's OWN catalog, or null.
+ *
+ * Only first-hand evidence counts: a listing borrowed from another account of
+ * the provider is advisory and never names a target, because plans differ and
+ * a borrowed list is not proof this account can call the model. A last-good
+ * own listing counts even when a later refresh failed. The role order is
+ * exactly {@link deriveFamilyDefaults}'s, so this can never disagree with the
+ * family default the provider applies for an unpinned account.
+ */
+export function getCodexCatalogRoleTarget(
+	accountId: string,
+	family: "fable" | "opus" | "sonnet" | "haiku",
+): string | null {
+	const own = getKnownCodexModels(accountId);
+	if (!own) return null;
+	const defaults = deriveFamilyDefaults(own.models);
+	return Object.hasOwn(defaults, family) ? (defaults[family] ?? null) : null;
+}
+
+/**
  * The weakest model of a listing, or null when there is no listing to read.
  *
  * `normalize` sorts by the provider's own priority, so the tail is the lowest
@@ -586,6 +606,23 @@ export async function getCodexModels(
 	}
 }
 
+/** Most accounts one refresh cycle, or one request-time prime, reads. */
+export const CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT = 100;
+
+/**
+ * Whether the catalog refresh reads this account's own listing. Request-time
+ * priming for catalog-role routes uses the same predicate, so it never reads
+ * an account the heartbeat would skip.
+ */
+export function isCodexCatalogRefreshEligible(account: Account): boolean {
+	return (
+		account.provider === "codex" &&
+		!account.paused &&
+		!account.requires_reauth &&
+		!account.custom_endpoint
+	);
+}
+
 /** Account-local heartbeat; at most two catalog calls run concurrently. */
 export function initCodexModelCatalogRefresh(
 	ctx: ProxyContext,
@@ -599,20 +636,16 @@ export function initCodexModelCatalogRefresh(
 		running = true;
 		try {
 			const eligible = (await ctx.dbOps.getAllAccounts()).filter(
-				(account) =>
-					account.provider === "codex" &&
-					!account.paused &&
-					!account.requires_reauth &&
-					!account.custom_endpoint,
+				isCodexCatalogRefreshEligible,
 			);
-			if (eligible.length > 100) {
+			if (eligible.length > CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT) {
 				log.warn(
-					`Codex model catalog refresh covers only 100 of ${eligible.length} eligible accounts this cycle; ${
-						eligible.length - 100
+					`Codex model catalog refresh covers only ${CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT} of ${eligible.length} eligible accounts this cycle; ${
+						eligible.length - CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT
 					} were dropped.`,
 				);
 			}
-			const accounts = eligible.slice(0, 100);
+			const accounts = eligible.slice(0, CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT);
 			let next = 0;
 			await Promise.all(
 				Array.from({ length: Math.min(2, accounts.length) }, async () => {

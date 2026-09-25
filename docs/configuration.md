@@ -409,6 +409,93 @@ model ID that Claude Code has saved, keep its `id` and replace `accountId` with
 same picker against every currently eligible matching account; no session or
 account UUID is copied into the public discovery response.
 
+### Catalog-role Codex profiles
+
+An `expectedPhysicalModel` is a fixed string, so a pool or pinned route that
+names one has to be edited and restarted for every new model generation. Set
+`physicalModelPolicy: "catalog-role"` instead to follow whatever model sits at
+the profile's role in each Codex account's own model catalog:
+
+```bash
+CCFLARE_MODEL_ROUTE_PROFILES_JSON='[
+  {
+    "id": "codex-opus",
+    "displayName": "Codex · opus",
+    "selection": "capability",
+    "logicalModel": "claude-opus-5",
+    "expectedProvider": "codex",
+    "physicalModelPolicy": "catalog-role"
+  },
+  {
+    "id": "codex-sonnet",
+    "displayName": "Codex · sonnet",
+    "selection": "capability",
+    "logicalModel": "claude-sonnet-5",
+    "expectedProvider": "codex",
+    "physicalModelPolicy": "catalog-role"
+  },
+  {
+    "id": "codex-haiku",
+    "displayName": "Codex · haiku",
+    "accountId": "00000000-0000-0000-0000-000000000000",
+    "logicalModel": "claude-haiku-4-5",
+    "expectedProvider": "codex",
+    "physicalModelPolicy": "catalog-role"
+  }
+]'
+```
+
+- **The role comes from `logicalModel`.** Its Claude family picks a position in
+  the account's catalog, which the provider already orders frontier first:
+  `fable` and `opus` take the first model, `sonnet` the second, and `haiku` the
+  third. A shorter catalog falls back to its last model. There is no separate
+  role field that could disagree with `logicalModel`, and a `logicalModel`
+  outside those four families is rejected at startup.
+- **Only the account's own catalog counts.** An account qualifies only when it
+  has read its own model listing, even an older last-good copy. A listing
+  borrowed from another Codex account is advisory and never names a target,
+  because plans can differ. Listings are kept in memory, so after a restart an
+  account has none until one is read. An account with no listing of its own is
+  primed once at request time, bounded by the account-selection deadline. If
+  that read fails, the route fails closed with `catalog_role_unavailable`.
+  Custom-endpoint Codex accounts are never primed or refreshed in the
+  background, so they qualify only after ordinary traffic has read their own
+  listing.
+- **Every model the route could send must be the role target.** The check
+  covers the account's `model_mappings` (including fallback arrays and legacy
+  `model_fallbacks`), `OPENAI_COMPATIBLE_MODEL_MAPPINGS`, and the global
+  provider default override. A pin that differs keeps that account out. A pin
+  that happens to equal the target is admitted, and a pin for another family
+  does not matter.
+- **Both selection modes work.** A capability profile admits exactly the Codex
+  accounts that pass this check. Paused, excluded and rate-limited accounts
+  stay out as before, and non-Codex accounts are never admitted. An
+  exact-account profile applies the same check to its one account.
+- **An attempt keeps the target it was admitted with.** If a catalog refresh
+  lands while a request is in flight, that attempt still sends the model that
+  admitted the account. The next request, or a later selection within the same
+  request, follows the new order. No profile edit or restart is involved.
+- **The policy needs the Codex provider and no fixed capacity claim.**
+  `catalog-role` requires `expectedProvider: "codex"` and rejects
+  `expectedPhysicalModel`, `contextWindow`, and `maxOutputTokens`. The model
+  changes with the catalog, so capacity comes from the catalog, not from a
+  number in the profile.
+
+Two failure reasons are specific to this policy. Both follow the existing
+`force_route_unavailable` 503 shape, and request history records them as
+`force_route_<reason>`:
+
+| Reason | Meaning |
+|---|---|
+| `catalog_role_unavailable` | The account (or, for a pool, every candidate) has no role target from its own catalog |
+| `catalog_role_mismatch` | The account has a role target, but a mapping, fallback, environment mapping, or provider override would send a different model |
+
+Picker IDs are chosen by the operator and stay `claude-bccf-route-<id>`, so
+role-named IDs such as `codex-opus` keep working across model generations.
+Discovery lists catalog-role profiles exactly like other profiles. Existing
+profiles without `physicalModelPolicy` behave as `"exact"`: their parsing,
+routing, error reasons, and saved picker IDs are unchanged.
+
 | Field | Required | Contract |
 |---|---:|---|
 | `id` | yes | Unique lowercase kebab-case slug, up to 48 characters. better-ccflare generates the reserved public model ID `claude-bccf-route-<id>`; clients cannot configure a different public ID |
@@ -419,7 +506,8 @@ account UUID is copied into the public discovery response.
 | `logicalModel` | yes | Claude request model written on an explicit root selection before the account's normal model mapping is applied |
 | `defaultEffort` | no | Default used only when the request omits effort. Accepted values: `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; an explicit client effort always wins |
 | `expectedProvider` | capability: yes; legacy: no | Lowercase provider guard. Capability profiles use it to build the candidate pool; legacy profiles fail closed if the pinned account differs |
-| `expectedPhysicalModel` | capability: yes; legacy: no | Guard for the first physical model produced by the account's mapping for `logicalModel`. Capability profiles use it as the pool predicate; legacy profiles fail closed if the pinned account differs. The guard reads the account's own configured `model_mappings`, not a provider default filled in later (for example xAI's catalog-derived default). Changing or clearing a pinned account's mapping without updating this field therefore fails every request on the profile. Omit it on a legacy profile that should follow the provider's newest model; see `docs/solutions/integration-issues/route-profile-expected-physical-model-checked-before-provider-defaults.md` |
+| `physicalModelPolicy` | no | `exact` (the default when omitted) or `catalog-role`. `catalog-role` requires `expectedProvider: "codex"`, a `logicalModel` in the fable, opus, sonnet or haiku family, and no `expectedPhysicalModel`, `contextWindow` or `maxOutputTokens`; see [Catalog-role Codex profiles](#catalog-role-codex-profiles) |
+| `expectedPhysicalModel` | capability: yes, unless `physicalModelPolicy` is `catalog-role` (then forbidden); legacy: no | Guard for the first physical model produced by the account's mapping for `logicalModel`. Capability profiles use it as the pool predicate; legacy profiles fail closed if the pinned account differs. The guard reads the account's own configured `model_mappings`, not a provider default filled in later (for example xAI's catalog-derived default). Changing or clearing a pinned account's mapping without updating this field therefore fails every request on the profile. Omit it on a legacy profile that should follow the provider's newest model; see `docs/solutions/integration-issues/route-profile-expected-physical-model-checked-before-provider-defaults.md` |
 | `exclusiveAccount` | no | Exact-account profiles only; defaults to `false`. When `true`, reserves the named account for exact configured route profiles that name it |
 | `contextWindow` | no | Exact-account profiles only; required with `maxOutputTokens`. Positive integer total context bound |
 | `maxOutputTokens` | no | Exact-account profiles only; required with `contextWindow`. Positive integer less than `contextWindow`; caps request output |
@@ -485,7 +573,7 @@ Gateway discovery can list multiple profiles; Claude Code's custom-model variabl
 
 Selecting a profile on a root agent pins only that authenticated caller's Claude Code session tree. Legacy profiles inherit the exact account. Capability profiles inherit the root capability predicate (provider plus root logical/physical mapping), then use each child request's own model for capacity and dispatch; children cannot broaden the pool to accounts that do not satisfy the root predicate. Other sessions continue through ordinary better-ccflare routing. Switching the same root session back to a native Claude model clears its profile binding on the next root request.
 
-Bindings are process-local, bounded, and restart-scoped. Their TTL matches `session_duration_ms`, and a restart clears every binding. Missing, paused, unavailable, rate-limited, or quota-exhausted exact accounts fail closed; capability profiles fail closed when no matching candidate remains, without falling back outside the profile. Configured provider and physical-model guards also fail closed, as does a conflicting `x-better-ccflare-account-id` header. Matching is exact: an OpenRouter account mapped to `fusion`, for example, does not satisfy a capability profile expecting provider `codex` and physical model `gpt-5.6-sol`. See [Account Routing Architecture](./routing-architecture.md#claude-code-model-route-profiles) for the request flow and inheritance boundary.
+Bindings are process-local, bounded, and restart-scoped. Their TTL matches `session_duration_ms`, and a restart clears every binding. Missing, paused, unavailable, rate-limited, or quota-exhausted exact accounts fail closed; capability profiles fail closed when no matching candidate remains, without falling back outside the profile. Configured provider and physical-model guards also fail closed (including the catalog-role reasons `catalog_role_unavailable` and `catalog_role_mismatch`), as does a conflicting `x-better-ccflare-account-id` header. Matching is exact: an OpenRouter account mapped to `fusion`, for example, does not satisfy a capability profile expecting provider `codex` and physical model `gpt-5.6-sol`. See [Account Routing Architecture](./routing-architecture.md#claude-code-model-route-profiles) for the request flow and inheritance boundary.
 
 ## Anthropic Degraded Mode
 
