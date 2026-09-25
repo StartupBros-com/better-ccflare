@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -198,6 +198,14 @@ describe("materializeProviderAttemptPlan", () => {
 			expect(
 				firstHeaders.get("x-better-ccflare-codex-client-version"),
 			).toBeNull();
+			// materializeProviderAttemptPlan goes through CodexProvider's own
+			// captureAttemptIdentity, which calls resolveCodexClientIdentity()
+			// with no injectable clock (always the real Date.now()). The
+			// resolver now memoizes a source-path read for READ_CACHE_MS, so
+			// mock the system clock forward past that window rather than
+			// relying on real elapsed time, to deterministically force this
+			// call to observe the rewrite above instead of the `first` memo.
+			setSystemTime(Date.now() + 1_100);
 			const second = materializeProviderAttemptPlan(provider, codexContext);
 			expect(new URL(second.targetUrl).searchParams.get("client_version")).toBe(
 				"0.169.0",
@@ -206,6 +214,7 @@ describe("materializeProviderAttemptPlan", () => {
 				"0.169.0",
 			);
 		} finally {
+			setSystemTime();
 			if (oldPath === undefined)
 				delete process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
 			else process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = oldPath;
@@ -247,6 +256,23 @@ describe("materializeProviderAttemptPlan", () => {
 		capturedPlan.prepareHeaders(new Headers(), "token");
 		expect(observedIdentity).toEqual({ source: "admission-snapshot" });
 		expect(liveCaptureCalls).toBe(1);
+	});
+	test("rejects a thenable legacy attempt identity before invoking buildUrl", () => {
+		const bareThenable: Record<string, unknown> = {};
+		// biome-ignore lint/suspicious/noThenProperty: The contract must reject non-Promise thenables synchronously.
+		Object.defineProperty(bareThenable, "then", { value: () => undefined });
+		let buildUrlCalls = 0;
+		const provider = baseProvider({
+			captureAttemptIdentity: () => bareThenable,
+			buildUrl: () => {
+				buildUrlCalls += 1;
+				return "https://fixture.invalid/v1/messages";
+			},
+		});
+		expect(() =>
+			materializeProviderAttemptPlan(provider, context(accountFixture())),
+		).toThrow("Provider attempt identity must be synchronous");
+		expect(buildUrlCalls).toBe(0);
 	});
 	test("bypasses custom planning for proof-null ordinary attempts", () => {
 		let plannerCalls = 0;

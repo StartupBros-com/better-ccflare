@@ -411,6 +411,48 @@ function isThenable(value: unknown): boolean {
 	);
 }
 
+/**
+ * Capture a legacy provider's per-attempt identity through a frozen captured
+ * hook reference and throw the canonical synchronicity TypeError when the
+ * provider violates its documented synchronous contract (types.ts
+ * `captureAttemptIdentity`). Shared by the canonical legacy-plan path and the
+ * unauthenticated proxy path so both surfaces reject a thenable identity with
+ * the exact same diagnostic instead of silently forwarding it.
+ */
+export function captureSynchronousAttemptIdentity(
+	provider: Provider,
+	captureAttemptIdentity: Provider["captureAttemptIdentity"],
+	account?: Account,
+	modelContextSnapshot?: unknown,
+): unknown {
+	if (captureAttemptIdentity === undefined) return undefined;
+	const identity = Reflect.apply(captureAttemptIdentity, provider, [
+		account,
+		modelContextSnapshot,
+	]);
+	if (isThenable(identity)) {
+		throw new TypeError("Provider attempt identity must be synchronous");
+	}
+	return identity;
+}
+
+/**
+ * Guard a legacy provider hook's return value against a thenable result,
+ * throwing `message` when it is one. Used to close the same synchronicity
+ * gap for `buildUrl` / `prepareHeaders` on the unauthenticated path that the
+ * canonical legacy-plan path already closes for `buildUrl`'s result via
+ * `normalizeTargetUrl` and for `prepareRequest` directly.
+ */
+export function assertSynchronousProviderResult<T>(
+	value: T,
+	message: string,
+): T {
+	if (isThenable(value)) {
+		throw new TypeError(message);
+	}
+	return value;
+}
+
 function sameReplayMode(
 	left: readonly ServerToolReplayAtom[],
 	right: readonly ServerToolReplayAtom[],
@@ -826,14 +868,16 @@ function materializeLegacyPlan(
 			validateLegacyAccountView(accountView, accountSchemaKeys);
 			requireStableProviderDescriptor(provider, providerDescriptor);
 		}
-		attemptIdentity =
+		attemptIdentity = assertSynchronousProviderResult(
 			context.capturedAttemptIdentity !== undefined
 				? context.capturedAttemptIdentity
-				: captureAttemptIdentity
-					? Reflect.apply(captureAttemptIdentity, provider, [accountView])
-					: undefined;
-		if (isThenable(attemptIdentity))
-			throw new TypeError("Provider attempt identity must be synchronous");
+				: captureSynchronousAttemptIdentity(
+						provider,
+						captureAttemptIdentity,
+						accountView,
+					),
+			"Provider attempt identity must be synchronous",
+		);
 		requireStableProviderDescriptor(provider, providerDescriptor);
 		targetUrl = Reflect.apply(buildUrl, provider, [
 			context.path,

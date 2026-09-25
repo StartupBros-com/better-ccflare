@@ -3081,6 +3081,52 @@ describe("catalog-role Codex route profiles", () => {
 		);
 	}
 
+	describe("plain Codex admission without a route profile", () => {
+		it("resolves a cold account's live catalog frontier for a family request on the first request", async () => {
+			const account = makeRoleAccount("cold-plain-codex-account");
+			// A pass-through operator mapping (sonnet -> its own literal alias) is
+			// what makes a bare Codex account eligible for *ordinary* stock-family
+			// routing at all (isOrdinaryStockModelAccountEligible in
+			// account-selector.ts requires every configured target to equal the
+			// requested model unchanged; an account with no mapping is otherwise
+			// excluded from the ordinary pool by design). Because the mapped value
+			// is identical to the input, resolveCodexRequestModel's `mapped !==
+			// anthropicModel` short-circuit does NOT fire, so this still falls
+			// through to its catalog-dependent branch — exercising the same
+			// pre-admission-ensure path a truly unmapped account would take.
+			account.model_mappings = JSON.stringify({ sonnet: "claude-sonnet-4-5" });
+			// No modelRouteSessionRegistry: makeRoleContext's registry exclusively
+			// reserves ROLE_ACCOUNT_ID for profile-matched traffic, which would
+			// reject this plain request before admission. Ordinary routing (no
+			// route profile at all) is what exercises preEnsureConcreteAttemptModel's
+			// resolveCodexRequestModel branch.
+			const harness = makeContext(undefined, { accounts: [account] });
+			harness.ctx.dbOps.getAccount = mock(async (id: string) =>
+				id === account.id ? account : null,
+			);
+			const upstream = installCodexRoleUpstream(NEXT_GENERATION);
+			expect(codexModelCatalogModule.getKnownCodexModels(account.id)).toBe(
+				null,
+			);
+
+			// "claude-sonnet-..." matches neither ROLE_PICKER nor ROLE_POOL_PICKER
+			// (both opus-only picker aliases), so no route profile applies and this
+			// exercises the plain resolveCodexRequestModel path in
+			// proxy-operations.ts (preEnsureConcreteAttemptModel), never
+			// catalogRoleAttemptTarget.
+			const first = await send(harness.ctx, "claude-sonnet-4-5");
+			expect(first.response.status, first.text).toBe(200);
+
+			// deriveFamilyDefaults maps sonnet to the catalog's second entry
+			// (priority order: gpt-7-sol), never the compiled DEFAULT_MODEL_MAP
+			// fallback ("gpt-5.3-codex"), proving hasExactPreAdmissionModelIdentity
+			// correctly awaited ensureCodexModelDefaults before admission bound the
+			// attempt's physical model on this, the account's first request.
+			expect(await upstreamModels(upstream.responses)).toEqual(["gpt-7-sol"]);
+			expect(upstream.catalogReads).toHaveLength(1);
+		});
+	});
+
 	it("routes an explicit role picker to the account's own role target and follows a catalog publication", async () => {
 		const account = makeRoleAccount();
 		const harness = makeRoleContext([account]);

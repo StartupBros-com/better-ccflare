@@ -26,12 +26,14 @@ import type {
 } from "@better-ccflare/providers";
 import {
 	applyXaiConvIdHeader,
+	assertSynchronousProviderResult,
 	buildServerToolCapabilityProofKey,
 	CODEX_AUTHENTICATED_CALLER_HEADER,
 	CODEX_CONVERSATION_ID_HEADER,
 	CODEX_NATIVE_RESPONSES_HEADER,
 	CODEX_TURN_STATE_HEADER,
 	captureCodexModelContextSnapshot,
+	captureSynchronousAttemptIdentity,
 	decideContextAdmission,
 	estimateAnthropicAdmissionTokens,
 	hasDeferredCustomTool,
@@ -2399,25 +2401,33 @@ export async function proxyUnauthenticated(
 ): Promise<Response> {
 	log.warn(ERROR_MESSAGES.NO_ACCOUNTS);
 
-	const identity = ctx.provider.captureAttemptIdentity?.();
-	const targetUrl =
+	const identity = captureSynchronousAttemptIdentity(
+		ctx.provider,
+		ctx.provider.captureAttemptIdentity,
+	);
+	const targetUrl = assertSynchronousProviderResult(
 		identity === undefined
 			? ctx.provider.buildUrl(url.pathname, url.search)
-			: (Reflect.apply(ctx.provider.buildUrl, ctx.provider, [
+			: Reflect.apply(ctx.provider.buildUrl, ctx.provider, [
 					url.pathname,
 					url.search,
 					undefined,
 					identity,
-				]) as string);
+				]),
+		"Legacy provider buildUrl must be synchronous",
+	) as string;
 	const headers = sanitizeInternalHeaders(
-		identity === undefined
-			? ctx.provider.prepareHeaders(req.headers, undefined, undefined)
-			: (Reflect.apply(ctx.provider.prepareHeaders, ctx.provider, [
-					req.headers,
-					undefined,
-					undefined,
-					identity,
-				]) as Headers),
+		assertSynchronousProviderResult(
+			identity === undefined
+				? ctx.provider.prepareHeaders(req.headers, undefined, undefined)
+				: Reflect.apply(ctx.provider.prepareHeaders, ctx.provider, [
+						req.headers,
+						undefined,
+						undefined,
+						identity,
+					]),
+			"Legacy provider prepareHeaders must be synchronous",
+		) as Headers,
 	);
 	const routingSignal = anthropicPreCommitRescue?.signal ?? req.signal;
 	const drainAbortController = new AbortController();

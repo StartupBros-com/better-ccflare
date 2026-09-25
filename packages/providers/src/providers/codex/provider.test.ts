@@ -104,6 +104,18 @@ describe("Codex verified client identity", () => {
 		const other = join(dir, "other.json");
 		const oldPath = process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
 		const oldVersion = process.env.CCFLARE_CODEX_CLIENT_VERSION;
+		// Injected clock for every direct resolveCodexClientIdentity() call
+		// below: the resolver now memoizes a source-path read for READ_CACHE_MS,
+		// so a same-path rewrite must be followed by an advance past that
+		// window to be observed. `buildUrl`/`prepareHeaders` go through
+		// CodexProvider's own internal resolveCodexClientIdentity() call, which
+		// has no clock parameter and always uses the real Date.now(); those two
+		// calls are intentionally left uninjected below -- they run immediately
+		// after the direct call that primed the memo, with the file unchanged
+		// in between, so the result is identical whether they hit the memo or
+		// revalidate.
+		const clock = { time: Date.now() };
+		const getNow = () => clock.time;
 		try {
 			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = record;
 			delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
@@ -116,7 +128,7 @@ describe("Codex verified client identity", () => {
 					verifiedAt: new Date(Date.now() - 60_000).toISOString(),
 				}),
 			);
-			expect(resolveCodexClientIdentity()).toMatchObject({
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
 				version: "0.160.0",
 				source: "verified",
 				fresh: true,
@@ -128,13 +140,14 @@ describe("Codex verified client identity", () => {
 				new CodexProvider().prepareHeaders(new Headers()).get("User-Agent"),
 			).toContain("codex-cli/0.160.0");
 			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.161.0";
-			expect(resolveCodexClientIdentity()).toMatchObject({
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
 				version: "0.161.0",
 				source: "explicit",
 			});
 			delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
 			writeFileSync(record, "{partial");
-			expect(resolveCodexClientIdentity()).toMatchObject({
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
 				version: "0.160.0",
 				source: "verified",
 				fresh: false,
@@ -148,12 +161,13 @@ describe("Codex verified client identity", () => {
 					verifiedAt: new Date(Date.now() - 60_000).toISOString(),
 				}),
 			);
-			expect(resolveCodexClientIdentity()).toMatchObject({
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
 				version: "0.159.0",
 				fresh: true,
 			});
 			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = other;
-			expect(resolveCodexClientIdentity()).toMatchObject({
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
 				version: CODEX_VERSION,
 				source: "default",
 			});
@@ -166,7 +180,8 @@ describe("Codex verified client identity", () => {
 					verifiedAt: "2050-01-01T00:00:00Z",
 				}),
 			);
-			expect(resolveCodexClientIdentity()).toMatchObject({
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
 				version: CODEX_VERSION,
 				source: "default",
 				error: "invalid_record",
@@ -180,7 +195,8 @@ describe("Codex verified client identity", () => {
 					verifiedAt: "2020-01-01T00:00:00Z",
 				}),
 			);
-			expect(resolveCodexClientIdentity()).toMatchObject({
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
 				version: "0.170.0",
 				source: "verified",
 				fresh: false,
@@ -195,13 +211,15 @@ describe("Codex verified client identity", () => {
 					verifiedAt: new Date().toISOString(),
 				}),
 			);
-			expect(resolveCodexClientIdentity()).toMatchObject({
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
 				version: "0.158.0",
 				source: "verified",
 				fresh: true,
 			});
 			writeFileSync(other, "{".repeat(4097));
-			expect(resolveCodexClientIdentity()).toMatchObject({
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
 				version: "0.158.0",
 				fresh: false,
 				error: "invalid_record",

@@ -120,6 +120,53 @@ describe("proxyUnauthenticated abort lifecycle", () => {
 		expect(ledger.physicalAttemptCount).toBe(MAX_REQUEST_PHYSICAL_ATTEMPTS);
 	});
 
+	it("rejects a thenable captureAttemptIdentity before building the URL or calling fetch", async () => {
+		const fetchMock = mock(async () => new Response("unexpected"));
+		globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+		const bareThenable: Record<string, unknown> = {};
+		// biome-ignore lint/suspicious/noThenProperty: The contract must reject non-Promise thenables synchronously.
+		Object.defineProperty(bareThenable, "then", { value: () => undefined });
+		let buildUrlCalls = 0;
+		let prepareHeadersCalls = 0;
+		const req = new Request("https://proxy.test/v1/messages", {
+			method: "GET",
+		});
+		const requestMeta: RequestMeta = {
+			id: "unauthenticated-thenable-identity",
+			method: req.method,
+			path: "/v1/messages",
+			timestamp: Date.now(),
+		};
+		const ctx = {
+			provider: {
+				name: "test-provider",
+				captureAttemptIdentity: () => bareThenable,
+				buildUrl: (path: string, search: string) => {
+					buildUrlCalls += 1;
+					return `https://provider.test${path}${search}`;
+				},
+				prepareHeaders: (headers: Headers) => {
+					prepareHeadersCalls += 1;
+					return new Headers(headers);
+				},
+			},
+		} as unknown as ProxyContext;
+
+		await expect(
+			proxyUnauthenticated(
+				req,
+				new URL(req.url),
+				requestMeta,
+				null,
+				() => undefined,
+				ctx,
+			),
+		).rejects.toThrow("Provider attempt identity must be synchronous");
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(buildUrlCalls).toBe(0);
+		expect(prepareHeadersCalls).toBe(0);
+	});
+
 	it("propagates caller abort to the string-target request without wrapping it as 502", async () => {
 		const caller = new AbortController();
 		const abortReason = new DOMException("client disconnected", "AbortError");

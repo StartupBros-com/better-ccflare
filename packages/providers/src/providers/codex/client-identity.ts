@@ -35,9 +35,22 @@ const MAX_FUTURE_SKEW_MS = 5 * 60_000;
 const READ_CACHE_MS = 1_000;
 type VerifiedRecord = { version: string; verifiedAt: string };
 const lastValidBySource = new Map<string, VerifiedRecord>();
-const readCache = new Map<
+
+type SourceOutcome =
+	| { kind: "record"; record: VerifiedRecord }
+	| { kind: "unavailable_record" | "invalid_record" };
+
+/**
+ * Per-source-path memo of the most recently completed file-validation
+ * outcome (success or failure). Reused as-is for up to READ_CACHE_MS after
+ * it completes, so open/fstat/read/close syscalls are bounded to at most one
+ * attempt per source path per second, independent of request volume.
+ * Freshness/staleness is still recomputed from `now` on every call since
+ * that check is pure arithmetic over the memoized record.
+ */
+const outcomeMemo = new Map<
 	string,
-	{ until: number; signature: string; result: VerifiedRecord }
+	{ until: number; outcome: SourceOutcome }
 >();
 
 function recordStatus(
@@ -112,6 +125,64 @@ function snapshot(
 	});
 }
 
+/** Executes the actual open/fstat/read/close attempt for one source path. */
+function computeSourceOutcome(source: string, now: number): SourceOutcome {
+	try {
+		// NONBLOCK prevents FIFO hangs, NOFOLLOW rejects symlinks; fstat and
+		// the bounded read use the same descriptor even during atomic replacement.
+		const fd = openSync(
+			source,
+			constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+		);
+		try {
+			const stats = fstatSync(fd, { bigint: true });
+			if (
+				!stats.isFile() ||
+				stats.size < 1n ||
+				stats.size > BigInt(MAX_RECORD_BYTES)
+			)
+				throw new Error("invalid record size or type");
+			return {
+				kind: "record",
+				record: readVerifiedRecord(fd, Number(stats.size), now),
+			};
+		} finally {
+			closeSync(fd);
+		}
+	} catch (cause) {
+		return {
+			kind:
+				cause instanceof Error && "code" in cause && cause.code === "ENOENT"
+					? "unavailable_record"
+					: "invalid_record",
+		};
+	}
+}
+
+/**
+ * Returns the memoized outcome for `source` when it is still within its
+ * READ_CACHE_MS window (zero syscalls), otherwise performs one validation
+ * attempt and memoizes it. See `outcomeMemo` for the syscall bound this
+ * enforces.
+ */
+function getSourceOutcome(source: string, now: number): SourceOutcome {
+	const memo = outcomeMemo.get(source);
+	// Reusable only within ~READ_CACHE_MS of when it was recorded (not just
+	// "before memo.until"): guards against a wall-clock step backwards (e.g.
+	// NTP) pinning the memo for the size of the step instead of at most one
+	// READ_CACHE_MS window.
+	if (memo && now >= memo.until - READ_CACHE_MS && now < memo.until)
+		return memo.outcome;
+	const outcome = computeSourceOutcome(source, now);
+	outcomeMemo.delete(source);
+	outcomeMemo.set(source, { until: now + READ_CACHE_MS, outcome });
+	while (outcomeMemo.size > MAX_CACHED_SOURCES) {
+		const oldest = outcomeMemo.keys().next().value;
+		if (oldest) outcomeMemo.delete(oldest);
+	}
+	return outcome;
+}
+
 /** Explicit nonexecuting source; a broken replacement keeps only this path's last valid record. */
 export function resolveCodexClientIdentity(
 	now: () => number = Date.now,
@@ -128,87 +199,41 @@ export function resolveCodexClientIdentity(
 		if (source.length > MAX_SOURCE_PATH_LENGTH || !source.startsWith("/")) {
 			error = "invalid_path";
 		} else {
-			try {
-				// NONBLOCK prevents FIFO hangs, NOFOLLOW rejects symlinks; fstat and
-				// bounded reads use the same descriptor even during atomic replacement.
-				const fd = openSync(
-					source,
-					constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
-				);
-				let record: VerifiedRecord;
-				try {
-					const stats = fstatSync(fd, { bigint: true });
+			const time = now();
+			const outcome = getSourceOutcome(source, time);
+			if (outcome.kind === "record") {
+				const status = recordStatus(outcome.record, time);
+				if (status !== "future") {
 					if (
-						!stats.isFile() ||
-						stats.size < 1n ||
-						stats.size > BigInt(MAX_RECORD_BYTES)
-					)
-						throw new Error("invalid record size or type");
-					const signature = `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
-					const cached = readCache.get(source);
-					const time = now();
-					if (
-						cached &&
-						time < cached.until &&
-						time >= cached.until - READ_CACHE_MS &&
-						time - Number(stats.mtimeMs) >= READ_CACHE_MS &&
-						cached.signature === signature
+						!lastValidBySource.has(source) &&
+						lastValidBySource.size >= MAX_CACHED_SOURCES
 					) {
-						record = cached.result;
-					} else {
-						record = readVerifiedRecord(fd, Number(stats.size), time);
-						readCache.delete(source);
-						readCache.set(source, {
-							until: time + READ_CACHE_MS,
-							signature,
-							result: record,
-						});
+						const oldest = lastValidBySource.keys().next().value;
+						if (oldest) lastValidBySource.delete(oldest);
 					}
-				} finally {
-					closeSync(fd);
-				}
-				const status = recordStatus(record, now());
-				if (status === "future")
-					throw new Error("record time is in the future");
-				if (
-					!lastValidBySource.has(source) &&
-					lastValidBySource.size >= MAX_CACHED_SOURCES
-				) {
-					const oldest = lastValidBySource.keys().next().value;
-					if (oldest) {
-						lastValidBySource.delete(oldest);
-						readCache.delete(oldest);
-					}
-				}
-				lastValidBySource.delete(source);
-				lastValidBySource.set(source, record);
-				while (readCache.size > MAX_CACHED_SOURCES) {
-					const oldest = readCache.keys().next().value;
-					if (oldest) readCache.delete(oldest);
-				}
-				return snapshot(
-					record.version,
-					"verified",
-					status === "fresh",
-					record.verifiedAt,
-					status === "stale" ? "stale_record" : error,
-				);
-			} catch (cause) {
-				readCache.delete(source);
-				error =
-					cause instanceof Error && "code" in cause && cause.code === "ENOENT"
-						? "unavailable_record"
-						: "invalid_record";
-				const last = lastValidBySource.get(source);
-				if (last)
+					lastValidBySource.delete(source);
+					lastValidBySource.set(source, outcome.record);
 					return snapshot(
-						last.version,
+						outcome.record.version,
 						"verified",
-						false,
-						last.verifiedAt,
-						error,
+						status === "fresh",
+						outcome.record.verifiedAt,
+						status === "stale" ? "stale_record" : error,
 					);
+				}
+				error = "invalid_record";
+			} else {
+				error = outcome.kind;
 			}
+			const last = lastValidBySource.get(source);
+			if (last)
+				return snapshot(
+					last.version,
+					"verified",
+					false,
+					last.verifiedAt,
+					error,
+				);
 		}
 	}
 	return snapshot(CODEX_VERSION, "default", false, undefined, error);
