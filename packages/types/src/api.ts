@@ -233,8 +233,10 @@ export interface RequestMeta {
 	routePhysicalModelPolicy?: RoutePhysicalModelPolicy | null;
 	/**
 	 * Catalog-role target that admitted each account during selection, keyed by
-	 * account id. An attempt sends exactly this model, and materialization checks
-	 * against it rather than a catalog published after admission.
+	 * account id. A profile rung in the root profile's family, root or
+	 * descendant, sends exactly this model; where routePhysicalModelPolicy is
+	 * "catalog-role", materialization also checks against it rather than a
+	 * catalog published after admission.
 	 */
 	routeCatalogRoleTargetByAccountId?: ReadonlyMap<string, string> | null;
 	/** Authenticated in-process auto-refresh probe; never derived from public hint headers. */

@@ -2917,17 +2917,20 @@ export async function proxyWithAccount(
 			account.provider === "codex"
 				? provider.captureAttemptIdentity?.(account, catalogContextSnapshot)
 				: undefined;
-		// A catalog-role rung binds this attempt to the role target that admitted
-		// the account during selection. A catalog published since then governs
-		// the next request or attempt, never this one; materialization re-checks
-		// the bound model against that same carried target.
+		// A catalog-role profile rung in the root profile's family, for the root
+		// request or a descendant, binds this attempt to the role target that
+		// admitted the account during selection. A catalog published since then
+		// governs the next request or attempt, never this one. Only a rung whose
+		// routePhysicalModelPolicy is catalog-role also re-checks the bound model
+		// at materialization; descendants stay pool-restricted, not model-bound.
 		const requestedRoleFamily = requestedModelBeforeAdmission
 			? getModelFamily(requestedModelBeforeAdmission)
 			: null;
 		const catalogRoleAttemptTarget =
 			account.provider === "codex" &&
 			requestMeta.routeProfileId != null &&
-			requestMeta.routePhysicalModelPolicy === "catalog-role" &&
+			(requestMeta.routePhysicalModelPolicy === "catalog-role" ||
+				requestMeta.routeProfilePhysicalModelPolicy === "catalog-role") &&
 			routeCandidateMetadata?.routeConstraintMode !== "ordinary" &&
 			requestedRoleFamily !== null &&
 			requestedRoleFamily ===
