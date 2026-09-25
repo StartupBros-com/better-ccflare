@@ -19,6 +19,14 @@ builds the upstream request. An account that relies on its provider's default mo
 fails a physical-model assertion even when the model it would send is right. A pinned profile
 meant to follow a provider's newest model should assert only the provider.
 
+### Force route
+
+A request's demand that one exact account serve it, carried by the account header or by a
+pinned route profile. Selection fails closed: when that account is paused, rate-limited, out of
+capacity, or cannot satisfy the profile's model assertions, the request is rejected rather than
+routed to any other account, so a forced request never lands on a provider the caller did not
+name. The rejection happens before any provider code runs, so it leaves no provider-side trace.
+
 ### Logical model
 
 The model a request names in Claude's vocabulary, before any account or provider translates
@@ -55,6 +63,14 @@ A semantically ordered tier of authorized routes in a capability descendant's ca
 Ranking may reorder accounts within one rung but cannot move a lower-authority rung ahead of a
 higher-authority rung or add a route that authorization did not admit.
 
+### Agent attribution
+
+The proxy's decision of which agent, if any, a request belongs to, recorded together with how
+it was decided: a registered agent matched on the request's system prompt, an explicit agent-id
+header, or, when neither matches, the request's own Claude Code session id. That session
+fallback exists so per-conversation alerting can key on a conversation; it identifies a
+session, not an agent, and is never agent evidence for containment.
+
 ### Attributed descendant
 
 A request the Codex provider contains as a subagent: it loses its Agent and Task tool
@@ -62,6 +78,16 @@ declarations without entering orchestration election. A request earns this statu
 real agent identity, meaning a registered agent matched on its prompt, an explicit agent-id
 header, or Claude Code's own subagent markers. The proxy's session-id attribution fallback
 identifies a session, not an agent, and never confers it.
+
+### Orchestration election
+
+The Codex provider's per-session claim of the single conversation allowed to keep its
+orchestration tools. The first eligible request in a session becomes the root; a later request
+keeps root only when it continues that root's lineage with the same instructions, otherwise it
+is admitted as non-root and loses those tools for that turn. A rejected claim never renews the
+root, so the root lapses only when it goes idle past the session TTL, after which a new claim
+can win. Attributed descendants and requests that offer no orchestration tools never enter the
+election.
 
 ### Trusted internal helper
 
