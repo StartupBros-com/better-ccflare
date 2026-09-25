@@ -311,7 +311,7 @@ U1 (predicate and its tests) → U2 (decision, proxy-boundary tests, glossary en
 - **Approach:**
   1. Replace the agent-field truthiness in the decision with the U1 predicate applied to the request metadata's attribution source, OR'd with the unchanged subagent-marker check on the request headers.
   2. Leave the header set and delete branches, and the stripping of client-supplied copies, exactly as they are.
-  3. In the existing descendant-marker test, declare a `header_agent` attribution source on its request metadata (KTD4).
+  3. In the existing descendant-marker test, declare a `prompt_agent` attribution source on its request metadata, since its agent field names a registered agent matched on the prompt (KTD4); the dedicated `header_agent` case below covers the proxy's explicit header.
   4. Add the session-fallback case and the per-marker cases below, using the block's request-metadata, account, and context helpers and its per-test fetch mock.
   5. Commit the glossary entry alongside the code and tests.
 - **Execution note:** Write the session-fallback test first and watch it fail against the old expression. After the change, restore the old expression once to confirm that test fails, then put the fix back and note the observation in the PR.
