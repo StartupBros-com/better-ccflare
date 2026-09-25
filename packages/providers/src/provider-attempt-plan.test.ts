@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Account, ServerToolReplayAtom } from "@better-ccflare/types";
 import {
 	createProviderAttemptNoExecutionSnapshot,
 	MAX_PROVIDER_NO_EXECUTION_BODY_BYTES,
 	materializeProviderAttemptPlan,
 } from "./provider-attempt-plan";
+import { CodexProvider } from "./providers/codex/provider";
 import type {
 	Provider,
 	ProviderAttemptNoExecutionSnapshot,
@@ -149,6 +153,101 @@ function customPlan(
 }
 
 describe("materializeProviderAttemptPlan", () => {
+	test("Codex model attempts pair their URL and headers before later file changes", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ccflare-plan-identity-"));
+		const file = join(dir, "verified.json");
+		const oldPath = process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
+		const oldVersion = process.env.CCFLARE_CODEX_CLIENT_VERSION;
+		const record = (version: string) =>
+			JSON.stringify({
+				schemaVersion: 1,
+				packageName: "@openai/codex",
+				version,
+				verifiedAt: new Date(Date.now() - 60_000).toISOString(),
+			});
+		try {
+			delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = file;
+			writeFileSync(file, record("0.170.0"));
+			const provider = new CodexProvider();
+			const codexContext = context(
+				{ ...accountFixture(), provider: "codex", custom_endpoint: null },
+				{
+					request: new Request("http://proxy.local/v1/models"),
+					requestBodyBuffer: null,
+					path: "/v1/models",
+				},
+			);
+			const first = materializeProviderAttemptPlan(provider, codexContext);
+			writeFileSync(file, record("0.169.0"));
+			const firstHeaders = first.prepareHeaders(
+				new Headers({
+					Version: "client-injected",
+					"User-Agent": "client-injected",
+					"x-better-ccflare-codex-client-version": "999.0.0",
+				}),
+				"token",
+			);
+			expect(new URL(first.targetUrl).searchParams.get("client_version")).toBe(
+				"0.170.0",
+			);
+			expect(firstHeaders.get("Version")).toBe("0.170.0");
+			expect(firstHeaders.get("User-Agent")).toBe(
+				"codex-cli/0.170.0 (Windows 10.0.26100; x64)",
+			);
+			expect(
+				firstHeaders.get("x-better-ccflare-codex-client-version"),
+			).toBeNull();
+			const second = materializeProviderAttemptPlan(provider, codexContext);
+			expect(new URL(second.targetUrl).searchParams.get("client_version")).toBe(
+				"0.169.0",
+			);
+			expect(second.prepareHeaders(new Headers(), "token").get("Version")).toBe(
+				"0.169.0",
+			);
+		} finally {
+			if (oldPath === undefined)
+				delete process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
+			else process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = oldPath;
+			if (oldVersion === undefined)
+				delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			else process.env.CCFLARE_CODEX_CLIENT_VERSION = oldVersion;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+	test("prefers a pre-captured attempt identity over the provider's live capture", () => {
+		let liveCaptureCalls = 0;
+		let observedIdentity: unknown;
+		const provider = baseProvider({
+			captureAttemptIdentity: () => {
+				liveCaptureCalls += 1;
+				return { source: "live", call: liveCaptureCalls };
+			},
+			prepareHeaders: (headers, _accessToken, _apiKey, identity?: unknown) => {
+				observedIdentity = identity;
+				return new Headers(headers);
+			},
+		});
+		const account = accountFixture();
+
+		const lazyPlan = materializeProviderAttemptPlan(provider, context(account));
+		lazyPlan.prepareHeaders(new Headers(), "token");
+		expect(observedIdentity).toEqual({ source: "live", call: 1 });
+		expect(liveCaptureCalls).toBe(1);
+
+		// A snapshot captured synchronously at admission (before any later
+		// credential/catalog await) must win over a fresh, potentially
+		// stale-relative-to-admission live re-capture at materialize time.
+		const capturedPlan = materializeProviderAttemptPlan(
+			provider,
+			context(account, {
+				capturedAttemptIdentity: { source: "admission-snapshot" },
+			}),
+		);
+		capturedPlan.prepareHeaders(new Headers(), "token");
+		expect(observedIdentity).toEqual({ source: "admission-snapshot" });
+		expect(liveCaptureCalls).toBe(1);
+	});
 	test("bypasses custom planning for proof-null ordinary attempts", () => {
 		let plannerCalls = 0;
 		let legacyBuildCalls = 0;

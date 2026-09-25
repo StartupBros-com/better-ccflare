@@ -1126,6 +1126,26 @@ describe("Codex strict hosted-search request mapper", () => {
 });
 
 describe("Codex exact hosted-search attempt plan", () => {
+	test("snapshots identity in hosted header callbacks across configuration changes", () => {
+		const previous = process.env.CCFLARE_CODEX_CLIENT_VERSION;
+		try {
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.171.0";
+			const plan = materializeHostedPlan(hostedRequestBody(true));
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.172.0";
+			expect(plan.prepareHeaders(new Headers(), "token").get("Version")).toBe(
+				"0.171.0",
+			);
+			expect(
+				materializeHostedPlan(hostedRequestBody(true))
+					.prepareHeaders(new Headers(), "token")
+					.get("Version"),
+			).toBe("0.172.0");
+		} finally {
+			if (previous === undefined)
+				delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			else process.env.CCFLARE_CODEX_CLIENT_VERSION = previous;
+		}
+	});
 	test("emits non-strict client functions beside hosted search without changing their schemas", async () => {
 		const inputSchema = {
 			type: "object",

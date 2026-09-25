@@ -43,6 +43,24 @@ function parseMappingValue(value: string): string | string[] | null {
 	return parts.length === 1 ? parts[0] : parts;
 }
 
+const FAMILY_FIELDS = ["fable", "opus", "sonnet", "haiku"] as const;
+
+/** Only edited family fields change; custom keys and ordered arrays survive. */
+export function mergeAccountModelMappings(
+	existing: Record<string, string | string[]> | null | undefined,
+	fields: Record<(typeof FAMILY_FIELDS)[number], string>,
+): Record<string, string | string[]> {
+	const result = { ...(existing ?? {}) };
+	for (const field of FAMILY_FIELDS) {
+		if (fields[field].trim() === formatMappingValue(result[field] ?? ""))
+			continue;
+		const value = parseMappingValue(fields[field]);
+		if (value === null) delete result[field];
+		else result[field] = value;
+	}
+	return result;
+}
+
 export function AccountModelMappingsDialog({
 	isOpen,
 	account,
@@ -86,16 +104,10 @@ export function AccountModelMappingsDialog({
 
 		setIsLoading(true);
 		try {
-			const mappingsToSend: { [key: string]: string | string[] } = {};
-			const fable = parseMappingValue(modelMappings.fable);
-			const opus = parseMappingValue(modelMappings.opus);
-			const sonnet = parseMappingValue(modelMappings.sonnet);
-			const haiku = parseMappingValue(modelMappings.haiku);
-
-			if (fable) mappingsToSend.fable = fable;
-			if (opus) mappingsToSend.opus = opus;
-			if (sonnet) mappingsToSend.sonnet = sonnet;
-			if (haiku) mappingsToSend.haiku = haiku;
+			const mappingsToSend = mergeAccountModelMappings(
+				account.modelMappings,
+				modelMappings,
+			);
 
 			await onUpdateModelMappings(account.id, mappingsToSend);
 			onOpenChange(false);
@@ -150,11 +162,9 @@ export function AccountModelMappingsDialog({
 						</p>
 						{!passthroughAllowed && (
 							<p className="text-xs text-warning mb-3">
-								{account.provider} does not serve Claude model ids, so a family
-								left empty here is not passthrough: the built-in default map of
-								the provider decides instead, and it may point at a model this
-								account is not entitled to call. Map every family this account
-								is actually used for.
+								{account.provider === "codex"
+									? "Automatic: an empty family inherits this account’s current catalog default when available; a value here is pinned. Shared catalog defaults are advisory until this account’s own listing succeeds."
+									: `${account.provider} does not serve Claude model ids. An empty family inherits its provider default, not passthrough; pin a family when its default is unsuitable.`}
 							</p>
 						)}
 						<div className="grid grid-cols-2 gap-3">

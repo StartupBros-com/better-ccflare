@@ -16,6 +16,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { Account } from "../../api";
 import { AccountList } from "./AccountList";
 import { AccountListItem } from "./AccountListItem";
+import { mergeAccountModelMappings } from "./AccountModelMappingsDialog";
 import type { AccountFamilyRoutingState } from "./account-routing";
 
 function noop() {}
@@ -91,6 +92,28 @@ function routingState(
 		...overrides,
 	};
 }
+
+describe("account model mapping edits", () => {
+	it("preserves unrelated exact pins and one-element ordered arrays", () => {
+		const existing = {
+			"claude-sonnet-4-8": ["private-a", "private-b"],
+			fable: ["pinned-a"],
+			opus: "pinned-b",
+		};
+		const merged = mergeAccountModelMappings(existing, {
+			fable: "pinned-a",
+			opus: "",
+			sonnet: "fresh",
+			haiku: "",
+		});
+		expect(merged).toEqual({
+			"claude-sonnet-4-8": ["private-a", "private-b"],
+			fable: ["pinned-a"],
+			sonnet: "fresh",
+		});
+		expect(existing.opus).toBe("pinned-b");
+	});
+});
 
 describe("AccountListItem (P2 review: pause-reason rendering)", () => {
 	it("renders the derived requiresReauth signal as the same primary recovery action", () => {

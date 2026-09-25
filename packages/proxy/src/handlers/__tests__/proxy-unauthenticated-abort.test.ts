@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { CodexProvider } from "@better-ccflare/providers";
 import type { RequestMeta } from "@better-ccflare/types";
 import { ANTHROPIC_DRAIN_DEADLINE_MS } from "../../anthropic-terminal-recovery";
 import { proxyUnauthenticated } from "../proxy-operations";
@@ -21,6 +22,57 @@ function fetchSignal(
 }
 
 describe("proxyUnauthenticated abort lifecycle", () => {
+	it("pairs a Codex model URL with its headers when identity changes between preparation steps", async () => {
+		const previous = process.env.CCFLARE_CODEX_CLIENT_VERSION;
+		const provider = new CodexProvider();
+		const buildUrl = provider.buildUrl;
+		let outgoing: Request | undefined;
+		try {
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.171.0";
+			provider.buildUrl = function (...args) {
+				const url = buildUrl.apply(this, args);
+				process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.172.0";
+				return url;
+			};
+			globalThis.fetch = (async (input, init) => {
+				outgoing = new Request(input, init);
+				return Response.json({ models: [] });
+			}) as typeof globalThis.fetch;
+			const req = new Request("https://proxy.test/v1/models", {
+				method: "GET",
+			});
+			const ctx = {
+				provider,
+				config: { getStorePayloads: () => false },
+				dbOps: {},
+				asyncWriter: {},
+			} as unknown as ProxyContext;
+			await expect(
+				proxyUnauthenticated(
+					req,
+					new URL(req.url),
+					{
+						id: "unauthenticated-codex-identity",
+						method: "GET",
+						path: "/v1/models",
+						timestamp: Date.now(),
+					},
+					null,
+					() => undefined,
+					ctx,
+				),
+			).rejects.toThrow("UsageCollector not initialized");
+			expect(outgoing).toBeDefined();
+			expect(
+				new URL(outgoing?.url ?? "").searchParams.get("client_version"),
+			).toBe("0.171.0");
+			expect(outgoing?.headers.get("Version")).toBe("0.171.0");
+		} finally {
+			if (previous === undefined)
+				delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			else process.env.CCFLARE_CODEX_CLIENT_VERSION = previous;
+		}
+	});
 	afterEach(() => {
 		globalThis.fetch = originalFetch;
 	});

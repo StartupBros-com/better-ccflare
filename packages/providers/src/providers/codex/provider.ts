@@ -40,10 +40,20 @@ import {
 } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import {
+	type CodexClientIdentity,
+	resolveCodexClientIdentity,
+} from "./client-identity";
+
+export { CODEX_USER_AGENT, CODEX_VERSION } from "./client-identity";
+
+import {
 	registerProviderModelDefaultFactory,
 	resolveProviderModelDefault,
 } from "../../provider-model-defaults";
 import {
+	type CodexModelContextSnapshot,
+	captureCodexModelContextSnapshot,
+	captureCodexModelReasoningSnapshot,
 	estimateAnthropicRequestTokens,
 	resolveModelContextCapability,
 } from "../../request-capabilities";
@@ -174,10 +184,9 @@ const TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const CODEX_DEFAULT_ENDPOINT =
 	"https://chatgpt.com/backend-api/codex/responses";
-export const CODEX_VERSION = "0.156.0";
+// The compiled compatibility constants are re-exported from client-identity.
 /** Hosts that are OpenAI's own Codex/Responses API, not a custom endpoint. */
 const OPENAI_PROMPT_CACHE_HOSTS = new Set(["chatgpt.com", "api.openai.com"]);
-export const CODEX_USER_AGENT = `codex-cli/${CODEX_VERSION} (Windows 10.0.26100; x64)`;
 export const CODEX_PING_MODEL = "gpt-5.6-sol";
 const CODEX_SYNTHETIC_COUNT_TOKENS_URL =
 	"https://better-ccflare.local/codex/count_tokens";
@@ -948,6 +957,8 @@ interface StreamState {
 	// Anthropic clients expect stop_reason=tool_use when the assistant emitted a tool call.
 	sawToolUse: boolean;
 	contextWindow: ContextWindow | null;
+	accountId?: string;
+	modelContextSnapshot: CodexModelContextSnapshot;
 	// Track function_call items: output_index → buffered arguments and block index
 	functionCallBlocks: Map<number, FunctionCallBuffer>;
 	/** Aggregate byte total across every entry in functionCallBlocks, capped by TOOL_ARGS_TOTAL_BYTE_CAP. */
@@ -1042,8 +1053,12 @@ function writeCodexStreamTerminalTrace(
 		requestId: state.traceRequestId,
 		attemptId: state.traceAttemptId,
 		modelOut: state.model,
-		modelContextWindow: resolveModelContextCapability("codex", state.model)
-			?.rawContextWindow,
+		modelContextWindow: resolveModelContextCapability(
+			"codex",
+			state.model,
+			state.accountId,
+			state.modelContextSnapshot,
+		)?.rawContextWindow,
 		turnStateHeaderPresent: state.traceTurnStateHeaderPresent,
 		turnState: state.traceTurnState,
 		turnStateTerminalAction: state.turnStateTerminalAction ?? "unknown_attempt",
@@ -1130,6 +1145,8 @@ export interface CodexProviderOptionsForTests {
 
 interface CodexTransformOptions {
 	hosted?: boolean;
+	modelContextSnapshot?: CodexModelContextSnapshot;
+	reasoningSnapshot?: ReturnType<typeof captureCodexModelReasoningSnapshot>;
 }
 
 interface CodexProcessResponseOptions {
@@ -2249,10 +2266,31 @@ export class CodexProvider extends BaseProvider {
 		return resolveCodexServerToolCapability(requirements, tuple);
 	}
 
+	captureAttemptIdentity(
+		account?: Account,
+		modelContextSnapshot?: CodexModelContextSnapshot,
+	): CodexClientIdentity & {
+		modelContextSnapshot?: CodexModelContextSnapshot;
+		reasoningSnapshot?: ReturnType<typeof captureCodexModelReasoningSnapshot>;
+	} {
+		const identity = resolveCodexClientIdentity();
+		return account
+			? {
+					...identity,
+					modelContextSnapshot:
+						modelContextSnapshot !== undefined
+							? modelContextSnapshot
+							: captureCodexModelContextSnapshot(account.id),
+					reasoningSnapshot: captureCodexModelReasoningSnapshot(account.id),
+				}
+			: identity;
+	}
+
 	createAttemptPlan(context: ProviderAttemptPlanContext) {
+		const identity = this.captureAttemptIdentity();
 		return createCodexHostedSearchAttemptPlan(context, {
 			prepareHeaders: (headers, accessToken) =>
-				this.prepareHeaders(headers, accessToken),
+				this.prepareHeaders(headers, accessToken, undefined, identity),
 			transformOrdinaryRequest: (request) =>
 				this.transformRequestBody(request, context.account, undefined, {
 					hosted: true,
@@ -2542,18 +2580,28 @@ export class CodexProvider extends BaseProvider {
 		};
 	}
 
-	buildUrl(_path: string, _query: string, account?: Account): string {
+	buildUrl(
+		_path: string,
+		_query: string,
+		account?: Account,
+		identity?: CodexClientIdentity,
+	): string {
 		if (_path === "/v1/messages/count_tokens") {
 			return CODEX_SYNTHETIC_COUNT_TOKENS_URL;
 		}
 		if (_path === "/v1/models") {
-			return `https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(CODEX_VERSION)}`;
+			return `https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent((identity ?? this.captureAttemptIdentity()).version)}`;
 		}
 
 		return resolveCodexEndpoint(account?.custom_endpoint, account?.name);
 	}
 
-	prepareHeaders(headers: Headers, accessToken?: string): Headers {
+	prepareHeaders(
+		headers: Headers,
+		accessToken?: string,
+		_apiKey?: string,
+		identity?: CodexClientIdentity,
+	): Headers {
 		const newHeaders = new Headers(headers);
 
 		// Remove client auth and Anthropic-specific headers
@@ -2576,9 +2624,10 @@ export class CodexProvider extends BaseProvider {
 		if (accessToken) {
 			newHeaders.set("Authorization", `Bearer ${accessToken}`);
 		}
-		newHeaders.set("Version", CODEX_VERSION);
+		const effectiveIdentity = identity ?? this.captureAttemptIdentity();
+		newHeaders.set("Version", effectiveIdentity.version);
 		newHeaders.set("Openai-Beta", "responses=experimental");
-		newHeaders.set("User-Agent", CODEX_USER_AGENT);
+		newHeaders.set("User-Agent", effectiveIdentity.userAgent);
 		newHeaders.set("originator", "codex_cli_rs");
 
 		return newHeaders;
@@ -2701,8 +2750,8 @@ export class CodexProvider extends BaseProvider {
 		}
 		// /v1/models is a GET passthrough to the subscription catalog endpoint.
 		// It has no JSON body to translate.
-		const codexModelsUrl = `https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(CODEX_VERSION)}`;
-		if (request.url.startsWith(codexModelsUrl.split("?")[0])) {
+		const codexModelsUrl = "https://chatgpt.com/backend-api/codex/models";
+		if (request.url.startsWith(codexModelsUrl)) {
 			return request;
 		}
 
@@ -2807,6 +2856,7 @@ export class CodexProvider extends BaseProvider {
 				finalModel ?? undefined,
 				logicalModelFamily,
 				passthrough,
+				options.reasoningSnapshot,
 			);
 			if (isSubscriptionEndpoint) {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
@@ -3067,10 +3117,18 @@ export class CodexProvider extends BaseProvider {
 	 */
 	async processResponse(
 		response: Response,
-		_account: Account | null,
+		account: Account | null,
 		_requestHeaders?: Headers,
 		drainAbortOrOptions: AbortController | CodexProcessResponseOptions = {},
+		attemptSnapshot?: CodexModelContextSnapshot,
 	): Promise<Response> {
+		const accountId = account?.id;
+		const modelContextSnapshot =
+			attemptSnapshot !== undefined
+				? attemptSnapshot
+				: accountId
+					? captureCodexModelContextSnapshot(accountId)
+					: null;
 		const options =
 			drainAbortOrOptions instanceof AbortController ? {} : drainAbortOrOptions;
 		const explicitDrainAbort =
@@ -3140,6 +3198,8 @@ export class CodexProvider extends BaseProvider {
 						finalModel,
 						options.hosted === true,
 						drainAbort,
+						accountId,
+						modelContextSnapshot,
 					);
 				}
 				return this.transformSseResponseToJson(
@@ -3149,6 +3209,8 @@ export class CodexProvider extends BaseProvider {
 					finalModel,
 					options.hosted === true,
 					drainAbort,
+					accountId,
+					modelContextSnapshot,
 				);
 			}
 			// A custom_tool_call can appear at any point in the stream, and the
@@ -3220,6 +3282,8 @@ export class CodexProvider extends BaseProvider {
 					finalModel,
 					options.hosted === true,
 					drainAbort,
+					accountId,
+					modelContextSnapshot,
 				);
 			}
 			return this.transformSseResponseToJson(
@@ -3229,6 +3293,8 @@ export class CodexProvider extends BaseProvider {
 				finalModel,
 				options.hosted === true,
 				drainAbort,
+				accountId,
+				modelContextSnapshot,
 			);
 		}
 
@@ -4153,10 +4219,17 @@ export class CodexProvider extends BaseProvider {
 	private extractContextWindow(
 		response: Record<string, unknown> | undefined,
 		usage: { input_tokens?: number } | undefined,
+		accountId?: string,
+		snapshot?: CodexModelContextSnapshot,
 	): ContextWindow | null {
 		const model = response?.model;
 		if (typeof model !== "string") return null;
-		const capability = resolveModelContextCapability("codex", model);
+		const capability = resolveModelContextCapability(
+			"codex",
+			model,
+			accountId,
+			snapshot,
+		);
 		if (!capability) return null;
 		const contextWindowSize =
 			process.env[CODEX_EFFECTIVE_CONTEXT_ENV] === "1"
@@ -4299,6 +4372,7 @@ export class CodexProvider extends BaseProvider {
 		finalModel?: string,
 		logicalModelFamily?: string | null,
 		passthrough?: Record<string, unknown>,
+		reasoningSnapshot?: ReturnType<typeof captureCodexModelReasoningSnapshot>,
 	): CodexConversionResult {
 		const { model: mappedModel, isExplicitMapping } = this.mapModel(
 			body.model,
@@ -4464,6 +4538,13 @@ export class CodexProvider extends BaseProvider {
 		const passthroughReasoning = passthrough?.reasoning as
 			| AnthropicRequest["reasoning"]
 			| undefined;
+		const reasoningMetadata = (
+			reasoningSnapshot !== undefined
+				? reasoningSnapshot
+				: account
+					? captureCodexModelReasoningSnapshot(account.id)
+					: null
+		)?.get(physicalModel);
 		const reasoningResolution = resolveAnthropicReasoningEffort(
 			passthroughReasoning
 				? { ...body, reasoning: passthroughReasoning }
@@ -4471,6 +4552,7 @@ export class CodexProvider extends BaseProvider {
 			{
 				sourceModel: body.model,
 				targetModel: physicalModel,
+				supportedTargetEfforts: reasoningMetadata?.supportedEfforts,
 			},
 		);
 		if (reasoningResolution.downgrades.length > 0) {
@@ -4487,6 +4569,20 @@ export class CodexProvider extends BaseProvider {
 			logicalModelFamily === "fable" && isGpt56SolModel(physicalModel)
 				? "xhigh"
 				: "medium";
+		// Retain our established default when supported; otherwise prefer the
+		// catalog's validated default before clamping to an advertised level.
+		const preferredDefault = reasoningMetadata?.supportedEfforts.includes(
+			defaultReasoningEffort,
+		)
+			? defaultReasoningEffort
+			: (reasoningMetadata?.defaultEffort ?? defaultReasoningEffort);
+		const resolvedDefault = resolveAnthropicReasoningEffort(
+			{ reasoning: { effort: preferredDefault } },
+			{
+				targetModel: physicalModel,
+				supportedTargetEfforts: reasoningMetadata?.supportedEfforts,
+			},
+		);
 		const codexRequest: CodexRequest = {
 			model: physicalModel,
 			input,
@@ -4497,7 +4593,10 @@ export class CodexProvider extends BaseProvider {
 				? { include: ["reasoning.encrypted_content"] }
 				: {}),
 			reasoning: {
-				effort: reasoningResolution.effort ?? defaultReasoningEffort,
+				effort:
+					reasoningResolution.effort ??
+					resolvedDefault.effort ??
+					defaultReasoningEffort,
 			},
 		};
 
@@ -4616,6 +4715,10 @@ export class CodexProvider extends BaseProvider {
 			undefined,
 		hosted = false,
 		drainAbort?: AbortController,
+		accountId?: string,
+		modelContextSnapshot: CodexModelContextSnapshot = accountId
+			? captureCodexModelContextSnapshot(accountId)
+			: null,
 	): Promise<Response> {
 		const transformed = this.transformStreamingResponse(
 			response,
@@ -4624,6 +4727,8 @@ export class CodexProvider extends BaseProvider {
 			finalModel,
 			hosted,
 			drainAbort,
+			accountId,
+			modelContextSnapshot,
 		);
 		const reader = transformed.body
 			?.pipeThrough(new TextDecoderStream())
@@ -4860,6 +4965,10 @@ export class CodexProvider extends BaseProvider {
 			"unknown",
 		hosted = false,
 		drainAbort?: AbortController,
+		accountId?: string,
+		modelContextSnapshot: CodexModelContextSnapshot = accountId
+			? captureCodexModelContextSnapshot(accountId)
+			: null,
 	): Response {
 		const state: StreamState = {
 			messageId: `msg_${crypto.randomUUID().replace(/-/g, "").substring(0, 24)}`,
@@ -4877,6 +4986,8 @@ export class CodexProvider extends BaseProvider {
 			usageMeasurementAvailable: false,
 			cacheMeasurementAvailable: false,
 			contextWindow: null,
+			accountId,
+			modelContextSnapshot,
 			functionCallBlocks: new Map(),
 			functionCallBytesTotal: 0,
 			sawToolUse: false,
@@ -6030,7 +6141,12 @@ export class CodexProvider extends BaseProvider {
 					state.traceResponseId = response.id;
 				}
 				if (typeof response?.model === "string") state.model = response.model;
-				state.contextWindow = this.extractContextWindow(response, usage);
+				state.contextWindow = this.extractContextWindow(
+					response,
+					usage,
+					state.accountId,
+					state.modelContextSnapshot,
+				);
 				state.upstreamError = this.normalizeCodexStreamError(eventName, data);
 				if (!state.hasSentTerminalEvents) {
 					// Claim the terminal trace before awaiting downstream writes so a
@@ -6108,7 +6224,12 @@ export class CodexProvider extends BaseProvider {
 						output: resp.output,
 					};
 				}
-				state.contextWindow = this.extractContextWindow(resp, usage);
+				state.contextWindow = this.extractContextWindow(
+					resp,
+					usage,
+					state.accountId,
+					state.modelContextSnapshot,
+				);
 				// Close any lingering content block
 				if (state.hasSentContentBlockStart) {
 					await writeSSE("content_block_stop", {

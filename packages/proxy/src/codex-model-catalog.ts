@@ -1,8 +1,11 @@
+import { registerHeartbeat } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
-	CODEX_VERSION,
+	clearCodexAccountModelContextMetadata,
 	clearDerivedAccountModelDefaults,
 	hasDerivedProviderModelDefaults,
+	resolveCodexClientIdentity,
+	setCodexAccountModelContextMetadata,
 	setDerivedAccountModelDefaults,
 	setDerivedProviderModelDefaults,
 } from "@better-ccflare/providers";
@@ -43,6 +46,9 @@ export interface CodexModelEntry {
 	maxContextWindow: number | null;
 	/** Catalog `effective_context_window_percent` (usable share of capacity). */
 	effectiveContextPercent: number | null;
+	/** Validated scalar effort levels; never a claim about tools or orchestration. */
+	supportedReasoningEfforts?: string[];
+	defaultReasoningEffort?: string | null;
 	/**
 	 * Model OpenAI says will replace this one, when it has announced a
 	 * deprecation. Worth surfacing: picking a model that is on its way out is
@@ -66,6 +72,7 @@ export interface CodexModelListing {
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
+const CATALOG_REFRESH_INTERVAL_MS = 15 * 60_000;
 const ENSURE_RETRY_DELAYS_MS = [
 	60_000, 120_000, 240_000, 480_000, 900_000,
 ] as const;
@@ -129,6 +136,8 @@ const ensureRetryByAccount = new Map<string, EnsureRetryState>();
 
 /** One best-effort listing request per account at a time. */
 const ensureInFlight = new Map<string, Promise<void>>();
+const unknownRevalidationAt = new Map<string, number>();
+const UNKNOWN_REVALIDATION_COOLDOWN_MS = 60_000;
 
 /**
  * Successful live reads publish in start order, not completion order.
@@ -151,10 +160,12 @@ let publishedProviderCatalogGeneration = 0;
  */
 export function clearCodexModelCacheForTests(): void {
 	lastGood.clear();
+	clearCodexAccountModelContextMetadata();
 	invalidationGenerationByAccount.clear();
 	providerWide = null;
 	ensureRetryByAccount.clear();
 	ensureInFlight.clear();
+	unknownRevalidationAt.clear();
 	publishedProviderCatalogGeneration = 0;
 }
 
@@ -174,7 +185,9 @@ export function clearCodexModelCacheForAccount(accountId: string): void {
 	lastGood.delete(accountId);
 	ensureRetryByAccount.delete(accountId);
 	ensureInFlight.delete(accountId);
+	unknownRevalidationAt.delete(accountId);
 	clearDerivedAccountModelDefaults("codex", accountId);
+	clearCodexAccountModelContextMetadata(accountId);
 }
 
 function scheduleEnsureRetry(accountId: string, now: number): void {
@@ -232,6 +245,8 @@ interface CodexModelsResponse {
 		context_window?: number;
 		max_context_window?: number;
 		effective_context_window_percent?: number;
+		supported_reasoning_levels?: Array<{ effort?: string }>;
+		default_reasoning_level?: string;
 		/** "list" to be offered; "hide" for routing aliases and internal models. */
 		visibility?: string;
 		/** OpenAI's own ordering, frontier first. */
@@ -278,6 +293,13 @@ function normalize(body: CodexModelsResponse): CodexModelEntry[] {
 				typeof raw.effective_context_window_percent === "number"
 					? raw.effective_context_window_percent
 					: null,
+			supportedReasoningEfforts: Array.isArray(raw.supported_reasoning_levels)
+				? raw.supported_reasoning_levels.map((level) => level?.effort ?? "")
+				: undefined,
+			defaultReasoningEffort:
+				typeof raw.default_reasoning_level === "string"
+					? raw.default_reasoning_level
+					: null,
 		});
 	}
 
@@ -297,10 +319,11 @@ async function fetchLive(
 	account: Account,
 	ctx: ProxyContext,
 ): Promise<CodexModelEntry[]> {
+	const identity = resolveCodexClientIdentity();
 	const accessToken = await getValidAccessToken(account, ctx);
 	if (!accessToken) throw new Error("no access token for this account");
 
-	const url = `https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(CODEX_VERSION)}`;
+	const url = `https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(identity.version)}`;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 	try {
@@ -313,7 +336,7 @@ async function fetchLive(
 				// identifies the caller by originator — mirroring the CLI keeps us
 				// on the path OpenAI actually serves.
 				originator: "codex_cli_rs",
-				"user-agent": `codex_cli_rs/${CODEX_VERSION}`,
+				"user-agent": identity.catalogUserAgent,
 			},
 			signal: controller.signal,
 		});
@@ -339,16 +362,25 @@ export function ensureCodexModelDefaults(
 	account: Account | null | undefined,
 	ctx: ProxyContext,
 	now: () => number = Date.now,
+	forceRevalidation = false,
 ): Promise<void> {
 	if (account?.provider !== "codex") return Promise.resolve();
 	const invalidationGeneration = invalidationGenerationFor(account.id);
-	if (hasDerivedProviderModelDefaults("codex", account.id)) {
-		ensureRetryByAccount.delete(account.id);
+	const ownListing = lastGood.get(account.id)?.listing;
+	if (
+		ownListing &&
+		!forceRevalidation &&
+		now() < ownListing.fetchedAt + CATALOG_REFRESH_INTERVAL_MS
+	)
+		return Promise.resolve();
+	if (!ownListing && hasDerivedProviderModelDefaults("codex", account.id)) {
 		return Promise.resolve();
 	}
 
 	const current = ensureInFlight.get(account.id);
-	if (current) return current;
+	// First-hand evidence makes refresh advisory: never hold a warm request on
+	// a stalled credential refresh or catalog fetch. Cold accounts still wait.
+	if (current) return ownListing ? Promise.resolve() : current;
 
 	const retry = ensureRetryByAccount.get(account.id);
 	if (retry && now() < retry.nextAttemptAt) return Promise.resolve();
@@ -356,8 +388,11 @@ export function ensureCodexModelDefaults(
 	let attempt: Promise<void>;
 	attempt = (async () => {
 		try {
-			await getCodexModels(account.id, ctx);
-			if (hasDerivedProviderModelDefaults("codex", account.id)) {
+			const listing = await getCodexModels(account.id, ctx);
+			if (
+				listing?.source === "live" &&
+				hasDerivedProviderModelDefaults("codex", account.id)
+			) {
 				ensureRetryByAccount.delete(account.id);
 				return;
 			}
@@ -381,7 +416,40 @@ export function ensureCodexModelDefaults(
 		}
 	});
 	ensureInFlight.set(account.id, attempt);
-	return attempt;
+	return ownListing ? Promise.resolve() : attempt;
+}
+
+/** One account-scoped revalidation per cooldown, shared with regular refresh. */
+export function revalidateUnknownCodexModel(
+	account: Account,
+	model: string,
+	ctx: ProxyContext,
+	now: () => number = Date.now,
+): Promise<void> {
+	if (
+		account.provider !== "codex" ||
+		!lastGood.has(account.id) ||
+		lastGood.get(account.id)?.listing.models.some((entry) => entry.id === model)
+	) {
+		return Promise.resolve();
+	}
+	const previous = unknownRevalidationAt.get(account.id);
+	if (
+		previous !== undefined &&
+		now() < previous + UNKNOWN_REVALIDATION_COOLDOWN_MS
+	) {
+		return ensureInFlight.get(account.id) ?? Promise.resolve();
+	}
+	if (
+		unknownRevalidationAt.size >= MAX_ENSURE_RETRY_ENTRIES &&
+		!unknownRevalidationAt.has(account.id)
+	) {
+		const oldest = unknownRevalidationAt.keys().next().value;
+		if (oldest !== undefined) unknownRevalidationAt.delete(oldest);
+	}
+	unknownRevalidationAt.set(account.id, now());
+	const wait = ensureCodexModelDefaults(account, ctx, now, true);
+	return ensureInFlight.get(account.id) ?? wait;
 }
 
 /**
@@ -463,6 +531,7 @@ export async function getCodexModels(
 				// This account's exact evidence advances independently of the shared
 				// frontier, so a late response from another account still remains useful.
 				lastGood.set(accountId, { listing, generation: fetchGeneration });
+				setCodexAccountModelContextMetadata(accountId, models);
 				setDerivedAccountModelDefaults("codex", accountId, families);
 			}
 			if (fetchGeneration > publishedProviderCatalogGeneration) {
@@ -480,6 +549,7 @@ export async function getCodexModels(
 			cached?.source === "cached" &&
 			isCurrentInvalidationGeneration(accountId, invalidationGeneration)
 		) {
+			setCodexAccountModelContextMetadata(accountId, cached.models);
 			setDerivedAccountModelDefaults(
 				"codex",
 				accountId,
@@ -494,4 +564,67 @@ export async function getCodexModels(
 		);
 		return cached;
 	}
+}
+
+/** Account-local heartbeat; at most two catalog calls run concurrently. */
+export function initCodexModelCatalogRefresh(
+	ctx: ProxyContext,
+	testOverrides?: { initialDelayMs?: number; tickSeconds?: number },
+): () => void {
+	let stopped = false;
+	let running = false;
+	let nextRefreshAt = 0;
+	const tick = async (): Promise<void> => {
+		if (stopped || running || Date.now() < nextRefreshAt) return;
+		running = true;
+		// Bound jitter to two minutes around the fifteen-minute cadence.
+		nextRefreshAt =
+			Date.now() +
+			CATALOG_REFRESH_INTERVAL_MS +
+			Math.floor(Math.random() * 120_000);
+		try {
+			const accounts = (await ctx.dbOps.getAllAccounts())
+				.filter(
+					(account) =>
+						account.provider === "codex" &&
+						!account.paused &&
+						!account.requires_reauth &&
+						!account.custom_endpoint,
+				)
+				.slice(0, 100);
+			let next = 0;
+			await Promise.all(
+				Array.from({ length: Math.min(2, accounts.length) }, async () => {
+					while (!stopped && next < accounts.length) {
+						const account = accounts[next++];
+						await ensureCodexModelDefaults(account, ctx);
+						// Warm callers return immediately; scheduler workers must still wait
+						// for the actual fetch before starting another account.
+						await ensureInFlight.get(account.id);
+					}
+				}),
+			);
+		} catch (error) {
+			log.warn(`Could not schedule Codex model refresh: ${error}`);
+		} finally {
+			running = false;
+		}
+	};
+	const initial = setTimeout(
+		() => {
+			void tick();
+		},
+		testOverrides?.initialDelayMs ?? 30_000 + Math.random() * 90_000,
+	);
+	const unregister = registerHeartbeat({
+		id: "codex-model-catalog-refresh",
+		callback: tick,
+		seconds: testOverrides?.tickSeconds ?? 60,
+		description: "Codex account model catalog freshness check",
+	});
+	return () => {
+		stopped = true;
+		clearTimeout(initial);
+		unregister();
+	};
 }

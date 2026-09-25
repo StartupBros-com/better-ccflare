@@ -4,6 +4,7 @@ import {
 	clearDerivedAccountModelDefaults,
 	clearDerivedProviderModelDefaults,
 	hasDerivedProviderModelDefaults,
+	resolveModelContextCapability,
 	resolveProviderModelDefault,
 	setDerivedProviderModelDefaults,
 } from "@better-ccflare/providers";
@@ -14,7 +15,9 @@ import {
 	ensureCodexModelDefaults,
 	getCodexModels,
 	getKnownCodexModels,
+	initCodexModelCatalogRefresh,
 	lowestTierCodexModel,
+	revalidateUnknownCodexModel,
 } from "../codex-model-catalog";
 import type { ProxyContext } from "../handlers/proxy-types";
 
@@ -137,6 +140,33 @@ afterEach(() => {
 });
 
 describe("getCodexModels", () => {
+	it("pairs catalog version and user agent across credential awaits", async () => {
+		const oldVersion = process.env.CCFLARE_CODEX_CLIENT_VERSION;
+		const requests: Request[] = [];
+		try {
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.171.0";
+			globalThis.fetch = (async (input, init) => {
+				requests.push(new Request(input, init));
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			const pending = getCodexModels("acc-codex", makeCtx(makeAccount()));
+			// Allow the account lookup to complete; fetchLive snapshots before its token await.
+			await Promise.resolve();
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.172.0";
+			await pending;
+			expect(new URL(requests[0].url).searchParams.get("client_version")).toBe(
+				"0.171.0",
+			);
+			expect(requests[0].headers.get("User-Agent")).toBe(
+				"codex_cli_rs/0.171.0",
+			);
+			expect(requests[0].headers.get("originator")).toBe("codex_cli_rs");
+		} finally {
+			if (oldVersion === undefined)
+				delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			else process.env.CCFLARE_CODEX_CLIENT_VERSION = oldVersion;
+		}
+	});
 	it("uses the current inference version when discovering Sol and Luna", async () => {
 		const requests: Request[] = [];
 		globalThis.fetch = (async (input, init) => {
@@ -351,6 +381,177 @@ describe("getCodexModels", () => {
 
 	it("returns nothing for an account that does not exist", async () => {
 		expect(await getCodexModels("ghost", makeCtx(null))).toBeNull();
+	});
+});
+
+describe("periodic Codex catalog freshness", () => {
+	it("coalesces unknown-model revalidation and observes an account cooldown", async () => {
+		const account = makeAccount();
+		const ctx = makeCtx(account);
+		let calls = 0;
+		globalThis.fetch = (async () => {
+			calls++;
+			return Response.json(calls === 1 ? LIVE_BODY : NEW_FRONTIER_BODY);
+		}) as typeof globalThis.fetch;
+		await getCodexModels(account.id, ctx);
+		await Promise.all(
+			Array.from({ length: 12 }, () =>
+				revalidateUnknownCodexModel(account, "gpt-6-codex", ctx),
+			),
+		);
+		expect(calls).toBe(2);
+		await revalidateUnknownCodexModel(account, "unlisted-next", ctx);
+		expect(calls).toBe(2);
+		expect(getKnownCodexModels(account.id)?.models[0].id).toBe("gpt-6-codex");
+	});
+
+	it("schedules only active Codex accounts and stops on shutdown", async () => {
+		const codex = makeAccount();
+		const paused = makeAccount({ id: "paused", paused: true });
+		const foreign = makeAccount({ id: "foreign", provider: "xai" });
+		const ctx = makeCtx(codex);
+		ctx.dbOps.getAllAccounts = async () => [codex, paused, foreign];
+		const calls: string[] = [];
+		globalThis.fetch = (async () => {
+			calls.push("fetch");
+			return Response.json(LIVE_BODY);
+		}) as typeof globalThis.fetch;
+		const stop = initCodexModelCatalogRefresh(ctx, {
+			initialDelayMs: 1,
+			tickSeconds: 1,
+		});
+		try {
+			await waitForFetchCount(() => calls.length, 1);
+			expect(getKnownCodexModels(paused.id)).toBeNull();
+			expect(getKnownCodexModels(foreign.id)).toBeNull();
+		} finally {
+			stop();
+		}
+		expect(calls).toHaveLength(1);
+	});
+	it("returns the warm listing without waiting for a stalled stale refresh and coalesces callers", async () => {
+		const account = makeAccount();
+		const ctx = makeCtx(account);
+		let calls = 0;
+		let release!: () => void;
+		globalThis.fetch = (async () => {
+			calls++;
+			if (calls === 1) return Response.json(LIVE_BODY);
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return Response.json(NEW_FRONTIER_BODY);
+		}) as typeof globalThis.fetch;
+		await getCodexModels(account.id, ctx);
+		const due = () => Date.now() + 16 * 60_000;
+		const first = ensureCodexModelDefaults(account, ctx, due);
+		await waitForFetchCount(() => calls, 2);
+		let settled = false;
+		void first.then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(true);
+		await ensureCodexModelDefaults(account, ctx, due);
+		expect(calls).toBe(2);
+		expect(getKnownCodexModels(account.id)?.models[0].id).toBe("gpt-5.6-sol");
+		release();
+		await waitForFetchCount(
+			() =>
+				getKnownCodexModels(account.id)?.models[0].id === "gpt-6-codex" ? 1 : 0,
+			1,
+		);
+	});
+
+	it("refreshes an existing own listing after fifteen minutes and retains it on failure", async () => {
+		let calls = 0;
+		globalThis.fetch = (async () => {
+			calls++;
+			return calls === 1
+				? new Response(JSON.stringify(LIVE_BODY), { status: 200 })
+				: new Response("unavailable", { status: 503 });
+		}) as typeof globalThis.fetch;
+		const account = makeAccount();
+		const ctx = makeCtx(account);
+		await ensureCodexModelDefaults(account, ctx);
+		expect(calls).toBe(1);
+		await ensureCodexModelDefaults(
+			account,
+			ctx,
+			() => Date.now() + 16 * 60_000,
+		);
+		// A warm request returns before the advisory fetch settles.
+		await waitForFetchCount(() => calls, 2);
+		expect(calls).toBe(2);
+		expect(getKnownCodexModels(account.id)?.models[0].id).toBe("gpt-5.6-sol");
+	});
+});
+
+describe("catalog-backed capacities", () => {
+	it("accepts safe large catalog windows and never invents capacity for missing scalars", async () => {
+		globalThis.fetch = (async () =>
+			Response.json({
+				models: [
+					{
+						slug: "gpt-6-wide",
+						visibility: "list",
+						context_window: 272_000,
+						max_context_window: 4_000_000,
+						effective_context_window_percent: 95,
+					},
+					{ slug: "gpt-5.6-sol", visibility: "list", context_window: 272_000 },
+				],
+			})) as typeof globalThis.fetch;
+		await getCodexModels("acc-codex", makeCtx(makeAccount()));
+		expect(
+			resolveModelContextCapability("codex", "gpt-6-wide", "acc-codex")
+				?.effectiveContextWindow,
+		).toBe(3_800_000);
+		expect(
+			resolveModelContextCapability("codex", "gpt-5.6-sol", "acc-codex"),
+		).toBeUndefined();
+	});
+
+	it("publishes bounded model capacity per account without leaking to other accounts", async () => {
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					models: [
+						{
+							slug: "gpt-6-luna",
+							visibility: "list",
+							priority: 1,
+							context_window: 272000,
+							max_context_window: 872000,
+							effective_context_window_percent: 95,
+						},
+						{
+							slug: "bad-window",
+							visibility: "list",
+							priority: 2,
+							context_window: -1,
+							max_context_window: 1e30,
+							effective_context_window_percent: 105,
+						},
+					],
+				}),
+				{ status: 200 },
+			)) as typeof globalThis.fetch;
+		await getCodexModels("acc-codex", makeCtx(makeAccount()));
+		expect(
+			resolveModelContextCapability("codex", "gpt-6-luna", "acc-codex"),
+		).toMatchObject({
+			defaultContextWindow: 272000,
+			maxContextWindow: 872000,
+			effectiveContextWindow: 828400,
+			match: "exact",
+		});
+		expect(
+			resolveModelContextCapability("codex", "gpt-6-luna", "other-account"),
+		).toBeUndefined();
+		expect(
+			resolveModelContextCapability("codex", "bad-window", "acc-codex"),
+		).toBeUndefined();
 	});
 });
 

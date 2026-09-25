@@ -104,6 +104,7 @@ export type {
 export {
 	clearCodexModelCacheForAccount,
 	getCodexModels,
+	initCodexModelCatalogRefresh,
 	lowestTierCodexModel,
 } from "./codex-model-catalog";
 export {

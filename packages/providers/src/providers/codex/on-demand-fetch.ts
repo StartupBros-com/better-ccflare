@@ -1,10 +1,9 @@
 import { Logger } from "@better-ccflare/logger";
 import type { UsageData } from "../../usage-fetcher";
+import { resolveCodexClientIdentity } from "./client-identity";
 import {
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_PING_MODEL,
-	CODEX_USER_AGENT,
-	CODEX_VERSION,
 	isCodexSubscriptionEndpoint,
 	resolveCodexEndpoint,
 } from "./provider";
@@ -58,6 +57,7 @@ export async function fetchCodexUsageOnDemand(
 	const controller = new AbortController();
 	const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 	const resolvedEndpoint = resolveCodexEndpoint(endpoint);
+	const identity = resolveCodexClientIdentity();
 
 	const requestBody: Record<string, unknown> = {
 		// Blank input is the same missing-model failure as a stale model name.
@@ -86,9 +86,9 @@ export async function fetchCodexUsageOnDemand(
 			headers: {
 				Authorization: `Bearer ${accessToken}`,
 				"Content-Type": "application/json",
-				Version: CODEX_VERSION,
+				Version: identity.version,
 				"Openai-Beta": "responses=experimental",
-				"User-Agent": CODEX_USER_AGENT,
+				"User-Agent": identity.userAgent,
 				originator: "codex_cli_rs",
 				Accept: "text/event-stream",
 			},

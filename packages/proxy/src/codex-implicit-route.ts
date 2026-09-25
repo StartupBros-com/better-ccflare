@@ -8,6 +8,7 @@ import type { Account } from "@better-ccflare/types";
 import {
 	ensureCodexModelDefaults,
 	getKnownCodexModels,
+	revalidateUnknownCodexModel,
 } from "./codex-model-catalog";
 import type { ProxyContext } from "./handlers/proxy-types";
 
@@ -39,6 +40,7 @@ async function primeBeforeDeadline(
 	ctx: ProxyContext,
 	deadlineAt: number,
 	signal?: AbortSignal,
+	unknownModel?: string,
 ): Promise<boolean> {
 	return new Promise<boolean>((resolve) => {
 		const finish = (completed: boolean) => {
@@ -56,7 +58,11 @@ async function primeBeforeDeadline(
 			finish(false);
 			return;
 		}
-		void ensureCodexModelDefaults(account, ctx).then(
+		void (
+			unknownModel
+				? revalidateUnknownCodexModel(account, unknownModel, ctx)
+				: ensureCodexModelDefaults(account, ctx)
+		).then(
 			() => finish(true),
 			() => finish(false),
 		);
@@ -101,7 +107,30 @@ export async function accountServesPhysicalModel(
 ): Promise<boolean> {
 	if (account.provider !== "codex" || selectionExpired(options)) return false;
 	const known = getKnownCodexModels(account.id);
-	if (known) return known.models.some((model) => model.id === id);
+	if (known) {
+		if (known.models.some((model) => model.id === id)) return true;
+		if (
+			options.prime === false ||
+			!options.ctx ||
+			options.deadlineAt === undefined
+		)
+			return false;
+		const completed = await primeBeforeDeadline(
+			account,
+			options.ctx,
+			options.deadlineAt,
+			options.signal,
+			id,
+		);
+		return (
+			completed &&
+			!selectionExpired(options) &&
+			(getKnownCodexModels(account.id)?.models.some(
+				(model) => model.id === id,
+			) ??
+				false)
+		);
+	}
 
 	// Parse account-owned mappings once, including exact Claude-id keys and bare
 	// families. Global environment mappings and provider defaults are not proof.
@@ -156,8 +185,8 @@ export async function resolveImplicitCodexRoute(
 	if (knownAccounts.some(isReady)) {
 		return { id, matchingAccounts: knownAccounts };
 	}
-	// Keep negative cached catalogs authoritative and retain unavailable proofs.
-	// Only eligible cold accounts may join the catalog's shared bounded ensure.
+	// Preserve unavailable proofs; eligible accounts with a negative catalog
+	// may perform one cooled-down revalidation, and cold accounts may hydrate.
 	const serves = await Promise.all(
 		accounts.map((account, index) =>
 			known[index] || account.provider !== "codex" || !isReady(account)

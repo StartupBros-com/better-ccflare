@@ -19,7 +19,11 @@ import {
 } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import { stripCacheControlFromOpenAIRequest } from "@better-ccflare/openai-formats";
-import type { Provider, ProviderAttemptPlan } from "@better-ccflare/providers";
+import type {
+	CodexModelContextSnapshot,
+	Provider,
+	ProviderAttemptPlan,
+} from "@better-ccflare/providers";
 import {
 	applyXaiConvIdHeader,
 	buildServerToolCapabilityProofKey,
@@ -27,6 +31,7 @@ import {
 	CODEX_CONVERSATION_ID_HEADER,
 	CODEX_NATIVE_RESPONSES_HEADER,
 	CODEX_TURN_STATE_HEADER,
+	captureCodexModelContextSnapshot,
 	decideContextAdmission,
 	estimateAnthropicAdmissionTokens,
 	hasDeferredCustomTool,
@@ -956,6 +961,7 @@ export function admitConcreteCodexModel(
 	account: Account,
 	model: string,
 	tracker?: ContextAdmissionTracker,
+	snapshot?: CodexModelContextSnapshot,
 ): boolean {
 	if (
 		process.env.CCFLARE_CONTEXT_ADMISSION !== "1" ||
@@ -964,7 +970,12 @@ export function admitConcreteCodexModel(
 	) {
 		return true;
 	}
-	const capability = resolveModelContextCapability("codex", model);
+	const capability = resolveModelContextCapability(
+		"codex",
+		model,
+		account.id,
+		snapshot,
+	);
 	const effectiveContextWindow =
 		getTestContextWindowOverride() ?? capability?.effectiveContextWindow;
 	if (!effectiveContextWindow) {
@@ -1057,15 +1068,21 @@ function getConcreteCodexModelList(
 function isKnownLargerCodexCandidate(
 	currentModel: string,
 	candidateModel: string,
+	accountId: string,
+	snapshot: CodexModelContextSnapshot,
 ): boolean {
 	const currentCapability = resolveModelContextCapability(
 		"codex",
 		currentModel,
+		accountId,
+		snapshot,
 	);
 	if (!currentCapability) return false;
 	const candidateCapability = resolveModelContextCapability(
 		"codex",
 		candidateModel,
+		accountId,
+		snapshot,
 	);
 	return (
 		candidateCapability !== undefined &&
@@ -1079,6 +1096,7 @@ export function selectAdmittedCodexModel(
 	requestedModel: string | null,
 	tracker?: ContextAdmissionTracker,
 	candidateModels?: readonly string[],
+	snapshot = captureCodexModelContextSnapshot(account.id),
 ): { admitted: boolean; model: string | null } {
 	if (
 		process.env.CCFLARE_CONTEXT_ADMISSION !== "1" ||
@@ -1090,7 +1108,7 @@ export function selectAdmittedCodexModel(
 	}
 	for (const model of candidateModels ??
 		getConcreteCodexModelList(account, requestedModel)) {
-		if (admitConcreteCodexModel(account, model, tracker)) {
+		if (admitConcreteCodexModel(account, model, tracker, snapshot)) {
 			return { admitted: true, model };
 		}
 	}
@@ -2390,9 +2408,25 @@ export async function proxyUnauthenticated(
 ): Promise<Response> {
 	log.warn(ERROR_MESSAGES.NO_ACCOUNTS);
 
-	const targetUrl = ctx.provider.buildUrl(url.pathname, url.search);
+	const identity = ctx.provider.captureAttemptIdentity?.();
+	const targetUrl =
+		identity === undefined
+			? ctx.provider.buildUrl(url.pathname, url.search)
+			: (Reflect.apply(ctx.provider.buildUrl, ctx.provider, [
+					url.pathname,
+					url.search,
+					undefined,
+					identity,
+				]) as string);
 	const headers = sanitizeInternalHeaders(
-		ctx.provider.prepareHeaders(req.headers, undefined, undefined),
+		identity === undefined
+			? ctx.provider.prepareHeaders(req.headers, undefined, undefined)
+			: (Reflect.apply(ctx.provider.prepareHeaders, ctx.provider, [
+					req.headers,
+					undefined,
+					undefined,
+					identity,
+				]) as Headers),
 	);
 	const routingSignal = anthropicPreCommitRescue?.signal ?? req.signal;
 	const drainAbortController = new AbortController();
@@ -2885,6 +2919,13 @@ export async function proxyWithAccount(
 		if (ensuredCodexDefaultsBeforeAdmission) {
 			await ensureCodexModelDefaults(account, ctx);
 		}
+		const catalogContextSnapshot = captureCodexModelContextSnapshot(account.id);
+		// Capture provider identity and metadata in the same synchronous turn as
+		// admission; later credential work cannot change this attempt's capacity.
+		const catalogAttemptIdentity =
+			account.provider === "codex"
+				? provider.captureAttemptIdentity?.(account, catalogContextSnapshot)
+				: undefined;
 		const concreteCodexModels =
 			account.provider === "codex" && requestedModelBeforeAdmission
 				? getConcreteCodexModelList(account, requestedModelBeforeAdmission)
@@ -2925,6 +2966,7 @@ export async function proxyWithAccount(
 			requestedModelBeforeAdmission,
 			attemptAdmissionTracker,
 			admissionCandidates,
+			catalogContextSnapshot,
 		);
 		if (!admission.admitted) return null;
 		const admittedModelIndex = admission.model
@@ -2972,7 +3014,12 @@ export async function proxyWithAccount(
 					mayPlanCodexContextOverflowFallback &&
 					admission.model &&
 					codexContextOverflowFallbackModel === null &&
-					isKnownLargerCodexCandidate(admission.model, candidateModel)
+					isKnownLargerCodexCandidate(
+						admission.model,
+						candidateModel,
+						account.id,
+						catalogContextSnapshot,
+					)
 				) {
 					// Set only after the request-level queue accepts this route (or
 					// de-duplicates it against the same route queued during admission).
@@ -3211,6 +3258,7 @@ export async function proxyWithAccount(
 				path: url.pathname,
 				query: serverToolAttemptPlanQuery,
 				physicalModel,
+				capturedAttemptIdentity: catalogAttemptIdentity,
 				capabilityProofKey: capability?.proofKey ?? null,
 				inputReplayMode: capability?.inputReplayMode ?? [],
 				outputReplayMode: capability?.outputReplayMode ?? [],
@@ -3310,17 +3358,10 @@ export async function proxyWithAccount(
 		if (provider.name === "codex" && !ensuredCodexDefaultsBeforeAdmission) {
 			await ensureCodexModelDefaults(account, ctx);
 		}
-		// Catalog hydration can change a logical Claude-family request from the
-		// compiled Codex fallback to the account/provider's live frontier. Resolve
-		// again after `ensureCodexModelDefaults`, then bind the plan and transform to
-		// that account's exact physical identity. The preflight key above remains a
-		// cheap request-local skip only when an explicit or cache-replay identity was
-		// already known; a legitimate account-specific catalog change is not plan
-		// drift.
-		const concreteAttemptModel =
-			account.provider === "codex" && admittedRequestModel
-				? resolveCodexRequestModel(admittedRequestModel, account)
-				: preEnsureConcreteAttemptModel;
+		// Bind to the concrete model selected with the admission snapshot. A
+		// concurrent catalog publication during credential work must not retarget
+		// this attempt after its capacity was checked.
+		const concreteAttemptModel = preEnsureConcreteAttemptModel;
 		const plannedPhysicalModel =
 			cacheReplayPhysicalModel ?? concreteAttemptModel;
 		let attemptPlan = materializeAttemptPlan(
@@ -6533,6 +6574,7 @@ export async function proxyWithAccount(
 								account,
 								nextModel,
 								attemptAdmissionTracker,
+								catalogContextSnapshot,
 							)
 						) {
 							continue;

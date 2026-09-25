@@ -112,6 +112,16 @@ describe("reasoning effort support", () => {
 		);
 	});
 
+	it("honors only advertised reasoning effort for an exact target without inventing ultra", () => {
+		const models = {
+			targetModel: "gpt-6-codex",
+			supportedTargetEfforts: ["low", "medium", "high"] as const,
+		};
+		expect(resolveReasoningEffort("xhigh", models).effort).toBe("high");
+		expect(() => resolveReasoningEffort("ultra", models)).toThrow();
+		expect(resolveReasoningEffort("medium", models).effort).toBe("medium");
+	});
+
 	it("passes through effort unchanged when target model is unknown", () => {
 		const resolved = resolveReasoningEffort("xhigh", {
 			sourceModel: "claude-sonnet-4-6",

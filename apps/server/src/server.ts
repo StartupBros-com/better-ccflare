@@ -91,6 +91,7 @@ import {
 	getUsageCollectorHealth,
 	getValidAccessToken,
 	handleProxy,
+	initCodexModelCatalogRefresh,
 	initModelCatalogRefresh,
 	initProxy,
 	lowestTierCodexModel,
@@ -510,6 +511,7 @@ let stopDataCleanupJob: (() => void) | null = null;
 let stopWalCheckpointJob: (() => void) | null = null;
 let stopIntegritySchedulerJob: (() => void) | null = null;
 let stopModelCatalogRefreshJob: (() => void) | null = null;
+let stopCodexCatalogRefreshJob: (() => void) | null = null;
 let stopDeviceSetupRecoveryJob: (() => Promise<void>) | null = null;
 let autoRefreshScheduler: AutoRefreshScheduler | null = null;
 let usagePollingLifecycle: UsagePollingLifecycle<NodeJS.Timeout> | null = null;
@@ -2793,6 +2795,7 @@ Available endpoints:
 	// 30-120s delay, then re-checks every 15 minutes whether a refresh is due,
 	// rather than a single long-lived interval timer).
 	stopModelCatalogRefreshJob = initModelCatalogRefresh(proxyContext);
+	stopCodexCatalogRefreshJob = initCodexModelCatalogRefresh(proxyContext);
 
 	const serverPort = serverInstance.port;
 	if (typeof serverPort !== "number") {
@@ -3074,6 +3077,10 @@ async function handleGracefulShutdown(signal: string) {
 		if (stopModelCatalogRefreshJob) {
 			stopModelCatalogRefreshJob();
 			stopModelCatalogRefreshJob = null;
+		}
+		if (stopCodexCatalogRefreshJob) {
+			stopCodexCatalogRefreshJob();
+			stopCodexCatalogRefreshJob = null;
 		}
 		if (autoRefreshScheduler) {
 			autoRefreshScheduler.stop();
