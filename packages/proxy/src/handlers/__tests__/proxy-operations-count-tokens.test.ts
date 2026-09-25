@@ -80,7 +80,9 @@ function makeRequestMeta(path = "/v1/messages/count_tokens"): RequestMeta {
 	};
 }
 
-function makeProxyContext(): ProxyContext {
+function makeProxyContext(
+	provider: ProxyContext["provider"] = new CodexProvider() as never,
+): ProxyContext {
 	return {
 		strategy: { getNextAccount: () => null } as never,
 		dbOps: {
@@ -95,7 +97,7 @@ function makeProxyContext(): ProxyContext {
 			})),
 		} as never,
 		runtime: { port: 8080, clientId: "test" } as never,
-		provider: new CodexProvider() as never,
+		provider,
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => {}) } as never,
 		config: { getStorePayloads: () => true } as never,
@@ -1933,80 +1935,35 @@ describe("proxyWithAccount — non-Codex accounts never receive the Codex descen
 	// x-better-ccflare-attributed-agent at all -- regardless of attribution
 	// source or Claude Code headers on the request.
 	function makeNonCodexAccount(overrides: Partial<Account> = {}): Account {
-		return {
+		return makeCodexAccount({
 			id: "openai-compat-1",
 			name: "non-codex-test",
 			provider: "openai-compatible",
 			api_key: "test-key",
 			refresh_token: "",
-			access_token: null,
-			expires_at: null,
-			request_count: 0,
-			total_requests: 0,
-			last_used: null,
-			created_at: Date.now(),
-			rate_limited_until: null,
-			rate_limited_reason: null,
-			rate_limited_at: null,
-			session_start: null,
-			session_request_count: 0,
-			paused: false,
-			requires_reauth: false,
-			rate_limit_reset: null,
-			rate_limit_status: null,
-			rate_limit_remaining: null,
-			priority: 0,
-			auto_fallback_enabled: false,
-			auto_refresh_enabled: false,
-			auto_pause_on_overage_enabled: false,
-			peak_hours_pause_enabled: false,
 			custom_endpoint: "https://openrouter.ai/api/v1",
-			model_mappings: null,
-			cross_region_mode: null,
-			model_fallbacks: null,
-			billing_type: null,
-			pause_reason: null,
-			refresh_token_issued_at: null,
-			consecutive_rate_limits: 0,
 			...overrides,
-		};
+		});
 	}
 
-	function makeNonCodexProxyContext(): ProxyContext {
+	// Forwards headers as-is, so a leaked marker would be visible upstream.
+	function makeNonCodexProvider(): ProxyContext["provider"] {
 		return {
-			strategy: { getNextAccount: () => null } as never,
-			dbOps: {
-				markAccountRateLimited: mock(() =>
-					Promise.resolve({ consecutiveRateLimits: 1, applied: true }),
-				),
-				saveRequest: mock(() => Promise.resolve()),
-				updateAccountUsage: mock(() => Promise.resolve()),
-				getAdapter: mock(() => ({
-					run: mock(() => Promise.resolve()),
-					get: mock(() => Promise.resolve(null)),
-				})),
-			} as never,
-			runtime: { port: 8080, clientId: "test" } as never,
-			provider: {
-				name: "openai-compatible",
-				canHandle: () => true,
-				buildUrl: (_path: string, _search: string) =>
-					"https://openrouter.ai/api/v1/messages",
-				prepareHeaders: (headers: Headers) => new Headers(headers),
-				transformRequestBody: null,
-				processResponse: async (r: Response) => r,
-				parseRateLimit: () => ({
-					isRateLimited: false,
-					resetTime: undefined,
-					statusHeader: "allowed",
-					remaining: undefined,
-				}),
-				isStreamingResponse: () => false,
-			} as never,
-			refreshInFlight: new Map(),
-			asyncWriter: { enqueue: mock(() => {}) } as never,
-			config: { getStorePayloads: () => true } as never,
-		};
+			name: "openai-compatible",
+			canHandle: () => true,
+			buildUrl: (_path: string, _search: string) =>
+				"https://openrouter.ai/api/v1/messages",
+			prepareHeaders: (headers: Headers) => new Headers(headers),
+			transformRequestBody: null,
+			processResponse: async (r: Response) => r,
+			parseRateLimit: () => ({
+				isRateLimited: false,
+				resetTime: undefined,
+				statusHeader: "allowed",
+				remaining: undefined,
+			}),
+			isStreamingResponse: () => false,
+		} as never;
 	}
 
 	it("never sets the Codex descendant marker for a non-Codex account, even with agent evidence present", async () => {
@@ -2057,7 +2014,7 @@ describe("proxyWithAccount — non-Codex accounts never receive the Codex descen
 				bodyBuffer,
 				() => undefined,
 				0,
-				makeNonCodexProxyContext(),
+				makeProxyContext(makeNonCodexProvider()),
 			);
 		} finally {
 			collectorSpy.mockRestore();
