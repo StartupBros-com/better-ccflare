@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	attributionSourceIdentifiesAgent,
 	deriveClaudeCodeRouteLineage,
 	isClaudeCodeSubagent,
 } from "../claude-code-request";
@@ -32,6 +33,19 @@ describe("isClaudeCodeSubagent", () => {
 		],
 	])("classifies a child from the %s", (_label, headers) => {
 		expect(isClaudeCodeSubagent(new Headers(headers))).toBeTrue();
+	});
+});
+
+describe("attributionSourceIdentifiesAgent", () => {
+	it.each([
+		["prompt_agent", "prompt_agent", true],
+		["header_agent", "header_agent", true],
+		["session_header", "session_header", false],
+		["none", "none", false],
+		["undefined", undefined, false],
+		["null", null, false],
+	] as const)("returns %s for source %s", (_label, source, expected) => {
+		expect(attributionSourceIdentifiesAgent(source)).toBe(expected);
 	});
 });
 
