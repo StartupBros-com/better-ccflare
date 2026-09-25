@@ -1,4 +1,7 @@
-import type { RouteLineageMetadata } from "@better-ccflare/types";
+import type {
+	AgentAttributionSource,
+	RouteLineageMetadata,
+} from "@better-ccflare/types";
 import { opaqueRuntimeId } from "./opaque-runtime-id";
 
 const CLAUDE_CODE_PARENT_AGENT_HEADER = "x-claude-code-parent-agent-id";
@@ -31,6 +34,44 @@ function boundedAgentId(value: string | null): string | null {
 		return null;
 	}
 	return value;
+}
+
+/**
+ * Compile-time exhaustiveness guard for `AgentAttributionSource`. Adding a
+ * new source to the union without classifying it below in
+ * `attributionSourceIdentifiesAgent` is a TypeScript error at the
+ * `default: return assertNeverAttributionSource(source)` call, not a silent
+ * runtime default.
+ */
+function assertNeverAttributionSource(source: never): never {
+	throw new Error(
+		`Unclassified agent attribution source \`${String(source)}\`: attributionSourceIdentifiesAgent's switch is non-exhaustive.`,
+	);
+}
+
+/**
+ * Return whether an attribution source -- as classified upstream by the
+ * request interceptor -- actually identifies a real agent. This is the
+ * trust boundary: `session_header` means the interceptor found nothing but
+ * a session id, and a session identifies a conversation, not an agent, so
+ * it must never count as agent evidence here or at any decision that
+ * consumes this value.
+ */
+export function attributionSourceIdentifiesAgent(
+	source: AgentAttributionSource | null | undefined,
+): boolean {
+	switch (source) {
+		case "prompt_agent":
+		case "header_agent":
+			return true;
+		case "session_header":
+		case "none":
+		case undefined:
+		case null:
+			return false;
+		default:
+			return assertNeverAttributionSource(source);
+	}
 }
 
 /** Return whether trusted Claude Code request metadata identifies a child agent. */

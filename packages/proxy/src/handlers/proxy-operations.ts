@@ -101,7 +101,10 @@ import {
 	stageCacheBodyForTransportAttempt,
 	stripCacheControlFromReplayBody,
 } from "../cache-transport-staging";
-import { isClaudeCodeSubagent } from "../claude-code-request";
+import {
+	attributionSourceIdentifiesAgent,
+	isClaudeCodeSubagent,
+} from "../claude-code-request";
 import { ensureCodexModelDefaults } from "../codex-model-catalog";
 import {
 	type CodexWebSocketReceipt,
@@ -3576,8 +3579,18 @@ export async function proxyWithAccount(
 				if (logicalModelFamily) {
 					prepared.set(CODEX_LOGICAL_MODEL_FAMILY_HEADER, logicalModelFamily);
 				}
+				// agentUsed truthiness alone is not agent evidence: the request
+				// interceptor's session-id fallback also fills it (source
+				// session_header), and a session identifies a conversation, not an
+				// agent. Treating that fallback as an agent marked every main
+				// conversation an attributed descendant and stripped its Agent and
+				// Task tools. Only a source that identifies a real agent
+				// (prompt_agent, header_agent), OR'd with Claude Code's own subagent
+				// markers, may count toward Codex-lane containment.
 				const isAttributedAgent =
-					Boolean(requestMeta.agentUsed) || isClaudeCodeSubagent(req.headers);
+					attributionSourceIdentifiesAgent(
+						requestMeta.agentAttributionSource,
+					) || isClaudeCodeSubagent(req.headers);
 				// Client-supplied copies are untrusted. Strip before attaching only
 				// server-derived experiment metadata so traces cannot be spoofed or
 				// retain arbitrary sensitive header content.

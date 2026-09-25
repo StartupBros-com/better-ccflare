@@ -85,7 +85,9 @@ function makeRequestMeta(path = "/v1/messages/count_tokens"): RequestMeta {
 	};
 }
 
-function makeProxyContext(): ProxyContext {
+function makeProxyContext(
+	provider: ProxyContext["provider"] = new CodexProvider() as never,
+): ProxyContext {
 	return {
 		strategy: { getNextAccount: () => null } as never,
 		dbOps: {
@@ -100,7 +102,7 @@ function makeProxyContext(): ProxyContext {
 			})),
 		} as never,
 		runtime: { port: 8080, clientId: "test" } as never,
-		provider: new CodexProvider() as never,
+		provider,
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => {}) } as never,
 		config: { getStorePayloads: () => true } as never,
@@ -369,7 +371,12 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 				}),
 				{
 					...makeRequestMeta("/v1/messages"),
+					// The interceptor prompt-matched this request to a registered
+					// agent, a source that identifies a real agent. The fixture
+					// states the source explicitly because the containment
+					// decision reads the source, not agentUsed truthiness.
 					agentUsed: "general-purpose",
+					agentAttributionSource: "prompt_agent",
 				},
 				bodyBuffer,
 				() => undefined,
@@ -393,6 +400,92 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		).toBeNull();
 		const upstreamBody = await fetchedRequest?.clone().json();
 		expect(upstreamBody.tools).toEqual([]);
+	});
+
+	it("does not treat the interceptor's session-id fallback as agent evidence (AE1)", async () => {
+		// The interceptor sets agentUsed to a session id and reports source
+		// "session_header" when it found nothing but a session id; that
+		// identifies a conversation, not an agent. No Claude Code subagent
+		// markers are present either. The Codex-lane containment decision
+		// must not treat this as agent evidence: no descendant marker
+		// upstream, and Agent/Read stay in the tool list.
+		//
+		// Persistence is not assertable here: this block replaces the usage
+		// collector with no-ops, and saveRequest is only reached from its
+		// handleEnd. That the session-fallback request still persists source
+		// "session_header" with the session id in agentUsed is proven by the
+		// unchanged "x-claude-code-session-id fallback" cases in
+		// agent-interceptor.header.test.ts, which produce the metadata this
+		// decision consumes.
+		let fetchedRequest: Request | null = null;
+		const fetchMock = mock(async (input: RequestInfo | URL) => {
+			fetchedRequest = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		globalThis.fetch = fetchMock;
+
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "claude-sonnet-4-5",
+					messages: [{ role: "user", content: "hello world" }],
+					max_tokens: 16,
+					tools: [
+						{
+							name: "Agent",
+							description: "Spawn an agent.",
+							input_schema: { type: "object" },
+						},
+						{
+							name: "Read",
+							description: "Read a file.",
+							input_schema: { type: "object" },
+						},
+					],
+				}),
+			).buffer;
+			await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+				}),
+				{
+					...makeRequestMeta("/v1/messages"),
+					agentUsed: "d4c3b2a1-0000-4000-8000-000000000001",
+					agentAttributionSource: "session_header",
+				},
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+			);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(fetchedRequest).not.toBeNull();
+		expect(
+			fetchedRequest?.headers.get("x-better-ccflare-attributed-agent"),
+		).toBeNull();
+		const upstreamBody = await fetchedRequest?.clone().json();
+		expect(
+			upstreamBody.tools.map((tool: { name: string }) => tool.name),
+		).toEqual(["Agent", "Read"]);
 	});
 
 	it("does not mark unattributed Codex requests", async () => {
@@ -516,6 +609,130 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		expect(
 			fetchedRequest?.headers.get("x-better-ccflare-attributed-agent"),
 		).toBeNull();
+	});
+
+	/**
+	 * Shared harness for the per-marker AE2/edge cases below: proves the
+	 * Codex-lane containment decision for a given `agentUsed` +
+	 * `agentAttributionSource` + Claude Code header combination by asserting
+	 * on the upstream tool list (the observable effect -- the internal
+	 * marker header itself is always stripped before the wire, see the
+	 * unconditional `newHeaders.delete("x-better-ccflare-attributed-agent")`
+	 * in the Codex provider's convertToCodexFormat).
+	 */
+	async function runDescendantMarkerCase(
+		agentUsed: string | undefined,
+		agentAttributionSource: RequestMeta["agentAttributionSource"],
+		headers: Record<string, string>,
+	): Promise<string[]> {
+		let fetchedRequest: Request | null = null;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			fetchedRequest = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "claude-sonnet-4-5",
+					messages: [{ role: "user", content: "hello world" }],
+					max_tokens: 16,
+					tools: [
+						{
+							name: "Agent",
+							description: "Spawn an agent.",
+							input_schema: { type: "object" },
+						},
+					],
+				}),
+			).buffer;
+			await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, {
+					"Content-Type": "application/json",
+					...headers,
+				}),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+				}),
+				{
+					...makeRequestMeta("/v1/messages"),
+					agentUsed,
+					agentAttributionSource,
+				},
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+			);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+
+		expect(
+			fetchedRequest?.headers.get("x-better-ccflare-attributed-agent"),
+		).toBeNull();
+		const upstreamBody = await fetchedRequest?.clone().json();
+		return upstreamBody.tools.map((tool: { name: string }) => tool.name);
+	}
+
+	it("contains a header_agent-sourced request (AE2)", async () => {
+		const toolNames = await runDescendantMarkerCase(
+			"matched-registered-agent",
+			"header_agent",
+			{},
+		);
+		expect(toolNames).toEqual([]);
+	});
+
+	it("still contains a session_header-sourced request carrying x-claude-code-parent-agent-id (AE2)", async () => {
+		const toolNames = await runDescendantMarkerCase(
+			"d4c3b2a1-0000-4000-8000-000000000002",
+			"session_header",
+			{ "x-claude-code-parent-agent-id": "parent-agent" },
+		);
+		expect(toolNames).toEqual([]);
+	});
+
+	it("still contains a session_header-sourced request carrying x-claude-code-agent-id (AE2)", async () => {
+		const toolNames = await runDescendantMarkerCase(
+			"d4c3b2a1-0000-4000-8000-000000000003",
+			"session_header",
+			{ "x-claude-code-agent-id": "child-agent" },
+		);
+		expect(toolNames).toEqual([]);
+	});
+
+	it("still contains a session_header-sourced request carrying cc_is_subagent=true billing metadata (AE2)", async () => {
+		const toolNames = await runDescendantMarkerCase(
+			"d4c3b2a1-0000-4000-8000-000000000004",
+			"session_header",
+			{ "x-anthropic-billing-header": "cc_is_subagent=true" },
+		);
+		expect(toolNames).toEqual([]);
+	});
+
+	it("does not contain a request when agentUsed is set but the attribution source is absent (edge)", async () => {
+		// The source decides, not the agent field: an agentUsed value with no
+		// declared attribution source must not count as agent evidence.
+		const toolNames = await runDescendantMarkerCase(
+			"general-purpose",
+			undefined,
+			{},
+		);
+		expect(toolNames).toEqual(["Agent"]);
 	});
 
 	it("does not trust client-supplied synthetic response markers", async () => {
@@ -1760,6 +1977,116 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		]) {
 			expect(fetchedRequest?.headers.get(header) ?? null).toBeNull();
 		}
+	});
+});
+
+describe("proxyWithAccount — non-Codex accounts never receive the Codex descendant marker", () => {
+	let originalFetch: typeof globalThis.fetch;
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	// Structural proof that the change is Codex-only: the marker set/delete
+	// branch in prepareAttemptHeaders lives entirely inside
+	// `if (plan.providerName === "codex")` in proxy-operations.ts, so a
+	// non-Codex provider never evaluates isAttributedAgent or touches
+	// x-better-ccflare-attributed-agent at all -- regardless of attribution
+	// source or Claude Code headers on the request.
+	function makeNonCodexAccount(overrides: Partial<Account> = {}): Account {
+		return makeCodexAccount({
+			id: "openai-compat-1",
+			name: "non-codex-test",
+			provider: "openai-compatible",
+			api_key: "test-key",
+			refresh_token: "",
+			custom_endpoint: "https://openrouter.ai/api/v1",
+			...overrides,
+		});
+	}
+
+	// Forwards headers as-is, so a leaked marker would be visible upstream.
+	function makeNonCodexProvider(): ProxyContext["provider"] {
+		return {
+			name: "openai-compatible",
+			canHandle: () => true,
+			buildUrl: (_path: string, _search: string) =>
+				"https://openrouter.ai/api/v1/messages",
+			prepareHeaders: (headers: Headers) => new Headers(headers),
+			transformRequestBody: null,
+			processResponse: async (r: Response) => r,
+			parseRateLimit: () => ({
+				isRateLimited: false,
+				resetTime: undefined,
+				statusHeader: "allowed",
+				remaining: undefined,
+			}),
+			isStreamingResponse: () => false,
+		} as never;
+	}
+
+	it("never sets the Codex descendant marker for a non-Codex account, even with agent evidence present", async () => {
+		let fetchedRequest: Request | null = null;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			fetchedRequest = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "claude-sonnet-4-5",
+					messages: [{ role: "user", content: "hello world" }],
+					max_tokens: 16,
+					tools: [
+						{
+							name: "Agent",
+							description: "Spawn an agent.",
+							input_schema: { type: "object" },
+						},
+					],
+				}),
+			).buffer;
+			await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
+				new URL("https://proxy.local/v1/messages"),
+				makeNonCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+				}),
+				{
+					...makeRequestMeta("/v1/messages"),
+					agentUsed: "general-purpose",
+					agentAttributionSource: "prompt_agent",
+				},
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(makeNonCodexProvider()),
+			);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+
+		expect(fetchedRequest).not.toBeNull();
+		expect(
+			fetchedRequest?.headers.get("x-better-ccflare-attributed-agent"),
+		).toBeNull();
 	});
 });
 
