@@ -16,8 +16,10 @@ model.
 Those assertions are checked when an account is selected, against the account's own configured
 model mapping. They are not checked against a default the provider fills in later, when it
 builds the upstream request. An account that relies on its provider's default model therefore
-fails a physical-model assertion even when the model it would send is right. A pinned profile
-meant to follow a provider's newest model should assert only the provider.
+fails a physical-model assertion even when the model it would send is right, and a family that
+turns automatic stops satisfying one. A pinned profile meant to follow a provider's newest model
+should assert only the provider; a capability profile meant to follow it names a catalog role
+instead of a physical model.
 
 ### Force route
 
@@ -37,6 +39,28 @@ it. Distinct from the physical model an upstream serves.
 The model an upstream provider actually serves for a request, after the account's model
 mapping or the provider's default has translated the logical model.
 
+### Catalog role
+
+The physical model an account's own provider catalog currently offers for a logical model
+family, derived from how that catalog ranks its models rather than named in any configuration.
+
+A catalog role moves whenever the provider re-ranks or replaces its models, with no
+configuration change. A route profile that follows a catalog role admits an account only on
+evidence from that account's own catalog, never another account's listing, and refuses an
+account with no current evidence for the role rather than guessing a model.
+
+### Automatic family
+
+A logical model family on an account that no configuration fixes, so the account serves whatever
+its own catalog role resolves to, or, without one, another account's catalog or a built-in
+default. Its opposite is a
+pinned family, fixed by an account mapping, a fallback list, a custom-endpoint or environment
+mapping, or a provider-wide override.
+*Avoid:* unmapped family
+
+Turning a pinned family automatic changes what route-profile checks see even when the served
+model stays the same (see Route profile).
+
 ### Upstream client identity
 
 The client software version and origin metadata a provider adapter advertises to an
@@ -50,7 +74,8 @@ from another identity will be accepted.
 ### Root-capable pool
 
 The accounts admitted by a capability profile because each can serve the profile's root
-logical model through its expected provider and physical model. Membership establishes the
+logical model through its expected provider and physical model, or through the model at the
+profile's catalog role in that account's own catalog. Membership establishes the
 preferred pool for descendants; it does not force every child family onto the root physical
 model.
 
@@ -249,5 +274,8 @@ shipped.
   information. A fixture for the limits-array shape that marks every entry active
   describes a payload that shape does not send — a real trap, because that is precisely
   the shape whose active flag is supposed to mean something.
+- *Pinned* describes both a route profile that names one account and an account family whose
+  model is fixed by configuration. These are distinct: a pinned profile can route to an
+  automatic family.
 - *Utilization* is always a 0–100 percentage once past normalization, never a 0–1 fraction,
   even though several providers report it as a fraction natively.
