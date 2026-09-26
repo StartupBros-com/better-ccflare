@@ -185,7 +185,7 @@ describe("provider model defaults", () => {
 	it("GET lists only codex by default (CCFLARE_MODEL_DEFAULTS_PROVIDERS unset)", async () => {
 		delete process.env.CCFLARE_MODEL_DEFAULTS_PROVIDERS;
 		const handlers = createConfigHandlers(makeConfig());
-		const response = handlers.getProviderModelDefaults();
+		const response = await handlers.getProviderModelDefaults();
 		expect(response.status).toBe(200);
 		const body = (await response.json()) as {
 			providers: Array<{ provider: string }>;
@@ -210,7 +210,9 @@ describe("provider model defaults", () => {
 	it("CCFLARE_MODEL_DEFAULTS_PROVIDERS=codex,xai lists and accepts xai again", async () => {
 		process.env.CCFLARE_MODEL_DEFAULTS_PROVIDERS = "codex,xai";
 		const handlers = createConfigHandlers(makeConfig());
-		const getBody = (await handlers.getProviderModelDefaults().json()) as {
+		const getBody = (await (
+			await handlers.getProviderModelDefaults()
+		).json()) as {
 			providers: Array<{ provider: string }>;
 		};
 		expect(

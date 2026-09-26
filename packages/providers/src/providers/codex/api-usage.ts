@@ -4,7 +4,7 @@ import type {
 	UsageFetchResult,
 	UsageWindow,
 } from "../../usage-fetcher";
-import { CODEX_USER_AGENT } from "./provider";
+import { resolveCodexClientIdentity } from "./client-identity";
 
 const log = new Logger("CodexApiUsage");
 
@@ -205,11 +205,12 @@ async function requestWhamUsage(
 	accessToken: string,
 	chatgptAccountId: string | null,
 	signal: AbortSignal,
+	userAgent: string,
 ): Promise<Response> {
 	const headers: Record<string, string> = {
 		Authorization: `Bearer ${accessToken}`,
 		Accept: "application/json",
-		"User-Agent": CODEX_USER_AGENT,
+		"User-Agent": userAgent,
 	};
 	if (chatgptAccountId) {
 		// Both conventions seen in the wild for this endpoint: codex-rs sends
@@ -254,6 +255,7 @@ export async function fetchCodexUsageData(
 	// it mid-flight, and the 404 counterpart must derive from the URL this
 	// call actually tried, not from whatever the global says afterwards.
 	const attemptedEndpoint = resolvedUsageEndpoint;
+	const userAgent = resolveCodexClientIdentity().userAgent;
 
 	try {
 		let response = await requestWhamUsage(
@@ -261,6 +263,7 @@ export async function fetchCodexUsageData(
 			accessToken,
 			chatgptAccountId,
 			controller.signal,
+			userAgent,
 		);
 		if (response.status === 404) {
 			const alternate = counterpartUsageEndpoint(attemptedEndpoint);
@@ -277,6 +280,7 @@ export async function fetchCodexUsageData(
 				accessToken,
 				chatgptAccountId,
 				controller.signal,
+				userAgent,
 			);
 			if (response.ok) {
 				resolvedUsageEndpoint = alternate;

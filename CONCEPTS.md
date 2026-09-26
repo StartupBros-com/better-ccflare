@@ -37,6 +37,16 @@ it. Distinct from the physical model an upstream serves.
 The model an upstream provider actually serves for a request, after the account's model
 mapping or the provider's default has translated the logical model.
 
+### Upstream client identity
+
+The client software version and origin metadata a provider adapter advertises to an
+upstream service, distinct from account credentials and the version of any separately
+installed command-line client.
+
+Catalog discovery and inference can use different identity formats while sharing the
+same version. A model advertised to one client identity is not proof that a request
+from another identity will be accepted.
+
 ### Root-capable pool
 
 The accounts admitted by a capability profile because each can serve the profile's root

@@ -8,6 +8,7 @@ import {
 	spyOn,
 } from "bun:test";
 import { agentRegistry } from "@better-ccflare/agents";
+import { type CodexCatalogEvt, codexCatalogEvents } from "@better-ccflare/core";
 import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
 import { handleResponsesRequest } from "@better-ccflare/openai-responses-adapter";
 import {
@@ -57,6 +58,7 @@ mock.module("../model-catalog", () => ({
 }));
 
 const usageCollectorModule = await import("../usage-collector");
+const codexModelCatalogModule = await import("../codex-model-catalog");
 const serverToolReplayRuntimeModule = await import(
 	"../server-tool-replay-runtime"
 );
@@ -2910,5 +2912,1071 @@ describe("Claude Code gateway model route profiles", () => {
 			output_config: { effort: "xhigh", service_tier: "auto" },
 		});
 		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+	});
+});
+
+describe("catalog-role Codex route profiles", () => {
+	// A fictitious next generation: the policy must follow the catalog order,
+	// never a model name this repository has seen before.
+	const NEXT_GENERATION = ["gpt-7-nova", "gpt-7-sol", "gpt-7-luna"] as const;
+	const REORDERED = ["gpt-7-sol", "gpt-7-nova", "gpt-7-luna"] as const;
+	const ROLE_PICKER = "claude-bccf-route-codex-opus";
+	const ROLE_POOL_PICKER = "claude-bccf-route-codex-opus-pool";
+	const ROLE_ACCOUNT_ID = "codex-role-account-secret";
+
+	function makeRoleAccount(id = ROLE_ACCOUNT_ID): Account {
+		const account = makeAccount(id);
+		account.provider = "codex";
+		account.api_key = null;
+		account.access_token = "codex-test-token";
+		account.expires_at = Date.now() + 3_600_000;
+		return account;
+	}
+
+	function makeRoleRegistry(accountId = ROLE_ACCOUNT_ID) {
+		return new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "codex-opus",
+						displayName: "Codex · opus",
+						description: "role-profile-description-secret",
+						accountId,
+						logicalModel: LOGICAL_MODEL,
+						expectedProvider: "codex",
+						physicalModelPolicy: "catalog-role",
+					},
+					{
+						id: "codex-opus-pool",
+						displayName: "Codex pool · opus",
+						selection: "capability",
+						logicalModel: LOGICAL_MODEL,
+						expectedProvider: "codex",
+						physicalModelPolicy: "catalog-role",
+					},
+				]),
+			),
+		);
+	}
+
+	function makeRoleContext(accounts: Account[]) {
+		const harness = makeContext(makeRoleRegistry(), { accounts });
+		harness.strategySelect.mockImplementation(
+			(candidates: Account[]) => candidates,
+		);
+		harness.ctx.dbOps.getAccount = mock(
+			async (id: string) =>
+				accounts.find((account) => account.id === id) ?? null,
+		);
+		return harness;
+	}
+
+	function installCodexRoleUpstream(
+		initial: readonly string[] = NEXT_GENERATION,
+	) {
+		let catalog: readonly string[] = initial;
+		let catalogFailure: "rejects" | "hangs" | null = null;
+		const catalogReads: string[] = [];
+		const hungCatalogReads: Array<(response: Response) => void> = [];
+		const responses: Request[] = [];
+		const fetchMock = mock(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request =
+					input instanceof Request ? input : new Request(input, init);
+				if (new URL(request.url).pathname.endsWith("/codex/models")) {
+					// The bearer token identifies which account's own listing was read.
+					catalogReads.push(request.headers.get("authorization") ?? "");
+					if (catalogFailure === "rejects") {
+						throw new TypeError("catalog read failed");
+					}
+					if (catalogFailure === "hangs") {
+						return new Promise<Response>((resolve) => {
+							hungCatalogReads.push(resolve);
+						});
+					}
+					return Response.json({
+						models: catalog.map((slug, index) => ({
+							slug,
+							display_name: slug,
+							visibility: "list",
+							priority: index + 1,
+						})),
+					});
+				}
+				responses.push(request.clone());
+				return new Response(
+					`event: response.completed\ndata: ${JSON.stringify({
+						type: "response.completed",
+						response: {
+							id: "resp-catalog-role",
+							object: "response",
+							status: "completed",
+							model: "gpt-7-nova",
+							output: [],
+							usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+						},
+					})}\n\n`,
+					{ headers: { "content-type": "text/event-stream" } },
+				);
+			},
+		);
+		globalThis.fetch = fetchMock as unknown as typeof fetch;
+		return {
+			responses,
+			fetchMock,
+			catalogReads,
+			setCatalog: (models: readonly string[]) => {
+				catalog = models;
+			},
+			/** Every later own-listing read fails (null restores them); responses are unaffected. */
+			failCatalog: (mode: "rejects" | "hangs" | null) => {
+				catalogFailure = mode;
+			},
+			/** Settle hung listing reads so no shared catalog work outlives a test. */
+			releaseHungCatalogReads: () => {
+				for (const resolve of hungCatalogReads.splice(0)) {
+					resolve(new Response(null, { status: 503 }));
+				}
+			},
+		};
+	}
+
+	async function publish(
+		upstream: ReturnType<typeof installCodexRoleUpstream>,
+		account: Account,
+		ctx: ProxyContext,
+		models: readonly string[],
+	): Promise<void> {
+		upstream.setCatalog(models);
+		const listing = await codexModelCatalogModule.getCodexModels(
+			account.id,
+			ctx,
+		);
+		expect(listing?.source).toBe("live");
+	}
+
+	async function send(
+		ctx: ProxyContext,
+		model: string,
+		headers: Record<string, string> = {},
+		body: Record<string, unknown> = {},
+	) {
+		const request = apiRequest("/v1/messages", model, headers, body);
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			ctx,
+			"key-1",
+		);
+		const text = await response.text();
+		return { response, text };
+	}
+
+	async function upstreamModels(requests: Request[]): Promise<unknown[]> {
+		return Promise.all(
+			requests.map(async (request) => {
+				expect(new URL(request.url).pathname).toEndWith("/codex/responses");
+				return (await fetchedJson(request.clone())).model;
+			}),
+		);
+	}
+
+	describe("plain Codex admission without a route profile", () => {
+		it("resolves a cold account's live catalog frontier for a family request on the first request", async () => {
+			const account = makeRoleAccount("cold-plain-codex-account");
+			// A pass-through operator mapping (sonnet -> its own literal alias) is
+			// what makes a bare Codex account eligible for *ordinary* stock-family
+			// routing at all (isOrdinaryStockModelAccountEligible in
+			// account-selector.ts requires every configured target to equal the
+			// requested model unchanged; an account with no mapping is otherwise
+			// excluded from the ordinary pool by design). Because the mapped value
+			// is identical to the input, resolveCodexRequestModel's `mapped !==
+			// anthropicModel` short-circuit does NOT fire, so this still falls
+			// through to its catalog-dependent branch — exercising the same
+			// pre-admission-ensure path a truly unmapped account would take.
+			account.model_mappings = JSON.stringify({ sonnet: "claude-sonnet-4-5" });
+			// No modelRouteSessionRegistry: makeRoleContext's registry exclusively
+			// reserves ROLE_ACCOUNT_ID for profile-matched traffic, which would
+			// reject this plain request before admission. Ordinary routing (no
+			// route profile at all) is what exercises preEnsureConcreteAttemptModel's
+			// resolveCodexRequestModel branch.
+			const harness = makeContext(undefined, { accounts: [account] });
+			harness.ctx.dbOps.getAccount = mock(async (id: string) =>
+				id === account.id ? account : null,
+			);
+			const upstream = installCodexRoleUpstream(NEXT_GENERATION);
+			expect(codexModelCatalogModule.getKnownCodexModels(account.id)).toBe(
+				null,
+			);
+
+			// "claude-sonnet-..." matches neither ROLE_PICKER nor ROLE_POOL_PICKER
+			// (both opus-only picker aliases), so no route profile applies and this
+			// exercises the plain resolveCodexRequestModel path in
+			// proxy-operations.ts (preEnsureConcreteAttemptModel), never
+			// catalogRoleAttemptTarget.
+			const first = await send(harness.ctx, "claude-sonnet-4-5");
+			expect(first.response.status, first.text).toBe(200);
+
+			// deriveFamilyDefaults maps sonnet to the catalog's second entry
+			// (priority order: gpt-7-sol), never the compiled DEFAULT_MODEL_MAP
+			// fallback ("gpt-5.3-codex"), proving hasExactPreAdmissionModelIdentity
+			// correctly awaited ensureCodexModelDefaults before admission bound the
+			// attempt's physical model on this, the account's first request.
+			expect(await upstreamModels(upstream.responses)).toEqual(["gpt-7-sol"]);
+			expect(upstream.catalogReads).toHaveLength(1);
+		});
+	});
+
+	it("routes an explicit role picker to the account's own role target and follows a catalog publication", async () => {
+		const account = makeRoleAccount();
+		const harness = makeRoleContext([account]);
+		const upstream = installCodexRoleUpstream();
+		await publish(upstream, account, harness.ctx, NEXT_GENERATION);
+
+		const first = await send(harness.ctx, ROLE_PICKER);
+		expect(first.response.status, first.text).toBe(200);
+
+		// A publication that reorders the catalog moves the role target with no
+		// profile, mapping, or picker-id change.
+		await publish(upstream, account, harness.ctx, REORDERED);
+		const second = await send(harness.ctx, ROLE_PICKER);
+		expect(second.response.status, second.text).toBe(200);
+
+		expect(await upstreamModels(upstream.responses)).toEqual([
+			"gpt-7-nova",
+			"gpt-7-sol",
+		]);
+		expect(harness.strategySelect).not.toHaveBeenCalled();
+	});
+
+	it("keeps an inherited picker on the role target and a native child on its own family", async () => {
+		const account = makeRoleAccount();
+		const harness = makeRoleContext([account]);
+		const upstream = installCodexRoleUpstream();
+		await publish(upstream, account, harness.ctx, NEXT_GENERATION);
+		const session = { "x-claude-code-session-id": "catalog-role-lineage" };
+
+		const root = await send(harness.ctx, ROLE_PICKER, session);
+		expect(root.response.status, root.text).toBe(200);
+		const pickerChild = await send(harness.ctx, ROLE_PICKER, {
+			...session,
+			"x-claude-code-agent-id": "catalog-role-picker-child",
+		});
+		expect(pickerChild.response.status, pickerChild.text).toBe(200);
+		const nativeChild = await send(harness.ctx, CHILD_MODEL, {
+			...session,
+			"x-claude-code-agent-id": "catalog-role-native-child",
+		});
+		expect(nativeChild.response.status, nativeChild.text).toBe(200);
+
+		await publish(upstream, account, harness.ctx, REORDERED);
+		const laterPickerChild = await send(harness.ctx, ROLE_PICKER, {
+			...session,
+			"x-claude-code-agent-id": "catalog-role-picker-child-later",
+		});
+		expect(laterPickerChild.response.status, laterPickerChild.text).toBe(200);
+
+		expect(await upstreamModels(upstream.responses)).toEqual([
+			"gpt-7-nova",
+			"gpt-7-nova",
+			// The native child keeps the existing child-family lane: sonnet's
+			// role in this account's own catalog.
+			"gpt-7-sol",
+			"gpt-7-sol",
+		]);
+		for (const request of upstream.responses) {
+			expect(request.url).not.toContain("upstream.test");
+		}
+	});
+
+	it("applies the role guard to an inherited server-tool helper", async () => {
+		const account = makeRoleAccount();
+		const harness = makeRoleContext([account]);
+		const { createReadyServerToolReplayRuntimeForTest } = await import(
+			"./helpers/server-tool-replay-runtime"
+		);
+		harness.ctx.serverToolReplay =
+			await createReadyServerToolReplayRuntimeForTest();
+		const upstream = installCodexRoleUpstream();
+		await publish(upstream, account, harness.ctx, NEXT_GENERATION);
+		const session = { "x-claude-code-session-id": "catalog-role-helper" };
+		const helperBody = {
+			tools: [{ type: "web_search_20250305", name: "web_search" }],
+		};
+
+		const root = await send(harness.ctx, ROLE_PICKER, session);
+		expect(root.response.status, root.text).toBe(200);
+
+		// Admitted: the helper passes the role guard and reaches the ordinary
+		// server-tool capability decision. No hosted-search proof exists for a
+		// fictitious model, so that later stage (not the role guard) refuses it.
+		const admitted = await send(harness.ctx, CHILD_MODEL, session, helperBody);
+		expect(JSON.parse(admitted.text)).toMatchObject({
+			error: {
+				code: "server_tool_force_route_unavailable",
+				reason: "forced_incapable",
+			},
+		});
+
+		account.model_mappings = JSON.stringify({ opus: "gpt-7-luna" });
+		const pinned = await send(harness.ctx, CHILD_MODEL, session, helperBody);
+		expect(pinned.response.status).toBe(503);
+		expect(JSON.parse(pinned.text)).toMatchObject({
+			error: {
+				type: "force_route_unavailable",
+				reason: "catalog_role_mismatch",
+			},
+		});
+
+		account.model_mappings = null;
+		codexModelCatalogModule.clearCodexModelCacheForAccount(account.id);
+		// A cold account is primed at request time; it stays unlisted only when
+		// that read of its own listing fails too.
+		upstream.failCatalog("rejects");
+		const unlisted = await send(harness.ctx, CHILD_MODEL, session, helperBody);
+		expect(unlisted.response.status).toBe(503);
+		expect(JSON.parse(unlisted.text)).toMatchObject({
+			error: {
+				type: "force_route_unavailable",
+				reason: "catalog_role_unavailable",
+			},
+		});
+		expect(await upstreamModels(upstream.responses)).toEqual(["gpt-7-nova"]);
+	});
+
+	it("binds an attempt to its admission target across a racing catalog publication", async () => {
+		const account = makeRoleAccount();
+		const harness = makeRoleContext([account]);
+		const upstream = installCodexRoleUpstream();
+		await publish(upstream, account, harness.ctx, NEXT_GENERATION);
+		const actualEnsure = codexModelCatalogModule.ensureCodexModelDefaults;
+		let raced = false;
+		// The account was admitted on gpt-7-nova. A refresh lands after
+		// selection, before the attempt resolves its physical model.
+		const ensureSpy = spyOn(
+			codexModelCatalogModule,
+			"ensureCodexModelDefaults",
+		).mockImplementation(async (...args) => {
+			if (!raced) {
+				raced = true;
+				await publish(upstream, account, harness.ctx, REORDERED);
+			}
+			return actualEnsure(...args);
+		});
+		try {
+			const racing = await send(harness.ctx, ROLE_PICKER);
+			expect(racing.response.status, racing.text).toBe(200);
+			expect(raced).toBe(true);
+		} finally {
+			ensureSpy.mockRestore();
+		}
+
+		// The refreshed catalog governs the next request with no config change.
+		const later = await send(harness.ctx, ROLE_PICKER);
+		expect(later.response.status, later.text).toBe(200);
+
+		expect(await upstreamModels(upstream.responses)).toEqual([
+			"gpt-7-nova",
+			"gpt-7-sol",
+		]);
+	});
+
+	describe("descendants of a role capability pool", () => {
+		// Moves opus to gpt-7-sol and sonnet to gpt-7-luna, so the admitted opus
+		// target, the child's pre-race role and its raced role all differ.
+		const RACED = ["gpt-7-sol", "gpt-7-luna", "gpt-7-nova"] as const;
+
+		/** Admit a root on the role pool and return a descendant's headers. */
+		async function bindPoolLineage(
+			ctx: ProxyContext,
+			lineage: string,
+		): Promise<Record<string, string>> {
+			const session = { "x-claude-code-session-id": lineage };
+			const root = await send(ctx, ROLE_POOL_PICKER, session);
+			expect(root.response.status, root.text).toBe(200);
+			return { ...session, "x-claude-code-agent-id": `${lineage}-child` };
+		}
+
+		/**
+		 * Publish `models` from the account's next catalog ensure: the attempt's
+		 * own, which runs after selection has already admitted the account.
+		 */
+		async function withRacingPublication<T>(
+			upstream: ReturnType<typeof installCodexRoleUpstream>,
+			account: Account,
+			ctx: ProxyContext,
+			models: readonly string[],
+			run: () => Promise<T>,
+		): Promise<T> {
+			const actualEnsure = codexModelCatalogModule.ensureCodexModelDefaults;
+			let raced = false;
+			const ensureSpy = spyOn(
+				codexModelCatalogModule,
+				"ensureCodexModelDefaults",
+			).mockImplementation(async (...args) => {
+				if (!raced) {
+					raced = true;
+					await publish(upstream, account, ctx, models);
+				}
+				return actualEnsure(...args);
+			});
+			try {
+				const result = await run();
+				expect(raced).toBe(true);
+				return result;
+			} finally {
+				ensureSpy.mockRestore();
+			}
+		}
+
+		it("binds a descendant's root-model rung to its admission target across a racing catalog publication", async () => {
+			const account = makeRoleAccount("role-descendant-root-rung");
+			const harness = makeRoleContext([account]);
+			const upstream = installCodexRoleUpstream();
+			await publish(upstream, account, harness.ctx, NEXT_GENERATION);
+			const child = await bindPoolLineage(
+				harness.ctx,
+				"role-descendant-root-rung",
+			);
+			// The child's own family is exhausted, so it runs the root-model rung.
+			usageCache.markModelScopedExhausted(
+				account.id,
+				CHILD_MODEL,
+				"",
+				Date.now() + 60_000,
+			);
+
+			const racing = await withRacingPublication(
+				upstream,
+				account,
+				harness.ctx,
+				RACED,
+				() => send(harness.ctx, CHILD_MODEL, child),
+			);
+			expect(racing.response.status, racing.text).toBe(200);
+			expect(
+				racing.response.headers.get("x-better-ccflare-route-fallback"),
+			).toBe("profile_root_model");
+
+			// The refreshed catalog governs the next descendant request.
+			const later = await send(harness.ctx, CHILD_MODEL, child);
+			expect(later.response.status, later.text).toBe(200);
+			expect(
+				later.response.headers.get("x-better-ccflare-route-fallback"),
+			).toBe("profile_root_model");
+
+			expect(await upstreamModels(upstream.responses)).toEqual([
+				"gpt-7-nova",
+				// The target that admitted the account, not the raced gpt-7-sol.
+				"gpt-7-nova",
+				"gpt-7-sol",
+			]);
+		});
+
+		it("leaves a descendant's other-family requested-model rung on the child's own resolution", async () => {
+			const account = makeRoleAccount("role-descendant-child-rung");
+			const harness = makeRoleContext([account]);
+			const upstream = installCodexRoleUpstream();
+			await publish(upstream, account, harness.ctx, NEXT_GENERATION);
+			const child = await bindPoolLineage(
+				harness.ctx,
+				"role-descendant-child-rung",
+			);
+
+			const racing = await withRacingPublication(
+				upstream,
+				account,
+				harness.ctx,
+				RACED,
+				() => send(harness.ctx, CHILD_MODEL, child),
+			);
+
+			expect(racing.response.status, racing.text).toBe(200);
+			expect(
+				racing.response.headers.get("x-better-ccflare-route-fallback"),
+			).toBe("profile_requested_model");
+			expect(await upstreamModels(upstream.responses)).toEqual([
+				"gpt-7-nova",
+				// Sonnet's role in the live catalog, never the carried opus target.
+				"gpt-7-luna",
+			]);
+		});
+
+		it("leaves a descendant's global rung to ordinary routing", async () => {
+			const account = makeRoleAccount("role-descendant-global-codex");
+			const native = makeAccount("role-descendant-global-native");
+			native.provider = "anthropic";
+			native.priority = 20;
+			const harness = makeRoleContext([account, native]);
+			const upstream = installCodexRoleUpstream();
+			await publish(upstream, account, harness.ctx, NEXT_GENERATION);
+			const child = await bindPoolLineage(
+				harness.ctx,
+				"role-descendant-global-rung",
+			);
+			// Both profile rungs are exhausted on the only role-capable account.
+			const exhaustedUntil = Date.now() + 60_000;
+			usageCache.markModelScopedExhausted(
+				account.id,
+				CHILD_MODEL,
+				"",
+				exhaustedUntil,
+			);
+			usageCache.markModelScopedExhausted(
+				account.id,
+				LOGICAL_MODEL,
+				"",
+				exhaustedUntil,
+			);
+
+			const global = await send(harness.ctx, CHILD_MODEL, child);
+
+			expect(global.response.status, global.text).toBe(200);
+			expect(
+				global.response.headers.get("x-better-ccflare-route-fallback"),
+			).toBe("global_requested_model");
+			expect(upstream.responses).toHaveLength(2);
+			expect(new URL(upstream.responses[0]?.url ?? "").pathname).toEndWith(
+				"/codex/responses",
+			);
+			expect(upstream.responses[1]?.url).toBe(
+				"https://api.anthropic.com/v1/messages",
+			);
+			expect((await fetchedJson(upstream.responses[1])).model).toBe(
+				CHILD_MODEL,
+			);
+		});
+	});
+
+	it("routes a role capability pool only through own-catalog Codex accounts", async () => {
+		const pinnedAway = makeRoleAccount("role-pool-pinned-away");
+		pinnedAway.model_mappings = JSON.stringify({ opus: "gpt-7-luna" });
+		const borrower = makeRoleAccount("role-pool-borrower");
+		const owner = makeRoleAccount("role-pool-owner");
+		owner.priority = 5;
+		const nonCodex = makeAccount("role-pool-non-codex");
+		nonCodex.model_mappings = JSON.stringify({ opus: "gpt-7-nova" });
+		const harness = makeRoleContext([pinnedAway, borrower, nonCodex, owner]);
+		const upstream = installCodexRoleUpstream();
+		await publish(upstream, pinnedAway, harness.ctx, NEXT_GENERATION);
+		await publish(upstream, owner, harness.ctx, REORDERED);
+		// The borrower's request-time read of its own listing fails, so it keeps
+		// only the borrowed listing; warm accounts read nothing more.
+		upstream.failCatalog("rejects");
+
+		const routed = await send(harness.ctx, ROLE_POOL_PICKER);
+		expect(routed.response.status, routed.text).toBe(200);
+
+		expect(
+			harness.strategySelect.mock.calls[0]?.[0].map((account) => account.id),
+		).toEqual([owner.id]);
+		expect(await upstreamModels(upstream.responses)).toEqual(["gpt-7-sol"]);
+	});
+
+	it.each([
+		{
+			reason: "catalog_role_mismatch",
+			arrange: (account: Account) => {
+				account.model_mappings = JSON.stringify({ opus: "gpt-7-luna" });
+			},
+		},
+		{
+			reason: "catalog_role_unavailable",
+			arrange: (account: Account) => {
+				codexModelCatalogModule.clearCodexModelCacheForAccount(account.id);
+			},
+		},
+	] as const)("fails an exact role route closed with force_route_$reason", async ({
+		reason,
+		arrange,
+	}) => {
+		const account = makeRoleAccount();
+		const harness = makeRoleContext([account]);
+		const upstream = installCodexRoleUpstream();
+		await publish(upstream, account, harness.ctx, NEXT_GENERATION);
+		arrange(account);
+		// A cleared account is primed at request time, so it stays unlisted only
+		// when that read fails too. The warm mismatch case reads nothing.
+		upstream.failCatalog("rejects");
+
+		const failed = await send(harness.ctx, ROLE_PICKER);
+
+		expect(failed.response.status).toBe(503);
+		expect(failed.response.headers.get("x-better-ccflare-force-route")).toBe(
+			"unavailable",
+		);
+		const payload = JSON.parse(failed.text) as {
+			error: Record<string, unknown>;
+		};
+		expect(payload.error).toMatchObject({
+			type: "force_route_unavailable",
+			reason,
+		});
+		expect(payload.error).not.toHaveProperty("account_id");
+		expect(failed.text).not.toContain(ROLE_ACCOUNT_ID);
+		expect(upstream.responses).toHaveLength(0);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(usageHandleEnd).toHaveBeenCalledTimes(1);
+		expect(usageHandleEnd.mock.calls[0]?.[0]).toMatchObject({
+			success: false,
+			error: `force_route_${reason}`,
+		});
+	});
+
+	it("fails a role capability pool with no own-catalog account closed", async () => {
+		const lender = makeRoleAccount("role-pool-lender");
+		const borrower = makeRoleAccount("role-pool-only-borrower");
+		const harness = makeRoleContext([borrower]);
+		const upstream = installCodexRoleUpstream();
+		const lenderHarness = makeRoleContext([lender]);
+		await publish(upstream, lender, lenderHarness.ctx, NEXT_GENERATION);
+		// The borrower's request-time read of its own listing fails.
+		upstream.failCatalog("rejects");
+
+		const failed = await send(harness.ctx, ROLE_POOL_PICKER);
+
+		expect(failed.response.status).toBe(503);
+		expect(JSON.parse(failed.text)).toMatchObject({
+			error: {
+				type: "force_route_unavailable",
+				reason: "catalog_role_unavailable",
+			},
+		});
+		expect(upstream.responses).toHaveLength(0);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(usageHandleEnd.mock.calls.at(-1)?.[0]).toMatchObject({
+			error: "force_route_catalog_role_unavailable",
+		});
+	});
+
+	it("reports each catalog-role fail-closed route on the Codex catalog event bus", async () => {
+		const events: CodexCatalogEvt[] = [];
+		const listener = (event: CodexCatalogEvt) => {
+			events.push(event);
+		};
+		codexCatalogEvents.on("event", listener);
+		try {
+			// Exact profile: its account's own target differs from its pin.
+			const account = makeRoleAccount();
+			const harness = makeRoleContext([account]);
+			const upstream = installCodexRoleUpstream();
+			await publish(upstream, account, harness.ctx, NEXT_GENERATION);
+			account.model_mappings = JSON.stringify({ opus: "gpt-7-luna" });
+			const exact = await send(harness.ctx, ROLE_PICKER);
+			expect(exact.response.status).toBe(503);
+
+			// Pool profile: no candidate has a catalog of its own.
+			const borrower = makeRoleAccount("role-pool-event-borrower");
+			const poolHarness = makeRoleContext([borrower]);
+			upstream.failCatalog("rejects");
+			const pool = await send(poolHarness.ctx, ROLE_POOL_PICKER);
+			expect(pool.response.status).toBe(503);
+
+			expect(
+				events.filter((event) => event.type === "route_role_unavailable"),
+			).toEqual([
+				{
+					type: "route_role_unavailable",
+					profileId: "codex-opus",
+					accountId: ROLE_ACCOUNT_ID,
+					reason: "catalog_role_mismatch",
+				},
+				{
+					type: "route_role_unavailable",
+					profileId: "codex-opus-pool",
+					reason: "catalog_role_unavailable",
+				},
+			]);
+		} finally {
+			codexCatalogEvents.off("event", listener);
+		}
+	});
+
+	it("discovers role pickers like any other profile without leaking route metadata", async () => {
+		const harness = makeRoleContext([makeRoleAccount()]);
+		const { fetchMock } = installCodexRoleUpstream();
+		const request = new Request("https://proxy.local/v1/models");
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		const raw = await response.text();
+		expect(JSON.parse(raw)).toEqual({
+			data: [
+				{ id: ROLE_PICKER, display_name: "Codex · opus" },
+				{ id: ROLE_POOL_PICKER, display_name: "Codex pool · opus" },
+			],
+			has_more: false,
+		});
+		for (const secret of [
+			ROLE_ACCOUNT_ID,
+			LOGICAL_MODEL,
+			"catalog-role",
+			"role-profile-description-secret",
+		]) {
+			expect(raw).not.toContain(secret);
+		}
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(harness.getAllAccounts).not.toHaveBeenCalled();
+	});
+
+	describe("request-time priming of cold own catalogs", () => {
+		// Own listings live in memory only, so every process start is cold. No
+		// test here starts the refresh heartbeat: the request itself must prime.
+		function coldRoleAccount(id = ROLE_ACCOUNT_ID): Account {
+			const account = makeRoleAccount(id);
+			account.access_token = `token-${id}`;
+			return account;
+		}
+
+		const bearer = (account: Account) => `Bearer ${account.access_token}`;
+
+		async function withSelectionTimeout<T>(
+			timeoutMs: string,
+			run: () => Promise<T>,
+		): Promise<T> {
+			const previous = process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS;
+			process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS = timeoutMs;
+			try {
+				return await run();
+			} finally {
+				if (previous === undefined)
+					delete process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS;
+				else process.env.CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS = previous;
+			}
+		}
+
+		it("primes a cold exact-account role route and sends the role target on the first request", async () => {
+			const account = coldRoleAccount();
+			const harness = makeRoleContext([account]);
+			const upstream = installCodexRoleUpstream();
+			expect(codexModelCatalogModule.getKnownCodexModels(account.id)).toBe(
+				null,
+			);
+
+			const first = await send(harness.ctx, ROLE_PICKER);
+
+			expect(first.response.status, first.text).toBe(200);
+			expect(upstream.catalogReads).toEqual([bearer(account)]);
+			expect(await upstreamModels(upstream.responses)).toEqual(["gpt-7-nova"]);
+		});
+
+		it("adds no catalog read for a second request once the account is warm", async () => {
+			const account = coldRoleAccount();
+			const harness = makeRoleContext([account]);
+			const upstream = installCodexRoleUpstream();
+
+			const first = await send(harness.ctx, ROLE_PICKER);
+			expect(first.response.status, first.text).toBe(200);
+			const second = await send(harness.ctx, ROLE_PICKER);
+			expect(second.response.status, second.text).toBe(200);
+
+			expect(upstream.catalogReads).toEqual([bearer(account)]);
+			expect(await upstreamModels(upstream.responses)).toEqual([
+				"gpt-7-nova",
+				"gpt-7-nova",
+			]);
+		});
+
+		it("primes every cold candidate of a role capability pool and admits them on the first request", async () => {
+			const first = coldRoleAccount("role-prime-pool-first");
+			const second = coldRoleAccount("role-prime-pool-second");
+			const nonCodex = makeAccount("role-prime-pool-non-codex");
+			const harness = makeRoleContext([first, nonCodex, second]);
+			const upstream = installCodexRoleUpstream();
+
+			const routed = await send(harness.ctx, ROLE_POOL_PICKER);
+
+			expect(routed.response.status, routed.text).toBe(200);
+			expect([...upstream.catalogReads].sort()).toEqual(
+				[bearer(first), bearer(second)].sort(),
+			);
+			expect(
+				harness.strategySelect.mock.calls[0]?.[0]
+					.map((account) => account.id)
+					.sort(),
+			).toEqual([first.id, second.id].sort());
+			expect(await upstreamModels(upstream.responses)).toEqual(["gpt-7-nova"]);
+		});
+
+		it.each([
+			"rejects",
+			"hangs",
+		] as const)("fails a cold role route closed with catalog_role_unavailable when its prime %s", async (mode) => {
+			const account = coldRoleAccount();
+			const harness = makeRoleContext([account]);
+			const upstream = installCodexRoleUpstream();
+			upstream.failCatalog(mode);
+			try {
+				// A hung read is bounded by the account-selection deadline; a
+				// rejected read settles on its own and needs no short deadline.
+				await withSelectionTimeout(
+					mode === "hangs" ? "5" : "20000",
+					async () => {
+						const startedAt = Date.now();
+						const failed = await send(harness.ctx, ROLE_PICKER);
+						// The shared single-flight or retry backoff absorbs a second
+						// request instead of starting another read.
+						const retried = await send(harness.ctx, ROLE_PICKER);
+						expect(Date.now() - startedAt).toBeLessThan(2_000);
+
+						for (const outcome of [failed, retried]) {
+							expect(outcome.response.status).toBe(503);
+							expect(JSON.parse(outcome.text)).toMatchObject({
+								error: {
+									type: "force_route_unavailable",
+									reason: "catalog_role_unavailable",
+								},
+							});
+						}
+					},
+				);
+				expect(upstream.catalogReads).toEqual([bearer(account)]);
+				expect(upstream.responses).toHaveLength(0);
+				expect(codexModelCatalogModule.getKnownCodexModels(account.id)).toBe(
+					null,
+				);
+			} finally {
+				upstream.releaseHungCatalogReads();
+				upstream.failCatalog(null);
+				// Settle the shared catalog work before the next test clears it, so
+				// a late completion cannot leave retry state for the same account id.
+				await ensureCodexModelDefaults(account, harness.ctx);
+			}
+		});
+
+		it("keeps a cold account whose own prime fails unavailable despite a shared listing", async () => {
+			const borrower = coldRoleAccount();
+			const lender = coldRoleAccount("role-prime-lender");
+			const harness = makeRoleContext([borrower, lender]);
+			const upstream = installCodexRoleUpstream();
+			await publish(upstream, lender, harness.ctx, NEXT_GENERATION);
+			expect(
+				codexModelCatalogModule.getKnownOrSharedCodexModels(borrower.id)
+					?.source,
+			).toBe("shared");
+			upstream.failCatalog("rejects");
+
+			const failed = await send(harness.ctx, ROLE_PICKER);
+
+			expect(failed.response.status).toBe(503);
+			expect(JSON.parse(failed.text)).toMatchObject({
+				error: {
+					type: "force_route_unavailable",
+					reason: "catalog_role_unavailable",
+				},
+			});
+			expect(upstream.catalogReads).toEqual([bearer(lender), bearer(borrower)]);
+			expect(upstream.responses).toHaveLength(0);
+			expect(codexModelCatalogModule.getKnownCodexModels(borrower.id)).toBe(
+				null,
+			);
+		});
+
+		it("never primes for an exact-policy profile or a plain request", async () => {
+			const codex = coldRoleAccount("exact-policy-cold-codex");
+			const normal = makeAccount("exact-policy-normal");
+			const exactProfile = {
+				displayName: "Codex exact",
+				accountId: codex.id,
+				logicalModel: LOGICAL_MODEL,
+				expectedProvider: "codex",
+				expectedPhysicalModel: "gpt-7-nova",
+			};
+			const harness = makeContext(
+				new ModelRouteSessionRegistry(
+					parseModelRouteProfiles(
+						JSON.stringify([
+							{ ...exactProfile, id: "codex-exact-default" },
+							{
+								...exactProfile,
+								id: "codex-exact-explicit",
+								physicalModelPolicy: "exact",
+							},
+							// A configured role profile must not prime unrelated requests.
+							{
+								id: "codex-opus",
+								displayName: "Codex · opus",
+								accountId: codex.id,
+								logicalModel: LOGICAL_MODEL,
+								expectedProvider: "codex",
+								physicalModelPolicy: "catalog-role",
+							},
+						]),
+					),
+				),
+				{ accounts: [normal, codex], normalAccountId: normal.id },
+			);
+			// A prime would read the listing through this lookup; without it a
+			// wrongly started prime would fail silently and look like no prime.
+			harness.ctx.dbOps.getAccount = mock(async (id: string) =>
+				id === codex.id ? codex : id === normal.id ? normal : null,
+			);
+			const upstream = installCodexRoleUpstream();
+
+			const exactDefault = await send(
+				harness.ctx,
+				"claude-bccf-route-codex-exact-default",
+			);
+			const exactExplicit = await send(
+				harness.ctx,
+				"claude-bccf-route-codex-exact-explicit",
+			);
+			const plain = await send(harness.ctx, CHILD_MODEL);
+
+			for (const exact of [exactDefault, exactExplicit]) {
+				expect(exact.response.status).toBe(503);
+				expect(JSON.parse(exact.text)).toMatchObject({
+					error: {
+						type: "force_route_unavailable",
+						reason: "model_mapping_mismatch",
+					},
+				});
+			}
+			expect(plain.response.status, plain.text).toBe(200);
+			expect(upstream.catalogReads).toEqual([]);
+			expect(codexModelCatalogModule.getKnownCodexModels(codex.id)).toBe(null);
+		});
+
+		it("never primes for a descendant of an exact-policy pool, a descendant of a catalog-role pool, or an unbound child", async () => {
+			const codex = coldRoleAccount("exact-pool-descendant-codex");
+			codex.model_mappings = JSON.stringify({ opus: "gpt-7-nova" });
+			const normal = makeAccount("exact-pool-descendant-normal");
+			const harness = makeContext(
+				new ModelRouteSessionRegistry(
+					parseModelRouteProfiles(
+						JSON.stringify([
+							{
+								id: "codex-exact-pool",
+								displayName: "Codex exact pool",
+								selection: "capability",
+								logicalModel: LOGICAL_MODEL,
+								expectedProvider: "codex",
+								expectedPhysicalModel: "gpt-7-nova",
+							},
+							// A configured role pool must not prime unrelated requests.
+							{
+								id: "codex-opus-pool",
+								displayName: "Codex pool · opus",
+								selection: "capability",
+								logicalModel: LOGICAL_MODEL,
+								expectedProvider: "codex",
+								physicalModelPolicy: "catalog-role",
+							},
+						]),
+					),
+				),
+				{ accounts: [normal, codex], normalAccountId: normal.id },
+			);
+			harness.ctx.dbOps.getAccount = mock(async (id: string) =>
+				id === codex.id ? codex : id === normal.id ? normal : null,
+			);
+			const upstream = installCodexRoleUpstream();
+			// Priming runs before selection, and an attempt reads a cold listing
+			// only after it. Record the reads each selection has already seen.
+			const readsAtSelection: number[] = [];
+			harness.strategySelect.mockImplementation((candidates: Account[]) => {
+				readsAtSelection.push(upstream.catalogReads.length);
+				return candidates;
+			});
+			const session = { "x-claude-code-session-id": "exact-pool-descendant" };
+
+			const root = await send(
+				harness.ctx,
+				"claude-bccf-route-codex-exact-pool",
+				session,
+			);
+			expect(root.response.status, root.text).toBe(200);
+			codexModelCatalogModule.clearCodexModelCacheForAccount(codex.id);
+			const descendant = await send(harness.ctx, CHILD_MODEL, {
+				...session,
+				"x-claude-code-agent-id": "exact-pool-descendant-child",
+			});
+			expect(descendant.response.status, descendant.text).toBe(200);
+			codexModelCatalogModule.clearCodexModelCacheForAccount(codex.id);
+			const unbound = await send(harness.ctx, CHILD_MODEL, {
+				"x-claude-code-session-id": "exact-pool-unbound",
+				"x-claude-code-agent-id": "exact-pool-unbound-child",
+			});
+			expect(unbound.response.status, unbound.text).toBe(200);
+
+			// Every read came from a Codex attempt after its selection: the root's
+			// and the descendant's. None came from a prime ahead of selection.
+			expect(readsAtSelection).toEqual([0, 1, 2]);
+			expect(upstream.catalogReads).toEqual([bearer(codex), bearer(codex)]);
+
+			// A catalog-role pool root primes its cold candidate ahead of selection.
+			// Only roots prime: a descendant meeting the pool cold under a live
+			// lineage binding reads nothing and fails closed.
+			const roleSession = {
+				"x-claude-code-session-id": "role-pool-descendant",
+			};
+			const roleRoot = await send(harness.ctx, ROLE_POOL_PICKER, roleSession);
+			expect(roleRoot.response.status, roleRoot.text).toBe(200);
+			expect(readsAtSelection).toEqual([0, 1, 2, 3]);
+			codexModelCatalogModule.clearCodexModelCacheForAccount(codex.id);
+			const roleDescendant = await send(harness.ctx, CHILD_MODEL, {
+				...roleSession,
+				"x-claude-code-agent-id": "role-pool-descendant-child",
+			});
+			expect(roleDescendant.response.status).toBe(503);
+			expect(JSON.parse(roleDescendant.text)).toMatchObject({
+				error: {
+					type: "force_route_unavailable",
+					reason: "catalog_role_unavailable",
+				},
+			});
+			expect(upstream.catalogReads).toEqual([
+				bearer(codex),
+				bearer(codex),
+				bearer(codex),
+			]);
+			expect(codexModelCatalogModule.getKnownCodexModels(codex.id)).toBe(null);
+		});
+
+		it("primes only refresh-eligible Codex candidates of a role pool", async () => {
+			const paused = coldRoleAccount("role-prime-paused");
+			paused.paused = true;
+			const reauth = coldRoleAccount("role-prime-reauth");
+			reauth.requires_reauth = true;
+			const custom = coldRoleAccount("role-prime-custom-endpoint");
+			custom.custom_endpoint = "https://codex-gateway.example.test";
+			const eligible = coldRoleAccount("role-prime-eligible");
+			const harness = makeRoleContext([paused, reauth, custom, eligible]);
+			const upstream = installCodexRoleUpstream();
+
+			const routed = await send(harness.ctx, ROLE_POOL_PICKER);
+
+			expect(routed.response.status, routed.text).toBe(200);
+			expect(upstream.catalogReads).toEqual([bearer(eligible)]);
+			expect(
+				harness.strategySelect.mock.calls[0]?.[0].map((account) => account.id),
+			).toEqual([eligible.id]);
+			expect(await upstreamModels(upstream.responses)).toEqual(["gpt-7-nova"]);
+		});
+
+		it.each([
+			"paused",
+			"requires_reauth",
+			"custom_endpoint",
+		] as const)("does not prime an exact role route to a %s account", async (kind) => {
+			const account = coldRoleAccount();
+			if (kind === "paused") account.paused = true;
+			else if (kind === "requires_reauth") account.requires_reauth = true;
+			else account.custom_endpoint = "https://codex-gateway.example.test";
+			const harness = makeRoleContext([account]);
+			const upstream = installCodexRoleUpstream();
+
+			const failed = await send(harness.ctx, ROLE_PICKER);
+
+			expect(failed.response.status).toBe(503);
+			expect(upstream.catalogReads).toEqual([]);
+			expect(upstream.responses).toHaveLength(0);
+		});
 	});
 });

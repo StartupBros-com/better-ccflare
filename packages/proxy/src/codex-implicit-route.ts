@@ -6,8 +6,11 @@ import {
 } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import {
+	CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT,
 	ensureCodexModelDefaults,
 	getKnownCodexModels,
+	isCodexCatalogRefreshEligible,
+	revalidateUnknownCodexModel,
 } from "./codex-model-catalog";
 import type { ProxyContext } from "./handlers/proxy-types";
 
@@ -39,6 +42,7 @@ async function primeBeforeDeadline(
 	ctx: ProxyContext,
 	deadlineAt: number,
 	signal?: AbortSignal,
+	unknownModel?: string,
 ): Promise<boolean> {
 	return new Promise<boolean>((resolve) => {
 		const finish = (completed: boolean) => {
@@ -56,11 +60,68 @@ async function primeBeforeDeadline(
 			finish(false);
 			return;
 		}
-		void ensureCodexModelDefaults(account, ctx).then(
+		void (
+			unknownModel
+				? revalidateUnknownCodexModel(account, unknownModel, ctx)
+				: ensureCodexModelDefaults(account, ctx)
+		).then(
 			() => finish(true),
 			() => finish(false),
 		);
 	});
+}
+
+export interface CatalogRolePrimeOptions {
+	/** The exact-account profile's account, or null for a capability pool. */
+	accountId: string | null;
+	/** Read only when some candidate may be cold. */
+	loadAccounts: () => Promise<readonly Account[]>;
+	ctx: ProxyContext;
+	/** Absolute account-selection deadline, in epoch milliseconds. */
+	deadlineAt: number;
+	signal?: AbortSignal;
+}
+
+/**
+ * Give each cold candidate of a catalog-role route one bounded read of its
+ * own listing before selection, which never fetches. Listings live in memory
+ * only, so after a restart this is what admits an account before the refresh
+ * heartbeat's first tick.
+ *
+ * Candidates are the accounts the heartbeat refreshes, under the same cap:
+ * the profile's account, or every such Codex account for a capability pool.
+ * An account with any listing of its own, even a stale one, is warm and adds
+ * no wait. The read goes through the catalog's shared ensure, so concurrent
+ * requests share one read per account and a failed read keeps its backoff. A
+ * failed or late read leaves the account cold, and selection fails closed.
+ */
+export async function primeCatalogRoleCandidates(
+	options: CatalogRolePrimeOptions,
+): Promise<void> {
+	const { accountId } = options;
+	if (accountId !== null && getKnownCodexModels(accountId) !== null) return;
+	const accounts = await options.loadAccounts();
+	const candidates =
+		accountId !== null
+			? accounts.filter(
+					(account) =>
+						account.id === accountId && isCodexCatalogRefreshEligible(account),
+				)
+			: accounts
+					.filter(isCodexCatalogRefreshEligible)
+					.slice(0, CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT);
+	await Promise.all(
+		candidates
+			.filter((account) => getKnownCodexModels(account.id) === null)
+			.map((account) =>
+				primeBeforeDeadline(
+					account,
+					options.ctx,
+					options.deadlineAt,
+					options.signal,
+				),
+			),
+	);
 }
 
 /** Read only the adapter's physical-model carrier, never the translated model. */
@@ -101,7 +162,30 @@ export async function accountServesPhysicalModel(
 ): Promise<boolean> {
 	if (account.provider !== "codex" || selectionExpired(options)) return false;
 	const known = getKnownCodexModels(account.id);
-	if (known) return known.models.some((model) => model.id === id);
+	if (known) {
+		if (known.models.some((model) => model.id === id)) return true;
+		if (
+			options.prime === false ||
+			!options.ctx ||
+			options.deadlineAt === undefined
+		)
+			return false;
+		const completed = await primeBeforeDeadline(
+			account,
+			options.ctx,
+			options.deadlineAt,
+			options.signal,
+			id,
+		);
+		return (
+			completed &&
+			!selectionExpired(options) &&
+			(getKnownCodexModels(account.id)?.models.some(
+				(model) => model.id === id,
+			) ??
+				false)
+		);
+	}
 
 	// Parse account-owned mappings once, including exact Claude-id keys and bare
 	// families. Global environment mappings and provider defaults are not proof.
@@ -156,8 +240,8 @@ export async function resolveImplicitCodexRoute(
 	if (knownAccounts.some(isReady)) {
 		return { id, matchingAccounts: knownAccounts };
 	}
-	// Keep negative cached catalogs authoritative and retain unavailable proofs.
-	// Only eligible cold accounts may join the catalog's shared bounded ensure.
+	// Preserve unavailable proofs; eligible accounts with a negative catalog
+	// may perform one cooled-down revalidation, and cold accounts may hydrate.
 	const serves = await Promise.all(
 		accounts.map((account, index) =>
 			known[index] || account.provider !== "codex" || !isReady(account)

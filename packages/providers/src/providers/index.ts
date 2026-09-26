@@ -15,10 +15,14 @@ export {
 	AnthropicCompatibleProvider,
 } from "./anthropic-compatible/index";
 export { BedrockProvider, parseBedrockConfig } from "./bedrock/index";
-export type { CodexUsageRefreshFetchResult } from "./codex/index";
+export type {
+	CodexClientIdentity,
+	CodexUsageRefreshFetchResult,
+} from "./codex/index";
 export {
 	CODEX_AUTHENTICATED_CALLER_HEADER,
 	CODEX_CACHE_KEY_MODE_ENV,
+	CODEX_CLIENT_VERSION_ENV,
 	CODEX_CONTINUATION_HEADER,
 	CODEX_CONVERSATION_ID_HEADER,
 	CODEX_DEFAULT_ENDPOINT,
@@ -28,6 +32,7 @@ export {
 	CODEX_PING_MODEL,
 	CODEX_PROMPT_CACHE_KEY_ENV,
 	CODEX_TURN_STATE_HEADER,
+	CODEX_VERIFIED_VERSION_FILE_ENV,
 	CODEX_VERSION,
 	CODEX_WHAM_USAGE_ENDPOINT,
 	CODEX_WHAM_USAGE_FALLBACK_ENDPOINT,
@@ -51,6 +56,7 @@ export {
 	readCodexTurnStateConfig,
 	resetCodexExplicitBreakpointSuppressionsForTest,
 	resetCodexUsageEndpointForTest,
+	resolveCodexClientIdentity,
 	resolveCodexEndpoint,
 	resolveCodexRequestModel,
 	suppressCodexExplicitCacheBreakpoint,

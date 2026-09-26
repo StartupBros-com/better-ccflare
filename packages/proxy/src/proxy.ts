@@ -69,8 +69,10 @@ import {
 } from "./claude-code-request";
 import {
 	getCodexPassthroughPhysicalModel,
+	primeCatalogRoleCandidates,
 	resolveImplicitCodexRoute,
 } from "./codex-implicit-route";
+import { reportCatalogRoleRouteFailClosed } from "./codex-model-catalog";
 import {
 	type AgentInterceptResult,
 	createContextAdmissionTracker,
@@ -942,11 +944,15 @@ async function handleProxyCoreImpl(
 	};
 	const createRecordedForceRouteResponse = (
 		error: ForceRouteUnavailableError,
-	): Response =>
-		recordLocalRoutingTerminal(
+	): Response => {
+		// Every terminal force-route failure passes through here, so this is
+		// the one place a catalog-role profile's fail-closed is reported.
+		reportCatalogRoleRouteFailClosed(requestMeta.routeProfileId, error);
+		return recordLocalRoutingTerminal(
 			forceRouteUnavailableResponse(error, requestMeta.routeProfileId == null),
 			`force_route_${error.reason}`,
 		);
+	};
 	const createUnservedServerToolRoutingErrorResponse = (
 		error: ServerToolRoutingError,
 	): Response => {
@@ -1221,6 +1227,8 @@ async function handleProxyCoreImpl(
 		requestMeta.routeProfileLogicalModel = profile.logicalModel;
 		requestMeta.routeProfileExpectedPhysicalModel =
 			profile.expectedPhysicalModel ?? null;
+		requestMeta.routeProfilePhysicalModelPolicy =
+			profile.physicalModelPolicy ?? null;
 		requestMeta.routeExpectedProvider = profile.expectedProvider;
 		const inheritedPickerModel =
 			source === "inherited" && configuredEffectivePicker;
@@ -1243,11 +1251,15 @@ async function handleProxyCoreImpl(
 			finalBodyBuffer = finalRequestBodyContext.getBuffer();
 			appliedModel = profile.logicalModel;
 			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
+			requestMeta.routePhysicalModelPolicy =
+				profile.physicalModelPolicy ?? null;
 		} else if (inheritedPickerModel || inheritedHelperModel) {
 			finalRequestBodyContext.setModel(profile.logicalModel);
 			finalBodyBuffer = finalRequestBodyContext.getBuffer();
 			appliedModel = profile.logicalModel;
 			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
+			requestMeta.routePhysicalModelPolicy =
+				profile.physicalModelPolicy ?? null;
 		}
 	}
 	const getRoutingSelectionDiagnostics = (
@@ -1656,6 +1668,44 @@ async function handleProxyCoreImpl(
 		const verdict = recordSessionRequest(requestMeta.clientSessionId);
 		if (verdict?.rejected) {
 			return buildSessionRejectResponse(verdict);
+		}
+	}
+
+	// 5b'. A catalog-role rung admits a Codex account only on its own catalog
+	// listing, and those live in memory: every process start is cold until the
+	// refresh heartbeat's first tick. Prime cold candidates here, as the implicit
+	// Codex route does, bounded by the account-selection deadline and the
+	// routing signal. Selection stays fetch-free, so a prime that fails or runs
+	// out of time leaves the account cold and the route fails closed with
+	// catalog_role_unavailable. Exact-policy and non-profile requests skip this.
+	if (
+		modelRouteResolution?.kind === "route" &&
+		requestMeta.routePhysicalModelPolicy === "catalog-role"
+	) {
+		const primeDeadlineAt =
+			Date.now() + preTransportDeadlines.accountSelectionTimeoutMs;
+		try {
+			await runWithPreTransportDeadline({
+				phase: "account_selection",
+				timeoutMs: preTransportDeadlines.accountSelectionTimeoutMs,
+				signal: routingSignal,
+				operation: () =>
+					primeCatalogRoleCandidates({
+						accountId: modelRouteResolution.profile.accountId ?? null,
+						loadAccounts: () => ctx.dbOps.getAllAccounts(),
+						ctx,
+						deadlineAt: primeDeadlineAt,
+						signal: routingSignal,
+					}),
+			});
+		} catch (error) {
+			// A departed client ends the request, as it would during selection.
+			if (routingSignal.aborted) throw error;
+			// The deadline helper already logged a timeout; anything else (such as
+			// an account lookup failure) is left for selection to classify.
+			if (!(error instanceof PreTransportPhaseTimeoutError)) {
+				log.warn("Catalog-role catalog priming failed before selection", error);
+			}
 		}
 	}
 

@@ -62,6 +62,7 @@ export * from "./build-provenance";
 export * from "./cache-flight-cohort-seal";
 export * from "./cache-flight-recorder";
 export * from "./cache-metrics";
+export * from "./codex-catalog-events";
 export {
 	type IntervalConfig,
 	intervalManager,

@@ -86,6 +86,8 @@ export interface ReasoningEffortResolution {
 interface ReasoningEffortModels {
 	sourceModel?: string;
 	targetModel?: string;
+	/** Validated account-local catalog levels; absent means use the legacy policy. */
+	supportedTargetEfforts?: readonly ReasoningEffort[];
 }
 
 export interface AnthropicReasoningEffortInput {
@@ -139,7 +141,9 @@ function resolveValidatedReasoningEffort(
 	);
 
 	for (const { model } of modelContexts) {
-		const supportedEfforts = getSupportedReasoningEfforts(model);
+		const supportedEfforts = models.supportedTargetEfforts?.length
+			? models.supportedTargetEfforts
+			: getSupportedReasoningEfforts(model);
 		if (!supportedEfforts) {
 			// Unknown model (source or target) — pass through unchanged
 			continue;

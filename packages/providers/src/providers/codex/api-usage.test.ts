@@ -50,6 +50,37 @@ describe("extractChatGptAccountId", () => {
 });
 
 describe("fetchCodexUsageData", () => {
+	it("keeps the same Codex user agent on a 404 fallback after identity changes", async () => {
+		const oldVersion = process.env.CCFLARE_CODEX_CLIENT_VERSION;
+		const agents: string[] = [];
+		const previousFetch = globalThis.fetch;
+		try {
+			resetCodexUsageEndpointForTest();
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.171.0";
+			globalThis.fetch = (async (input, init) => {
+				const request = new Request(input, init);
+				agents.push(request.headers.get("User-Agent") ?? "");
+				if (agents.length === 1) {
+					process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.172.0";
+					return new Response(null, { status: 404 });
+				}
+				return Response.json({
+					rate_limit: { primary_window: { used_percent: 12 } },
+				});
+			}) as typeof globalThis.fetch;
+			await fetchCodexUsageData(ACCOUNT_TOKEN);
+			expect(agents).toEqual([
+				"codex-cli/0.171.0 (Windows 10.0.26100; x64)",
+				"codex-cli/0.171.0 (Windows 10.0.26100; x64)",
+			]);
+		} finally {
+			globalThis.fetch = previousFetch;
+			resetCodexUsageEndpointForTest();
+			if (oldVersion === undefined)
+				delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			else process.env.CCFLARE_CODEX_CLIENT_VERSION = oldVersion;
+		}
+	});
 	let originalFetch: typeof fetch;
 
 	beforeEach(() => {

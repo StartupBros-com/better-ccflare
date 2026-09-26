@@ -1,10 +1,12 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import type { Account } from "@better-ccflare/types";
 import { AnthropicProvider } from "./providers/anthropic/provider";
 import { CodexProvider } from "./providers/codex/provider";
 import { QwenProvider } from "./providers/qwen/provider";
 import { XaiProvider } from "./providers/xai/provider";
 import {
+	captureCodexModelReasoningSnapshot,
+	clearCodexAccountModelContextMetadata,
 	createComboRouteClassDraftProbe,
 	decideContextAdmission,
 	deriveComboRouteClass,
@@ -14,6 +16,7 @@ import {
 	MODEL_CONTEXT_WINDOWS,
 	resolveAccountLogicalModelCapability,
 	resolveModelContextCapability,
+	setCodexAccountModelContextMetadata,
 } from "./request-capabilities";
 import type { Provider } from "./types";
 
@@ -729,5 +732,162 @@ describe("decideContextAdmission", () => {
 			occupiedTokens: 0,
 			safeLimitTokens: 90,
 		});
+	});
+});
+
+/**
+ * Covers finding #3: `captureCodexModelReasoningSnapshot` feeds request-time
+ * reasoning-effort resolution (packages/providers/src/providers/codex/provider.ts
+ * ~2284 and ~4563) and had no direct coverage — the only `supportedReasoningEfforts`
+ * arrays anywhere in the suite were pre-vetted valid ones (provider.test.ts
+ * ~2111, ~2121), so the length/enum gate and the dedup step inside
+ * `setCodexAccountModelContextMetadata` (request-capabilities.ts ~270-289)
+ * could silently regress. Mirrors the style of the sibling "bad-window"
+ * context-capacity case in
+ * packages/proxy/src/__tests__/codex-model-catalog.test.ts (`bad-window`
+ * has an out-of-range `effective_context_window_percent` and is asserted
+ * `toBeUndefined()` rather than crashing).
+ */
+describe("captureCodexModelReasoningSnapshot / setCodexAccountModelContextMetadata reasoning gate", () => {
+	// One fresh accountId per test avoids cross-test pollution of the
+	// module-level `codexReasoningByAccount` map; clearing after each test
+	// keeps this describe block self-contained regardless of run order.
+	let nextAccountId = 0;
+	const freshAccountId = () =>
+		`reasoning-gate-test-${(nextAccountId++).toString()}`;
+
+	const noContext = {
+		contextWindow: null,
+		maxContextWindow: null,
+		effectiveContextPercent: null,
+	} as const;
+
+	afterEach(() => {
+		clearCodexAccountModelContextMetadata();
+	});
+
+	it("never recorded snapshot for an account returns null, not an empty map", () => {
+		expect(captureCodexModelReasoningSnapshot(freshAccountId())).toBeNull();
+	});
+
+	it("drops a model whose supportedReasoningEfforts contains an invalid effort string, leaving siblings intact", () => {
+		const accountId = freshAccountId();
+		setCodexAccountModelContextMetadata(accountId, [
+			{
+				id: "model-good",
+				...noContext,
+				supportedReasoningEfforts: ["high", "low"],
+				defaultReasoningEffort: "high",
+			},
+			{
+				id: "model-bad-effort",
+				...noContext,
+				supportedReasoningEfforts: ["high", "bogus-effort"],
+			},
+		]);
+		const snapshot = captureCodexModelReasoningSnapshot(accountId);
+		expect(snapshot?.has("model-bad-effort")).toBe(false);
+		expect(snapshot?.get("model-good")).toEqual({
+			supportedEfforts: ["high", "low"],
+			defaultEffort: "high",
+		});
+	});
+
+	it("drops a supportedReasoningEfforts array longer than 6 entries, leaving siblings intact", () => {
+		const accountId = freshAccountId();
+		setCodexAccountModelContextMetadata(accountId, [
+			{
+				id: "model-too-long",
+				...noContext,
+				// All 6 valid efforts plus one duplicate: distinct-value count stays
+				// within range, but the raw array length (7) exceeds the bound.
+				supportedReasoningEfforts: [
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"xhigh",
+					"max",
+					"low",
+				],
+			},
+			{
+				id: "model-good",
+				...noContext,
+				supportedReasoningEfforts: ["medium"],
+			},
+		]);
+		const snapshot = captureCodexModelReasoningSnapshot(accountId);
+		expect(snapshot?.has("model-too-long")).toBe(false);
+		expect(snapshot?.get("model-good")).toEqual({
+			supportedEfforts: ["medium"],
+		});
+	});
+
+	it("drops an empty supportedReasoningEfforts array — no efforts recorded is treated as no reasoning capability, not as a valid zero-length set", () => {
+		const accountId = freshAccountId();
+		setCodexAccountModelContextMetadata(accountId, [
+			{ id: "model-empty", ...noContext, supportedReasoningEfforts: [] },
+		]);
+		const snapshot = captureCodexModelReasoningSnapshot(accountId);
+		expect(snapshot?.has("model-empty")).toBe(false);
+	});
+
+	it("drops a non-array supportedReasoningEfforts value", () => {
+		const accountId = freshAccountId();
+		setCodexAccountModelContextMetadata(accountId, [
+			{
+				id: "model-not-array",
+				...noContext,
+				// biome-ignore lint/suspicious/noExplicitAny: exercising a malformed wire value
+				supportedReasoningEfforts: "high" as any,
+			},
+		]);
+		const snapshot = captureCodexModelReasoningSnapshot(accountId);
+		expect(snapshot?.has("model-not-array")).toBe(false);
+	});
+
+	it("dedups duplicate efforts and preserves first-occurrence order", () => {
+		const accountId = freshAccountId();
+		setCodexAccountModelContextMetadata(accountId, [
+			{
+				id: "model-dupes",
+				...noContext,
+				supportedReasoningEfforts: ["high", "low", "high", "medium", "low"],
+			},
+		]);
+		expect(
+			captureCodexModelReasoningSnapshot(accountId)?.get("model-dupes"),
+		).toEqual({ supportedEfforts: ["high", "low", "medium"] });
+	});
+
+	it("keeps supportedEfforts but omits defaultEffort when the default is not itself a supported effort", () => {
+		const accountId = freshAccountId();
+		setCodexAccountModelContextMetadata(accountId, [
+			{
+				id: "model-bad-default",
+				...noContext,
+				supportedReasoningEfforts: ["low", "medium"],
+				defaultReasoningEffort: "high",
+			},
+		]);
+		const entry =
+			captureCodexModelReasoningSnapshot(accountId)?.get("model-bad-default");
+		expect(entry).toEqual({ supportedEfforts: ["low", "medium"] });
+		expect(entry).not.toHaveProperty("defaultEffort");
+	});
+
+	it("omits defaultEffort entirely (not just undefined) when the server sends none", () => {
+		const accountId = freshAccountId();
+		setCodexAccountModelContextMetadata(accountId, [
+			{
+				id: "model-no-default",
+				...noContext,
+				supportedReasoningEfforts: ["max"],
+			},
+		]);
+		const entry =
+			captureCodexModelReasoningSnapshot(accountId)?.get("model-no-default");
+		expect(Object.keys(entry ?? {})).toEqual(["supportedEfforts"]);
 	});
 });

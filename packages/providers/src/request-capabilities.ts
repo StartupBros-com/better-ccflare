@@ -205,6 +205,124 @@ interface ModelContextMetadata {
 	effectiveContextPercent: number;
 }
 
+/** Account-local catalog projection, replaced as a single successful generation. */
+const codexCatalogContextByAccount = new Map<
+	string,
+	ReadonlyMap<string, ModelContextMetadata | null>
+>();
+
+/** A captured generation: subsequent publications cannot change an in-flight attempt. */
+export type CodexModelContextSnapshot = ReadonlyMap<
+	string,
+	ModelContextMetadata | null
+> | null;
+
+export function captureCodexModelContextSnapshot(
+	accountId: string,
+): CodexModelContextSnapshot {
+	return codexCatalogContextByAccount.get(accountId) ?? null;
+}
+
+export interface CodexModelReasoningMetadata {
+	supportedEfforts: readonly (
+		| "minimal"
+		| "low"
+		| "medium"
+		| "high"
+		| "xhigh"
+		| "max"
+	)[];
+	defaultEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+}
+const codexReasoningByAccount = new Map<
+	string,
+	ReadonlyMap<string, CodexModelReasoningMetadata>
+>();
+export function captureCodexModelReasoningSnapshot(
+	accountId: string,
+): ReadonlyMap<string, CodexModelReasoningMetadata> | null {
+	return codexReasoningByAccount.get(accountId) ?? null;
+}
+
+export function setCodexAccountModelContextMetadata(
+	accountId: string,
+	models: readonly {
+		id: string;
+		contextWindow: number | null;
+		maxContextWindow: number | null;
+		effectiveContextPercent: number | null;
+		supportedReasoningEfforts?: readonly string[];
+		defaultReasoningEffort?: string | null;
+	}[],
+): void {
+	const entries = new Map<string, ModelContextMetadata | null>();
+	const reasoning = new Map<string, CodexModelReasoningMetadata>();
+	const validEfforts = new Set([
+		"minimal",
+		"low",
+		"medium",
+		"high",
+		"xhigh",
+		"max",
+	]);
+	const window = (n: number | null): n is number =>
+		typeof n === "number" && Number.isSafeInteger(n) && n > 0;
+	for (const model of models.slice(0, 1000)) {
+		const supported = model.supportedReasoningEfforts;
+		if (
+			Array.isArray(supported) &&
+			supported.length > 0 &&
+			supported.length <= 6 &&
+			supported.every((effort) => validEfforts.has(effort))
+		) {
+			const levels = [
+				...new Set(supported),
+			] as CodexModelReasoningMetadata["supportedEfforts"];
+			const defaultEffort = model.defaultReasoningEffort;
+			reasoning.set(model.id, {
+				supportedEfforts: levels,
+				...(defaultEffort &&
+				levels.includes(defaultEffort as (typeof levels)[number])
+					? { defaultEffort: defaultEffort as (typeof levels)[number] }
+					: {}),
+			});
+		}
+		const recommended = model.contextWindow;
+		const max = model.maxContextWindow;
+		const percent = model.effectiveContextPercent;
+		entries.set(
+			model.id,
+			window(recommended) &&
+				window(max) &&
+				recommended <= max &&
+				typeof percent === "number" &&
+				Number.isFinite(percent) &&
+				percent > 0 &&
+				percent <= 100
+				? {
+						defaultContextWindow: recommended,
+						maxContextWindow: max,
+						effectiveContextPercent: percent,
+					}
+				: null,
+		);
+	}
+	codexCatalogContextByAccount.set(accountId, entries);
+	codexReasoningByAccount.set(accountId, reasoning);
+}
+
+export function clearCodexAccountModelContextMetadata(
+	accountId?: string,
+): void {
+	if (accountId === undefined) {
+		codexCatalogContextByAccount.clear();
+		codexReasoningByAccount.clear();
+	} else {
+		codexCatalogContextByAccount.delete(accountId);
+		codexReasoningByAccount.delete(accountId);
+	}
+}
+
 // Synced from the Codex CLI model cache (~/.codex/models_cache.json,
 // codex-cli 0.147.0). This is the single source for Codex context capability.
 // The catalog distinguishes `context_window` (default/recommended) from
@@ -274,11 +392,22 @@ export const MODEL_CONTEXT_WINDOWS: Readonly<Record<string, number>> =
 export function resolveModelContextCapability(
 	provider: string,
 	model: string,
+	accountId?: string,
+	snapshot?: CodexModelContextSnapshot,
 ): ModelContextCapability | undefined {
 	if (provider.toLowerCase() !== "codex" || typeof model !== "string") {
 		return undefined;
 	}
-	const exact = CODEX_MODEL_CONTEXT_METADATA[model];
+	const catalog =
+		snapshot !== undefined
+			? snapshot
+			: accountId
+				? codexCatalogContextByAccount.get(accountId)
+				: undefined;
+	// A listed model with malformed/missing scalars must not inherit an old
+	// generation's static ceiling via a coincidental family prefix.
+	if (catalog?.has(model) && !catalog.get(model)) return undefined;
+	const exact = catalog?.get(model) ?? CODEX_MODEL_CONTEXT_METADATA[model];
 	let family = model;
 	let metadata = exact;
 	let match: ModelContextCapability["match"] = "exact";

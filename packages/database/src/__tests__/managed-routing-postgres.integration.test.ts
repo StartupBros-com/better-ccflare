@@ -851,6 +851,129 @@ describePostgres("managed routing PostgreSQL integration", () => {
 		});
 	});
 
+	it("applies guarded model_mappings writes with revision and null-safe row guards on PostgreSQL", async () => {
+		await withDisposableDatabase(async (adapter) => {
+			await ensureSchemaPg(adapter);
+			await runMigrationsPg(adapter);
+			const alphaOld = JSON.stringify({
+				opus: "gpt-6-astra",
+				sonnet: ["gpt-6-sol", "gpt-6-sol-mini"],
+			});
+			const betaOld = JSON.stringify({ haiku: "gpt-6-luna" });
+			await adapter.run(
+				"INSERT INTO accounts (id, name, provider, created_at, model_mappings) VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)",
+				[
+					"codex-alpha",
+					"alpha",
+					"codex",
+					1,
+					alphaOld,
+					"codex-beta",
+					"beta",
+					"codex",
+					1,
+					betaOld,
+					"codex-gamma",
+					"gamma",
+					"codex",
+					1,
+					null,
+				],
+			);
+			const repo = new ComboRepository(adapter);
+			const mappings = async (id: string) =>
+				(
+					await adapter.get<{ model_mappings: string | null }>(
+						"SELECT model_mappings FROM accounts WHERE id = ?",
+						[id],
+					)
+				)?.model_mappings ?? null;
+
+			// Stale revision: nothing written, revision unchanged.
+			const revision = await repo.getRoutingPolicyRevision();
+			await expect(
+				repo.applyGuardedModelMappingsWrites({
+					expected_revision: revision - 1,
+					writes: [
+						{
+							account_id: "codex-alpha",
+							expected_old_value: alphaOld,
+							new_value: null,
+						},
+					],
+				}),
+			).rejects.toMatchObject({ reason: "revision" });
+			expect(await mappings("codex-alpha")).toBe(alphaOld);
+			expect(await repo.getRoutingPolicyRevision()).toBe(revision);
+
+			// Stale row after a successful earlier statement: full rollback.
+			await expect(
+				repo.applyGuardedModelMappingsWrites({
+					expected_revision: revision,
+					writes: [
+						{
+							account_id: "codex-alpha",
+							expected_old_value: alphaOld,
+							new_value: null,
+						},
+						{
+							account_id: "codex-beta",
+							expected_old_value: "{}",
+							new_value: null,
+						},
+					],
+				}),
+			).rejects.toMatchObject({ reason: "row", accountId: "codex-beta" });
+			expect(await mappings("codex-alpha")).toBe(alphaOld);
+			expect(await repo.getRoutingPolicyRevision()).toBe(revision);
+
+			// A NULL expectation must not match a non-null row.
+			await expect(
+				repo.applyGuardedModelMappingsWrites({
+					expected_revision: revision,
+					writes: [
+						{
+							account_id: "codex-beta",
+							expected_old_value: null,
+							new_value: alphaOld,
+						},
+					],
+				}),
+			).rejects.toMatchObject({ reason: "row", accountId: "codex-beta" });
+
+			// Success: NULL-safe match, NULL write, one revision advance.
+			const alphaNew = JSON.stringify({
+				sonnet: ["gpt-6-sol", "gpt-6-sol-mini"],
+			});
+			await expect(
+				repo.applyGuardedModelMappingsWrites({
+					expected_revision: revision,
+					writes: [
+						{
+							account_id: "codex-alpha",
+							expected_old_value: alphaOld,
+							new_value: alphaNew,
+						},
+						{
+							account_id: "codex-beta",
+							expected_old_value: betaOld,
+							new_value: null,
+						},
+						{
+							account_id: "codex-gamma",
+							expected_old_value: null,
+							new_value: betaOld,
+						},
+					],
+				}),
+			).resolves.toEqual({ revision: revision + 1, written: 3 });
+			expect(await mappings("codex-alpha")).toBe(alphaNew);
+			expect(await mappings("codex-beta")).toBeNull();
+			expect(await mappings("codex-gamma")).toBe(betaOld);
+			expect(await repo.getRoutingPolicyRevision()).toBe(revision + 1);
+		});
+	});
+
 	it("tracks legacy-mirrored credential shape without secret-rotation churn", async () => {
 		await withDisposableDatabase(async (adapter) => {
 			await ensureSchemaPg(adapter);

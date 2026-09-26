@@ -43,7 +43,26 @@ export type AlertType =
 	| "cache_efficiency_low"
 	| "cache_efficiency_critical"
 	| "cache_telemetry_gap"
-	| "cache_efficiency_recovered";
+	| "cache_efficiency_recovered"
+	/** info: a Codex account's own catalog moved a family's AUTOMATIC role
+	 * target (the model unpinned families follow). Fires once per new target.
+	 * Webhook opt-in: see WEBHOOK_OPT_IN_ALERT_TYPES. */
+	| "codex_role_target_changed"
+	/** info: a pinned Codex family's model is still offered but is no longer
+	 * the catalog's role target. An intentional pin is not an error. Webhook
+	 * opt-in: see WEBHOOK_OPT_IN_ALERT_TYPES. */
+	| "codex_pin_superseded"
+	/** warning: a pinned Codex family's model is absent from the account's
+	 * own fresh catalog. */
+	| "codex_pin_unavailable"
+	/** warning: an account's own Codex catalog is old and its latest refresh
+	 * failed, so routing is still serving the last-good catalog. */
+	| "codex_catalog_stale"
+	/** warning: a catalog-role route profile failed closed. */
+	| "codex_route_role_unavailable"
+	/** warning: a configured verified Codex CLI version record is stale or
+	 * unreadable — the managed updater has stalled. */
+	| "codex_identity_record_stale";
 
 /**
  * Every known `AlertType` value, in the same order as the union above. The
@@ -69,6 +88,12 @@ export const ALERT_TYPES: readonly AlertType[] = [
 	"cache_efficiency_critical",
 	"cache_telemetry_gap",
 	"cache_efficiency_recovered",
+	"codex_role_target_changed",
+	"codex_pin_superseded",
+	"codex_pin_unavailable",
+	"codex_catalog_stale",
+	"codex_route_role_unavailable",
+	"codex_identity_record_stale",
 ];
 
 const ALERT_TYPE_SET: ReadonlySet<string> = new Set(ALERT_TYPES);
@@ -76,6 +101,30 @@ const ALERT_TYPE_SET: ReadonlySet<string> = new Set(ALERT_TYPES);
 /** Type guard: is `value` one of the known `AlertType` names? */
 export function isAlertType(value: string): value is AlertType {
 	return ALERT_TYPE_SET.has(value);
+}
+
+/**
+ * Informational alert types that an EMPTY webhook allowlist does not deliver:
+ * they are recorded, listed and streamed to the dashboard, but reach the
+ * webhook only when the operator names them in `ALERT_WEBHOOK_TYPES` /
+ * `alert_webhook_types`. Healthy adoption of a new model and an intentional
+ * pin are not worth a push notification by default.
+ *
+ * Every type that existed before this list keeps its original delivery (an
+ * empty allowlist still delivers it); only types added here opt out.
+ */
+export const WEBHOOK_OPT_IN_ALERT_TYPES: readonly AlertType[] = [
+	"codex_role_target_changed",
+	"codex_pin_superseded",
+];
+
+const WEBHOOK_OPT_IN_ALERT_TYPE_SET: ReadonlySet<string> = new Set(
+	WEBHOOK_OPT_IN_ALERT_TYPES,
+);
+
+/** True for types an empty webhook allowlist keeps in-app only. */
+export function isWebhookOptInAlertType(type: AlertType): boolean {
+	return WEBHOOK_OPT_IN_ALERT_TYPE_SET.has(type);
 }
 
 /**

@@ -414,6 +414,327 @@ describe("parseModelRouteProfiles", () => {
 	});
 });
 
+describe("parseModelRouteProfiles physicalModelPolicy", () => {
+	const roleProfile = {
+		id: "codex-opus",
+		displayName: "Codex · opus role",
+		accountId: "codex-account",
+		logicalModel: "claude-opus-5",
+		expectedProvider: "codex",
+		physicalModelPolicy: "catalog-role",
+	};
+	const roleCapabilityProfile = {
+		id: "codex-opus-pool",
+		displayName: "Codex pool · opus role",
+		selection: "capability",
+		logicalModel: "claude-opus-5",
+		expectedProvider: "codex",
+		physicalModelPolicy: "catalog-role",
+	};
+
+	it("keeps existing exact and capability profiles byte-identical", () => {
+		const parsed = parseModelRouteProfiles(
+			JSON.stringify([
+				JSON.parse(PROFILE_JSON)[0],
+				{
+					id: "sol-capability",
+					displayName: "GPT-5.6 Sol · available account",
+					selection: "capability",
+					logicalModel: "claude-opus-5",
+					expectedProvider: "CODEX",
+					expectedPhysicalModel: "gpt-5.6-sol",
+				},
+			]),
+		);
+
+		// Literal output captured from the parser before physicalModelPolicy existed.
+		expect(parsed.map((entry) => JSON.stringify(entry))).toEqual([
+			'{"id":"pro-primary-sol","publicModelId":"claude-bccf-route-pro-primary-sol","discoveryModelId":"claude-bccf-route-pro-primary-sol","displayName":"GPT-5.6 Sol · pro-primary","description":"Pinned high-reasoning route","accountId":"df44bdf6-d646-45aa-b3d1-1b2b2cdbf774","logicalModel":"claude-opus-5","defaultEffort":"xhigh","expectedProvider":"codex","expectedPhysicalModel":"gpt-5.6-sol"}',
+			'{"id":"sol-capability","publicModelId":"claude-bccf-route-sol-capability","discoveryModelId":"claude-bccf-route-sol-capability","displayName":"GPT-5.6 Sol · available account","selection":"capability","logicalModel":"claude-opus-5","expectedProvider":"codex","expectedPhysicalModel":"gpt-5.6-sol"}',
+		]);
+		expect(parsed.map((entry) => Object.keys(entry))).toEqual([
+			[
+				"id",
+				"publicModelId",
+				"discoveryModelId",
+				"displayName",
+				"description",
+				"accountId",
+				"logicalModel",
+				"defaultEffort",
+				"expectedProvider",
+				"expectedPhysicalModel",
+			],
+			[
+				"id",
+				"publicModelId",
+				"discoveryModelId",
+				"displayName",
+				"description",
+				"selection",
+				"logicalModel",
+				"defaultEffort",
+				"expectedProvider",
+				"expectedPhysicalModel",
+			],
+		]);
+	});
+
+	it("accepts a catalog-role policy on an exact-account Codex profile", () => {
+		const [configured] = parseModelRouteProfiles(
+			JSON.stringify([{ ...roleProfile, expectedProvider: "CODEX" }]),
+		);
+
+		expect(configured).toEqual({
+			id: "codex-opus",
+			publicModelId: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}codex-opus`,
+			discoveryModelId: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}codex-opus`,
+			displayName: "Codex · opus role",
+			description: undefined,
+			accountId: "codex-account",
+			logicalModel: "claude-opus-5",
+			defaultEffort: undefined,
+			expectedProvider: "codex",
+			expectedPhysicalModel: undefined,
+			physicalModelPolicy: "catalog-role",
+		});
+	});
+
+	it("lets a catalog-role capability profile omit expectedPhysicalModel", () => {
+		const [configured] = parseModelRouteProfiles(
+			JSON.stringify([roleCapabilityProfile]),
+		);
+
+		expect(configured).toMatchObject({
+			selection: "capability",
+			expectedProvider: "codex",
+			physicalModelPolicy: "catalog-role",
+		});
+		expect(configured?.accountId).toBeUndefined();
+		expect(configured?.expectedPhysicalModel).toBeUndefined();
+	});
+
+	it("accepts an explicit exact policy with and without an expected physical model", () => {
+		const [pinned, providerOnly, capability] = parseModelRouteProfiles(
+			JSON.stringify([
+				{ ...JSON.parse(PROFILE_JSON)[0], physicalModelPolicy: "exact" },
+				{
+					id: "provider-only",
+					displayName: "Provider only",
+					accountId: "account",
+					logicalModel: "claude-opus-5",
+					expectedProvider: "xai",
+					physicalModelPolicy: "exact",
+				},
+				{
+					id: "exact-capability",
+					displayName: "Exact capability",
+					selection: "capability",
+					logicalModel: "claude-opus-5",
+					expectedProvider: "codex",
+					expectedPhysicalModel: "gpt-5.6-sol",
+					physicalModelPolicy: "exact",
+				},
+			]),
+		);
+
+		expect(pinned).toMatchObject({
+			expectedPhysicalModel: "gpt-5.6-sol",
+			physicalModelPolicy: "exact",
+		});
+		expect(providerOnly).toMatchObject({
+			expectedProvider: "xai",
+			physicalModelPolicy: "exact",
+		});
+		expect(providerOnly?.expectedPhysicalModel).toBeUndefined();
+		expect(capability).toMatchObject({
+			expectedPhysicalModel: "gpt-5.6-sol",
+			physicalModelPolicy: "exact",
+		});
+	});
+
+	it("still requires expectedPhysicalModel on an exact capability profile", () => {
+		expect(() =>
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{ ...roleCapabilityProfile, physicalModelPolicy: "exact" },
+				]),
+			),
+		).toThrow(
+			"CCFLARE_MODEL_ROUTE_PROFILES_JSON: profile 0 capability selection requires expectedPhysicalModel",
+		);
+	});
+
+	it("rejects unsupported physicalModelPolicy values", () => {
+		for (const physicalModelPolicy of [
+			"",
+			"EXACT",
+			"Catalog-Role",
+			"catalog",
+			"role",
+			" exact",
+			null,
+			1,
+			true,
+			{},
+			[],
+		]) {
+			expect(() =>
+				parseModelRouteProfiles(
+					JSON.stringify([{ ...roleProfile, physicalModelPolicy }]),
+				),
+			).toThrow(
+				"CCFLARE_MODEL_ROUTE_PROFILES_JSON: profile 0 field physicalModelPolicy must be exact or catalog-role",
+			);
+		}
+	});
+
+	it("requires the Codex provider for catalog-role", () => {
+		const { expectedProvider: _omitted, ...withoutProvider } = roleProfile;
+		for (const candidate of [
+			withoutProvider,
+			{ ...roleProfile, expectedProvider: "xai" },
+			{ ...roleProfile, expectedProvider: "openai" },
+			{ ...roleProfile, expectedProvider: "codex-compatible" },
+		]) {
+			expect(() =>
+				parseModelRouteProfiles(JSON.stringify([candidate])),
+			).toThrow(
+				"CCFLARE_MODEL_ROUTE_PROFILES_JSON: profile 0 physicalModelPolicy catalog-role requires expectedProvider codex",
+			);
+		}
+	});
+
+	it("keeps the existing capability expectedProvider error for a role pool without a provider", () => {
+		const { expectedProvider: _omitted, ...withoutProvider } =
+			roleCapabilityProfile;
+		expect(() =>
+			parseModelRouteProfiles(JSON.stringify([withoutProvider])),
+		).toThrow(
+			"CCFLARE_MODEL_ROUTE_PROFILES_JSON: profile 0 capability selection requires expectedProvider",
+		);
+	});
+
+	it("forbids a fixed physical model on catalog-role profiles", () => {
+		for (const candidate of [
+			{ ...roleProfile, expectedPhysicalModel: "gpt-7-nova" },
+			{ ...roleCapabilityProfile, expectedPhysicalModel: "gpt-7-nova" },
+		]) {
+			expect(() =>
+				parseModelRouteProfiles(JSON.stringify([candidate])),
+			).toThrow(
+				"CCFLARE_MODEL_ROUTE_PROFILES_JSON: profile 0 physicalModelPolicy catalog-role must omit expectedPhysicalModel",
+			);
+		}
+	});
+
+	it("forbids fixed capacity claims on catalog-role profiles", () => {
+		expect(() =>
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{ ...roleProfile, contextWindow: 272_000, maxOutputTokens: 4_000 },
+				]),
+			),
+		).toThrow(
+			"CCFLARE_MODEL_ROUTE_PROFILES_JSON: profile 0 physicalModelPolicy catalog-role must omit contextWindow and maxOutputTokens",
+		);
+		for (const candidate of [
+			{ ...roleProfile, contextWindow: 272_000 },
+			{ ...roleProfile, maxOutputTokens: 4_000 },
+			{
+				...roleCapabilityProfile,
+				contextWindow: 272_000,
+				maxOutputTokens: 4_000,
+			},
+		]) {
+			expect(() =>
+				parseModelRouteProfiles(JSON.stringify([candidate])),
+			).toThrow("CCFLARE_MODEL_ROUTE_PROFILES_JSON");
+		}
+	});
+
+	it("requires a logical model whose Claude family defines the role", () => {
+		for (const logicalModel of ["gpt-5.6-sol", "gemini-3-pro", "claude-x"]) {
+			expect(() =>
+				parseModelRouteProfiles(
+					JSON.stringify([{ ...roleProfile, logicalModel }]),
+				),
+			).toThrow(
+				"CCFLARE_MODEL_ROUTE_PROFILES_JSON: profile 0 physicalModelPolicy catalog-role requires a logicalModel in the fable, opus, sonnet or haiku family",
+			);
+		}
+		for (const logicalModel of [
+			"claude-fable-5",
+			"claude-opus-5",
+			"claude-sonnet-5",
+			"claude-haiku-4-5",
+		]) {
+			expect(
+				parseModelRouteProfiles(
+					JSON.stringify([{ ...roleProfile, logicalModel }]),
+				)[0]?.logicalModel,
+			).toBe(logicalModel);
+		}
+	});
+
+	it("keeps the reserved implicit-codex namespace closed to catalog-role profiles", () => {
+		expect(() =>
+			parseModelRouteProfiles(
+				JSON.stringify([{ ...roleProfile, id: "implicit-codex:gpt-7-nova" }]),
+			),
+		).toThrow(
+			"id namespace implicit-codex: is reserved for request-time Codex routing",
+		);
+	});
+
+	it("discovers role-named catalog-role profiles exactly like other profiles", () => {
+		const profiles = parseModelRouteProfiles(
+			JSON.stringify([
+				JSON.parse(PROFILE_JSON)[0],
+				{ ...roleProfile, displayName: "Codex · opus" },
+				{
+					...roleProfile,
+					id: "codex-sonnet",
+					displayName: "Codex · sonnet",
+					logicalModel: "claude-sonnet-5",
+				},
+				{
+					...roleCapabilityProfile,
+					id: "codex-haiku",
+					displayName: "Codex · haiku",
+					logicalModel: "claude-haiku-4-5",
+					clientContextWindowHint: "1m",
+				},
+			]),
+		);
+		const registry = new ModelRouteSessionRegistry(profiles);
+
+		expect(registry.getDiscoveryModels()).toEqual([
+			{
+				id: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}pro-primary-sol`,
+				display_name: "GPT-5.6 Sol · pro-primary",
+			},
+			{
+				id: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}codex-opus`,
+				display_name: "Codex · opus",
+			},
+			{
+				id: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}codex-sonnet`,
+				display_name: "Codex · sonnet",
+			},
+			{
+				id: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}codex-haiku[1m]`,
+				display_name: "Codex · haiku",
+			},
+		]);
+		for (const id of ["codex-opus", "codex-sonnet", "codex-haiku"]) {
+			expect(
+				registry.hasPublicModelId(`${MODEL_ROUTE_PROFILE_MODEL_PREFIX}${id}`),
+			).toBe(true);
+		}
+	});
+});
+
 describe("ModelRouteSessionRegistry", () => {
 	it("routes an exact virtual model without requiring a session", () => {
 		const configured = profile();

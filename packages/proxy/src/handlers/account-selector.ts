@@ -20,6 +20,7 @@ import {
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
 	resolveAccountLogicalModelCapability,
+	resolveCodexRequestModel,
 	resolveProviderForAccount,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -46,7 +47,10 @@ import type {
 	AnthropicReplayRisk,
 } from "../anthropic-degraded-mode";
 import { accountServesPhysicalModel } from "../codex-implicit-route";
-import { getKnownCodexModels } from "../codex-model-catalog";
+import {
+	getCodexCatalogRoleTarget,
+	getKnownCodexModels,
+} from "../codex-model-catalog";
 import { evaluateServerToolReplayEligibility } from "../server-tool-replay-eligibility";
 import {
 	ServerToolRoutingError,
@@ -94,6 +98,97 @@ function isClaudeModelId(model: string): boolean {
 	return getModelFamily(model) !== null;
 }
 
+export type RouteProfileConstraintViolation =
+	| "provider_mismatch"
+	| "model_mapping_mismatch"
+	| "catalog_role_unavailable"
+	| "catalog_role_mismatch";
+
+type RouteProfileConstraintMeta = Pick<
+	RequestMeta,
+	| "routeProfileId"
+	| "routeProfileSelection"
+	| "routeExpectedProvider"
+	| "routeExpectedPhysicalModel"
+	| "routeProfileExpectedPhysicalModel"
+	| "routePhysicalModelPolicy"
+	| "routeProfileLogicalModel"
+	| "routeCatalogRoleTargetByAccountId"
+>;
+
+/**
+ * Every concrete Codex model a logical request can execute on this account,
+ * in routing order: the account's mapping list, each resolved through the
+ * provider's defaults and overrides exactly as request transformation will.
+ */
+export function getConcreteCodexModelList(
+	account: Account,
+	requestedModel: string,
+): string[] {
+	const configuredModels = getModelList(requestedModel, account);
+	if (!configuredModels) {
+		return [resolveCodexRequestModel(requestedModel, account)];
+	}
+	return configuredModels.map((model) =>
+		resolveCodexRequestModel(model, account),
+	);
+}
+
+function catalogRoleFamily(
+	logicalModel: string | null | undefined,
+	meta: RouteProfileConstraintMeta,
+): ReturnType<typeof getModelFamily> {
+	return (
+		(logicalModel?.trim() ? getModelFamily(logicalModel) : null) ??
+		(meta.routeProfileLogicalModel?.trim()
+			? getModelFamily(meta.routeProfileLogicalModel)
+			: null)
+	);
+}
+
+/**
+ * The catalog-role policy replaces a fixed expected model with the model at
+ * the logical family's role in this Codex account's own catalog. An attempt
+ * that carries its admission-time target is judged against that target, never
+ * a catalog published after admission; selection passes no carried target and
+ * so reads the live own-catalog evidence.
+ */
+function evaluateCatalogRoleConstraint(
+	account: Account,
+	meta: RouteProfileConstraintMeta,
+	logicalModel: string | null | undefined,
+	concretePhysicalModel: string | null | undefined,
+): {
+	readonly violation: RouteProfileConstraintViolation | null;
+	readonly target: string | null;
+} {
+	// Role following is Codex-only even if a profile's provider were ever
+	// mis-set: it must never become cross-provider or arbitrary-model routing.
+	if (account.provider.trim().toLowerCase() !== "codex") {
+		return { violation: "provider_mismatch", target: null };
+	}
+	const family = catalogRoleFamily(logicalModel, meta);
+	const target =
+		meta.routeCatalogRoleTargetByAccountId?.get(account.id) ??
+		(family ? getCodexCatalogRoleTarget(account.id, family) : null);
+	if (!target) return { violation: "catalog_role_unavailable", target: null };
+	const candidates =
+		concretePhysicalModel !== undefined
+			? [concretePhysicalModel]
+			: logicalModel?.trim()
+				? getConcreteCodexModelList(account, logicalModel.trim())
+				: [];
+	const matches =
+		candidates.length > 0 &&
+		candidates.every(
+			(candidate) =>
+				typeof candidate === "string" && candidate.trim() === target,
+		);
+	return matches
+		? { violation: null, target }
+		: { violation: "catalog_role_mismatch", target };
+}
+
 /**
  * Route-profile constraints are server-derived metadata, distinct from public
  * force-account routes. Every executable mapping candidate must remain within
@@ -102,27 +197,69 @@ function isClaudeModelId(model: string): boolean {
  */
 export function getRouteProfileConstraintViolation(
 	account: Account,
-	meta: Pick<
-		RequestMeta,
-		| "routeProfileId"
-		| "routeProfileSelection"
-		| "routeExpectedProvider"
-		| "routeExpectedPhysicalModel"
-		| "routeProfileExpectedPhysicalModel"
-	>,
+	meta: RouteProfileConstraintMeta,
 	logicalModel: string | null | undefined,
 	concretePhysicalModel?: string | null,
-): "provider_mismatch" | "model_mapping_mismatch" | null {
-	if (!meta.routeProfileId?.trim()) return null;
+): RouteProfileConstraintViolation | null {
+	return evaluateRouteProfileConstraint(
+		account,
+		meta,
+		logicalModel,
+		concretePhysicalModel,
+	).violation;
+}
+
+function evaluateRouteProfileConstraint(
+	account: Account,
+	meta: RouteProfileConstraintMeta,
+	logicalModel: string | null | undefined,
+	concretePhysicalModel?: string | null,
+): {
+	readonly violation: RouteProfileConstraintViolation | null;
+	readonly catalogRoleTarget: string | null;
+} {
+	if (!meta.routeProfileId?.trim()) {
+		return { violation: null, catalogRoleTarget: null };
+	}
 
 	const expectedProvider = meta.routeExpectedProvider?.trim().toLowerCase();
 	if (
 		expectedProvider &&
 		account.provider.trim().toLowerCase() !== expectedProvider
 	) {
-		return "provider_mismatch";
+		return { violation: "provider_mismatch", catalogRoleTarget: null };
 	}
 
+	if (meta.routePhysicalModelPolicy === "catalog-role") {
+		const evaluation = evaluateCatalogRoleConstraint(
+			account,
+			meta,
+			logicalModel,
+			concretePhysicalModel,
+		);
+		return {
+			violation: evaluation.violation,
+			catalogRoleTarget: evaluation.target,
+		};
+	}
+
+	return {
+		violation: getExactPhysicalModelViolation(
+			account,
+			meta,
+			logicalModel,
+			concretePhysicalModel,
+		),
+		catalogRoleTarget: null,
+	};
+}
+
+function getExactPhysicalModelViolation(
+	account: Account,
+	meta: RouteProfileConstraintMeta,
+	logicalModel: string | null | undefined,
+	concretePhysicalModel?: string | null,
+): "model_mapping_mismatch" | null {
 	const expectedPhysicalModel = meta.routeExpectedPhysicalModel?.trim();
 	if (!expectedPhysicalModel) return null;
 
@@ -612,6 +749,8 @@ function serverToolSelectionFailure(meta: RequestMeta): ServerToolRoutingError {
 
 export type ForceRouteUnavailableReason =
 	| "account_capacity_exhausted"
+	| "catalog_role_mismatch"
+	| "catalog_role_unavailable"
 	| "conflicting_force_route"
 	| "lookup_failed"
 	| "model_capacity_exhausted"
@@ -2191,8 +2330,20 @@ function matchesCapabilityRouteProfile(
 	meta: RequestMeta,
 ): boolean {
 	const expectedProvider = meta.routeExpectedProvider?.trim().toLowerCase();
-	const expectedPhysicalModel = meta.routeProfileExpectedPhysicalModel?.trim();
 	const logicalModel = meta.routeProfileLogicalModel?.trim();
+	if (meta.routeProfilePhysicalModelPolicy === "catalog-role") {
+		if (!expectedProvider || !logicalModel) return false;
+		const evaluation = evaluateRootCatalogRoleConstraint(account, meta);
+		const admitted =
+			evaluation.violation === null && evaluation.catalogRoleTarget !== null;
+		recordCatalogRoleAdmission(
+			meta,
+			account.id,
+			admitted ? evaluation.catalogRoleTarget : null,
+		);
+		return admitted;
+	}
+	const expectedPhysicalModel = meta.routeProfileExpectedPhysicalModel?.trim();
 	if (!expectedProvider || !expectedPhysicalModel || !logicalModel) {
 		return false;
 	}
@@ -2208,13 +2359,73 @@ function matchesCapabilityRouteProfile(
 	);
 }
 
+/**
+ * Evaluate the profile's root catalog-role predicate against live own-catalog
+ * evidence. Selection never reuses a target carried from an earlier admission,
+ * so a re-check after strategy ordering sees any publication in between.
+ */
+function evaluateRootCatalogRoleConstraint(
+	account: Account,
+	meta: RequestMeta,
+): ReturnType<typeof evaluateRouteProfileConstraint> {
+	return evaluateRouteProfileConstraint(
+		account,
+		{
+			...meta,
+			routePhysicalModelPolicy: "catalog-role",
+			routeExpectedPhysicalModel: null,
+			routeCatalogRoleTargetByAccountId: null,
+		},
+		meta.routeProfileLogicalModel?.trim(),
+	);
+}
+
+/**
+ * Remember the role target that admitted an account (or forget it after a
+ * rejection), so the attempt later sends exactly that model.
+ */
+function recordCatalogRoleAdmission(
+	meta: RequestMeta,
+	accountId: string,
+	target: string | null,
+): void {
+	const next = new Map(meta.routeCatalogRoleTargetByAccountId ?? []);
+	if (target) next.set(accountId, target);
+	else next.delete(accountId);
+	meta.routeCatalogRoleTargetByAccountId = next;
+}
+
+/**
+ * Why a catalog-role pool admitted nobody: some candidate had its own role
+ * target but its effective mapping differs, or no candidate had one at all.
+ */
+function catalogRolePoolViolation(
+	meta: RequestMeta,
+	poolAccounts: readonly Account[],
+): "catalog_role_mismatch" | "catalog_role_unavailable" {
+	return poolAccounts.some(
+		(account) =>
+			evaluateRootCatalogRoleConstraint(account, meta).violation ===
+			"catalog_role_mismatch",
+	)
+		? "catalog_role_mismatch"
+		: "catalog_role_unavailable";
+}
+
 function capabilityRouteUnavailable(
 	meta: RequestMeta,
 	matchingAccounts: readonly Account[],
+	poolAccounts?: readonly Account[],
 ): ForceRouteUnavailableError {
 	const accountId = meta.routeProfileId?.trim() || "capability-route";
 	if (matchingAccounts.length === 0) {
-		return new ForceRouteUnavailableError(accountId, "model_mapping_mismatch");
+		return new ForceRouteUnavailableError(
+			accountId,
+			poolAccounts !== undefined &&
+				meta.routeProfilePhysicalModelPolicy === "catalog-role"
+				? catalogRolePoolViolation(meta, poolAccounts)
+				: "model_mapping_mismatch",
+		);
 	}
 	if (matchingAccounts.every((account) => account.paused)) {
 		return new ForceRouteUnavailableError(accountId, "paused");
@@ -2286,7 +2497,17 @@ async function selectCapabilityDescendantAccounts(
 			matchesCapabilityRouteProfile(account, meta) &&
 			!isProviderExcludedForRequest(account, excludedProviders),
 	);
-	if (rootPool.length === 0) throw capabilityRouteUnavailable(meta, rootPool);
+	if (rootPool.length === 0) {
+		throw capabilityRouteUnavailable(
+			meta,
+			rootPool,
+			allAccounts.filter(
+				(account) =>
+					isAccountEligibleForRouteIntent(account, meta, ctx) &&
+					!isProviderExcludedForRequest(account, excludedProviders),
+			),
+		);
+	}
 
 	const globalPool = applyImplicitFallbackPolicy(
 		allAccounts.filter(
@@ -2612,6 +2833,8 @@ async function selectAccountsForRequestInternal(
 	meta.routingCandidates = null;
 	meta.routingSelectionDiagnostics = null;
 	meta.serverToolCapabilitySummary = undefined;
+	// Each selection re-derives catalog-role admission from live evidence.
+	meta.routeCatalogRoleTargetByAccountId = null;
 	saveCapacityContext(meta, effectiveModel, []);
 
 	// A route profile's server-derived account id has the same exact-account,
@@ -2678,15 +2901,23 @@ async function selectAccountsForRequestInternal(
 				);
 			}
 			if (meta.routeProfileId) {
-				const constraintViolation = getRouteProfileConstraintViolation(
+				const constraint = evaluateRouteProfileConstraint(
 					forcedAccount,
-					meta,
+					{ ...meta, routeCatalogRoleTargetByAccountId: null },
 					effectiveModel,
 				);
-				if (constraintViolation) {
+				if (constraint.violation) {
 					throw new ForceRouteUnavailableError(
 						forcedAccountId,
-						constraintViolation,
+						constraint.violation,
+					);
+				}
+				if (constraint.catalogRoleTarget !== null) {
+					// Carry the target that admitted this account into its attempt.
+					recordCatalogRoleAdmission(
+						meta,
+						forcedAccount.id,
+						constraint.catalogRoleTarget,
 					);
 				}
 			}
@@ -2986,7 +3217,15 @@ async function selectAccountsForRequestInternal(
 			if (meta.routeLineage?.kind === "helper") {
 				return selectGlobalHelperFallback();
 			}
-			throw capabilityRouteUnavailable(meta, matchingAccounts);
+			throw capabilityRouteUnavailable(
+				meta,
+				matchingAccounts,
+				allAccounts.filter(
+					(account) =>
+						isAccountEligibleForRouteIntent(account, meta, ctx) &&
+						!isProviderExcludedForRequest(account, excludedProviders),
+				),
+			);
 		}
 		let selected: Account[];
 		try {

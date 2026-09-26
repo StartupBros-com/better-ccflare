@@ -311,7 +311,7 @@ describe("implicit Codex catalog priming", () => {
 		expect(fetches).toBe(1);
 	});
 
-	it("never primes a cached negative even when another cold account needs discovery", async () => {
+	it("revalidates a cached negative for an unknown concrete model alongside a cold account's discovery", async () => {
 		const negative = makeAccount({
 			id: "negative",
 			model_mappings: JSON.stringify({ sonnet: PHYSICAL_MODEL }),
@@ -326,6 +326,49 @@ describe("implicit Codex catalog priming", () => {
 		};
 		globalThis.fetch = (async () =>
 			catalogResponse(PHYSICAL_MODEL)) as typeof fetch;
+		// The requested id is genuinely unknown to `negative`'s cached listing, so
+		// one bounded, cooled-down revalidation may run alongside `cold`'s normal
+		// discovery. A fresh listing that now serves the model joins the result.
+		expect(
+			await resolveImplicitCodexRoute(
+				carrier(PHYSICAL_MODEL),
+				[negative, cold],
+				{
+					ctx,
+					deadlineAt: Date.now() + 1_000,
+				},
+			),
+		).toEqual({ id: PHYSICAL_MODEL, matchingAccounts: [negative, cold] });
+		expect(reads).toEqual([negative.id, cold.id]);
+	});
+
+	it("leaves a cached negative excluded when its bounded revalidation still does not serve the model", async () => {
+		const negative = makeAccount({
+			id: "negative",
+			access_token: "negative-access-token",
+			model_mappings: JSON.stringify({ sonnet: PHYSICAL_MODEL }),
+		});
+		await primeCatalog(negative, "other-model");
+		const cold = makeAccount();
+		const ctx = makeContext(cold);
+		const reads: string[] = [];
+		ctx.dbOps.getAccount = async (id) => {
+			reads.push(id);
+			return id === negative.id ? negative : cold;
+		};
+		// Each account authenticates with its own token; negative's revalidated
+		// listing still omits PHYSICAL_MODEL, proving one bounded revalidation
+		// must not fabricate capacity that genuinely is not there.
+		globalThis.fetch = (async (
+			_input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const headers = init?.headers as Record<string, string> | undefined;
+			const isNegative = headers?.authorization?.includes(
+				negative.access_token as string,
+			);
+			return catalogResponse(isNegative ? "other-model" : PHYSICAL_MODEL);
+		}) as typeof fetch;
 		expect(
 			await resolveImplicitCodexRoute(
 				carrier(PHYSICAL_MODEL),
@@ -336,7 +379,7 @@ describe("implicit Codex catalog priming", () => {
 				},
 			),
 		).toEqual({ id: PHYSICAL_MODEL, matchingAccounts: [cold] });
-		expect(reads).toEqual([cold.id]);
+		expect(reads).toEqual([negative.id, cold.id]);
 	});
 
 	it("primes an unprimed account once within the selection deadline", async () => {

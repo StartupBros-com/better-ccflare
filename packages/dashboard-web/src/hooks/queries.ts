@@ -28,6 +28,14 @@ export interface ManagedRoutingInvalidationOptions {
 	combos?: boolean;
 	effective?: boolean;
 	accountOverview?: boolean;
+	/**
+	 * `queryKeys.providerModelDefaults()` — the Automatic/Pinned source
+	 * `useCodexAccountEffectiveDefaults` reports. Not part of the routing
+	 * matrix's other keys, so a mutation that can change which layer pins an
+	 * account's family (e.g. saving its model mappings) must opt in
+	 * explicitly or that status goes stale until something else refetches it.
+	 */
+	providerModelDefaults?: boolean;
 }
 
 export const FULL_MANAGED_ROUTING_INVALIDATION = {
@@ -92,6 +100,13 @@ export async function invalidateManagedRouting(
 		invalidations.push(
 			queryClient.invalidateQueries({
 				queryKey: queryKeys.accountRoutingOverview(),
+			}),
+		);
+	}
+	if (options.providerModelDefaults) {
+		invalidations.push(
+			queryClient.invalidateQueries({
+				queryKey: queryKeys.providerModelDefaults(),
 			}),
 		);
 	}
@@ -786,7 +801,15 @@ export const getUpdateAccountCustomEndpointMutationOptions = (
 		accountId: string;
 		customEndpoint: string | null;
 	}) => api.updateAccountCustomEndpoint(accountId, customEndpoint),
-	onSuccess: () => invalidateManagedRouting(queryClient),
+	// A custom endpoint's embedded `modelMappings` is the
+	// `custom_endpoint_mapping` pin source, so saving it can change the
+	// Automatic/Pinned status AccountModelMappingsDialog reads via
+	// `useCodexAccountEffectiveDefaults` (queryKeys.providerModelDefaults()).
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, {
+			...FULL_MANAGED_ROUTING_INVALIDATION,
+			providerModelDefaults: true,
+		}),
 });
 
 export const useUpdateAccountCustomEndpoint = () => {
@@ -806,7 +829,16 @@ export const getUpdateAccountModelMappingsMutationOptions = (
 		accountId: string;
 		modelMappings: Record<string, string | string[]>;
 	}) => api.updateAccountModelMappings(accountId, modelMappings),
-	onSuccess: () => invalidateManagedRouting(queryClient),
+	// Saving an account's model mappings can change which layer pins its
+	// family (account mapping vs. catalog vs. provider default), so the
+	// Automatic/Pinned status AccountModelMappingsDialog reads via
+	// `useCodexAccountEffectiveDefaults` (queryKeys.providerModelDefaults())
+	// must refresh too, not just the account record itself.
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, {
+			...FULL_MANAGED_ROUTING_INVALIDATION,
+			providerModelDefaults: true,
+		}),
 });
 
 export const useUpdateAccountModelMappings = () => {

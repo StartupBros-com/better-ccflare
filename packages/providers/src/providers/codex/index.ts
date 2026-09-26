@@ -6,6 +6,12 @@ export {
 	mapWhamUsageResponse,
 	resetCodexUsageEndpointForTest,
 } from "./api-usage";
+export type { CodexClientIdentity } from "./client-identity";
+export {
+	CODEX_CLIENT_VERSION_ENV,
+	CODEX_VERIFIED_VERSION_FILE_ENV,
+	resolveCodexClientIdentity,
+} from "./client-identity";
 export type { CodexDeviceFlowResult, CodexTokenResponse } from "./device-oauth";
 export {
 	initiateCodexDeviceFlow,

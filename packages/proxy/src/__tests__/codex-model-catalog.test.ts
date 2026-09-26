@@ -1,20 +1,33 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { type CodexCatalogEvt, codexCatalogEvents } from "@better-ccflare/core";
+import { Logger } from "@better-ccflare/logger";
 import {
 	CodexProvider,
 	clearDerivedAccountModelDefaults,
 	clearDerivedProviderModelDefaults,
 	hasDerivedProviderModelDefaults,
+	resolveModelContextCapability,
 	resolveProviderModelDefault,
 	setDerivedProviderModelDefaults,
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import {
+	CODEX_CATALOG_STALE_ALERT_MS,
 	clearCodexModelCacheForAccount,
 	clearCodexModelCacheForTests,
 	ensureCodexModelDefaults,
+	evaluateCodexCatalogStaleness,
+	evaluateCodexClientIdentityRecord,
 	getCodexModels,
 	getKnownCodexModels,
+	initCodexModelCatalogRefresh,
 	lowestTierCodexModel,
+	CATALOG_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS,
+	reportCatalogRoleRouteFailClosed,
+	revalidateUnknownCodexModel,
 } from "../codex-model-catalog";
 import type { ProxyContext } from "../handlers/proxy-types";
 
@@ -119,6 +132,34 @@ async function waitForFetchCount(
 	expect(readCount()).toBe(expected);
 }
 
+// A real (unmocked) wall-clock wait, for tests that mock Date.now to control
+// application-level scheduling math while still needing the real
+// setInterval-backed heartbeat to actually fire between waypoints.
+async function waitRealMs(totalMs: number, stepMs = 5): Promise<void> {
+	const steps = Math.max(1, Math.ceil(totalMs / stepMs));
+	for (let i = 0; i < steps; i++) {
+		await new Promise((resolve) => setTimeout(resolve, stepMs));
+	}
+}
+
+async function waitForWarnCall(
+	warnSpy: { mock: { calls: unknown[][] } },
+	substring: string,
+	iterations = 20,
+): Promise<void> {
+	for (
+		let i = 0;
+		i < iterations &&
+		!warnSpy.mock.calls.some((call) => String(call[0]).includes(substring));
+		i++
+	) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	expect(
+		warnSpy.mock.calls.some((call) => String(call[0]).includes(substring)),
+	).toBe(true);
+}
+
 let originalFetch: typeof globalThis.fetch;
 
 beforeEach(() => {
@@ -137,6 +178,33 @@ afterEach(() => {
 });
 
 describe("getCodexModels", () => {
+	it("pairs catalog version and user agent across credential awaits", async () => {
+		const oldVersion = process.env.CCFLARE_CODEX_CLIENT_VERSION;
+		const requests: Request[] = [];
+		try {
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.171.0";
+			globalThis.fetch = (async (input, init) => {
+				requests.push(new Request(input, init));
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			const pending = getCodexModels("acc-codex", makeCtx(makeAccount()));
+			// Allow the account lookup to complete; fetchLive snapshots before its token await.
+			await Promise.resolve();
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.172.0";
+			await pending;
+			expect(new URL(requests[0].url).searchParams.get("client_version")).toBe(
+				"0.171.0",
+			);
+			expect(requests[0].headers.get("User-Agent")).toBe(
+				"codex_cli_rs/0.171.0",
+			);
+			expect(requests[0].headers.get("originator")).toBe("codex_cli_rs");
+		} finally {
+			if (oldVersion === undefined)
+				delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			else process.env.CCFLARE_CODEX_CLIENT_VERSION = oldVersion;
+		}
+	});
 	it("uses the current inference version when discovering Sol and Luna", async () => {
 		const requests: Request[] = [];
 		globalThis.fetch = (async (input, init) => {
@@ -351,6 +419,297 @@ describe("getCodexModels", () => {
 
 	it("returns nothing for an account that does not exist", async () => {
 		expect(await getCodexModels("ghost", makeCtx(null))).toBeNull();
+	});
+});
+
+describe("periodic Codex catalog freshness", () => {
+	it("coalesces unknown-model revalidation and observes an account cooldown", async () => {
+		const account = makeAccount();
+		const ctx = makeCtx(account);
+		let calls = 0;
+		globalThis.fetch = (async () => {
+			calls++;
+			return Response.json(calls === 1 ? LIVE_BODY : NEW_FRONTIER_BODY);
+		}) as typeof globalThis.fetch;
+		await getCodexModels(account.id, ctx);
+		await Promise.all(
+			Array.from({ length: 12 }, () =>
+				revalidateUnknownCodexModel(account, "gpt-6-codex", ctx),
+			),
+		);
+		expect(calls).toBe(2);
+		await revalidateUnknownCodexModel(account, "unlisted-next", ctx);
+		expect(calls).toBe(2);
+		expect(getKnownCodexModels(account.id)?.models[0].id).toBe("gpt-6-codex");
+	});
+
+	it("schedules only active Codex accounts and stops on shutdown", async () => {
+		const codex = makeAccount();
+		const paused = makeAccount({ id: "paused", paused: true });
+		const foreign = makeAccount({ id: "foreign", provider: "xai" });
+		const ctx = makeCtx(codex);
+		ctx.dbOps.getAllAccounts = async () => [codex, paused, foreign];
+		const calls: string[] = [];
+		globalThis.fetch = (async () => {
+			calls.push("fetch");
+			return Response.json(LIVE_BODY);
+		}) as typeof globalThis.fetch;
+		const stop = initCodexModelCatalogRefresh(ctx, {
+			initialDelayMs: 1,
+			tickSeconds: 1,
+		});
+		try {
+			await waitForFetchCount(() => calls.length, 1);
+			expect(getKnownCodexModels(paused.id)).toBeNull();
+			expect(getKnownCodexModels(foreign.id)).toBeNull();
+		} finally {
+			stop();
+		}
+		expect(calls).toHaveLength(1);
+	});
+
+	// nextRefreshAt used to be pinned at *tick-start* + 15min (+ jitter),
+	// independent of how long that tick's own fetch actually took. Any
+	// account whose fetch finishes late within its tick misses the next
+	// tick's own per-account freshness check (it isn't 15 real minutes
+	// stale *yet*, by ensureCodexModelDefaults's own fetchedAt-based
+	// clock) and then gets rescheduled a further 15 minutes out from that
+	// *skipped* tick's start -- silently doubling its true refresh
+	// interval. Anchoring nextRefreshAt to tick *completion* keeps the
+	// heartbeat's own due-check aligned with the per-account check it
+	// gates, for every account touched that tick.
+	it("does not skip an account's next refresh when its fetch finishes late in a tick", async () => {
+		const BASE_NOW = 1_800_000_000_000;
+		const CATALOG_REFRESH_INTERVAL_MS = 15 * 60_000;
+		const FETCH_DELAY_MS = 2 * 60_000;
+		let currentNow = BASE_NOW;
+		const nowSpy = spyOn(Date, "now").mockImplementation(() => currentNow);
+		const randomSpy = spyOn(Math, "random").mockReturnValue(0);
+		try {
+			const account = makeAccount({
+				expires_at: BASE_NOW + 10 * 3_600_000,
+			});
+			const ctx = makeCtx(account);
+			ctx.dbOps.getAllAccounts = async () => [account];
+			let fetchCount = 0;
+			globalThis.fetch = (async () => {
+				fetchCount++;
+				// This account's own fetch takes real (simulated) time; its
+				// fetchedAt is stamped only once this resolves, inside
+				// getCodexModels -- not at tick start.
+				currentNow += FETCH_DELAY_MS;
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+
+			const stop = initCodexModelCatalogRefresh(ctx, {
+				initialDelayMs: 1,
+				tickSeconds: 0.01,
+			});
+			try {
+				await waitForFetchCount(() => fetchCount, 1);
+				const firstFetchedAt = getKnownCodexModels(account.id)?.fetchedAt;
+				expect(firstFetchedAt).toBe(BASE_NOW + FETCH_DELAY_MS);
+
+				// The old tick-start-anchored nextRefreshAt would open here.
+				// The account is not yet 15 real minutes past its own
+				// fetchedAt, so a correct per-account check still holds it.
+				currentNow = BASE_NOW + CATALOG_REFRESH_INTERVAL_MS;
+				await waitRealMs(40);
+
+				// The account's true due point: 15 minutes after its own
+				// fetchedAt (not after tick start). Bounded polling (rather than a
+				// fixed real-time wait) for this positive assertion: it only needs
+				// the heartbeat to fire at least once more, so it should not force
+				// every run to pay a fixed 60ms regardless of how quickly that
+				// actually happens, nor risk flaking on a slower CI host.
+				currentNow = BASE_NOW + FETCH_DELAY_MS + CATALOG_REFRESH_INTERVAL_MS;
+				await waitForFetchCount(() => fetchCount, 2);
+
+				expect(getKnownCodexModels(account.id)?.fetchedAt).toBe(
+					BASE_NOW + CATALOG_REFRESH_INTERVAL_MS + 2 * FETCH_DELAY_MS,
+				);
+			} finally {
+				stop();
+			}
+		} finally {
+			nowSpy.mockRestore();
+			randomSpy.mockRestore();
+		}
+	});
+
+	it("warns when the eligible Codex account list exceeds the refresh cap", async () => {
+		const accounts = Array.from({ length: 103 }, (_, i) =>
+			makeAccount({ id: `acc-${i}` }),
+		);
+		const ctx = makeCtx(accounts[0]);
+		ctx.dbOps.getAllAccounts = async () => accounts;
+		globalThis.fetch = (async () =>
+			Response.json(LIVE_BODY)) as typeof globalThis.fetch;
+		const warnSpy = spyOn(Logger.prototype, "warn").mockImplementation(
+			() => undefined,
+		);
+		const stop = initCodexModelCatalogRefresh(ctx, {
+			initialDelayMs: 1,
+			tickSeconds: 1,
+		});
+		try {
+			await waitForWarnCall(warnSpy, "100 of 103");
+			const call = warnSpy.mock.calls.find((c) =>
+				String(c[0]).includes("100 of 103"),
+			);
+			expect(String(call?.[0])).toContain("3");
+		} finally {
+			stop();
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("does not warn when the eligible Codex account list is within the refresh cap", async () => {
+		const codex = makeAccount();
+		const ctx = makeCtx(codex);
+		ctx.dbOps.getAllAccounts = async () => [codex];
+		globalThis.fetch = (async () =>
+			Response.json(LIVE_BODY)) as typeof globalThis.fetch;
+		const warnSpy = spyOn(Logger.prototype, "warn").mockImplementation(
+			() => undefined,
+		);
+		const stop = initCodexModelCatalogRefresh(ctx, {
+			initialDelayMs: 1,
+			tickSeconds: 1,
+		});
+		try {
+			await waitRealMs(30);
+			expect(
+				warnSpy.mock.calls.some((c) => String(c[0]).includes("eligible")),
+			).toBe(false);
+		} finally {
+			stop();
+			warnSpy.mockRestore();
+		}
+	});
+	it("returns the warm listing without waiting for a stalled stale refresh and coalesces callers", async () => {
+		const account = makeAccount();
+		const ctx = makeCtx(account);
+		let calls = 0;
+		let release!: () => void;
+		globalThis.fetch = (async () => {
+			calls++;
+			if (calls === 1) return Response.json(LIVE_BODY);
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return Response.json(NEW_FRONTIER_BODY);
+		}) as typeof globalThis.fetch;
+		await getCodexModels(account.id, ctx);
+		const due = () => Date.now() + 16 * 60_000;
+		const first = ensureCodexModelDefaults(account, ctx, due);
+		await waitForFetchCount(() => calls, 2);
+		let settled = false;
+		void first.then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(true);
+		await ensureCodexModelDefaults(account, ctx, due);
+		expect(calls).toBe(2);
+		expect(getKnownCodexModels(account.id)?.models[0].id).toBe("gpt-5.6-sol");
+		release();
+		await waitForFetchCount(
+			() =>
+				getKnownCodexModels(account.id)?.models[0].id === "gpt-6-codex" ? 1 : 0,
+			1,
+		);
+	});
+
+	it("refreshes an existing own listing after fifteen minutes and retains it on failure", async () => {
+		let calls = 0;
+		globalThis.fetch = (async () => {
+			calls++;
+			return calls === 1
+				? new Response(JSON.stringify(LIVE_BODY), { status: 200 })
+				: new Response("unavailable", { status: 503 });
+		}) as typeof globalThis.fetch;
+		const account = makeAccount();
+		const ctx = makeCtx(account);
+		await ensureCodexModelDefaults(account, ctx);
+		expect(calls).toBe(1);
+		await ensureCodexModelDefaults(
+			account,
+			ctx,
+			() => Date.now() + 16 * 60_000,
+		);
+		// A warm request returns before the advisory fetch settles.
+		await waitForFetchCount(() => calls, 2);
+		expect(calls).toBe(2);
+		expect(getKnownCodexModels(account.id)?.models[0].id).toBe("gpt-5.6-sol");
+	});
+});
+
+describe("catalog-backed capacities", () => {
+	it("accepts safe large catalog windows and never invents capacity for missing scalars", async () => {
+		globalThis.fetch = (async () =>
+			Response.json({
+				models: [
+					{
+						slug: "gpt-6-wide",
+						visibility: "list",
+						context_window: 272_000,
+						max_context_window: 4_000_000,
+						effective_context_window_percent: 95,
+					},
+					{ slug: "gpt-5.6-sol", visibility: "list", context_window: 272_000 },
+				],
+			})) as typeof globalThis.fetch;
+		await getCodexModels("acc-codex", makeCtx(makeAccount()));
+		expect(
+			resolveModelContextCapability("codex", "gpt-6-wide", "acc-codex")
+				?.effectiveContextWindow,
+		).toBe(3_800_000);
+		expect(
+			resolveModelContextCapability("codex", "gpt-5.6-sol", "acc-codex"),
+		).toBeUndefined();
+	});
+
+	it("publishes bounded model capacity per account without leaking to other accounts", async () => {
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					models: [
+						{
+							slug: "gpt-6-luna",
+							visibility: "list",
+							priority: 1,
+							context_window: 272000,
+							max_context_window: 872000,
+							effective_context_window_percent: 95,
+						},
+						{
+							slug: "bad-window",
+							visibility: "list",
+							priority: 2,
+							context_window: -1,
+							max_context_window: 1e30,
+							effective_context_window_percent: 105,
+						},
+					],
+				}),
+				{ status: 200 },
+			)) as typeof globalThis.fetch;
+		await getCodexModels("acc-codex", makeCtx(makeAccount()));
+		expect(
+			resolveModelContextCapability("codex", "gpt-6-luna", "acc-codex"),
+		).toMatchObject({
+			defaultContextWindow: 272000,
+			maxContextWindow: 872000,
+			effectiveContextWindow: 828400,
+			match: "exact",
+		});
+		expect(
+			resolveModelContextCapability("codex", "gpt-6-luna", "other-account"),
+		).toBeUndefined();
+		expect(
+			resolveModelContextCapability("codex", "bad-window", "acc-codex"),
+		).toBeUndefined();
 	});
 });
 
@@ -904,5 +1263,457 @@ describe("ensureCodexModelDefaults", () => {
 		clearCodexModelCacheForTests();
 		await ensureCodexModelDefaults(account, makeCtx(account), () => 50_000);
 		expect(fetches).toBe(2);
+	});
+});
+
+/**
+ * The catalog side of the Codex alerts (issue #370 unit 6): the proxy only
+ * emits typed events on the core bus; AlertService turns them into alerts.
+ */
+type CatalogEventOf<T extends CodexCatalogEvt["type"]> = Extract<
+	CodexCatalogEvt,
+	{ type: T }
+>;
+
+function collectCatalogEvents() {
+	const events: CodexCatalogEvt[] = [];
+	const listener = (event: CodexCatalogEvt) => {
+		events.push(event);
+	};
+	codexCatalogEvents.on("event", listener);
+	return {
+		events,
+		of<T extends CodexCatalogEvt["type"]>(type: T): CatalogEventOf<T>[] {
+			return events.filter(
+				(event): event is CatalogEventOf<T> => event.type === type,
+			);
+		},
+		stop() {
+			codexCatalogEvents.off("event", listener);
+		},
+	};
+}
+
+function serve(body: unknown, status = 200): void {
+	globalThis.fetch = (async () =>
+		typeof body === "string"
+			? new Response(body, { status })
+			: new Response(JSON.stringify(body), {
+					status,
+					headers: { "content-type": "application/json" },
+				})) as unknown as typeof globalThis.fetch;
+}
+
+/** Bounded polling for a positive assertion; never a fixed real-time wait. */
+async function waitUntil(
+	predicate: () => boolean,
+	iterations = 400,
+): Promise<void> {
+	for (let i = 0; i < iterations && !predicate(); i++) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	expect(predicate()).toBe(true);
+}
+
+describe("Codex catalog alert events", () => {
+	let collected: ReturnType<typeof collectCatalogEvents>;
+
+	beforeEach(() => {
+		collected = collectCatalogEvents();
+	});
+
+	afterEach(() => {
+		collected.stop();
+	});
+
+	it("publishes a first own catalog without reporting a role change", async () => {
+		serve(LIVE_BODY);
+		await getCodexModels("acc-codex", makeCtx(makeAccount()));
+
+		expect(collected.of("role_target_changed")).toEqual([]);
+		expect(collected.of("own_catalog_published")).toEqual([
+			{
+				type: "own_catalog_published",
+				accountId: "acc-codex",
+				accountName: "codex-account",
+				models: ["gpt-5.6-sol", "gpt-5.4-mini"],
+				roleTargets: {
+					fable: "gpt-5.6-sol",
+					opus: "gpt-5.6-sol",
+					sonnet: "gpt-5.4-mini",
+					haiku: "gpt-5.4-mini",
+				},
+			},
+		]);
+	});
+
+	it("reports each changed role target exactly once and nothing on a same-value republish", async () => {
+		const ctx = makeCtx(makeAccount());
+		serve(LIVE_BODY);
+		await getCodexModels("acc-codex", ctx);
+		serve(NEW_FRONTIER_BODY);
+		await getCodexModels("acc-codex", ctx);
+
+		const changes = [
+			{ family: "fable", from: "gpt-5.6-sol", to: "gpt-6-codex" },
+			{ family: "opus", from: "gpt-5.6-sol", to: "gpt-6-codex" },
+			{ family: "sonnet", from: "gpt-5.4-mini", to: "gpt-5.6-sol" },
+			{ family: "haiku", from: "gpt-5.4-mini", to: "gpt-5.6-sol" },
+		] as const;
+		const expected = changes.map(
+			(change): CatalogEventOf<"role_target_changed"> => ({
+				type: "role_target_changed",
+				accountId: "acc-codex",
+				accountName: "codex-account",
+				...change,
+			}),
+		);
+		expect(collected.of("role_target_changed")).toEqual(expected);
+
+		await getCodexModels("acc-codex", ctx);
+		expect(collected.of("role_target_changed")).toEqual(expected);
+		expect(collected.of("own_catalog_published")).toHaveLength(3);
+	});
+
+	it("emits nothing for a failed, empty or malformed refresh", async () => {
+		const ctx = makeCtx(makeAccount());
+		serve(LIVE_BODY);
+		await getCodexModels("acc-codex", ctx);
+		collected.events.length = 0;
+
+		const replies: Array<[unknown, number]> = [
+			["unavailable", 503],
+			[{ models: [] }, 200],
+			["{not json", 200],
+			[{ models: "gpt-9" }, 200],
+			[null, 200],
+			[{ models: [{ slug: 42, visibility: "list" }] }, 200],
+		];
+		for (const [body, status] of replies) {
+			serve(body, status);
+			const listing = await getCodexModels("acc-codex", ctx);
+			expect(listing?.source).toBe("cached");
+		}
+
+		expect(collected.events).toEqual([]);
+		expect(
+			getKnownCodexModels("acc-codex")?.models.map((model) => model.id),
+		).toEqual(["gpt-5.6-sol", "gpt-5.4-mini"]);
+	});
+
+	it("never publishes a borrowed listing as the borrower's own", async () => {
+		serve(LIVE_BODY);
+		await getCodexModels("acc-codex", makeCtx(makeAccount()));
+		collected.events.length = 0;
+
+		serve("nope", 401);
+		const listing = await getCodexModels(
+			"acc-blind",
+			makeCtx(makeAccount({ id: "acc-blind" })),
+		);
+
+		expect(listing?.source).toBe("shared");
+		expect(collected.events).toEqual([]);
+	});
+
+	it("treats a recreated account's first publication as a first load", async () => {
+		const ctx = makeCtx(makeAccount());
+		serve(LIVE_BODY);
+		await getCodexModels("acc-codex", ctx);
+		clearCodexModelCacheForAccount("acc-codex");
+		serve(NEW_FRONTIER_BODY);
+		await getCodexModels("acc-codex", ctx);
+
+		expect(collected.of("role_target_changed")).toEqual([]);
+		expect(collected.of("own_catalog_published")).toHaveLength(2);
+	});
+
+	describe("stale own catalogs", () => {
+		const BASE_NOW = 1_800_000_000_000;
+
+		it("uses a conservative threshold of four refresh intervals", () => {
+			expect(CODEX_CATALOG_STALE_ALERT_MS).toBe(4 * REFRESH_INTERVAL_MS);
+		});
+
+		it("reports a stale own catalog only past the threshold after a failed attempt", async () => {
+			let now = BASE_NOW;
+			const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+			try {
+				const account = makeAccount({ expires_at: BASE_NOW + 10 * 3_600_000 });
+				const ctx = makeCtx(account);
+				serve(LIVE_BODY);
+				await getCodexModels(account.id, ctx);
+
+				// Old but healthy: the latest attempt succeeded.
+				evaluateCodexCatalogStaleness(
+					[account],
+					BASE_NOW + 10 * CODEX_CATALOG_STALE_ALERT_MS,
+				);
+				expect(collected.of("catalog_stale")).toEqual([]);
+
+				now = BASE_NOW + REFRESH_INTERVAL_MS + 1;
+				serve("unavailable", 503);
+				await getCodexModels(account.id, ctx);
+
+				// Failed, but not yet past the threshold.
+				evaluateCodexCatalogStaleness(
+					[account],
+					BASE_NOW + CODEX_CATALOG_STALE_ALERT_MS,
+				);
+				expect(collected.of("catalog_stale")).toEqual([]);
+
+				evaluateCodexCatalogStaleness(
+					[account],
+					BASE_NOW + CODEX_CATALOG_STALE_ALERT_MS + 1,
+				);
+				expect(collected.of("catalog_stale")).toEqual([
+					{
+						type: "catalog_stale",
+						accountId: account.id,
+						accountName: account.name,
+						ageMs: CODEX_CATALOG_STALE_ALERT_MS + 1,
+					},
+				]);
+
+				// An account the refresh would skip is never reported.
+				evaluateCodexCatalogStaleness(
+					[{ ...account, paused: true }],
+					BASE_NOW + 2 * CODEX_CATALOG_STALE_ALERT_MS,
+				);
+				expect(collected.of("catalog_stale")).toHaveLength(1);
+
+				// A later success clears the failed-attempt state.
+				serve(LIVE_BODY);
+				await getCodexModels(account.id, ctx);
+				evaluateCodexCatalogStaleness(
+					[account],
+					now + 2 * CODEX_CATALOG_STALE_ALERT_MS,
+				);
+				expect(collected.of("catalog_stale")).toHaveLength(1);
+			} finally {
+				nowSpy.mockRestore();
+			}
+		});
+
+		it("never reports an account that has no catalog of its own", async () => {
+			const account = makeAccount({ id: "acc-never-listed" });
+			serve("nope", 401);
+			await getCodexModels(account.id, makeCtx(account));
+
+			evaluateCodexCatalogStaleness(
+				[account],
+				Date.now() + 10 * CODEX_CATALOG_STALE_ALERT_MS,
+			);
+
+			expect(collected.events).toEqual([]);
+		});
+
+		it("is evaluated by the refresh heartbeat after its own attempt fails", async () => {
+			let now = BASE_NOW;
+			const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+			const randomSpy = spyOn(Math, "random").mockReturnValue(0);
+			const account = makeAccount({ expires_at: BASE_NOW + 10 * 3_600_000 });
+			const ctx = makeCtx(account);
+			ctx.dbOps.getAllAccounts = async () => [account];
+			let stop = (): void => {};
+			try {
+				serve(LIVE_BODY);
+				await getCodexModels(account.id, ctx);
+				serve("unavailable", 503);
+				now = BASE_NOW + CODEX_CATALOG_STALE_ALERT_MS + 60_000;
+
+				stop = initCodexModelCatalogRefresh(ctx, {
+					initialDelayMs: 1,
+					tickSeconds: 0.01,
+				});
+				await waitUntil(() => collected.of("catalog_stale").length > 0);
+
+				expect(collected.of("catalog_stale")[0]).toEqual({
+					type: "catalog_stale",
+					accountId: account.id,
+					accountName: account.name,
+					ageMs: CODEX_CATALOG_STALE_ALERT_MS + 60_000,
+				});
+			} finally {
+				stop();
+				nowSpy.mockRestore();
+				randomSpy.mockRestore();
+			}
+		});
+	});
+
+	describe("verified Codex CLI version record", () => {
+		const previousPath = process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
+		const previousVersion = process.env.CCFLARE_CODEX_CLIENT_VERSION;
+		let dir: string;
+
+		function writeRecord(name: string, verifiedAt: string): string {
+			const file = join(dir, name);
+			writeFileSync(
+				file,
+				JSON.stringify({
+					schemaVersion: 1,
+					packageName: "@openai/codex",
+					version: "0.190.0",
+					verifiedAt,
+				}),
+			);
+			return file;
+		}
+
+		beforeEach(() => {
+			dir = mkdtempSync(join(tmpdir(), "ccflare-codex-identity-alert-"));
+			delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			delete process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
+		});
+
+		afterEach(() => {
+			if (previousPath === undefined)
+				delete process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
+			else process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = previousPath;
+			if (previousVersion === undefined)
+				delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			else process.env.CCFLARE_CODEX_CLIENT_VERSION = previousVersion;
+			rmSync(dir, { recursive: true, force: true });
+		});
+
+		it("stays silent for an install without the updater", () => {
+			evaluateCodexClientIdentityRecord();
+			expect(collected.events).toEqual([]);
+		});
+
+		it("stays silent while a configured record is fresh", () => {
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = writeRecord(
+				"fresh",
+				new Date(Date.now() - 24 * 60 * 60_000).toISOString(),
+			);
+			evaluateCodexClientIdentityRecord();
+			expect(collected.events).toEqual([]);
+		});
+
+		it("reports a configured record that has gone stale", () => {
+			const verifiedAt = new Date(
+				Date.now() - 40 * 24 * 60 * 60_000,
+			).toISOString();
+			const file = writeRecord("stale", verifiedAt);
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = file;
+
+			evaluateCodexClientIdentityRecord();
+
+			expect(collected.of("identity_record_stale")).toEqual([
+				{
+					type: "identity_record_stale",
+					error: "stale_record",
+					version: "0.190.0",
+					verifiedAt,
+				},
+			]);
+			expect(JSON.stringify(collected.events)).not.toContain(dir);
+		});
+
+		it("reports a configured record that is missing", () => {
+			const file = join(dir, "missing");
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = file;
+
+			evaluateCodexClientIdentityRecord();
+
+			const [event] = collected.of("identity_record_stale");
+			expect(event).toMatchObject({
+				type: "identity_record_stale",
+				error: "unavailable_record",
+			});
+			expect(typeof event?.version).toBe("string");
+			expect(JSON.stringify(collected.events)).not.toContain(dir);
+		});
+
+		it("defers to an explicit client version", () => {
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.200.0";
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = join(dir, "missing");
+			evaluateCodexClientIdentityRecord();
+			expect(collected.events).toEqual([]);
+		});
+
+		it("is evaluated once per refresh cycle by the heartbeat, never per tick", async () => {
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = join(dir, "missing");
+			const ctx = makeCtx(null);
+			ctx.dbOps.getAllAccounts = async () => [];
+			const stop = initCodexModelCatalogRefresh(ctx, {
+				initialDelayMs: 1,
+				tickSeconds: 0.01,
+			});
+			try {
+				await waitUntil(() => collected.of("identity_record_stale").length > 0);
+				// Later heartbeat ticks inside the same refresh cycle stay quiet.
+				await waitRealMs(60);
+				expect(collected.of("identity_record_stale")).toHaveLength(1);
+			} finally {
+				stop();
+			}
+		});
+	});
+
+	describe("catalog-role route fail-closed reports", () => {
+		const T = 1_000_000;
+
+		it("reports each profile, account and reason once per throttle window", () => {
+			const mismatch = {
+				accountId: "acc-role",
+				reason: "catalog_role_mismatch",
+			};
+			reportCatalogRoleRouteFailClosed("codex-opus", mismatch, T);
+			reportCatalogRoleRouteFailClosed("codex-opus", mismatch, T + 1_000);
+			expect(collected.of("route_role_unavailable")).toEqual([
+				{
+					type: "route_role_unavailable",
+					profileId: "codex-opus",
+					accountId: "acc-role",
+					reason: "catalog_role_mismatch",
+				},
+			]);
+
+			reportCatalogRoleRouteFailClosed(
+				"codex-opus",
+				{ accountId: "acc-role", reason: "catalog_role_unavailable" },
+				T + 1_000,
+			);
+			expect(collected.of("route_role_unavailable")).toHaveLength(2);
+
+			reportCatalogRoleRouteFailClosed("codex-opus", mismatch, T + 60_001);
+			expect(collected.of("route_role_unavailable")).toHaveLength(3);
+		});
+
+		it("omits the account for a pool profile, whose error names the profile", () => {
+			reportCatalogRoleRouteFailClosed(
+				"codex-opus-pool",
+				{ accountId: "codex-opus-pool", reason: "catalog_role_unavailable" },
+				T,
+			);
+			expect(collected.of("route_role_unavailable")).toEqual([
+				{
+					type: "route_role_unavailable",
+					profileId: "codex-opus-pool",
+					reason: "catalog_role_unavailable",
+				},
+			]);
+		});
+
+		it("ignores other fail-closed reasons and routes without a profile", () => {
+			reportCatalogRoleRouteFailClosed(
+				"codex-opus",
+				{ accountId: "acc-role", reason: "paused" },
+				T,
+			);
+			reportCatalogRoleRouteFailClosed(
+				null,
+				{ accountId: "acc-role", reason: "catalog_role_mismatch" },
+				T,
+			);
+			reportCatalogRoleRouteFailClosed(
+				undefined,
+				{ accountId: "acc-role", reason: "catalog_role_unavailable" },
+				T,
+			);
+			expect(collected.events).toEqual([]);
+		});
 	});
 });

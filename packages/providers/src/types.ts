@@ -107,6 +107,8 @@ export interface ProviderAttemptPlanContext {
 	readonly path: string;
 	readonly query: string;
 	readonly physicalModel: string | null;
+	/** Identity captured with admission before any later credential/catalog await. */
+	readonly capturedAttemptIdentity?: unknown;
 	readonly capabilityProofKey: string | null;
 	readonly inputReplayMode: readonly ServerToolReplayAtom[];
 	readonly outputReplayMode: readonly ServerToolReplayAtom[];
@@ -290,6 +292,12 @@ export interface Provider {
 	 * account and physical model have been selected. Async planners are invalid.
 	 */
 	createAttemptPlan?(context: ProviderAttemptPlanContext): ProviderAttemptPlan;
+
+	/** Optional synchronous identity snapshot captured once per legacy physical attempt. */
+	captureAttemptIdentity?(
+		account?: Account,
+		modelContextSnapshot?: unknown,
+	): unknown;
 
 	/**
 	 * Check if this provider can handle the given request path

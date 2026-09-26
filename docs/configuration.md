@@ -409,6 +409,93 @@ model ID that Claude Code has saved, keep its `id` and replace `accountId` with
 same picker against every currently eligible matching account; no session or
 account UUID is copied into the public discovery response.
 
+### Catalog-role Codex profiles
+
+An `expectedPhysicalModel` is a fixed string, so a pool or pinned route that
+names one has to be edited and restarted for every new model generation. Set
+`physicalModelPolicy: "catalog-role"` instead to follow whatever model sits at
+the profile's role in each Codex account's own model catalog:
+
+```bash
+CCFLARE_MODEL_ROUTE_PROFILES_JSON='[
+  {
+    "id": "codex-opus",
+    "displayName": "Codex · opus",
+    "selection": "capability",
+    "logicalModel": "claude-opus-5",
+    "expectedProvider": "codex",
+    "physicalModelPolicy": "catalog-role"
+  },
+  {
+    "id": "codex-sonnet",
+    "displayName": "Codex · sonnet",
+    "selection": "capability",
+    "logicalModel": "claude-sonnet-5",
+    "expectedProvider": "codex",
+    "physicalModelPolicy": "catalog-role"
+  },
+  {
+    "id": "codex-haiku",
+    "displayName": "Codex · haiku",
+    "accountId": "00000000-0000-0000-0000-000000000000",
+    "logicalModel": "claude-haiku-4-5",
+    "expectedProvider": "codex",
+    "physicalModelPolicy": "catalog-role"
+  }
+]'
+```
+
+- **The role comes from `logicalModel`.** Its Claude family picks a position in
+  the account's catalog, which the provider already orders frontier first:
+  `fable` and `opus` take the first model, `sonnet` the second, and `haiku` the
+  third. A shorter catalog falls back to its last model. There is no separate
+  role field that could disagree with `logicalModel`, and a `logicalModel`
+  outside those four families is rejected at startup.
+- **Only the account's own catalog counts.** An account qualifies only when it
+  has read its own model listing, even an older last-good copy. A listing
+  borrowed from another Codex account is advisory and never names a target,
+  because plans can differ. Listings are kept in memory, so after a restart an
+  account has none until one is read. An account with no listing of its own is
+  primed once at request time, bounded by the account-selection deadline. If
+  that read fails, the route fails closed with `catalog_role_unavailable`.
+  Custom-endpoint Codex accounts are never primed or refreshed in the
+  background, so they qualify only after ordinary traffic has read their own
+  listing.
+- **Every model the route could send must be the role target.** The check
+  covers the account's `model_mappings` (including fallback arrays and legacy
+  `model_fallbacks`), `OPENAI_COMPATIBLE_MODEL_MAPPINGS`, and the global
+  provider default override. A pin that differs keeps that account out. A pin
+  that happens to equal the target is admitted, and a pin for another family
+  does not matter.
+- **Both selection modes work.** A capability profile admits exactly the Codex
+  accounts that pass this check. Paused, excluded and rate-limited accounts
+  stay out as before, and non-Codex accounts are never admitted. An
+  exact-account profile applies the same check to its one account.
+- **An attempt keeps the target it was admitted with.** If a catalog refresh
+  lands while a request is in flight, that attempt still sends the model that
+  admitted the account. The next request, or a later selection within the same
+  request, follows the new order. No profile edit or restart is involved.
+- **The policy needs the Codex provider and no fixed capacity claim.**
+  `catalog-role` requires `expectedProvider: "codex"` and rejects
+  `expectedPhysicalModel`, `contextWindow`, and `maxOutputTokens`. The model
+  changes with the catalog, so capacity comes from the catalog, not from a
+  number in the profile.
+
+Two failure reasons are specific to this policy. Both follow the existing
+`force_route_unavailable` 503 shape, and request history records them as
+`force_route_<reason>`:
+
+| Reason | Meaning |
+|---|---|
+| `catalog_role_unavailable` | The account (or, for a pool, every candidate) has no role target from its own catalog |
+| `catalog_role_mismatch` | The account has a role target, but a mapping, fallback, environment mapping, or provider override would send a different model |
+
+Picker IDs are chosen by the operator and stay `claude-bccf-route-<id>`, so
+role-named IDs such as `codex-opus` keep working across model generations.
+Discovery lists catalog-role profiles exactly like other profiles. Existing
+profiles without `physicalModelPolicy` behave as `"exact"`: their parsing,
+routing, error reasons, and saved picker IDs are unchanged.
+
 | Field | Required | Contract |
 |---|---:|---|
 | `id` | yes | Unique lowercase kebab-case slug, up to 48 characters. better-ccflare generates the reserved public model ID `claude-bccf-route-<id>`; clients cannot configure a different public ID |
@@ -419,7 +506,8 @@ account UUID is copied into the public discovery response.
 | `logicalModel` | yes | Claude request model written on an explicit root selection before the account's normal model mapping is applied |
 | `defaultEffort` | no | Default used only when the request omits effort. Accepted values: `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; an explicit client effort always wins |
 | `expectedProvider` | capability: yes; legacy: no | Lowercase provider guard. Capability profiles use it to build the candidate pool; legacy profiles fail closed if the pinned account differs |
-| `expectedPhysicalModel` | capability: yes; legacy: no | Guard for the first physical model produced by the account's mapping for `logicalModel`. Capability profiles use it as the pool predicate; legacy profiles fail closed if the pinned account differs. The guard reads the account's own configured `model_mappings`, not a provider default filled in later (for example xAI's catalog-derived default). Changing or clearing a pinned account's mapping without updating this field therefore fails every request on the profile. Omit it on a legacy profile that should follow the provider's newest model; see `docs/solutions/integration-issues/route-profile-expected-physical-model-checked-before-provider-defaults.md` |
+| `physicalModelPolicy` | no | `exact` (the default when omitted) or `catalog-role`. `catalog-role` requires `expectedProvider: "codex"`, a `logicalModel` in the fable, opus, sonnet or haiku family, and no `expectedPhysicalModel`, `contextWindow` or `maxOutputTokens`; see [Catalog-role Codex profiles](#catalog-role-codex-profiles) |
+| `expectedPhysicalModel` | capability: yes, unless `physicalModelPolicy` is `catalog-role` (then forbidden); legacy: no | Guard for the first physical model produced by the account's mapping for `logicalModel`. Capability profiles use it as the pool predicate; legacy profiles fail closed if the pinned account differs. The guard reads the account's own configured `model_mappings`, not a provider default filled in later (for example xAI's catalog-derived default). Changing or clearing a pinned account's mapping without updating this field therefore fails every request on the profile. Omit it on a legacy profile that should follow the provider's newest model; see `docs/solutions/integration-issues/route-profile-expected-physical-model-checked-before-provider-defaults.md` |
 | `exclusiveAccount` | no | Exact-account profiles only; defaults to `false`. When `true`, reserves the named account for exact configured route profiles that name it |
 | `contextWindow` | no | Exact-account profiles only; required with `maxOutputTokens`. Positive integer total context bound |
 | `maxOutputTokens` | no | Exact-account profiles only; required with `contextWindow`. Positive integer less than `contextWindow`; caps request output |
@@ -485,7 +573,7 @@ Gateway discovery can list multiple profiles; Claude Code's custom-model variabl
 
 Selecting a profile on a root agent pins only that authenticated caller's Claude Code session tree. Legacy profiles inherit the exact account. Capability profiles inherit the root capability predicate (provider plus root logical/physical mapping), then use each child request's own model for capacity and dispatch; children cannot broaden the pool to accounts that do not satisfy the root predicate. Other sessions continue through ordinary better-ccflare routing. Switching the same root session back to a native Claude model clears its profile binding on the next root request.
 
-Bindings are process-local, bounded, and restart-scoped. Their TTL matches `session_duration_ms`, and a restart clears every binding. Missing, paused, unavailable, rate-limited, or quota-exhausted exact accounts fail closed; capability profiles fail closed when no matching candidate remains, without falling back outside the profile. Configured provider and physical-model guards also fail closed, as does a conflicting `x-better-ccflare-account-id` header. Matching is exact: an OpenRouter account mapped to `fusion`, for example, does not satisfy a capability profile expecting provider `codex` and physical model `gpt-5.6-sol`. See [Account Routing Architecture](./routing-architecture.md#claude-code-model-route-profiles) for the request flow and inheritance boundary.
+Bindings are process-local, bounded, and restart-scoped. Their TTL matches `session_duration_ms`, and a restart clears every binding. Missing, paused, unavailable, rate-limited, or quota-exhausted exact accounts fail closed; capability profiles fail closed when no matching candidate remains, without falling back outside the profile. Configured provider and physical-model guards also fail closed (including the catalog-role reasons `catalog_role_unavailable` and `catalog_role_mismatch`), as does a conflicting `x-better-ccflare-account-id` header. Matching is exact: an OpenRouter account mapped to `fusion`, for example, does not satisfy a capability profile expecting provider `codex` and physical model `gpt-5.6-sol`. See [Account Routing Architecture](./routing-architecture.md#claude-code-model-route-profiles) for the request flow and inheritance boundary.
 
 ## Anthropic Degraded Mode
 
@@ -644,7 +732,7 @@ better-ccflare can emit threshold and anomaly alerts and deliver them via webhoo
 | `ALERT_ANOMALY_LOOP_MIN_REQUESTS` | Minimum request count in the detection window before the runaway-loop detector will flag a burst, keyed per account + model + project + agent (with the `x-claude-code-session-id` header as an attribution fallback). Set above the rate a single legitimate worker reaches in the window so a true loop (50+ req/min) stands out. Clamped to `[5, 1000]` | `25` | `ALERT_ANOMALY_LOOP_MIN_REQUESTS=50` |
 | `ALERT_COOLDOWN_MINUTES` | Per-alert-type-and-scope cooldown bucket size in minutes — within a bucket, only the first alert is persisted and delivered (no SSE storms or duplicate webhooks). Clamped to `[1, 1440]` | `60` | `ALERT_COOLDOWN_MINUTES=120` |
 | `ALERT_WEBHOOK_URL` | `http(s)` URL to receive `POST` deliveries of alert payloads (see "Webhook delivery" below for the body shape). Unset = no webhook delivery. Must be a valid URL or the setter rejects it | unset | `ALERT_WEBHOOK_URL=https://example.com/alerts` |
-| `ALERT_WEBHOOK_TYPES` | Comma-separated allowlist of alert type names restricting which alert types are *delivered to the webhook*; the DB insert and dashboard SSE emission always happen regardless. Empty/unset = deliver every type (current default behavior). Unknown type names are rejected when the setting is written | unset (all types) | `ALERT_WEBHOOK_TYPES=auth_failure,model_routing_drift` |
+| `ALERT_WEBHOOK_TYPES` | Comma-separated allowlist of alert type names restricting which alert types are *delivered to the webhook*; the DB insert and dashboard SSE emission always happen regardless. Empty/unset = deliver every type except the informational opt-in types `codex_role_target_changed` and `codex_pin_superseded`, which stay in-app until named; a non-empty list delivers exactly the listed types, opt-in types included. Unknown type names are rejected when the setting is written | unset (all but opt-in types) | `ALERT_WEBHOOK_TYPES=auth_failure,model_routing_drift` |
 
 In addition to threshold alerts, an `auth_failure` alert (severity `critical`) fires automatically when an OAuth account's refresh token fails definitively (e.g. `invalid_grant`) and the account is marked `requires_reauth`. It is deduplicated by the same cooldown bucket as the threshold alerts.
 
@@ -654,7 +742,7 @@ Alerts are listed on the dashboard and via the API; unacknowledged counts surfac
 
 ### Recorded cache health
 
-Cache monitoring defaults to enabled in the application, independently of `ALERT_ANOMALY_ENABLED`. **This feature is not live in production until a separate approved deployment and webhook allowlist update.** Implementation or merge does not activate the running service. Keep the existing webhook destination and any nonempty `ALERT_WEBHOOK_TYPES` unchanged during implementation. At an approved rollout, deploy from main and add only the desired types: `cache_efficiency_low`, `cache_efficiency_critical`, `cache_telemetry_gap`, and `cache_efficiency_recovered`. An empty allowlist continues to allow all alert types.
+Cache monitoring defaults to enabled in the application, independently of `ALERT_ANOMALY_ENABLED`. **This feature is not live in production until a separate approved deployment and webhook allowlist update.** Implementation or merge does not activate the running service. Keep the existing webhook destination and any nonempty `ALERT_WEBHOOK_TYPES` unchanged during implementation. At an approved rollout, deploy from main and add only the desired types: `cache_efficiency_low`, `cache_efficiency_critical`, `cache_telemetry_gap`, and `cache_efficiency_recovered`. An empty allowlist continues to deliver all four cache alert types.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
@@ -678,6 +766,25 @@ Native Anthropic, Codex, and official xAI cache routes are eligible without requ
 Messages include account display names, provider, model, the UTC evidence window, request/token counts, recorded reuse, zero-hit share, and stored coverage. They contain no prompts or session identifiers. Sparse traffic, first-turn misses and cold traffic may not qualify; these sample and time guards do not prove a warmed prefix. Some adapters synthesize numeric compatibility zeros when cache fields are absent, so a recorded zero cannot distinguish a true miss from missing upstream cache telemetry. A telemetry alert means **cache usage is unavailable in request records**, not that the upstream stopped reporting. Neither alert proves a cache-backend cause.
 
 History persistence is not a delivery receipt. Webhooks remain best effort, with no outbox or delivery replay after an outage. Stop, disable, and reconfiguration invalidate pending evaluations and cancel pending cache webhook fetches. An atomic database batch already admitted can finish before awaited shutdown completes; an invalidated evaluation cannot publish it. A transport failure can therefore leave an alert in dashboard history without a delivered Discord message.
+
+### Codex catalog alerts
+
+Six alert types report on each Codex account's own model catalog, its family pins (fable, opus, sonnet, haiku), [catalog-role route profiles](#catalog-role-codex-profiles), and the verified Codex CLI version record. Messages carry account names, family names, route-profile ids, and model slugs; never credentials, file paths, or emails.
+
+| Type | Severity | Fires when | Dedup | Empty allowlist delivers |
+|------|----------|------------|-------|--------------------------|
+| `codex_role_target_changed` | `info` | A successful read of an account's own catalog puts a different model at a family's role than the previous own catalog in this process did. Unpinned families follow the new target | Content-addressed: once per account, family, and new target | No (opt-in) |
+| `codex_pin_superseded` | `info` | A family pinned on the account names a model the account's own fresh catalog still offers but no longer puts at that role | Content-addressed: once per account, family, pin, and role target | No (opt-in) |
+| `codex_pin_unavailable` | `warning` | A family pinned on the account names a model absent from the account's own fresh catalog; that family's requests on the account may fail until the pin changes | Content-addressed: once per account, family, and pin | Yes |
+| `codex_catalog_stale` | `warning` | The account's last successful own catalog is older than four refresh intervals (one hour at the 15-minute cadence) **and** its latest refresh attempt failed. Routing keeps serving the last-good catalog. An account that never loaded a catalog of its own is not reported. Checked once per refresh cycle | Cooldown bucket per account | Yes |
+| `codex_route_role_unavailable` | `warning` | A catalog-role route profile failed closed and refused the request: no own-catalog role target exists yet (`catalog_role_unavailable`), or the account's effective mapping pins a different model than the role target (`catalog_role_mismatch`) | At most one report per minute per profile, account, and reason, then a cooldown bucket per that scope | Yes |
+| `codex_identity_record_stale` | `warning` | Only when `CCFLARE_CODEX_VERIFIED_VERSION_FILE` is set: the record is older than its 30-day freshness window, missing, unreadable, or the configured path is not absolute, meaning the managed updater has stalled. A valid explicit `CCFLARE_CODEX_CLIENT_VERSION` takes precedence over the record and suppresses this alert. Checked once per refresh cycle | Cooldown bucket per failure kind | Yes |
+
+Content-addressed alerts derive their id from the state itself, so a standing condition is recorded and delivered once rather than on every 15-minute republication; only a change in the fields its Dedup cell lists produces a new alert. An intentional pin is never an error just because a newer model exists: a superseded pin is `info`, and only a pin the catalog no longer offers is a `warning`.
+
+Catalogs are held in memory only. The first own-catalog read after a restart, or after an account is recreated, is a baseline, so a role target that changed across a restart is not alerted. Pin alerts are still evaluated on that first read.
+
+An empty `ALERT_WEBHOOK_TYPES` delivers the four warning types and keeps the two `info` types in the dashboard, SSE stream, and alert history. An operator with a non-empty allowlist must add `codex_pin_unavailable`, `codex_catalog_stale`, `codex_route_role_unavailable`, and `codex_identity_record_stale` to receive them by webhook, plus either `info` type if wanted.
 
 ### Webhook delivery
 

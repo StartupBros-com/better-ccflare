@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import {
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUFFER_SIZES } from "@better-ccflare/core";
@@ -7,11 +13,16 @@ import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
 import { logBus } from "@better-ccflare/logger";
 import { setDerivedProviderModelDefaults } from "../../provider-model-defaults";
 import {
+	clearCodexAccountModelContextMetadata,
+	setCodexAccountModelContextMetadata,
+} from "../../request-capabilities";
+import {
 	getResponseDrainTransport,
 	registerResponseDrainTransport,
 } from "../../utils/stream-drain";
 import { analyzeCodexCacheExperiments } from "./analyze-trace";
 import { CODEX_CACHE_DIAGNOSTICS_ENV } from "./cache-diagnostics";
+import { resolveCodexClientIdentity } from "./client-identity";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -85,6 +96,145 @@ const CODEX_TURN_STATE_ENV_KEYS = [
 	CODEX_TURN_STATE_COHORT_IDS_ENV,
 	CODEX_TURN_STATE_OBSERVE_ONLY_ENV,
 ] as const;
+
+describe("Codex verified client identity", () => {
+	it("resolves explicit, verified, stale, rollback and path-isolated defaults", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ccflare-identity-"));
+		const record = join(dir, "verified.json");
+		const other = join(dir, "other.json");
+		const oldPath = process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
+		const oldVersion = process.env.CCFLARE_CODEX_CLIENT_VERSION;
+		// Injected clock for every direct resolveCodexClientIdentity() call
+		// below: the resolver now memoizes a source-path read for READ_CACHE_MS,
+		// so a same-path rewrite must be followed by an advance past that
+		// window to be observed. `buildUrl`/`prepareHeaders` go through
+		// CodexProvider's own internal resolveCodexClientIdentity() call, which
+		// has no clock parameter and always uses the real Date.now(); those two
+		// calls are intentionally left uninjected below -- they run immediately
+		// after the direct call that primed the memo, with the file unchanged
+		// in between, so the result is identical whether they hit the memo or
+		// revalidate.
+		const clock = { time: Date.now() };
+		const getNow = () => clock.time;
+		try {
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = record;
+			delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			writeFileSync(
+				record,
+				JSON.stringify({
+					schemaVersion: 1,
+					packageName: "@openai/codex",
+					version: "0.160.0",
+					verifiedAt: new Date(Date.now() - 60_000).toISOString(),
+				}),
+			);
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
+				version: "0.160.0",
+				source: "verified",
+				fresh: true,
+			});
+			expect(new CodexProvider().buildUrl("/v1/models", "")).toContain(
+				"client_version=0.160.0",
+			);
+			expect(
+				new CodexProvider().prepareHeaders(new Headers()).get("User-Agent"),
+			).toContain("codex-cli/0.160.0");
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.161.0";
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
+				version: "0.161.0",
+				source: "explicit",
+			});
+			delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			writeFileSync(record, "{partial");
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
+				version: "0.160.0",
+				source: "verified",
+				fresh: false,
+			});
+			writeFileSync(
+				record,
+				JSON.stringify({
+					schemaVersion: 1,
+					packageName: "@openai/codex",
+					version: "0.159.0",
+					verifiedAt: new Date(Date.now() - 60_000).toISOString(),
+				}),
+			);
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
+				version: "0.159.0",
+				fresh: true,
+			});
+			process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = other;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
+				version: CODEX_VERSION,
+				source: "default",
+			});
+			writeFileSync(
+				other,
+				JSON.stringify({
+					schemaVersion: 1,
+					packageName: "@openai/codex",
+					version: "0.170.0",
+					verifiedAt: "2050-01-01T00:00:00Z",
+				}),
+			);
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
+				version: CODEX_VERSION,
+				source: "default",
+				error: "invalid_record",
+			});
+			writeFileSync(
+				other,
+				JSON.stringify({
+					schemaVersion: 1,
+					packageName: "@openai/codex",
+					version: "0.170.0",
+					verifiedAt: "2020-01-01T00:00:00Z",
+				}),
+			);
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
+				version: "0.170.0",
+				source: "verified",
+				fresh: false,
+				error: "stale_record",
+			});
+			writeFileSync(
+				other,
+				JSON.stringify({
+					schemaVersion: 1,
+					packageName: "@openai/codex",
+					version: "0.158.0",
+					verifiedAt: new Date().toISOString(),
+				}),
+			);
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
+				version: "0.158.0",
+				source: "verified",
+				fresh: true,
+			});
+			writeFileSync(other, "{".repeat(4097));
+			clock.time += 1_100;
+			expect(resolveCodexClientIdentity(getNow)).toMatchObject({
+				version: "0.158.0",
+				fresh: false,
+				error: "invalid_record",
+			});
+		} finally {
+			if (oldPath === undefined)
+				delete process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE;
+			else process.env.CCFLARE_CODEX_VERIFIED_VERSION_FILE = oldPath;
+			if (oldVersion === undefined)
+				delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			else process.env.CCFLARE_CODEX_CLIENT_VERSION = oldVersion;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("CodexProvider release identity", () => {
 	it("uses the exact upstream version and overwrites stale client identity", () => {
@@ -1960,6 +2110,72 @@ describe("CodexProvider request conversion", () => {
 
 		expect(body.reasoning).toEqual({ effort: "max" });
 		expect(body.output_config).toBeUndefined();
+	});
+
+	it("uses captured account-local catalog efforts without changing explicit requests after refresh", async () => {
+		const account = {
+			id: "reasoning-first",
+			model_mappings: JSON.stringify({ fable: "gpt-6-wide" }),
+		} as NonNullable<Parameters<CodexProvider["transformRequestBody"]>[1]>;
+		const model = {
+			id: "gpt-6-wide",
+			contextWindow: 272_000,
+			maxContextWindow: 4_000_000,
+			effectiveContextPercent: 95,
+		};
+		setCodexAccountModelContextMetadata(account.id, [
+			{
+				...model,
+				supportedReasoningEfforts: ["high"],
+				defaultReasoningEffort: "high",
+			},
+		]);
+		try {
+			const provider = new CodexProvider();
+			const identity = provider.captureAttemptIdentity(account);
+			setCodexAccountModelContextMetadata(account.id, [
+				{
+					...model,
+					supportedReasoningEfforts: ["low", "xhigh"],
+					defaultReasoningEffort: "low",
+				},
+			]);
+			const request = (effort?: string) =>
+				new Request("https://example.com/v1/messages", {
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
+						"x-better-ccflare-final-model": "gpt-6-wide",
+					},
+					body: JSON.stringify({
+						model: "claude-fable-5",
+						max_tokens: 100,
+						...(effort ? { output_config: { effort } } : {}),
+						messages: [{ role: "user", content: "Hello" }],
+					}),
+				});
+			const explicit = await provider.transformRequestBody(
+				request("xhigh"),
+				account,
+				undefined,
+				identity,
+			);
+			expect((await explicit.clone().json()).reasoning).toEqual({
+				effort: "high",
+			});
+			const automatic = await provider.transformRequestBody(
+				request(),
+				account,
+				undefined,
+				identity,
+			);
+			expect((await automatic.clone().json()).reasoning).toEqual({
+				effort: "high",
+			});
+		} finally {
+			clearCodexAccountModelContextMetadata(account.id);
+		}
 	});
 
 	it("rejects conflicting official and legacy Anthropic effort fields", async () => {
@@ -5436,6 +5652,42 @@ describe("CodexProvider.processResponse", () => {
 			expect(messageDeltaLine).toContain('"context_window_size":828400');
 		} finally {
 			delete process.env.CCFLARE_CODEX_EFFECTIVE_CONTEXT;
+		}
+	});
+
+	it("uses an account-local response capacity captured before a generation refresh", async () => {
+		const account = { id: "telemetry-first" } as never;
+		const model = {
+			id: "gpt-6-wide",
+			contextWindow: 272_000,
+			maxContextWindow: 4_000_000,
+			effectiveContextPercent: 95,
+		};
+		setCodexAccountModelContextMetadata("telemetry-first", [model]);
+		try {
+			const provider = new CodexProvider();
+			const response = new Response(
+				sseBody([
+					...eventLine("response.created", {
+						response: { id: "resp_wide", model: "gpt-6-wide" },
+					}),
+					...eventLine("response.completed", {
+						response: {
+							model: "gpt-6-wide",
+							usage: { input_tokens: 100, output_tokens: 50 },
+						},
+					}),
+				]),
+				{ headers: { "content-type": "text/event-stream" } },
+			);
+			const pending = await provider.processResponse(response, account);
+			setCodexAccountModelContextMetadata("telemetry-first", [
+				{ ...model, maxContextWindow: 1_000_000 },
+			]);
+			const body = await pending.text();
+			expect(body).toContain('"context_window_size":4000000');
+		} finally {
+			clearCodexAccountModelContextMetadata("telemetry-first");
 		}
 	});
 
@@ -10097,6 +10349,28 @@ describe("parseCodexUsageHeaders reset-after handling", () => {
 });
 
 describe("fetchCodexUsageOnDemand", () => {
+	it("uses the resolved explicit identity for both version and user agent", async () => {
+		const originalFetch = globalThis.fetch;
+		const previous = process.env.CCFLARE_CODEX_CLIENT_VERSION;
+		let headers: Headers | undefined;
+		try {
+			process.env.CCFLARE_CODEX_CLIENT_VERSION = "0.171.0";
+			globalThis.fetch = (async (input, init) => {
+				headers = new Request(input, init).headers;
+				return new Response(null, { status: 200 });
+			}) as typeof fetch;
+			await fetchCodexUsageOnDemand("test-token");
+			expect(headers?.get("Version")).toBe("0.171.0");
+			expect(headers?.get("User-Agent")).toBe(
+				"codex-cli/0.171.0 (Windows 10.0.26100; x64)",
+			);
+		} finally {
+			globalThis.fetch = originalFetch;
+			if (previous === undefined)
+				delete process.env.CCFLARE_CODEX_CLIENT_VERSION;
+			else process.env.CCFLARE_CODEX_CLIENT_VERSION = previous;
+		}
+	});
 	let originalFetch: typeof fetch;
 	let recorded: { url: string; init: RequestInit } | null;
 

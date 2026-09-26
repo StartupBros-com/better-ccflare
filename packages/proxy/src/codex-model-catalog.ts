@@ -1,8 +1,18 @@
+import {
+	CODEX_CATALOG_FAMILIES,
+	type CodexCatalogFamily,
+	type CodexIdentityRecordError,
+	emitCodexCatalogEvent,
+	registerHeartbeat,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
-	CODEX_VERSION,
+	CODEX_VERIFIED_VERSION_FILE_ENV,
+	clearCodexAccountModelContextMetadata,
 	clearDerivedAccountModelDefaults,
 	hasDerivedProviderModelDefaults,
+	resolveCodexClientIdentity,
+	setCodexAccountModelContextMetadata,
 	setDerivedAccountModelDefaults,
 	setDerivedProviderModelDefaults,
 } from "@better-ccflare/providers";
@@ -43,6 +53,9 @@ export interface CodexModelEntry {
 	maxContextWindow: number | null;
 	/** Catalog `effective_context_window_percent` (usable share of capacity). */
 	effectiveContextPercent: number | null;
+	/** Validated scalar effort levels; never a claim about tools or orchestration. */
+	supportedReasoningEfforts?: string[];
+	defaultReasoningEffort?: string | null;
 	/**
 	 * Model OpenAI says will replace this one, when it has announced a
 	 * deprecation. Worth surfacing: picking a model that is on its way out is
@@ -66,6 +79,13 @@ export interface CodexModelListing {
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
+/**
+ * Exported so callers outside this module (e.g. the effective-defaults
+ * diagnostics API) can judge staleness against the exact same threshold this
+ * module refreshes against, instead of hardcoding a second copy that could
+ * silently drift from this one.
+ */
+export const CATALOG_REFRESH_INTERVAL_MS = 15 * 60_000;
 const ENSURE_RETRY_DELAYS_MS = [
 	60_000, 120_000, 240_000, 480_000, 900_000,
 ] as const;
@@ -127,8 +147,26 @@ let providerWide: CodexModelListing | null = null;
 /** Retry only unresolved accounts; exact live or cached-own evidence stops it. */
 const ensureRetryByAccount = new Map<string, EnsureRetryState>();
 
+/**
+ * Accounts whose most recently completed own-catalog read failed, with when.
+ * A success clears the entry. Only the staleness report reads it; retry
+ * scheduling keeps its own state above.
+ */
+const lastRefreshFailedAt = new Map<string, number>();
+
+/**
+ * A fail-closed catalog-role route is reported at most once per this window
+ * per (profile, account, reason). The AlertService dedupes by cooldown bucket
+ * anyway; this only keeps a client retry loop against a failing profile from
+ * turning every local 503 into an alert-table write.
+ */
+const CATALOG_ROLE_ROUTE_REPORT_INTERVAL_MS = 60_000;
+const lastCatalogRoleRouteReportAt = new Map<string, number>();
+
 /** One best-effort listing request per account at a time. */
 const ensureInFlight = new Map<string, Promise<void>>();
+const unknownRevalidationAt = new Map<string, number>();
+const UNKNOWN_REVALIDATION_COOLDOWN_MS = 60_000;
 
 /**
  * Successful live reads publish in start order, not completion order.
@@ -151,10 +189,14 @@ let publishedProviderCatalogGeneration = 0;
  */
 export function clearCodexModelCacheForTests(): void {
 	lastGood.clear();
+	clearCodexAccountModelContextMetadata();
 	invalidationGenerationByAccount.clear();
 	providerWide = null;
 	ensureRetryByAccount.clear();
 	ensureInFlight.clear();
+	unknownRevalidationAt.clear();
+	lastRefreshFailedAt.clear();
+	lastCatalogRoleRouteReportAt.clear();
 	publishedProviderCatalogGeneration = 0;
 }
 
@@ -174,7 +216,10 @@ export function clearCodexModelCacheForAccount(accountId: string): void {
 	lastGood.delete(accountId);
 	ensureRetryByAccount.delete(accountId);
 	ensureInFlight.delete(accountId);
+	unknownRevalidationAt.delete(accountId);
+	lastRefreshFailedAt.delete(accountId);
 	clearDerivedAccountModelDefaults("codex", accountId);
+	clearCodexAccountModelContextMetadata(accountId);
 }
 
 function scheduleEnsureRetry(accountId: string, now: number): void {
@@ -208,6 +253,20 @@ export function getKnownCodexModels(
 	return own ? { ...own, source: "cached" } : null;
 }
 
+/**
+ * Same as {@link getKnownCodexModels}, but falls back to another account of
+ * the same provider's listing when this account has none of its own -- the
+ * same advisory fallback request-time routing already uses. Callers must
+ * read the returned `source` ("cached" for first-hand, "shared" for
+ * borrowed) rather than assuming every result is this account's own. Never
+ * triggers a fetch.
+ */
+export function getKnownOrSharedCodexModels(
+	accountId: string,
+): CodexModelListing | null {
+	return readCache(accountId);
+}
+
 function readCache(accountId: string): CodexModelListing | null {
 	const own = getKnownCodexModels(accountId);
 	if (own) return own;
@@ -232,6 +291,8 @@ interface CodexModelsResponse {
 		context_window?: number;
 		max_context_window?: number;
 		effective_context_window_percent?: number;
+		supported_reasoning_levels?: Array<{ effort?: string }>;
+		default_reasoning_level?: string;
 		/** "list" to be offered; "hide" for routing aliases and internal models. */
 		visibility?: string;
 		/** OpenAI's own ordering, frontier first. */
@@ -278,6 +339,13 @@ function normalize(body: CodexModelsResponse): CodexModelEntry[] {
 				typeof raw.effective_context_window_percent === "number"
 					? raw.effective_context_window_percent
 					: null,
+			supportedReasoningEfforts: Array.isArray(raw.supported_reasoning_levels)
+				? raw.supported_reasoning_levels.map((level) => level?.effort ?? "")
+				: undefined,
+			defaultReasoningEffort:
+				typeof raw.default_reasoning_level === "string"
+					? raw.default_reasoning_level
+					: null,
 		});
 	}
 
@@ -297,10 +365,11 @@ async function fetchLive(
 	account: Account,
 	ctx: ProxyContext,
 ): Promise<CodexModelEntry[]> {
+	const identity = resolveCodexClientIdentity();
 	const accessToken = await getValidAccessToken(account, ctx);
 	if (!accessToken) throw new Error("no access token for this account");
 
-	const url = `https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(CODEX_VERSION)}`;
+	const url = `https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(identity.version)}`;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 	try {
@@ -313,7 +382,7 @@ async function fetchLive(
 				// identifies the caller by originator — mirroring the CLI keeps us
 				// on the path OpenAI actually serves.
 				originator: "codex_cli_rs",
-				"user-agent": `codex_cli_rs/${CODEX_VERSION}`,
+				"user-agent": identity.catalogUserAgent,
 			},
 			signal: controller.signal,
 		});
@@ -339,16 +408,25 @@ export function ensureCodexModelDefaults(
 	account: Account | null | undefined,
 	ctx: ProxyContext,
 	now: () => number = Date.now,
+	forceRevalidation = false,
 ): Promise<void> {
 	if (account?.provider !== "codex") return Promise.resolve();
 	const invalidationGeneration = invalidationGenerationFor(account.id);
-	if (hasDerivedProviderModelDefaults("codex", account.id)) {
-		ensureRetryByAccount.delete(account.id);
+	const ownListing = lastGood.get(account.id)?.listing;
+	if (
+		ownListing &&
+		!forceRevalidation &&
+		now() < ownListing.fetchedAt + CATALOG_REFRESH_INTERVAL_MS
+	)
+		return Promise.resolve();
+	if (!ownListing && hasDerivedProviderModelDefaults("codex", account.id)) {
 		return Promise.resolve();
 	}
 
 	const current = ensureInFlight.get(account.id);
-	if (current) return current;
+	// First-hand evidence makes refresh advisory: never hold a warm request on
+	// a stalled credential refresh or catalog fetch. Cold accounts still wait.
+	if (current) return ownListing ? Promise.resolve() : current;
 
 	const retry = ensureRetryByAccount.get(account.id);
 	if (retry && now() < retry.nextAttemptAt) return Promise.resolve();
@@ -356,8 +434,11 @@ export function ensureCodexModelDefaults(
 	let attempt: Promise<void>;
 	attempt = (async () => {
 		try {
-			await getCodexModels(account.id, ctx);
-			if (hasDerivedProviderModelDefaults("codex", account.id)) {
+			const listing = await getCodexModels(account.id, ctx);
+			if (
+				listing?.source === "live" &&
+				hasDerivedProviderModelDefaults("codex", account.id)
+			) {
 				ensureRetryByAccount.delete(account.id);
 				return;
 			}
@@ -381,7 +462,40 @@ export function ensureCodexModelDefaults(
 		}
 	});
 	ensureInFlight.set(account.id, attempt);
-	return attempt;
+	return ownListing ? Promise.resolve() : attempt;
+}
+
+/** One account-scoped revalidation per cooldown, shared with regular refresh. */
+export function revalidateUnknownCodexModel(
+	account: Account,
+	model: string,
+	ctx: ProxyContext,
+	now: () => number = Date.now,
+): Promise<void> {
+	if (
+		account.provider !== "codex" ||
+		!lastGood.has(account.id) ||
+		lastGood.get(account.id)?.listing.models.some((entry) => entry.id === model)
+	) {
+		return Promise.resolve();
+	}
+	const previous = unknownRevalidationAt.get(account.id);
+	if (
+		previous !== undefined &&
+		now() < previous + UNKNOWN_REVALIDATION_COOLDOWN_MS
+	) {
+		return ensureInFlight.get(account.id) ?? Promise.resolve();
+	}
+	if (
+		unknownRevalidationAt.size >= MAX_ENSURE_RETRY_ENTRIES &&
+		!unknownRevalidationAt.has(account.id)
+	) {
+		const oldest = unknownRevalidationAt.keys().next().value;
+		if (oldest !== undefined) unknownRevalidationAt.delete(oldest);
+	}
+	unknownRevalidationAt.set(account.id, now());
+	const wait = ensureCodexModelDefaults(account, ctx, now, true);
+	return ensureInFlight.get(account.id) ?? wait;
 }
 
 /**
@@ -409,6 +523,73 @@ export function deriveFamilyDefaults(
 		sonnet: at(1),
 		haiku: at(2),
 	};
+}
+
+/**
+ * Tell the alert bus about one successful own-catalog publication.
+ *
+ * A role-target change is reported only against a previous own catalog in this
+ * process: the first read after start (or after an account is recreated) is a
+ * first load, not a change, and a republication with the same order changes
+ * nothing. Pin status is not decided here — the subscriber owns the
+ * pin-attribution resolver — so every publication is reported with its models
+ * and role targets for it to classify.
+ */
+function reportOwnCatalogPublication(
+	account: Account,
+	previous: CodexModelListing | null,
+	models: CodexModelEntry[],
+	families: Record<string, string>,
+): void {
+	const roleTargets: Partial<Record<CodexCatalogFamily, string>> = {};
+	for (const family of CODEX_CATALOG_FAMILIES) {
+		const target = families[family];
+		if (target) roleTargets[family] = target;
+	}
+	if (previous) {
+		const before = deriveFamilyDefaults(previous.models);
+		for (const family of CODEX_CATALOG_FAMILIES) {
+			const from = before[family];
+			const to = roleTargets[family];
+			if (from && to && from !== to) {
+				emitCodexCatalogEvent({
+					type: "role_target_changed",
+					accountId: account.id,
+					accountName: account.name,
+					family,
+					from,
+					to,
+				});
+			}
+		}
+	}
+	emitCodexCatalogEvent({
+		type: "own_catalog_published",
+		accountId: account.id,
+		accountName: account.name,
+		models: models.map((model) => model.id),
+		roleTargets,
+	});
+}
+
+/**
+ * The model at a Claude family's role in this account's OWN catalog, or null.
+ *
+ * Only first-hand evidence counts: a listing borrowed from another account of
+ * the provider is advisory and never names a target, because plans differ and
+ * a borrowed list is not proof this account can call the model. A last-good
+ * own listing counts even when a later refresh failed. The role order is
+ * exactly {@link deriveFamilyDefaults}'s, so this can never disagree with the
+ * family default the provider applies for an unpinned account.
+ */
+export function getCodexCatalogRoleTarget(
+	accountId: string,
+	family: "fable" | "opus" | "sonnet" | "haiku",
+): string | null {
+	const own = getKnownCodexModels(accountId);
+	if (!own) return null;
+	const defaults = deriveFamilyDefaults(own.models);
+	return Object.hasOwn(defaults, family) ? (defaults[family] ?? null) : null;
 }
 
 /**
@@ -454,8 +635,11 @@ export async function getCodexModels(
 			source: "live",
 		};
 		const families = deriveFamilyDefaults(models);
-		const publishedAccountGeneration = lastGood.get(accountId)?.generation;
+		const previousOwn = lastGood.get(accountId);
+		const publishedAccountGeneration = previousOwn?.generation;
+		let publishedOwn = false;
 		if (isCurrentInvalidationGeneration(accountId, invalidationGeneration)) {
+			lastRefreshFailedAt.delete(accountId);
 			if (
 				publishedAccountGeneration === undefined ||
 				fetchGeneration > publishedAccountGeneration
@@ -463,7 +647,9 @@ export async function getCodexModels(
 				// This account's exact evidence advances independently of the shared
 				// frontier, so a late response from another account still remains useful.
 				lastGood.set(accountId, { listing, generation: fetchGeneration });
+				setCodexAccountModelContextMetadata(accountId, models);
 				setDerivedAccountModelDefaults("codex", accountId, families);
+				publishedOwn = true;
 			}
 			if (fetchGeneration > publishedProviderCatalogGeneration) {
 				providerWide = listing;
@@ -471,15 +657,28 @@ export async function getCodexModels(
 				publishedProviderCatalogGeneration = fetchGeneration;
 			}
 		}
+		// Reported only after every registry above reflects the new catalog.
+		if (publishedOwn) {
+			reportOwnCatalogPublication(
+				account,
+				previousOwn?.listing ?? null,
+				models,
+				families,
+			);
+		}
 		return listing;
 	} catch (error) {
 		const cached = readCache(accountId);
+		if (isCurrentInvalidationGeneration(accountId, invalidationGeneration)) {
+			lastRefreshFailedAt.set(accountId, Date.now());
+		}
 		// The cached listing is still this account's own answer, just an older
 		// one — far better than a map compiled months ago.
 		if (
 			cached?.source === "cached" &&
 			isCurrentInvalidationGeneration(accountId, invalidationGeneration)
 		) {
+			setCodexAccountModelContextMetadata(accountId, cached.models);
 			setDerivedAccountModelDefaults(
 				"codex",
 				accountId,
@@ -494,4 +693,226 @@ export async function getCodexModels(
 		);
 		return cached;
 	}
+}
+
+/**
+ * How old an account's last successful own catalog may get, while its latest
+ * refresh attempt has failed, before the refresh heartbeat reports it stale.
+ *
+ * Four refresh intervals (one hour at the fifteen-minute cadence) on purpose:
+ * one or two failed reads are routine — the endpoint is not part of OpenAI's
+ * public reference, and ensure-retries back off for up to one interval — while
+ * an hour without a single successful read means new or retired models are no
+ * longer being reflected. Routing keeps serving the last-good catalog either
+ * way; this only decides when that becomes worth an operator's attention.
+ */
+export const CODEX_CATALOG_STALE_ALERT_MS = 4 * CATALOG_REFRESH_INTERVAL_MS;
+
+/**
+ * Report every eligible account whose own catalog is older than
+ * {@link CODEX_CATALOG_STALE_ALERT_MS} while its latest refresh attempt
+ * failed. An account that never had a catalog of its own (some accounts only
+ * ever answer 401 here) is not reported: there is no last-good catalog to go
+ * stale, and borrowed listings are advisory. The refresh heartbeat calls this
+ * once per refresh cycle; AlertService buckets the resulting alerts.
+ */
+export function evaluateCodexCatalogStaleness(
+	accounts: readonly Account[],
+	now: number = Date.now(),
+): void {
+	for (const account of accounts) {
+		if (!isCodexCatalogRefreshEligible(account)) continue;
+		const own = lastGood.get(account.id)?.listing;
+		if (!own || !lastRefreshFailedAt.has(account.id)) continue;
+		const ageMs = now - own.fetchedAt;
+		if (ageMs <= CODEX_CATALOG_STALE_ALERT_MS) continue;
+		emitCodexCatalogEvent({
+			type: "catalog_stale",
+			accountId: account.id,
+			accountName: account.name,
+			ageMs,
+		});
+	}
+}
+
+const IDENTITY_RECORD_ALERT_ERRORS: ReadonlySet<string> =
+	new Set<CodexIdentityRecordError>([
+		"stale_record",
+		"unavailable_record",
+		"invalid_record",
+		"invalid_path",
+	]);
+
+/** Record problems only; an invalid explicit version is a separate setting. */
+function isIdentityRecordAlertError(
+	error: string | undefined,
+): error is CodexIdentityRecordError {
+	return error !== undefined && IDENTITY_RECORD_ALERT_ERRORS.has(error);
+}
+
+/**
+ * Report a configured verified Codex CLI version record that is stale or
+ * unreadable, which means the managed updater has stalled.
+ *
+ * The record is only read when `CCFLARE_CODEX_VERIFIED_VERSION_FILE` is set
+ * (there is no default path), so an install without the updater never alerts.
+ * A valid explicit `CCFLARE_CODEX_CLIENT_VERSION` wins over the record and is
+ * not reported either. Evaluated by the refresh heartbeat once per cycle,
+ * never per request.
+ */
+export function evaluateCodexClientIdentityRecord(
+	now: () => number = Date.now,
+): void {
+	if (!process.env[CODEX_VERIFIED_VERSION_FILE_ENV]) return;
+	const identity = resolveCodexClientIdentity(now);
+	if (!isIdentityRecordAlertError(identity.error)) return;
+	emitCodexCatalogEvent({
+		type: "identity_record_stale",
+		error: identity.error,
+		version: identity.version,
+		...(identity.verifiedAt ? { verifiedAt: identity.verifiedAt } : {}),
+	});
+}
+
+/**
+ * Report a catalog-role route profile that failed closed. Called from the one
+ * place the proxy turns a force-route failure into its terminal response, so
+ * every fail-closed path is covered. Other fail-closed reasons, and routes
+ * without a profile, are not catalog conditions and are ignored. For a pool
+ * profile the error names the profile rather than an account, and the report
+ * then carries no account.
+ */
+export function reportCatalogRoleRouteFailClosed(
+	profileId: string | null | undefined,
+	error: { accountId: string; reason: string },
+	now: number = Date.now(),
+): void {
+	const profile = profileId?.trim();
+	if (!profile) return;
+	if (
+		error.reason !== "catalog_role_unavailable" &&
+		error.reason !== "catalog_role_mismatch"
+	) {
+		return;
+	}
+	const accountId =
+		error.accountId && error.accountId !== profile ? error.accountId : null;
+	const key = `${profile}\0${accountId ?? ""}\0${error.reason}`;
+	const last = lastCatalogRoleRouteReportAt.get(key);
+	if (last !== undefined && now - last < CATALOG_ROLE_ROUTE_REPORT_INTERVAL_MS)
+		return;
+	if (
+		last === undefined &&
+		lastCatalogRoleRouteReportAt.size >= MAX_ENSURE_RETRY_ENTRIES
+	) {
+		const oldest = lastCatalogRoleRouteReportAt.keys().next().value;
+		if (oldest !== undefined) lastCatalogRoleRouteReportAt.delete(oldest);
+	}
+	lastCatalogRoleRouteReportAt.delete(key);
+	lastCatalogRoleRouteReportAt.set(key, now);
+	emitCodexCatalogEvent({
+		type: "route_role_unavailable",
+		profileId: profile,
+		...(accountId ? { accountId } : {}),
+		reason: error.reason,
+	});
+}
+
+/** Most accounts one refresh cycle, or one request-time prime, reads. */
+export const CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT = 100;
+
+/**
+ * Whether the catalog refresh reads this account's own listing. Request-time
+ * priming for catalog-role routes uses the same predicate, so it never reads
+ * an account the heartbeat would skip.
+ */
+export function isCodexCatalogRefreshEligible(account: Account): boolean {
+	return (
+		account.provider === "codex" &&
+		!account.paused &&
+		!account.requires_reauth &&
+		!account.custom_endpoint
+	);
+}
+
+/** Account-local heartbeat; at most two catalog calls run concurrently. */
+export function initCodexModelCatalogRefresh(
+	ctx: ProxyContext,
+	testOverrides?: { initialDelayMs?: number; tickSeconds?: number },
+): () => void {
+	let stopped = false;
+	let running = false;
+	let nextRefreshAt = 0;
+	const tick = async (): Promise<void> => {
+		if (stopped || running || Date.now() < nextRefreshAt) return;
+		running = true;
+		try {
+			// Once per refresh cycle, never per request, and independent of the
+			// account read below: a stalled updater matters even when it fails.
+			try {
+				evaluateCodexClientIdentityRecord();
+			} catch {
+				// Never interpolate the error: it could name the record's path.
+				log.warn("Could not evaluate the Codex client version record");
+			}
+			const eligible = (await ctx.dbOps.getAllAccounts()).filter(
+				isCodexCatalogRefreshEligible,
+			);
+			if (eligible.length > CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT) {
+				log.warn(
+					`Codex model catalog refresh covers only ${CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT} of ${eligible.length} eligible accounts this cycle; ${
+						eligible.length - CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT
+					} were dropped.`,
+				);
+			}
+			const accounts = eligible.slice(0, CODEX_CATALOG_REFRESH_ACCOUNT_LIMIT);
+			let next = 0;
+			await Promise.all(
+				Array.from({ length: Math.min(2, accounts.length) }, async () => {
+					while (!stopped && next < accounts.length) {
+						const account = accounts[next++];
+						await ensureCodexModelDefaults(account, ctx);
+						// Warm callers return immediately; scheduler workers must still wait
+						// for the actual fetch before starting another account.
+						await ensureInFlight.get(account.id);
+					}
+				}),
+			);
+			if (!stopped) evaluateCodexCatalogStaleness(accounts, Date.now());
+		} catch (error) {
+			log.warn(`Could not schedule Codex model refresh: ${error}`);
+		} finally {
+			// Anchored to this tick's *completion*, not its start. An account
+			// whose own fetch finishes late within a tick (many eligible
+			// accounts, only two concurrent workers) still gets a full
+			// CATALOG_REFRESH_INTERVAL_MS measured from here, so
+			// ensureCodexModelDefaults's own fetchedAt-based due check for it
+			// can never already be satisfied by the time this fires again --
+			// which anchoring nextRefreshAt to tick *start* could cause,
+			// silently skipping that account for a whole extra cycle. Bound
+			// jitter to two minutes around the fifteen-minute cadence.
+			nextRefreshAt =
+				Date.now() +
+				CATALOG_REFRESH_INTERVAL_MS +
+				Math.floor(Math.random() * 120_000);
+			running = false;
+		}
+	};
+	const initial = setTimeout(
+		() => {
+			void tick();
+		},
+		testOverrides?.initialDelayMs ?? 30_000 + Math.random() * 90_000,
+	);
+	const unregister = registerHeartbeat({
+		id: "codex-model-catalog-refresh",
+		callback: tick,
+		seconds: testOverrides?.tickSeconds ?? 60,
+		description: "Codex account model catalog freshness check",
+	});
+	return () => {
+		stopped = true;
+		clearTimeout(initial);
+		unregister();
+	};
 }

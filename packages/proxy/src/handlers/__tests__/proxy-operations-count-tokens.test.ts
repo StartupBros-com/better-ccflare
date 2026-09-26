@@ -17,8 +17,13 @@ import {
 import { RequestBodyContext } from "../../request-body-context";
 import type { ProxyContext } from "../proxy-types";
 
-const { CodexProvider, estimateAnthropicAdmissionTokens, getProvider } =
-	await import("@better-ccflare/providers");
+const {
+	CodexProvider,
+	estimateAnthropicAdmissionTokens,
+	getProvider,
+	setCodexAccountModelContextMetadata,
+	clearCodexAccountModelContextMetadata,
+} = await import("@better-ccflare/providers");
 const usageCollectorModule = await import("../../usage-collector");
 const {
 	admitBoundedModelRouteProfileRequest,
@@ -922,6 +927,64 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 			safeLimitTokens: 828_400,
 			outcome: "defer_low_confidence",
 		});
+	});
+
+	it("admits account-local current-model capacity without borrowing a sibling's window", () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const first = makeCodexAccount({
+			id: "current-first",
+			model_mappings: JSON.stringify({ opus: "gpt-6-wide" }),
+		});
+		const second = makeCodexAccount({
+			id: "current-second",
+			model_mappings: first.model_mappings,
+		});
+		try {
+			setCodexAccountModelContextMetadata(first.id, [
+				{
+					id: "gpt-6-wide",
+					contextWindow: 272_000,
+					maxContextWindow: 4_000_000,
+					effectiveContextPercent: 95,
+				},
+			]);
+			const tracker = () =>
+				createContextAdmissionTracker(
+					calibratedAdmissionEstimate(3_500_000),
+					50_000,
+				);
+			expect(
+				selectAdmittedCodexModel(first, "claude-opus-4-8", tracker()),
+			).toEqual({ admitted: true, model: "gpt-6-wide" });
+			expect(
+				selectAdmittedCodexModel(second, "claude-opus-4-8", tracker()),
+			).toEqual({ admitted: true, model: "gpt-6-wide" });
+			const rejected = createContextAdmissionTracker(
+				calibratedAdmissionEstimate(3_900_000),
+				50_000,
+			);
+			expect(
+				selectAdmittedCodexModel(first, "claude-opus-4-8", rejected).admitted,
+			).toBe(false);
+			expect(rejected.rejectedCount).toBe(1);
+			// Proves non-borrowing directly: `second` carries no metadata of its
+			// own, so if it inherited `first`'s 3.8M effective window (4M * 95%)
+			// this 3.9M estimate would be rejected just like `first`'s was above.
+			// Instead it must fail open (unknown capacity, admit).
+			expect(
+				selectAdmittedCodexModel(
+					second,
+					"claude-opus-4-8",
+					createContextAdmissionTracker(
+						calibratedAdmissionEstimate(3_900_000),
+						50_000,
+					),
+				),
+			).toEqual({ admitted: true, model: "gpt-6-wide" });
+		} finally {
+			clearCodexAccountModelContextMetadata(first.id);
+			clearCodexAccountModelContextMetadata(second.id);
+		}
 	});
 
 	it("admits a calibrated 500k prompt within GPT-5.6 operational capacity", () => {

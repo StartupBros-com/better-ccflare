@@ -3,7 +3,7 @@ import type {
 	BunSqlAdapter,
 	DatabaseOperations,
 } from "@better-ccflare/database";
-import type { CircuitBreaker } from "@better-ccflare/proxy";
+import type { CircuitBreaker, ModelRouteProfile } from "@better-ccflare/proxy";
 import type { Account } from "./account";
 import type { AlertEvent } from "./alerts";
 import type { AffinityOwnerSnapshot, RequestMeta } from "./api";
@@ -185,6 +185,13 @@ export interface APIContext {
 	 * internalProbeSecret above.
 	 */
 	localControlSecret?: string;
+	/**
+	 * The restart-scoped route profiles the server parsed and validated from
+	 * CCFLARE_MODEL_ROUTE_PROFILES_JSON at startup. Read-only here (the Codex
+	 * migration preview reports profiles that still pin a physical model);
+	 * absent in narrower contexts that do not configure profiles.
+	 */
+	modelRouteProfiles?: readonly ModelRouteProfile[];
 }
 
 // Load balancing strategy interface

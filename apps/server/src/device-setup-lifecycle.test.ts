@@ -83,6 +83,7 @@ mock.module("@better-ccflare/proxy", () => {
 		getUsageCollectorHealth: () => null,
 		getValidAccessToken: async () => null,
 		handleProxy: async () => new Response(),
+		initCodexModelCatalogRefresh: () => () => {},
 		initModelCatalogRefresh: () => () => {},
 		initProxy: () => {},
 		lowestTierCodexModel: () => null,

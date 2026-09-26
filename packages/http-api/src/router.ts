@@ -74,6 +74,10 @@ import {
 	createApiKeyUpdateRoleHandler,
 } from "./handlers/api-keys";
 import {
+	createCodexModelMigrationApplyHandler,
+	createCodexModelMigrationPreviewHandler,
+} from "./handlers/codex-model-migration";
+import {
 	createAccountRoutingOverviewHandler,
 	createComboCreateHandler,
 	createComboDeleteHandler,
@@ -254,6 +258,7 @@ export class APIRouter {
 			config,
 			this.context.runtime,
 			this.context.modelCatalog,
+			dbOps,
 		);
 		const logsStreamHandler = createLogsStreamHandler();
 		const logsHistoryHandler = createLogsHistoryHandler();
@@ -621,6 +626,16 @@ export class APIRouter {
 		);
 		this.handlers.set("POST:/api/routing/family-aliases/apply", (req) =>
 			createFamilyAliasApplyHandler(dbOps)(req),
+		);
+
+		// Codex pin → automatic migration (read-only preview, guarded apply)
+		this.handlers.set("POST:/api/codex/model-migration/preview", (req) =>
+			createCodexModelMigrationPreviewHandler(dbOps, {
+				routeProfiles: this.context.modelRouteProfiles ?? [],
+			})(req),
+		);
+		this.handlers.set("POST:/api/codex/model-migration/apply", (req) =>
+			createCodexModelMigrationApplyHandler(dbOps)(req),
 		);
 
 		// Model catalog routes

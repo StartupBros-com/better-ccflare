@@ -6,6 +6,7 @@ import {
 } from "@better-ccflare/core";
 import React, { useState } from "react";
 import type { Account } from "../../api";
+import { useCodexAccountEffectiveDefaults } from "../../hooks/useProviderModelDefaults";
 import { providerAllowsClientModelPassthrough } from "../../utils/provider-utils";
 import { ModelCombobox } from "../models/ModelCombobox";
 import { Button } from "../ui/button";
@@ -18,6 +19,7 @@ import {
 	DialogTitle,
 } from "../ui/dialog";
 import { Label } from "../ui/label";
+import { describeCodexFamilyStatus } from "./codex-family-status";
 
 interface AccountModelMappingsDialogProps {
 	isOpen: boolean;
@@ -41,6 +43,177 @@ function parseMappingValue(value: string): string | string[] | null {
 		.map((s) => s.trim())
 		.filter(Boolean);
 	return parts.length === 1 ? parts[0] : parts;
+}
+
+const FAMILY_FIELDS = ["fable", "opus", "sonnet", "haiku"] as const;
+type FamilyField = (typeof FAMILY_FIELDS)[number];
+
+function FamilyStatusLine({ status }: { status: string | null }) {
+	if (!status) return null;
+	return <p className="text-[11px] text-muted-foreground">{status}</p>;
+}
+
+/** Only edited family fields change; custom keys and ordered arrays survive. */
+export function mergeAccountModelMappings(
+	existing: Record<string, string | string[]> | null | undefined,
+	fields: Record<(typeof FAMILY_FIELDS)[number], string>,
+): Record<string, string | string[]> {
+	const result = { ...(existing ?? {}) };
+	for (const field of FAMILY_FIELDS) {
+		if (fields[field].trim() === formatMappingValue(result[field] ?? ""))
+			continue;
+		const value = parseMappingValue(fields[field]);
+		if (value === null) delete result[field];
+		else result[field] = value;
+	}
+	return result;
+}
+
+interface AccountModelMappingsBodyProps {
+	account: Account;
+	modelMappings: Record<FamilyField, string>;
+	onInputChange: (modelType: FamilyField, value: string) => void;
+}
+
+/**
+ * The dialog's editable content, split out from `AccountModelMappingsDialog`
+ * so it can be unit-tested with `renderToStaticMarkup` directly: the parent
+ * wraps this in Radix's `Dialog`/`DialogPortal`, whose portal only mounts via
+ * a client-side effect and renders nothing during static/server rendering
+ * (mirrors `ManagedFamilyConversionBody` in ../combos/ManagedFamilyConversionDialog).
+ */
+export function AccountModelMappingsBody({
+	account,
+	modelMappings,
+	onInputChange,
+}: AccountModelMappingsBodyProps) {
+	// Same single rule as the combo slot. Here it does not block Save (mapping
+	// only the families this account actually uses is legitimate), but the
+	// user needs to know that "empty" is not passthrough on this provider.
+	const passthroughAllowed = providerAllowsClientModelPassthrough(
+		account.provider,
+	);
+	const isCodex = account.provider === "codex";
+	const { data: codexEffectiveDefaults } = useCodexAccountEffectiveDefaults();
+	const accountEffectiveDefaults = isCodex
+		? codexEffectiveDefaults?.accounts?.find(
+				(entry) => entry.accountId === account.id,
+			)
+		: undefined;
+
+	const familyStatus = (family: FamilyField): string | null => {
+		if (!isCodex) return null;
+		const familyDefault = accountEffectiveDefaults?.families.find(
+			(entry) => entry.family === family,
+		);
+		return describeCodexFamilyStatus(
+			familyDefault,
+			accountEffectiveDefaults?.catalog,
+		);
+	};
+
+	return (
+		<div className="space-y-4 py-2 overflow-y-auto flex-1">
+			<div>
+				<h4 className="text-sm font-medium mb-2">Model Mappings</h4>
+				<p className="text-xs text-muted-foreground mb-3">
+					Map Anthropic model names to provider-specific models. Use commas for
+					multiple models (e.g.{" "}
+					<code className="text-xs bg-muted px-1 rounded">
+						model-a, model-b
+					</code>
+					) to cycle on rate limits. Pick from the provider list or type the
+					name; Test sends one real request with the first model of the field
+					and consumes quota.
+				</p>
+				{!passthroughAllowed && (
+					<p className="text-xs text-warning mb-3">
+						{isCodex
+							? "Automatic: an empty family inherits this account’s current catalog default when available; a value here is pinned. Shared catalog defaults are advisory until this account’s own listing succeeds."
+							: `${account.provider} does not serve Claude model ids. An empty family inherits its provider default, not passthrough; pin a family when its default is unsuitable.`}
+					</p>
+				)}
+				<div className="grid grid-cols-2 gap-3">
+					<div className="space-y-1">
+						<Label htmlFor="fable" className="text-xs">
+							Fable
+						</Label>
+						<div className="flex items-center gap-1.5">
+							<ModelCombobox
+								id="fable"
+								mode="list"
+								provider={account.provider}
+								accountId={account.id}
+								value={modelMappings.fable}
+								onChange={(value) => onInputChange("fable", value)}
+								placeholder={`e.g., ${LATEST_FABLE_MODEL}`}
+								className="flex-1"
+								inputClassName="h-8"
+							/>
+						</div>
+						<FamilyStatusLine status={familyStatus("fable")} />
+					</div>
+					<div className="space-y-1">
+						<Label htmlFor="opus" className="text-xs">
+							Opus
+						</Label>
+						<div className="flex items-center gap-1.5">
+							<ModelCombobox
+								id="opus"
+								mode="list"
+								provider={account.provider}
+								accountId={account.id}
+								value={modelMappings.opus}
+								onChange={(value) => onInputChange("opus", value)}
+								placeholder={`e.g., ${LATEST_OPUS_MODEL}`}
+								className="flex-1"
+								inputClassName="h-8"
+							/>
+						</div>
+						<FamilyStatusLine status={familyStatus("opus")} />
+					</div>
+					<div className="space-y-1">
+						<Label htmlFor="sonnet" className="text-xs">
+							Sonnet
+						</Label>
+						<div className="flex items-center gap-1.5">
+							<ModelCombobox
+								id="sonnet"
+								mode="list"
+								provider={account.provider}
+								accountId={account.id}
+								value={modelMappings.sonnet}
+								onChange={(value) => onInputChange("sonnet", value)}
+								placeholder={`e.g., ${LATEST_SONNET_MODEL}`}
+								className="flex-1"
+								inputClassName="h-8"
+							/>
+						</div>
+						<FamilyStatusLine status={familyStatus("sonnet")} />
+					</div>
+					<div className="space-y-1">
+						<Label htmlFor="haiku" className="text-xs">
+							Haiku
+						</Label>
+						<div className="flex items-center gap-1.5">
+							<ModelCombobox
+								id="haiku"
+								mode="list"
+								provider={account.provider}
+								accountId={account.id}
+								value={modelMappings.haiku}
+								onChange={(value) => onInputChange("haiku", value)}
+								placeholder={`e.g., ${LATEST_HAIKU_MODEL}`}
+								className="flex-1"
+								inputClassName="h-8"
+							/>
+						</div>
+						<FamilyStatusLine status={familyStatus("haiku")} />
+					</div>
+				</div>
+			</div>
+		</div>
+	);
 }
 
 export function AccountModelMappingsDialog({
@@ -86,16 +259,10 @@ export function AccountModelMappingsDialog({
 
 		setIsLoading(true);
 		try {
-			const mappingsToSend: { [key: string]: string | string[] } = {};
-			const fable = parseMappingValue(modelMappings.fable);
-			const opus = parseMappingValue(modelMappings.opus);
-			const sonnet = parseMappingValue(modelMappings.sonnet);
-			const haiku = parseMappingValue(modelMappings.haiku);
-
-			if (fable) mappingsToSend.fable = fable;
-			if (opus) mappingsToSend.opus = opus;
-			if (sonnet) mappingsToSend.sonnet = sonnet;
-			if (haiku) mappingsToSend.haiku = haiku;
+			const mappingsToSend = mergeAccountModelMappings(
+				account.modelMappings,
+				modelMappings,
+			);
 
 			await onUpdateModelMappings(account.id, mappingsToSend);
 			onOpenChange(false);
@@ -118,13 +285,6 @@ export function AccountModelMappingsDialog({
 
 	if (!account) return null;
 
-	// Same single rule as the combo slot. Here it does not block Save (mapping
-	// only the families this account actually uses is legitimate), but the
-	// user needs to know that "empty" is not passthrough on this provider.
-	const passthroughAllowed = providerAllowsClientModelPassthrough(
-		account.provider,
-	);
-
 	return (
 		<Dialog open={isOpen} onOpenChange={onOpenChange}>
 			<DialogContent className="sm:max-w-[600px] flex flex-col max-h-[85vh]">
@@ -135,104 +295,11 @@ export function AccountModelMappingsDialog({
 						models with commas to cycle through them on rate limits.
 					</DialogDescription>
 				</DialogHeader>
-				<div className="space-y-4 py-2 overflow-y-auto flex-1">
-					<div>
-						<h4 className="text-sm font-medium mb-2">Model Mappings</h4>
-						<p className="text-xs text-muted-foreground mb-3">
-							Map Anthropic model names to provider-specific models. Use commas
-							for multiple models (e.g.{" "}
-							<code className="text-xs bg-muted px-1 rounded">
-								model-a, model-b
-							</code>
-							) to cycle on rate limits. Pick from the provider list or type the
-							name; Test sends one real request with the first model of the
-							field and consumes quota.
-						</p>
-						{!passthroughAllowed && (
-							<p className="text-xs text-warning mb-3">
-								{account.provider} does not serve Claude model ids, so a family
-								left empty here is not passthrough: the built-in default map of
-								the provider decides instead, and it may point at a model this
-								account is not entitled to call. Map every family this account
-								is actually used for.
-							</p>
-						)}
-						<div className="grid grid-cols-2 gap-3">
-							<div className="space-y-1">
-								<Label htmlFor="fable" className="text-xs">
-									Fable
-								</Label>
-								<div className="flex items-center gap-1.5">
-									<ModelCombobox
-										id="fable"
-										mode="list"
-										provider={account.provider}
-										accountId={account.id}
-										value={modelMappings.fable}
-										onChange={(value) => handleInputChange("fable", value)}
-										placeholder={`e.g., ${LATEST_FABLE_MODEL}`}
-										className="flex-1"
-										inputClassName="h-8"
-									/>
-								</div>
-							</div>
-							<div className="space-y-1">
-								<Label htmlFor="opus" className="text-xs">
-									Opus
-								</Label>
-								<div className="flex items-center gap-1.5">
-									<ModelCombobox
-										id="opus"
-										mode="list"
-										provider={account.provider}
-										accountId={account.id}
-										value={modelMappings.opus}
-										onChange={(value) => handleInputChange("opus", value)}
-										placeholder={`e.g., ${LATEST_OPUS_MODEL}`}
-										className="flex-1"
-										inputClassName="h-8"
-									/>
-								</div>
-							</div>
-							<div className="space-y-1">
-								<Label htmlFor="sonnet" className="text-xs">
-									Sonnet
-								</Label>
-								<div className="flex items-center gap-1.5">
-									<ModelCombobox
-										id="sonnet"
-										mode="list"
-										provider={account.provider}
-										accountId={account.id}
-										value={modelMappings.sonnet}
-										onChange={(value) => handleInputChange("sonnet", value)}
-										placeholder={`e.g., ${LATEST_SONNET_MODEL}`}
-										className="flex-1"
-										inputClassName="h-8"
-									/>
-								</div>
-							</div>
-							<div className="space-y-1">
-								<Label htmlFor="haiku" className="text-xs">
-									Haiku
-								</Label>
-								<div className="flex items-center gap-1.5">
-									<ModelCombobox
-										id="haiku"
-										mode="list"
-										provider={account.provider}
-										accountId={account.id}
-										value={modelMappings.haiku}
-										onChange={(value) => handleInputChange("haiku", value)}
-										placeholder={`e.g., ${LATEST_HAIKU_MODEL}`}
-										className="flex-1"
-										inputClassName="h-8"
-									/>
-								</div>
-							</div>
-						</div>
-					</div>
-				</div>
+				<AccountModelMappingsBody
+					account={account}
+					modelMappings={modelMappings}
+					onInputChange={handleInputChange}
+				/>
 				<DialogFooter className="mt-2 shrink-0">
 					<Button
 						type="button"

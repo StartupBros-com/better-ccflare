@@ -36,6 +36,7 @@ interface CapturedProviderDescriptor {
 	readonly providerName: string;
 	readonly cacheReplayModelStrategy: CacheReplayModelStrategy;
 	readonly createAttemptPlan: Provider["createAttemptPlan"];
+	readonly captureAttemptIdentity: Provider["captureAttemptIdentity"];
 	readonly prepareRequest: Provider["prepareRequest"];
 	readonly buildUrl: Provider["buildUrl"];
 	readonly prepareHeaders: Provider["prepareHeaders"];
@@ -56,6 +57,8 @@ type ValidatedProviderAttemptPlanContext = Readonly<{
 	path: string;
 	query: string;
 	physicalModel: string | null;
+	/** Identity captured with admission before any later credential/catalog await. */
+	capturedAttemptIdentity?: unknown;
 	capabilityProofKey: string | null;
 	inputReplayMode: readonly ServerToolReplayAtom[];
 	outputReplayMode: readonly ServerToolReplayAtom[];
@@ -180,6 +183,9 @@ function captureProviderDescriptor(
 	const createAttemptPlan = optionalFunction<
 		NonNullable<Provider["createAttemptPlan"]>
 	>(provider.createAttemptPlan, "createAttemptPlan");
+	const captureAttemptIdentity = optionalFunction<
+		NonNullable<Provider["captureAttemptIdentity"]>
+	>(provider.captureAttemptIdentity, "captureAttemptIdentity");
 	const prepareRequest = optionalFunction<
 		NonNullable<Provider["prepareRequest"]>
 	>(provider.prepareRequest, "prepareRequest");
@@ -226,6 +232,7 @@ function captureProviderDescriptor(
 				? "normalized-source"
 				: normalizeCacheReplayModelStrategy(rawCacheReplayModelStrategy),
 		createAttemptPlan,
+		captureAttemptIdentity,
 		prepareRequest,
 		buildUrl,
 		prepareHeaders,
@@ -249,6 +256,7 @@ function requireStableProviderDescriptor(
 		current.providerName !== expected.providerName ||
 		current.cacheReplayModelStrategy !== expected.cacheReplayModelStrategy ||
 		current.createAttemptPlan !== expected.createAttemptPlan ||
+		current.captureAttemptIdentity !== expected.captureAttemptIdentity ||
 		current.prepareRequest !== expected.prepareRequest ||
 		current.buildUrl !== expected.buildUrl ||
 		current.prepareHeaders !== expected.prepareHeaders ||
@@ -401,6 +409,48 @@ function isThenable(value: unknown): boolean {
 			typeof (value as { then?: unknown }).then === "function") ||
 		false
 	);
+}
+
+/**
+ * Capture a legacy provider's per-attempt identity through a frozen captured
+ * hook reference and throw the canonical synchronicity TypeError when the
+ * provider violates its documented synchronous contract (types.ts
+ * `captureAttemptIdentity`). Shared by the canonical legacy-plan path and the
+ * unauthenticated proxy path so both surfaces reject a thenable identity with
+ * the exact same diagnostic instead of silently forwarding it.
+ */
+export function captureSynchronousAttemptIdentity(
+	provider: Provider,
+	captureAttemptIdentity: Provider["captureAttemptIdentity"],
+	account?: Account,
+	modelContextSnapshot?: unknown,
+): unknown {
+	if (captureAttemptIdentity === undefined) return undefined;
+	const identity = Reflect.apply(captureAttemptIdentity, provider, [
+		account,
+		modelContextSnapshot,
+	]);
+	if (isThenable(identity)) {
+		throw new TypeError("Provider attempt identity must be synchronous");
+	}
+	return identity;
+}
+
+/**
+ * Guard a legacy provider hook's return value against a thenable result,
+ * throwing `message` when it is one. Used to close the same synchronicity
+ * gap for `buildUrl` / `prepareHeaders` on the unauthenticated path that the
+ * canonical legacy-plan path already closes for `buildUrl`'s result via
+ * `normalizeTargetUrl` and for `prepareRequest` directly.
+ */
+export function assertSynchronousProviderResult<T>(
+	value: T,
+	message: string,
+): T {
+	if (isThenable(value)) {
+		throw new TypeError(message);
+	}
+	return value;
 }
 
 function sameReplayMode(
@@ -580,6 +630,7 @@ function validateContext(
 			context.physicalModel,
 			"physicalModel",
 		),
+		capturedAttemptIdentity: context.capturedAttemptIdentity,
 		capabilityProofKey: normalizeNullableString(
 			context.capabilityProofKey,
 			"capabilityProofKey",
@@ -786,6 +837,7 @@ function materializeLegacyPlan(
 	const accountView = createScalarAccountView(context.account);
 	const accountSchemaKeys = new Set<PropertyKey>(Reflect.ownKeys(accountView));
 	const {
+		captureAttemptIdentity,
 		prepareRequest,
 		buildUrl,
 		prepareHeaders,
@@ -800,6 +852,7 @@ function materializeLegacyPlan(
 	} = providerDescriptor;
 
 	let targetUrl: string;
+	let attemptIdentity: unknown;
 	try {
 		if (prepareRequest) {
 			const prepared = Reflect.apply(prepareRequest, provider, [
@@ -815,10 +868,22 @@ function materializeLegacyPlan(
 			validateLegacyAccountView(accountView, accountSchemaKeys);
 			requireStableProviderDescriptor(provider, providerDescriptor);
 		}
+		attemptIdentity = assertSynchronousProviderResult(
+			context.capturedAttemptIdentity !== undefined
+				? context.capturedAttemptIdentity
+				: captureSynchronousAttemptIdentity(
+						provider,
+						captureAttemptIdentity,
+						accountView,
+					),
+			"Provider attempt identity must be synchronous",
+		);
+		requireStableProviderDescriptor(provider, providerDescriptor);
 		targetUrl = Reflect.apply(buildUrl, provider, [
 			context.path,
 			context.query,
 			accountView,
+			attemptIdentity,
 		]);
 		validateLegacyAccountView(accountView, accountSchemaKeys);
 		requireStableProviderDescriptor(provider, providerDescriptor);
@@ -841,13 +906,19 @@ function materializeLegacyPlan(
 		},
 		cacheReplayModelStrategy: providerDescriptor.cacheReplayModelStrategy,
 		prepareHeaders: (headers, accessToken, apiKey) =>
-			Reflect.apply(prepareHeaders, provider, [headers, accessToken, apiKey]),
+			Reflect.apply(prepareHeaders, provider, [
+				headers,
+				accessToken,
+				apiKey,
+				attemptIdentity,
+			]),
 		transformRequestBody: transformRequestBody
 			? (request) =>
 					Reflect.apply(transformRequestBody, provider, [
 						request,
 						accountView,
 						context.beforePhysicalTransport,
+						attemptIdentity,
 					])
 			: async (request) => request,
 		processResponse: (response, requestHeaders, transportAbort) =>
@@ -856,6 +927,8 @@ function materializeLegacyPlan(
 				accountView,
 				requestHeaders,
 				transportAbort,
+				(attemptIdentity as { modelContextSnapshot?: unknown } | undefined)
+					?.modelContextSnapshot,
 			]),
 		parseRateLimit: (response) =>
 			Reflect.apply(parseRateLimit, provider, [response]),

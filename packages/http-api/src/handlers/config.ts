@@ -13,6 +13,7 @@ import {
 	validateNumber,
 	validateString,
 } from "@better-ccflare/core";
+import type { DatabaseOperations } from "@better-ccflare/database";
 import {
 	BadRequest,
 	errorResponse,
@@ -20,15 +21,23 @@ import {
 } from "@better-ccflare/http-common";
 import {
 	getProviderModelDefaultFactories,
+	getProviderModelDefaultOverrides,
 	resolveProviderModelDefault,
 	setProviderModelDefaultOverrides,
 } from "@better-ccflare/providers";
+import { resolveCodexClientIdentity } from "@better-ccflare/providers/codex";
 import type { APIContext } from "@better-ccflare/types";
+import {
+	describeCodexAccountCatalog,
+	resolveCodexAccountFamilyDefault,
+} from "../services/codex-effective-defaults";
 import {
 	allowedModelErrorMessage,
 	isAllowedModel,
 } from "../services/model-validation";
 import type { ConfigResponse, RetentionSetRequest } from "../types";
+
+const CODEX_FAMILIES = ["fable", "opus", "sonnet", "haiku"] as const;
 
 /**
  * Create config handlers
@@ -37,8 +46,52 @@ export function createConfigHandlers(
 	config: Config,
 	runtime?: { port: number; tlsEnabled: boolean },
 	modelCatalog?: APIContext["modelCatalog"],
+	dbOps?: DatabaseOperations,
 ) {
-	const getProviderModelDefaults = (): Response => {
+	/**
+	 * Per-account, per-family effective Codex defaults, additive to the
+	 * provider-level `providers` field above. Read-only: never triggers a
+	 * catalog fetch (uses getKnownOrSharedCodexModels, not getCodexModels).
+	 * Omitted entirely when no dbOps was wired in (e.g. a caller that only
+	 * needs the provider-level view), so existing consumers are unaffected.
+	 */
+	const getCodexAccountsEffectiveDefaults = async () => {
+		if (!dbOps) return undefined;
+		// The global-override attribution reads the process-wide registry — the
+		// same state `resolveCodexRequestModel` → `resolveProviderModelDefault`
+		// resolves `effectiveModel` from — not Config, so the
+		// `global_provider_override` label and the effective model can never
+		// disagree. Boot and the POST handler own writing that registry.
+		const globalOverrides = getProviderModelDefaultOverrides().codex;
+		const accounts = (await dbOps.getAllAccounts())
+			.filter((account) => account.provider === "codex")
+			.sort((a, b) => a.name.localeCompare(b.name));
+
+		const now = Date.now();
+		return accounts.map((account) => {
+			const { info: catalogInfo, view: catalog } = describeCodexAccountCatalog(
+				account.id,
+				now,
+			);
+
+			const families = CODEX_FAMILIES.map((family) =>
+				resolveCodexAccountFamilyDefault(account, family, {
+					globalOverride: globalOverrides?.[family],
+					catalog: catalogInfo,
+				}),
+			);
+
+			return {
+				accountId: account.id,
+				accountName: account.name,
+				paused: account.paused,
+				catalog,
+				families,
+			};
+		});
+	};
+
+	const getProviderModelDefaults = async (): Promise<Response> => {
 		const enabled = config.getEnabledProviderModelDefaultProviders();
 		const factories = getProviderModelDefaultFactories();
 		const saved = config.getProviderModelDefaultOverrides();
@@ -61,7 +114,33 @@ export function createConfigHandlers(
 				})),
 			};
 		});
-		return jsonResponse({ providers });
+
+		const response: {
+			providers: typeof providers;
+			codexClientIdentity?: {
+				version: string;
+				source: string;
+				fresh: boolean;
+				verifiedAt?: string;
+				error?: string;
+			};
+			accounts?: Awaited<ReturnType<typeof getCodexAccountsEffectiveDefaults>>;
+		} = { providers };
+
+		if (enabled.includes("codex")) {
+			const identity = resolveCodexClientIdentity();
+			response.codexClientIdentity = {
+				version: identity.version,
+				source: identity.source,
+				fresh: identity.fresh,
+				verifiedAt: identity.verifiedAt,
+				error: identity.error,
+			};
+			const accounts = await getCodexAccountsEffectiveDefaults();
+			if (accounts !== undefined) response.accounts = accounts;
+		}
+
+		return jsonResponse(response);
 	};
 
 	return {
