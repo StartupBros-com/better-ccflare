@@ -69,7 +69,9 @@ installed command-line client.
 
 Catalog discovery and inference can use different identity formats while sharing the
 same version. A model advertised to one client identity is not proof that a request
-from another identity will be accepted.
+from another identity will be accepted. The identity follows an installed client only
+through an explicitly configured, verified version record, never by running or
+inspecting that client; without one it stays at the adapter's built-in version.
 
 ### Root-capable pool
 

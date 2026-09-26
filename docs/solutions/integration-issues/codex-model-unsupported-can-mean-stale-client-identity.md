@@ -59,8 +59,14 @@ and deployment verification are recorded in [issue #378](https://github.com/Star
 ## What Didn't Work
 
 - **Updating only the installed CLI.** The proxy has its own compiled
-  `CODEX_VERSION` and derived `CODEX_USER_AGENT`; it does not obtain them by running
-  the installed CLI (`packages/providers/src/providers/codex/provider.ts:175-180`).
+  `CODEX_VERSION` and derived `CODEX_USER_AGENT`
+  (`packages/providers/src/providers/codex/client-identity.ts:4-5`), and it never runs
+  the installed CLI.
+  - Since #384, the identity resolves from an explicit `CCFLARE_CODEX_CLIENT_VERSION`,
+    then a verified-version record named by `CCFLARE_CODEX_VERIFIED_VERSION_FILE`, then
+    that compiled default (`client-identity.ts:186-240`).
+  - Nothing writes that record until the CLI updater (dotfiles #1377) exists, so a CLI
+    update alone still leaves the proxy on the compiled version.
 - **Treating a newer CLI's catalog as inference proof.** A listing establishes
   what that catalog request advertised, not what an older proxy identity can
   invoke. This investigation did not establish that the older identity's catalog
@@ -70,9 +76,9 @@ and deployment verification are recorded in [issue #378](https://github.com/Star
   fallback rung, and stream completion, not just client-visible success.
 - **Expecting existing traces to contain the rejected JSON body.** The planned
   model-unavailable path can retain a response for terminal delivery or discard
-  it when superseded (`packages/proxy/src/handlers/proxy-operations.ts:6397-6423`).
+  it when superseded (`packages/proxy/src/handlers/proxy-operations.ts:6475-6501`).
   The non-SSE Codex trace records `http_<status>` and status text, not the parsed
-  upstream error detail (`packages/providers/src/providers/codex/provider.ts:3247-3265`).
+  upstream error detail (`packages/providers/src/providers/codex/provider.ts:3331-3349`).
   Existing records recovered HTTP 400, but the precise reason required the bounded,
   explicitly authorized comparison. This observability limitation was **not**
   repaired by the identity change.
@@ -88,20 +94,22 @@ existing shared compatibility constant:
 ```
 
 The proxy's catalog and inference paths already shared this constant; they were
-consistently **stale**, not independently versioned. The change advanced all of them:
+consistently **stale**, not independently versioned. The change advanced all of them.
+Since #384 the constant lives in `client-identity.ts`, and each path reads the resolved
+identity rather than the constant directly:
 
 - Inference `Version` and the derived `codex-cli/...` user agent:
-  `packages/providers/src/providers/codex/provider.ts:2556-2583`.
+  `packages/providers/src/providers/codex/provider.ts:2645-2648`.
 - Provider model-list URL:
-  `packages/providers/src/providers/codex/provider.ts:2545-2553`.
+  `packages/providers/src/providers/codex/provider.ts:2610-2612`.
 - Account catalog query and its distinct `codex_cli_rs/...` user agent:
-  `packages/proxy/src/codex-model-catalog.ts:303-317`.
+  `packages/proxy/src/codex-model-catalog.ts:364-386`.
 
 Regression tests assert the literal verified version, replacement of stale inbound
 identity headers, and catalog/inference version parity. The catalog response is
 mocked: those assertions verify request construction, not live model entitlement
-(`packages/providers/src/providers/codex/provider.test.ts:89-113`;
-`packages/proxy/src/__tests__/codex-model-catalog.test.ts:139-176`). The fix is merged
+(`packages/providers/src/providers/codex/provider.test.ts:239-262`;
+`packages/proxy/src/__tests__/codex-model-catalog.test.ts:208-239`). The fix is merged
 and deployed; it did not change mappings, credentials, fallback policy, or tool schemas.
 
 ## Why This Works
@@ -121,7 +129,9 @@ post-deployment routing.
 
 1. Compare the deployed proxy's outbound identity with the working client's
    identity. Do not infer production behavior from a locally installed CLI or a
-   source branch that has not been deployed.
+   source branch that has not been deployed. Since #384, the admin
+   `GET /api/config/provider-model-defaults` reports the effective identity as
+   `codexClientIdentity`: version, source (`explicit`, `verified` or `default`) and freshness.
 2. Keep version-parity tests across both catalog implementations and inference,
    while preserving their intentionally different user-agent formats. Literal
    expectations must supplement comparisons derived from the same constant.
@@ -131,12 +141,15 @@ post-deployment routing.
 4. Investigate existing records first. If they cannot recover the failure, obtain
    explicit authorization for a bounded comparison on a non-Anthropic account;
    never replay customer conversations or treat an exhausted probe budget as reusable.
-5. Keep future automation separate from this static compatibility repair.
+5. Keep automation separate from this static compatibility repair.
    [better-ccflare #370](https://github.com/StartupBros-com/better-ccflare/issues/370)
-   and [dotfiles #1377](https://github.com/StartupBros-com/dotfiles/issues/1377) track
-   verified CLI updates and a shared version source. That design must cover
-   inference as well as catalog negotiation; a new identity still does not prove
-   support for arbitrary new protocol fields or hosted tools.
+   shipped the proxy side in #384: one resolved identity is shared by inference and
+   catalog negotiation, fed by a verified-version record.
+   [dotfiles #1377](https://github.com/StartupBros-com/dotfiles/issues/1377), which
+   writes that record after a verified CLI update, is still open. Until it ships and
+   the service points at the record, the identity stays at the compiled default and a
+   version bump still needs a code change. A new identity still does not prove support
+   for arbitrary new protocol fields or hosted tools.
 
 ## Related Issues
 
