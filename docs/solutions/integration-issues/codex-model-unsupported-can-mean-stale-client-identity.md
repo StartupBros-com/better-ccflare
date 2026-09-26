@@ -65,8 +65,10 @@ and deployment verification are recorded in [issue #378](https://github.com/Star
   - Since #384, the identity resolves from an explicit `CCFLARE_CODEX_CLIENT_VERSION`,
     then a verified-version record named by `CCFLARE_CODEX_VERIFIED_VERSION_FILE`, then
     that compiled default (`client-identity.ts:186-240`).
-  - Nothing writes that record until the CLI updater (dotfiles #1377) exists, so a CLI
-    update alone still leaves the proxy on the compiled version.
+  - The verified CLI updater from dotfiles #1377 writes that record after each verified
+    promotion, and production has pointed the variable at it since 2026-09-26. A CLI
+    updated any other way, or a service without the variable, still leaves the proxy on
+    the compiled version.
 - **Treating a newer CLI's catalog as inference proof.** A listing establishes
   what that catalog request advertised, not what an older proxy identity can
   invoke. This investigation did not establish that the older identity's catalog
@@ -145,11 +147,20 @@ post-deployment routing.
    [better-ccflare #370](https://github.com/StartupBros-com/better-ccflare/issues/370)
    shipped the proxy side in #384: one resolved identity is shared by inference and
    catalog negotiation, fed by a verified-version record.
-   [dotfiles #1377](https://github.com/StartupBros-com/dotfiles/issues/1377), which
-   writes that record after a verified CLI update, is still open. Until it ships and
-   the service points at the record, the identity stays at the compiled default and a
-   version bump still needs a code change. A new identity still does not prove support
-   for arbitrary new protocol fields or hosted tools.
+   [dotfiles #1377](https://github.com/StartupBros-com/dotfiles/issues/1377) writes that
+   record after each verified CLI promotion. It was merged as dotfiles #1401 and
+   activated on 2026-09-26. Production sets `CCFLARE_CODEX_VERIFIED_VERSION_FILE` in a
+   systemd drop-in, and reports source `verified` for the promoted 0.157.1.
+   - The resolver re-reads the record at most once a second, so a later promotion reaches
+     the proxy without a restart.
+   - A record that goes missing or invalid after a valid read keeps the last valid version.
+     One older than 30 days is still used but reported as not fresh.
+   - While the variable is set, a stalled updater raises `codex_identity_record_stale`
+     (`packages/proxy/src/codex-model-catalog.ts:753-775`).
+   - An install without the updater still stays at the compiled default, where a version
+     bump needs a code change.
+   A new identity still does not prove support for arbitrary new protocol fields or
+   hosted tools.
 
 ## Related Issues
 
