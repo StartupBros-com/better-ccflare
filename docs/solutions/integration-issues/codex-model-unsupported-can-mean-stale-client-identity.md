@@ -105,7 +105,7 @@ identity rather than the constant directly:
 - Account catalog query and its distinct `codex_cli_rs/...` user agent:
   `packages/proxy/src/codex-model-catalog.ts:364-386`.
 
-Regression tests assert the literal verified version, replacement of stale inbound
+Regression tests assert the literal compiled version, replacement of stale inbound
 identity headers, and catalog/inference version parity. The catalog response is
 mocked: those assertions verify request construction, not live model entitlement
 (`packages/providers/src/providers/codex/provider.test.ts:239-262`;
