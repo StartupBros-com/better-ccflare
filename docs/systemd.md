@@ -80,6 +80,24 @@ Bun rejects queue-full body requests locally with `503` and `Retry-After: 1` bef
 
 After a restart, inspect `GET /_guard/health` and `GET /health` on naturally arriving authorized traffic; do not generate synthetic traffic against Anthropic-backed accounts. Guard root and `runtime.limits` must both report `maxRequestBodyBytes` and `maxBufferedRequestBodyBytes`. Root `bodyReaders.reservationLimitBytes`, `reservedBytes`, and `reservedBytesPeak` show the guard aggregate budget, current reservation, and high-water mark. Bun's `runtime.bodyAdmission` reports aggregate configuration, current/peak reservations, active/queued counts, and counters only; it never includes body data, paths, accounts, sessions, or request IDs. The OpenAI Responses endpoint also applies the 32 MiB limit separately to encoded and decoded `gzip`, `deflate`, and `zstd` request bodies.
 
+## Codex Client Identity Drop-In
+
+By default the Codex provider advertises its compiled client version. To have it follow a managed Codex CLI updater, set `CCFLARE_CODEX_VERIFIED_VERSION_FILE` to the updater's verified-version record. Put it in its own operator drop-in that sorts after the deploy-owned pin:
+
+```ini
+# /etc/systemd/system/ccflare-stack.service.d/80-codex-verified-version.conf
+[Service]
+Environment=CCFLARE_CODEX_VERIFIED_VERSION_FILE=/home/<user>/.local/state/codex-update/verified-version.json
+```
+
+`deploy-ccflare.sh` replaces only `50-pinned-build.conf`, so this drop-in survives deploys. The service user must be able to read the record.
+
+- **Apply:** run `systemctl daemon-reload` and restart once. Later record updates take effect without a restart.
+- **Confirm:** `GET /api/config/provider-model-defaults` reports `codexClientIdentity.source` as `verified`.
+- **Revert:** removing the drop-in, reloading and restarting returns the service to the compiled version.
+
+The record format and fallback rules are in [configuration](configuration.md) under `CCFLARE_CODEX_VERIFIED_VERSION_FILE`.
+
 ## Memory Management
 
 ### The `--smol` flag (recommended)
