@@ -66,9 +66,10 @@ and deployment verification are recorded in [issue #378](https://github.com/Star
     then a verified-version record named by `CCFLARE_CODEX_VERIFIED_VERSION_FILE`, then
     that compiled default (`client-identity.ts:186-240`).
   - The verified CLI updater from dotfiles #1377 writes that record after each verified
-    promotion, and production has pointed the variable at it since 2026-09-26. A CLI
-    updated any other way, or a service without the variable, still leaves the proxy on
-    the compiled version.
+    promotion, and production has pointed the variable at it since 2026-09-26. Without
+    the updater, or with the variable unset, a CLI updated any other way still leaves the
+    proxy on the compiled version. On a host running the updater, its next run records
+    whatever version is installed.
 - **Treating a newer CLI's catalog as inference proof.** A listing establishes
   what that catalog request advertised, not what an older proxy identity can
   invoke. This investigation did not establish that the older identity's catalog
@@ -153,12 +154,13 @@ post-deployment routing.
    systemd drop-in, and reports source `verified` for the promoted 0.157.1.
    - The resolver re-reads the record at most once a second, so a later promotion reaches
      the proxy without a restart.
-   - A record that goes missing or invalid after a valid read keeps the last valid version.
+   - A record that goes missing or invalid after a valid read keeps the last valid version
+     within the same process.
      One older than 30 days is still used but reported as not fresh.
    - While the variable is set, a stalled updater raises `codex_identity_record_stale`
      (`packages/proxy/src/codex-model-catalog.ts:753-775`).
    - An install without the updater still stays at the compiled default, where a version
-     bump needs a code change.
+     bump needs `CCFLARE_CODEX_CLIENT_VERSION` or a code change.
    A new identity still does not prove support for arbitrary new protocol fields or
    hosted tools.
 
