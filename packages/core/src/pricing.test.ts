@@ -591,6 +591,19 @@ describe("getModelRates", () => {
 	// Offline mode still falls back to the shared on-disk models.dev cache, which
 	// a server on this host may have refreshed; hide it so these assert the
 	// bundled table rather than whatever the live catalogue lists.
+	it("returns the Sonnet 5 bundled rates at its standard $2/$10 price", async () => {
+		const rates = await withDiskCache(null, () =>
+			getModelRates("claude-sonnet-5"),
+		);
+
+		expect(rates).toEqual({
+			input: 2,
+			output: 10,
+			cacheRead: 0.2,
+			cacheWrite: 2.5,
+		});
+	});
+
 	it("returns the Sonnet 5.5 bundled rates published at launch", async () => {
 		const rates = await withDiskCache(null, () =>
 			getModelRates("claude-sonnet-5-5"),
