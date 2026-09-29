@@ -105,6 +105,9 @@ function deferred<T>(): {
 
 describe("model-catalog", () => {
 	const originalFetch = global.fetch;
+	// The test preload sets this for the whole process, and bun runs every test
+	// file in one process, so restore it rather than deleting it.
+	const savedCacheDir = process.env.BETTER_CCFLARE_MODELS_CACHE_DIR;
 
 	beforeEach(async () => {
 		process.env.BETTER_CCFLARE_MODELS_CACHE_DIR = TEST_CACHE_DIR;
@@ -116,7 +119,9 @@ describe("model-catalog", () => {
 
 	afterEach(async () => {
 		global.fetch = originalFetch;
-		delete process.env.BETTER_CCFLARE_MODELS_CACHE_DIR;
+		if (savedCacheDir === undefined)
+			delete process.env.BETTER_CCFLARE_MODELS_CACHE_DIR;
+		else process.env.BETTER_CCFLARE_MODELS_CACHE_DIR = savedCacheDir;
 		delete process.env.BETTER_CCFLARE_MODELS_REFRESH_HOURS;
 		delete process.env.BETTER_CCFLARE_MODELS_OFFLINE;
 		await cleanCacheDir();
