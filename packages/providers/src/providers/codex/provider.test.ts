@@ -261,6 +261,74 @@ describe("CodexProvider release identity", () => {
 	});
 });
 
+describe("CodexProvider selected account identity", () => {
+	function tokenWithAccountId(accountId: unknown): string {
+		const payload = Buffer.from(
+			JSON.stringify({
+				"https://api.openai.com/auth": { chatgpt_account_id: accountId },
+			}),
+		).toString("base64url");
+		return `header.${payload}.signature`;
+	}
+
+	it("uses the selected token's ChatGPT account for inference quota", () => {
+		const token = tokenWithAccountId("selected-chatgpt-account");
+		const headers = new CodexProvider().prepareHeaders(new Headers(), token);
+
+		expect(headers.get("Authorization")).toBe(`Bearer ${token}`);
+		expect(headers.get("ChatGPT-Account-ID")).toBe("selected-chatgpt-account");
+	});
+
+	it("replaces stale caller account identity on each selected-account attempt", () => {
+		const inbound = new Headers({
+			Authorization: "Bearer caller-token",
+			"cHaTgPt-AcCoUnT-iD": "caller-chatgpt-account",
+			"X-Account-ID": "caller-account-alias",
+			session_id: "stable-session",
+		});
+		const provider = new CodexProvider();
+		const first = provider.prepareHeaders(inbound, tokenWithAccountId("first"));
+		const secondToken = tokenWithAccountId("second");
+		const second = provider.prepareHeaders(first, secondToken);
+
+		expect(first.get("ChatGPT-Account-ID")).toBe("first");
+		expect(first.has("X-Account-ID")).toBe(false);
+		expect(second.get("ChatGPT-Account-ID")).toBe("second");
+		expect(second.get("Authorization")).toBe(`Bearer ${secondToken}`);
+		expect(second.get("session_id")).toBe("stable-session");
+		expect(inbound.get("ChatGPT-Account-ID")).toBe("caller-chatgpt-account");
+	});
+
+	it.each([
+		undefined,
+		"opaque-custom-endpoint-token",
+		"a.!!!not-base64!!!.c",
+		...[
+			undefined,
+			null,
+			42,
+			[],
+			"",
+			" ",
+			"account\r\ninjected: value",
+			"account\u0000",
+			"account\u{1f600}",
+		].map(tokenWithAccountId),
+	])("clears caller identity without throwing for missing or malformed claims (%#)", (token) => {
+		const headers = new CodexProvider().prepareHeaders(
+			new Headers({
+				"ChatGPT-Account-ID": "caller-chatgpt-account",
+				"X-Account-ID": "caller-account-alias",
+			}),
+			token,
+		);
+
+		expect(headers.has("ChatGPT-Account-ID")).toBe(false);
+		expect(headers.has("X-Account-ID")).toBe(false);
+		expect(headers.get("Authorization")).toBe(token ? `Bearer ${token}` : null);
+	});
+});
+
 afterEach(() => {
 	delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
 	delete process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV];

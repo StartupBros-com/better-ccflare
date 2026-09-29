@@ -62,10 +62,9 @@ interface WhamUsageResponse {
 /**
  * Decode the `https://api.openai.com/auth` claim's `chatgpt_account_id` out
  * of a ChatGPT access token (a JWT) without verifying the signature — we
- * only need the workspace/team account id to attach to the usage request,
- * the same way OnWatch does. Never throws: malformed tokens simply yield
- * null and the request proceeds without the header (fine for personal
- * accounts).
+ * only need the workspace/team account id to attach to usage and inference
+ * requests. Never throws: malformed tokens or header-unsafe claims simply
+ * yield null and the request proceeds without the header.
  */
 export function extractChatGptAccountId(accessToken: string): string | null {
 	try {
@@ -83,7 +82,10 @@ export function extractChatGptAccountId(accessToken: string): string | null {
 		) {
 			const chatgptAccountId = (authClaim as Record<string, unknown>)
 				.chatgpt_account_id;
-			if (typeof chatgptAccountId === "string" && chatgptAccountId !== "") {
+			if (
+				typeof chatgptAccountId === "string" &&
+				/^[\x21-\x7e]+$/.test(chatgptAccountId)
+			) {
 				return chatgptAccountId;
 			}
 		}
