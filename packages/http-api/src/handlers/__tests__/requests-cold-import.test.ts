@@ -35,7 +35,10 @@ async function coldImport(specifier: string): Promise<{
 }> {
 	const proc = Bun.spawn(
 		["bun", "-e", `await import(${JSON.stringify(specifier)});`],
-		{ cwd: REPO_ROOT, stdout: "ignore", stderr: "pipe" },
+		// env: process.env so the child inherits the test preload's per-process
+		// TMPDIR; Bun's default is the startup environment, whose tmpdir is the
+		// production service's (the child's logger would append to its app.log).
+		{ cwd: REPO_ROOT, env: process.env, stdout: "ignore", stderr: "pipe" },
 	);
 	const timer = setTimeout(() => proc.kill(), COLD_IMPORT_TIMEOUT_MS);
 	try {
