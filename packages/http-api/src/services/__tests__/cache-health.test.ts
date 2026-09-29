@@ -54,6 +54,14 @@ function bucket(
 	};
 }
 
+function thick(index: number, rate = 89): CacheHealthBucket {
+	return bucket(index, rate, {
+		eligible: 30,
+		measured: 30,
+		zeroHit: rate === 0 ? 30 : 0,
+	});
+}
+
 function run(buckets: CacheHealthBucket[], initial?: CacheHealthState) {
 	let state = initial ?? createCacheHealthState(buckets[0].scope);
 	const alerts = [];
@@ -120,19 +128,54 @@ describe("cache health policy", () => {
 	});
 
 	it("requires two earlier qualified healthy buckets within 24h for a critical collapse", () => {
-		expect(run([bucket(0, 0)]).alerts).toEqual([]);
-		expect(run([bucket(0, 92), bucket(1, 92), bucket(2, 50)]).alerts).toEqual(
+		expect(run([thick(0, 0)]).alerts).toEqual([]);
+		expect(run([bucket(0, 92), bucket(1, 92), thick(2, 50)]).alerts).toEqual(
 			[],
 		);
 		expect(
-			run([bucket(0, 92), bucket(1, 92), bucket(2, 49)]).alerts[0].type,
+			run([bucket(0, 92), bucket(1, 92), thick(2, 49)]).alerts[0].type,
 		).toBe("cache_efficiency_critical");
-		expect(run([bucket(0, 92), bucket(1, 92), bucket(147, 0)]).alerts).toEqual(
+		expect(run([bucket(0, 92), bucket(1, 92), thick(147, 0)]).alerts).toEqual(
 			[],
 		);
 		expect(
-			run([bucket(0, 92, { measured: 9 }), bucket(1, 92), bucket(2, 0)]).alerts,
+			run([bucket(0, 92, { measured: 9 }), bucket(1, 92), thick(2, 0)]).alerts,
 		).toEqual([]);
+	});
+
+	it("requires the critical request floor for a single-bucket collapse", () => {
+		expect(policy.criticalMinimumRequests).toBe(30);
+		const healthy = [bucket(0, 92), bucket(1, 92)];
+		const thin = run([
+			...healthy,
+			bucket(2, 0, { measured: 29, eligible: 29, zeroHit: 29 }),
+		]);
+		expect(thin.alerts).toEqual([]);
+		expect(thin.state.reuse.bad?.buckets).toBe(1);
+		const floor = run([...healthy, thick(2, 0)]);
+		expect(floor.alerts).toHaveLength(1);
+		expect(floor.alerts[0].type).toBe("cache_efficiency_critical");
+		expect(floor.alerts[0].threshold).toBe(policy.criticalPercent);
+		const warned = run([...healthy, bucket(2, 0), bucket(3, 0), bucket(4, 0)]);
+		expect(warned.alerts).toHaveLength(1);
+		expect(warned.alerts[0].type).toBe("cache_efficiency_low");
+	});
+
+	it("does not escalate an open warning from a thin bucket below the critical threshold", () => {
+		const warned = run([
+			bucket(0, 95),
+			bucket(1, 95),
+			bucket(2),
+			bucket(3),
+			bucket(4),
+		]);
+		expect(warned.alerts.map((a) => a.type)).toEqual(["cache_efficiency_low"]);
+		const thin = run([bucket(5, 0)], warned.state);
+		expect(thin.alerts).toEqual([]);
+		const escalated = run([thick(6, 0)], thin.state);
+		expect(escalated.alerts).toHaveLength(1);
+		expect(escalated.alerts[0].phase).toBe("escalated");
+		expect(escalated.alerts[0].type).toBe("cache_efficiency_critical");
 	});
 
 	it("escalates once, reminds only after six elapsed hours with new bad evidence, and recovers with hysteresis", () => {
@@ -142,8 +185,8 @@ describe("cache health policy", () => {
 			bucket(2),
 			bucket(3),
 			bucket(4),
-			bucket(5, 40),
-			bucket(6, 40),
+			thick(5, 40),
+			thick(6, 40),
 		]);
 		expect(opened.alerts.map((a) => a.phase)).toEqual(["opened", "escalated"]);
 		expect(run([bucket(40, 40)], opened.state).alerts).toEqual([]);
@@ -284,6 +327,31 @@ describe("cache health policy", () => {
 				[run([bucket(0), bucket(1), bucket(2)]).state],
 			),
 		).toBe(true);
+	});
+
+	it("applies the critical request floor after provider aggregation", () => {
+		const account = (id: string, index: number, rate: number) => {
+			const b = bucket(index, rate);
+			return {
+				...b,
+				scope: { ...b.scope, accountId: id },
+				contributors: [{ accountId: id, accountGeneration: 1 }],
+			};
+		};
+		const ids = ["a", "b", "c"];
+		const provider = (index: number, rate: number) =>
+			aggregateProviderCacheBuckets(
+				ids.map((id) => account(id, index, rate)),
+			)[0];
+		const collapsed = run([provider(0, 92), provider(1, 92), provider(2, 0)]);
+		expect(collapsed.alerts.map((a) => a.type)).toEqual([
+			"cache_efficiency_critical",
+		]);
+		expect(collapsed.alerts[0].evidence.measured).toBe(30);
+		for (const id of ids)
+			expect(
+				run([account(id, 0, 92), account(id, 1, 92), account(id, 2, 0)]).alerts,
+			).toEqual([]);
 	});
 
 	it("weights provider tokens and carries new enrollment forward through zero-hit buckets", () => {

@@ -650,9 +650,9 @@ describe("cache health persisted alert pipeline", () => {
 		expect((await history()).map((a) => a.type)).toEqual([
 			"cache_efficiency_low",
 		]);
-		await sample(5, 40);
+		await sample(5, 40, 30);
 		await tick(6);
-		await sample(6, 40);
+		await sample(6, 40, 30);
 		await tick(7);
 		expect(
 			(await history()).filter((a) => a.type === "cache_efficiency_critical"),
@@ -675,10 +675,10 @@ describe("cache health persisted alert pipeline", () => {
 		await sample(0, 45);
 		await sample(1, 45);
 		await tick(2);
-		await sample(2, 41);
+		await sample(2, 41, 30);
 		await tick(3);
 		expect(await history()).toEqual([]); // below 50 alone is insufficient
-		await sample(3, 39);
+		await sample(3, 39, 30);
 		await tick(4);
 		expect((await history())[0]).toMatchObject({
 			type: "cache_efficiency_critical",
@@ -691,6 +691,20 @@ describe("cache health persisted alert pipeline", () => {
 			(await history()).find((a) => a.type === "cache_efficiency_recovered")
 				?.threshold,
 		).toBe(42);
+	});
+
+	it("requires thirty measured requests for a single-bucket critical", async () => {
+		await sample(0, 95);
+		await sample(1, 95);
+		await tick(2);
+		await sample(2, 0);
+		await tick(3);
+		expect(await history()).toEqual([]);
+		await sample(3, 0, 30);
+		await tick(4);
+		expect((await history()).map((a) => a.type)).toEqual([
+			"cache_efficiency_critical",
+		]);
 	});
 
 	it("caps recovery at 100 percent and never widens the three-bucket startup window", async () => {
@@ -896,7 +910,7 @@ describe("cache health persisted alert pipeline", () => {
 		await db.run("UPDATE accounts SET created_at = 2 WHERE id = ?", [
 			"cache-a",
 		]);
-		await sample(6, 0, 10, { account_generation: 2 });
+		await sample(6, 0, 30, { account_generation: 2 });
 		await tick(7);
 		expect(await history()).toHaveLength(1); // old history remains, no cold critical
 	});
