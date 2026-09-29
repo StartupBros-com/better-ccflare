@@ -111,6 +111,7 @@ interface HarnessOptions {
 interface TestRequestState {
 	startMessage: StartMessage;
 	buffer: string;
+	discardingUsageLine?: boolean;
 	chunks: Uint8Array[];
 	chunksBytes: number;
 	usagePayloadSeq?: number;
@@ -401,6 +402,176 @@ describe("UsageCollector request lifecycle", () => {
 		collectors.push(value.collector);
 		return value;
 	}
+
+	describe("bounded streaming usage parsing", () => {
+		const previousBufferLimit = process.env.CF_STREAM_USAGE_BUFFER_KB;
+		const bufferLimit = 64 * 1024;
+		const encoder = new TextEncoder();
+		const frame = (type: string, data: Record<string, unknown>) =>
+			`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+		const start = (model = "claude-sonnet-5-5") =>
+			frame("message_start", {
+				message: {
+					model,
+					usage: {
+						input_tokens: 100,
+						cache_read_input_tokens: 900,
+						cache_creation_input_tokens: 50,
+						output_tokens: 0,
+					},
+				},
+			});
+		const finish =
+			frame("message_delta", {
+				delta: { stop_reason: "end_turn" },
+				usage: { output_tokens: 200 },
+			}) + frame("message_stop", {});
+
+		beforeEach(() => {
+			process.env.CF_STREAM_USAGE_BUFFER_KB = "64";
+		});
+		afterEach(() => {
+			if (previousBufferLimit === undefined) {
+				delete process.env.CF_STREAM_USAGE_BUFFER_KB;
+			} else {
+				process.env.CF_STREAM_USAGE_BUFFER_KB = previousBufferLimit;
+			}
+		});
+
+		it.each([
+			"coalesced",
+			"fragmented",
+		] as const)("persists complete usage when many bounded SSE lines arrive %s", async (delivery) => {
+			const harness = createHarness();
+			collectors.push(harness.collector);
+			const requestId = `usage-${delivery}`;
+			harness.collector.handleStart(makeStartMessage(requestId));
+			const content = frame("content_block_delta", {
+				index: 0,
+				delta: { type: "text_delta", text: "x".repeat(1024) },
+			});
+			const bytes = encoder.encode(start() + content.repeat(100) + finish);
+			expect(bytes.length).toBeGreaterThan(bufferLimit);
+			const chunkSize = delivery === "coalesced" ? bytes.length : 4096;
+			for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+				harness.collector.handleChunk(
+					requestId,
+					bytes.subarray(offset, offset + chunkSize),
+				);
+			}
+			await harness.collector.handleEnd({
+				type: "end",
+				requestId,
+				success: true,
+				streamTerminalState: "complete",
+			});
+			await harness.collector.drain();
+			expect(harness.savedUsages.get(requestId)).toMatchObject({
+				model: "claude-sonnet-5-5",
+				inputTokens: 100,
+				cacheReadInputTokens: 900,
+				cacheCreationInputTokens: 50,
+				outputTokens: 200,
+				promptTokens: 1050,
+			});
+		});
+
+		it("retains start and end usage around an oversized complete content line", async () => {
+			const harness = createHarness();
+			collectors.push(harness.collector);
+			const requestId = "oversized-complete-content-line";
+			harness.collector.handleStart(makeStartMessage(requestId));
+			const oversizedContent = frame("content_block_delta", {
+				index: 0,
+				delta: { type: "text_delta", text: "x".repeat(bufferLimit + 1) },
+			});
+			harness.collector.handleChunk(
+				requestId,
+				encoder.encode(start() + oversizedContent + finish),
+			);
+			await harness.collector.handleEnd({
+				type: "end",
+				requestId,
+				success: true,
+				streamTerminalState: "complete",
+			});
+			await harness.collector.drain();
+			expect(harness.savedUsages.get(requestId)).toMatchObject({
+				model: "claude-sonnet-5-5",
+				inputTokens: 100,
+				cacheReadInputTokens: 900,
+				cacheCreationInputTokens: 50,
+				outputTokens: 200,
+				promptTokens: 1050,
+			});
+		});
+
+		it("discards an oversized incomplete line through its newline and recovers bounded usage", async () => {
+			const harness = createHarness();
+			collectors.push(harness.collector);
+			const requestId = "oversized-usage-line";
+			harness.collector.handleStart(makeStartMessage(requestId));
+			harness.collector.handleChunk(
+				requestId,
+				encoder.encode(
+					`event: message_start\ndata: ${"x".repeat(bufferLimit)}`,
+				),
+			);
+			const state = testable(harness.collector).requests.get(requestId);
+			expect(state?.buffer.length).toBeLessThanOrEqual(bufferLimit);
+			expect(state?.discardingUsageLine).toBe(true);
+			// This apparent event is still part of the discarded data line. Its
+			// following data line must not inherit the earlier event context.
+			harness.collector.handleChunk(
+				requestId,
+				encoder.encode(
+					'event: message_start\ndata: {"type":"message_start","message":{"model":"forged","usage":{"input_tokens":999}}}\n\n',
+				),
+			);
+			expect(state?.usage).toEqual({});
+			expect(state?.discardingUsageLine).toBe(false);
+			harness.collector.handleChunk(
+				requestId,
+				encoder.encode(start() + finish),
+			);
+			await harness.collector.handleEnd({
+				type: "end",
+				requestId,
+				success: true,
+			});
+			await harness.collector.drain();
+			expect(harness.savedUsages.get(requestId)).toMatchObject({
+				model: "claude-sonnet-5-5",
+				inputTokens: 100,
+				cacheReadInputTokens: 900,
+				cacheCreationInputTokens: 50,
+				outputTokens: 200,
+			});
+		});
+
+		it("preserves usage across split event lines and UTF-8 code points", async () => {
+			const harness = createHarness();
+			collectors.push(harness.collector);
+			const requestId = "split-utf8-usage";
+			harness.collector.handleStart(makeStartMessage(requestId));
+			for (const byte of encoder.encode(start("test-雪") + finish)) {
+				harness.collector.handleChunk(requestId, new Uint8Array([byte]));
+			}
+			await harness.collector.handleEnd({
+				type: "end",
+				requestId,
+				success: true,
+			});
+			await harness.collector.drain();
+			expect(harness.savedUsages.get(requestId)).toMatchObject({
+				model: "test-雪",
+				inputTokens: 100,
+				cacheReadInputTokens: 900,
+				cacheCreationInputTokens: 50,
+				outputTokens: 200,
+			});
+		});
+	});
 
 	describe("fallback usage attribution", () => {
 		it("uses fresh top-level totals when the retained fallback iteration snapshot is stale", async () => {

@@ -53,6 +53,8 @@ interface RequestState {
 	startMessage: StartMessage;
 	cacheFlightCohortSealReceipt?: CacheFlightCohortSealReceipt | null;
 	buffer: string;
+	/** Ignore an oversized usage line until its newline arrives. */
+	discardingUsageLine: boolean;
 	streamDecoder: TextDecoder;
 	nativeResponses?: NativeResponsesState;
 	chunks: Uint8Array[];
@@ -808,36 +810,31 @@ function processStreamChunk(
 	maxBufferSize: number,
 ): void {
 	const text = state.streamDecoder.decode(chunk, { stream: true });
-	state.buffer += text;
 	state.lastActivity = Date.now();
 
-	// Limit buffer size - preserve event boundaries
-	if (state.buffer.length > maxBufferSize) {
-		const excess = state.buffer.length - maxBufferSize;
-		// Find the first newline after cutting the excess to avoid cutting mid-event
-		const firstNewlineAfterCut = state.buffer.indexOf("\n", excess);
-		if (firstNewlineAfterCut !== -1) {
-			state.buffer = state.buffer.slice(firstNewlineAfterCut + 1);
-		} else {
-			// Fallback: if no newline found, slice from end but this might cut mid-event
-			state.buffer = state.buffer.slice(-maxBufferSize);
-		}
-		// Event context is lost after truncation — a partial event: line may have
-		// been discarded, so the next data: line must not inherit a stale type.
-		state.currentEvent = undefined;
-	}
-
+	// A transport chunk may contain many small, complete events. Consume those
+	// before bounding the unfinished line so coalescing cannot erase earlier
+	// message_start/model/usage metadata. The cap still applies to each line.
 	let lineStart = 0;
-	for (;;) {
-		const lineEnd = state.buffer.indexOf("\n", lineStart);
-		if (lineEnd === -1) break;
+	while (lineStart < text.length) {
+		const newline = text.indexOf("\n", lineStart);
+		const lineEnd = newline === -1 ? text.length : newline;
+		if (state.discardingUsageLine) {
+			if (newline === -1) return;
+			state.discardingUsageLine = false;
+		} else if (state.buffer.length + lineEnd - lineStart > maxBufferSize) {
+			state.buffer = "";
+			state.currentEvent = undefined;
+			state.discardingUsageLine = newline === -1;
+		} else if (newline === -1) {
+			state.buffer += text.slice(lineStart);
+			return;
+		} else {
+			processSSELine(state.buffer + text.slice(lineStart, lineEnd), state);
+			state.buffer = "";
+		}
 
-		processSSELine(state.buffer.slice(lineStart, lineEnd), state);
 		lineStart = lineEnd + 1;
-	}
-
-	if (lineStart > 0) {
-		state.buffer = state.buffer.slice(lineStart);
 	}
 }
 
@@ -846,6 +843,7 @@ function freeRequestState(state: RequestState): void {
 	state.chunks.length = 0;
 	state.chunksBytes = 0;
 	state.buffer = "";
+	state.discardingUsageLine = false;
 	state.nativeResponses = undefined;
 	state.usage.iterations = undefined;
 	state.usage.iterationsSeq = undefined;
@@ -962,6 +960,7 @@ export class UsageCollector {
 			startMessage: msg,
 			cacheFlightCohortSealReceipt: msg.cacheFlightCohortSealReceipt ?? null,
 			buffer: "",
+			discardingUsageLine: false,
 			streamDecoder: new TextDecoder(),
 			// This RESPONSE marker is authored by CodexProvider after native
 			// passthrough selection. A client-supplied request header is not used.
