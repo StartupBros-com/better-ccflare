@@ -1815,6 +1815,11 @@ export class AlertService {
 	 * fires. Fires when `window.valueUsd < median * (1 - threshold)`, using
 	 * the configured (or default 0.25) usageWindowValueDropThreshold.
 	 *
+	 * Only priors valued under the same projection_version count: a list-price
+	 * correction makes older values incomparable until the ledger's startup
+	 * re-valuation re-stamps them, and a window closing mid-pass (or next to a
+	 * sibling that pass skipped) must not be measured against the old prices.
+	 *
 	 * Dedup id is (type, accountId, windowKey, resetsAtMs) via
 	 * buildUsageWindowAlertId — a closed window's resetsAt is fixed
 	 * forever, so persistAndEmit's INSERT OR IGNORE guarantees the SAME
@@ -1835,11 +1840,13 @@ export class AlertService {
 			`SELECT value_usd FROM usage_windows
 			 WHERE account_id = ? AND window_key = ? AND id != ?
 			   AND closed_at IS NOT NULL AND value_usd IS NOT NULL
+			   AND projection_version IS NOT DISTINCT FROM ?
 			 ORDER BY closed_at DESC LIMIT ?`,
 			[
 				window.accountId,
 				window.windowKey,
 				window.id,
+				window.projectionVersion,
 				USAGE_WINDOW_VALUE_DROP_PRIOR_LIMIT,
 			],
 		);

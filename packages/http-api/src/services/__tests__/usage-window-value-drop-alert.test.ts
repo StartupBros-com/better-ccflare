@@ -82,7 +82,8 @@ let priorIdCounter = 0;
 
 /** Seeds one priced, closed prior sibling window directly into usage_windows
  * — evaluateClosedWindow reads priors with raw SQL, so no repository/ledger
- * round-trip is needed to set these up. */
+ * round-trip is needed to set these up. `projectionVersion` defaults to
+ * buildClosedWindow's "v1", since only same-version priors are compared. */
 function seedClosedWindow(
 	sqlite: Database,
 	opts: {
@@ -93,6 +94,7 @@ function seedClosedWindow(
 		startedAt?: number;
 		resetsAt?: number;
 		grantType?: UsageWindowGrantType;
+		projectionVersion?: string | null;
 	},
 ): void {
 	priorIdCounter += 1;
@@ -103,8 +105,8 @@ function seedClosedWindow(
 	sqlite.run(
 		`INSERT INTO usage_windows (
 			id, account_id, window_key, started_at, resets_at, closed_at,
-			grant_type, peak_utilization, value_usd
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			grant_type, peak_utilization, value_usd, projection_version
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			`prior-${priorIdCounter}`,
 			accountId,
@@ -115,6 +117,7 @@ function seedClosedWindow(
 			opts.grantType ?? "natural",
 			100,
 			opts.valueUsd,
+			opts.projectionVersion === undefined ? "v1" : opts.projectionVersion,
 		],
 	);
 }
@@ -302,5 +305,85 @@ describe("AlertService.evaluateClosedWindow (usage_window_value_drop)", () => {
 		);
 		expect(alerts).toHaveLength(1);
 		expect((alerts[0] as AlertEvent).threshold).toBe(0.1);
+	});
+
+	it("does not fire against priors still valued at an older projection_version", async () => {
+		// A window closing while the startup re-valuation is still running:
+		// its newer siblings carry the old, higher list price. Across versions
+		// the median would be $20 (floor $15) and $8 would fire; the same-version
+		// priors ($10, $10; floor $7.50) are what it is actually compared with.
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		seedClosedWindow(sqlite, {
+			valueUsd: 30,
+			closedAt: 1_800_000_000_000 - SEVEN_DAYS_MS,
+			projectionVersion: "v0",
+		});
+		seedClosedWindow(sqlite, {
+			valueUsd: 30,
+			closedAt: 1_800_000_000_000 - 2 * SEVEN_DAYS_MS,
+			projectionVersion: "v0",
+		});
+		seedClosedWindow(sqlite, {
+			valueUsd: 10,
+			closedAt: 1_800_000_000_000 - 3 * SEVEN_DAYS_MS,
+		});
+		seedClosedWindow(sqlite, {
+			valueUsd: 10,
+			closedAt: 1_800_000_000_000 - 4 * SEVEN_DAYS_MS,
+		});
+		const window = buildClosedWindow({ valueUsd: 8 });
+
+		await service.evaluateClosedWindow(window, "Primary account");
+
+		expect(await service.listAlerts()).toHaveLength(0);
+	});
+
+	it("does not fire when every prior is at another projection_version", async () => {
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		seedClosedWindow(sqlite, {
+			valueUsd: 30,
+			closedAt: 1_800_000_000_000 - SEVEN_DAYS_MS,
+			projectionVersion: "v0",
+		});
+		seedClosedWindow(sqlite, {
+			valueUsd: 30,
+			closedAt: 1_800_000_000_000 - 2 * SEVEN_DAYS_MS,
+			projectionVersion: null,
+		});
+		const window = buildClosedWindow({ valueUsd: 1 });
+
+		await service.evaluateClosedWindow(window, "Primary account");
+
+		expect(await service.listAlerts()).toHaveLength(0);
+	});
+
+	it("still fires on a real drop measured against same-version priors, including NULL", async () => {
+		// Newer cross-version priors ($1, $1) would drag a mixed median down to
+		// $5.50 (floor $4.125) and hide this drop; the same-version median is
+		// $11 (floor $8.25).
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		for (const [i, [valueUsd, projectionVersion]] of (
+			[
+				[1, "v0"],
+				[1, "v0"],
+				[10, null],
+				[12, null],
+			] as const
+		).entries()) {
+			seedClosedWindow(sqlite, {
+				valueUsd,
+				closedAt: 1_800_000_000_000 - (i + 1) * SEVEN_DAYS_MS,
+				projectionVersion,
+			});
+		}
+		const window = buildClosedWindow({ valueUsd: 5, projectionVersion: null });
+
+		await service.evaluateClosedWindow(window, "Primary account");
+
+		const alerts = (await service.listAlerts()).filter(
+			(a) => a.type === "usage_window_value_drop",
+		);
+		expect(alerts).toHaveLength(1);
+		expect((alerts[0] as AlertEvent).message).toContain("11.00");
 	});
 });
