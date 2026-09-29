@@ -12,6 +12,7 @@ import {
 	getModelMappings,
 	getModelShortName,
 	getStrictClaudeModelFamily,
+	hasForcedToolChoice,
 	isFamilyAliasModel,
 	isValidClaudeModel,
 	isWellFormedConcreteClaudeModelId,
@@ -129,6 +130,25 @@ describe("Sonnet 5.5 registry metadata", () => {
 		]) {
 			expect(supportsForcedToolChoice(modelId)).toBe(true);
 		}
+	});
+
+	test("hasForcedToolChoice is true only for tool_choice any/tool objects", () => {
+		expect(hasForcedToolChoice({ tool_choice: { type: "any" } })).toBe(true);
+		expect(
+			hasForcedToolChoice({ tool_choice: { type: "tool", name: "x" } }),
+		).toBe(true);
+		expect(hasForcedToolChoice({ tool_choice: { type: "auto" } })).toBe(false);
+		expect(hasForcedToolChoice({ tool_choice: { type: "none" } })).toBe(false);
+		expect(hasForcedToolChoice({ tool_choice: { type: "bogus" } })).toBe(false);
+		expect(hasForcedToolChoice({ tool_choice: {} })).toBe(false);
+		expect(hasForcedToolChoice({ tool_choice: "any" })).toBe(false);
+		expect(hasForcedToolChoice({ tool_choice: null })).toBe(false);
+		expect(hasForcedToolChoice({ tool_choice: [{ type: "any" }] })).toBe(false);
+		expect(hasForcedToolChoice({})).toBe(false);
+		expect(hasForcedToolChoice(null)).toBe(false);
+		expect(hasForcedToolChoice(undefined)).toBe(false);
+		expect(hasForcedToolChoice("any")).toBe(false);
+		expect(hasForcedToolChoice(42)).toBe(false);
 	});
 
 	test("classifies Sonnet 5.5 into the sonnet family for routing", () => {
