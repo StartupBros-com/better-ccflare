@@ -70,6 +70,8 @@ export interface CacheHealthPolicy {
 	recoveryPercent: number;
 	warningBuckets: number;
 	minimumRequests: number;
+	/** Measured requests a single bucket needs to open or escalate a critical. */
+	criticalMinimumRequests: number;
 	minimumInputTokens: number;
 	minimumCoveragePercent: number;
 	telemetryGapPercent: number;
@@ -88,6 +90,7 @@ export const CACHE_HEALTH_DEFAULT_POLICY: Readonly<CacheHealthPolicy> =
 		recoveryPercent: 92,
 		warningBuckets: 3,
 		minimumRequests: 10,
+		criticalMinimumRequests: 30,
 		minimumInputTokens: 100_000,
 		minimumCoveragePercent: 90,
 		telemetryGapPercent: 80,

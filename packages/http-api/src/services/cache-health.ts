@@ -318,6 +318,7 @@ export function advanceCacheHealth(
 		qualified && (current.reusePercent as number) < policy.warningPercent,
 		qualified && (current.reusePercent as number) >= policy.recoveryPercent,
 		qualified &&
+			bucket.measured >= policy.criticalMinimumRequests &&
 			(current.reusePercent as number) < policy.criticalPercent &&
 			state.healthyEnds.length >= 2,
 		true,
