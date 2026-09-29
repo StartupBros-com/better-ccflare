@@ -1,7 +1,9 @@
 import {
+	CLAUDE_MODEL_IDS,
 	LATEST_HAIKU_MODEL,
 	LATEST_OPUS_MODEL,
 	LATEST_SONNET_MODEL,
+	supportsForcedToolChoice,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type {
@@ -31,13 +33,38 @@ export class InvalidInstructionError extends Error {
 //   *-nano  → haiku (fast/cheap tier)
 //   gpt-5*  → sonnet (default capable tier, everything else)
 // Non-gpt-5 names (e.g. gpt-4) are passed through unchanged.
-function mapGptModelToClaudeFamily(model: string): string {
+// The model here is chosen on the client's behalf, so a forced tool_choice
+// (`required` or a named function) must not land on a model that rejects it:
+// fall back to the newest model in the family that accepts one.
+function mapGptModelToClaudeFamily(
+	model: string,
+	forcedToolChoice: boolean,
+): string {
 	const lower = model.toLowerCase();
 	if (!lower.startsWith("gpt-")) return model;
-	if (lower.endsWith("-pro")) return LATEST_OPUS_MODEL;
+	if (lower.endsWith("-pro"))
+		return forcedToolCompatible(
+			LATEST_OPUS_MODEL,
+			CLAUDE_MODEL_IDS.OPUS_5,
+			forcedToolChoice,
+		);
 	if (lower.endsWith("-mini") || lower.endsWith("-nano"))
 		return LATEST_HAIKU_MODEL;
-	return LATEST_SONNET_MODEL;
+	return forcedToolCompatible(
+		LATEST_SONNET_MODEL,
+		CLAUDE_MODEL_IDS.SONNET_5,
+		forcedToolChoice,
+	);
+}
+
+function forcedToolCompatible(
+	latest: string,
+	fallback: string,
+	forcedToolChoice: boolean,
+): string {
+	return forcedToolChoice && !supportsForcedToolChoice(latest)
+		? fallback
+		: latest;
 }
 
 function parseArguments(args: string): unknown {
@@ -724,8 +751,19 @@ export function translateRequestToAnthropic(
 
 	const mergedMessages = mergeConsecutiveSameRole(messages);
 
+	const translatedTools =
+		Array.isArray(req.tools) && req.tools.length > 0
+			? translateTools(req.tools, emitWarn)
+			: [];
+	const toolChoice =
+		translatedTools.length > 0
+			? translateToolChoice(req.tool_choice)
+			: undefined;
+	const forcedToolChoice =
+		toolChoice?.type === "any" || toolChoice?.type === "tool";
+
 	const result: AnthropicRequest = {
-		model: mapGptModelToClaudeFamily(req.model),
+		model: mapGptModelToClaudeFamily(req.model, forcedToolChoice),
 		messages: mergedMessages,
 		max_tokens: req.max_output_tokens ?? 4096,
 	};
@@ -751,13 +789,8 @@ export function translateRequestToAnthropic(
 	if (req.top_p !== undefined) result.top_p = req.top_p;
 	if (req.service_tier !== undefined) result.service_tier = req.service_tier;
 
-	const translatedTools =
-		Array.isArray(req.tools) && req.tools.length > 0
-			? translateTools(req.tools, emitWarn)
-			: [];
 	if (translatedTools.length > 0) {
 		result.tools = translatedTools;
-		const toolChoice = translateToolChoice(req.tool_choice);
 		if (toolChoice !== undefined) {
 			result.tool_choice = toolChoice;
 		}

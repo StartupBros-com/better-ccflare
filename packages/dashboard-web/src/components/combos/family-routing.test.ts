@@ -286,7 +286,7 @@ describe("family model options", () => {
 		const latestDisplayNames: Record<ComboFamily, string> = {
 			fable: "Claude Fable 5.1",
 			opus: "Claude Opus 5.5",
-			sonnet: "Claude Sonnet 5",
+			sonnet: "Claude Sonnet 5.5",
 			haiku: "Claude Haiku 4.5",
 		};
 

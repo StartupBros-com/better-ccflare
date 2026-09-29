@@ -11,6 +11,7 @@ export const CLAUDE_MODEL_IDS = {
 	SONNET_4_5: "claude-sonnet-4-5-20250929",
 	SONNET_4_6: "claude-sonnet-4-6",
 	SONNET_5: "claude-sonnet-5",
+	SONNET_5_5: "claude-sonnet-5-5",
 	HAIKU_4_5: "claude-haiku-4-5-20251001",
 	OPUS_4: "claude-opus-4-20250514",
 	OPUS_4_1: "claude-opus-4-1-20250805",
@@ -29,7 +30,7 @@ export const CLAUDE_MODEL_IDS = {
 // `fetchedAt` for the fallback catalog (packages/proxy/src/model-catalog.ts)
 // so a fresh install without a live-refreshable account shows an honest
 // "as of <date>" provenance instead of a misleading "just now".
-export const BUNDLED_MODELS_AS_OF = "2026-09-22";
+export const BUNDLED_MODELS_AS_OF = "2026-09-29";
 
 // Model display names
 export const MODEL_DISPLAY_NAMES: Record<string, string> = {
@@ -37,6 +38,7 @@ export const MODEL_DISPLAY_NAMES: Record<string, string> = {
 	[CLAUDE_MODEL_IDS.SONNET_4_5]: "Claude Sonnet 4.5",
 	[CLAUDE_MODEL_IDS.SONNET_4_6]: "Claude Sonnet 4.6",
 	[CLAUDE_MODEL_IDS.SONNET_5]: "Claude Sonnet 5",
+	[CLAUDE_MODEL_IDS.SONNET_5_5]: "Claude Sonnet 5.5",
 	[CLAUDE_MODEL_IDS.HAIKU_4_5]: "Claude Haiku 4.5",
 	[CLAUDE_MODEL_IDS.OPUS_4]: "Claude Opus 4",
 	[CLAUDE_MODEL_IDS.OPUS_4_1]: "Claude Opus 4.1",
@@ -56,6 +58,7 @@ export const MODEL_SHORT_NAMES: Record<string, string> = {
 	[CLAUDE_MODEL_IDS.SONNET_4_5]: "claude-sonnet-4.5",
 	[CLAUDE_MODEL_IDS.SONNET_4_6]: "claude-sonnet-4.6",
 	[CLAUDE_MODEL_IDS.SONNET_5]: "claude-sonnet-5",
+	[CLAUDE_MODEL_IDS.SONNET_5_5]: "claude-sonnet-5.5",
 	[CLAUDE_MODEL_IDS.HAIKU_4_5]: "claude-haiku-4.5",
 	[CLAUDE_MODEL_IDS.OPUS_4]: "claude-opus-4",
 	[CLAUDE_MODEL_IDS.OPUS_4_1]: "claude-opus-4.1",
@@ -73,7 +76,7 @@ export const MODEL_SHORT_NAMES: Record<string, string> = {
 // Check https://docs.anthropic.com/en/docs/about-claude/models for the current list.
 export const LATEST_FABLE_MODEL = CLAUDE_MODEL_IDS.FABLE_5_1;
 export const LATEST_OPUS_MODEL = CLAUDE_MODEL_IDS.OPUS_5_5;
-export const LATEST_SONNET_MODEL = CLAUDE_MODEL_IDS.SONNET_5;
+export const LATEST_SONNET_MODEL = CLAUDE_MODEL_IDS.SONNET_5_5;
 export const LATEST_HAIKU_MODEL = CLAUDE_MODEL_IDS.HAIKU_4_5;
 
 /** Canonical logical policy model for each managed family. */
@@ -107,4 +110,18 @@ export function getModelDisplayName(modelId: string): string {
 // Helper function to validate if a string is a valid model ID
 export function isValidModelId(modelId: string): modelId is ClaudeModelId {
 	return Object.values(CLAUDE_MODEL_IDS).includes(modelId as ClaudeModelId);
+}
+
+// Models that answer a forced tool_choice ({type: "any"} or {type: "tool"})
+// with a 400; `auto` and `none` still work. Source:
+// https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools#forcing-tool-use
+const FORCED_TOOL_CHOICE_UNSUPPORTED: ReadonlySet<string> = new Set([
+	CLAUDE_MODEL_IDS.OPUS_5_5,
+	CLAUDE_MODEL_IDS.SONNET_5_5,
+	CLAUDE_MODEL_IDS.FABLE_5_1,
+]);
+
+// Helper function to check whether a model accepts a forced tool_choice
+export function supportsForcedToolChoice(modelId: string): boolean {
+	return !FORCED_TOOL_CHOICE_UNSUPPORTED.has(modelId);
 }
