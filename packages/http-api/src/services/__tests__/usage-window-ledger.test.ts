@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { LIST_PRICE_ERAS, VALUE_PRICING_VERSION } from "@better-ccflare/core";
+import {
+	CLAUDE_MODEL_IDS,
+	LIST_PRICE_ERAS,
+	priceTokensAtListPrice,
+	VALUE_PRICING_VERSION,
+} from "@better-ccflare/core";
 import { DatabaseOperations, type UsageWindow } from "@better-ccflare/database";
 import type { CanonicalUsageWindow } from "@better-ccflare/types";
 import type { AlertService } from "../alerts";
@@ -832,7 +837,7 @@ describe("UsageWindowLedger.revalueStaleClosedWindows", () => {
 			inputTokens: opts.totals?.inputTokens ?? sum((e) => e.inputTokens),
 			cacheReadInputTokens:
 				opts.totals?.cacheReadInputTokens ?? sum((e) => e.cacheReadInputTokens),
-			cacheCreationInputTokens: 0,
+			cacheCreationInputTokens: sum((e) => e.cacheCreationInputTokens),
 			outputTokens: opts.totals?.outputTokens ?? sum((e) => e.outputTokens),
 			requestCount: opts.totals?.requestCount ?? sum((e) => e.requestCount),
 			modelBreakdown: opts.breakdown,
@@ -1038,6 +1043,89 @@ describe("UsageWindowLedger.revalueStaleClosedWindows", () => {
 		).revalueStaleClosedWindows();
 		expect(summary.stamped).toBe(1);
 		expect(calls).toHaveLength(0);
+	});
+
+	it("re-prices a production-shaped breakdown: empty-model entry, cache writes, key order", async () => {
+		// Shaped like a real stored row: a zero-token "" entry with a null value
+		// (requests that never resolved a model), Claude models with cache writes,
+		// and a model at the stale Sonnet 5 $3/$15 era next to a current one.
+		const unresolved = {
+			requestCount: 25,
+			inputTokens: 0,
+			cacheReadInputTokens: 0,
+			cacheCreationInputTokens: 0,
+			outputTokens: 0,
+			valueUsd: null,
+		};
+		const sonnet5Tokens = {
+			requestCount: 10,
+			inputTokens: 1_000_000,
+			cacheReadInputTokens: 10_000_000,
+			cacheCreationInputTokens: 200_000,
+			outputTokens: 100_000,
+		};
+		// $3/$15 era: 3 + 3.0 + 0.75 + 1.5
+		const SONNET5_STALE = 8.25;
+		// $2/$10 era: 2 + 2.0 + 0.5 + 1.0
+		const SONNET5_CURRENT = 5.5;
+		const opusTokens = {
+			requestCount: 4,
+			inputTokens: 200_000,
+			cacheReadInputTokens: 3_000_000,
+			cacheCreationInputTokens: 50_000,
+			outputTokens: 40_000,
+		};
+		const opusValue = priceTokensAtListPrice(
+			CLAUDE_MODEL_IDS.OPUS_5,
+			STARTED_AT,
+			opusTokens,
+		);
+		if (opusValue === null) throw new Error("Opus 5 must be priced");
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: {
+				"": unresolved,
+				[CLAUDE_MODEL_IDS.OPUS_5]: { ...opusTokens, valueUsd: opusValue },
+				[CLAUDE_MODEL_IDS.SONNET_5]: {
+					...sonnet5Tokens,
+					valueUsd: SONNET5_STALE,
+				},
+			},
+			valueUsd: opusValue + SONNET5_STALE,
+			version: "2026-09-01.1",
+		});
+
+		const summary = await new UsageWindowLedger(
+			dbOps,
+		).revalueStaleClosedWindows();
+		expect(summary).toMatchObject({ stamped: 1, valueChanged: 1, skipped: 0 });
+		expect(summary.valueDeltaUsd).toBeCloseTo(
+			SONNET5_CURRENT - SONNET5_STALE,
+			9,
+		);
+
+		const after = await reload(w.id);
+		expect(after.valueUsd).toBeCloseTo(opusValue + SONNET5_CURRENT, 9);
+		expect(after.unpricedTokens).toBe(0);
+		expect(after.projectionVersion).toBe(VALUE_PRICING_VERSION);
+		const breakdown = after.modelBreakdown as Record<
+			string,
+			ReturnType<typeof entry>
+		>;
+		expect(Object.keys(breakdown)).toEqual([
+			"",
+			CLAUDE_MODEL_IDS.OPUS_5,
+			CLAUDE_MODEL_IDS.SONNET_5,
+		]);
+		expect(breakdown[""]).toEqual(unresolved);
+		expect(breakdown[CLAUDE_MODEL_IDS.OPUS_5]).toEqual({
+			...opusTokens,
+			valueUsd: opusValue,
+		});
+		expect(breakdown[CLAUDE_MODEL_IDS.SONNET_5]).toEqual({
+			...sonnet5Tokens,
+			valueUsd: expect.closeTo(SONNET5_CURRENT, 9),
+		});
 	});
 
 	it("prices a model that was unpriced at the old version and drops unpriced_tokens", async () => {
