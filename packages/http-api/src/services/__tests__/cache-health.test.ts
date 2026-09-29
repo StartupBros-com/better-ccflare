@@ -329,6 +329,31 @@ describe("cache health policy", () => {
 		).toBe(true);
 	});
 
+	it("applies the critical request floor after provider aggregation", () => {
+		const account = (id: string, index: number, rate: number) => {
+			const b = bucket(index, rate);
+			return {
+				...b,
+				scope: { ...b.scope, accountId: id },
+				contributors: [{ accountId: id, accountGeneration: 1 }],
+			};
+		};
+		const ids = ["a", "b", "c"];
+		const provider = (index: number, rate: number) =>
+			aggregateProviderCacheBuckets(
+				ids.map((id) => account(id, index, rate)),
+			)[0];
+		const collapsed = run([provider(0, 92), provider(1, 92), provider(2, 0)]);
+		expect(collapsed.alerts.map((a) => a.type)).toEqual([
+			"cache_efficiency_critical",
+		]);
+		expect(collapsed.alerts[0].evidence.measured).toBe(30);
+		for (const id of ids)
+			expect(
+				run([account(id, 0, 92), account(id, 1, 92), account(id, 2, 0)]).alerts,
+			).toEqual([]);
+	});
+
 	it("weights provider tokens and carries new enrollment forward through zero-hit buckets", () => {
 		const unknown = [
 			bucket(0, 95, { native: false }),
