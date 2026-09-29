@@ -804,6 +804,14 @@ describe("UsageWindowLedger.revalueStaleClosedWindows", () => {
 		};
 	}
 
+	const TOTALS_FIELDS = [
+		"requestCount",
+		"inputTokens",
+		"cacheReadInputTokens",
+		"cacheCreationInputTokens",
+		"outputTokens",
+	] as const;
+
 	/** Seeds a closed window straight through the repository, bypassing the
 	 * ledger, so its stored version/values can be arbitrarily stale. */
 	async function seedClosed(opts: {
@@ -812,12 +820,7 @@ describe("UsageWindowLedger.revalueStaleClosedWindows", () => {
 		valueUsd: number;
 		unpricedTokens?: number;
 		version: string | null;
-		totals?: Partial<{
-			inputTokens: number;
-			cacheReadInputTokens: number;
-			outputTokens: number;
-			requestCount: number;
-		}>;
+		totals?: Partial<Record<(typeof TOTALS_FIELDS)[number], number>>;
 		close?: boolean;
 	}): Promise<UsageWindow> {
 		const opened = await dbOps.openUsageWindow({
@@ -837,7 +840,9 @@ describe("UsageWindowLedger.revalueStaleClosedWindows", () => {
 			inputTokens: opts.totals?.inputTokens ?? sum((e) => e.inputTokens),
 			cacheReadInputTokens:
 				opts.totals?.cacheReadInputTokens ?? sum((e) => e.cacheReadInputTokens),
-			cacheCreationInputTokens: sum((e) => e.cacheCreationInputTokens),
+			cacheCreationInputTokens:
+				opts.totals?.cacheCreationInputTokens ??
+				sum((e) => e.cacheCreationInputTokens),
 			outputTokens: opts.totals?.outputTokens ?? sum((e) => e.outputTokens),
 			requestCount: opts.totals?.requestCount ?? sum((e) => e.requestCount),
 			modelBreakdown: opts.breakdown,
@@ -960,21 +965,132 @@ describe("UsageWindowLedger.revalueStaleClosedWindows", () => {
 		expect(await reload(w.id)).toEqual(afterFirst);
 	});
 
-	it("skips a window whose stored totals disagree with its breakdown", async () => {
-		const w = await seedClosed({
+	for (const field of TOTALS_FIELDS) {
+		it(`skips a window whose stored ${field} disagrees with its breakdown`, async () => {
+			const w = await seedClosed({
+				resetsAt: STARTED_AT + 7 * DAY_MS,
+				breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+				valueUsd: 9.99,
+				version: "old-version",
+				totals: { [field]: 123 },
+			});
+			const summary = await new UsageWindowLedger(
+				dbOps,
+			).revalueStaleClosedWindows();
+			expect(summary).toMatchObject({ scanned: 1, stamped: 0, skipped: 1 });
+			const after = await reload(w.id);
+			expect(after.valueUsd).toBe(9.99);
+			expect(after.projectionVersion).toBe("old-version");
+		});
+	}
+
+	it("keeps going past unreadable, mismatched and malformed windows", async () => {
+		// Listed in resets_at order: the three bad windows come before the
+		// valid one, so a skip that ended the pass would leave it stale.
+		const unreadable = await seedClosed({
 			resetsAt: STARTED_AT + 7 * DAY_MS,
 			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
 			valueUsd: 9.99,
 			version: "old-version",
-			totals: { inputTokens: 123 },
 		});
+		await dbOps
+			.getAdapter()
+			.run("UPDATE usage_windows SET model_breakdown = ? WHERE id = ?", [
+				"{not json",
+				unreadable.id,
+			]);
+		const mismatched = await seedClosed({
+			resetsAt: STARTED_AT + 8 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: "old-version",
+			totals: { outputTokens: 123 },
+		});
+		const malformed = await seedClosed({
+			resetsAt: STARTED_AT + 9 * DAY_MS,
+			breakdown: {
+				[TERRA]: { requestCount: "x" } as unknown as ReturnType<typeof entry>,
+			},
+			valueUsd: 9.99,
+			version: "old-version",
+			totals: { inputTokens: 0, requestCount: 0 },
+		});
+		const valid = await seedClosed({
+			resetsAt: STARTED_AT + 10 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: "old-version",
+		});
+
 		const summary = await new UsageWindowLedger(
 			dbOps,
 		).revalueStaleClosedWindows();
-		expect(summary).toMatchObject({ scanned: 1, stamped: 0, skipped: 1 });
-		const after = await reload(w.id);
-		expect(after.valueUsd).toBe(9.99);
-		expect(after.projectionVersion).toBe("old-version");
+		expect(summary).toMatchObject({
+			scanned: 4,
+			stamped: 1,
+			valueChanged: 1,
+			skipped: 3,
+		});
+		expect(summary.valueDeltaUsd).toBeCloseTo(TERRA_CURRENT - 9.99, 9);
+		const adapter = dbOps.getAdapter();
+		const raw = await adapter.get<{
+			model_breakdown: string;
+			projection_version: string;
+		}>(
+			"SELECT model_breakdown, projection_version FROM usage_windows WHERE id = ?",
+			[unreadable.id],
+		);
+		expect(raw).toEqual({
+			model_breakdown: "{not json",
+			projection_version: "old-version",
+		});
+		// reload() parses every row, so the corrupt one has to go first.
+		await adapter.run("DELETE FROM usage_windows WHERE id = ?", [
+			unreadable.id,
+		]);
+		const repriced = await reload(valid.id);
+		expect(repriced.valueUsd).toBeCloseTo(TERRA_CURRENT, 9);
+		expect(repriced.projectionVersion).toBe(VALUE_PRICING_VERSION);
+		for (const id of [mismatched.id, malformed.id]) {
+			const after = await reload(id);
+			expect(after.valueUsd).toBe(9.99);
+			expect(after.projectionVersion).toBe("old-version");
+		}
+	});
+
+	it("skips a window whose write throws and re-prices the rest", async () => {
+		const failing = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: "old-version",
+		});
+		const next = await seedClosed({
+			resetsAt: STARTED_AT + 8 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: "old-version",
+		});
+		const realRevalue = dbOps.revalueClosedUsageWindow.bind(dbOps);
+		const revalueSpy = spyOn(
+			dbOps,
+			"revalueClosedUsageWindow",
+		).mockImplementation(async (id, input, expected) => {
+			if (id === failing.id) throw new Error("disk I/O error");
+			return realRevalue(id, input, expected);
+		});
+		try {
+			const summary = await new UsageWindowLedger(
+				dbOps,
+			).revalueStaleClosedWindows();
+			expect(summary).toMatchObject({ scanned: 2, stamped: 1, skipped: 1 });
+		} finally {
+			revalueSpy.mockRestore();
+		}
+		expect((await reload(failing.id)).projectionVersion).toBe("old-version");
+		expect((await reload(next.id)).projectionVersion).toBe(
+			VALUE_PRICING_VERSION,
+		);
 	});
 
 	it("skips a window with a malformed breakdown entry", async () => {

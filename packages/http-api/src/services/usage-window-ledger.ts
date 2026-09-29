@@ -17,7 +17,8 @@ export interface RevalueSummary {
 	stamped: number;
 	/** Stamped windows whose value_usd actually moved. */
 	valueChanged: number;
-	/** Windows left as-is: malformed breakdown, totals mismatch, or lost the guard. */
+	/** Windows left as-is: unreadable row, malformed breakdown, totals
+	 * mismatch, lost the guard, or a thrown write. */
 	skipped: number;
 	/** Sum of (new - old) value_usd over stamped windows. */
 	valueDeltaUsd: number;
@@ -273,10 +274,11 @@ export class UsageWindowLedger {
 	 * Deliberately silent: never notifies AlertService (a re-price is not a
 	 * newly closed window, and would skew usage_window_value_drop's sibling
 	 * median), never touches open windows, and writes through a guard on the
-	 * version it read, so a concurrent writer wins. A window whose recomputed
-	 * totals disagree with its stored columns, or whose breakdown is malformed,
-	 * is skipped untouched. Idempotent: rewritten rows carry the current
-	 * version and are not listed again.
+	 * version it read, so a concurrent writer wins. A window whose row cannot
+	 * be read, whose recomputed totals disagree with its stored columns, whose
+	 * breakdown is malformed, or whose write throws is skipped untouched and
+	 * the pass moves on to the next one. Idempotent: rewritten rows carry the
+	 * current version and are not listed again.
 	 */
 	async revalueStaleClosedWindows(): Promise<RevalueSummary> {
 		const summary: RevalueSummary = {
@@ -286,58 +288,71 @@ export class UsageWindowLedger {
 			skipped: 0,
 			valueDeltaUsd: 0,
 		};
-		const stale = await this.dbOps.listClosedWindowsNotAtProjectionVersion(
-			VALUE_PRICING_VERSION,
-		);
-		for (const window of stale) {
-			summary.scanned++;
-			const aggregates = window.modelBreakdown
-				? aggregatesFromBreakdown(window.modelBreakdown)
-				: null;
-			if (!aggregates) {
-				log.warn(
-					`Skipping re-valuation of window ${window.id}: malformed model_breakdown`,
-				);
-				summary.skipped++;
-				continue;
-			}
-			const valuation = valueWindowAggregates(aggregates, window.startedAt);
-			if (
-				valuation.requestCount !== window.requestCount ||
-				valuation.inputTokens !== window.inputTokens ||
-				valuation.cacheReadInputTokens !== window.cacheReadInputTokens ||
-				valuation.cacheCreationInputTokens !==
-					window.cacheCreationInputTokens ||
-				valuation.outputTokens !== window.outputTokens
-			) {
-				log.warn(
-					`Skipping re-valuation of window ${window.id}: breakdown totals disagree with stored columns`,
-				);
-				summary.skipped++;
-				continue;
-			}
-			const applied = await this.dbOps.revalueClosedUsageWindow(
-				window.id,
-				{
-					valueUsd: valuation.valueUsd,
-					modelBreakdown: valuation.modelBreakdown,
-					unpricedTokens: valuation.unpricedTokens,
-					projectionVersion: VALUE_PRICING_VERSION,
-				},
-				window.projectionVersion,
+		const { windows, unreadable } =
+			await this.dbOps.listClosedWindowsNotAtProjectionVersion(
+				VALUE_PRICING_VERSION,
 			);
-			if (!applied) {
+		for (const { id, reason } of unreadable) {
+			summary.scanned++;
+			summary.skipped++;
+			log.warn(`Skipping re-valuation of window ${id}: ${reason}`);
+		}
+		for (const window of windows) {
+			summary.scanned++;
+			try {
+				const aggregates = window.modelBreakdown
+					? aggregatesFromBreakdown(window.modelBreakdown)
+					: null;
+				if (!aggregates) {
+					log.warn(
+						`Skipping re-valuation of window ${window.id}: malformed model_breakdown`,
+					);
+					summary.skipped++;
+					continue;
+				}
+				const valuation = valueWindowAggregates(aggregates, window.startedAt);
+				if (
+					valuation.requestCount !== window.requestCount ||
+					valuation.inputTokens !== window.inputTokens ||
+					valuation.cacheReadInputTokens !== window.cacheReadInputTokens ||
+					valuation.cacheCreationInputTokens !==
+						window.cacheCreationInputTokens ||
+					valuation.outputTokens !== window.outputTokens
+				) {
+					log.warn(
+						`Skipping re-valuation of window ${window.id}: breakdown totals disagree with stored columns`,
+					);
+					summary.skipped++;
+					continue;
+				}
+				const applied = await this.dbOps.revalueClosedUsageWindow(
+					window.id,
+					{
+						valueUsd: valuation.valueUsd,
+						modelBreakdown: valuation.modelBreakdown,
+						unpricedTokens: valuation.unpricedTokens,
+						projectionVersion: VALUE_PRICING_VERSION,
+					},
+					window.projectionVersion,
+				);
+				if (!applied) {
+					log.warn(
+						`Skipping re-valuation of window ${window.id}: changed concurrently`,
+					);
+					summary.skipped++;
+					continue;
+				}
+				summary.stamped++;
+				const delta = valuation.valueUsd - (window.valueUsd ?? 0);
+				if (delta !== 0) {
+					summary.valueChanged++;
+					summary.valueDeltaUsd += delta;
+				}
+			} catch (error) {
 				log.warn(
-					`Skipping re-valuation of window ${window.id}: changed concurrently`,
+					`Skipping re-valuation of window ${window.id}: ${error instanceof Error ? error.message : String(error)}`,
 				);
 				summary.skipped++;
-				continue;
-			}
-			summary.stamped++;
-			const delta = valuation.valueUsd - (window.valueUsd ?? 0);
-			if (delta !== 0) {
-				summary.valueChanged++;
-				summary.valueDeltaUsd += delta;
 			}
 		}
 		log.info(

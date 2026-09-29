@@ -441,6 +441,17 @@ function isSafeDisposableLoopbackTestPgUrl(value: string | undefined): boolean {
 const livePgAvailable = isSafeDisposableLoopbackTestPgUrl(
 	process.env.DATABASE_URL,
 );
+// CI sets this so a DATABASE_URL the gate rejects fails the step instead of
+// silently skipping the live block (same contract as
+// CCFLARE_REQUIRE_LIVE_PG_MIGRATIONS in migrations-pg.test.ts).
+if (
+	process.env.CCFLARE_REQUIRE_LIVE_PG_USAGE_WINDOWS === "true" &&
+	!livePgAvailable
+) {
+	throw new Error(
+		"CCFLARE_REQUIRE_LIVE_PG_USAGE_WINDOWS=true requires DATABASE_URL to be a safe disposable loopback PostgreSQL test database",
+	);
+}
 
 describe.skipIf(!livePgAvailable)(
 	"UsageWindowsRepository (live PostgreSQL, requires DATABASE_URL)",
@@ -565,16 +576,30 @@ describe.skipIf(!livePgAvailable)(
 				const a = await mk("a");
 				const b = await mk("b");
 				const open = await mk("c");
+				const corrupt = await mk("d");
 				await repo.closeWindow(a.id, close("old"));
 				await repo.closeWindow(b.id, close(null));
+				await repo.closeWindow(corrupt.id, close("old"));
+				await adapter.run(
+					"UPDATE usage_windows SET model_breakdown = ? WHERE id = ?",
+					["{not json", corrupt.id],
+				);
 
-				const listed = (
-					await repo.listClosedWindowsNotAtProjectionVersion(version)
-				)
+				const listing =
+					await repo.listClosedWindowsNotAtProjectionVersion(version);
+				const listed = listing.windows
 					.filter((w) => w.accountId === accountId)
 					.map((w) => w.id)
 					.sort();
 				expect(listed).toEqual([a.id, b.id].sort());
+				expect(listing.unreadable).toContainEqual({
+					id: corrupt.id,
+					reason: "usage window model_breakdown contains invalid JSON",
+				});
+				// listWindows below parses every row, so the corrupt one goes first.
+				await adapter.run("DELETE FROM usage_windows WHERE id = ?", [
+					corrupt.id,
+				]);
 
 				expect(await repo.revalueClosedWindow(a.id, revalue, "wrong")).toBe(
 					false,
@@ -891,8 +916,40 @@ describe("UsageWindowsRepository re-valuation", () => {
 			...closeInput("v1"),
 			modelBreakdown: null,
 		});
-		const rows = await repo.listClosedWindowsNotAtProjectionVersion("v2");
-		expect(rows.map((r) => r.id).sort()).toEqual([old.id, nul.id].sort());
+		const listing = await repo.listClosedWindowsNotAtProjectionVersion("v2");
+		expect(listing.windows.map((r) => r.id).sort()).toEqual(
+			[old.id, nul.id].sort(),
+		);
+		expect(listing.unreadable).toEqual([]);
+		db.close();
+	});
+
+	it("reports rows with an unreadable breakdown instead of failing the listing", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		const badJson = await seed(repo, "a", "v1");
+		const notObject = await seed(repo, "b", "v1");
+		const good = await seed(repo, "c", "v1");
+		db.run("UPDATE usage_windows SET model_breakdown = ? WHERE id = ?", [
+			"{not json",
+			badJson.id,
+		]);
+		db.run("UPDATE usage_windows SET model_breakdown = ? WHERE id = ?", [
+			"[1]",
+			notObject.id,
+		]);
+		const listing = await repo.listClosedWindowsNotAtProjectionVersion("v2");
+		expect(listing.windows.map((r) => r.id)).toEqual([good.id]);
+		expect(listing.unreadable).toEqual([
+			{
+				id: badJson.id,
+				reason: "usage window model_breakdown contains invalid JSON",
+			},
+			{
+				id: notObject.id,
+				reason: "usage window model_breakdown must be a JSON object",
+			},
+		]);
 		db.close();
 	});
 

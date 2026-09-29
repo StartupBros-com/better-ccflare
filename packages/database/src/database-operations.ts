@@ -88,6 +88,7 @@ import type {
 	ListWindowsOptions,
 	OpenWindowInput,
 	RevalueWindowInput,
+	StaleClosedWindows,
 	UsageWindow,
 } from "./repositories/usage-windows.repository";
 import { UsageWindowsRepository } from "./repositories/usage-windows.repository";
@@ -1244,7 +1245,7 @@ OAuth tokens will need to be re-authenticated.
 
 	async listClosedWindowsNotAtProjectionVersion(
 		projectionVersion: string,
-	): Promise<UsageWindow[]> {
+	): Promise<StaleClosedWindows> {
 		return this.usageWindows.listClosedWindowsNotAtProjectionVersion(
 			projectionVersion,
 		);

@@ -60,6 +60,13 @@ export interface RevalueWindowInput {
 	projectionVersion: string;
 }
 
+export interface StaleClosedWindows {
+	windows: UsageWindow[];
+	/** Matching rows whose stored data cannot be read (e.g. invalid
+	 * model_breakdown JSON), reported instead of failing the whole listing. */
+	unreadable: Array<{ id: string; reason: string }>;
+}
+
 export interface CloseWindowInput extends CloseWindowAggregates {
 	closedAt: number;
 }
@@ -366,11 +373,13 @@ export class UsageWindowsRepository extends BaseRepository<UsageWindow> {
 	/**
 	 * Closed windows carrying a model_breakdown whose projection_version is
 	 * not `projectionVersion` (NULL counts as different). Feeds the ledger's
-	 * startup re-valuation after a list-price correction.
+	 * startup re-valuation after a list-price correction. A row that fails
+	 * integrity checks is returned in `unreadable` rather than thrown, so one
+	 * corrupt row cannot block re-valuation of every other window.
 	 */
 	async listClosedWindowsNotAtProjectionVersion(
 		projectionVersion: string,
-	): Promise<UsageWindow[]> {
+	): Promise<StaleClosedWindows> {
 		requireNonEmpty(projectionVersion, "projectionVersion");
 		const rows = await this.query<UsageWindowRow>(
 			`SELECT ${WINDOW_COLUMNS} FROM usage_windows
@@ -380,7 +389,16 @@ export class UsageWindowsRepository extends BaseRepository<UsageWindow> {
 			 ORDER BY resets_at ASC`,
 			[projectionVersion],
 		);
-		return rows.map(toUsageWindow);
+		const listing: StaleClosedWindows = { windows: [], unreadable: [] };
+		for (const row of rows) {
+			try {
+				listing.windows.push(toUsageWindow(row));
+			} catch (error) {
+				if (!(error instanceof UsageWindowDataIntegrityError)) throw error;
+				listing.unreadable.push({ id: row.id, reason: error.message });
+			}
+		}
+		return listing;
 	}
 
 	/**
