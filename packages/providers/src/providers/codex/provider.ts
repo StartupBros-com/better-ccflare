@@ -77,6 +77,7 @@ import {
 	transferResponseDrainTransport,
 } from "../../utils/stream-drain";
 import { applyCodexAffinityHeaders } from "./affinity-headers";
+import { extractChatGptAccountId } from "./api-usage";
 import {
 	CODEX_CACHE_DIAGNOSTICS_ENV,
 	CodexCacheDiagnostics,
@@ -2624,6 +2625,8 @@ export class CodexProvider extends BaseProvider {
 
 		// Remove client auth and Anthropic-specific headers
 		newHeaders.delete("authorization");
+		newHeaders.delete("chatgpt-account-id");
+		newHeaders.delete("x-account-id");
 		newHeaders.delete("anthropic-version");
 		newHeaders.delete("anthropic-dangerous-direct-browser-access");
 		newHeaders.delete("anthropic-beta");
@@ -2641,6 +2644,12 @@ export class CodexProvider extends BaseProvider {
 		// Set Codex-required headers
 		if (accessToken) {
 			newHeaders.set("Authorization", `Bearer ${accessToken}`);
+			// Bind inference quota to the selected account, just as usage polling
+			// does. A caller's account identity can belong to a different workspace.
+			const chatgptAccountId = extractChatGptAccountId(accessToken);
+			if (chatgptAccountId) {
+				newHeaders.set("ChatGPT-Account-ID", chatgptAccountId);
+			}
 		}
 		const effectiveIdentity = identity ?? this.captureAttemptIdentity();
 		newHeaders.set("Version", effectiveIdentity.version);

@@ -47,6 +47,29 @@ describe("extractChatGptAccountId", () => {
 	it("returns null for an empty string", () => {
 		expect(extractChatGptAccountId("")).toBeNull();
 	});
+
+	it.each(
+		[
+			null,
+			42,
+			[],
+			"",
+			" ",
+			"account\r\ninjected: value",
+			"account\u0000",
+			"account\u{1f600}",
+		].map((accountId) => ({ accountId })),
+	)("rejects malformed or header-unsafe account claims (%#)", ({
+		accountId,
+	}) => {
+		expect(
+			extractChatGptAccountId(
+				makeAccessToken({
+					"https://api.openai.com/auth": { chatgpt_account_id: accountId },
+				}),
+			),
+		).toBeNull();
+	});
 });
 
 describe("fetchCodexUsageData", () => {
