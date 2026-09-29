@@ -394,9 +394,9 @@ describe("interceptAndModifyRequest - forced tool_choice guard", () => {
 		},
 	];
 	const catalog = async () => liveCatalog([ORIGINAL, REJECTING, ACCEPTING]);
+	const dbPath = `${process.env.TMPDIR || "/tmp"}/test-agent-interceptor-forced-tool.db`;
 
 	beforeAll(() => {
-		const dbPath = `${process.env.TMPDIR || "/tmp"}/test-agent-interceptor-forced-tool.db`;
 		try {
 			if (existsSync(dbPath)) unlinkSync(dbPath);
 		} catch (error) {
@@ -413,6 +413,9 @@ describe("interceptAndModifyRequest - forced tool_choice guard", () => {
 
 	afterAll(() => {
 		DatabaseFactory.reset();
+		for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+			fs.rmSync(file, { force: true });
+		}
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 		agentRegistry.clearWorkspaces();
 	});
