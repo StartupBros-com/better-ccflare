@@ -34,8 +34,25 @@ const testEras: ListPriceEra[] = [
 ];
 
 describe("priceTokensAtListPrice", () => {
-	it("advances VALUE_PRICING_VERSION for the Fable 5.1 price table", () => {
-		expect(VALUE_PRICING_VERSION).toBe("2026-09-01.1");
+	it("advances VALUE_PRICING_VERSION for the Sonnet 5.5 price table", () => {
+		expect(VALUE_PRICING_VERSION).toBe("2026-09-29.1");
+	});
+
+	it("has a list-price era for every bundled Claude model id", () => {
+		// priceTokensAtListPrice returns null for a model with no era, and the
+		// window ledger then silently counts its tokens as unpriced.
+		const afterFloorMs = Date.parse("2026-06-15T00:00:00Z");
+		const unpriced = Object.values(CLAUDE_MODEL_IDS).filter(
+			(modelId) =>
+				priceTokensAtListPrice(modelId, afterFloorMs, {
+					inputTokens: 1,
+					outputTokens: 1,
+					cacheReadInputTokens: 1,
+					cacheCreationInputTokens: 1,
+				}) === null,
+		);
+
+		expect(unpriced).toEqual([]);
 	});
 
 	describe("with a synthetic two-era model", () => {
@@ -218,6 +235,20 @@ describe("priceTokensAtListPrice", () => {
 				},
 			);
 			expect(result).toBeCloseTo(3 + 15 + 0.3 + 3.75, 10);
+		});
+
+		it("prices Sonnet 5.5 at Anthropic's published launch rates", () => {
+			const result = priceTokensAtListPrice(
+				CLAUDE_MODEL_IDS.SONNET_5_5,
+				AFTER_FLOOR_MS,
+				{
+					inputTokens: 1_000_000,
+					cacheReadInputTokens: 1_000_000,
+					cacheCreationInputTokens: 1_000_000,
+					outputTokens: 1_000_000,
+				},
+			);
+			expect(result).toBeCloseTo(2 + 10 + 0.2 + 2.5, 10);
 		});
 
 		it("estimates Fable 5.1 aggregate cache creation at its published 5-minute write rate", () => {

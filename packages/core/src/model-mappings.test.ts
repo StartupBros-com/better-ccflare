@@ -18,6 +18,7 @@ import {
 	LATEST_FABLE_MODEL,
 	LATEST_MODEL_BY_FAMILY,
 	LATEST_OPUS_MODEL,
+	LATEST_SONNET_MODEL,
 	MAX_MODEL_MAPPING_CANDIDATES,
 	mapModelName,
 	parseCustomEndpointData,
@@ -44,7 +45,7 @@ describe("Fable 5.1 registry metadata", () => {
 		expect(getModelShortName(CLAUDE_MODEL_IDS.FABLE_5_1)).toBe(
 			"claude-fable-5.1",
 		);
-		expect(BUNDLED_MODELS_AS_OF).toBe("2026-09-22");
+		expect(BUNDLED_MODELS_AS_OF).toBe("2026-09-29");
 	});
 
 	test("advances bare Fable aliases without rewriting concrete legacy pins", () => {
@@ -86,6 +87,38 @@ describe("Opus 5.5 registry metadata", () => {
 		expect(getModelFamily(CLAUDE_MODEL_IDS.OPUS_5_5)).toBe("opus");
 		expect(getStrictClaudeModelFamily(CLAUDE_MODEL_IDS.OPUS_5_5)).toBe("opus");
 		expect(isValidClaudeModel(CLAUDE_MODEL_IDS.OPUS_5_5)).toBe(true);
+	});
+});
+
+describe("Sonnet 5.5 registry metadata", () => {
+	test("registers Sonnet 5.5 while preserving the explicit Sonnet 5 legacy pin", () => {
+		expect(CLAUDE_MODEL_IDS.SONNET_5_5).toBe("claude-sonnet-5-5");
+		expect(CLAUDE_MODEL_IDS.SONNET_5).toBe("claude-sonnet-5");
+		expect(getModelDisplayName(CLAUDE_MODEL_IDS.SONNET_5_5)).toBe(
+			"Claude Sonnet 5.5",
+		);
+		expect(getModelShortName(CLAUDE_MODEL_IDS.SONNET_5_5)).toBe(
+			"claude-sonnet-5.5",
+		);
+	});
+
+	test("advances bare Sonnet aliases without rewriting concrete legacy pins", () => {
+		expect(LATEST_SONNET_MODEL).toBe(CLAUDE_MODEL_IDS.SONNET_5_5);
+		expect(LATEST_MODEL_BY_FAMILY.sonnet).toBe(CLAUDE_MODEL_IDS.SONNET_5_5);
+		expect(resolveFamilyAliasModel("sonnet", "sonnet")).toBe(
+			CLAUDE_MODEL_IDS.SONNET_5_5,
+		);
+		expect(resolveFamilyAliasModel(CLAUDE_MODEL_IDS.SONNET_5, "sonnet")).toBe(
+			CLAUDE_MODEL_IDS.SONNET_5,
+		);
+	});
+
+	test("classifies Sonnet 5.5 into the sonnet family for routing", () => {
+		expect(getModelFamily(CLAUDE_MODEL_IDS.SONNET_5_5)).toBe("sonnet");
+		expect(getStrictClaudeModelFamily(CLAUDE_MODEL_IDS.SONNET_5_5)).toBe(
+			"sonnet",
+		);
+		expect(isValidClaudeModel(CLAUDE_MODEL_IDS.SONNET_5_5)).toBe(true);
 	});
 });
 

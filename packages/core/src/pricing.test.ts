@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CLAUDE_MODEL_IDS } from "./models";
 import {
 	estimateCostUSD,
 	fetchNanoGPTPricingData,
@@ -585,6 +586,31 @@ describe("getModelRates", () => {
 			cacheRead: 0.25,
 			cacheWrite: 12.5,
 		});
+	});
+
+	it("returns the Sonnet 5.5 bundled rates published at launch", async () => {
+		const rates = await getModelRates("claude-sonnet-5-5");
+
+		expect(rates).toEqual({
+			input: 2,
+			output: 10,
+			cacheRead: 0.2,
+			cacheWrite: 2.5,
+		});
+	});
+
+	it("has complete bundled rates for every bundled Claude model id", async () => {
+		// A missing cache_write rate makes estimateCostUSD throw internally and
+		// record the whole request as 0, so every kind must be present.
+		const incomplete: string[] = [];
+		for (const modelId of Object.values(CLAUDE_MODEL_IDS)) {
+			const rates = await getModelRates(modelId);
+			if (!rates || rates.cacheRead === null || rates.cacheWrite === null) {
+				incomplete.push(modelId);
+			}
+		}
+
+		expect(incomplete).toEqual([]);
 	});
 
 	it("estimates Fable 5.1 aggregate cache creation at its published 5-minute write rate", async () => {
