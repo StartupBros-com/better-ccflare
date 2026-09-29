@@ -26,6 +26,7 @@ import {
 	resolveCompatibleEndpoint,
 	resolveFamilyAliasModel,
 	resolveStoredPolicyAliasModel,
+	supportsForcedToolChoice,
 	ValidationError,
 	validatePriority,
 } from "@better-ccflare/core";
@@ -111,6 +112,23 @@ describe("Sonnet 5.5 registry metadata", () => {
 		expect(resolveFamilyAliasModel(CLAUDE_MODEL_IDS.SONNET_5, "sonnet")).toBe(
 			CLAUDE_MODEL_IDS.SONNET_5,
 		);
+	});
+
+	test("records that the 5.5-generation models reject forced tool choice", () => {
+		for (const modelId of [
+			CLAUDE_MODEL_IDS.SONNET_5_5,
+			CLAUDE_MODEL_IDS.OPUS_5_5,
+			CLAUDE_MODEL_IDS.FABLE_5_1,
+		]) {
+			expect(supportsForcedToolChoice(modelId)).toBe(false);
+		}
+		for (const modelId of [
+			CLAUDE_MODEL_IDS.SONNET_5,
+			CLAUDE_MODEL_IDS.OPUS_5,
+			CLAUDE_MODEL_IDS.HAIKU_4_5,
+		]) {
+			expect(supportsForcedToolChoice(modelId)).toBe(true);
+		}
 	});
 
 	test("classifies Sonnet 5.5 into the sonnet family for routing", () => {

@@ -111,3 +111,17 @@ export function getModelDisplayName(modelId: string): string {
 export function isValidModelId(modelId: string): modelId is ClaudeModelId {
 	return Object.values(CLAUDE_MODEL_IDS).includes(modelId as ClaudeModelId);
 }
+
+// Models that answer a forced tool_choice ({type: "any"} or {type: "tool"})
+// with a 400; `auto` and `none` still work. Source:
+// https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools#forcing-tool-use
+const FORCED_TOOL_CHOICE_UNSUPPORTED: ReadonlySet<string> = new Set([
+	CLAUDE_MODEL_IDS.OPUS_5_5,
+	CLAUDE_MODEL_IDS.SONNET_5_5,
+	CLAUDE_MODEL_IDS.FABLE_5_1,
+]);
+
+// Helper function to check whether a model accepts a forced tool_choice
+export function supportsForcedToolChoice(modelId: string): boolean {
+	return !FORCED_TOOL_CHOICE_UNSUPPORTED.has(modelId);
+}

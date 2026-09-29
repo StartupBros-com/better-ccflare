@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	CLAUDE_MODEL_IDS,
 	LATEST_HAIKU_MODEL,
 	LATEST_OPUS_MODEL,
 	LATEST_SONNET_MODEL,
@@ -567,6 +568,79 @@ describe("translateRequestToAnthropic", () => {
 			input: [],
 		};
 		expect(translateRequestToAnthropic(req).model).toBe("claude-opus-4-5");
+	});
+
+	describe("forced tool choice on an implicitly mapped model", () => {
+		const fnTool = {
+			type: "function" as const,
+			name: "my_fn",
+			description: "A function",
+			parameters: {},
+		};
+		const forcedChoices: ResponsesRequest["tool_choice"][] = [
+			"required",
+			{ type: "function", name: "my_fn" },
+		];
+
+		test("maps plain gpt models to Sonnet 5, which accepts a forced choice", () => {
+			for (const tool_choice of forcedChoices) {
+				const result = translateRequestToAnthropic({
+					model: "gpt-5.5",
+					input: [],
+					tools: [fnTool],
+					tool_choice,
+				});
+				expect(result.model).toBe(CLAUDE_MODEL_IDS.SONNET_5);
+				expect(result.tool_choice?.type).toMatch(/^(any|tool)$/);
+			}
+		});
+
+		test("maps *-pro to Opus 5, which accepts a forced choice", () => {
+			for (const tool_choice of forcedChoices) {
+				const result = translateRequestToAnthropic({
+					model: "gpt-5.5-pro",
+					input: [],
+					tools: [fnTool],
+					tool_choice,
+				});
+				expect(result.model).toBe(CLAUDE_MODEL_IDS.OPUS_5);
+			}
+		});
+
+		test("keeps the latest model when the choice is not forced", () => {
+			for (const tool_choice of ["auto", "none"] as const) {
+				expect(
+					translateRequestToAnthropic({
+						model: "gpt-5.5",
+						input: [],
+						tools: [fnTool],
+						tool_choice,
+					}).model,
+				).toBe(LATEST_SONNET_MODEL);
+			}
+		});
+
+		test("keeps the latest haiku, which accepts a forced choice", () => {
+			expect(
+				translateRequestToAnthropic({
+					model: "gpt-5.4-mini",
+					input: [],
+					tools: [fnTool],
+					tool_choice: "required",
+				}).model,
+			).toBe(LATEST_HAIKU_MODEL);
+		});
+
+		test("never rewrites a Claude model the client asked for explicitly", () => {
+			expect(
+				translateRequestToAnthropic({
+					model: CLAUDE_MODEL_IDS.SONNET_5_5,
+					input: [],
+					tools: [fnTool],
+					tool_choice: "required",
+				}).model,
+			).toBe(CLAUDE_MODEL_IDS.SONNET_5_5);
+		});
 	});
 
 	test("gpt-5 model mapping — *-pro maps to opus family alias", () => {

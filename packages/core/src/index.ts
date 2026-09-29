@@ -113,6 +113,7 @@ export {
 	LATEST_SONNET_MODEL,
 	MODEL_DISPLAY_NAMES,
 	MODEL_SHORT_NAMES,
+	supportsForcedToolChoice,
 } from "./models";
 export {
 	installOutboundProxy,
