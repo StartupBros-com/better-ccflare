@@ -2,6 +2,10 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { agentRegistry } from "@better-ccflare/agents";
+import {
+	hasForcedToolChoice,
+	supportsForcedToolChoice,
+} from "@better-ccflare/core";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import { validatePath } from "@better-ccflare/security";
@@ -35,6 +39,30 @@ export function isRewriteTargetServable(
 	if (catalog.source !== "live") return true;
 	if (catalog.models.length === 0) return true;
 	return catalog.models.some((entry) => entry.id === model);
+}
+
+/**
+ * Some models (Opus 5.5, Sonnet 5.5, Fable 5.1) answer a forced tool_choice
+ * with HTTP 400. Rewriting a forced-tool request onto one of them would turn
+ * a working request into a failing one, so the caller passes the client's
+ * model through instead. Logs the reason and returns true when the rewrite
+ * must be declined.
+ */
+function declinesForcedToolChoiceRewrite(
+	parsedBody: unknown,
+	agentId: string,
+	preferredModel: string,
+	originalModel: string | null,
+): boolean {
+	if (
+		!hasForcedToolChoice(parsedBody) ||
+		supportsForcedToolChoice(preferredModel)
+	)
+		return false;
+	log.warn(
+		`Agent ${agentId} prefers model ${preferredModel} which rejects a forced tool_choice, and this request forces one — passing through ${originalModel}`,
+	);
+	return true;
 }
 
 /**
@@ -142,7 +170,16 @@ export async function interceptAndModifyRequest(
 				);
 			}
 			const preferredModel = skipModelRewrite ? undefined : preference?.model;
-			if (preferredModel && preferredModel !== originalModel) {
+			if (
+				preferredModel &&
+				preferredModel !== originalModel &&
+				!declinesForcedToolChoiceRewrite(
+					parsedBody,
+					explicitAgentId,
+					preferredModel,
+					originalModel,
+				)
+			) {
 				const catalog = await loadModelCatalog();
 				if (isRewriteTargetServable(catalog, preferredModel)) {
 					log.debug(
@@ -308,6 +345,23 @@ export async function interceptAndModifyRequest(
 		// If there's no preference at all, or it matches the original, no
 		// modification is needed. agentUsed is still reported for attribution.
 		if (!preferredModel || preferredModel === originalModel) {
+			return {
+				modifiedBody: requestBodyBuffer,
+				agentUsed: detectedAgent.id,
+				originalModel,
+				appliedModel: originalModel,
+				agentAttributionSource: "prompt_agent",
+			};
+		}
+
+		if (
+			declinesForcedToolChoiceRewrite(
+				parsedBody,
+				detectedAgent.id,
+				preferredModel,
+				originalModel,
+			)
+		) {
 			return {
 				modifiedBody: requestBodyBuffer,
 				agentUsed: detectedAgent.id,

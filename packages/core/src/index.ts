@@ -105,6 +105,7 @@ export {
 	DEFAULT_MODEL,
 	getModelDisplayName,
 	getModelShortName,
+	hasForcedToolChoice,
 	isValidModelId,
 	LATEST_FABLE_MODEL,
 	LATEST_HAIKU_MODEL,

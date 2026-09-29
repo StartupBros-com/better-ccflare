@@ -125,3 +125,14 @@ const FORCED_TOOL_CHOICE_UNSUPPORTED: ReadonlySet<string> = new Set([
 export function supportsForcedToolChoice(modelId: string): boolean {
 	return !FORCED_TOOL_CHOICE_UNSUPPORTED.has(modelId);
 }
+
+// True iff the request body carries a forced tool_choice ({type: "any"} or
+// {type: "tool"}). `auto`, `none`, a missing value, or anything malformed is
+// not forced.
+export function hasForcedToolChoice(body: unknown): boolean {
+	if (typeof body !== "object" || body === null) return false;
+	const toolChoice = (body as { tool_choice?: unknown }).tool_choice;
+	if (typeof toolChoice !== "object" || toolChoice === null) return false;
+	const type = (toolChoice as { type?: unknown }).type;
+	return type === "any" || type === "tool";
+}
