@@ -588,8 +588,13 @@ describe("getModelRates", () => {
 		});
 	});
 
+	// Offline mode still falls back to the shared on-disk models.dev cache, which
+	// a server on this host may have refreshed; hide it so these assert the
+	// bundled table rather than whatever the live catalogue lists.
 	it("returns the Sonnet 5.5 bundled rates published at launch", async () => {
-		const rates = await getModelRates("claude-sonnet-5-5");
+		const rates = await withDiskCache(null, () =>
+			getModelRates("claude-sonnet-5-5"),
+		);
 
 		expect(rates).toEqual({
 			input: 2,
@@ -602,13 +607,16 @@ describe("getModelRates", () => {
 	it("has complete bundled rates for every bundled Claude model id", async () => {
 		// A missing cache_write rate makes estimateCostUSD throw internally and
 		// record the whole request as 0, so every kind must be present.
-		const incomplete: string[] = [];
-		for (const modelId of Object.values(CLAUDE_MODEL_IDS)) {
-			const rates = await getModelRates(modelId);
-			if (!rates || rates.cacheRead === null || rates.cacheWrite === null) {
-				incomplete.push(modelId);
+		const incomplete = await withDiskCache(null, async () => {
+			const missing: string[] = [];
+			for (const modelId of Object.values(CLAUDE_MODEL_IDS)) {
+				const rates = await getModelRates(modelId);
+				if (!rates || rates.cacheRead === null || rates.cacheWrite === null) {
+					missing.push(modelId);
+				}
 			}
-		}
+			return missing;
+		});
 
 		expect(incomplete).toEqual([]);
 	});
