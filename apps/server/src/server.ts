@@ -1455,6 +1455,13 @@ export default async function startServer(options?: {
 	// otherwise never reach the ledger. Internally resilient: see
 	// UsageWindowLedger.observeSnapshot's per-window try/catch.
 	const usageWindowLedger = new UsageWindowLedger(dbOps, alertService);
+	// Re-price closed windows stamped with an older VALUE_PRICING_VERSION. Done
+	// here, at construction, because the ledger has no init lifecycle and this
+	// runs exactly once per process. Not awaited so startup isn't blocked; the
+	// ledger's own guards make it safe against concurrent poll writes.
+	usageWindowLedger.revalueStaleClosedWindows().catch((err) => {
+		log.warn(`Usage window re-valuation failed: ${err}`);
+	});
 
 	// Shared successful-poll snapshot dispatch for the API-key pollers
 	// (nanogpt/zai/kilo/minimax): history persistence + usage-window alert

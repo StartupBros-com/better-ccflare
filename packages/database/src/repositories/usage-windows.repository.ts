@@ -52,6 +52,14 @@ export interface CloseWindowAggregates {
 	projectionVersion: string | null;
 }
 
+/** The fields a re-valuation rewrites on an already-closed window. */
+export interface RevalueWindowInput {
+	valueUsd: number | null;
+	modelBreakdown: Record<string, unknown>;
+	unpricedTokens: number | null;
+	projectionVersion: string;
+}
+
 export interface CloseWindowInput extends CloseWindowAggregates {
 	closedAt: number;
 }
@@ -350,6 +358,56 @@ export class UsageWindowsRepository extends BaseRepository<UsageWindow> {
 				input.projectionVersion,
 				id,
 				...(expectedCreatedAt === undefined ? [] : [expectedCreatedAt]),
+			],
+		);
+		return changes === 1;
+	}
+
+	/**
+	 * Closed windows carrying a model_breakdown whose projection_version is
+	 * not `projectionVersion` (NULL counts as different). Feeds the ledger's
+	 * startup re-valuation after a list-price correction.
+	 */
+	async listClosedWindowsNotAtProjectionVersion(
+		projectionVersion: string,
+	): Promise<UsageWindow[]> {
+		requireNonEmpty(projectionVersion, "projectionVersion");
+		const rows = await this.query<UsageWindowRow>(
+			`SELECT ${WINDOW_COLUMNS} FROM usage_windows
+			 WHERE closed_at IS NOT NULL
+			   AND model_breakdown IS NOT NULL
+			   AND projection_version IS DISTINCT FROM ?
+			 ORDER BY resets_at ASC`,
+			[projectionVersion],
+		);
+		return rows.map(toUsageWindow);
+	}
+
+	/**
+	 * Rewrites the valuation of one CLOSED window, only while its stored
+	 * projection_version still equals `expectedProjectionVersion` (what the
+	 * caller read; null matches a NULL column). Returns false when the guard
+	 * or the closed check fails, so a concurrent re-stamp is never overwritten.
+	 */
+	async revalueClosedWindow(
+		id: string,
+		input: RevalueWindowInput,
+		expectedProjectionVersion: string | null,
+	): Promise<boolean> {
+		requireNonEmpty(id, "id");
+		const changes = await this.runWithChanges(
+			`UPDATE usage_windows
+			 SET value_usd = ?, model_breakdown = ?, unpriced_tokens = ?,
+			     projection_version = ?
+			 WHERE id = ? AND closed_at IS NOT NULL
+			   AND projection_version IS NOT DISTINCT FROM ?`,
+			[
+				input.valueUsd,
+				JSON.stringify(input.modelBreakdown),
+				input.unpricedTokens,
+				input.projectionVersion,
+				id,
+				expectedProjectionVersion,
 			],
 		);
 		return changes === 1;

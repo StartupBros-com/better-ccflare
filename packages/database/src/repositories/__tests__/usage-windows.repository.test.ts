@@ -520,6 +520,84 @@ describe.skipIf(!livePgAvailable)(
 			}
 		});
 
+		it("lists and guardedly re-values closed windows against a real PG server", async () => {
+			const { SQL } = await import("bun");
+			const { randomUUID } = await import("node:crypto");
+			const { ensureSchemaPg, runMigrationsPg } = await import(
+				"../../migrations-pg"
+			);
+
+			// biome-ignore lint/style/noNonNullAssertion: guarded by describe.skipIf(!livePgAvailable)
+			const databaseUrl = process.env.DATABASE_URL!;
+			const adapter = new BunSqlAdapter(new SQL({ url: databaseUrl }), false);
+			const accountId = `usage-windows-revalue-${randomUUID()}`;
+			const version = `test-${randomUUID()}`;
+			const close = (v: string | null) => ({
+				closedAt: 6000,
+				valueUsd: 1,
+				inputTokens: 1,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0,
+				outputTokens: 0,
+				requestCount: 1,
+				modelBreakdown: { m: { requestCount: 1 } },
+				unpricedTokens: 0,
+				projectionVersion: v,
+			});
+			const revalue = {
+				valueUsd: 2,
+				modelBreakdown: { m: { requestCount: 1, valueUsd: 2 } },
+				unpricedTokens: 5,
+				projectionVersion: version,
+			};
+			try {
+				await ensureSchemaPg(adapter);
+				await runMigrationsPg(adapter);
+				const repo = new UsageWindowsRepository(adapter);
+				const mk = (key: string) =>
+					repo.openWindow({
+						accountId,
+						windowKey: key,
+						startedAt: 1000,
+						resetsAt: 6000,
+						grantType: "natural",
+					});
+				const a = await mk("a");
+				const b = await mk("b");
+				const open = await mk("c");
+				await repo.closeWindow(a.id, close("old"));
+				await repo.closeWindow(b.id, close(null));
+
+				const listed = (
+					await repo.listClosedWindowsNotAtProjectionVersion(version)
+				)
+					.filter((w) => w.accountId === accountId)
+					.map((w) => w.id)
+					.sort();
+				expect(listed).toEqual([a.id, b.id].sort());
+
+				expect(await repo.revalueClosedWindow(a.id, revalue, "wrong")).toBe(
+					false,
+				);
+				expect(await repo.revalueClosedWindow(a.id, revalue, "old")).toBe(true);
+				expect(await repo.revalueClosedWindow(b.id, revalue, null)).toBe(true);
+				expect(await repo.revalueClosedWindow(open.id, revalue, null)).toBe(
+					false,
+				);
+				const rows = await repo.listWindows({ accountId });
+				expect(rows.find((r) => r.id === a.id)?.valueUsd).toBe(2);
+				expect(rows.find((r) => r.id === b.id)?.projectionVersion).toBe(
+					version,
+				);
+				expect(rows.find((r) => r.id === open.id)?.valueUsd).toBeNull();
+			} finally {
+				await adapter.run("DELETE FROM usage_windows WHERE account_id = ?", [
+					accountId,
+				]);
+				await adapter.close();
+			}
+		});
+
 		it("enforces expectedCreatedAt after a same-id account generation replacement", async () => {
 			const { SQL } = await import("bun");
 			const { randomUUID } = await import("node:crypto");
@@ -744,6 +822,109 @@ describe("UsageWindowsRepository generation fences", () => {
 			generationB,
 		);
 		expect(replacementOpen?.accountId).toBe(accountId);
+		db.close();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Re-valuation queries (SQLite; the PG equivalents run in the live suite)
+// ---------------------------------------------------------------------------
+
+describe("UsageWindowsRepository re-valuation", () => {
+	const closeInput = (projectionVersion: string | null, valueUsd = 1) => ({
+		closedAt: 6000,
+		valueUsd,
+		inputTokens: 1,
+		cacheReadInputTokens: 0,
+		cacheCreationInputTokens: 0,
+		outputTokens: 0,
+		requestCount: 1,
+		modelBreakdown: { m: { requestCount: 1 } } as Record<string, unknown>,
+		unpricedTokens: 0,
+		projectionVersion,
+	});
+	const revalue = {
+		valueUsd: 2,
+		modelBreakdown: { m: { requestCount: 1, valueUsd: 2 } } as Record<
+			string,
+			unknown
+		>,
+		unpricedTokens: 5,
+		projectionVersion: "v2",
+	};
+
+	async function seed(
+		repo: UsageWindowsRepository,
+		key: string,
+		version: string | null | "open",
+	) {
+		const w = await repo.openWindow({
+			accountId: "acc1",
+			windowKey: key,
+			startedAt: 1000,
+			resetsAt: 6000,
+			grantType: "natural",
+		});
+		if (version !== "open") await repo.closeWindow(w.id, closeInput(version));
+		return w;
+	}
+
+	it("lists only closed windows with a breakdown whose version differs (NULL counts)", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		const old = await seed(repo, "a", "v1");
+		const nul = await seed(repo, "b", null);
+		await seed(repo, "c", "v2");
+		const openWindow = await seed(repo, "d", "open");
+		db.run(
+			"UPDATE usage_windows SET model_breakdown = '{\"m\":{}}', projection_version = 'v1' WHERE id = ?",
+			[openWindow.id],
+		);
+		const noBreakdown = await repo.openWindow({
+			accountId: "acc1",
+			windowKey: "e",
+			startedAt: 1000,
+			resetsAt: 6000,
+			grantType: "natural",
+		});
+		await repo.closeWindow(noBreakdown.id, {
+			...closeInput("v1"),
+			modelBreakdown: null,
+		});
+		const rows = await repo.listClosedWindowsNotAtProjectionVersion("v2");
+		expect(rows.map((r) => r.id).sort()).toEqual([old.id, nul.id].sort());
+		db.close();
+	});
+
+	it("revalueClosedWindow applies when the stored version matches, including NULL", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		const a = await seed(repo, "a", "v1");
+		const b = await seed(repo, "b", null);
+		expect(await repo.revalueClosedWindow(a.id, revalue, "v1")).toBe(true);
+		expect(await repo.revalueClosedWindow(b.id, revalue, null)).toBe(true);
+		const rows = await repo.listWindows({});
+		for (const r of rows) {
+			expect(r.valueUsd).toBe(2);
+			expect(r.unpricedTokens).toBe(5);
+			expect(r.projectionVersion).toBe("v2");
+			expect(r.closedAt).toBe(6000);
+			expect(r.inputTokens).toBe(1);
+		}
+		db.close();
+	});
+
+	it("revalueClosedWindow refuses a stale expected version and an open window", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		const a = await seed(repo, "a", "v1");
+		const open = await seed(repo, "d", "open");
+		expect(await repo.revalueClosedWindow(a.id, revalue, "other")).toBe(false);
+		expect(await repo.revalueClosedWindow(a.id, revalue, null)).toBe(false);
+		expect(await repo.revalueClosedWindow(open.id, revalue, null)).toBe(false);
+		const rows = await repo.listWindows({});
+		expect(rows.find((r) => r.id === a.id)?.valueUsd).toBe(1);
+		expect(rows.find((r) => r.id === open.id)?.valueUsd).toBeNull();
 		db.close();
 	});
 });

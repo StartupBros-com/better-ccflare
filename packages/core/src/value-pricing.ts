@@ -33,9 +33,11 @@ import type { TokenBreakdown } from "./pricing";
 
 /**
  * Bump this whenever LIST_PRICE_ERAS changes (new model, new era, corrected
- * rate). The ledger stamps this onto each materialized window row as
- * `projection_version` so a later rate correction can trigger an idempotent
- * recompute instead of silently leaving stale values on old rows.
+ * rate). The ledger stamps it onto each closed window as
+ * `projection_version`; at server startup it re-prices every closed window
+ * stamped with any other version from its stored model breakdown
+ * (UsageWindowLedger.revalueStaleClosedWindows), so history follows the
+ * current rates instead of keeping the price it was closed at.
  */
 export const VALUE_PRICING_VERSION = "2026-09-29.2";
 

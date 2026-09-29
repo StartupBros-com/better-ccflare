@@ -1,6 +1,7 @@
 import {
 	VALUE_PRICING_VERSION,
 	valueWindowAggregates,
+	type WindowTokenAggregate,
 } from "@better-ccflare/core";
 import type { DatabaseOperations, UsageWindow } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
@@ -8,6 +9,54 @@ import type { CanonicalUsageWindow } from "@better-ccflare/types";
 import type { AlertService } from "./alerts";
 
 const log = new Logger("UsageWindowLedger");
+
+export interface RevalueSummary {
+	/** Closed windows found at a projection_version other than the current one. */
+	scanned: number;
+	/** Windows rewritten and stamped with the current version. */
+	stamped: number;
+	/** Stamped windows whose value_usd actually moved. */
+	valueChanged: number;
+	/** Windows left as-is: malformed breakdown, totals mismatch, or lost the guard. */
+	skipped: number;
+	/** Sum of (new - old) value_usd over stamped windows. */
+	valueDeltaUsd: number;
+}
+
+const BREAKDOWN_TOKEN_FIELDS = [
+	"requestCount",
+	"inputTokens",
+	"cacheReadInputTokens",
+	"cacheCreationInputTokens",
+	"outputTokens",
+] as const;
+
+/** Rebuilds per-model aggregates, in stored key order, from a stored
+ * model_breakdown; null when any entry is not a plain object of finite
+ * numbers. Key order matters: it reproduces the original summation order. */
+function aggregatesFromBreakdown(
+	breakdown: Record<string, unknown>,
+): WindowTokenAggregate[] | null {
+	const aggregates: WindowTokenAggregate[] = [];
+	for (const [model, raw] of Object.entries(breakdown)) {
+		if (raw === null || typeof raw !== "object") return null;
+		const entry = raw as Record<string, unknown>;
+		for (const field of BREAKDOWN_TOKEN_FIELDS) {
+			if (typeof entry[field] !== "number" || !Number.isFinite(entry[field])) {
+				return null;
+			}
+		}
+		aggregates.push({
+			model,
+			requestCount: entry.requestCount as number,
+			inputTokens: entry.inputTokens as number,
+			cacheReadInputTokens: entry.cacheReadInputTokens as number,
+			cacheCreationInputTokens: entry.cacheCreationInputTokens as number,
+			outputTokens: entry.outputTokens as number,
+		});
+	}
+	return aggregates;
+}
 
 /**
  * Only this exact window key is ledgered (issue #252, task P1.3). `five_hour`
@@ -213,6 +262,88 @@ export class UsageWindowLedger {
 			timestampMs,
 			expectedCreatedAt,
 		);
+	}
+
+	/**
+	 * Re-prices closed windows stamped with a projection_version other than
+	 * the current VALUE_PRICING_VERSION, from their stored per-model token
+	 * breakdowns (no request-table scan), at each window's own started_at era.
+	 * This is what makes a VALUE_PRICING_VERSION bump take effect on history.
+	 *
+	 * Deliberately silent: never notifies AlertService (a re-price is not a
+	 * newly closed window, and would skew usage_window_value_drop's sibling
+	 * median), never touches open windows, and writes through a guard on the
+	 * version it read, so a concurrent writer wins. A window whose recomputed
+	 * totals disagree with its stored columns, or whose breakdown is malformed,
+	 * is skipped untouched. Idempotent: rewritten rows carry the current
+	 * version and are not listed again.
+	 */
+	async revalueStaleClosedWindows(): Promise<RevalueSummary> {
+		const summary: RevalueSummary = {
+			scanned: 0,
+			stamped: 0,
+			valueChanged: 0,
+			skipped: 0,
+			valueDeltaUsd: 0,
+		};
+		const stale = await this.dbOps.listClosedWindowsNotAtProjectionVersion(
+			VALUE_PRICING_VERSION,
+		);
+		for (const window of stale) {
+			summary.scanned++;
+			const aggregates = window.modelBreakdown
+				? aggregatesFromBreakdown(window.modelBreakdown)
+				: null;
+			if (!aggregates) {
+				log.warn(
+					`Skipping re-valuation of window ${window.id}: malformed model_breakdown`,
+				);
+				summary.skipped++;
+				continue;
+			}
+			const valuation = valueWindowAggregates(aggregates, window.startedAt);
+			if (
+				valuation.requestCount !== window.requestCount ||
+				valuation.inputTokens !== window.inputTokens ||
+				valuation.cacheReadInputTokens !== window.cacheReadInputTokens ||
+				valuation.cacheCreationInputTokens !==
+					window.cacheCreationInputTokens ||
+				valuation.outputTokens !== window.outputTokens
+			) {
+				log.warn(
+					`Skipping re-valuation of window ${window.id}: breakdown totals disagree with stored columns`,
+				);
+				summary.skipped++;
+				continue;
+			}
+			const applied = await this.dbOps.revalueClosedUsageWindow(
+				window.id,
+				{
+					valueUsd: valuation.valueUsd,
+					modelBreakdown: valuation.modelBreakdown,
+					unpricedTokens: valuation.unpricedTokens,
+					projectionVersion: VALUE_PRICING_VERSION,
+				},
+				window.projectionVersion,
+			);
+			if (!applied) {
+				log.warn(
+					`Skipping re-valuation of window ${window.id}: changed concurrently`,
+				);
+				summary.skipped++;
+				continue;
+			}
+			summary.stamped++;
+			const delta = valuation.valueUsd - (window.valueUsd ?? 0);
+			if (delta !== 0) {
+				summary.valueChanged++;
+				summary.valueDeltaUsd += delta;
+			}
+		}
+		log.info(
+			`Window value re-valuation to ${VALUE_PRICING_VERSION}: scanned ${summary.scanned}, stamped ${summary.stamped}, value changed ${summary.valueChanged}, skipped ${summary.skipped}, delta $${summary.valueDeltaUsd.toFixed(2)}`,
+		);
+		return summary;
 	}
 
 	/**
