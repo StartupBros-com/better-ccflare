@@ -1,9 +1,11 @@
 // Bun test preload (see bunfig.toml). Production runs on the same host and
 // user as developers and shares os.tmpdir() paths (pricing cache, model
 // catalog cache, app.log), so tests must never write there. Give each test
-// process its own tmpdir: every tmpdir() consumer and spawned subprocess is
-// covered at once. The two log/cache overrides are pinned too, so a shell that
-// exports them cannot redirect tests at real locations.
+// process its own tmpdir, which covers every tmpdir() consumer in-process. The
+// two log/cache overrides are pinned too, so a shell that exports them cannot
+// redirect tests at real locations. Subprocesses see these only when spawned
+// with `env: process.env`: Bun (1.3) hands a child the startup environment by
+// default, not later process.env changes.
 import { afterAll } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
