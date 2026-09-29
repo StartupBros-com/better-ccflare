@@ -10,7 +10,19 @@ import {
 	statSync,
 } from "node:fs";
 import http from "node:http";
-import { Readable, Transform } from "node:stream";
+import https from "node:https";
+import {
+	Duplex,
+	Readable,
+	Transform,
+	pipeline as pipelineStreams,
+} from "node:stream";
+import {
+	createBrotliDecompress,
+	createGunzip,
+	createInflate,
+	createInflateRaw,
+} from "node:zlib";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -539,6 +551,8 @@ function responseBodyIdleTimeoutError() {
 
 function isEventStreamResponse(response) {
 	return (
+		(!response.headers.has("content-encoding") ||
+			response.headers.get("content-encoding")?.toLowerCase() === "identity") &&
 		response.headers
 			.get("content-type")
 			?.split(";", 1)[0]
@@ -1235,6 +1249,203 @@ export function planRecoveryAction({
 	};
 }
 
+// Match fetch's support for both zlib-wrapped and legacy raw HTTP deflate,
+// without buffering a response or ignoring downstream backpressure.
+function createDeflateDecoder() {
+	let decoder;
+	const stream = new Duplex({
+		read() {
+			decoder?.resume();
+		},
+		write(chunk, encoding, callback) {
+			if (chunk.length === 0) {
+				callback();
+				return;
+			}
+			if (!decoder) {
+				decoder = (chunk[0] & 15) === 8 ? createInflate() : createInflateRaw();
+				decoder.on("data", (data) => {
+					if (!stream.push(data)) decoder.pause();
+				});
+				decoder.on("end", () => stream.push(null));
+				decoder.on("error", (error) => stream.destroy(error));
+			}
+			decoder.write(chunk, encoding, callback);
+		},
+		final(callback) {
+			if (decoder) decoder.end(callback);
+			else {
+				stream.push(null);
+				callback();
+			}
+		},
+		destroy(error, callback) {
+			decoder?.destroy();
+			callback(error);
+		},
+	});
+	return stream;
+}
+
+function toWebByteStream(source) {
+	return Readable.toWeb(source, {
+		strategy: { highWaterMark: 64 * 1024, size: (chunk) => chunk.byteLength },
+	});
+}
+
+function upstreamResponseBody(incoming, headers) {
+	const encodings = (headers.get("content-encoding") || "")
+		.toLowerCase()
+		.split(",")
+		.map((value) => value.trim())
+		.filter(Boolean);
+	const decoderFactories = {
+		gzip: createGunzip,
+		"x-gzip": createGunzip,
+		deflate: createDeflateDecoder,
+		br: createBrotliDecompress,
+	};
+	// An unknown/overly deep coding remains a coherent encoded passthrough;
+	// never decode only part of a stack and advertise the original encoding.
+	if (
+		!encodings.length ||
+		encodings.length > 5 ||
+		encodings.some((value) => !Object.hasOwn(decoderFactories, value))
+	) {
+		return toWebByteStream(incoming);
+	}
+	const decoders = encodings
+		.reverse()
+		.map((value) => decoderFactories[value]());
+	const body = toWebByteStream(decoders[decoders.length - 1]);
+	// The pipeline owns every decoder and the socket: cancellation or a decode
+	// error must destroy the complete chain, not leave the upstream running.
+	pipelineStreams(incoming, ...decoders, () => {});
+	headers.delete("content-encoding");
+	headers.delete("content-length");
+	return body;
+}
+
+// The guard owns the pre-response deadline and post-response idle watchdog.
+// Node's fetch adds an independent 300s headers/body cutoff, which can reject
+// a valid non-streaming generation before either configured guard budget.
+// Keep this local transport dependency-free: deployment copies this module to
+// an immutable directory without node_modules. It deliberately does not follow
+// redirects or retry network failures. Supported compression is decoded before
+// semantic inspection, with matching response headers.
+function createUpstreamTransport() {
+	const agentOptions = { keepAlive: true, maxFreeSockets: 16, timeout: 0 };
+	const httpAgent = new http.Agent(agentOptions);
+	const httpsAgent = new https.Agent(agentOptions);
+	return {
+		fetch(target, init) {
+			return new Promise((resolve, reject) => {
+				const transport = target.protocol === "https:" ? https : http;
+				const headers = new Headers(init.headers);
+				// Recovery and SSE inspection require uncompressed local responses.
+				// An upstream that nevertheless encodes one is decoded explicitly
+				// with stale encoding/length metadata removed below.
+				headers.set("accept-encoding", "identity");
+				let incomingResponse;
+				const request = transport.request(
+					target,
+					{
+						method: init.method,
+						headers: Object.fromEntries(headers),
+						agent: target.protocol === "https:" ? httpsAgent : httpAgent,
+					},
+					(incoming) => {
+						incomingResponse = incoming;
+						incoming.once("close", removeAbortListener);
+						try {
+							const responseHeaders = new Headers();
+							for (
+								let index = 0;
+								index < incoming.rawHeaders.length;
+								index += 2
+							) {
+								responseHeaders.append(
+									incoming.rawHeaders[index],
+									incoming.rawHeaders[index + 1],
+								);
+							}
+							const status = incoming.statusCode;
+							const hasBody =
+								init.method !== "HEAD" && ![204, 205, 304].includes(status);
+							const response = new Response(
+								hasBody
+									? upstreamResponseBody(incoming, responseHeaders)
+									: null,
+								{
+									status,
+									headers: responseHeaders,
+								},
+							);
+							if (!hasBody) incoming.resume();
+							resolve(response);
+						} catch (error) {
+							incoming.destroy();
+							request.destroy(error);
+							reject(error);
+						}
+					},
+				);
+				// Retain the error listener after headers: client cancellation and
+				// body cancellation still destroy this exact request/socket. The
+				// IncomingMessage web stream carries any subsequent body error.
+				request.on("error", (error) =>
+					reject(new TypeError("fetch failed", { cause: error })),
+				);
+				// Own cancellation explicitly rather than relying on runtime-specific
+				// ClientRequest signal handling (Node and Bun differ before headers).
+				const abort = () => {
+					const error = init.signal.reason || abortError();
+					incomingResponse?.destroy(error);
+					request.destroy(error);
+					reject(error);
+				};
+				function removeAbortListener() {
+					init.signal.removeEventListener("abort", abort);
+				}
+				request.once("close", () => {
+					if (!incomingResponse) removeAbortListener();
+				});
+				init.signal.addEventListener("abort", abort, { once: true });
+				if (init.signal.aborted) abort();
+				else request.end(init.body);
+			});
+		},
+		close() {
+			httpAgent.destroy();
+			httpsAgent.destroy();
+		},
+	};
+}
+
+const SAFE_TRANSPORT_ERROR_CODES = new Set([
+	"ECONNREFUSED",
+	"ECONNRESET",
+	"EPIPE",
+	"ENOTFOUND",
+	"EAI_AGAIN",
+	"ETIMEDOUT",
+	"ABORT_ERR",
+	"UND_ERR_HEADERS_TIMEOUT",
+	"UND_ERR_BODY_TIMEOUT",
+	"UND_ERR_SOCKET",
+	"ERR_STREAM_PREMATURE_CLOSE",
+]);
+
+function transportErrorFields(error) {
+	// Never log arbitrary cause messages, addresses, headers or error objects.
+	return {
+		errorCode: SAFE_TRANSPORT_ERROR_CODES.has(error?.code) ? error.code : null,
+		causeCode: SAFE_TRANSPORT_ERROR_CODES.has(error?.cause?.code)
+			? error.cause.code
+			: null,
+	};
+}
+
 export function createGuard(options = {}) {
 	const env = options.env || process.env;
 	const signGuardCorrelation = createGuardCorrelationSigner(
@@ -1397,7 +1608,10 @@ export function createGuard(options = {}) {
 		options.sourceId ?? env.GUARD_SOURCE_ID ?? DEFAULT_GUARD_SOURCE_ID;
 	const policyId =
 		options.policyId ?? env.GUARD_POLICY_ID ?? DEFAULT_GUARD_POLICY_ID;
-	const fetchImpl = options.fetchImpl || fetch;
+	const upstreamTransport = options.fetchImpl
+		? null
+		: createUpstreamTransport();
+	const fetchImpl = options.fetchImpl || upstreamTransport.fetch;
 	const now = options.now || Date.now;
 	const random = options.random || Math.random;
 	const logger = options.logger || console.log;
@@ -1418,6 +1632,7 @@ export function createGuard(options = {}) {
 		poolExhausted: 0,
 		overload529: 0,
 		upstream429: 0,
+		upstreamTransportErrors: 0,
 		queueFull: 0,
 		aborted: 0,
 		deadlineExceeded: 0,
@@ -2527,10 +2742,12 @@ export function createGuard(options = {}) {
 				return;
 			}
 			if (handleAbort(error, res, context, attempt, responseTelemetry)) return;
+			counters.upstreamTransportErrors += 1;
 			log("proxy_exception", {
 				id,
 				attempt,
 				message: error.message,
+				...transportErrorFields(error),
 				...rawResponseTelemetryFields(responseTelemetry),
 			});
 			if (res.headersSent) {
@@ -2570,10 +2787,12 @@ export function createGuard(options = {}) {
 				return;
 			}
 			if (handleAbort(error, res, context, 1, responseTelemetry)) return;
+			counters.upstreamTransportErrors += 1;
 			log("proxy_exception", {
 				id: context.id,
 				attempt: 1,
 				message: error.message,
+				...transportErrorFields(error),
 				...rawResponseTelemetryFields(responseTelemetry),
 			});
 			if (res.headersSent) {
@@ -2850,6 +3069,8 @@ export function createGuard(options = {}) {
 			context.dispose();
 		}
 	});
+
+	server.on("close", () => upstreamTransport?.close());
 
 	const sockets = new Set();
 	server.on("connection", (socket) => {

@@ -6,6 +6,12 @@ import http, { type Server } from "node:http";
 import net from "node:net";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import {
+	gzipSync,
+	deflateSync,
+	deflateRawSync,
+	brotliCompressSync,
+} from "node:zlib";
 import { GUARD_CORRELATION_SECRET_HEADER } from "../../packages/http-common/src/headers";
 import { createGuardCorrelationVerifier } from "../../packages/proxy/src/handlers/guard-correlation-auth";
 import { GUARD_REQUEST_ID_HEADER } from "../../packages/proxy/src/handlers/internal-transport-headers";
@@ -87,12 +93,20 @@ async function allocatePort() {
 async function startProductionNodeGuard(
 	upstreamBase: string,
 	extraEnv: Record<string, string> = {},
+	runtimePrelude = "",
 ) {
 	const listenPort = await allocatePort();
 	const guardPath = fileURLToPath(
 		new URL("../ccflare-guard.mjs", import.meta.url),
 	);
-	const child = spawn(process.env.GUARD_NODE_BIN || "node", [guardPath], {
+	const nodeArgs = runtimePrelude
+		? [
+				"--input-type=module",
+				"--eval",
+				`${runtimePrelude}; process.argv[1] = ${JSON.stringify(guardPath)}; await import(${JSON.stringify(new URL("../ccflare-guard.mjs", import.meta.url).href)});`,
+			]
+		: [guardPath];
+	const child = spawn(process.env.GUARD_NODE_BIN || "node", nodeArgs, {
 		cwd: process.platform === "win32" ? process.env.SystemRoot : undefined,
 		env: {
 			...process.env,
@@ -1852,7 +1866,11 @@ describe("source-controlled guard", () => {
 			logger: (line: string) => events.push(JSON.parse(line)),
 			fetchImpl: async () => {
 				fetchCalls += 1;
-				throw new Error("test upstream error before headers");
+				throw new Error("test upstream error before headers", {
+					cause: Object.assign(new Error("private-network-detail"), {
+						code: "UND_ERR_HEADERS_TIMEOUT",
+					}),
+				});
 			},
 		});
 
@@ -1869,6 +1887,8 @@ describe("source-controlled guard", () => {
 		expect(upstreamError).toMatchObject({
 			attempt: 1,
 			message: "test upstream error before headers",
+			errorCode: null,
+			causeCode: "UND_ERR_HEADERS_TIMEOUT",
 			rawResponseChunkCount: 0,
 			rawResponseBytes: 0,
 			firstBodyByteMs: null,
@@ -1877,6 +1897,10 @@ describe("source-controlled guard", () => {
 		});
 		expect(fetchCalls).toBe(1);
 		expect(guard.state.counters.retried).toBe(0);
+		expect(guard.state.counters.upstreamTransportErrors).toBe(1);
+		expect(JSON.stringify(upstreamError)).not.toContain(
+			"private-network-detail",
+		);
 	});
 
 	test("resets raw body telemetry for each authorized retry attempt", async () => {
@@ -3175,6 +3199,374 @@ describe("source-controlled guard", () => {
 		);
 		expect(attempts).toBe(2);
 		expect(health.counters.aborted).toBe(1);
+	});
+
+	test("production transport waits for permitted delayed headers without an implicit fetch cutoff", async () => {
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((req, res) => {
+				attempts += 1;
+				req.resume();
+				setTimeout(() => {
+					res.writeHead(200, { "content-type": "application/json" });
+					res.end('{"ok":true}');
+				}, 150);
+			}),
+		);
+		// Accelerate the runtime's hidden fetch cutoff instead of spending five
+		// minutes on each regression run. The loopback upstream is real; only
+		// the global fetch timer is shortened, below the explicit guard budget.
+		const { baseUrl, waitForEvent } = await startProductionNodeGuard(
+			upstreamBase,
+			{
+				GUARD_TOTAL_DEADLINE_MS: "1000",
+			},
+			`const nativeFetch = globalThis.fetch;
+		globalThis.fetch = (url, init) => nativeFetch(url, {
+			...init, signal: AbortSignal.any([init.signal, AbortSignal.timeout(40)])
+		});`,
+		);
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ ok: true });
+		await waitForEvent("proxy_response");
+		expect(attempts).toBe(1);
+	});
+
+	test.each([
+		"deadline",
+		"client",
+		"idle",
+		"idle-compressed",
+	] as const)("production transport closes the upstream socket on %s without replay", async (scenario) => {
+		// Both ends use production Node here: Bun's node:http shim does not
+		// consistently emit socket close events for a cancelled response.
+		const { baseUrl, waitForEvent } = await startProductionNodeGuard(
+			"http://127.0.0.1:1",
+			{
+				GUARD_TOTAL_DEADLINE_MS: scenario === "deadline" ? "80" : "1000",
+				GUARD_RESPONSE_IDLE_TIMEOUT_MS: "50",
+			},
+			`const http = await import("node:http");
+		const zlib = await import("node:zlib");
+		const fixture = http.createServer((req, res) => {
+			req.resume();
+			console.log(JSON.stringify({event: "fixture_received"}));
+			res.on("close", () => console.log(JSON.stringify({event: "fixture_closed"})));
+			if (${JSON.stringify(scenario)} === "idle") {res.writeHead(200, {"content-type": "text/plain"}); res.write("prefix");}
+			if (${JSON.stringify(scenario)} === "idle-compressed") {res.writeHead(200, {"content-type": "text/plain", "content-encoding": "gzip"}); const compressed = zlib.createGzip(); compressed.pipe(res); compressed.write("prefix"); compressed.flush();}
+		});
+		await new Promise(resolve => fixture.listen(0, "127.0.0.1", resolve));
+		process.env.CCFLARE_UPSTREAM = "http://127.0.0.1:" + fixture.address().port;`,
+		);
+		const controller = new AbortController();
+		const pending = fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+			signal: controller.signal,
+		}).catch(() => null);
+		await waitForEvent("fixture_received");
+		if (scenario === "client") controller.abort();
+		const response = await pending;
+		if (scenario === "deadline") {
+			expect(response?.status).toBe(504);
+			expect(await response?.json()).toMatchObject({
+				error: { type: "guard_deadline_exceeded" },
+			});
+			await waitForEvent("guard_deadline_exceeded");
+		} else if (scenario.startsWith("idle")) {
+			expect(response).not.toBeNull();
+			await expect(response!.text()).rejects.toThrow();
+			await waitForEvent("response_body_idle_timeout");
+		} else {
+			await waitForEvent("client_aborted");
+		}
+		await waitForEvent("fixture_closed");
+		const health = await waitForHealth(
+			baseUrl,
+			(health) => health.active === 0,
+		);
+		expect(health.counters.total).toBe(1);
+		expect(health.counters.retried).toBe(0);
+	});
+
+	test("production transport decodes supported wire bodies, fixes headers, and preserves manual redirects", async () => {
+		let attempts = 0;
+		let acceptEncoding: string | undefined;
+		const encoded = gzipSync("fixture-response");
+		const upstreamBase = await listen(
+			http.createServer((req, res) => {
+				attempts += 1;
+				acceptEncoding = req.headers["accept-encoding"];
+				req.resume();
+				res.writeHead(302, {
+					"content-type": "application/octet-stream",
+					"content-encoding": "gzip",
+					"content-length": encoded.length,
+					location: "/must-not-follow",
+				});
+				res.end(encoded);
+			}),
+		);
+		const { baseUrl } = await startProductionNodeGuard(upstreamBase);
+		// node:http deliberately leaves the response encoded for a wire check.
+		const response = await new Promise<{
+			status: number | undefined;
+			headers: http.IncomingHttpHeaders;
+			body: Buffer;
+		}>((resolve, reject) => {
+			http
+				.get(
+					`${baseUrl}/fixture`,
+					{ headers: { "accept-encoding": "gzip" } },
+					(res) => {
+						const chunks: Buffer[] = [];
+						res.on("data", (chunk) => chunks.push(chunk));
+						res.on("error", reject);
+						res.on("end", () =>
+							resolve({
+								status: res.statusCode,
+								headers: res.headers,
+								body: Buffer.concat(chunks),
+							}),
+						);
+					},
+				)
+				.on("error", reject);
+		});
+		expect(response.status).toBe(302);
+		expect(response.headers.location).toBe("/must-not-follow");
+		expect(response.headers["content-encoding"]).toBeUndefined();
+		expect(response.headers["content-length"]).toBeUndefined();
+		expect(response.body.toString()).toBe("fixture-response");
+		expect(acceptEncoding).toBe("identity");
+		expect(attempts).toBe(1);
+	});
+
+	test.each([
+		["gzip", gzipSync],
+		["x-gzip", gzipSync],
+		["deflate", deflateSync],
+		["deflate", deflateRawSync],
+		["br", brotliCompressSync],
+		["gzip, br", (body: string) => brotliCompressSync(gzipSync(body))],
+	] as const)("production transport inspects decoded %s SSE", async (encoding, encode) => {
+		const content = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		const encoded = encode(content);
+		const upstreamBase = await listen(
+			http.createServer((req, res) => {
+				req.resume();
+				res.writeHead(200, {
+					"content-type": "text/event-stream",
+					"content-encoding": encoding,
+					"content-length": encoded.length,
+				});
+				res.end(encoded);
+			}),
+		);
+		const { baseUrl, waitForEvent } =
+			await startProductionNodeGuard(upstreamBase);
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.headers.get("content-encoding")).toBeNull();
+		expect(response.headers.get("content-length")).toBeNull();
+		expect(await response.text()).toBe(content);
+		expect(await waitForEvent("proxy_response")).toMatchObject({
+			outcome: "success",
+		});
+	});
+
+	test("production transport inspects compressed recovery JSON before its one authorized retry", async () => {
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((req, res) => {
+				req.resume();
+				attempts += 1;
+				if (attempts > 1) {
+					res.end("recovered");
+					return;
+				}
+				const body = gzipSync(
+					JSON.stringify({
+						error: {
+							type: "pool_exhausted",
+							next_available_at: new Date(Date.now() + 50).toISOString(),
+						},
+					}),
+				);
+				res.writeHead(503, {
+					"content-type": "application/json",
+					"content-encoding": "gzip",
+					"content-length": body.length,
+					"x-better-ccflare-pool-status": "exhausted",
+				});
+				res.end(body);
+			}),
+		);
+		const { baseUrl, waitForEvent } =
+			await startProductionNodeGuard(upstreamBase);
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("recovered");
+		expect(attempts).toBe(2);
+		const retry = await waitForEvent("proxy_retry_wait");
+		expect(retry.recoverySource).toBe("error.next_available_at");
+	});
+
+	test.each([
+		"/v1/messages",
+		"/fixture",
+	])("production transport records a safe network error without replay at %s", async (path) => {
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((req) => {
+				attempts += 1;
+				req.socket.destroy();
+			}),
+		);
+		const { baseUrl, waitForEvent } =
+			await startProductionNodeGuard(upstreamBase);
+		const response = await fetch(`${baseUrl}${path}`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(502);
+		expect(await response.json()).toMatchObject({
+			error: { type: "guard_upstream_error", message: "fetch failed" },
+		});
+		const error = await waitForEvent("proxy_exception");
+		expect(error).toMatchObject({
+			message: "fetch failed",
+			causeCode: "ECONNRESET",
+			rawResponseBytes: 0,
+		});
+		const health = await waitForHealth(
+			baseUrl,
+			(health) => health.active === 0,
+		);
+		expect(health.counters.upstreamTransportErrors).toBe(1);
+		expect(health.counters.retried).toBe(0);
+		expect(attempts).toBe(1);
+	});
+
+	test("production transport never records a truncated HTTP body as success or replays it", async () => {
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((req, res) => {
+				attempts += 1;
+				req.resume();
+				res.writeHead(200, {
+					"content-type": "text/plain",
+					"content-length": 100,
+				});
+				res.write("short");
+				setTimeout(() => req.socket.destroy(), 30);
+			}),
+		);
+		const { baseUrl } =
+			await startProductionNodeGuard(upstreamBase);
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		await expect(response.text()).rejects.toThrow();
+		const health = await waitForHealth(
+			baseUrl,
+			(health) => health.active === 0,
+		);
+		expect(health.counters.success).toBe(0);
+		expect(health.counters.retried).toBe(0);
+		expect(attempts).toBe(1);
+	});
+
+	test("production transport forwards the complete buffered request exactly once", async () => {
+		let attempts = 0;
+		const body = Buffer.alloc(512 * 1024, 42);
+		const upstreamBase = await listen(
+			http.createServer(async (req, res) => {
+				attempts += 1;
+				const chunks: Buffer[] = [];
+				for await (const chunk of req) chunks.push(chunk);
+				const received = Buffer.concat(chunks);
+				res.setHeader("content-type", "application/json");
+				res.end(
+					JSON.stringify({
+						length: received.length,
+						contentLength: req.headers["content-length"],
+						hash: createHash("sha256").update(received).digest("hex"),
+					}),
+				);
+			}),
+		);
+		const { baseUrl } = await startProductionNodeGuard(upstreamBase);
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body,
+		});
+		expect(await response.json()).toEqual({
+			length: body.length,
+			contentLength: String(body.length),
+			hash: createHash("sha256").update(body).digest("hex"),
+		});
+		expect(attempts).toBe(1);
+	});
+
+	test("production transport preserves unsupported encoding without false SSE classification", async () => {
+		const body = Buffer.from([0, 1, 255, 4]);
+		const upstreamBase = await listen(
+			http.createServer((req, res) => {
+				req.resume();
+				res.writeHead(200, {
+					"content-type": "text/event-stream",
+					"content-encoding": "fixture-unknown",
+					"content-length": body.length,
+				});
+				res.end(body);
+			}),
+		);
+		const { baseUrl, waitForEvent } =
+			await startProductionNodeGuard(upstreamBase);
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.headers.get("content-encoding")).toBe("fixture-unknown");
+		expect(response.headers.get("content-length")).toBe(String(body.length));
+		expect(Buffer.from(await response.arrayBuffer())).toEqual(body);
+		const event = await waitForEvent("proxy_response");
+		expect(event).not.toHaveProperty("semanticErrorType");
+	});
+
+	test("production transport supports bodyless responses", async () => {
+		const upstreamBase = await listen(
+			http.createServer((req, res) => {
+				req.resume();
+				res.writeHead(Number(req.url?.slice(1)) || 200);
+				res.end();
+			}),
+		);
+		const { baseUrl } = await startProductionNodeGuard(upstreamBase);
+		for (const [method, status] of [
+			["HEAD", 200],
+			["GET", 204],
+			["GET", 205],
+			["GET", 304],
+		] as const) {
+			const response = await fetch(`${baseUrl}/${status}`, {
+				method,
+				redirect: "manual",
+			});
+			expect(response.status).toBe(status);
+			expect(await response.text()).toBe("");
+		}
 	});
 
 	test("aborts an upstream fetch that never produces headers at the deadline", async () => {
