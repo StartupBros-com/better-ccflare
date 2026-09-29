@@ -1817,8 +1817,8 @@ export class AlertService {
 	 *
 	 * Only priors valued under the same projection_version count: a list-price
 	 * correction makes older values incomparable until the ledger's startup
-	 * re-valuation re-stamps them, and a window closing mid-pass (or next to a
-	 * sibling that pass skipped) must not be measured against the old prices.
+	 * re-valuation re-stamps them. The ledger holds this call until that pass
+	 * ends; this filter keeps any sibling the pass skipped out of the median.
 	 *
 	 * Dedup id is (type, accountId, windowKey, resetsAtMs) via
 	 * buildUsageWindowAlertId — a closed window's resetsAt is fixed

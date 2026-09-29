@@ -1110,6 +1110,101 @@ describe("UsageWindowLedger.revalueStaleClosedWindows", () => {
 		expect((await reload(w.id)).projectionVersion).toBe("old-version");
 	});
 
+	/** Opens a fresh window after the seeded ones so closeAndValue can close it. */
+	function openNext(resetsAt: number): Promise<UsageWindow> {
+		return dbOps.openUsageWindow({
+			accountId: ACCOUNT_ID,
+			windowKey: "seven_day",
+			startedAt: resetsAt - 7 * DAY_MS,
+			resetsAt,
+			grantType: "natural",
+		});
+	}
+
+	async function countStaleClosed(): Promise<number> {
+		const row = await dbOps.getAdapter().get<{ n: number }>(
+			`SELECT COUNT(*) AS n FROM usage_windows
+			 WHERE closed_at IS NOT NULL AND projection_version IS DISTINCT FROM ?`,
+			[VALUE_PRICING_VERSION],
+		);
+		return Number(row?.n ?? -1);
+	}
+
+	it("holds a close's value-drop evaluation until the pass has finished", async () => {
+		for (let day = 7; day <= 9; day++) {
+			await seedClosed({
+				resetsAt: STARTED_AT + day * DAY_MS,
+				breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+				valueUsd: 9.99,
+				version: "old-version",
+			});
+		}
+		let markPaused = () => {};
+		const paused = new Promise<void>((resolve) => {
+			markPaused = resolve;
+		});
+		let release = () => {};
+		const released = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const realRevalue = dbOps.revalueClosedUsageWindow.bind(dbOps);
+		let writes = 0;
+		const revalueSpy = spyOn(
+			dbOps,
+			"revalueClosedUsageWindow",
+		).mockImplementation(async (id, input, expected) => {
+			if (++writes === 2) {
+				markPaused();
+				await released;
+			}
+			return realRevalue(id, input, expected);
+		});
+		const staleAtEvaluation: number[] = [];
+		const { service, calls } = fakeAlertService(async () => {
+			staleAtEvaluation.push(await countStaleClosed());
+		});
+		const ledger = new UsageWindowLedger(dbOps, service);
+		try {
+			const pass = ledger.revalueStaleClosedWindows();
+			await paused;
+			const next = await openNext(STARTED_AT + 10 * DAY_MS);
+			const closing = ledger.closeAndValue(next, STARTED_AT + 10 * DAY_MS);
+			await Bun.sleep(20);
+			// The close itself is written; only its evaluation waits.
+			expect((await reload(next.id)).closedAt).toBe(STARTED_AT + 10 * DAY_MS);
+			expect(calls).toHaveLength(0);
+			release();
+			expect(await closing).toBe(true);
+			expect((await pass).stamped).toBe(3);
+		} finally {
+			release();
+			revalueSpy.mockRestore();
+		}
+		expect(calls).toHaveLength(1);
+		expect(staleAtEvaluation).toEqual([0]);
+	});
+
+	it("still evaluates closes after a pass that failed outright", async () => {
+		const listSpy = spyOn(
+			dbOps,
+			"listClosedWindowsNotAtProjectionVersion",
+		).mockRejectedValue(new Error("database is locked"));
+		const { service, calls } = fakeAlertService(async () => {});
+		const ledger = new UsageWindowLedger(dbOps, service);
+		try {
+			await expect(ledger.revalueStaleClosedWindows()).rejects.toThrow(
+				"database is locked",
+			);
+		} finally {
+			listSpy.mockRestore();
+		}
+		const next = await openNext(STARTED_AT + 7 * DAY_MS);
+		expect(await ledger.closeAndValue(next, STARTED_AT + 7 * DAY_MS)).toBe(
+			true,
+		);
+		expect(calls).toHaveLength(1);
+	});
+
 	it("does not apply when projection_version changed between list and update", async () => {
 		const w = await seedClosed({
 			resetsAt: STARTED_AT + 7 * DAY_MS,

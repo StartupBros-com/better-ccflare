@@ -96,12 +96,17 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
  * `alertService` is optional (mirrors this class's own tests, which
  * construct it without one) and drives the `usage_window_value_drop` alert
  * (issue #252, task P1.6): closeAndValue calls back into
- * `alertService.evaluateClosedWindow` right after a successful close, with
- * the same swallow-and-log isolation as every other window-level failure in
- * this class — an alert failure must never surface as a closeAndValue
- * failure.
+ * `alertService.evaluateClosedWindow` right after a successful close (or,
+ * during a re-valuation pass, once that pass ends), with the same
+ * swallow-and-log isolation as every other window-level failure in this
+ * class — an alert failure must never surface as a closeAndValue failure.
  */
 export class UsageWindowLedger {
+	/** Settles (never rejects) when the latest re-valuation pass ends; a
+	 * close's value-drop evaluation waits on it so the sibling median never
+	 * mixes re-priced and not-yet-re-priced windows. */
+	private revaluationSettled: Promise<void> = Promise.resolve();
+
 	constructor(
 		private readonly dbOps: DatabaseOperations,
 		private readonly alertService?: AlertService,
@@ -279,8 +284,22 @@ export class UsageWindowLedger {
 	 * breakdown is malformed, or whose write throws is skipped untouched and
 	 * the pass moves on to the next one. Idempotent: rewritten rows carry the
 	 * current version and are not listed again.
+	 *
+	 * Windows that close while the pass runs are written immediately, but their
+	 * usage_window_value_drop evaluation waits for the pass to end: mid-pass,
+	 * only the oldest siblings carry the new version, and their median can
+	 * differ from the full re-priced set's.
 	 */
-	async revalueStaleClosedWindows(): Promise<RevalueSummary> {
+	revalueStaleClosedWindows(): Promise<RevalueSummary> {
+		const pass = this.revalueStaleClosedWindowsNow();
+		this.revaluationSettled = pass.then(
+			() => undefined,
+			() => undefined,
+		);
+		return pass;
+	}
+
+	private async revalueStaleClosedWindowsNow(): Promise<RevalueSummary> {
 		const summary: RevalueSummary = {
 			scanned: 0,
 			stamped: 0,
@@ -439,6 +458,7 @@ export class UsageWindowLedger {
 		expectedCreatedAt?: number,
 	): Promise<void> {
 		if (!this.alertService) return;
+		await this.revaluationSettled;
 		const account = await this.dbOps.getAccount(closedWindow.accountId);
 		await this.alertService.evaluateClosedWindow(
 			closedWindow,
