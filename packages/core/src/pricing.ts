@@ -120,10 +120,12 @@ const BUNDLED_PRICING: ApiResponse = {
 				id: CLAUDE_MODEL_IDS.SONNET_5,
 				name: MODEL_DISPLAY_NAMES[CLAUDE_MODEL_IDS.SONNET_5],
 				cost: {
-					input: 3,
-					output: 15,
-					cache_read: 0.3,
-					cache_write: 3.75,
+					// $2/$10 is now the standard price; the planned $3/$15 increase will
+					// not occur (https://platform.claude.com/docs/en/about-claude/pricing).
+					input: 2,
+					output: 10,
+					cache_read: 0.2,
+					cache_write: 2.5,
 				},
 			},
 			[CLAUDE_MODEL_IDS.SONNET_5_5]: {

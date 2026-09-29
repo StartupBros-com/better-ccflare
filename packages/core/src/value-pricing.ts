@@ -33,11 +33,13 @@ import type { TokenBreakdown } from "./pricing";
 
 /**
  * Bump this whenever LIST_PRICE_ERAS changes (new model, new era, corrected
- * rate). The ledger stamps this onto each materialized window row as
- * `projection_version` so a later rate correction can trigger an idempotent
- * recompute instead of silently leaving stale values on old rows.
+ * rate). The ledger stamps it onto each closed window as
+ * `projection_version`; at server startup it re-prices every closed window
+ * stamped with any other version from its stored model breakdown
+ * (UsageWindowLedger.revalueStaleClosedWindows), so history follows the
+ * current rates instead of keeping the price it was closed at.
  */
-export const VALUE_PRICING_VERSION = "2026-09-29.1";
+export const VALUE_PRICING_VERSION = "2026-09-29.2";
 
 /**
  * One dated list-price era for a single model, in dollars per 1,000,000
@@ -177,11 +179,13 @@ export const LIST_PRICE_ERAS: Record<string, ListPriceEra[]> = {
 	[CLAUDE_MODEL_IDS.SONNET_5]: [
 		{
 			sinceMs: INITIAL_ERA_FLOOR_MS,
-			inputPerM: 3,
-			cacheReadPerM: 0.3,
-			cacheCreationPerM: 3.75,
-			outputPerM: 15,
-			// source: BUNDLED_PRICING[anthropic].models[CLAUDE_MODEL_IDS.SONNET_5].cost in packages/core/src/pricing.ts
+			inputPerM: 2,
+			cacheReadPerM: 0.2,
+			// Published 5-minute write rate applied to aggregate cache creation until TTL buckets are preserved end-to-end.
+			cacheCreationPerM: 2.5,
+			outputPerM: 10,
+			// $2/$10 is the standard price; the planned $3/$15 increase never took effect, so this corrects the single era rather than adding a dated one.
+			// source: https://platform.claude.com/docs/en/about-claude/pricing
 		},
 	],
 	[CLAUDE_MODEL_IDS.SONNET_5_5]: [

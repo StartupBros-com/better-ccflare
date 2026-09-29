@@ -604,6 +604,19 @@ describe("getModelRates", () => {
 		});
 	});
 
+	it("returns the Sonnet 5 bundled rates at its standard $2/$10 price", async () => {
+		const rates = await withDiskCache(null, () =>
+			getModelRates("claude-sonnet-5"),
+		);
+
+		expect(rates).toEqual({
+			input: 2,
+			output: 10,
+			cacheRead: 0.2,
+			cacheWrite: 2.5,
+		});
+	});
+
 	it("has complete bundled rates for every bundled Claude model id", async () => {
 		// A missing cache_write rate makes estimateCostUSD throw internally and
 		// record the whole request as 0, so every kind must be present.

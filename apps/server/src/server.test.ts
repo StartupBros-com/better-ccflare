@@ -1089,6 +1089,19 @@ describe("startServer() wiring guards", () => {
 		expect(body).toMatch(/bootstrapMinimaxUsagePolling\s*\(/);
 	});
 
+	// Without this call a VALUE_PRICING_VERSION bump never reaches closed
+	// usage windows, and every ledger test would still pass.
+	it("re-prices stale closed usage windows on the ledger it constructs", () => {
+		const body = readStartServerBody();
+		const ledgerVar = body.match(
+			/const\s+(\w+)\s*=\s*new\s+UsageWindowLedger\s*\(/,
+		)?.[1];
+		expect(ledgerVar).toBeDefined();
+		expect(body).toMatch(
+			new RegExp(`${ledgerVar}\\.revalueStaleClosedWindows\\s*\\(`),
+		);
+	});
+
 	it("passes accounts, usageCache, and the configured poll interval to bootstrapMinimaxUsagePolling", () => {
 		const body = readStartServerBody();
 		// Check that the call site carries the same arguments the surrounding

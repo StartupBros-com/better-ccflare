@@ -74,6 +74,14 @@ jobs:
           test "${DATABASE_URL#*://*:*@}" = "localhost:5432/better_ccflare_test"
           bun test --timeout 15000 packages/database/src/migrations-pg.test.ts
 
+      - name: Run usage-window repository tests against PostgreSQL
+        # Its live block (the closed-window re-valuation SQL) is gated on
+        # DATABASE_URL and would otherwise only ever be skipped in CI.
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/better_ccflare_test
+          CCFLARE_REQUIRE_LIVE_PG_USAGE_WINDOWS: "true"
+        run: bun test --timeout 15000 packages/database/src/repositories/__tests__/usage-windows.repository.test.ts
+
       - name: Run focused PostgreSQL integration tests
         env:
           BETTER_CCFLARE_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/better_ccflare_test

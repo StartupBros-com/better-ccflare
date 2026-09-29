@@ -34,8 +34,8 @@ const testEras: ListPriceEra[] = [
 ];
 
 describe("priceTokensAtListPrice", () => {
-	it("advances VALUE_PRICING_VERSION for the Sonnet 5.5 price table", () => {
-		expect(VALUE_PRICING_VERSION).toBe("2026-09-29.1");
+	it("advances VALUE_PRICING_VERSION for the corrected Sonnet 5 price table", () => {
+		expect(VALUE_PRICING_VERSION).toBe("2026-09-29.2");
 	});
 
 	it("has a list-price era for every bundled Claude model id", () => {
@@ -222,8 +222,9 @@ describe("priceTokensAtListPrice", () => {
 		});
 
 		it("prices an Anthropic model including its cache-creation rate", () => {
-			// claude-sonnet-5, from BUNDLED_PRICING in pricing.ts: input 3,
-			// output 15, cache_read 0.3, cache_write 3.75 ($/M).
+			// claude-sonnet-5 at its standard price (Anthropic pricing page): input 2,
+			// output 10, cache_read 0.2, cache_write 2.5 ($/M). The planned $3/$15
+			// increase never took effect.
 			const result = priceTokensAtListPrice(
 				CLAUDE_MODEL_IDS.SONNET_5,
 				AFTER_FLOOR_MS,
@@ -234,7 +235,7 @@ describe("priceTokensAtListPrice", () => {
 					outputTokens: 1_000_000,
 				},
 			);
-			expect(result).toBeCloseTo(3 + 15 + 0.3 + 3.75, 10);
+			expect(result).toBeCloseTo(2 + 10 + 0.2 + 2.5, 10);
 		});
 
 		it("prices Sonnet 5.5 at Anthropic's published launch rates", () => {

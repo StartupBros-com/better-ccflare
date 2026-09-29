@@ -87,6 +87,8 @@ import type {
 	CloseWindowInput,
 	ListWindowsOptions,
 	OpenWindowInput,
+	RevalueWindowInput,
+	StaleClosedWindows,
 	UsageWindow,
 } from "./repositories/usage-windows.repository";
 import { UsageWindowsRepository } from "./repositories/usage-windows.repository";
@@ -1239,6 +1241,26 @@ OAuth tokens will need to be re-authenticated.
 		expectedCreatedAt?: number,
 	): Promise<boolean> {
 		return this.usageWindows.closeWindow(id, input, expectedCreatedAt);
+	}
+
+	async listClosedWindowsNotAtProjectionVersion(
+		projectionVersion: string,
+	): Promise<StaleClosedWindows> {
+		return this.usageWindows.listClosedWindowsNotAtProjectionVersion(
+			projectionVersion,
+		);
+	}
+
+	async revalueClosedUsageWindow(
+		id: string,
+		input: RevalueWindowInput,
+		expectedProjectionVersion: string | null,
+	): Promise<boolean> {
+		return this.usageWindows.revalueClosedWindow(
+			id,
+			input,
+			expectedProjectionVersion,
+		);
 	}
 
 	async listUsageWindows(

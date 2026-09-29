@@ -10,13 +10,26 @@ mock.module("@better-ccflare/database", () => ({
 }));
 
 class MockHttpApiService {}
+// startServer() calls this on the ledger it constructs; keep the stand-in
+// complete so booting startServer against this mock cannot throw.
+class MockUsageWindowLedger {
+	async revalueStaleClosedWindows() {
+		return {
+			scanned: 0,
+			stamped: 0,
+			valueChanged: 0,
+			skipped: 0,
+			valueDeltaUsd: 0,
+		};
+	}
+}
 const restorePendingRotations = mock(async () => 0);
 
 mock.module("@better-ccflare/http-api", () => ({
 	AlertService: MockHttpApiService,
 	APIRouter: MockHttpApiService,
 	AuthService: MockHttpApiService,
-	UsageWindowLedger: MockHttpApiService,
+	UsageWindowLedger: MockUsageWindowLedger,
 	classifyAuthPath: () => null,
 	createServerDeviceSetupCoordinator: () => ({
 		tick: async () => {},

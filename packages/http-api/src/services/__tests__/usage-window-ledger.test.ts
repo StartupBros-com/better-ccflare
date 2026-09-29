@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { LIST_PRICE_ERAS, VALUE_PRICING_VERSION } from "@better-ccflare/core";
+import {
+	CLAUDE_MODEL_IDS,
+	LIST_PRICE_ERAS,
+	priceTokensAtListPrice,
+	VALUE_PRICING_VERSION,
+} from "@better-ccflare/core";
 import { DatabaseOperations, type UsageWindow } from "@better-ccflare/database";
 import type { CanonicalUsageWindow } from "@better-ccflare/types";
 import type { AlertService } from "../alerts";
@@ -767,5 +772,597 @@ describe("UsageWindowLedger generation fence", () => {
 		}
 		expect(replaced).toBe(true);
 		expect(await dbOps.listUsageWindows({ accountId: ACCOUNT_ID })).toEqual([]);
+	});
+});
+
+describe("UsageWindowLedger.revalueStaleClosedWindows", () => {
+	let dbOps: DatabaseOperations;
+
+	beforeEach(() => {
+		dbOps = new DatabaseOperations(":memory:", { walMode: false });
+	});
+
+	afterEach(async () => {
+		await dbOps.dispose();
+	});
+
+	const STARTED_AT = Date.parse("2026-09-01T00:00:00Z");
+	const TERRA = "gpt-5.6-terra"; // 2.0 / 0.2 / 12.0 per 1M
+	const LUNA = "gpt-5.6-luna"; // 0.2 / 0.02 / 1.2 per 1M
+
+	function entry(
+		tokens: { input?: number; cacheRead?: number; output?: number },
+		valueUsd: number | null,
+	) {
+		return {
+			requestCount: 2,
+			inputTokens: tokens.input ?? 0,
+			cacheReadInputTokens: tokens.cacheRead ?? 0,
+			cacheCreationInputTokens: 0,
+			outputTokens: tokens.output ?? 0,
+			valueUsd,
+		};
+	}
+
+	const TOTALS_FIELDS = [
+		"requestCount",
+		"inputTokens",
+		"cacheReadInputTokens",
+		"cacheCreationInputTokens",
+		"outputTokens",
+	] as const;
+
+	/** Seeds a closed window straight through the repository, bypassing the
+	 * ledger, so its stored version/values can be arbitrarily stale. */
+	async function seedClosed(opts: {
+		resetsAt: number;
+		breakdown: Record<string, ReturnType<typeof entry>> | null;
+		valueUsd: number;
+		unpricedTokens?: number;
+		version: string | null;
+		totals?: Partial<Record<(typeof TOTALS_FIELDS)[number], number>>;
+		close?: boolean;
+	}): Promise<UsageWindow> {
+		const opened = await dbOps.openUsageWindow({
+			accountId: ACCOUNT_ID,
+			windowKey: "seven_day",
+			startedAt: STARTED_AT,
+			resetsAt: opts.resetsAt,
+			grantType: "natural",
+		});
+		if (opts.close === false) return opened;
+		const values = Object.values(opts.breakdown ?? {});
+		const sum = (f: (e: ReturnType<typeof entry>) => number) =>
+			values.reduce((a, e) => a + f(e), 0);
+		await dbOps.closeUsageWindow(opened.id, {
+			closedAt: opts.resetsAt,
+			valueUsd: opts.valueUsd,
+			inputTokens: opts.totals?.inputTokens ?? sum((e) => e.inputTokens),
+			cacheReadInputTokens:
+				opts.totals?.cacheReadInputTokens ?? sum((e) => e.cacheReadInputTokens),
+			cacheCreationInputTokens:
+				opts.totals?.cacheCreationInputTokens ??
+				sum((e) => e.cacheCreationInputTokens),
+			outputTokens: opts.totals?.outputTokens ?? sum((e) => e.outputTokens),
+			requestCount: opts.totals?.requestCount ?? sum((e) => e.requestCount),
+			modelBreakdown: opts.breakdown,
+			unpricedTokens: opts.unpricedTokens ?? 0,
+			projectionVersion: opts.version,
+		});
+		return opened;
+	}
+
+	async function reload(id: string): Promise<UsageWindow> {
+		const all = await dbOps.listUsageWindows({ accountId: ACCOUNT_ID });
+		const found = all.find((w) => w.id === id);
+		if (!found) throw new Error("window vanished");
+		return found;
+	}
+
+	const terraTokens = {
+		input: 1_000_000,
+		cacheRead: 1_000_000,
+		output: 100_000,
+	};
+	// 2.0 + 0.2 + 1.2 = 3.4
+	const TERRA_CURRENT = 3.4;
+	const lunaTokens = { input: 500_000, output: 50_000 };
+	// 0.1 + 0.06 = 0.16
+	const LUNA_VALUE = (500_000 * 0.2 + 50_000 * 1.2) / 1_000_000;
+
+	it("re-prices a stale-version window at current eras and only touches the changed model", async () => {
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: {
+				[TERRA]: entry(terraTokens, 9.99), // stale rate
+				[LUNA]: entry(lunaTokens, LUNA_VALUE),
+			},
+			valueUsd: 9.99 + LUNA_VALUE,
+			version: "old-version",
+		});
+		const ledger = new UsageWindowLedger(dbOps);
+		const summary = await ledger.revalueStaleClosedWindows();
+
+		expect(summary.scanned).toBe(1);
+		expect(summary.stamped).toBe(1);
+		expect(summary.valueChanged).toBe(1);
+		expect(summary.skipped).toBe(0);
+		expect(summary.valueDeltaUsd).toBeCloseTo(TERRA_CURRENT - 9.99, 9);
+
+		const after = await reload(w.id);
+		expect(after.valueUsd).toBeCloseTo(TERRA_CURRENT + LUNA_VALUE, 9);
+		const breakdown = after.modelBreakdown as Record<
+			string,
+			ReturnType<typeof entry>
+		>;
+		expect(breakdown[TERRA].valueUsd).toBeCloseTo(TERRA_CURRENT, 9);
+		expect(breakdown[LUNA]).toEqual(entry(lunaTokens, LUNA_VALUE));
+		expect(after.unpricedTokens).toBe(0);
+		expect(after.projectionVersion).toBe(VALUE_PRICING_VERSION);
+		expect(after.closedAt).toBe(w.resetsAt);
+	});
+
+	it("leaves a window already at the current version untouched", async () => {
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: VALUE_PRICING_VERSION,
+		});
+		const summary = await new UsageWindowLedger(
+			dbOps,
+		).revalueStaleClosedWindows();
+		expect(summary.scanned).toBe(0);
+		expect((await reload(w.id)).valueUsd).toBe(9.99);
+	});
+
+	it("leaves open windows untouched", async () => {
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: null,
+			valueUsd: 0,
+			version: null,
+			close: false,
+		});
+		// A closed-only invariant, not a data one: give the open row a stale
+		// version and a breakdown so only the closed_at filter can exclude it.
+		await dbOps
+			.getAdapter()
+			.run(
+				"UPDATE usage_windows SET model_breakdown = ?, projection_version = ? WHERE id = ?",
+				[JSON.stringify({ [TERRA]: entry(terraTokens, 9.99) }), "old", w.id],
+			);
+		const summary = await new UsageWindowLedger(
+			dbOps,
+		).revalueStaleClosedWindows();
+		expect(summary.scanned).toBe(0);
+		const after = await reload(w.id);
+		expect(after.closedAt).toBeNull();
+		expect(after.projectionVersion).toBe("old");
+	});
+
+	it("treats a NULL projection_version as stale and is idempotent on a second run", async () => {
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: null,
+		});
+		const ledger = new UsageWindowLedger(dbOps);
+		const first = await ledger.revalueStaleClosedWindows();
+		expect(first.stamped).toBe(1);
+		const afterFirst = await reload(w.id);
+		expect(afterFirst.projectionVersion).toBe(VALUE_PRICING_VERSION);
+
+		const second = await ledger.revalueStaleClosedWindows();
+		expect(second).toMatchObject({
+			scanned: 0,
+			stamped: 0,
+			valueChanged: 0,
+			skipped: 0,
+			valueDeltaUsd: 0,
+		});
+		expect(await reload(w.id)).toEqual(afterFirst);
+	});
+
+	for (const field of TOTALS_FIELDS) {
+		it(`skips a window whose stored ${field} disagrees with its breakdown`, async () => {
+			const w = await seedClosed({
+				resetsAt: STARTED_AT + 7 * DAY_MS,
+				breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+				valueUsd: 9.99,
+				version: "old-version",
+				totals: { [field]: 123 },
+			});
+			const summary = await new UsageWindowLedger(
+				dbOps,
+			).revalueStaleClosedWindows();
+			expect(summary).toMatchObject({ scanned: 1, stamped: 0, skipped: 1 });
+			const after = await reload(w.id);
+			expect(after.valueUsd).toBe(9.99);
+			expect(after.projectionVersion).toBe("old-version");
+		});
+	}
+
+	it("keeps going past unreadable, mismatched and malformed windows", async () => {
+		// Listed in resets_at order: the three bad windows come before the
+		// valid one, so a skip that ended the pass would leave it stale.
+		const unreadable = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: "old-version",
+		});
+		await dbOps
+			.getAdapter()
+			.run("UPDATE usage_windows SET model_breakdown = ? WHERE id = ?", [
+				"{not json",
+				unreadable.id,
+			]);
+		const mismatched = await seedClosed({
+			resetsAt: STARTED_AT + 8 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: "old-version",
+			totals: { outputTokens: 123 },
+		});
+		const malformed = await seedClosed({
+			resetsAt: STARTED_AT + 9 * DAY_MS,
+			breakdown: {
+				[TERRA]: { requestCount: "x" } as unknown as ReturnType<typeof entry>,
+			},
+			valueUsd: 9.99,
+			version: "old-version",
+			totals: { inputTokens: 0, requestCount: 0 },
+		});
+		const valid = await seedClosed({
+			resetsAt: STARTED_AT + 10 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: "old-version",
+		});
+
+		const summary = await new UsageWindowLedger(
+			dbOps,
+		).revalueStaleClosedWindows();
+		expect(summary).toMatchObject({
+			scanned: 4,
+			stamped: 1,
+			valueChanged: 1,
+			skipped: 3,
+		});
+		expect(summary.valueDeltaUsd).toBeCloseTo(TERRA_CURRENT - 9.99, 9);
+		const adapter = dbOps.getAdapter();
+		const raw = await adapter.get<{
+			model_breakdown: string;
+			projection_version: string;
+		}>(
+			"SELECT model_breakdown, projection_version FROM usage_windows WHERE id = ?",
+			[unreadable.id],
+		);
+		expect(raw).toEqual({
+			model_breakdown: "{not json",
+			projection_version: "old-version",
+		});
+		// reload() parses every row, so the corrupt one has to go first.
+		await adapter.run("DELETE FROM usage_windows WHERE id = ?", [
+			unreadable.id,
+		]);
+		const repriced = await reload(valid.id);
+		expect(repriced.valueUsd).toBeCloseTo(TERRA_CURRENT, 9);
+		expect(repriced.projectionVersion).toBe(VALUE_PRICING_VERSION);
+		for (const id of [mismatched.id, malformed.id]) {
+			const after = await reload(id);
+			expect(after.valueUsd).toBe(9.99);
+			expect(after.projectionVersion).toBe("old-version");
+		}
+	});
+
+	it("skips a window whose write throws and re-prices the rest", async () => {
+		const failing = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: "old-version",
+		});
+		const next = await seedClosed({
+			resetsAt: STARTED_AT + 8 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: "old-version",
+		});
+		const realRevalue = dbOps.revalueClosedUsageWindow.bind(dbOps);
+		const revalueSpy = spyOn(
+			dbOps,
+			"revalueClosedUsageWindow",
+		).mockImplementation(async (id, input, expected) => {
+			if (id === failing.id) throw new Error("disk I/O error");
+			return realRevalue(id, input, expected);
+		});
+		try {
+			const summary = await new UsageWindowLedger(
+				dbOps,
+			).revalueStaleClosedWindows();
+			expect(summary).toMatchObject({ scanned: 2, stamped: 1, skipped: 1 });
+		} finally {
+			revalueSpy.mockRestore();
+		}
+		expect((await reload(failing.id)).projectionVersion).toBe("old-version");
+		expect((await reload(next.id)).projectionVersion).toBe(
+			VALUE_PRICING_VERSION,
+		);
+	});
+
+	it("skips a window with a malformed breakdown entry", async () => {
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: {
+				[TERRA]: { requestCount: "x" } as unknown as ReturnType<typeof entry>,
+			},
+			valueUsd: 9.99,
+			version: "old-version",
+			totals: { inputTokens: 0, requestCount: 0 },
+		});
+		const summary = await new UsageWindowLedger(
+			dbOps,
+		).revalueStaleClosedWindows();
+		expect(summary).toMatchObject({ scanned: 1, stamped: 0, skipped: 1 });
+		expect((await reload(w.id)).projectionVersion).toBe("old-version");
+	});
+
+	/** Opens a fresh window after the seeded ones so closeAndValue can close it. */
+	function openNext(resetsAt: number): Promise<UsageWindow> {
+		return dbOps.openUsageWindow({
+			accountId: ACCOUNT_ID,
+			windowKey: "seven_day",
+			startedAt: resetsAt - 7 * DAY_MS,
+			resetsAt,
+			grantType: "natural",
+		});
+	}
+
+	async function countStaleClosed(): Promise<number> {
+		const row = await dbOps.getAdapter().get<{ n: number }>(
+			`SELECT COUNT(*) AS n FROM usage_windows
+			 WHERE closed_at IS NOT NULL AND projection_version IS DISTINCT FROM ?`,
+			[VALUE_PRICING_VERSION],
+		);
+		return Number(row?.n ?? -1);
+	}
+
+	it("holds a close's value-drop evaluation until the pass has finished", async () => {
+		for (let day = 7; day <= 9; day++) {
+			await seedClosed({
+				resetsAt: STARTED_AT + day * DAY_MS,
+				breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+				valueUsd: 9.99,
+				version: "old-version",
+			});
+		}
+		let markPaused = () => {};
+		const paused = new Promise<void>((resolve) => {
+			markPaused = resolve;
+		});
+		let release = () => {};
+		const released = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const realRevalue = dbOps.revalueClosedUsageWindow.bind(dbOps);
+		let writes = 0;
+		const revalueSpy = spyOn(
+			dbOps,
+			"revalueClosedUsageWindow",
+		).mockImplementation(async (id, input, expected) => {
+			if (++writes === 2) {
+				markPaused();
+				await released;
+			}
+			return realRevalue(id, input, expected);
+		});
+		const staleAtEvaluation: number[] = [];
+		const { service, calls } = fakeAlertService(async () => {
+			staleAtEvaluation.push(await countStaleClosed());
+		});
+		const ledger = new UsageWindowLedger(dbOps, service);
+		try {
+			const pass = ledger.revalueStaleClosedWindows();
+			await paused;
+			const next = await openNext(STARTED_AT + 10 * DAY_MS);
+			const closing = ledger.closeAndValue(next, STARTED_AT + 10 * DAY_MS);
+			await Bun.sleep(20);
+			// The close itself is written; only its evaluation waits.
+			expect((await reload(next.id)).closedAt).toBe(STARTED_AT + 10 * DAY_MS);
+			expect(calls).toHaveLength(0);
+			release();
+			expect(await closing).toBe(true);
+			expect((await pass).stamped).toBe(3);
+		} finally {
+			release();
+			revalueSpy.mockRestore();
+		}
+		expect(calls).toHaveLength(1);
+		expect(staleAtEvaluation).toEqual([0]);
+	});
+
+	it("still evaluates closes after a pass that failed outright", async () => {
+		const listSpy = spyOn(
+			dbOps,
+			"listClosedWindowsNotAtProjectionVersion",
+		).mockRejectedValue(new Error("database is locked"));
+		const { service, calls } = fakeAlertService(async () => {});
+		const ledger = new UsageWindowLedger(dbOps, service);
+		try {
+			await expect(ledger.revalueStaleClosedWindows()).rejects.toThrow(
+				"database is locked",
+			);
+		} finally {
+			listSpy.mockRestore();
+		}
+		const next = await openNext(STARTED_AT + 7 * DAY_MS);
+		expect(await ledger.closeAndValue(next, STARTED_AT + 7 * DAY_MS)).toBe(
+			true,
+		);
+		expect(calls).toHaveLength(1);
+	});
+
+	it("does not apply when projection_version changed between list and update", async () => {
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: "old-version",
+		});
+		const realList = dbOps.listClosedWindowsNotAtProjectionVersion.bind(dbOps);
+		const listSpy = spyOn(
+			dbOps,
+			"listClosedWindowsNotAtProjectionVersion",
+		).mockImplementation(async (v: string) => {
+			const rows = await realList(v);
+			// A concurrent writer re-stamps the row after we listed it.
+			await dbOps
+				.getAdapter()
+				.run("UPDATE usage_windows SET projection_version = ? WHERE id = ?", [
+					"concurrent-version",
+					w.id,
+				]);
+			return rows;
+		});
+		try {
+			const summary = await new UsageWindowLedger(
+				dbOps,
+			).revalueStaleClosedWindows();
+			expect(summary).toMatchObject({ scanned: 1, stamped: 0, skipped: 1 });
+		} finally {
+			listSpy.mockRestore();
+		}
+		const after = await reload(w.id);
+		expect(after.valueUsd).toBe(9.99);
+		expect(after.projectionVersion).toBe("concurrent-version");
+	});
+
+	it("fires no alert while re-pricing", async () => {
+		await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: { [TERRA]: entry(terraTokens, 9.99) },
+			valueUsd: 9.99,
+			version: "old-version",
+		});
+		const { service, calls } = fakeAlertService(async () => {});
+		const summary = await new UsageWindowLedger(
+			dbOps,
+			service,
+		).revalueStaleClosedWindows();
+		expect(summary.stamped).toBe(1);
+		expect(calls).toHaveLength(0);
+	});
+
+	it("re-prices a production-shaped breakdown: empty-model entry, cache writes, key order", async () => {
+		// Shaped like a real stored row: a zero-token "" entry with a null value
+		// (requests that never resolved a model), Claude models with cache writes,
+		// and a model at the stale Sonnet 5 $3/$15 era next to a current one.
+		const unresolved = {
+			requestCount: 25,
+			inputTokens: 0,
+			cacheReadInputTokens: 0,
+			cacheCreationInputTokens: 0,
+			outputTokens: 0,
+			valueUsd: null,
+		};
+		const sonnet5Tokens = {
+			requestCount: 10,
+			inputTokens: 1_000_000,
+			cacheReadInputTokens: 10_000_000,
+			cacheCreationInputTokens: 200_000,
+			outputTokens: 100_000,
+		};
+		// $3/$15 era: 3 + 3.0 + 0.75 + 1.5
+		const SONNET5_STALE = 8.25;
+		// $2/$10 era: 2 + 2.0 + 0.5 + 1.0
+		const SONNET5_CURRENT = 5.5;
+		const opusTokens = {
+			requestCount: 4,
+			inputTokens: 200_000,
+			cacheReadInputTokens: 3_000_000,
+			cacheCreationInputTokens: 50_000,
+			outputTokens: 40_000,
+		};
+		const opusValue = priceTokensAtListPrice(
+			CLAUDE_MODEL_IDS.OPUS_5,
+			STARTED_AT,
+			opusTokens,
+		);
+		if (opusValue === null) throw new Error("Opus 5 must be priced");
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: {
+				"": unresolved,
+				[CLAUDE_MODEL_IDS.OPUS_5]: { ...opusTokens, valueUsd: opusValue },
+				[CLAUDE_MODEL_IDS.SONNET_5]: {
+					...sonnet5Tokens,
+					valueUsd: SONNET5_STALE,
+				},
+			},
+			valueUsd: opusValue + SONNET5_STALE,
+			version: "2026-09-01.1",
+		});
+
+		const summary = await new UsageWindowLedger(
+			dbOps,
+		).revalueStaleClosedWindows();
+		expect(summary).toMatchObject({ stamped: 1, valueChanged: 1, skipped: 0 });
+		expect(summary.valueDeltaUsd).toBeCloseTo(
+			SONNET5_CURRENT - SONNET5_STALE,
+			9,
+		);
+
+		const after = await reload(w.id);
+		expect(after.valueUsd).toBeCloseTo(opusValue + SONNET5_CURRENT, 9);
+		expect(after.unpricedTokens).toBe(0);
+		expect(after.projectionVersion).toBe(VALUE_PRICING_VERSION);
+		const breakdown = after.modelBreakdown as Record<
+			string,
+			ReturnType<typeof entry>
+		>;
+		expect(Object.keys(breakdown)).toEqual([
+			"",
+			CLAUDE_MODEL_IDS.OPUS_5,
+			CLAUDE_MODEL_IDS.SONNET_5,
+		]);
+		expect(breakdown[""]).toEqual(unresolved);
+		expect(breakdown[CLAUDE_MODEL_IDS.OPUS_5]).toEqual({
+			...opusTokens,
+			valueUsd: opusValue,
+		});
+		expect(breakdown[CLAUDE_MODEL_IDS.SONNET_5]).toEqual({
+			...sonnet5Tokens,
+			valueUsd: expect.closeTo(SONNET5_CURRENT, 9),
+		});
+	});
+
+	it("prices a model that was unpriced at the old version and drops unpriced_tokens", async () => {
+		const unpriced = 1_000_000 + 1_000_000 + 100_000;
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: {
+				[TERRA]: entry(terraTokens, null),
+				[LUNA]: entry(lunaTokens, LUNA_VALUE),
+			},
+			valueUsd: LUNA_VALUE,
+			unpricedTokens: unpriced,
+			version: "old-version",
+		});
+		const summary = await new UsageWindowLedger(
+			dbOps,
+		).revalueStaleClosedWindows();
+		expect(summary.valueChanged).toBe(1);
+		expect(summary.valueDeltaUsd).toBeCloseTo(TERRA_CURRENT, 9);
+		const after = await reload(w.id);
+		expect(after.unpricedTokens).toBe(0);
+		expect(after.valueUsd).toBeCloseTo(TERRA_CURRENT + LUNA_VALUE, 9);
+		const breakdown = after.modelBreakdown as Record<
+			string,
+			ReturnType<typeof entry>
+		>;
+		expect(breakdown[TERRA].valueUsd).toBeCloseTo(TERRA_CURRENT, 9);
 	});
 });
