@@ -35,8 +35,8 @@ import { Database } from "bun:sqlite";
  * in (small N → short hold).
  *
  * Memory knobs applied inside the worker connection:
- *  - `cache_size = -2000` (2 MiB): keep SQLite's page cache small; the worker
- *    is short-lived and doesn't need a big cache for one PRAGMA.
+ *  - `cache_size = -2000` (2 MiB): keep SQLite's page cache small; each
+ *    request opens a short-lived connection that only runs one maintenance job.
  *  - `temp_store = FILE`: never spill temp tables to RAM under cgroup pressure.
  *  - `mmap_size = 0`: no mmap; reads go through the page cache (still
  *    reclaimable by the kernel under MemoryHigh pressure).
