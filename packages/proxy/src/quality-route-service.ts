@@ -16,6 +16,11 @@ import type {
 } from "@better-ccflare/types";
 import { sanitizeQualityDecision } from "@better-ccflare/types/request";
 
+import {
+	type QualityRecoveryOptions,
+	QualitySettlementRecovery,
+} from "./quality-settlement-recovery";
+
 function safeDecisionSnapshot(
 	snapshot: QualityConversation["decision"],
 ): QualityConversation["decision"] {
@@ -48,30 +53,84 @@ export interface QualityRouteStatus {
  * election, credential verification or spend grant is available in this unit.
  */
 export class QualityRouteService {
+	private readonly recovery: QualitySettlementRecovery;
 	constructor(
 		private readonly repository: QualityRouteRepository,
 		private readonly now: () => number = Date.now,
-	) {}
+		recoveryOptions?: QualityRecoveryOptions,
+	) {
+		this.recovery = new QualitySettlementRecovery(
+			(...args) => this.settleDispatch(...args),
+			recoveryOptions,
+		);
+	}
+	reserveObservedSettlement() {
+		const reservation = this.recovery.reserve();
+		if (!reservation) return null;
+		return {
+			...reservation,
+			bind: async (identity: QualityLease) => {
+				// Bind synchronously first: controls completing during the read below
+				// now see this entry. The read covers controls committed before binding,
+				// without an unbounded second store of invalidation watermarks.
+				reservation.bind(identity);
+				const { session, incarnation, conversation } =
+					structuredClone(identity);
+				const state = await this.repository.status(session, this.now());
+				if (state?.incarnation !== incarnation) return;
+				const revision =
+					conversation === "$request-only"
+						? state.root?.revision
+						: state.conversations.find((item) => item.key === conversation)
+								?.revision;
+				if (revision !== undefined)
+					this.recovery.retireBefore(
+						session,
+						incarnation,
+						conversation,
+						revision,
+					);
+			},
+		};
+	}
+	private retireRoot(
+		session: QualityVerifiedSession,
+		incarnation: string,
+		revision: number,
+	) {
+		this.recovery.retireBefore(session, incarnation, "$root", revision);
+		this.recovery.retireBefore(session, incarnation, "$request-only", revision);
+	}
+	stop() {
+		return this.recovery.stop();
+	}
 	reserveIngress(session: QualityVerifiedSession) {
 		return this.repository.reserveIngress(session, this.now());
 	}
 	withdrawIngress(ticket: QualityIngressTicket) {
 		return this.repository.withdrawIngress(ticket, this.now());
 	}
-	acceptRoot(
+	async acceptRoot(
 		ticket: QualityIngressTicket,
 		preference: QualityRootPreference | null,
 	) {
-		return this.repository.acceptRoot(ticket, preference, this.now());
+		const state = await this.repository.acceptRoot(
+			ticket,
+			preference,
+			this.now(),
+		);
+		if (state.root)
+			this.retireRoot(ticket.session, state.incarnation, state.root.revision);
+		return state;
 	}
-	acceptChild(
+	async acceptChild(
 		session: QualityVerifiedSession,
 		incarnation: string,
 		child: QualityTrustedChild | null,
 		role: QualityWorkerRole,
 		expectedRevision: number | null,
 	) {
-		return this.repository.acceptChild(
+		const accepted = await this.repository.acceptChild(
 			session,
 			incarnation,
 			child,
@@ -79,6 +138,14 @@ export class QualityRouteService {
 			expectedRevision,
 			this.now(),
 		);
+		if (accepted)
+			this.recovery.retireBefore(
+				session,
+				incarnation,
+				accepted.key,
+				accepted.revision,
+			);
+		return accepted;
 	}
 	async status(
 		session: QualityVerifiedSession,
@@ -107,8 +174,10 @@ export class QualityRouteService {
 			),
 		};
 	}
-	retryPreferred(input: QualityRetryInput) {
-		return this.repository.retryPreferred(input, this.now());
+	async retryPreferred(input: QualityRetryInput) {
+		const outcome = await this.repository.retryPreferred(input, this.now());
+		this.retireRoot(input.session, outcome.incarnation, outcome.intentRevision);
+		return outcome;
 	}
 	acquireLease(
 		session: QualityVerifiedSession,

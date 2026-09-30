@@ -504,6 +504,7 @@ function serveDashboardFile(
 let serverInstance: ReturnType<typeof serve> | null = null;
 // The active server has one independent Bun-process admission budget.
 let activeBodyAdmission: BodyAdmissionController | null = null;
+let activeQualityRouteService: QualityRouteService | undefined;
 let registeredServerId: string | null = null;
 let stopRetentionJob: (() => void) | null = null;
 let stopOAuthCleanupJob: (() => void) | null = null;
@@ -1231,12 +1232,11 @@ export default async function startServer(options?: {
 		}
 		return {
 			port: existingPort,
-			stop: () => {
-				if (serverInstance) {
-					serverInstance.stop();
-					serverInstance = null;
-				}
-			},
+			stop: createServerStopHandle(
+				serverInstance,
+				activeQualityRouteService,
+				activeBodyAdmission,
+			),
 		};
 	}
 
@@ -1633,6 +1633,7 @@ export default async function startServer(options?: {
 	const qualityRouteService = config.getQualityRoutingPolicy()
 		? new QualityRouteService(dbOps.getQualityRouteRepository())
 		: undefined;
+	activeQualityRouteService = qualityRouteService;
 	const apiRouter = new APIRouter(
 		{
 			db,
@@ -2820,14 +2821,11 @@ Available endpoints:
 
 	return {
 		port: serverPort,
-		stop: () => {
-			activeBodyAdmission?.shutdown();
-			activeBodyAdmission = null;
-			if (serverInstance) {
-				serverInstance.stop();
-				serverInstance = null;
-			}
-		},
+		stop: createServerStopHandle(
+			serverInstance,
+			qualityRouteService,
+			bodyAdmission,
+		),
 	};
 }
 
@@ -2993,6 +2991,96 @@ export async function waitForForceCloseSettlement(
 	}
 }
 
+type DrainableServer = {
+	readonly pendingRequests: number;
+	stop(closeActiveConnections?: boolean): unknown;
+};
+type SettlementRecovery = { stop(): Promise<void> };
+const responseDrains = new WeakMap<DrainableServer, Promise<void>>();
+const serverStops = new WeakMap<DrainableServer, Promise<void>>();
+
+/** One response drain per listener, shared by programmatic and signal shutdown. */
+function drainServerResponses(
+	server: DrainableServer,
+	drainMs: number,
+): Promise<void> {
+	const existing = responseDrains.get(server);
+	if (existing) return existing;
+	// Publish ownership before calling stop(), which may invoke terminal callbacks.
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
+	responseDrains.set(server, promise);
+	void (async () => {
+		server.stop(); // synchronous stop-accepting behavior, even if caller ignores completion
+		const deadline = Date.now() + drainMs;
+		const initialPending = server.pendingRequests;
+		if (initialPending > 0) {
+			console.log(
+				`Draining ${initialPending} in-flight request(s) (budget ${drainMs}ms)...`,
+			);
+		}
+		while (server.pendingRequests > 0 && Date.now() < deadline) {
+			await new Promise((done) =>
+				setTimeout(done, Math.min(250, Math.max(0, deadline - Date.now()))),
+			);
+		}
+		const remaining = server.pendingRequests;
+		if (remaining > 0) {
+			console.error(
+				`Drain budget exhausted; force-closing ${remaining} in-flight request(s)`,
+			);
+			// Bun 1.x cannot reliably escalate stop(); explicitly error tracked streams.
+			server.stop(true);
+			const { aborted, settled } = abortInflightStreams();
+			if (aborted > 0)
+				console.error(`Errored ${aborted} tracked response stream(s)`);
+			await waitForForceCloseSettlement(settled, () => server.pendingRequests);
+		}
+	})().then(resolve, reject);
+	return promise;
+}
+
+/** Stops this listener and its recovery only; never disposes shared DBs or exits. */
+export function stopServerResponsesAndRecovery(
+	server: DrainableServer,
+	recovery?: SettlementRecovery,
+	drainMs = readShutdownDrainMs(),
+): Promise<void> {
+	const existing = serverStops.get(server);
+	if (existing) return existing;
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
+	serverStops.set(server, promise);
+	void drainServerResponses(server, drainMs)
+		.then(async () => {
+			await recovery?.stop();
+		})
+		.then(resolve, reject);
+	return promise;
+}
+
+/** Capture all owners now: an old handle must never stop a replacement listener. */
+function createServerStopHandle(
+	server: NonNullable<typeof serverInstance>,
+	recovery: QualityRouteService | undefined,
+	admission: BodyAdmissionController | null,
+): () => Promise<void> {
+	return () => {
+		admission?.shutdown();
+		const completion = stopServerResponsesAndRecovery(server, recovery);
+		void completion.then(
+			() => {
+				// Keep ownership visible throughout draining so a racing signal can await it.
+				if (serverInstance !== server) return;
+				serverInstance = null;
+				if (activeBodyAdmission === admission) activeBodyAdmission = null;
+				if (activeQualityRouteService === recovery)
+					activeQualityRouteService = undefined;
+			},
+			() => {},
+		);
+		return completion;
+	};
+}
+
 export function readShutdownDrainMs(): number {
 	const raw = process.env[SHUTDOWN_DRAIN_MS_ENV];
 	if (raw === undefined || raw === "") return DEFAULT_SHUTDOWN_DRAIN_MS;
@@ -3021,6 +3109,9 @@ async function handleGracefulShutdown(signal: string) {
 		return;
 	}
 	isShuttingDown = true;
+	// A programmatic stop may finish while schedulers below are draining.
+	const shuttingDownServer = serverInstance;
+	const shuttingDownRecovery = activeQualityRouteService;
 	// Reject queued requests before stopping the listener. Active leases still
 	// drain with their response streams and release through the terminal wrapper.
 	activeBodyAdmission?.shutdown();
@@ -3124,51 +3215,25 @@ async function handleGracefulShutdown(signal: string) {
 
 		// The polling lifecycle retired retry and stagger timers before shutdown.
 
-		// Drain in-flight requests before tearing down shared resources.
-		// stop() without arguments stops accepting new connections while
-		// letting active ones (including agent SSE streams) run to
-		// completion; wait for pendingRequests to reach zero within the
-		// drain budget, then force-close whatever remains.
-		if (serverInstance) {
-			serverInstance.stop();
-			const deadline = Date.now() + drainMs;
-			const initialPending = serverInstance.pendingRequests;
-			if (initialPending > 0) {
-				console.log(
-					`Draining ${initialPending} in-flight request(s) (budget ${drainMs}ms)...`,
-				);
-			}
-			while (serverInstance.pendingRequests > 0 && Date.now() < deadline) {
-				await new Promise((resolve) => setTimeout(resolve, 250));
-			}
-			const remaining = serverInstance.pendingRequests;
-			if (remaining > 0) {
-				console.error(
-					`Drain budget exhausted; force-closing ${remaining} in-flight request(s)`,
-				);
-				// stop(true) cannot escalate an earlier graceful stop() on Bun 1.x
-				// (verified on 1.3.5), so error the tracked response streams
-				// directly; the call stays as belt-and-braces for Bun versions
-				// where escalation works.
-				serverInstance.stop(true);
-				const { aborted, settled } = abortInflightStreams();
-				if (aborted > 0) {
-					console.error(`Errored ${aborted} tracked response stream(s)`);
-				}
-				// Force-cancelled streams still have close/error handlers that
-				// record final usage. The graceful drain deadline is exhausted at
-				// this point, so use a dedicated 1s slice of the 15s watchdog
-				// cleanup margin. A hung source cancel cannot consume the ~14s
-				// left for usage-collector drain and DB disposal.
-				await waitForForceCloseSettlement(
-					settled,
-					() => serverInstance?.pendingRequests ?? 0,
-				);
-			}
+		// Share the instance-owned drain with programmatic stop, including a stop
+		// already in progress when this signal arrived.
+		if (shuttingDownServer) {
+			await drainServerResponses(shuttingDownServer, drainMs);
 		}
 
 		usageCache.clear(); // Stop all usage polling
 		await drainUsageCollector();
+		if (shuttingDownServer) {
+			await stopServerResponsesAndRecovery(
+				shuttingDownServer,
+				shuttingDownRecovery,
+				drainMs,
+			);
+		} else {
+			await shuttingDownRecovery?.stop();
+		}
+		if (activeQualityRouteService === shuttingDownRecovery)
+			activeQualityRouteService = undefined;
 		await shutdown();
 		console.log("✅ Shutdown complete");
 		process.exit(0);

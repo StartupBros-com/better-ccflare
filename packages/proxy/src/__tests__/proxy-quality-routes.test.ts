@@ -260,6 +260,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	await flush();
+	await service.stop();
 	globalThis.fetch = originalFetch;
 	for (const restore of restores) restore();
 	resetModelCatalogForTest();
@@ -1297,6 +1298,7 @@ it("persistent settlement failure retains a restart-visible fence without replay
 	expect(fail).toHaveBeenCalledTimes(3);
 	expect(sends).toHaveLength(1);
 	expect(await home()).toBeUndefined();
+	await service.stop();
 	fail.mockRestore();
 	service = new QualityRouteService(
 		new QualityRouteRepository(new BunSqlAdapter(db)),
@@ -1305,6 +1307,163 @@ it("persistent settlement failure retains a restart-visible fence without replay
 	expect((await service.status(scope))?.unresolved).toHaveLength(1);
 	expect((await send()).status).toBe(503);
 	expect(sends).toHaveLength(1);
+});
+it.each([
+	"root",
+	"child",
+	"request-only",
+])("delivered %s output recovers after three write failures without another fetch", async (mode) => {
+	const scheduled: (() => void)[] = [];
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db)),
+		Date.now,
+		{
+			schedule: (callback) => {
+				scheduled.push(callback);
+				return () => {};
+			},
+		},
+	);
+	ctx.qualityRouteService = service;
+	if (mode !== "root") {
+		await (await send()).text();
+		await flush();
+	}
+	const original = service.settleDispatch.bind(service);
+	let writes = 0;
+	const fail = spyOn(service, "settleDispatch").mockImplementation(
+		(...args) => {
+			if (++writes <= 3)
+				return Promise.reject(new Error("database unavailable"));
+			return original(...args);
+		},
+	);
+	try {
+		const input =
+			mode === "root"
+				? request()
+				: request(
+						"claude-sonnet-5-5",
+						mode === "child"
+							? { "x-claude-code-agent-id": "worker" }
+							: { "x-anthropic-billing-header": "cc_is_subagent=true" },
+					);
+		expect((await (await send(input)).json()).content).toEqual([
+			{ type: "text", text: "ok" },
+		]);
+		await flush();
+		expect(writes).toBe(3);
+		expect((await service.status(scope))?.unresolved).toHaveLength(1);
+		expect(scheduled).toHaveLength(1);
+		scheduled.shift()?.();
+		await flush();
+		expect((await home())?.accountId).toBe("a");
+		expect((await home())?.physicalModel).toBe("claude-fable-5-1");
+		expect((await service.status(scope))?.unresolved).toHaveLength(0);
+		if (mode === "child")
+			expect(
+				(await service.status(scope))?.conversations
+					.filter((item) => item.key !== "$root")
+					.map((item) => item.home?.target.physicalModel),
+			).toEqual(["claude-sonnet-5-5"]);
+		if (mode === "request-only")
+			expect((await service.status(scope))?.conversations).toHaveLength(1);
+		expect(sends).toHaveLength(mode === "root" ? 1 : 2);
+	} finally {
+		fail.mockRestore();
+	}
+});
+it("recovery capacity is reserved before an asynchronous lease and rejects concurrent inference", async () => {
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db)),
+		Date.now,
+		{ capacity: 1 },
+	);
+	ctx.qualityRouteService = service;
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const acquire = service.acquireLease.bind(service);
+	const hold = spyOn(service, "acquireLease").mockImplementationOnce(
+		async (...args) => {
+			entered.resolve();
+			await release.promise;
+			return acquire(...args);
+		},
+	);
+	const first = send();
+	try {
+		await entered.promise;
+		expect(
+			(
+				await send(
+					request(undefined, { "x-claude-code-session-id": "another-session" }),
+				)
+			).status,
+		).toBe(503);
+		expect(sends).toHaveLength(0);
+		release.resolve();
+		await (await first).text();
+		await flush();
+		expect(sends).toHaveLength(1);
+		expect(service.reserveObservedSettlement()).not.toBeNull();
+	} finally {
+		release.resolve();
+		hold.mockRestore();
+	}
+});
+it("begin-dispatch failure returns recovery capacity without inventing a provider outcome", async () => {
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db)),
+		Date.now,
+		{ capacity: 1 },
+	);
+	ctx.qualityRouteService = service;
+	const begin = spyOn(service, "beginDispatch").mockRejectedValue(
+		new Error("write failed"),
+	);
+	const settle = spyOn(service, "settleDispatch");
+	try {
+		expect((await send()).status).toBe(503);
+		expect(sends).toHaveLength(0);
+		expect(settle).not.toHaveBeenCalled();
+		const next = service.reserveObservedSettlement();
+		expect(next).not.toBeNull();
+		next?.release();
+	} finally {
+		begin.mockRestore();
+		settle.mockRestore();
+	}
+});
+it("abort during lease acquisition releases capacity without a provider outcome", async () => {
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db)),
+		Date.now,
+		{ capacity: 1 },
+	);
+	ctx.qualityRouteService = service;
+	const abort = new AbortController();
+	const original = service.acquireLease.bind(service);
+	const acquire = spyOn(service, "acquireLease").mockImplementationOnce(
+		async (...args) => {
+			const lease = await original(...args);
+			abort.abort();
+			return lease;
+		},
+	);
+	const settle = spyOn(service, "settleDispatch");
+	try {
+		expect(
+			(await send(new Request(request(), { signal: abort.signal }))).status,
+		).toBe(503);
+		expect(sends).toHaveLength(0);
+		expect(settle).not.toHaveBeenCalled();
+		const next = service.reserveObservedSettlement();
+		expect(next).not.toBeNull();
+		next?.release();
+	} finally {
+		acquire.mockRestore();
+		settle.mockRestore();
+	}
 });
 it("lost settlement response retries only persistence", async () => {
 	const settle = service.settleDispatch.bind(service);
@@ -1451,6 +1610,47 @@ it("proven native no-work rejection tries another account with that account's cr
 		{ model: "claude-fable-5-1", authorization: "synthetic-b" },
 	]);
 	expect((await home())?.accountId).toBe("b");
+});
+it("queued no-work settlement does not authorize the next candidate before acknowledgement", async () => {
+	const pending: (() => void | Promise<void>)[] = [];
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db)),
+		Date.now,
+		{
+			schedule: (callback) => {
+				pending.push(callback);
+				return () => {};
+			},
+		},
+	);
+	ctx.qualityRouteService = service;
+	upstream = () =>
+		Response.json(
+			{
+				type: "error",
+				error: { type: "rate_limit_error", message: "synthetic limit" },
+			},
+			{
+				status: 429,
+				headers: { "anthropic-ratelimit-unified-status": "rejected" },
+			},
+		);
+	const write = spyOn(service, "settleDispatch").mockRejectedValue(
+		new Error("outage"),
+	);
+	try {
+		expect((await send()).status).toBe(503);
+		expect(write).toHaveBeenCalledTimes(3);
+		expect(sends).toHaveLength(1);
+		expect(pending).toHaveLength(1);
+		write.mockRestore();
+		await pending.shift()?.();
+		expect((await service.status(scope))?.unresolved).toHaveLength(0);
+		expect(await home()).toBeUndefined();
+		expect(sends).toHaveLength(1);
+	} finally {
+		write.mockRestore();
+	}
 });
 it("hard no-work rejection of the exact healthy home authorizes its replacement", async () => {
 	await (await send()).text();
@@ -2055,6 +2255,12 @@ it.each([
 	);
 });
 it("ambiguous send failure never replays against a second account", async () => {
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db)),
+		Date.now,
+		{ capacity: 1 },
+	);
+	ctx.qualityRouteService = service;
 	upstream = () => {
 		throw new Error("synthetic connection loss after write");
 	};
@@ -2062,6 +2268,9 @@ it("ambiguous send failure never replays against a second account", async () => 
 	await flush();
 	expect(sends).toHaveLength(1);
 	expect(await home()).toBeUndefined();
+	expect((await service.status(scope))?.unresolved).toHaveLength(1);
+	// An ambiguous send cannot withdraw ownership of a possible late callback.
+	expect(service.reserveObservedSettlement()).toBeNull();
 });
 
 it.each([

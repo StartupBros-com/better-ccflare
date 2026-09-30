@@ -664,7 +664,6 @@ export async function routeQualityRequest(input: {
 			let lease: QualityLease | null = null;
 			let fenced = false,
 				dispatched = false,
-				settling = false,
 				noWork = false;
 			const provider = resolveProviderForAccount(
 				account.provider,
@@ -752,24 +751,16 @@ export async function routeQualityRequest(input: {
 				accounting = decision.accounting;
 			};
 			let attemptDecision: QualityDecisionRecord | null = null;
+			let settlement: ReturnType<typeof service.reserveObservedSettlement> =
+				null;
 			const settle = async (outcome: QualitySettlement) => {
 				if (!lease || !fenced) return true;
-				if (settling) return false;
-				settling = true;
-				// Retry only the idempotent CAS, never the provider. Persistent failures keep
-				// the pre-dispatch fence, even across restart and lease expiry.
-				for (let attempt = 0; attempt < 3; attempt++) {
-					try {
-						await service.settleDispatch(lease, outcome, {
-							requestId: meta.id,
-							decision: attemptDecision,
-						});
-						return true;
-					} catch (error) {
-						if ((error as { code?: string }).code === "stale") return false;
-					}
-				}
-				return false;
+				return (
+					settlement?.settle(outcome, {
+						requestId: meta.id,
+						decision: attemptDecision,
+					}) ?? false
+				);
 			};
 			const hooks: QualityAttemptHooks = {
 				target: candidate.target,
@@ -778,8 +769,11 @@ export async function routeQualityRequest(input: {
 					return accounting;
 				},
 				async beforeDispatch(wire, accessToken) {
-					if (dispatched || fenced)
+					if (dispatched || fenced || settlement)
 						throw new QualityAttemptRejected("replay-forbidden");
+					settlement = service.reserveObservedSettlement();
+					if (!settlement)
+						throw new QualityAttemptRejected("settlement-capacity");
 					token = accessToken;
 					finalBody = await wire.clone().json();
 					const currentAccount = await ctx.dbOps.getAccount(account.id);
@@ -799,6 +793,7 @@ export async function routeQualityRequest(input: {
 						dispatchReplacement = replacingHome
 							? currentReplacement(policy)
 							: null;
+						await settlement.bind(lease);
 						await service.beginDispatch(
 							lease,
 							candidate.target,
@@ -834,6 +829,7 @@ export async function routeQualityRequest(input: {
 							null,
 							status.intentRevision,
 						);
+						await settlement.bind(lease);
 						await service.beginDispatch(lease, candidate.target, null);
 						fenced = true;
 						const finalAccount = await ctx.dbOps.getAccount(account.id);
@@ -965,6 +961,14 @@ export async function routeQualityRequest(input: {
 				}
 				if (!(error instanceof QualityAttemptRejected))
 					return unavailable("attempt-unavailable");
+			} finally {
+				// Only a definitely unsent attempt can withdraw its reservation.
+				// Ambiguous sends retain bounded ownership for a possible late callback;
+				// neither memory cleanup nor a missing response supplies an outcome.
+				if (!dispatched)
+					(
+						settlement as ReturnType<typeof service.reserveObservedSettlement>
+					)?.release();
 			}
 		}
 		if (conversation) {
