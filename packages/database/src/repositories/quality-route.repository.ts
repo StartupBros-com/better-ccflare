@@ -449,15 +449,15 @@ export class QualityRouteRepository extends BaseRepository<never> {
 					(item) => item.order !== ticket.order && item.expiresAt > now,
 				);
 			});
-			// Delete only an empty, never-accepted provisional row. Manual watermarks
-			// have a short finite TTL; they never occupy the accepted pool.
+			// A native-only watermark is needed only while another ingress can use it.
+			// Exact JSON + incarnation protect reservations and state added concurrently.
 			await this.runWithChanges(
 				`DELETE FROM quality_route_sessions WHERE principal_id = ? AND session_id = ? AND incarnation = ? AND enrolled = 0 AND ingress_until = 0 AND unresolved = 0 AND state_json = ?`,
 				[
 					ticket.session.principalId,
 					ticket.session.sessionId,
 					ticket.incarnation,
-					await this.emptyProvisionalJson(ticket.session),
+					await this.reclaimableProvisionalJson(ticket.session),
 				],
 			);
 		} catch (error) {
@@ -468,13 +468,21 @@ export class QualityRouteRepository extends BaseRepository<never> {
 				throw error;
 		}
 	}
-	private async emptyProvisionalJson(
+	private async reclaimableProvisionalJson(
 		session: QualityVerifiedSession,
 	): Promise<string | null> {
 		const row = await this.load(session);
 		if (!row) return null;
 		const state = JSON.parse(row.state_json) as QualityRouteState;
-		return !state.root && !state.conversations.length && !state.leases.length
+		return !row.enrolled &&
+			!state.ingress?.length &&
+			(!state.root || state.root.preference === null) &&
+			state.conversations.every(
+				(item) => item.key === "$root" && item.home === null,
+			) &&
+			!state.leases.length &&
+			!state.commands.length &&
+			!state.requestOnlySettlements?.length
 			? row.state_json
 			: null;
 	}

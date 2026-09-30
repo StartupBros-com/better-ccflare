@@ -1530,7 +1530,13 @@ it.each([
 	);
 	expect((await pending).status).toBe(503);
 	expect(sends).toHaveLength(before);
-	expect((await service.status(scope))?.preference).toBeNull();
+	const status = await service.status(scope);
+	if (state === "fresh") {
+		expect(status).toBeNull();
+	} else {
+		expect(status).not.toBeNull();
+		expect(status?.preference).toBeNull();
+	}
 });
 it("candidate authority is immutable and exhausts each lane before the next", () => {
 	accounts[0].priority = 100;

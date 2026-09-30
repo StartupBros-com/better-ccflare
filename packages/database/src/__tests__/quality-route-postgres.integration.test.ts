@@ -102,6 +102,78 @@ describe.skipIf(!postgresUrl)(
 			new QualityRouteRepository(adapters[1], limits),
 		]);
 
+		it("completed native ingress immediately releases provisional capacity", async () => {
+			first = new QualityRouteRepository(adapters[0], {
+				maxProvisionalSessions: 1,
+			});
+			const native = await first.reserveIngress(scope, 100);
+			await first.acceptRoot(native, null, 101);
+			await first.withdrawIngress(native, 102);
+			const other = { ...scope, sessionId: "unrelated-quality" };
+			const ticket = await first.reserveIngress(other, 103);
+			expect((await first.acceptRoot(ticket, "auto", 104)).enrolled).toBe(true);
+			expect(await second.status(scope, 104)).toBeNull();
+		});
+
+		it("native watermark survives older ingress until final withdrawal and cannot delete a new incarnation", async () => {
+			first = new QualityRouteRepository(adapters[0], {
+				maxProvisionalSessions: 1,
+			});
+			const older = await first.reserveIngress(scope, 100);
+			const native = await second.reserveIngress(scope, 101);
+			await second.acceptRoot(native, null, 102);
+			await second.withdrawIngress(native, 103);
+			expect((await first.status(scope, 103))?.acceptedOrder).toBe(
+				native.order,
+			);
+			await expect(first.acceptRoot(older, "auto", 104)).rejects.toMatchObject({
+				code: "stale",
+			});
+			await first.withdrawIngress(older, 105);
+			expect(await second.status(scope, 105)).toBeNull();
+			const replacement = await first.reserveIngress(scope, 106);
+			expect(replacement.incarnation).not.toBe(native.incarnation);
+			await second.withdrawIngress(native, 107);
+			await expect(first.acceptRoot(older, "auto", 107)).rejects.toMatchObject({
+				code: "stale",
+			});
+			expect((await first.acceptRoot(replacement, "auto", 108)).enrolled).toBe(
+				true,
+			);
+		});
+
+		it("native withdrawal retains enrolled children and unresolved dispatch fences", async () => {
+			const enrolled = await first.reserveIngress(scope, 100);
+			await first.acceptRoot(enrolled, "auto", 101);
+			const child = await first.acceptChild(
+				scope,
+				enrolled.incarnation,
+				{ trusted: true, conversationId: "worker" },
+				"standard",
+				null,
+				102,
+			);
+			if (!child) throw new Error("Expected enrolled child");
+			const lease = await first.acquireLease(
+				scope,
+				enrolled.incarnation,
+				"child:worker",
+				child.revision,
+				103,
+			);
+			await first.beginDispatch(lease, target, null, 104);
+			const native = await second.reserveIngress(scope, 105);
+			await second.acceptRoot(native, null, 106);
+			const before = await first.status(scope, 106);
+			await second.withdrawIngress(native, 107);
+			expect(await first.status(scope, 107)).toEqual(before);
+			expect(before?.enrolled).toBe(true);
+			expect(before?.leases[0]?.dispatch).not.toBeNull();
+			expect(
+				before?.conversations.find((item) => item.key === "child:worker"),
+			).toEqual(child);
+		});
+
 		it("upgrade separates legacy provisional rows without deleting live homes or fences", async () => {
 			const adapter = adapters[0];
 			const ticket = await first.reserveIngress(scope, 100);
