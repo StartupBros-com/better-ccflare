@@ -179,6 +179,7 @@ export function compileQualityCandidates(
 		);
 		const previous = conversation?.home?.target;
 		const exactOnly =
+			conversation?.home?.intentRevision === conversation?.revision &&
 			previous?.accountId === account.id &&
 			previous.line === line &&
 			policy.assignments.find((assignment) => assignment.line === line)
@@ -550,7 +551,9 @@ export async function routeQualityRequest(input: {
 		);
 		meta.routingCandidates = selectionMeta.routingCandidates;
 		meta.routingCandidateCatalog = selectionMeta.routingCandidateCatalog;
-		let replacement = replacementFor(conversation, policy, accounts);
+		// A proven hard-account no-work response is attempt-bound authority, unlike
+		// mutable quota/account snapshots, which must be revalidated near dispatch.
+		let hardReplacement: QualityReplacementAuthority = null;
 		const skipped = new Map<
 			QualityLane,
 			Partial<Record<QualityAdmissionReason, number>>
@@ -671,6 +674,26 @@ export async function routeQualityRequest(input: {
 			let finalBody: unknown;
 			let token = "";
 			let latestAccount = account;
+			const home = conversation?.home;
+			const replacingHome =
+				home?.intentRevision === conversation?.revision &&
+				home != null &&
+				(home.target.accountId !== candidate.target.accountId ||
+					home.target.physicalModel !== candidate.target.physicalModel ||
+					home.target.line !== candidate.target.line);
+			let latestHomeAccount: Account | null = null;
+			let dispatchReplacement: QualityReplacementAuthority = null;
+			const refreshHomeAccount = async () => {
+				if (replacingHome && !hardReplacement)
+					latestHomeAccount = await ctx.dbOps.getAccount(home.target.accountId);
+			};
+			const currentReplacement = (currentPolicy: QualityRoutingPolicy) =>
+				hardReplacement ??
+				replacementFor(
+					conversation,
+					currentPolicy,
+					latestHomeAccount ? [latestHomeAccount] : [],
+				);
 			let accounting: QualityAdmissionDecision["accounting"];
 			const check = () => {
 				const currentPolicy = ctx.config.getQualityRoutingPolicy?.();
@@ -689,6 +712,12 @@ export async function routeQualityRequest(input: {
 					!isAccountAvailable(latestAccount)
 				)
 					throw new QualityAttemptRejected("changed-admission");
+				// installHome is already durable after beginDispatch. If mutable home
+				// evidence recovered meanwhile, refuse before sending rather than settle
+				// a successful fallback under stale replacement authority. Recheck usage
+				// and catalog synchronously again in assertDispatch after all awaits.
+				if (fenced && dispatchReplacement && !currentReplacement(currentPolicy))
+					throw new QualityAttemptRejected("home-recovered");
 				const decision = evaluateQualityRouteAdmission({
 					account: latestAccount,
 					policy: currentPolicy,
@@ -765,7 +794,16 @@ export async function routeQualityRequest(input: {
 							conversation.key,
 							conversation.revision,
 						);
-						await service.beginDispatch(lease, candidate.target, replacement);
+						await refreshHomeAccount();
+						check();
+						dispatchReplacement = replacingHome
+							? currentReplacement(policy)
+							: null;
+						await service.beginDispatch(
+							lease,
+							candidate.target,
+							dispatchReplacement,
+						);
 						fenced = true;
 						const finalAccount = await ctx.dbOps.getAccount(account.id);
 						if (!finalAccount)
@@ -782,6 +820,9 @@ export async function routeQualityRequest(input: {
 							(conversation.key === "$root" && current.preference === null)
 						)
 							throw new QualityAttemptRejected("stale-intent");
+						// Account rows are snapshots: read the exact old home again after
+						// the fence, selected-account read and session-status await.
+						await refreshHomeAccount();
 					} else {
 						const current = await service.status(session);
 						if (
@@ -831,7 +872,7 @@ export async function routeQualityRequest(input: {
 						home.target.physicalModel === candidate.target.physicalModel &&
 						home.target.line === candidate.target.line
 					)
-						replacement = {
+						hardReplacement = {
 							kind: "genuinely-unavailable",
 							homeVersion: home.version,
 						};

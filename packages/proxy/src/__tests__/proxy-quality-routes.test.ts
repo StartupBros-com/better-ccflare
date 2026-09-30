@@ -1124,6 +1124,79 @@ it("healthy home survives priority changes and temporary request-only fallback",
 	await (await send()).text();
 	expect(sends[3]?.authorization).toBe("synthetic-a");
 });
+it.each([
+	["quota", "preparation"],
+	["unpause", "preparation"],
+	["quota", "fence"],
+	["unpause", "fence"],
+	["quota", "status"],
+	["unpause", "status"],
+])("recovered home cannot be replaced by stale %s evidence during %s", async (cause, boundary) => {
+	await (await send()).text();
+	await flush();
+	const originalHome = await home();
+	const setQuota = (percent: number) =>
+		usageCache.set("a", {
+			limits: [{ kind: "weekly_all", percent, resets_at: Date.now() + 60000 }],
+			spend: { enabled: false },
+		} as never);
+	if (cause === "quota") setQuota(100);
+	else accounts[0] = { ...accounts[0], paused: true };
+	const reached = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const barrier = async () => {
+		reached.resolve();
+		await release.promise;
+	};
+	const provider = getProvider("anthropic");
+	if (!provider?.transformRequestBody) throw new Error("missing provider");
+	const transform = provider.transformRequestBody.bind(provider);
+	const begin = service.beginDispatch.bind(service);
+	const status = service.status.bind(service);
+	let fenced = false;
+	const spies = [
+		spyOn(provider, "transformRequestBody").mockImplementation(
+			async (...args) => {
+				const result = await transform(...args);
+				if (boundary === "preparation") await barrier();
+				return result;
+			},
+		),
+		spyOn(service, "beginDispatch").mockImplementation(async (...args) => {
+			await begin(...args);
+			fenced = true;
+			if (boundary === "fence") await barrier();
+		}),
+		spyOn(service, "status").mockImplementation(async (...args) => {
+			const result = await status(...args);
+			if (boundary === "status" && fenced) await barrier();
+			return result;
+		}),
+	];
+	try {
+		const pending = send();
+		await reached.promise;
+		if (cause === "quota") setQuota(10);
+		else accounts[0] = { ...accounts[0], paused: false };
+		release.resolve();
+		const response = await pending;
+		await response.text();
+		await flush();
+		expect(await home()).toEqual(originalHome);
+		if (boundary === "preparation") {
+			expect(response.status).toBe(200);
+			expect(sends[1]?.authorization).toBe("synthetic-b");
+		} else {
+			expect(response.status).toBe(503);
+			expect(sends).toHaveLength(1);
+		}
+		expect((await service.status(scope))?.unresolved).toHaveLength(0);
+	} finally {
+		release.resolve();
+		for (const spy of spies) spy.mockRestore();
+	}
+});
+
 it("same-account Opus remains eligible when Fable scoped quota is exhausted", async () => {
 	for (const a of accounts)
 		usageCache.set(a.id, {
@@ -1758,7 +1831,12 @@ it("missing stable session rejects an explicit quality ID", async () => {
 	expect((await send(req)).status).toBe(400);
 	expect(sends).toHaveLength(0);
 });
-it("owned Codex transport keeps an exact Sol predecessor after successor arrival and retry selects latest", async () => {
+it.each([
+	"retry",
+	"preference",
+	"removed-approved",
+	"removed-exact",
+])("owned Codex transport keeps an exact Sol predecessor and reconsiders only with authority: %s", async (action) => {
 	const codex = {
 		...account("c"),
 		provider: "codex",
@@ -1876,15 +1954,40 @@ it("owned Codex transport keeps an exact Sol predecessor after successor arrival
 			status.conversations[0],
 		).candidates.map((candidate) => candidate.target.physicalModel),
 	).toEqual(["gpt-5.6-sol"]);
-	await service.retryPreferred({
-		session: scope,
-		incarnation: status.incarnation,
-		expectedIntentRevision: status.intentRevision,
-		idempotencyToken: "retry-once",
-	});
+	ctx.config.getQualityRoutingPolicy = () => exactPolicy;
 	await (await send(request("claude-bccf-quality-opus"))).text();
 	await flush();
-	expect(sends[2]?.model).toBe("gpt-6.1-sol");
+	expect(sends[2]?.model).toBe("gpt-5.6-sol");
+	if (action === "retry")
+		await service.retryPreferred({
+			session: scope,
+			incarnation: status.incarnation,
+			expectedIntentRevision: status.intentRevision,
+			idempotencyToken: "retry-once",
+		});
+	if (action.startsWith("removed")) {
+		models.shift();
+		await getCodexModels(codex.id, ctx);
+		if (action === "removed-approved")
+			ctx.config.getQualityRoutingPolicy = () => policy;
+	}
+	const reconsidered = await send(
+		request(
+			action === "preference"
+				? "claude-bccf-quality-auto"
+				: "claude-bccf-quality-opus",
+		),
+	);
+	await reconsidered.text();
+	await flush();
+	if (action === "removed-exact") {
+		expect(reconsidered.status).toBe(503);
+		expect(sends).toHaveLength(3);
+		expect((await home())?.physicalModel).toBe("gpt-5.6-sol");
+		return;
+	}
+	expect(reconsidered.status).toBe(200);
+	expect(sends[3]?.model).toBe("gpt-6.1-sol");
 	expect((await home())?.physicalModel).toBe("gpt-6.1-sol");
 	expect(sends.every((s) => s.authorization === "Bearer synthetic-c")).toBe(
 		true,
