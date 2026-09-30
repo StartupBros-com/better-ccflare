@@ -2,7 +2,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import type { Config } from "@better-ccflare/config";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import { usageCache } from "@better-ccflare/providers";
-import { clearSession, recordServedAccount } from "@better-ccflare/proxy";
+import {
+	clearSession,
+	getServedAccountObservation,
+	recordServedAccount,
+} from "@better-ccflare/proxy";
 import type { Account } from "@better-ccflare/types";
 import { AuthService } from "../../services/auth-service";
 import { createSessionAccountHandler } from "../sessions";
@@ -85,6 +89,7 @@ type SessionAccountBody = {
 			requestedModel: string | null;
 			appliedModel: string | null;
 			upstreamModel: string | null;
+			recordedAt: number;
 		};
 	};
 };
@@ -152,6 +157,29 @@ describe("createSessionAccountHandler", () => {
 		);
 	});
 
+	it("returns the recorded response observation time unchanged across status polling", async () => {
+		const before = Date.now();
+		recordServedAccount(SESSION, ACCOUNT_ID);
+		const recordedAt = getServedAccountObservation(SESSION)?.recordedAt;
+		const handler = createSessionAccountHandler(
+			makeDbOps([makeAccount({ id: ACCOUNT_ID })]),
+			makeConfig(),
+		);
+		const first = (await (await handler(SESSION)).json()) as SessionAccountBody;
+		expect(first.data.account?.recordedAt).toBeGreaterThanOrEqual(before);
+		expect(first.data.account?.recordedAt).toBe(recordedAt);
+		await Bun.sleep(5);
+		const second = (await (
+			await handler(SESSION)
+		).json()) as SessionAccountBody;
+		expect(second.data.account?.recordedAt).toBe(recordedAt);
+		clearSession(SESSION);
+		const cleared = (await (
+			await handler(SESSION)
+		).json()) as SessionAccountBody;
+		expect(cleared.data).toEqual({ status: "unknown" });
+	});
+
 	it("redacts the raw account id for a model-route-profile observation", async () => {
 		recordServedAccount(SESSION, ACCOUNT_ID, Date.now(), "pro-primary-sol");
 		const account = makeAccount({
@@ -178,6 +206,7 @@ describe("createSessionAccountHandler", () => {
 			rateLimitStatus: "OK",
 		});
 		expect(body.data.account?.id).toBeUndefined();
+		expect(body.data.account?.recordedAt).toBeGreaterThan(0);
 	});
 
 	it("composes usage provider-aware for a non-anthropic (zai) account", async () => {

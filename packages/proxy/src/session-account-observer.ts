@@ -1,8 +1,11 @@
 import { TIME_CONSTANTS } from "@better-ccflare/core";
 
 /**
- * Records which better-ccflare account actually served the most recent request
- * for a given Claude Code session id (the `X-Claude-Code-Session-Id` header).
+ * Records the account selected for response forwarding for a Claude Code
+ * session id (the `X-Claude-Code-Session-Id` header). This is normally recorded
+ * at `forwardToClient` entry, before stream completion; a direct terminal
+ * response path also records before returning its response. It is not a live
+ * dispatch indicator or proof that a request completed successfully.
  *
  * This is live, short-lived state — the read-only foundation for the status-line
  * account badge. It is deliberately in-memory only: the association carries no
@@ -31,7 +34,8 @@ interface SessionAccountEntry {
 	routeProfileId: string | null;
 	/** Models associated with the same successful physical route, when observed. */
 	models: SessionModelObservation | null;
-	/** Observation (completion) time — drives TTL expiry and eviction recency. */
+	/** Observation time in epoch milliseconds — drives TTL expiry and eviction
+	 * recency. Recorded at response forwarding, not stream completion. */
 	recordedAt: number;
 	/**
 	 * Ordering version = the request's START time. A record/clear only applies
@@ -64,6 +68,9 @@ export interface SessionModelObservation {
 /** The account observation stored atomically for one live Claude Code session. */
 export interface SessionAccountObservation {
 	accountId: string;
+	/** Response-forwarding observation time in epoch milliseconds. Reads do not
+	 * refresh it; this is neither dispatch time nor stream completion time. */
+	recordedAt: number;
 	/** Operator profile slug or `implicit-codex:<model>`, or null when ordinary
 	 * account selection served it. */
 	routeProfileId: string | null;
@@ -157,6 +164,7 @@ export class SessionAccountObserver {
 		if (entry.accountId === null) return undefined;
 		return {
 			accountId: entry.accountId,
+			recordedAt: entry.recordedAt,
 			routeProfileId: entry.routeProfileId,
 			...(entry.models ? { models: entry.models } : {}),
 		};

@@ -48,6 +48,7 @@ describe("SessionAccountObserver", () => {
 			upstreamModel: "gpt-5.6-sol",
 		});
 		expect(obs.getObservation("session-a")).toEqual({
+			recordedAt: expect.any(Number),
 			accountId: "profile-account",
 			routeProfileId: "pro-primary-sol",
 			models: {
@@ -59,6 +60,7 @@ describe("SessionAccountObserver", () => {
 
 		obs.record("session-a", "ordinary-account", 20);
 		expect(obs.getObservation("session-a")).toEqual({
+			recordedAt: expect.any(Number),
 			accountId: "ordinary-account",
 			routeProfileId: null,
 		});
@@ -71,9 +73,35 @@ describe("SessionAccountObserver", () => {
 			upstreamModel: "stale-upstream",
 		});
 		expect(obs.getObservation("session-a")).toEqual({
+			recordedAt: expect.any(Number),
 			accountId: "ordinary-account",
 			routeProfileId: null,
 		});
+	});
+
+	it("exposes the original observation clock without refreshing it on reads or stale writes", () => {
+		const clock = makeClock(0);
+		const obs = new SessionAccountObserver({ now: clock.now, ttlMs: 100 });
+		obs.record("session", "first", 20);
+		expect(obs.getObservation("session")?.recordedAt).toBe(0);
+		clock.advance(50);
+		expect(obs.getObservation("session")?.recordedAt).toBe(0);
+		obs.record("session", "older-request", 10);
+		obs.clear("session", 10);
+		expect(obs.getObservation("session")).toMatchObject({
+			accountId: "first",
+			recordedAt: 0,
+		});
+		obs.record("session", "newer-request", 30);
+		expect(obs.getObservation("session")).toMatchObject({
+			accountId: "newer-request",
+			recordedAt: 50,
+		});
+		clock.advance(100);
+		expect(obs.getObservation("session")).toBeUndefined();
+		obs.record("session", "last", 40);
+		obs.clear("session", 40);
+		expect(obs.getObservation("session")).toBeUndefined();
 	});
 
 	it("returns undefined for a session that was never recorded", () => {
@@ -233,6 +261,7 @@ describe("session-account-observer module singleton", () => {
 		recordServedAccount("mod-session", "acc-9", undefined, "premium");
 		expect(getServedAccount("mod-session")).toBe("acc-9");
 		expect(getServedAccountObservation("mod-session")).toEqual({
+			recordedAt: expect.any(Number),
 			accountId: "acc-9",
 			routeProfileId: "premium",
 		});
