@@ -72,7 +72,10 @@ interface SessionAccountData {
 		usageThrottledUntil: number | null;
 		/** Names of the windows driving the throttle, if any. */
 		usageThrottledWindows: string[];
-		/** Model names from the same successful physical route. */
+		/** Response-forwarding observation time (epoch milliseconds), not the
+		 * current dispatch, completion, or status-poll time. */
+		recordedAt: number;
+		/** Model names from the same observed physical route. */
 		requestedModel: string | null;
 		appliedModel: string | null;
 		upstreamModel: string | null;
@@ -171,7 +174,10 @@ function buildLimitWindows(
  *
  * The serving account id comes from the proxy's in-memory session→account
  * observer (U1); name, usage, and health are resolved at read time so the badge
- * never shows a stale usage snapshot. Usage is composed with the same
+ * never shows a stale usage snapshot. The separate `account.recordedAt` is the
+ * original response-forwarding observation time, so clients can distinguish an
+ * older route observation from current account usage. It does not prove an
+ * active dispatch or completed stream. Usage is composed with the same
  * provider-aware pieces `health.ts` uses (`usageCache` +
  * `getRepresentativeUtilizationForProvider` + `getRepresentativeUsageResetMs`),
  * NOT the per-provider dispatch block in `createAccountsListHandler` — that
@@ -303,6 +309,7 @@ export function createSessionAccountHandler(
 				rateLimitReset: account.rate_limit_reset ?? null,
 				usageThrottledUntil,
 				usageThrottledWindows,
+				recordedAt: observation.recordedAt,
 				requestedModel: observation.models?.requestedModel ?? null,
 				appliedModel: observation.models?.appliedModel ?? null,
 				upstreamModel: observation.models?.upstreamModel ?? null,
