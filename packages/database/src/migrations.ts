@@ -322,6 +322,25 @@ function ensureRoutingPolicyRevisionSchema(db: Database): void {
 	}
 }
 
+function ensureQualityRouteSchema(db: Database): void {
+	db.run(`CREATE TABLE IF NOT EXISTS quality_route_sessions (
+  principal_id TEXT NOT NULL, session_id TEXT NOT NULL, incarnation TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version >= 0), state_json TEXT NOT NULL,
+  expires_at INTEGER NOT NULL, lease_until INTEGER NOT NULL DEFAULT 0,
+  unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0, 1)),
+  PRIMARY KEY (principal_id, session_id)
+ )`);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_quality_route_expiry ON quality_route_sessions(unresolved, expires_at, lease_until)`,
+	);
+	db.run(
+		`CREATE TABLE IF NOT EXISTS quality_route_admission (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL)`,
+	);
+	db.run(
+		`INSERT INTO quality_route_admission (id, revision) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`,
+	);
+}
+
 function ensureServerToolReplayIssuanceSchema(db: Database): void {
 	db.run(`
 		CREATE TABLE IF NOT EXISTS server_tool_replay_issuance (
@@ -599,6 +618,7 @@ export function ensureSchema(db: Database): void {
 		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_account
 		 ON device_setup_jobs(account_id)`,
 	);
+	ensureQualityRouteSchema(db);
 	ensureServerToolReplayIssuanceSchema(db);
 
 	// Create agent_preferences table for storing user-defined agent settings
@@ -1522,6 +1542,7 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 }
 
 export function runMigrations(db: Database, dbPath?: string): void {
+	ensureQualityRouteSchema(db);
 	// Ensure base schema exists first (outside transaction as it creates tables)
 	ensureSchema(db);
 	db.run(CACHE_HEALTH_STATE_SCHEMA);

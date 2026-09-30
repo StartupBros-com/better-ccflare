@@ -43,6 +43,7 @@ import {
 	clearAccountRefreshCache,
 	clearAutoRefreshTrackingForAccount,
 	clearCodexModelCacheForAccount,
+	clearNativeAutoCatalogEvidence,
 	clearOpenAICompatibleModelCacheForAccount,
 	clearPendingRotationForDeletedAccount,
 	getBindingConstraint,
@@ -1096,6 +1097,7 @@ export function createAccountRemoveHandler(dbOps: DatabaseOperations) {
 			// A same-ID replacement must fetch its own model list rather than inherit
 			// state published by the deleted account's pending request.
 			clearCodexModelCacheForAccount(accountId);
+			clearNativeAutoCatalogEvidence(accountId);
 			clearOpenAICompatibleModelCacheForAccount(accountId);
 
 			// Clear provider usage and account-scoped depletion evidence only after

@@ -223,6 +223,27 @@ async function ensureDeviceSetupJobsSchemaPg(
 	);
 }
 
+async function ensureQualityRouteSchemaPg(
+	adapter: BunSqlAdapter,
+): Promise<void> {
+	await adapter.unsafe(`CREATE TABLE IF NOT EXISTS quality_route_sessions (
+  principal_id TEXT NOT NULL, session_id TEXT NOT NULL, incarnation TEXT NOT NULL,
+  version BIGINT NOT NULL CHECK (version >= 0), state_json TEXT NOT NULL,
+  expires_at BIGINT NOT NULL, lease_until BIGINT NOT NULL DEFAULT 0,
+  unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0, 1)),
+  PRIMARY KEY (principal_id, session_id)
+ )`);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_quality_route_expiry ON quality_route_sessions(unresolved, expires_at, lease_until)`,
+	);
+	await adapter.unsafe(
+		`CREATE TABLE IF NOT EXISTS quality_route_admission (id INTEGER PRIMARY KEY CHECK (id = 1), revision BIGINT NOT NULL)`,
+	);
+	await adapter.unsafe(
+		`INSERT INTO quality_route_admission (id, revision) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`,
+	);
+}
+
 async function ensureServerToolReplayIssuanceSchemaPg(
 	adapter: BunSqlAdapter,
 ): Promise<void> {
@@ -740,6 +761,7 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 		`CREATE INDEX IF NOT EXISTS idx_oauth_sessions_expires ON oauth_sessions(expires_at)`,
 	);
 	await ensureDeviceSetupJobsSchemaPg(adapter);
+	await ensureQualityRouteSchemaPg(adapter);
 	await ensureServerToolReplayIssuanceSchemaPg(adapter);
 	await ensureUsageWindowsSchemaPg(adapter);
 
@@ -1873,6 +1895,7 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 		 WHERE last_verified_at IS NULL`,
 	);
 	await ensureDeviceSetupJobsSchemaPg(adapter);
+	await ensureQualityRouteSchemaPg(adapter);
 	await ensureServerToolReplayIssuanceSchemaPg(adapter);
 	await ensureUsageWindowsSchemaPg(adapter);
 

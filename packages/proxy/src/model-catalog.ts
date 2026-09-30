@@ -7,6 +7,7 @@
  * to the last known-good cache — and ultimately to the bundled
  * `CLAUDE_MODEL_IDS` list — if a live fetch is unavailable.
  */
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,7 +18,15 @@ import {
 	registerHeartbeat,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
-import { getProvider } from "@better-ccflare/providers";
+import {
+	AUTO_CATALOG_MAX_AGE_MS,
+	type AutoCatalogEvidence,
+	type AutoModelCapabilities,
+	createAutoCatalogEvidence,
+	getProvider,
+	isAutoCatalogEvidenceCurrent,
+	normalizeAutoModelCapabilities,
+} from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "./handlers/proxy-types";
 import { getValidAccessToken } from "./handlers/token-manager";
@@ -25,6 +34,7 @@ import { getValidAccessToken } from "./handlers/token-manager";
 const log = new Logger("ModelCatalog");
 
 export interface ModelCatalogEntry {
+	capabilities?: AutoModelCapabilities;
 	id: string;
 	displayName: string;
 	createdAt: string | null;
@@ -54,10 +64,75 @@ interface AnthropicModelsPageResponse {
 		id: string;
 		display_name?: string;
 		created_at?: string;
+		max_input_tokens?: unknown;
+		max_tokens?: unknown;
+		capabilities?: unknown;
 	}>;
 	has_more?: boolean;
 	first_id?: string | null;
 	last_id?: string | null;
+}
+
+const nativeOwnEvidence = new Map<string, AutoCatalogEvidence>();
+const nativeEvidenceGeneration = new Map<string, number>();
+const nativeCredentialFingerprint = new Map<string, string>();
+let nextNativeEvidenceGeneration = 0;
+
+/** Fresh process-local owned evidence only; the global disk catalog is advisory.
+ * Account ID alone does not validate the selected dispatch credential epoch.
+ */
+export function getNativeAutoCatalogEvidence(
+	accountId: string,
+): AutoCatalogEvidence | null {
+	const evidence = nativeOwnEvidence.get(accountId) ?? null;
+	return isAutoCatalogEvidenceCurrent(evidence) ? evidence : null;
+}
+
+/** Integrators must call on account deletion/replacement, before reusing its ID. */
+export function clearNativeAutoCatalogEvidence(accountId: string): void {
+	nativeOwnEvidence.delete(accountId);
+	nativeCredentialFingerprint.delete(accountId);
+	nativeEvidenceGeneration.set(accountId, ++nextNativeEvidenceGeneration);
+}
+
+function nativeEntry(
+	raw: AnthropicModelsPageResponse["data"][number],
+): ModelCatalogEntry {
+	return {
+		id: raw.id,
+		displayName: raw.display_name || raw.id,
+		createdAt: raw.created_at ?? null,
+		...(Object.hasOwn(raw, "max_input_tokens") ||
+		Object.hasOwn(raw, "max_tokens") ||
+		Object.hasOwn(raw, "capabilities")
+			? { capabilities: normalizeAutoModelCapabilities("anthropic", raw) }
+			: {}),
+	};
+}
+
+function publishNativeEvidence(
+	accountId: string,
+	models: ModelCatalogEntry[],
+	generation: number,
+): void {
+	if (nativeEvidenceGeneration.get(accountId) !== generation) return;
+	const fetchedAt = Date.now();
+	// One refresh interval, capped at the native default, without scheduler jitter
+	// or retry grace. Disabling refresh does not grant unbounded validity.
+	const intervalMs = getRefreshHours() * 60 * 60_000;
+	const validityMs = Math.min(
+		intervalMs || AUTO_CATALOG_MAX_AGE_MS.anthropic,
+		AUTO_CATALOG_MAX_AGE_MS.anthropic,
+	);
+	const evidence = createAutoCatalogEvidence({
+		fetchedAt,
+		expiresAt: fetchedAt + Math.floor(validityMs),
+		accountId,
+		provider: "anthropic",
+		source: "live",
+		models,
+	});
+	if (evidence) nativeOwnEvidence.set(accountId, evidence);
 }
 
 const MAX_PAGES = 5;
@@ -215,11 +290,18 @@ function selectEligibleAccount(
  */
 export async function fetchLiveModels(
 	ctx: ProxyContext,
-	options?: { allowOAuth?: boolean },
+	options?: { allowOAuth?: boolean; accountId?: string },
 ): Promise<ModelCatalogEntry[]> {
+	// Reserve before the first await: deletion or a newer lookup must fence us.
+	const generation = ++nextNativeEvidenceGeneration;
 	const allowOAuth = options?.allowOAuth ?? false;
 	const accounts = await ctx.dbOps.getAllAccounts();
-	const account = selectEligibleAccount(accounts, { allowOAuth });
+	const account = selectEligibleAccount(
+		options?.accountId
+			? accounts.filter((entry) => entry.id === options.accountId)
+			: accounts,
+		{ allowOAuth },
+	);
 	if (!account) {
 		throw new Error(
 			allowOAuth
@@ -228,8 +310,19 @@ export async function fetchLiveModels(
 		);
 	}
 
+	if ((nativeEvidenceGeneration.get(account.id) ?? 0) > generation)
+		throw new Error("obsolete native catalog generation");
+	nativeEvidenceGeneration.set(account.id, generation);
 	const provider = getProvider(account.provider) || ctx.provider;
 	const accessToken = await getValidAccessToken(account, ctx);
+	if (nativeEvidenceGeneration.get(account.id) !== generation)
+		throw new Error("obsolete native catalog generation");
+	const fingerprint = createHash("sha256")
+		.update(JSON.stringify([account.provider, accessToken, account.api_key]))
+		.digest("hex");
+	if (nativeCredentialFingerprint.get(account.id) !== fingerprint)
+		nativeOwnEvidence.delete(account.id);
+	nativeCredentialFingerprint.set(account.id, fingerprint);
 	const headers = provider.prepareHeaders(
 		new Headers(),
 		accessToken,
@@ -267,14 +360,14 @@ export async function fetchLiveModels(
 
 		const body = (await response.json()) as AnthropicModelsPageResponse;
 		for (const m of body.data ?? []) {
-			models.push({
-				id: m.id,
-				displayName: m.display_name || m.id,
-				createdAt: m.created_at ?? null,
-			});
+			models.push(nativeEntry(m));
 		}
 
-		if (!body.has_more || !body.last_id) break;
+		if (!body.has_more) {
+			publishNativeEvidence(account.id, models, generation);
+			break;
+		}
+		if (!body.last_id) break;
 		afterId = body.last_id;
 	}
 
@@ -432,14 +525,14 @@ export async function ingestModelsListing(
 		const body = JSON.parse(bodyText) as AnthropicModelsPageResponse;
 		if (!Array.isArray(body.data) || body.data.length === 0) return;
 
-		const observed: ModelCatalogEntry[] = body.data.map((m) => ({
-			id: m.id,
-			displayName: m.display_name || m.id,
-			createdAt: m.created_at ?? null,
-		}));
+		const observed = body.data.map(nativeEntry);
 
 		const params = new URLSearchParams(requestQuery ?? "");
 		const isComplete = body.has_more !== true && !params.has("after_id");
+		// Passive responses have no request-start credential/generation fence.
+		// Even a complete response may arrive after deletion or token replacement.
+		// Keep its facts in the advisory catalog, never publish Auto entitlement;
+		// fetchLiveModels is the generation-fenced owned discovery path.
 
 		const existing = await getModelCatalog();
 		let models: ModelCatalogEntry[];
@@ -584,6 +677,9 @@ export function initModelCatalogRefresh(
  * Reset internal in-memory state. Intended for test cleanup only.
  */
 export function resetModelCatalogForTest(): void {
+	nativeOwnEvidence.clear();
+	nativeEvidenceGeneration.clear();
+	nativeCredentialFingerprint.clear();
 	memoryCatalog = null;
 	diskLoadAttempted = false;
 }

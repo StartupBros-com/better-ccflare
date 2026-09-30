@@ -1,3 +1,4 @@
+export * from "./auto-model-capabilities";
 // Export all types
 
 // Export Alibaba Coding Plan usage fetcher
@@ -22,6 +23,7 @@ export {
 	createProviderForService,
 	PresetProviders,
 } from "./providers/anthropic-compatible/factory";
+export { extractChatGptAccountId } from "./providers/codex/api-usage";
 // Export providers
 export * from "./providers/index";
 // Export registry functions

@@ -105,6 +105,7 @@ export {
 	CATALOG_REFRESH_INTERVAL_MS,
 	clearCodexModelCacheForAccount,
 	clearCodexModelCacheForTests,
+	getCodexAutoCatalogEvidence,
 	getCodexCatalogRoleTarget,
 	getCodexModels,
 	getKnownCodexModels,
@@ -175,8 +176,10 @@ export {
 	startIntegrityScheduler,
 } from "./integrity-scheduler";
 export {
+	clearNativeAutoCatalogEvidence,
 	fetchLiveModels,
 	getModelCatalog,
+	getNativeAutoCatalogEvidence,
 	initModelCatalogRefresh,
 	type ModelCatalog,
 	type ModelCatalogEntry,
@@ -217,6 +220,10 @@ export {
 	initProxy,
 	type ProxyContext,
 } from "./proxy";
+export {
+	QualityRouteService,
+	type QualityRouteStatus,
+} from "./quality-route-service";
 export {
 	forwardToClient,
 	type ResponseHandlerOptions,

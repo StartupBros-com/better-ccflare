@@ -21,6 +21,7 @@ import {
 	ensureCodexModelDefaults,
 	evaluateCodexCatalogStaleness,
 	evaluateCodexClientIdentityRecord,
+	getCodexAutoCatalogEvidence,
 	getCodexModels,
 	getKnownCodexModels,
 	initCodexModelCatalogRefresh,
@@ -67,6 +68,166 @@ function makeCtx(account: Account | null): ProxyContext {
 
 // Shaped after what a real subscription account returned on 2026-08-09,
 // including the two entries OpenAI marks `hide` and the deprecation notices.
+it("does not let an older account lookup rebind a replaced token", async () => {
+	const original = globalThis.fetch;
+	let release!: (account: Account) => void;
+	const lookup = new Promise<Account>((resolve) => {
+		release = resolve;
+	});
+	const oldAccount = makeAccount();
+	const ctx = makeCtx(oldAccount);
+	ctx.dbOps.getAccount = () => lookup;
+	const seen: Array<string | null> = [];
+	globalThis.fetch = (async (_url, init) => {
+		const auth = new Headers(init?.headers).get("authorization");
+		seen.push(auth);
+		return Response.json({
+			models: [
+				{ slug: auth === "Bearer replacement" ? "gpt-6.1-sol" : "gpt-6-astra" },
+			],
+		});
+	}) as typeof fetch;
+	try {
+		const old = getCodexModels(oldAccount.id, ctx);
+		await getCodexModels(
+			oldAccount.id,
+			makeCtx(makeAccount({ access_token: "replacement" })),
+		);
+		release(oldAccount);
+		await old;
+		expect(getCodexAutoCatalogEvidence(oldAccount.id)?.models[0].id).toBe(
+			"gpt-6.1-sol",
+		);
+		expect(seen).toEqual(["Bearer replacement"]);
+	} finally {
+		globalThis.fetch = original;
+		clearCodexModelCacheForTests();
+	}
+});
+
+it("retires owned evidence when a replacement token cannot refresh its catalog", async () => {
+	const original = globalThis.fetch;
+	const account = makeAccount({ id: "rotating" });
+	globalThis.fetch = (async () =>
+		Response.json({ models: [{ slug: "gpt-6-astra" }] })) as typeof fetch;
+	try {
+		await getCodexModels(account.id, makeCtx(account));
+		expect(getCodexAutoCatalogEvidence(account.id)).not.toBeNull();
+		account.access_token = "replacement-token";
+		globalThis.fetch = (async () =>
+			new Response("unavailable", { status: 503 })) as typeof fetch;
+		await getCodexModels(account.id, makeCtx(account));
+		expect(getCodexAutoCatalogEvidence(account.id)).toBeNull();
+	} finally {
+		globalThis.fetch = original;
+		clearCodexModelCacheForTests();
+	}
+});
+
+it("bounds Auto last-good evidence independently of legacy caches and other accounts", async () => {
+	const original = globalThis.fetch;
+	const start = 1_000_000;
+	const clock = spyOn(Date, "now").mockReturnValue(start);
+	const first = makeAccount({ id: "expiry-first" });
+	const second = makeAccount({ id: "expiry-second" });
+	const live = (async () =>
+		Response.json({ models: [{ slug: "gpt-6-astra" }] })) as typeof fetch;
+	globalThis.fetch = live;
+	try {
+		const listing = await getCodexModels(first.id, makeCtx(first));
+		const evidence = getCodexAutoCatalogEvidence(first.id);
+		expect(evidence?.fetchedAt).toBe(listing?.fetchedAt);
+		expect(evidence?.expiresAt).toBe(start + REFRESH_INTERVAL_MS);
+		clock.mockReturnValue(start - 1);
+		expect(getCodexAutoCatalogEvidence(first.id)).toBeNull();
+		clock.mockReturnValue(start + REFRESH_INTERVAL_MS - 1);
+		expect(getCodexAutoCatalogEvidence(first.id)).toBe(evidence);
+		expect(getCodexAutoCatalogEvidence(first.id)).toBe(evidence);
+		await getCodexModels(second.id, makeCtx(second));
+		globalThis.fetch = (async () =>
+			new Response("unavailable", { status: 503 })) as typeof fetch;
+		await getCodexModels(first.id, makeCtx(first));
+		expect(getCodexAutoCatalogEvidence(first.id)).toBe(evidence);
+		clock.mockReturnValue(start + REFRESH_INTERVAL_MS);
+		await getCodexModels(first.id, makeCtx(first));
+		expect(getCodexAutoCatalogEvidence(first.id)).toBeNull();
+		expect(getKnownCodexModels(first.id)?.fetchedAt).toBe(start);
+		expect(getCodexAutoCatalogEvidence(second.id)).not.toBeNull();
+		globalThis.fetch = live;
+		await getCodexModels(first.id, makeCtx(first));
+		const renewed = getCodexAutoCatalogEvidence(first.id);
+		expect(renewed?.revision).toBe(evidence?.revision);
+		expect(renewed?.fetchedAt).toBe(start + REFRESH_INTERVAL_MS);
+		expect(renewed).not.toBe(evidence);
+	} finally {
+		clock.mockRestore();
+		globalThis.fetch = original;
+		clearCodexModelCacheForTests();
+	}
+});
+
+it("retains exact owned capabilities and never lends Auto entitlement", async () => {
+	const original = globalThis.fetch;
+	globalThis.fetch = (async () =>
+		Response.json({
+			models: [
+				{
+					slug: "gpt-6.1-sol",
+					context_window: 272000,
+					max_context_window: 872000,
+					effective_context_window_percent: 95,
+					input_modalities: ["text", "image"],
+					tool_mode: "function",
+					supports_search_tool: true,
+				},
+			],
+		})) as typeof fetch;
+	try {
+		await getCodexModels("owner", makeCtx(makeAccount({ id: "owner" })));
+		const evidence = getCodexAutoCatalogEvidence("owner");
+		expect(evidence?.models[0].capabilities?.maxContextWindow).toBe(872000);
+		expect(evidence?.models[0].capabilities?.maxOutputTokens).toBeNull();
+		expect(
+			evidence?.models[0].capabilities?.toolEvidence.supports_search_tool,
+		).toBe(true);
+		expect(getCodexAutoCatalogEvidence("borrower")).toBeNull();
+		const legacy = getKnownCodexModels("owner");
+		if (legacy) legacy.models[0].id = "mutated-by-legacy-consumer";
+		expect(getCodexAutoCatalogEvidence("owner")?.models[0].id).toBe(
+			"gpt-6.1-sol",
+		);
+		clearCodexModelCacheForAccount("owner");
+		expect(getCodexAutoCatalogEvidence("owner")).toBeNull();
+	} finally {
+		globalThis.fetch = original;
+		clearCodexModelCacheForTests();
+	}
+});
+
+it("binds interleaved catalog discovery to each selected token account claim", async () => {
+	const original = globalThis.fetch;
+	const seen: Array<string | null> = [];
+	const token = (id: string) =>
+		`e30.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: id } })).toString("base64url")}.signature`;
+	globalThis.fetch = (async (_url, init) => {
+		seen.push(new Headers(init?.headers).get("chatgpt-account-id"));
+		await Promise.resolve();
+		return Response.json({ models: [{ slug: "gpt-6-astra" }] });
+	}) as typeof fetch;
+	try {
+		await Promise.all(
+			["workspace-a", "workspace-b"].map((id) => {
+				const account = makeAccount({ id, access_token: token(id) });
+				return getCodexModels(id, makeCtx(account));
+			}),
+		);
+		expect(seen).toEqual(["workspace-a", "workspace-b"]);
+	} finally {
+		globalThis.fetch = original;
+		clearCodexModelCacheForTests();
+	}
+});
+
 const LIVE_BODY = {
 	models: [
 		{

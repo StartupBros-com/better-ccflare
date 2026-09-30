@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	CODEX_CATALOG_FAMILIES,
 	type CodexCatalogFamily,
@@ -7,10 +8,16 @@ import {
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
+	type AutoCatalogEvidence,
+	type AutoModelCapabilities,
 	CODEX_VERIFIED_VERSION_FILE_ENV,
 	clearCodexAccountModelContextMetadata,
 	clearDerivedAccountModelDefaults,
+	createAutoCatalogEvidence,
+	extractChatGptAccountId,
 	hasDerivedProviderModelDefaults,
+	isAutoCatalogEvidenceCurrent,
+	normalizeAutoModelCapabilities,
 	resolveCodexClientIdentity,
 	setCodexAccountModelContextMetadata,
 	setDerivedAccountModelDefaults,
@@ -39,6 +46,8 @@ const log = new Logger("CodexModelCatalog");
  * models this plan cannot call.
  */
 export interface CodexModelEntry {
+	/** Exact facts from this listing; never inherited from provider defaults. */
+	capabilities?: AutoModelCapabilities;
 	id: string;
 	displayName: string;
 	description: string | null;
@@ -111,6 +120,21 @@ interface CachedAccountCatalog {
 }
 
 const lastGood = new Map<string, CachedAccountCatalog>();
+const autoEvidence = new Map<string, AutoCatalogEvidence>();
+// Private credential generations, never exposed in catalog evidence or logs.
+const selectedTokenGeneration = new Map<
+	string,
+	{ fingerprint: string; generation: number }
+>();
+function tokenFingerprint(token: string): string {
+	return createHash("sha256").update(token).digest("hex");
+}
+function retireOwnCatalog(accountId: string): void {
+	lastGood.delete(accountId);
+	autoEvidence.delete(accountId);
+	clearDerivedAccountModelDefaults("codex", accountId);
+	clearCodexAccountModelContextMetadata(accountId);
+}
 
 /**
  * Per-account deletion generation. A request captures this before any await;
@@ -189,6 +213,8 @@ let publishedProviderCatalogGeneration = 0;
  */
 export function clearCodexModelCacheForTests(): void {
 	lastGood.clear();
+	autoEvidence.clear();
+	selectedTokenGeneration.clear();
 	clearCodexAccountModelContextMetadata();
 	invalidationGenerationByAccount.clear();
 	providerWide = null;
@@ -214,6 +240,8 @@ export function clearCodexModelCacheForAccount(accountId: string): void {
 		invalidationGenerationFor(accountId) + 1,
 	);
 	lastGood.delete(accountId);
+	autoEvidence.delete(accountId);
+	selectedTokenGeneration.delete(accountId);
 	ensureRetryByAccount.delete(accountId);
 	ensureInFlight.delete(accountId);
 	unknownRevalidationAt.delete(accountId);
@@ -267,6 +295,17 @@ export function getKnownOrSharedCodexModels(
 	return readCache(accountId);
 }
 
+/** No fetch, provider-wide fallback, or capacity-prefix inference. Freshness is
+ * checked on every read. Account ID alone does not prove that a dispatch token
+ * still belongs to the credential epoch that produced this snapshot.
+ */
+export function getCodexAutoCatalogEvidence(
+	accountId: string,
+): AutoCatalogEvidence | null {
+	const evidence = autoEvidence.get(accountId) ?? null;
+	return isAutoCatalogEvidenceCurrent(evidence) ? evidence : null;
+}
+
 function readCache(accountId: string): CodexModelListing | null {
 	const own = getKnownCodexModels(accountId);
 	if (own) return own;
@@ -316,8 +355,10 @@ function normalize(body: CodexModelsResponse): CodexModelEntry[] {
 		if (raw.visibility && raw.visibility !== "list") continue;
 
 		seen.add(id);
+		const capabilities = normalizeAutoModelCapabilities("codex", raw);
 		entries.push({
 			id,
+			capabilities,
 			priority: typeof raw.priority === "number" ? raw.priority : 1_000,
 			supersededBy:
 				typeof raw.upgrade?.model === "string" ? raw.upgrade.model : null,
@@ -329,16 +370,9 @@ function normalize(body: CodexModelsResponse): CodexModelEntry[] {
 				typeof raw.description === "string" && raw.description.trim()
 					? raw.description
 					: null,
-			contextWindow:
-				typeof raw.context_window === "number" ? raw.context_window : null,
-			maxContextWindow:
-				typeof raw.max_context_window === "number"
-					? raw.max_context_window
-					: null,
-			effectiveContextPercent:
-				typeof raw.effective_context_window_percent === "number"
-					? raw.effective_context_window_percent
-					: null,
+			contextWindow: capabilities.contextWindow,
+			maxContextWindow: capabilities.maxContextWindow,
+			effectiveContextPercent: capabilities.effectiveContextPercent,
 			supportedReasoningEfforts: Array.isArray(raw.supported_reasoning_levels)
 				? raw.supported_reasoning_levels.map((level) => level?.effort ?? "")
 				: undefined,
@@ -364,18 +398,35 @@ function normalize(body: CodexModelsResponse): CodexModelEntry[] {
 async function fetchLive(
 	account: Account,
 	ctx: ProxyContext,
-): Promise<CodexModelEntry[]> {
+	generation: number,
+	invalidationGeneration: number,
+): Promise<{ models: CodexModelEntry[]; fingerprint: string }> {
 	const identity = resolveCodexClientIdentity();
 	const accessToken = await getValidAccessToken(account, ctx);
 	if (!accessToken) throw new Error("no access token for this account");
+	const fingerprint = tokenFingerprint(accessToken);
+	const previousToken = selectedTokenGeneration.get(account.id);
+	if (
+		!isCurrentInvalidationGeneration(account.id, invalidationGeneration) ||
+		(previousToken &&
+			previousToken.generation > generation &&
+			previousToken.fingerprint !== fingerprint)
+	) {
+		throw new Error("obsolete catalog credential generation");
+	}
+	if (previousToken?.fingerprint !== fingerprint) retireOwnCatalog(account.id);
+	if (!previousToken || generation >= previousToken.generation)
+		selectedTokenGeneration.set(account.id, { fingerprint, generation });
 
 	const url = `https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(identity.version)}`;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 	try {
+		const accountClaim = extractChatGptAccountId(accessToken);
 		const response = await fetch(url, {
 			method: "GET",
 			headers: {
+				...(accountClaim ? { "chatgpt-account-id": accountClaim } : {}),
 				authorization: `Bearer ${accessToken}`,
 				accept: "application/json",
 				// The endpoint rejects the request without a client version, and
@@ -390,7 +441,10 @@ async function fetchLive(
 		if (!response.ok) {
 			throw new Error(`HTTP ${response.status}`);
 		}
-		return normalize((await response.json()) as CodexModelsResponse);
+		return {
+			models: normalize((await response.json()) as CodexModelsResponse),
+			fingerprint,
+		};
 	} finally {
 		clearTimeout(timeout);
 	}
@@ -616,12 +670,17 @@ export async function getCodexModels(
 	ctx: ProxyContext,
 ): Promise<CodexModelListing | null> {
 	const invalidationGeneration = invalidationGenerationFor(accountId);
+	const fetchGeneration = ++nextCatalogFetchGeneration;
 	const account = await ctx.dbOps.getAccount(accountId);
 	if (!account || account.provider !== "codex") return null;
-	const fetchGeneration = ++nextCatalogFetchGeneration;
 
 	try {
-		const models = await fetchLive(account, ctx);
+		const { models, fingerprint } = await fetchLive(
+			account,
+			ctx,
+			fetchGeneration,
+			invalidationGeneration,
+		);
 		// An answer with nothing usable in it is not an answer. Recording it
 		// would mark the account as resolved and stop every later attempt, so a
 		// single odd response would freeze the account with no defaults at all.
@@ -638,7 +697,11 @@ export async function getCodexModels(
 		const previousOwn = lastGood.get(accountId);
 		const publishedAccountGeneration = previousOwn?.generation;
 		let publishedOwn = false;
-		if (isCurrentInvalidationGeneration(accountId, invalidationGeneration)) {
+		if (
+			isCurrentInvalidationGeneration(accountId, invalidationGeneration) &&
+			(!selectedTokenGeneration.has(accountId) ||
+				selectedTokenGeneration.get(accountId)?.fingerprint === fingerprint)
+		) {
 			lastRefreshFailedAt.delete(accountId);
 			if (
 				publishedAccountGeneration === undefined ||
@@ -647,6 +710,13 @@ export async function getCodexModels(
 				// This account's exact evidence advances independently of the shared
 				// frontier, so a late response from another account still remains useful.
 				lastGood.set(accountId, { listing, generation: fetchGeneration });
+				const evidence = createAutoCatalogEvidence({
+					...listing,
+					expiresAt: listing.fetchedAt + CATALOG_REFRESH_INTERVAL_MS,
+					provider: "codex",
+				});
+				if (evidence) autoEvidence.set(accountId, evidence);
+				else autoEvidence.delete(accountId);
 				setCodexAccountModelContextMetadata(accountId, models);
 				setDerivedAccountModelDefaults("codex", accountId, families);
 				publishedOwn = true;
