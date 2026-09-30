@@ -12,6 +12,7 @@ import {
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveNodeExecutable } from "./node-runtime";
 
 const repoRoot = join(import.meta.dir, "..", "..");
 const runnerScript = join(repoRoot, "scripts", "run-ccflare-stack.sh");
@@ -1132,9 +1133,12 @@ describe("run-ccflare-stack supervisor lifecycle", () => {
 
 describe("persistent guard memory replacement (real Node guard, mock upstream only)", () => {
 	async function start(extra: Record<string, string> = {}) {
+		const nodeExecutable = resolveNodeExecutable();
 		const dir = tempDir("ccflare-persistent-fixture-");
 		const programs = writeFixturePrograms(dir);
 		let source = readFileSync(programs.upstream, "utf8");
+		// The runner owns PATH; pin this mock to the same verified native runtime.
+		source = source.replace("#!/usr/bin/env node", `#!${nodeExecutable}`);
 		source = source.replace(
 			"res.end('{}');",
 			"res.end(JSON.stringify({git_sha:existsSync(`${process.env.CAPTURE_DIR}/bad-health`) ? 'wrong-sha' : 'fixture-sha'}));",
@@ -1153,9 +1157,7 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 			{
 				...rssPolicy({ RUNNER_RSS_POLL_INTERVAL_MS: "20" }),
 				RUNNER_PERSISTENT_GUARD: "1",
-				NODE_BIN:
-					process.env.GUARD_NODE_BIN ||
-					"/home/will/.local/share/mise/shims/node",
+				NODE_BIN: nodeExecutable,
 				GUARD_PORT: String(guardPort),
 				GUARD_SOURCE_ID: "fixture-sha",
 				GUARD_TOTAL_DEADLINE_MS: "2000",

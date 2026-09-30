@@ -8,6 +8,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGuard } from "../ccflare-guard.mjs";
+import { resolveNodeExecutable } from "./node-runtime";
 
 const cleanups: Array<() => Promise<unknown> | void> = [];
 afterEach(async () => {
@@ -287,7 +288,7 @@ test("native Node body receipt timeout cannot preempt the finite paused-upload d
  process.on('SIGTERM',()=>guard.shutdown('SIGTERM',{exitProcess:true}));
  `;
 	const child = spawn(
-		process.env.GUARD_NODE_BIN || "/home/will/.local/share/mise/shims/node",
+		resolveNodeExecutable(),
 		["--input-type=module", "--eval", script],
 		{ stdio: ["ignore", "pipe", "pipe"] },
 	);
@@ -432,3 +433,9 @@ test("trickled unauthenticated control input cannot pin all command slots", asyn
 		for (const socket of sockets) socket.destroy();
 	}
 }, 5000);
+
+test("native fixture runtime resolution rejects Bun instead of silently weakening coverage", () => {
+	expect(() =>
+		resolveNodeExecutable({ ...process.env, GUARD_NODE_BIN: process.execPath }),
+	).toThrow("require Node");
+});
