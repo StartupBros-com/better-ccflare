@@ -62,6 +62,13 @@ RUNNER_PROC_ROOT=${RUNNER_PROC_ROOT:-/proc}
 # bounded status below.
 RUNNER_CIRCUIT_HOLD=${RUNNER_CIRCUIT_HOLD:-auto}
 RUNNER_CIRCUIT_EXIT_STATUS=75
+RUNNER_PERSISTENT_GUARD=${RUNNER_PERSISTENT_GUARD:-1}
+case "$RUNNER_PERSISTENT_GUARD" in 0 | 1) ;; *) printf 'invalid RUNNER_PERSISTENT_GUARD\n' >&2; exit 64 ;; esac
+control_dir=""
+control_pid=""
+guard_control_secret=""
+upstream_generation=1
+pending_replacement=0
 
 upstream_pid=""
 guard_pid=""
@@ -256,7 +263,7 @@ stop_stack_children() {
 
 proc_start_time() {
 	local line rest
-	IFS= read -r line <"$RUNNER_PROC_ROOT/$1/stat" || return 1
+	IFS= read -r line <"${2:-$RUNNER_PROC_ROOT}/$1/stat" || return 1
 	rest="${line##*) }"
 	set -- $rest
 	[[ "${20}" =~ ^[0-9]+$ ]] || return 1
@@ -402,8 +409,10 @@ cleanup() {
 	fi
 	cleanup_ran=1
 	trap - EXIT TERM INT
+	if [[ -n "$control_pid" ]]; then kill "$control_pid" 2>/dev/null || true; wait "$control_pid" 2>/dev/null || true; control_pid=""; fi
 	log "stopping ccflare stack"
 	stop_stack_children
+	if [[ -n "$control_dir" ]]; then rm -f -- "$control_dir/control.sock"; rmdir -- "$control_dir" 2>/dev/null || true; fi
 }
 
 terminate() {
@@ -556,6 +565,48 @@ generate_guard_correlation_secret() {
 	guard_correlation_secret="$secret"
 }
 
+# The socket directory is private and per runner lifetime; credentials never
+# enter argv, logs, or persistent files. The client is an owned child so TERM
+# interrupts a pending drain instead of waiting for a long synchronous command.
+guard_control() {
+	local command="$1" target_generation="$2" candidate_pid="${3:-0}" candidate_start="${4:-0}" status
+	GUARD_CONTROL_SECRET="$guard_control_secret" CCFLARE_GUARD_CORRELATION_SECRET="$guard_correlation_secret" \
+		"$NODE_BIN" - "$control_dir/control.sock" "$command" "$target_generation" "$candidate_pid" "$candidate_start" "$GUARD_STOP_BUDGET_MS" <<'NODE' &
+const net = require("node:net");
+const [path, command, generation, pid, startTime, budget] = process.argv.slice(2);
+const socket = net.createConnection(path);
+let output = "", settled = false;
+const fail = () => { if (settled) return; settled = true; socket.destroy(); process.exitCode = 1; };
+socket.setTimeout(Number(budget) + 3000, fail);
+socket.on("error", fail);
+socket.on("connect", () => socket.write(JSON.stringify({ command, generation: Number(generation), pid: Number(pid), startTime, secret: process.env.GUARD_CONTROL_SECRET, correlationSecret: process.env.CCFLARE_GUARD_CORRELATION_SECRET }) + "\n"));
+socket.on("data", chunk => { output += chunk.toString(); if (output.length > 4096) fail(); });
+socket.on("end", () => {
+ if (settled) return;
+ try { const result = JSON.parse(output); if (!result.ok) { fail(); return; } settled = true; if (result.outcome) process.stdout.write(`guard recycle outcome=${result.outcome}\n`); }
+ catch { fail(); }
+});
+NODE
+	control_pid=$!
+	if wait "$control_pid"; then status=0; else status=$?; fi
+	control_pid=""
+	return "$status"
+}
+
+recycle_upstream_with_persistent_guard() {
+	log "memory recycle drain starting; ordering=guard-barrier,upstream; grace_ms=${GUARD_SHUTDOWN_GRACE_MS}; guard_listener=retained"
+	guard_control begin "$upstream_generation" || return 1
+	# The guard has fenced all old dispatches. Reap the sole DB owner before
+	# allowing a replacement to bind the same upstream port.
+	stop_child "better-ccflare upstream" "$upstream_pid" 5000
+	wait "$upstream_pid" 2>/dev/null || true
+	upstream_pid=""
+	[[ -n "$watchdog_pid" ]] && { wait "$watchdog_pid" 2>/dev/null || true; }
+	watchdog_pid=""
+	((upstream_generation += 1))
+	pending_replacement=1
+}
+
 tunnel_is_required() {
 	case "$AI_GATEWAY_TUNNEL_REQUIRED" in
 		1 | true | TRUE | yes | YES) return 0 ;;
@@ -600,7 +651,7 @@ run_stack_once() {
 		return 1
 	fi
 
-	if ! start_ai_gateway_tunnel; then
+	if [[ -z "$guard_pid" ]] && ! start_ai_gateway_tunnel; then
 		if tunnel_is_required; then
 			# Preserve the operator-facing startup boundary while handing the
 			# failure to the bounded supervisor instead of spinning a fatal loop.
@@ -616,6 +667,16 @@ run_stack_once() {
 		child_exit_name=""
 		child_exit_status=1
 		child_exit_class="failure"
+	fi
+
+	if [[ -z "$guard_pid" && "$RUNNER_PERSISTENT_GUARD" == "1" ]]; then
+		if [[ -n "$control_dir" ]]; then rm -f -- "$control_dir/control.sock"; rmdir -- "$control_dir" 2>/dev/null || true; fi
+		control_dir="$(mktemp -d "${TMPDIR:-/tmp}/ccflare-control.XXXXXX")"
+		chmod 700 "$control_dir"
+		guard_control_secret="$(LC_ALL=C head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
+		[[ "$guard_control_secret" =~ ^[A-Za-z0-9_-]{43}$ ]] || return 1
+		upstream_generation=1
+		pending_replacement=0
 	fi
 
 	log "starting better-ccflare upstream on 127.0.0.1:${UPSTREAM_PORT}"
@@ -640,6 +701,13 @@ run_stack_once() {
 		return 1
 	fi
 
+	if [[ -n "$guard_pid" ]]; then
+		if ! guard_control attach "$upstream_generation" "$upstream_pid" "$(proc_start_time "$upstream_pid" /proc)"; then
+			log "replacement generation verification failed; admission remains fenced"
+			return 1
+		fi
+		pending_replacement=0
+	else
 	log "starting ccflare guard on 127.0.0.1:${GUARD_PORT} -> 127.0.0.1:${UPSTREAM_PORT}; failure_cleanup_budget_ms=${RUNNER_FAILURE_STOP_BUDGET_MS}; intentional_stop_budget_ms=${GUARD_STOP_BUDGET_MS}"
 	HOME="$HOME" \
 		USER="$USER" \
@@ -647,6 +715,8 @@ run_stack_once() {
 		GUARD_PORT="$GUARD_PORT" \
 		CCFLARE_UPSTREAM="http://127.0.0.1:${UPSTREAM_PORT}" \
 		GUARD_UPSTREAM_PID="${upstream_pid}" \
+		GUARD_CONTROL_SOCKET="${control_dir:+$control_dir/control.sock}" \
+		GUARD_CONTROL_SECRET="$guard_control_secret" \
 		CCFLARE_GUARD_CORRELATION_SECRET="$guard_correlation_secret" \
 		GUARD_MAX_ACTIVE="$GUARD_EFFECTIVE_MAX_ACTIVE" \
 		GUARD_MAX_QUEUE="${CCFLARE_GUARD_MAX_QUEUE:-${GUARD_MAX_QUEUE:-500}}" \
@@ -669,6 +739,7 @@ run_stack_once() {
 		return 1
 	fi
 
+	fi
 	stack_started_ms="$(epoch_ms)"
 	log "ccflare stack ready; upstream_pid=${upstream_pid} guard_pid=${guard_pid}"
 	local -a child_pids=("$upstream_pid" "$guard_pid")
@@ -799,11 +870,22 @@ while :; do
 		if ((rss_recycle_window_started_ms == 0 || now_ms - rss_recycle_window_started_ms >= RUNNER_RSS_RECYCLE_WINDOW_MS)); then
 			rss_recycle_window_started_ms=$now_ms; rss_recycle_count=0
 		fi
-		if stop_stack_for_memory_recycle; then
+		if { [[ "$RUNNER_PERSISTENT_GUARD" == "1" ]] && recycle_upstream_with_persistent_guard; } || { [[ "$RUNNER_PERSISTENT_GUARD" == "0" ]] && stop_stack_for_memory_recycle; }; then
 			((rss_recycle_count += 1)); rss_last_recycle_ms=$now_ms
 			log "restarting stack after memory recycle; recycle_count=${rss_recycle_count}; no_failure_backoff=true"
 			continue
 		fi
+	fi
+	if ((pending_replacement)) && [[ -n "$guard_pid" ]] && kill -0 "$guard_pid" 2>/dev/null; then
+		stop_child "failed replacement upstream" "$upstream_pid" "$RUNNER_FAILURE_STOP_BUDGET_MS"
+		wait "${upstream_pid:-0}" 2>/dev/null || true
+		upstream_pid=""
+		log "replacement failed; guard remains available with bounded admission"
+		if schedule_restart; then continue; else replacement_status=$?; fi
+		# Exhausting the existing circuit is terminal; ordinary cleanup/systemd
+		# owns recovery. Never leave an active unit with no viable upstream.
+		stop_stack_children "$RUNNER_FAILURE_STOP_BUDGET_MS"
+		exit "$replacement_status"
 	fi
 	stop_stack_children "$RUNNER_FAILURE_STOP_BUDGET_MS"
 	if ((shutdown_requested)); then
