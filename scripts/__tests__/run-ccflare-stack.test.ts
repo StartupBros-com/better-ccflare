@@ -12,6 +12,7 @@ import {
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveNodeExecutable } from "./node-runtime";
 
 const repoRoot = join(import.meta.dir, "..", "..");
 const runnerScript = join(repoRoot, "scripts", "run-ccflare-stack.sh");
@@ -226,6 +227,7 @@ async function spawnRunnerFixture(
 			RUNNER_HEALTH_MAX_ATTEMPTS: "100",
 			RUNNER_HEALTH_STABILITY_DELAY_MS: "0",
 			RUNNER_CIRCUIT_HOLD: "false",
+			RUNNER_PERSISTENT_GUARD: "0",
 			RUNNER_PROC_ROOT: join(captureDir, "proc"),
 			...extraEnv,
 		},
@@ -1126,4 +1128,159 @@ describe("run-ccflare-stack supervisor lifecycle", () => {
 			);
 			expect(output.stdout).not.toContain("paused until operator restart");
 	}, 10_000);
+});
+
+
+describe("persistent guard memory replacement (real Node guard, mock upstream only)", () => {
+	async function start(extra: Record<string, string> = {}) {
+		const nodeExecutable = resolveNodeExecutable();
+		const dir = tempDir("ccflare-persistent-fixture-");
+		const programs = writeFixturePrograms(dir);
+		let source = readFileSync(programs.upstream, "utf8");
+		// The runner owns PATH; pin this mock to the same verified native runtime.
+		source = source.replace("#!/usr/bin/env node", `#!${nodeExecutable}`);
+		source = source.replace(
+			"res.end('{}');",
+			"res.end(JSON.stringify({git_sha:existsSync(`${process.env.CAPTURE_DIR}/bad-health`) ? 'wrong-sha' : 'fixture-sha'}));",
+		);
+		source = source.replace(
+			"const server = http.createServer((_req, res) => {",
+			"const server = http.createServer((_req, res) => { if(_req.url === '/hold') { res.writeHead(200); res.write('first'); setTimeout(()=>res.end('last'), 250); return; }",
+		);
+		writeFileSync(programs.upstream, source);
+		const guardPort = await allocatePort();
+		const runner = await spawnRunner(
+			{
+				upstream: programs.upstream,
+				guard: join(repoRoot, "scripts/ccflare-guard.mjs"),
+			},
+			{
+				...rssPolicy({ RUNNER_RSS_POLL_INTERVAL_MS: "20" }),
+				RUNNER_PERSISTENT_GUARD: "1",
+				NODE_BIN: nodeExecutable,
+				GUARD_PORT: String(guardPort),
+				GUARD_SOURCE_ID: "fixture-sha",
+				GUARD_TOTAL_DEADLINE_MS: "2000",
+				GUARD_SHUTDOWN_GRACE_MS: "2000",
+				GUARD_RETRY_ATTEMPT_HEADROOM_MS: "10",
+				GUARD_MAX_RECOVERY_SLEEP_MS: "20",
+				...extra,
+			},
+		);
+		await waitForOutput(runner, "ccflare stack ready");
+		return { runner, base: `http://127.0.0.1:${guardPort}` };
+	}
+	test("retains guard pid, drains old work, rotates credentials and reaps old owner before replacement", async () => {
+		const { runner, base } = await start();
+		try {
+			const before = await (await fetch(`${base}/_guard/health`)).json();
+			const initialStartCount = generationCount(runner);
+			const initialLogLength = runner.getOutput().stdout.length;
+			const stream = await fetch(`${base}/hold`);
+			const body = stream.text();
+			setRssKiB(runner, 20);
+			await waitForOutput(runner, "guard_recycle_begin");
+			const during = await (await fetch(`${base}/_guard/health`)).json();
+			expect(during.lifecycle.state).toBe("draining");
+			const next = fetch(`${base}/v1/messages`, {
+				method: "POST",
+				body: "fixture",
+			});
+			expect(await body).toBe("firstlast");
+			expect((await next).status).toBe(200);
+			const after = await (await fetch(`${base}/_guard/health`)).json();
+			expect(after.runtime.process.guardPid).toBe(
+				before.runtime.process.guardPid,
+			);
+			expect(after.runtime.process.upstreamPid).not.toBe(
+				before.runtime.process.upstreamPid,
+			);
+			expect(after.lifecycle.generation).toBe(2);
+			const starts = readFileSync(
+				join(runner.captureDir, "upstream.json"),
+				"utf8",
+			)
+				.trim()
+				.split("\n")
+				.map((x) => JSON.parse(x));
+			try {
+				expect(starts).toHaveLength(2);
+			} catch (error) {
+				// Keep startup retries distinct from replacement attempts. Never print
+				// upstream.json: it deliberately captures synthetic credentials.
+				const output = runner.getOutput();
+				const redact = (value: string) => starts.reduce(
+					(text, record) => typeof record.secret === "string"
+						? text.replaceAll(record.secret, "[redacted]") : text,
+					value,
+				);
+				console.error(JSON.stringify({
+					event: "persistent_handoff_fixture_failure",
+					initialStartCount,
+					initialUpstreamPid: before.runtime.process.upstreamPid,
+					initialGeneration: before.lifecycle.generation,
+					finalUpstreamPid: after.runtime.process.upstreamPid,
+					finalGeneration: after.lifecycle.generation,
+					startedPids: starts.map((record) => record.pid),
+					startupLog: redact(output.stdout.slice(0, initialLogLength)),
+					handoffLog: redact(output.stdout.slice(initialLogLength)),
+					stderr: redact(output.stderr),
+					lifecycle: readFileSync(join(runner.captureDir, "lifecycle.log"), "utf8"),
+				}));
+				throw error;
+			}
+			expect(starts[1].secret).not.toBe(starts[0].secret);
+			const events = readFileSync(
+				join(runner.captureDir, "lifecycle.log"),
+				"utf8",
+			)
+				.trim()
+				.split("\n");
+			expect(events.indexOf(`upstream-term ${starts[0].pid}`)).toBeLessThan(
+				events.indexOf(`upstream-start ${starts[1].pid}`),
+			);
+			expect(runner.getOutput().stdout).not.toContain(starts[1].secret);
+		} finally {
+			await stopRunner(runner);
+		}
+	}, 15000);
+	test("failed replacement remains fenced and retries the same generation within the circuit", async () => {
+		const { runner, base } = await start({
+			RUNNER_RESTART_BACKOFF_BASE_MS: "500",
+			RUNNER_RESTART_BACKOFF_MAX_MS: "500",
+		});
+		try {
+			writeFileSync(join(runner.captureDir, "bad-health"), "1");
+			setRssKiB(runner, 20);
+			await waitForOutput(
+				runner,
+				"replacement failed; guard remains available",
+			);
+			const health = await (await fetch(`${base}/_guard/health`)).json();
+			expect(health.lifecycle.state).toBe("absent");
+			expect(health.lifecycle.generation).toBe(1);
+			expect((await fetch(`${base}/health`)).status).toBe(503);
+			rmSync(join(runner.captureDir, "bad-health"));
+			await waitForOutput(runner, "guard_recycle_attached");
+			expect(
+				(await (await fetch(`${base}/_guard/health`)).json()).lifecycle
+					.generation,
+			).toBe(2);
+			expect(generationCount(runner)).toBe(3);
+		} finally {
+			await stopRunner(runner);
+		}
+	}, 15000);
+	test("external TERM during a pending drain preserves terminal shutdown and starts no replacement", async () => {
+		const { runner, base } = await start();
+		const response = await fetch(`${base}/hold`);
+		const body = response.text().catch(() => "aborted");
+		setRssKiB(runner, 20);
+		await waitForOutput(runner, "guard_recycle_begin");
+		const exit = waitForExit(runner.child);
+		runner.child.kill("SIGTERM");
+		expect((await exit).code).toBe(143);
+		await body;
+		expect(generationCount(runner)).toBe(1);
+	}, 15000);
 });

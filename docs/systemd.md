@@ -541,3 +541,37 @@ systemctl restart ccflare-stack.service
 Leave `CCFLARE_CODEX_PROMPT_CACHE_KEY` unset to preserve the default-enabled conversation-scoped prompt-cache-key behavior, or retain any existing nonzero value. Remove `CCFLARE_CODEX_CACHE_KEY_MODE=session` if an explicit session override was present, because that override takes precedence over the percentage. If prompt cache keys themselves must be disabled, set `CCFLARE_CODEX_PROMPT_CACHE_KEY=0` as a separate rollback decision.
 
 Accounts with mature repeated 429 streaks use process-local single-flight recovery probes after cooldown expiry. Journal events are `cooldown_probe_admitted`, `cooldown_probe_suppressed`, `cooldown_probe_recovery_success`, and `cooldown_probe_reapplied`. The upstream reset time remains authoritative; probe gating prevents concurrent re-entry without imposing a longer fixed cooldown.
+
+
+### Listener-preserving memory recycling
+
+The runner defaults `RUNNER_PERSISTENT_GUARD=1`. An RSS+swap watchdog recycle
+keeps the existing guard and SSH tunnel alive. A private per-runner Unix socket
+(mode 0600 inside a 0700 directory) authenticates the drain and replacement
+commands; generation numbers reject stale transitions. Control and correlation
+credentials travel only through child environments/private IPC, never argv or logs.
+
+The guard pauses new dispatches and retains already-dispatched requests through
+the existing shutdown grace. Requests accepted during the pause wait in a bounded,
+cancellable queue before body reads, using their original guard deadline. Existing
+concurrency/body-reader queues and weighted body limits remain in force. The native whole-upload timeout is disabled because every post-header path has
+an owned request deadline or bounded discard; the native 60-second header timeout
+remains enabled. Queue saturation returns an explicit 503; expired requests retain the existing deadline
+error. `/_guard/health` stays available and exposes lifecycle state, generation,
+waiting/dispatched counts and recycle counters. `/health` returns a prompt 503
+while the upstream is unavailable; it never claims the backend is healthy.
+
+After a natural or bounded forced drain, the runner stops and reaps the old sole
+upstream before launching the replacement. The guard verifies process start time,
+executable digest, ownership of the upstream listening socket and health build SHA,
+then updates runtime PID/artifact identity and rotates the correlation signer before
+releasing waiting requests. Already-dispatched requests are never replayed across
+this boundary. Failed replacements remain fenced while the existing bounded
+restart circuit applies. Terminal TERM/INT still shuts the entire stack down.
+
+This handoff is intentionally limited to watchdog memory recycling. Official
+production deployments still replace the full service through
+`scripts/deploy-ccflare.sh`, including the guard, and can interrupt admission while
+draining. `RUNNER_PERSISTENT_GUARD=0` retains the legacy full-stack recycling path
+for explicit rollback. The memory threshold, swap accounting, recycle cap, response
+idle controls and request deadlines are unchanged.

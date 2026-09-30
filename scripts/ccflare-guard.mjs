@@ -1,15 +1,24 @@
 #!/usr/bin/env node
 
-import { createHash, createHmac, randomUUID } from "node:crypto";
 import {
+	createHash,
+	createHmac,
+	randomUUID,
+	timingSafeEqual,
+} from "node:crypto";
+import {
+	chmodSync,
 	closeSync,
 	openSync,
 	readFileSync,
+	readdirSync,
+	readlinkSync,
 	readSync,
 	realpathSync,
 	statSync,
 } from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import https from "node:https";
 import {
 	Duplex,
@@ -1448,7 +1457,7 @@ function transportErrorFields(error) {
 
 export function createGuard(options = {}) {
 	const env = options.env || process.env;
-	const signGuardCorrelation = createGuardCorrelationSigner(
+	let signGuardCorrelation = createGuardCorrelationSigner(
 		options.guardCorrelationSecret ?? env[GUARD_CORRELATION_SECRET_ENV],
 	);
 	const listenHost = options.listenHost ?? env.GUARD_HOST ?? "127.0.0.1";
@@ -1655,6 +1664,10 @@ export function createGuard(options = {}) {
 		bodyReaderBudgetBlocked: 0,
 		responseBodyIdleTimeouts: 0,
 		drainingRejected: 0,
+		recycles: 0,
+		recycleQueued: 0,
+		recycleQueueFull: 0,
+		recycleForcedRequests: 0,
 		// R21: per-outcome counts for terminal upstream-driven responses logged
 		// via proxy_response/proxy_final_error (see outcomeForStatus above).
 		success: 0,
@@ -1668,6 +1681,316 @@ export function createGuard(options = {}) {
 	let activeRecoveryWaits = 0;
 	let peakRecoveryWaits = 0;
 	let draining = false;
+	const controlSocketPath =
+		options.controlSocketPath ?? env.GUARD_CONTROL_SOCKET;
+	const controlSecret = options.controlSecret ?? env.GUARD_CONTROL_SECRET;
+	const lifecycleEnabled = Boolean(
+		options.lifecycleEnabled || controlSocketPath,
+	);
+	if (controlSocketPath && !decodeGuardCorrelationSecret(controlSecret)) {
+		throw new Error("private guard control requires a 32-byte credential");
+	}
+	let lifecycle = "serving";
+	let shutdownAllowsAdmission = false;
+	let generation = 1;
+	const contexts = new Map();
+	const lifecycleWaiters = new Set();
+	let recyclePending = null;
+	let recycleTimer = null;
+	let attaching = false;
+	let replacementIdentity = null;
+	let lastRecycleOutcome = null;
+	const controlSockets = new Set();
+	const lifecycleSnapshot = () => ({
+		state: lifecycle,
+		generation,
+		waiting: lifecycleWaiters.size,
+		dispatched: [...contexts.values()].filter((c) => c.generation != null)
+			.length,
+		lastRecycleOutcome,
+	});
+	function lifecycleError(code = "GUARD_RECYCLE_UNAVAILABLE") {
+		const error = new Error("upstream replacement in progress");
+		error.code = code;
+		return error;
+	}
+	function finishRecycle(outcome) {
+		if (!recyclePending) return;
+		clearTimeout(recycleTimer);
+		lastRecycleOutcome = outcome;
+		if (lifecycle !== "shutdown") lifecycle = "absent";
+		const pending = recyclePending;
+		recyclePending = null;
+		log("guard_recycle_drained", { generation, outcome });
+		pending.resolve({ ok: true, generation, outcome });
+	}
+	function checkRecycle() {
+		if (
+			lifecycle === "draining" &&
+			![...contexts.values()].some((c) => c.generation != null)
+		)
+			finishRecycle("natural");
+	}
+	function beginRecycle(requestedGeneration) {
+		if (
+			!lifecycleEnabled ||
+			requestedGeneration !== generation ||
+			!["serving", "draining"].includes(lifecycle)
+		) {
+			return Promise.resolve({
+				ok: false,
+				reason: "invalid_generation_or_state",
+			});
+		}
+		if (recyclePending) return recyclePending.promise;
+		lifecycle = "draining";
+		counters.recycles += 1;
+		let resolve;
+		const promise = new Promise((done) => {
+			resolve = done;
+		});
+		recyclePending = { promise, resolve };
+		log("guard_recycle_begin", lifecycleSnapshot());
+		// Existing dispatched requests own the old generation until final cleanup,
+		// including trusted recovery sleeps. Never replay them on a replacement.
+		recycleTimer = setTimeout(() => {
+			for (const context of contexts.values()) {
+				if (context.generation != null) {
+					counters.recycleForcedRequests += 1;
+					context.abortRecycle();
+				}
+			}
+			finishRecycle("forced");
+		}, shutdownGraceMs);
+		recycleTimer.unref?.();
+		checkRecycle();
+		return promise;
+	}
+	function waitForServing(context) {
+		context.ensureBudget();
+		if (context.generation != null) {
+			if (
+				context.generation === generation &&
+				["serving", "draining", "shutdown"].includes(lifecycle)
+			)
+				return Promise.resolve();
+			return Promise.reject(lifecycleError());
+		}
+		if (lifecycle === "serving" || (lifecycle === "shutdown" && shutdownAllowsAdmission))
+			return Promise.resolve();
+		if (lifecycle === "shutdown") return Promise.reject(lifecycleError());
+		if (lifecycleWaiters.size >= maxQueue) {
+			counters.recycleQueueFull += 1;
+			return Promise.reject(lifecycleError("GUARD_RECYCLE_QUEUE_FULL"));
+		}
+		counters.recycleQueued += 1;
+		return new Promise((resolve, reject) => {
+			const entry = {
+				finish(error) {
+					lifecycleWaiters.delete(entry);
+					context.signal.removeEventListener("abort", abort);
+					if (error) reject(error);
+					else resolve();
+				},
+			};
+			const abort = () => entry.finish(context.signal.reason || abortError());
+			lifecycleWaiters.add(entry);
+			context.signal.addEventListener("abort", abort, { once: true });
+			if (context.signal.aborted) abort();
+		});
+	}
+	function procStartTime(pid) {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		return stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[19];
+	}
+	const initialUpstreamPid = Number(env.GUARD_UPSTREAM_PID);
+	let oldIdentity =
+		Number.isSafeInteger(initialUpstreamPid) && initialUpstreamPid > 1
+			? {
+					pid: initialUpstreamPid,
+					startTime: procStartTime(initialUpstreamPid),
+				}
+			: null;
+	async function verifyReplacement(candidate) {
+		if (
+			!Number.isSafeInteger(candidate.pid) ||
+			candidate.pid <= 1 ||
+			!/^\d+$/.test(candidate.startTime || "")
+		)
+			throw new Error("invalid identity");
+		if (oldIdentity) {
+			let oldStart;
+			try {
+				oldStart = procStartTime(oldIdentity.pid);
+			} catch {
+				/* reaped */
+			}
+			if (oldStart === oldIdentity.startTime)
+				throw new Error("previous upstream still exists");
+		}
+		// A matching health document alone is insufficient: the verified process
+		// must actually own the pinned listener, not merely coexist with it.
+		const portHex = Number(upstreamUrl.port || 80)
+			.toString(16)
+			.toUpperCase()
+			.padStart(4, "0");
+		const listenerInodes = readFileSync("/proc/net/tcp", "utf8")
+			.split("\n")
+			.slice(1)
+			.map((line) => line.trim().split(/\s+/))
+			.filter(
+				(fields) => fields[1] === `0100007F:${portHex}` && fields[3] === "0A",
+			)
+			.map((fields) => fields[9]);
+		const ownsListener = readdirSync(`/proc/${candidate.pid}/fd`).some((fd) => {
+			try {
+				const link = readlinkSync(`/proc/${candidate.pid}/fd/${fd}`);
+				return listenerInodes.some((inode) => link === `socket:[${inode}]`);
+			} catch {
+				return false;
+			}
+		});
+		if (!ownsListener) throw new Error("replacement does not own listener");
+		const artifact = processExecutableIdentity(candidate.pid, "/proc");
+		if (
+			procStartTime(candidate.pid) !== candidate.startTime ||
+			!artifact?.sha256 ||
+			artifact.sha256 !== runtimeIdentity.artifacts.binary?.sha256
+		)
+			throw new Error("replacement executable identity mismatch");
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 2000);
+		try {
+			const probe = await fetchImpl(new URL("/health", upstreamUrl), {
+				signal: controller.signal,
+				redirect: "manual",
+			});
+			if (probe.status !== 200) throw new Error("replacement not ready");
+			const reader = probe.body.getReader();
+			const chunks = [];
+			let bytes = 0;
+			try {
+				while (true) {
+					const { value, done } = await reader.read();
+					if (done) break;
+					bytes += value.length;
+					if (bytes > 65536) throw new Error("health response too large");
+					chunks.push(value);
+				}
+			} finally {
+				await reader.cancel().catch(() => {});
+			}
+			const health = JSON.parse(Buffer.concat(chunks).toString());
+			if (
+				!health.git_sha ||
+				health.git_sha !== sourceId ||
+				procStartTime(candidate.pid) !== candidate.startTime
+			)
+				throw new Error("replacement health identity mismatch");
+			return {
+				pid: candidate.pid,
+				startTime: candidate.startTime,
+				...artifact,
+			};
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+	async function attachReplacement(candidate) {
+		if (
+			!lifecycleEnabled ||
+			lifecycle !== "absent" ||
+			attaching ||
+			candidate?.generation !== generation + 1 ||
+			!decodeGuardCorrelationSecret(candidate.correlationSecret)
+		)
+			return { ok: false, reason: "invalid_generation_or_state" };
+		attaching = true;
+		try {
+			const identity = await (options.verifyReplacement || verifyReplacement)(
+				candidate,
+			);
+			if (!identity || lifecycle !== "absent")
+				return { ok: false, reason: "verification_superseded" };
+			replacementIdentity = identity;
+			oldIdentity = identity;
+			generation = candidate.generation;
+			signGuardCorrelation = createGuardCorrelationSigner(
+				candidate.correlationSecret,
+			);
+			lifecycle = "serving";
+			log("guard_recycle_attached", { generation, upstreamPid: identity.pid });
+			for (const entry of [...lifecycleWaiters]) entry.finish();
+			drainQueue();
+			drainBodyReaderQueue();
+			return { ok: true, generation };
+		} catch {
+			log("guard_recycle_verification_failed", {
+				generation: candidate.generation,
+			});
+			return { ok: false, reason: "verification_failed" };
+		} finally {
+			attaching = false;
+		}
+	}
+	const controlServer = controlSocketPath
+		? net.createServer((socket) => {
+				if (controlSockets.size >= 4) {
+					socket.destroy();
+					return;
+				}
+				controlSockets.add(socket);
+				socket.on("error", () => {});
+				// Absolute, not an idle timer: trickled bytes must not reserve all
+				// private control slots and prevent a watchdog transition.
+				let controlTimer = setTimeout(() => socket.destroy(), 2000);
+				socket.on("close", () => {
+					clearTimeout(controlTimer);
+					controlSockets.delete(socket);
+				});
+				let input = "";
+				let handled = false;
+				socket.on("data", async (chunk) => {
+					if (handled) return;
+					input += chunk.toString();
+					if (input.length > 4096) {
+						socket.destroy();
+						return;
+					}
+					if (!input.includes("\n")) return;
+					handled = true;
+					let command;
+					try {
+						command = JSON.parse(input);
+					} catch {
+						socket.end(JSON.stringify({ ok: false }));
+						return;
+					}
+					if (!command || typeof command !== "object" || Array.isArray(command)) {
+						socket.end(JSON.stringify({ ok: false, reason: "invalid_command" }));
+						return;
+					}
+					const token = Buffer.from(String(command.secret || ""));
+					const expected = Buffer.from(controlSecret);
+					if (
+						token.length !== expected.length ||
+						!timingSafeEqual(token, expected)
+					) {
+						socket.end(JSON.stringify({ ok: false, reason: "unauthorized" }));
+						return;
+					}
+					clearTimeout(controlTimer);
+					controlTimer = setTimeout(() => socket.destroy(), shutdownGraceMs + 5000);
+					const result =
+						command.command === "begin"
+							? await beginRecycle(command.generation)
+							: command.command === "attach"
+								? await attachReplacement(command)
+								: { ok: false, reason: "unknown_command" };
+					socket.end(JSON.stringify(result));
+				});
+			})
+		: null;
 	const queue = [];
 	const bodyReaderQueue = [];
 
@@ -1719,7 +2042,14 @@ export function createGuard(options = {}) {
 
 	function drainQueue() {
 		while (active < maxActive && queue.length > 0) {
-			const next = queue.shift();
+			const index = queue.findIndex(
+				(entry) =>
+					lifecycle === "serving" ||
+					(lifecycle === "shutdown" && shutdownAllowsAdmission) ||
+					contexts.get(entry.id)?.generation === generation,
+			);
+			if (index < 0) return;
+			const [next] = queue.splice(index, 1);
 			if (!next || next.settled) continue;
 			next.settled = true;
 			next.signal?.removeEventListener("abort", next.abort);
@@ -1753,6 +2083,7 @@ export function createGuard(options = {}) {
 
 	function canAcquireBodyReader(reservationBytes) {
 		return (
+			(lifecycle === "serving" || (lifecycle === "shutdown" && shutdownAllowsAdmission)) &&
 			bodyReadersActive < maxBodyReaders &&
 			reservationBytes <= maxBufferedRequestBodyBytes - reservedBodyReaderBytes
 		);
@@ -1834,7 +2165,13 @@ export function createGuard(options = {}) {
 			return Promise.reject(signal.reason || abortError());
 		}
 		// Do not let a newly arriving retry jump ahead of an existing waiter.
-		if (active < maxActive && queue.length === 0) {
+		if (
+			active < maxActive &&
+			queue.length === 0 &&
+			(lifecycle === "serving" ||
+				(lifecycle === "shutdown" && shutdownAllowsAdmission) ||
+				contexts.get(id)?.generation === generation)
+		) {
 			return Promise.resolve(grantLease(0));
 		}
 		if (queue.length >= maxQueue) {
@@ -1943,6 +2280,15 @@ export function createGuard(options = {}) {
 		guardRequestId,
 		guardAttemptOrdinal,
 	) {
+		const context = contexts.get(guardRequestId);
+		do {
+			await waitForServing(context);
+		} while (
+			context.generation == null &&
+			!(lifecycle === "serving" || (lifecycle === "shutdown" && shutdownAllowsAdmission))
+		);
+		context.ensureBudget();
+		context.generation ??= generation;
 		// Sign at the physical-fetch boundary so ordinals describe actual guard
 		// attempts, not queue admissions or planned retries.
 		const guardCorrelationEnvelope = signGuardCorrelation(
@@ -1969,9 +2315,11 @@ export function createGuard(options = {}) {
 		const deadlineAt = acceptedAt + totalDeadlineMs;
 		const deadlineController = new AbortController();
 		const clientController = new AbortController();
+		const recycleController = new AbortController();
 		const combined = combineAbortSignals([
 			deadlineController.signal,
 			clientController.signal,
+			recycleController.signal,
 		]);
 		let abortCause = null;
 		let responseBegun = false;
@@ -2001,8 +2349,12 @@ export function createGuard(options = {}) {
 		res.on("close", onResponseClose);
 		req.socket.on("close", onSocketClose);
 
-		return {
+		const context = {
 			id: randomUUID(),
+			generation: null,
+			abortRecycle() {
+				recycleController.abort(lifecycleError());
+			},
 			acceptedAt,
 			deadlineAt,
 			signal: combined.signal,
@@ -2038,8 +2390,12 @@ export function createGuard(options = {}) {
 				res.off("close", onResponseClose);
 				req.socket.off("close", onSocketClose);
 				combined.dispose();
+				contexts.delete(context.id);
+				checkRecycle();
 			},
 		};
+		contexts.set(context.id, context);
+		return context;
 	}
 
 	function sendJsonError(res, context, status, type, message, headers = {}) {
@@ -2060,6 +2416,23 @@ export function createGuard(options = {}) {
 
 	function handleAbort(error, res, context, attempt, responseTelemetry) {
 		const elapsedMs = now() - context.acceptedAt;
+		if (error?.code?.startsWith("GUARD_RECYCLE_")) {
+			log("guard_recycle_request_terminated", {
+				id: context.id,
+				code: error.code,
+			});
+			if (res.headersSent) res.destroy(error);
+			else
+				sendJsonError(
+					res,
+					context,
+					503,
+					"guard_upstream_unavailable",
+					"upstream replacement in progress",
+					{ "retry-after": "1" },
+				);
+			return true;
+		}
 		if (
 			context.abortCause === "deadline" ||
 			error?.code === "GUARD_DEADLINE_EXCEEDED"
@@ -2803,7 +3176,11 @@ export function createGuard(options = {}) {
 		}
 	}
 
-	const server = http.createServer(async (req, res) => {
+	// Every post-header path has an owned deadline or bounded body drain. Node's
+	// independent 300s whole-upload timeout otherwise preempts a legitimate
+	// maintenance waiter whose body is intentionally not being consumed.
+	// Preserve finite native protection before a complete header is available.
+	const server = http.createServer({ requestTimeout: 0, headersTimeout: 60_000 }, async (req, res) => {
 		// server.close() stops accepting new TCP connections, but a connection
 		// with an in-flight request can still present another keep-alive request.
 		// Gate admission before reading its body or acquiring a concurrency lease
@@ -2829,6 +3206,9 @@ export function createGuard(options = {}) {
 		}
 
 		if (req.url === "/_guard/health") {
+			// Even a GET may carry a slow body. Health bypasses admission, so it
+			// must own its bounded discard after the immediate response.
+			drainRequest(req, requestDrainTimeoutMs, () => onRequestDrainTimeout(null));
 			res.writeHead(200, { "content-type": "application/json" });
 			res.end(
 				JSON.stringify({
@@ -2858,8 +3238,25 @@ export function createGuard(options = {}) {
 					allowLegacyPoolBody,
 					shutdownGraceMs,
 					draining,
+					lifecycle: lifecycleSnapshot(),
 					runtime: {
 						...runtimeIdentity,
+						...(replacementIdentity
+							? {
+									process: {
+										...runtimeIdentity.process,
+										upstreamPid: replacementIdentity.pid,
+										upstreamStartTime: replacementIdentity.startTime,
+									},
+									artifacts: {
+										...runtimeIdentity.artifacts,
+										binary: {
+											path: replacementIdentity.path,
+											sha256: replacementIdentity.sha256,
+										},
+									},
+								}
+							: {}),
 						limits: {
 							totalDeadlineMs,
 							retryAttemptHeadroomMs,
@@ -2906,6 +3303,19 @@ export function createGuard(options = {}) {
 		}
 
 		const context = createRequestContext(req, res);
+		if (req.url === "/health" && lifecycle !== "serving") {
+			drainRequestForContext(req, context);
+			sendJsonError(
+				res,
+				context,
+				503,
+				"guard_upstream_unavailable",
+				"upstream replacement in progress",
+				{ "retry-after": "1" },
+			);
+			context.dispose();
+			return;
+		}
 		const upstreamTarget = resolveUpstreamTarget(req.url, upstreamUrl);
 		if (!upstreamTarget) {
 			drainRequestForContext(req, context);
@@ -2920,6 +3330,14 @@ export function createGuard(options = {}) {
 			return;
 		}
 
+		try {
+			await waitForServing(context);
+		} catch (error) {
+			drainRequestForContext(req, context);
+			handleAbort(error, res, context, 0, null);
+			context.dispose();
+			return;
+		}
 		const limited = isLimitedPath(req);
 		let admissionLease = null;
 		let bodyReaderLease = null;
@@ -3078,7 +3496,15 @@ export function createGuard(options = {}) {
 		socket.on("close", () => sockets.delete(socket));
 	});
 
-	function listen() {
+	async function listen() {
+		if (controlServer)
+			await new Promise((resolve, reject) => {
+				controlServer.once("error", reject);
+				controlServer.listen(controlSocketPath, () => {
+					chmodSync(controlSocketPath, 0o600);
+					resolve();
+				});
+			});
 		return new Promise((resolve, reject) => {
 			const onError = (error) => reject(error);
 			server.once("error", onError);
@@ -3120,6 +3546,22 @@ export function createGuard(options = {}) {
 		// This state transition must precede server.close(): already-open sockets
 		// may otherwise admit fresh work during the close/drain race.
 		draining = true;
+		shutdownAllowsAdmission = lifecycle === "serving";
+		lifecycle = "shutdown";
+		// Terminal shutdown may finish already-admitted work on a serving
+		// generation, but must never reopen a maintenance barrier onto an
+		// absent or not-yet-verified replacement.
+		if (!shutdownAllowsAdmission) {
+			for (const context of contexts.values()) {
+				if (context.generation == null) context.abortRecycle();
+			}
+		}
+		finishRecycle("shutdown");
+		for (const entry of [...lifecycleWaiters]) entry.finish(lifecycleError());
+		drainQueue();
+		drainBodyReaderQueue();
+		controlServer?.close();
+		for (const socket of controlSockets) socket.destroy();
 		log("guard_shutdown", { signal, openSockets: sockets.size });
 		shutdownPromise = new Promise((resolve) => {
 			let terminal = false;
@@ -3153,7 +3595,11 @@ export function createGuard(options = {}) {
 		server,
 		listen,
 		shutdown,
+		recycle: { begin: beginRecycle, attach: attachReplacement },
 		state: {
+			get lifecycle() {
+				return lifecycleSnapshot();
+			},
 			counters,
 			get draining() {
 				return draining;
