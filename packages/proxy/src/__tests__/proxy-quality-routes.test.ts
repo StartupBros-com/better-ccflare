@@ -48,6 +48,7 @@ let ctx: ProxyContext;
 let accounts: Account[];
 let sends: { model: string; authorization: string | null }[];
 let upstream: () => Response;
+let envelopes: Record<string, unknown>[];
 let restores: (() => void)[];
 function account(id: string): Account {
 	return {
@@ -139,6 +140,7 @@ beforeEach(async () => {
 	);
 	accounts = [account("a"), account("b")];
 	sends = [];
+	envelopes = [];
 	upstream = complete;
 	const policy = compileQualityRoutingPolicy({
 		version: 1,
@@ -236,6 +238,7 @@ beforeEach(async () => {
 					has_more: false,
 				});
 			const body = (await req.json()) as { model: string };
+			envelopes.push(body);
 			sends.push({
 				model: body.model,
 				authorization:
@@ -715,6 +718,148 @@ it("rejects unknown quality IDs and hard-route conflicts without provider sends 
 	expect(sends).toHaveLength(0);
 	expect(await service.status(scope)).toBeNull();
 });
+it("preserves native adaptive thinking and effort through owned admission and durable completion", async () => {
+	const body = {
+		thinking: { type: "adaptive" },
+		output_config: { effort: "high" },
+		metadata: { user_id: "synthetic-claude-code" },
+	};
+	const response = await send(request(undefined, {}, body));
+	expect(response.status).toBe(200);
+	await response.text();
+	await flush();
+	expect(envelopes).toHaveLength(1);
+	expect(envelopes[0]).toMatchObject(body);
+	expect(await home()).toMatchObject({ physicalModel: "claude-fable-5-1" });
+});
+
+it.each([
+	false,
+	true,
+])("preserves native context edits, deferred schemas (%s) and signed thinking history without discounts", async (defer_loading) => {
+	const body = {
+		thinking: { type: "adaptive" },
+		context_management: {
+			edits: [
+				{ type: "clear_thinking_20251015" },
+				{ type: "clear_tool_uses_20250919" },
+			],
+		},
+		tools: [
+			{
+				name: "lookup",
+				defer_loading,
+				input_schema: {
+					type: "object",
+					properties: { query: { type: "string" } },
+				},
+			},
+		],
+		messages: [
+			{ role: "user", content: "Find the answer" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "thinking",
+						thinking: "Inspect previous results",
+						signature: "synthetic-signed-history",
+					},
+					{
+						type: "tool_use",
+						id: "call-1",
+						name: "lookup",
+						input: { query: "answer" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{ type: "tool_result", tool_use_id: "call-1", content: "42" },
+				],
+			},
+		],
+	};
+	const response = await send(request(undefined, {}, body));
+	expect(response.status).toBe(200);
+	await response.text();
+	await flush();
+	expect(envelopes).toHaveLength(1);
+	expect(envelopes[0]).toMatchObject(body);
+	expect(await home()).toMatchObject({ physicalModel: "claude-fable-5-1" });
+});
+
+it.each([
+	false,
+	true,
+])("counts all deferred schema bytes even with defer_loading=%s", async (defer_loading) => {
+	const tool = {
+		name: "lookup",
+		defer_loading,
+		input_schema: { type: "object", description: "x".repeat(90000) },
+	};
+	const response = await send(
+		request(
+			undefined,
+			{},
+			{
+				tools: [tool],
+				context_management: { edits: [{ type: "clear_tool_uses_20250919" }] },
+			},
+		),
+	);
+	expect(response.status).toBe(503);
+	expect(sends).toHaveLength(0);
+	expect(await home()).toBeUndefined();
+});
+
+it.each([
+	{ thinking: { type: "adaptive", unknown: true } },
+	{ output_config: { effort: "unlimited" } },
+	{ output_config: { effort: "high", unknown: true } },
+	{
+		thinking: { type: "disabled" },
+		context_management: { edits: [{ type: "clear_thinking_20251015" }] },
+	},
+	{ context_management: { edits: [{ type: "future_edit" }] } },
+	{
+		tools: [
+			{ type: "custom", name: "lookup", input_schema: { type: "object" } },
+		],
+	},
+	{
+		tools: [
+			{
+				name: "lookup",
+				input_schema: { type: "object" },
+				defer_loading: "true",
+			},
+		],
+	},
+	{
+		messages: [
+			{
+				role: "assistant",
+				content: [{ type: "redacted_thinking", data: "opaque" }],
+			},
+		],
+	},
+	{
+		messages: [
+			{
+				role: "assistant",
+				content: [{ type: "thinking", thinking: "history", signature: 1 }],
+			},
+		],
+	},
+])("does not broaden native admission to unknown or incompatible shapes: %j", async (body) => {
+	const response = await send(request(undefined, {}, body));
+	expect(response.status).toBe(503);
+	expect(sends).toHaveLength(0);
+	expect(await home()).toBeUndefined();
+});
+
 it("requires a verified API principal, not raw authorization", async () => {
 	expect(
 		(await send(request(undefined, { authorization: "Bearer spoof" }), null))
@@ -1453,6 +1598,33 @@ it("unsupported hosted work remains typed unavailable rather than bypassing acco
 	expect(sends).toHaveLength(0);
 	expect(await home()).toBeUndefined();
 });
+it("quota exhaustion during preparation blocks the physical send even with manual throttles disabled", async () => {
+	const provider = getProvider("anthropic");
+	if (!provider?.transformRequestBody)
+		throw new Error("missing native provider");
+	const transform = provider.transformRequestBody.bind(provider);
+	const spy = spyOn(provider, "transformRequestBody").mockImplementation(
+		async (...args) => {
+			const prepared = await transform(...args);
+			for (const a of accounts)
+				usageCache.set(a.id, {
+					limits: [
+						{ kind: "weekly_all", percent: 100, resets_at: Date.now() + 60000 },
+					],
+					spend: { enabled: false },
+				} as never);
+			return prepared;
+		},
+	);
+	try {
+		expect((await send()).status).toBe(503);
+		expect(sends).toHaveLength(0);
+		expect(await home()).toBeUndefined();
+	} finally {
+		spy.mockRestore();
+	}
+});
+
 it("original output reserve cannot be weakened during provider transformation", async () => {
 	const provider = getProvider("anthropic");
 	if (!provider?.transformRequestBody)

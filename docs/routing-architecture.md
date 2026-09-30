@@ -331,6 +331,30 @@ flowchart TD
 
 *Source: this fork implements the filter inline rather than in upstream's standalone `model-capacity.ts` module — see `packages/proxy/src/handlers/account-selector.ts` (`getReactiveModelCapacityBlocker`, the hard-capacity exclusion path), `packages/proxy/src/handlers/usage-throttling.ts` (`evaluateHardCapacity`), `packages/proxy/src/handlers/routing-terminal.ts` (the `model_pool_exhausted` terminal outcome), and `packages/proxy/src/handlers/proxy-operations.ts` (the `out_of_credits` 429 handler that feeds the reactive cache — distinct from the unrelated `all_models_exhausted_429` per-account cooldown reason used when an account's own configured model-fallback list is exhausted`).*
 
+## Durable Auto quality routing
+
+This opt-in path is separate from legacy strategy selection and the fail-open manual model-capacity filter above. No policy means no Auto enrollment or discovery entries. Enabled semantic choices are `claude-bccf-quality-auto`, `claude-bccf-quality-fable`, `claude-bccf-quality-astra`, and `claude-bccf-quality-opus`; they are intent IDs, never physical upstream model names. Main Auto starts on Fable → Astra → Opus. An explicit main preference starts on that suffix. Standard and lightweight children use their own approved lanes and independent homes, including while a root response streams. A trusted request-only child without a stable conversation key does not acquire a guessed durable home.
+
+One server-owned `QualityRouteService` connects inference, HTTP controls and the durable repository. The principal is a verified inference API-key identity, not an unverified header, local-control secret or bootstrap authentication exemption. The session string alone is not authority. SQLite and PostgreSQL persist a bounded aggregate with compare-and-swap updates: accepted intent/revision, ingress ordering watermark, per-conversation homes, leases, unresolved dispatches and idempotent control outcomes. Restart reconstructs that state rather than repicking every session.
+
+1. Reserve ingress before accepting a potentially delayed body. Reject conflicting hard routes and unknown intent IDs rather than weakening existing exact-route contracts.
+2. Compile explicitly enrolled account/line candidates. A healthy exact predecessor remains eligible after recovery or successor discovery; catalog order, account priority edits and a newly released model do not themselves displace it.
+3. Recheck selected-account owned catalog, credential epoch, mandatory scoped quota/spend authority and original/final request suitability after preparation. Record a durable dispatch fence before the physical send. A quota or intent change during preparation must still prevent that send.
+4. Settle a home only from validated completion. Proven no-work rejection may authorize the next candidate; ambiguous send, partial stream, cancellation, malformed completion or unproven rate-limit response cannot authorize replay. A request-only fallback does not relabel a healthy stored home.
+5. After delivered output, settlement failure retries **persistence only**, never inference. Unresolved dispatches remain restart-visible and block unsafe continuation; cleanup does not silently erase them. Bound exhaustion rejects new growth rather than evicting live homes or idempotency outcomes.
+
+Selecting the same semantic choice is continuation, not “retry preferred.” The authenticated retry command increments intent revision, fences previously reserved bodies/late completions and makes the next root inference reconsider the preferred suffix without making a provider request itself. Independent child homes survive root retry/leave. Exact idempotent command redelivery returns the saved result; stale revision or changed payload/token combinations fail instead of duplicating a change.
+
+### Completion and explanations
+
+Nonstream validation examines the complete JSON response within an **8 MiB validation budget**, independently of the smaller analytics capture budget. The budget does not truncate delivered output. A larger body may reach the client intact but cannot establish a successful Auto home. Streaming requires actual terminal completion evidence; synthesized recovery or HTTP 200 alone is insufficient.
+
+A bounded, strict, versioned `qualityDecision` (at most 8 KiB after sanitization) records requested intent, selected physical target, skipped-lane reason counts and labeled accounting. Zero-send rejection has no selected target. History uses the first writer's envelope across later usage updates; status distinguishes current/in-flight/pending decisions from the last successful decision/home. Credentials, prompt content and arbitrary provider messages are not explanation fields. Existing unauthenticated badges are not expanded into an authenticated-history bypass.
+
+The current usage-collection path executes in-process; its historical `worker-messages` protocol name is not proof of a live worker thread. End-to-end tests exercise that actual collector/storage path. The former inference worker was retired, so a worker-thread transport roundtrip is **not established** by those tests.
+
+See [configuration](configuration.md#opt-in-auto-quality-routing) for capability/estimate boundaries and separate activation gates, and [CLI controls](cli.md#auto-quality-session-controls) for authenticated operations.
+
 ## Selection Diagnostics
 
 When selection ends without an upstream dispatch, the proxy emits a bounded `routing_diagnostics` object in the `route_unavailable` error and records the same shape in structured logs. It contains only candidate counts and policy/profile flags — never account IDs, names, headers, request bodies, or provider messages. Selection-origin terminals always include `attempted_routes: 0`; this is the authoritative distinction between “no route was sent” and a terminal produced after upstream attempts.

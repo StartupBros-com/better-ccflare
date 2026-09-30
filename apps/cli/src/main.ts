@@ -2004,7 +2004,7 @@ async function main() {
 	await new Promise(() => {});
 }
 
-if (import.meta.main) {
+export function startCli() {
 	// Run main and handle errors
 	main().catch(async (error) => {
 		console.error("Error:", error.message);
@@ -2023,3 +2023,5 @@ if (import.meta.main) {
 		await exitGracefully(0);
 	});
 }
+
+if (import.meta.main) startCli();

@@ -1,11 +1,33 @@
 import { expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
 	parseQualityRouteCommand,
 	runQualityRouteCommand,
 } from "../quality-route-control";
+
+// Host builds the binary separately. Reuse the same isolated transport/credential
+// tests for the compiled entrypoint instead of treating source-only tests as proof.
+function cliEntrypoint(): string[] {
+	const binary = process.env.BETTER_CCFLARE_TEST_COMPILED_CLI;
+	if (binary) {
+		if (!isAbsolute(binary))
+			throw new Error("Compiled CLI test path must be absolute");
+		return [binary];
+	}
+	return [
+		process.execPath,
+		"--no-env-file",
+		new URL("../main.ts", import.meta.url).pathname,
+	];
+}
 
 it("actual CLI transport denies ambient proxies before sending, works directly, and refuses redirects", async () => {
 	let proxyCalls = 0;
@@ -45,9 +67,7 @@ it("actual CLI transport denies ambient proxies before sending, works directly, 
 			redirect = mode === "redirect";
 			const child = Bun.spawn(
 				[
-					process.execPath,
-					"--no-env-file",
-					new URL("../main.ts", import.meta.url).pathname,
+					...cliEntrypoint(),
 					"--quality-routing-status",
 					"session-a",
 					"--origin",
@@ -101,21 +121,34 @@ it("actual CLI transport denies ambient proxies before sending, works directly, 
 	}
 });
 it("the actual CLI command never loads a dotenv credential or starts inference", async () => {
+	let calls = 0;
+	const target = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch() {
+			calls++;
+			return Response.json({
+				status: "known",
+				incarnation: "synthetic",
+				intentRevision: 1,
+			});
+		},
+	});
 	const directory = mkdtempSync(join(tmpdir(), "quality-cli-"));
 	try {
-		writeFileSync(
-			join(directory, ".env"),
-			"SYNTHETIC_INFERENCE_KEY=synthetic-file-secret\n",
-		);
+		for (const file of [".env", ".env.local", ".env.production"]) {
+			writeFileSync(
+				join(directory, file),
+				"SYNTHETIC_INFERENCE_KEY=synthetic-file-secret\n",
+			);
+		}
 		const child = Bun.spawn(
 			[
-				process.execPath,
-				"--no-env-file",
-				new URL("../main.ts", import.meta.url).pathname,
+				...cliEntrypoint(),
 				"--quality-routing-status",
 				"session-a",
 				"--origin",
-				"http://127.0.0.1:1",
+				`http://127.0.0.1:${target.port}`,
 				"--credential-env",
 				"SYNTHETIC_INFERENCE_KEY",
 			],
@@ -134,11 +167,151 @@ it("the actual CLI command never loads a dotenv credential or starts inference",
 		const stderr = await new Response(child.stderr).text();
 		expect(await child.exited).toBe(1);
 		expect(stdout.trim()).toBe('{"status":"missing-credential"}');
-		expect(stderr).not.toContain("synthetic-file-secret");
+		expect(stdout + stderr).not.toContain("synthetic-file-secret");
+		expect(calls).toBe(0);
 	} finally {
+		target.stop(true);
 		rmSync(directory, { recursive: true });
 	}
 });
+// Characterize ordinary startup with the real binary (or source runtime), not a
+// replacement dotenv parser. --list only opens an empty synthetic local database.
+for (const scenario of [
+	{
+		name: "default development",
+		nodeEnv: undefined,
+		files: [".env", ".env.development", ".env.production"],
+		winner: "development",
+	},
+	{ name: "base", nodeEnv: "production", files: [".env"], winner: "base" },
+	{
+		name: "production",
+		nodeEnv: "production",
+		files: [".env", ".env.production"],
+		winner: "production",
+	},
+	{
+		name: "local",
+		nodeEnv: "production",
+		files: [".env", ".env.production", ".env.local"],
+		winner: "local",
+	},
+	{
+		name: "development",
+		nodeEnv: "development",
+		files: [".env", ".env.development"],
+		winner: "development",
+	},
+	{
+		name: "test ignores local",
+		nodeEnv: "test",
+		files: [".env", ".env.test", ".env.local"],
+		winner: "test",
+	},
+	{
+		name: "process wins",
+		nodeEnv: "production",
+		files: [".env", ".env.production", ".env.local"],
+		winner: "process",
+	},
+]) {
+	it(`ordinary CLI preserves dotenv precedence and expansion: ${scenario.name}`, async () => {
+		const directory = mkdtempSync(join(tmpdir(), "quality-cli-ordinary-"));
+		try {
+			for (const file of scenario.files) {
+				const label = file === ".env" ? "base" : file.slice(5);
+				writeFileSync(
+					join(directory, file),
+					`SYNTHETIC_STEM=${label}\nBETTER_CCFLARE_DB_PATH="$SYNTHETIC_DIRECTORY/\${SYNTHETIC_STEM}.db"\n`,
+				);
+			}
+			const entrypoint = process.env.BETTER_CCFLARE_TEST_COMPILED_CLI
+				? cliEntrypoint()
+				: [process.execPath, new URL("../main.ts", import.meta.url).pathname];
+			const child = Bun.spawn([...entrypoint, "--list"], {
+				cwd: directory,
+				env: {
+					HOME: directory,
+					XDG_CONFIG_HOME: directory,
+					TMPDIR: directory,
+					PATH: process.env.PATH ?? "",
+					NODE_ENV: scenario.nodeEnv,
+					SYNTHETIC_DIRECTORY: directory,
+					...(scenario.winner === "process"
+						? { BETTER_CCFLARE_DB_PATH: join(directory, "process.db") }
+						: {}),
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const stdout = await new Response(child.stdout).text();
+			const stderr = await new Response(child.stderr).text();
+			expect({ exit: await child.exited, stdout, stderr }).toMatchObject({
+				exit: 0,
+			});
+			expect(stdout).toContain("No accounts configured");
+			expect(existsSync(join(directory, `${scenario.winner}.db`))).toBe(true);
+		} finally {
+			rmSync(directory, { recursive: true });
+		}
+	});
+}
+
+it.skipIf(!process.env.BETTER_CCFLARE_TEST_COMPILED_CLI)(
+	"compiled ordinary CLI preserves project dotenv fallback",
+	async () => {
+		const directory = mkdtempSync(join(tmpdir(), "quality-cli-fallback-"));
+		try {
+			const cwd = join(directory, "work", "cwd");
+			mkdirSync(cwd, { recursive: true });
+			const executable = cliEntrypoint()[0];
+			if (!executable) throw new Error("Compiled CLI required");
+			const database = join(directory, "synthetic.db");
+			writeFileSync(
+				join(directory, ".env"),
+				`BETTER_CCFLARE_DB_PATH=${database}\n`,
+			);
+			const env = {
+				HOME: directory,
+				XDG_CONFIG_HOME: directory,
+				TMPDIR: directory,
+				PATH: process.env.PATH ?? "",
+			};
+			const ordinary = Bun.spawn([executable, "--list"], {
+				cwd,
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const stdout = await new Response(ordinary.stdout).text();
+			const stderr = await new Response(ordinary.stderr).text();
+			expect({ exit: await ordinary.exited, stdout, stderr }).toMatchObject({
+				exit: 0,
+			});
+			expect(stdout).toContain("No accounts configured");
+			expect(existsSync(database)).toBe(true);
+			// The same fallback location is never searched in control mode.
+			const control = Bun.spawn(
+				[
+					executable,
+					"--quality-routing-status",
+					"synthetic-session",
+					"--origin",
+					"http://127.0.0.1:1",
+					"--credential-env",
+					"BETTER_CCFLARE_DB_PATH",
+				],
+				{ cwd, env, stdout: "pipe", stderr: "pipe" },
+			);
+			const result = await new Response(control.stdout).text();
+			expect(await control.exited).toBe(1);
+			expect(result.trim()).toBe('{"status":"missing-credential"}');
+		} finally {
+			rmSync(directory, { recursive: true });
+		}
+	},
+);
+
 const args = [
 	"--quality-routing-retry-preferred",
 	"session-a",

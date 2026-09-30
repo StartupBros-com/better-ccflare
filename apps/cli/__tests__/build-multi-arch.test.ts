@@ -351,6 +351,15 @@ describe("release binary provenance", () => {
 		const packageJson = JSON.parse(
 			readFileSync(join(import.meta.dir, "../package.json"), "utf8"),
 		) as { scripts: Record<string, string> };
+		expect(packageJson.scripts.build).toContain(
+			"bun build src/compiled.ts --compile --no-compile-autoload-dotenv",
+		);
+		const builder = readFileSync(
+			join(import.meta.dir, "../build-multi-arch.ts"),
+			"utf8",
+		);
+		expect(builder).toContain('"src/compiled.ts"');
+		expect(builder).toContain('"--no-compile-autoload-dotenv"');
 		const expectedScripts = {
 			"build:linux-amd64": "bun-linux-amd64",
 			"build:linux-arm64": "bun-linux-arm64",

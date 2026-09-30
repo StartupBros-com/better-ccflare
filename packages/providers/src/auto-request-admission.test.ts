@@ -234,7 +234,13 @@ describe("Auto request suitability (fixtures are not activation proof)", () => {
 	it("keeps unsupported local tool forms and unaccountable media unavailable", () => {
 		for (const tools of [
 			[{ type: "custom", name: "Read" }],
-			[{ name: "Read", input_schema: { type: "object" }, defer_loading: true }],
+			[
+				{
+					name: "Read",
+					input_schema: { type: "object" },
+					defer_loading: "true",
+				},
+			],
 			[{}],
 		]) {
 			const original = { ...body, tools };

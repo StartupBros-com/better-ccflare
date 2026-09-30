@@ -1,16 +1,20 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { randomUUID } from "node:crypto";
-import type { QualityVerifiedSession } from "@better-ccflare/types";
+import type { APIContext, QualityVerifiedSession } from "@better-ccflare/types";
+import { NodeCryptoUtils } from "@better-ccflare/types/api-key";
 import {
 	type RequestRow,
 	sanitizeQualityDecision,
 	toRequest,
 } from "@better-ccflare/types/request";
 import { SQL } from "bun";
+import { APIRouter } from "../../../http-api/src/router";
+import { QualityRouteService } from "../../../proxy/src/quality-route-service";
 import { BunSqlAdapter } from "../adapters/bun-sql-adapter";
 import { ensureSchema } from "../migrations";
 import { ensureSchemaPg, runMigrationsPg } from "../migrations-pg";
+import { ApiKeyRepository } from "../repositories/api-key.repository";
 import { QualityRouteRepository } from "../repositories/quality-route.repository";
 import { RequestRepository } from "../repositories/request.repository";
 
@@ -90,6 +94,104 @@ describe.skipIf(!postgresUrl)(
 					if (admin) await admin.end();
 				}
 			}
+		});
+
+		it("authenticated HTTP exposes durable provenance after reconstruction and fences retry duplicates", async () => {
+			const keys = new ApiKeyRepository(adapters[0]);
+			const secret = "synthetic-pg-u8-owner";
+			await keys.create({
+				id: scope.principalId,
+				name: "synthetic",
+				hashed_key: await new NodeCryptoUtils().hashApiKey(secret),
+				prefix_last_8: secret.slice(-8),
+				created_at: 100,
+				last_used: null,
+				is_active: 1,
+				role: "api-only",
+			});
+			const service = new QualityRouteService(first, () => 1000);
+			const ticket = await service.reserveIngress(scope);
+			await service.acceptRoot(ticket, "auto");
+			const decision = sanitizeQualityDecision({
+				version: 1,
+				policyRevision: "quality-policy-v1:synthetic",
+				requested: { kind: "main", preference: "auto" },
+				selected: target,
+				skippedLanes: [
+					{ lane: "fable", reasons: { "subscription-exhausted": 1 } },
+				],
+			});
+			const lease = await service.acquireLease(
+				scope,
+				ticket.incarnation,
+				"$root",
+				1,
+			);
+			await service.beginDispatch(lease, target, null);
+			await service.settleDispatch(
+				lease,
+				{ kind: "validated-success" },
+				{ requestId: "pg-http-history", decision },
+			);
+			// Use the second real PG connection after recreating the application service.
+			const restarted = new QualityRouteService(second, () => 1001);
+			const router = new APIRouter({
+				db: adapters[1],
+				dbOps: {
+					getAdapter: () => adapters[1],
+					countActiveApiKeys: () => keys.countActive(),
+					getActiveApiKeys: () => keys.findActive(),
+					updateApiKeyUsage: (id: string, at: number) =>
+						keys.updateUsage(id, at),
+				},
+				config: {},
+				qualityRouteService: restarted,
+			} as unknown as APIContext);
+			const call = async (body?: unknown, authorized = true) => {
+				const req = new Request(
+					`http://localhost/v1/quality-routing/sessions/session${body === undefined ? "" : "/retry-preferred"}`,
+					{
+						method: body === undefined ? "GET" : "POST",
+						headers: {
+							"content-type": "application/json",
+							...(authorized ? { authorization: `Bearer ${secret}` } : {}),
+						},
+						...(body === undefined ? {} : { body: JSON.stringify(body) }),
+					},
+				);
+				const response = await router.handleRequest(new URL(req.url), req);
+				if (!response) throw new Error("Control route fell through");
+				return response;
+			};
+			expect((await call(undefined, false)).status).toBe(401);
+			const before = await (await call()).json();
+			expect(before).toMatchObject({
+				status: "known",
+				intentRevision: 1,
+				lastSuccessfulHome: {
+					target: { accountId: "a", physicalModel: "astra-fixture" },
+				},
+			});
+			expect(JSON.stringify(before)).toContain("pg-http-history");
+			expect(before.decision.selected.evidenceRef).toBeUndefined();
+			expect(before.decision.selected.catalogRevision).toBeUndefined();
+			const body = {
+				incarnation: ticket.incarnation,
+				expectedIntentRevision: 1,
+				idempotencyToken: "pg-http-retry",
+			};
+			const retry = await call(body);
+			expect(retry.status).toBe(200);
+			const outcome = await retry.json();
+			expect(outcome).toMatchObject({ status: "ready", intentRevision: 2 });
+			expect(await (await call(body)).json()).toEqual(outcome);
+			expect(
+				(await call({ ...body, idempotencyToken: "stale-retry" })).status,
+			).toBe(409);
+			const after = await (await call()).json();
+			expect(after.intentRevision).toBe(2);
+			expect(after.lastSuccessfulHome).toEqual(before.lastSuccessfulHome);
+			expect(after.decision).toBeNull();
 		});
 
 		it("quality explanations survive fresh/upgrade, late saves and cross-connection readback", async () => {

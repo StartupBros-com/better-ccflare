@@ -1140,6 +1140,27 @@ When experiencing issues, check these in order:
    sqlite3 ~/.config/better-ccflare/better-ccflare.db "PRAGMA integrity_check;"
    ```
 
+## Auto quality routing
+
+Auto is opt-in; an absent policy is not a working live deployment. Diagnose through authenticated session status and request history, not an unauthenticated badge or model name alone. `quality_route_unavailable` with a zero-send explanation is a local admission result, not evidence that a provider rejected an inference request.
+
+| Observation | Interpretation and next diagnostic |
+|---|---|
+| No Auto discovery choices / controls disabled | Confirm policy presence and configuration precedence in the authorized instance; never activate accounts implicitly. |
+| `capacity-evidence-unknown` | Check freshness, resets, activity metadata and account/family scope of the selected account's own usage evidence. A missing limit is not spare capacity. |
+| `spend-not-authorized` / `billing-evidence-unknown` | Provider overage enablement is not operator permission or subscription-only assurance. Do not add a paid grant to make a test green. |
+| `catalog-evidence-stale` / `credential-evidence-unknown` | Recheck owned catalog acquisition time and selected credential epoch. Shared/borrowed listings and cached predecessor limits cannot fill unknowns. |
+| `input-accounting-unknown`, modality/tool/output/context refusal | Compare the original and final envelope against the documented bounded shapes/capabilities. Never strip history/tools/settings or shrink requested output to force admission. Deferred schemas and prospective history clearing receive no accounting discount. |
+| HTTP 200 but no new home | Validate actual terminal success: a truncated/error/cancelled stream, malformed JSON tail or nonstream body over the 8 MiB validation budget does not install a home, even if bytes were delivered. |
+| `unresolved` after restart | A dispatched attempt has no durable settlement. Recover persistence; do not replay inference, delete the fence or clear routing tables. |
+| Retry `stale` / `conflict` | The incarnation/revision changed or the idempotency token was reused with a different payload. Read current authenticated status; do not blindly reissue a newly tokened command. |
+| Healthy lower/predecessor home persists after recovery | Expected: continuation retains the exact healthy home. Use authenticated retry-preferred for deliberate reconsideration, not repeated selection of the same semantic choice. |
+| Compiled CLI missing-credential test sends traffic | Bun standalone dotenv auto-loading precedes the application guard. Reproduced only against an ephemeral synthetic loopback API: status/retry/proxy-denial/redirect checks passed, but a `.env`-only credential was accepted. Fix startup/build behavior and re-run compiled tests; source-only `--no-env-file` results do not establish compiled isolation. Do not solve this by changing production credentials or deleting user dotenv files. |
+
+Remaining activation evidence is explicit: Astra/Sol subscription-specific output/tool/billing guarantees have not been established; native missing capability facts remain unknown. The reported GPT-5.6 picker row has not been observed in the actual affected UI/source, so no picker cleanup is claimed. The needed observation is that UI row plus its actual discovery/configuration source, not unrelated cached model names. Do not scan credential stores, restart shared daemons or delete settings to guess at the cause.
+
+Deployment and activation require separate authorization from current main. Reverse-disable the policy using [the configuration procedure](configuration.md#activation-and-reverse-disable), preserving durable state and legacy routes. Do not use the generic database deletion, account recreation or process-killing suggestions below to repair Auto state.
+
 ### Common Quick Fixes
 
 | Problem | Quick Fix |

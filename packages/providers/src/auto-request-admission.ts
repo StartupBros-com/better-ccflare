@@ -116,7 +116,10 @@ export function revalidateAutoTarget(
 	return current?.evidenceRef === target.evidenceRef ? current : null;
 }
 
-function modalities(body: Record<string, unknown>): Set<string> | null {
+function modalities(
+	body: Record<string, unknown>,
+	native: boolean,
+): Set<string> | null {
 	const found = new Set<string>();
 	const visit = (value: unknown): boolean => {
 		if (typeof value === "string") {
@@ -132,6 +135,15 @@ function modalities(body: Record<string, unknown>): Set<string> | null {
 				return (
 					typeof block.text === "string" &&
 					onlyKeys(block, ["type", "text", "cache_control"])
+				);
+			case "thinking":
+				found.add("text");
+				return (
+					native &&
+					typeof block.thinking === "string" &&
+					typeof block.signature === "string" &&
+					block.signature.length > 0 &&
+					onlyKeys(block, ["type", "thinking", "signature"])
 				);
 			case "image":
 				found.add("image");
@@ -196,7 +208,7 @@ function onlyKeys(
  * existing function adapter. This does NOT infer hosted-tool support from a flag.
  * Unknown tool variants/schemas are deliberately outside this contract.
  */
-function clientTools(body: Record<string, unknown>): boolean {
+function clientTools(body: Record<string, unknown>, native: boolean): boolean {
 	return (
 		body.tools === undefined ||
 		(Array.isArray(body.tools) &&
@@ -209,7 +221,10 @@ function clientTools(body: Record<string, unknown>): boolean {
 						"description",
 						"input_schema",
 						"cache_control",
+						...(native ? ["defer_loading"] : []),
 					]) &&
+					(tool.defer_loading === undefined ||
+						typeof tool.defer_loading === "boolean") &&
 					typeof tool.name === "string" &&
 					tool.name.length > 0 &&
 					(tool.description === undefined ||
@@ -218,6 +233,47 @@ function clientTools(body: Record<string, unknown>): boolean {
 				);
 			}))
 	);
+}
+
+/** Native protocol shapes whose entire JSON representation can be conservatively
+ * counted. This is not permission to rewrite an unsupported combination to fit.
+ */
+function nativeTextConfiguration(body: Record<string, unknown>): boolean {
+	if (body.thinking !== undefined) {
+		const thinking = record(body.thinking);
+		if (
+			!thinking ||
+			!onlyKeys(thinking, ["type"]) ||
+			!["adaptive", "disabled"].includes(String(thinking.type))
+		)
+			return false;
+	}
+	if (body.output_config !== undefined) {
+		const output = record(body.output_config);
+		if (
+			!output ||
+			!onlyKeys(output, ["effort"]) ||
+			!["low", "medium", "high", "max"].includes(String(output.effort))
+		)
+			return false;
+	}
+	if (body.context_management !== undefined) {
+		const context = record(body.context_management);
+		if (
+			!context ||
+			!onlyKeys(context, ["edits"]) ||
+			!Array.isArray(context.edits)
+		)
+			return false;
+		for (const value of context.edits) {
+			const edit = record(value);
+			if (!edit || !onlyKeys(edit, ["type"])) return false;
+			if (edit.type === "clear_thinking_20251015") {
+				if (record(body.thinking)?.type !== "adaptive") return false;
+			} else if (edit.type !== "clear_tool_uses_20250919") return false;
+		}
+	}
+	return true;
 }
 
 function textBlocks(value: unknown, separator: string): string | null {
@@ -466,7 +522,10 @@ export function evaluateAutoRequestAdmission(
 		output > capabilities.maxOutputTokens
 	)
 		return { status: "reject", reason: "output-unsupported" };
-	const requestedModalities = modalities(original);
+	const requestedModalities = modalities(
+		original,
+		target.provider === "anthropic",
+	);
 	if (
 		requestedModalities &&
 		capabilities?.inputModalities &&
@@ -508,7 +567,7 @@ export function evaluateAutoRequestAdmission(
 			return { status: "unknown", reason: "tools-unsupported" };
 		}
 	}
-	if (!hosted && !clientTools(original))
+	if (!hosted && !clientTools(original, target.provider === "anthropic"))
 		return { status: "unknown", reason: "tools-unsupported" };
 	if (target.provider === "anthropic") {
 		const finalOutput = positiveSafeCapacity(final.max_tokens);
@@ -542,6 +601,7 @@ export function evaluateAutoRequestAdmission(
 	// owner exists here yet, so do not accept a caller-supplied count or valid=true.
 	if (
 		hosted ||
+		(target.provider === "anthropic" && !nativeTextConfiguration(original)) ||
 		[...requestedModalities].some((value) => value !== "text") ||
 		Object.keys(original).some(
 			(key) =>
@@ -558,6 +618,9 @@ export function evaluateAutoRequestAdmission(
 					"top_p",
 					"top_k",
 					"stop_sequences",
+					...(target.provider === "anthropic"
+						? ["thinking", "output_config", "context_management"]
+						: []),
 				].includes(key),
 		)
 	)
