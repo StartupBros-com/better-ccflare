@@ -1141,7 +1141,7 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 		source = source.replace("#!/usr/bin/env node", `#!${nodeExecutable}`);
 		source = source.replace(
 			"res.end('{}');",
-			"res.end(JSON.stringify({git_sha:existsSync(`${process.env.CAPTURE_DIR}/bad-health`) ? 'wrong-sha' : 'fixture-sha'}));",
+			"res.end(JSON.stringify({git_sha:existsSync(`${process.env.CAPTURE_DIR}/bad-health`) ? 'wrong-sha' : '01234567'}));",
 		);
 		source = source.replace(
 			"const server = http.createServer((_req, res) => {",
@@ -1159,7 +1159,7 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 				RUNNER_PERSISTENT_GUARD: "1",
 				NODE_BIN: nodeExecutable,
 				GUARD_PORT: String(guardPort),
-				GUARD_SOURCE_ID: "fixture-sha",
+				GUARD_SOURCE_ID: "0123456789abcdef0123456789abcdef01234567",
 				GUARD_TOTAL_DEADLINE_MS: "2000",
 				GUARD_SHUTDOWN_GRACE_MS: "2000",
 				GUARD_RETRY_ATTEMPT_HEADROOM_MS: "10",

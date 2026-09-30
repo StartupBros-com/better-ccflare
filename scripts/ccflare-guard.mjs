@@ -200,6 +200,19 @@ export function inspectRuntimeIdentity(options = {}) {
 	};
 }
 
+// Compiled /health uses Git's abbreviated SHA; GUARD_SOURCE_ID pins the full
+// commit. This supplements the independently verified executable SHA256, PID,
+// start time and listener ownership; it never replaces those identity checks.
+export function matchesPinnedSourceId(reported, pinned) {
+	if (typeof reported !== "string" || typeof pinned !== "string") return false;
+	if (reported === pinned) return reported.length > 0;
+	return (
+		/^[0-9a-f]{40}$/.test(pinned) &&
+		/^[0-9a-f]{7,40}$/.test(reported) &&
+		pinned.startsWith(reported)
+	);
+}
+
 function configuredNumber(value, fallback) {
 	if (value == null || value === "") return fallback;
 	const parsed = Number(value);
@@ -1883,7 +1896,7 @@ export function createGuard(options = {}) {
 			const health = JSON.parse(Buffer.concat(chunks).toString());
 			if (
 				!health.git_sha ||
-				health.git_sha !== sourceId ||
+				!matchesPinnedSourceId(health.git_sha, sourceId) ||
 				procStartTime(candidate.pid) !== candidate.startTime
 			)
 				throw new Error("replacement health identity mismatch");
