@@ -77,6 +77,60 @@ const nativeOwnEvidence = new Map<string, AutoCatalogEvidence>();
 const nativeEvidenceGeneration = new Map<string, number>();
 const nativeCredentialFingerprint = new Map<string, string>();
 let nextNativeEvidenceGeneration = 0;
+const nativeOwnerEpoch = new Map<string, number>();
+const nativeOwners = new WeakMap<
+	AutoCatalogEvidence,
+	{ fingerprint: string; createdAt: number; epoch: number }
+>();
+
+/** Server-resolved credentials only; this API does not mint client proof tokens. */
+export interface AutoResolvedCredentials {
+	readonly account: Pick<
+		Account,
+		"id" | "provider" | "api_key" | "created_at" | "custom_endpoint"
+	>;
+	readonly accessToken: string | null;
+}
+function nativeFingerprint(selected: AutoResolvedCredentials): string {
+	return createHash("sha256")
+		.update(
+			JSON.stringify([
+				selected.account.provider,
+				selected.accessToken,
+				selected.account.api_key,
+				selected.account.custom_endpoint,
+			]),
+		)
+		.digest("hex");
+}
+
+/** No IO. Recheck after the LAST credential-preparation await and immediately
+ * before transport. Only source-owned snapshots from the same account incarnation
+ * and credential are accepted; same-content renewal does not invalidate a target.
+ * Raw credentials and private fingerprints never enter public provenance.
+ */
+export function validateNativeAutoCatalogCredentials(
+	evidence: AutoCatalogEvidence | null,
+	selected: AutoResolvedCredentials,
+): boolean {
+	const current = getNativeAutoCatalogEvidence(selected.account.id);
+	const owner = evidence && nativeOwners.get(evidence);
+	const currentOwner = current && nativeOwners.get(current);
+	return Boolean(
+		evidence &&
+			isAutoCatalogEvidenceCurrent(evidence) &&
+			current &&
+			owner &&
+			currentOwner &&
+			evidence.accountId === selected.account.id &&
+			evidence.revision === current.revision &&
+			owner.epoch === currentOwner.epoch &&
+			owner.createdAt === selected.account.created_at &&
+			currentOwner.createdAt === selected.account.created_at &&
+			owner.fingerprint === currentOwner.fingerprint &&
+			owner.fingerprint === nativeFingerprint(selected),
+	);
+}
 
 /** Fresh process-local owned evidence only; the global disk catalog is advisory.
  * Account ID alone does not validate the selected dispatch credential epoch.
@@ -91,6 +145,7 @@ export function getNativeAutoCatalogEvidence(
 /** Integrators must call on account deletion/replacement, before reusing its ID. */
 export function clearNativeAutoCatalogEvidence(accountId: string): void {
 	nativeOwnEvidence.delete(accountId);
+	nativeOwnerEpoch.set(accountId, (nativeOwnerEpoch.get(accountId) ?? 0) + 1);
 	nativeCredentialFingerprint.delete(accountId);
 	nativeEvidenceGeneration.set(accountId, ++nextNativeEvidenceGeneration);
 }
@@ -111,10 +166,11 @@ function nativeEntry(
 }
 
 function publishNativeEvidence(
-	accountId: string,
+	selected: AutoResolvedCredentials,
 	models: ModelCatalogEntry[],
 	generation: number,
 ): void {
+	const accountId = selected.account.id;
 	if (nativeEvidenceGeneration.get(accountId) !== generation) return;
 	const fetchedAt = Date.now();
 	// One refresh interval, capped at the native default, without scheduler jitter
@@ -132,7 +188,14 @@ function publishNativeEvidence(
 		source: "live",
 		models,
 	});
-	if (evidence) nativeOwnEvidence.set(accountId, evidence);
+	if (evidence) {
+		nativeOwners.set(evidence, {
+			fingerprint: nativeFingerprint(selected),
+			createdAt: selected.account.created_at,
+			epoch: nativeOwnerEpoch.get(accountId) ?? 0,
+		});
+		nativeOwnEvidence.set(accountId, evidence);
+	}
 }
 
 const MAX_PAGES = 5;
@@ -318,9 +381,8 @@ export async function fetchLiveModels(
 	const accessToken = await getValidAccessToken(account, ctx);
 	if (nativeEvidenceGeneration.get(account.id) !== generation)
 		throw new Error("obsolete native catalog generation");
-	const fingerprint = createHash("sha256")
-		.update(JSON.stringify([account.provider, accessToken, account.api_key]))
-		.digest("hex");
+	const selected = { account: { ...account }, accessToken };
+	const fingerprint = nativeFingerprint(selected);
 	if (nativeCredentialFingerprint.get(account.id) !== fingerprint)
 		nativeOwnEvidence.delete(account.id);
 	nativeCredentialFingerprint.set(account.id, fingerprint);
@@ -365,7 +427,7 @@ export async function fetchLiveModels(
 		}
 
 		if (!body.has_more) {
-			publishNativeEvidence(account.id, models, generation);
+			publishNativeEvidence(selected, models, generation);
 			break;
 		}
 		if (!body.last_id) break;

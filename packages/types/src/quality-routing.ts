@@ -119,7 +119,33 @@ export type QualityAdmissionReason =
 	| "context-unsupported"
 	| "subscription-exhausted"
 	| "spend-not-authorized"
-	| "lane-unavailable";
+	| "lane-unavailable"
+	| "provider-capacity-exhausted"
+	| "capacity-evidence-unknown"
+	| "billing-evidence-unknown"
+	| "catalog-evidence-stale"
+	| "credential-evidence-unknown"
+	| "input-accounting-unknown"
+	| "output-unsupported"
+	| "modality-unsupported"
+	| "tools-unsupported"
+	| "request-preservation-unknown";
+
+/** Safe bounded diagnostics; never contains raw requests or provider payloads. */
+export type QualityAdmissionDecision = (
+	| Readonly<{ status: "admit" }>
+	| Readonly<{ status: "reject" | "unknown"; reason: QualityAdmissionReason }>
+) &
+	Readonly<{
+		accounting?: {
+			readonly source: "local-envelope-v1";
+			readonly kind: "estimate";
+			readonly envelopeBytes: number;
+			readonly inputEstimate: number;
+			readonly headroom: number;
+			readonly requestedOutput: number;
+		};
+	}>;
 
 /** Counts only: no prompt, secrets, arbitrary messages or raw quota payloads. */
 export interface QualitySkippedLaneSummary {

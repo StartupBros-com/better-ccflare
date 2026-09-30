@@ -29,6 +29,7 @@ import {
 	CATALOG_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS,
 	reportCatalogRoleRouteFailClosed,
 	revalidateUnknownCodexModel,
+	validateCodexAutoCatalogCredentials,
 } from "../codex-model-catalog";
 import type { ProxyContext } from "../handlers/proxy-types";
 
@@ -68,6 +69,74 @@ function makeCtx(account: Account | null): ProxyContext {
 
 // Shaped after what a real subscription account returned on 2026-08-09,
 // including the two entries OpenAI marks `hide` and the deprecation notices.
+it("validates selected Codex credentials, not copied evidence or a reused account ID", async () => {
+	const original = globalThis.fetch;
+	const account = makeAccount();
+	globalThis.fetch = Object.assign(
+		async () => Response.json({ models: [{ slug: "gpt-6-astra" }] }),
+		{ preconnect: () => {} },
+	);
+	try {
+		await getCodexModels(account.id, makeCtx(account));
+		const evidence = getCodexAutoCatalogEvidence(account.id);
+		const selected = { account, accessToken: "at" };
+		expect(validateCodexAutoCatalogCredentials(evidence, selected)).toBe(true);
+		expect(
+			validateCodexAutoCatalogCredentials(evidence, {
+				...selected,
+				accessToken: "replacement",
+			}),
+		).toBe(false);
+		expect(
+			validateCodexAutoCatalogCredentials(evidence, {
+				...selected,
+				account: { ...account, created_at: account.created_at + 1 },
+			}),
+		).toBe(false);
+		expect(
+			validateCodexAutoCatalogCredentials(
+				evidence && { ...evidence },
+				selected,
+			),
+		).toBe(false);
+		await getCodexModels(account.id, makeCtx(account));
+		expect(validateCodexAutoCatalogCredentials(evidence, selected)).toBe(true);
+		clearCodexModelCacheForAccount(account.id);
+		await getCodexModels(account.id, makeCtx(account));
+		expect(validateCodexAutoCatalogCredentials(evidence, selected)).toBe(false);
+		expect(
+			validateCodexAutoCatalogCredentials(
+				getCodexAutoCatalogEvidence(account.id),
+				selected,
+			),
+		).toBe(true);
+	} finally {
+		globalThis.fetch = original;
+		clearCodexModelCacheForTests();
+	}
+});
+it("does not use the fixed subscription catalog as evidence for a custom Codex endpoint", async () => {
+	const original = globalThis.fetch;
+	const account = makeAccount({
+		custom_endpoint: "https://example.invalid/responses",
+	});
+	globalThis.fetch = Object.assign(
+		async () => Response.json({ models: [{ slug: "gpt-6-astra" }] }),
+		{ preconnect: () => {} },
+	);
+	try {
+		await getCodexModels(account.id, makeCtx(account));
+		expect(
+			validateCodexAutoCatalogCredentials(
+				getCodexAutoCatalogEvidence(account.id),
+				{ account, accessToken: "at" },
+			),
+		).toBe(false);
+	} finally {
+		globalThis.fetch = original;
+		clearCodexModelCacheForTests();
+	}
+});
 it("does not let an older account lookup rebind a replaced token", async () => {
 	const original = globalThis.fetch;
 	let release!: (account: Account) => void;

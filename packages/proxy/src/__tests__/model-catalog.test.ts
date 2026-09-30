@@ -24,6 +24,7 @@ import {
 	type ModelCatalog,
 	refreshModelCatalog,
 	resetModelCatalogForTest,
+	validateNativeAutoCatalogCredentials,
 } from "../model-catalog";
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -141,6 +142,52 @@ describe("model-catalog", () => {
 		resetModelCatalogForTest();
 	});
 
+	it("validates actual native credentials and incarnation without rediscovery", async () => {
+		const account = makeAccount({ provider: "anthropic", api_key: null });
+		global.fetch = Object.assign(
+			async () =>
+				Response.json({
+					data: [{ id: "claude-fable-5-1" }],
+					has_more: false,
+				}),
+			{ preconnect: () => {} },
+		);
+		await fetchLiveModels(makeCtx([account]), { allowOAuth: true });
+		const evidence = getNativeAutoCatalogEvidence(account.id);
+		const selected = { account, accessToken: "at-valid" };
+		expect(validateNativeAutoCatalogCredentials(evidence, selected)).toBe(true);
+		expect(
+			validateNativeAutoCatalogCredentials(evidence, {
+				...selected,
+				accessToken: "replaced",
+			}),
+		).toBe(false);
+		expect(
+			validateNativeAutoCatalogCredentials(evidence, {
+				...selected,
+				account: { ...account, created_at: account.created_at + 1 },
+			}),
+		).toBe(false);
+		expect(
+			validateNativeAutoCatalogCredentials(
+				evidence && { ...evidence },
+				selected,
+			),
+		).toBe(false);
+		await fetchLiveModels(makeCtx([account]), { allowOAuth: true });
+		expect(validateNativeAutoCatalogCredentials(evidence, selected)).toBe(true);
+		clearNativeAutoCatalogEvidence(account.id);
+		await fetchLiveModels(makeCtx([account]), { allowOAuth: true });
+		expect(validateNativeAutoCatalogCredentials(evidence, selected)).toBe(
+			false,
+		);
+		expect(
+			validateNativeAutoCatalogCredentials(
+				getNativeAutoCatalogEvidence(account.id),
+				selected,
+			),
+		).toBe(true);
+	});
 	it.each([
 		undefined,
 		"1",

@@ -1,10 +1,138 @@
 import {
+	collectAutoCapacityEvidence,
 	computeWindowStartMs,
 	getModelFamily,
 	weeklyScopedWindowKey,
 } from "@better-ccflare/core";
 import type { AnyUsageData } from "@better-ccflare/providers";
-import type { Account, AccountBindingConstraint } from "@better-ccflare/types";
+import type {
+	Account,
+	AccountBindingConstraint,
+	QualityAdmissionDecision,
+	QualityApprovedLine,
+	QualityProvider,
+	QualitySpendGrant,
+} from "@better-ccflare/types";
+
+export interface AutoCapacityOptions {
+	readonly accountId: string;
+	readonly line: QualityApprovedLine;
+	readonly provider: QualityProvider;
+	readonly requestModel: string;
+	readonly observedAt: number;
+	readonly now?: number;
+	/** Trusted current policy only; never provider payload or request headers. */
+	readonly spendGrants: readonly QualitySpendGrant[];
+}
+
+/** Mandatory Auto policy, intentionally separate from manual/predictive flags. */
+export function evaluateAutoCapacity(
+	data: unknown,
+	options: AutoCapacityOptions,
+): QualityAdmissionDecision {
+	const now = options.now ?? Date.now();
+	if (
+		!Number.isFinite(now) ||
+		!Number.isFinite(options.observedAt) ||
+		options.observedAt > now ||
+		options.observedAt < 0 ||
+		now - options.observedAt >= DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS
+	) {
+		return { status: "unknown", reason: "capacity-evidence-unknown" };
+	}
+	const family = getModelFamily(options.requestModel);
+	const rows = collectAutoCapacityEvidence(data, options.provider).filter(
+		(row) =>
+			row.scope === "account" ||
+			row.scope === "unknown" ||
+			(row.scope === "model"
+				? row.model === options.requestModel
+				: row.model === family),
+	);
+	let unknown = false;
+	let accountEvidence = false;
+	let allowanceExhausted = false;
+	for (const row of rows) {
+		if (row.active === false) {
+			// Anthropic marks only the binding limit active. A nonbinding shared
+			// window can still prove headroom, but never exhaustion. Generic rows
+			// retain precedence over flat mirrors, even when unusable as evidence.
+			if (
+				options.provider === "anthropic" &&
+				row.source === "limits" &&
+				row.scope === "account" &&
+				row.utilization !== null &&
+				row.utilization < 100 &&
+				row.resetsAtMs !== null &&
+				row.resetsAtMs > now
+			)
+				accountEvidence = true;
+			continue;
+		}
+		if (
+			row.active === null ||
+			row.scope === "unknown" ||
+			row.utilization === null ||
+			row.resetsAtMs === null ||
+			row.resetsAtMs <= now
+		) {
+			unknown = true;
+			continue;
+		}
+		if (row.scope === "account") accountEvidence = true;
+		if (row.utilization < 100) continue;
+		if (row.semantics === "provider-limit")
+			return { status: "reject", reason: "provider-capacity-exhausted" };
+		allowanceExhausted = true;
+	}
+	const billingPayload = data as {
+		spend?: { enabled?: unknown; percent?: unknown } | null;
+		extra_usage?: { is_enabled?: unknown; utilization?: unknown } | null;
+	} | null;
+	const enabled =
+		options.provider === "anthropic"
+			? billingPayload?.spend !== undefined
+				? billingPayload.spend?.enabled
+				: billingPayload?.extra_usage?.is_enabled
+			: undefined;
+	const billing =
+		enabled === false
+			? "unavailable"
+			: enabled === true
+				? "available"
+				: "unknown";
+	const grant = options.spendGrants.some(
+		(item) =>
+			item.accountId === options.accountId &&
+			item.line === options.line &&
+			item.authorization === "operator-approved" &&
+			item.scope === "outside-subscription",
+	);
+	if (allowanceExhausted) {
+		if (billing === "unavailable")
+			return { status: "reject", reason: "subscription-exhausted" };
+		if (!grant) return { status: "reject", reason: "spend-not-authorized" };
+		if (billing !== "available")
+			return { status: "unknown", reason: "billing-evidence-unknown" };
+		// Enablement is not paid capacity. Use the authoritative spend percentage,
+		// with legacy utilization only when the newer spend block is absent.
+		const percent =
+			billingPayload?.spend !== undefined
+				? billingPayload.spend?.percent
+				: billingPayload?.extra_usage?.utilization;
+		if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0)
+			return { status: "unknown", reason: "billing-evidence-unknown" };
+		if (percent >= 100)
+			return { status: "reject", reason: "provider-capacity-exhausted" };
+	}
+	if (unknown || !accountEvidence)
+		return { status: "unknown", reason: "capacity-evidence-unknown" };
+	// Codex has no established subscription-only billing signal in this adapter.
+	// Billing enablement is not assurance that this request stays within allowance.
+	if (!grant && billing !== "unavailable")
+		return { status: "unknown", reason: "spend-not-authorized" };
+	return { status: "admit" };
+}
 
 const RETRY_AFTER_SECONDS = 60;
 /** Two default 90-second usage polls; independent from the cache's 10m maximum. */

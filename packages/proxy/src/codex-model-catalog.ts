@@ -17,6 +17,7 @@ import {
 	extractChatGptAccountId,
 	hasDerivedProviderModelDefaults,
 	isAutoCatalogEvidenceCurrent,
+	isCodexSubscriptionEndpoint,
 	normalizeAutoModelCapabilities,
 	resolveCodexClientIdentity,
 	setCodexAccountModelContextMetadata,
@@ -121,6 +122,47 @@ interface CachedAccountCatalog {
 
 const lastGood = new Map<string, CachedAccountCatalog>();
 const autoEvidence = new Map<string, AutoCatalogEvidence>();
+const codexOwners = new WeakMap<
+	AutoCatalogEvidence,
+	{
+		fingerprint: string;
+		createdAt: number;
+		endpoint: string | null;
+		epoch: number;
+	}
+>();
+
+/** Revalidate the actual server-resolved token at the final dispatch boundary.
+ * Source ownership is private, not a caller's boolean or a copied catalog record.
+ */
+export function validateCodexAutoCatalogCredentials(
+	evidence: AutoCatalogEvidence | null,
+	selected: import("./model-catalog").AutoResolvedCredentials,
+): boolean {
+	const current = getCodexAutoCatalogEvidence(selected.account.id);
+	const owner = evidence && codexOwners.get(evidence);
+	const currentOwner = current && codexOwners.get(current);
+	return Boolean(
+		evidence &&
+			isAutoCatalogEvidenceCurrent(evidence) &&
+			current &&
+			owner &&
+			currentOwner &&
+			selected.account.provider === "codex" &&
+			selected.accessToken &&
+			(!selected.account.custom_endpoint ||
+				isCodexSubscriptionEndpoint(selected.account.custom_endpoint)) &&
+			evidence.accountId === selected.account.id &&
+			evidence.revision === current.revision &&
+			owner.epoch === currentOwner.epoch &&
+			owner.createdAt === selected.account.created_at &&
+			currentOwner.createdAt === selected.account.created_at &&
+			owner.endpoint === (selected.account.custom_endpoint ?? null) &&
+			currentOwner.endpoint === owner.endpoint &&
+			owner.fingerprint === currentOwner.fingerprint &&
+			owner.fingerprint === tokenFingerprint(selected.accessToken),
+	);
+}
 // Private credential generations, never exposed in catalog evidence or logs.
 const selectedTokenGeneration = new Map<
 	string,
@@ -671,8 +713,9 @@ export async function getCodexModels(
 ): Promise<CodexModelListing | null> {
 	const invalidationGeneration = invalidationGenerationFor(accountId);
 	const fetchGeneration = ++nextCatalogFetchGeneration;
-	const account = await ctx.dbOps.getAccount(accountId);
-	if (!account || account.provider !== "codex") return null;
+	const resolvedAccount = await ctx.dbOps.getAccount(accountId);
+	if (!resolvedAccount || resolvedAccount.provider !== "codex") return null;
+	const account = { ...resolvedAccount };
 
 	try {
 		const { models, fingerprint } = await fetchLive(
@@ -715,8 +758,15 @@ export async function getCodexModels(
 					expiresAt: listing.fetchedAt + CATALOG_REFRESH_INTERVAL_MS,
 					provider: "codex",
 				});
-				if (evidence) autoEvidence.set(accountId, evidence);
-				else autoEvidence.delete(accountId);
+				if (evidence) {
+					codexOwners.set(evidence, {
+						fingerprint,
+						createdAt: account.created_at,
+						endpoint: account.custom_endpoint ?? null,
+						epoch: invalidationGeneration,
+					});
+					autoEvidence.set(accountId, evidence);
+				} else autoEvidence.delete(accountId);
 				setCodexAccountModelContextMetadata(accountId, models);
 				setDerivedAccountModelDefaults("codex", accountId, families);
 				publishedOwn = true;

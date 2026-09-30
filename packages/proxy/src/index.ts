@@ -112,6 +112,7 @@ export {
 	getKnownOrSharedCodexModels,
 	initCodexModelCatalogRefresh,
 	lowestTierCodexModel,
+	validateCodexAutoCatalogCredentials,
 } from "./codex-model-catalog";
 export {
 	recordCodexUsageSnapshot,
@@ -163,6 +164,10 @@ export {
 } from "./handlers/pending-rotation-registry";
 export { createPendingRotationWal } from "./handlers/pending-rotation-wal";
 export {
+	evaluateQualityRouteAdmission,
+	type QualityRouteAdmissionInput,
+} from "./handlers/quality-route-admission";
+export {
 	clearRoutingObservations,
 	getRoutingObservations,
 	type RoutingObservation,
@@ -176,6 +181,7 @@ export {
 	startIntegrityScheduler,
 } from "./integrity-scheduler";
 export {
+	type AutoResolvedCredentials,
 	clearNativeAutoCatalogEvidence,
 	fetchLiveModels,
 	getModelCatalog,
@@ -185,6 +191,7 @@ export {
 	type ModelCatalogEntry,
 	type ModelCatalogRefreshResult,
 	refreshModelCatalog,
+	validateNativeAutoCatalogCredentials,
 } from "./model-catalog";
 export {
 	MODEL_ROUTE_PROFILE_MODEL_PREFIX,
