@@ -295,13 +295,14 @@ export async function fetchLiveModels(
 	// Reserve before the first await: deletion or a newer lookup must fence us.
 	const generation = ++nextNativeEvidenceGeneration;
 	const allowOAuth = options?.allowOAuth ?? false;
-	const accounts = await ctx.dbOps.getAllAccounts();
-	const account = selectEligibleAccount(
-		options?.accountId
-			? accounts.filter((entry) => entry.id === options.accountId)
-			: accounts,
-		{ allowOAuth },
-	);
+	let accounts: Account[];
+	if (options?.accountId) {
+		const target = await ctx.dbOps.getAccount(options.accountId);
+		accounts = target?.id === options.accountId ? [target] : [];
+	} else {
+		accounts = await ctx.dbOps.getAllAccounts();
+	}
+	const account = selectEligibleAccount(accounts, { allowOAuth });
 	if (!account) {
 		throw new Error(
 			allowOAuth

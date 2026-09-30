@@ -74,8 +74,11 @@ function makeCtx(
 	const oauthRefreshEnabled = options?.oauthRefreshEnabled ?? false;
 	return {
 		strategy: {} as never,
-		// biome-ignore lint/suspicious/noExplicitAny: minimal test double
-		dbOps: { getAllAccounts: async () => accounts } as any,
+		dbOps: {
+			getAllAccounts: async () => accounts,
+			getAccount: async (id: string) =>
+				accounts.find((a) => a.id === id) ?? null,
+		} as ProxyContext["dbOps"],
 		runtime: { port: 8080, clientId: "test-client" } as never,
 		config: {
 			getModelCatalogOAuthRefreshEnabled: () => oauthRefreshEnabled,
@@ -243,6 +246,95 @@ describe("model-catalog", () => {
 	});
 
 	describe("fetchLiveModels", () => {
+		it.each([
+			["missing", null],
+			["paused", { paused: true }],
+			["wrong provider", { provider: "zai" }],
+			["mismatched ID", { id: "another-account" }],
+			["custom endpoint", { custom_endpoint: "https://example.test" }],
+			["OAuth without opt-in", { provider: "anthropic" }],
+		] as const)("denies a targeted %s account without fallback", async (_label, overrides) => {
+			const target =
+				overrides === null ? null : makeAccount({ id: "target", ...overrides });
+			const ctx = makeCtx([
+				makeAccount({ id: "fallback" }),
+				...(target ? [target] : []),
+			]);
+			const lookup = spyOn(ctx.dbOps, "getAccount").mockResolvedValue(target);
+			const enumerate = spyOn(ctx.dbOps, "getAllAccounts");
+			const fetchMock = mock(async () => Response.json({ data: [] }));
+			global.fetch = fetchMock as unknown as typeof fetch;
+			await expect(
+				fetchLiveModels(ctx, { accountId: "target" }),
+			).rejects.toThrow(
+				"No active anthropic account available to fetch models (console/API-key accounts only; set BETTER_CCFLARE_MODELS_OAUTH_REFRESH=1 or use a manual refresh to allow an OAuth account fallback)",
+			);
+			expect(lookup).toHaveBeenCalledWith("target");
+			expect(enumerate).not.toHaveBeenCalled();
+			expect(fetchMock).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			undefined,
+			"",
+		])("enumerates accounts for untargeted ID %s", async (accountId) => {
+			const ctx = makeCtx([
+				makeAccount({ id: "low", priority: 10 }),
+				makeAccount({ id: "preferred", api_key: "preferred-key" }),
+			]);
+			const lookup = spyOn(ctx.dbOps, "getAccount");
+			const enumerate = spyOn(ctx.dbOps, "getAllAccounts");
+			const seen: Array<string | null> = [];
+			global.fetch = mock(
+				async (_input: RequestInfo | URL, init?: RequestInit) => {
+					seen.push(new Headers(init?.headers).get("authorization"));
+					return Response.json({ data: [] });
+				},
+			) as unknown as typeof fetch;
+			expect(await fetchLiveModels(ctx, { accountId })).toEqual([]);
+			expect(seen).toEqual(["Bearer preferred-key"]);
+			expect(enumerate).toHaveBeenCalledTimes(1);
+			expect(lookup).not.toHaveBeenCalled();
+		});
+
+		it("fences deletion while targeted lookup is pending", async () => {
+			const account = makeAccount();
+			const lookup = deferred<Account | null>();
+			const ctx = makeCtx([account]);
+			ctx.dbOps.getAccount = () => lookup.promise;
+			const fetchMock = mock(async () => Response.json({ data: [] }));
+			global.fetch = fetchMock as unknown as typeof fetch;
+			const pending = fetchLiveModels(ctx, { accountId: account.id });
+			clearNativeAutoCatalogEvidence(account.id);
+			lookup.resolve(account);
+			await expect(pending).rejects.toThrow(
+				"obsolete native catalog generation",
+			);
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(getNativeAutoCatalogEvidence(account.id)).toBeNull();
+		});
+
+		it("fences an older targeted lookup that resolves after a newer refresh", async () => {
+			const account = makeAccount();
+			const lookup = deferred<Account | null>();
+			const ctx = makeCtx([account]);
+			ctx.dbOps.getAccount = () => lookup.promise;
+			const fetchMock = mock(async () =>
+				Response.json({ data: [{ id: "claude-opus-5-5" }] }),
+			);
+			global.fetch = fetchMock as unknown as typeof fetch;
+			const pending = fetchLiveModels(ctx, { accountId: account.id });
+			await fetchLiveModels(makeCtx([account]), { accountId: account.id });
+			const evidence = getNativeAutoCatalogEvidence(account.id);
+			expect(evidence).not.toBeNull();
+			lookup.resolve(account);
+			await expect(pending).rejects.toThrow(
+				"obsolete native catalog generation",
+			);
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(getNativeAutoCatalogEvidence(account.id)).toBe(evidence);
+		});
+
 		it("fences deletion while account lookup is pending", async () => {
 			const account = makeAccount();
 			const lookup = deferred<Account[]>();
@@ -352,13 +444,15 @@ describe("model-catalog", () => {
 					data: [{ id: "claude-opus-5-5", max_tokens: 128000 }],
 				}),
 			) as unknown as typeof fetch;
-			await fetchLiveModels(makeCtx([account]));
+			await fetchLiveModels(makeCtx([account]), { accountId: account.id });
 			expect(getNativeAutoCatalogEvidence(account.id)).not.toBeNull();
 			account.api_key = "replacement";
 			global.fetch = mock(
 				async () => new Response("unavailable", { status: 503 }),
 			) as unknown as typeof fetch;
-			await expect(fetchLiveModels(makeCtx([account]))).rejects.toThrow("503");
+			await expect(
+				fetchLiveModels(makeCtx([account]), { accountId: account.id }),
+			).rejects.toThrow("503");
 			expect(getNativeAutoCatalogEvidence(account.id)).toBeNull();
 		});
 		it("preserves selected-account native capability evidence without global entitlement", async () => {
@@ -392,8 +486,15 @@ describe("model-catalog", () => {
 					});
 				},
 			) as unknown as typeof fetch;
-			await fetchLiveModels(makeCtx([first, second]), { accountId: second.id });
+			const ctx = makeCtx([first, second]);
+			const lookup = spyOn(ctx.dbOps, "getAccount");
+			const enumerate = spyOn(ctx.dbOps, "getAllAccounts");
+			const models = await fetchLiveModels(ctx, { accountId: second.id });
+			expect(models.map((entry) => entry.id)).toEqual(["claude-opus-5-5"]);
 			expect(seen).toEqual(["Bearer second-key"]);
+			expect(lookup).toHaveBeenCalledWith(second.id);
+			expect(lookup).toHaveBeenCalledTimes(1);
+			expect(enumerate).not.toHaveBeenCalled();
 			const evidence = getNativeAutoCatalogEvidence(second.id);
 			expect(evidence?.models[0].capabilities?.maxOutputTokens).toBe(128000);
 			expect(evidence?.models[0].capabilities?.nativeCapabilities).toEqual({
