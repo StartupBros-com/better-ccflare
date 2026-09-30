@@ -99,6 +99,7 @@ import {
 	markAccountTokensFresh,
 	type ProxyContext,
 	parseModelRouteProfiles,
+	QualityRouteService,
 	recordCodexUsageSnapshot,
 	refreshModelCatalog,
 	registerAutoRefreshTrackingClearer,
@@ -1627,12 +1628,18 @@ export default async function startServer(options?: {
 	});
 	stopDataCleanupJob = unregisterDataCleanup;
 
+	// One persistence boundary for authenticated controls and inference. No
+	// service, state enrollment, or discovery choices when policy is absent.
+	const qualityRouteService = config.getQualityRoutingPolicy()
+		? new QualityRouteService(dbOps.getQualityRouteRepository())
+		: undefined;
 	const apiRouter = new APIRouter(
 		{
 			db,
 			config,
 			dbOps,
 			alertService,
+			qualityRouteService,
 			modelCatalog: {
 				codexModels: async (accountId: string) => {
 					if (!modelCatalogProxyContext) return null;
@@ -1847,6 +1854,7 @@ export default async function startServer(options?: {
 	cacheFlightCohortSealService?.dispose();
 	cacheFlightCohortSealService = new CohortSealService({ config });
 	const proxyContext: ProxyContext = {
+		qualityRouteService,
 		strategy,
 		cacheAffinityOrderer: new CacheAffinityOrderer(
 			runtimeConfig.sessionDurationMs,

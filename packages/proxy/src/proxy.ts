@@ -857,17 +857,29 @@ async function handleProxyCoreImpl(
 		});
 	}
 
-	// handleProxy is entered only after the server's authentication layer. When
-	// profiles are configured, Claude Code gateway discovery is a local metadata
-	// read: never validate a provider, query accounts, or forward this request.
+	// handleProxy is entered only after the server's authentication layer. These
+	// choices describe intent, not live candidate availability; admission remains
+	// authoritative. Discovery must never refresh catalogs or query providers.
+	const qualityChoices =
+		req.method === "GET" &&
+		url.pathname === "/v1/models" &&
+		ctx.qualityRouteService
+			? (ctx.config?.getQualityRoutingPolicy?.()?.choices ?? [])
+			: [];
 	if (
 		req.method === "GET" &&
 		url.pathname === "/v1/models" &&
-		ctx.modelRouteSessionRegistry?.hasProfiles
+		(ctx.modelRouteSessionRegistry?.hasProfiles || qualityChoices.length > 0)
 	) {
 		return new Response(
 			JSON.stringify({
-				data: ctx.modelRouteSessionRegistry.getDiscoveryModels(),
+				data: [
+					...(ctx.modelRouteSessionRegistry?.getDiscoveryModels() ?? []),
+					...qualityChoices.map((choice) => ({
+						id: choice.publicModelId,
+						display_name: choice.displayName,
+					})),
+				],
 				has_more: false,
 			}),
 			{

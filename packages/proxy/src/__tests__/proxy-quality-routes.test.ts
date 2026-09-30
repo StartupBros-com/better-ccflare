@@ -1,12 +1,23 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, it, spyOn } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { compileQualityRoutingPolicy } from "@better-ccflare/core";
+import { DatabaseOperations } from "@better-ccflare/database";
 import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
 import { getProvider, usageCache } from "@better-ccflare/providers";
-import type { Account, QualityVerifiedSession } from "@better-ccflare/types";
+import type {
+	Account,
+	APIContext,
+	QualityVerifiedSession,
+} from "@better-ccflare/types";
+import { NodeCryptoUtils } from "@better-ccflare/types/api-key";
 import { BunSqlAdapter } from "../../../database/src/adapters/bun-sql-adapter";
 import { ensureSchema } from "../../../database/src/migrations";
 import { QualityRouteRepository } from "../../../database/src/repositories/quality-route.repository";
+import { APIRouter } from "../../../http-api/src/router";
+import { AuthService } from "../../../http-api/src/services/auth-service";
 import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
 import {
 	clearCodexModelCacheForTests,
@@ -14,6 +25,7 @@ import {
 } from "../codex-model-catalog";
 import type { ProxyContext } from "../handlers/proxy-types";
 import { fetchLiveModels, resetModelCatalogForTest } from "../model-catalog";
+import { ModelRouteSessionRegistry } from "../model-route-profiles";
 import { handleProxy } from "../proxy";
 import { compileQualityCandidates } from "../quality-route-candidates";
 import { QualityRouteService } from "../quality-route-service";
@@ -246,6 +258,148 @@ afterEach(async () => {
 	clearCodexModelCacheForTests();
 	usageCache.clear();
 	db.close();
+});
+it("one service connects verified inference enrollment, status, retry and next inference with no control sends", async () => {
+	const directory = mkdtempSync(join(tmpdir(), "quality-lifecycle-"));
+	const operations = new DatabaseOperations(join(directory, "test.db"));
+	try {
+		const secret = "synthetic-lifecycle-credential";
+		await operations.createApiKey({
+			id: scope.principalId,
+			name: "synthetic",
+			hashedKey: await new NodeCryptoUtils().hashApiKey(secret),
+			prefixLast8: secret.slice(-8),
+			createdAt: Date.now(),
+			isActive: true,
+			role: "api-only",
+		});
+		service = new QualityRouteService(operations.getQualityRouteRepository());
+		ctx.qualityRouteService = service;
+		const router = new APIRouter({
+			db: operations.getAdapter(),
+			dbOps: operations,
+			config: ctx.config,
+			qualityRouteService: service,
+			alertService: {
+				listAlerts: async () => [],
+				getUnacknowledgedCount: async () => 0,
+				acknowledgeAlert: async () => true,
+				acknowledgeAll: async () => {},
+			},
+		} as APIContext);
+		const auth = new AuthService(operations);
+		async function dispatch(req: Request) {
+			const url = new URL(req.url);
+			const routed = await router.handleRequest(url, req);
+			if (routed) return routed;
+			const identity = await auth.authenticateRequest(
+				req,
+				url.pathname,
+				req.method,
+			);
+			expect(identity.apiKeyId).toBe(scope.principalId);
+			return handleProxy(req, url, ctx, identity.apiKeyId);
+		}
+		const credential = { authorization: `Bearer ${secret}` };
+		const first = await dispatch(request(undefined, credential));
+		expect(first.status).toBe(200);
+		await first.text();
+		await flush();
+		expect(sends.length).toBe(1);
+		const url = `http://localhost/v1/quality-routing/sessions/${scope.sessionId}`;
+		const status = (await (
+			await dispatch(new Request(url, { headers: credential }))
+		).json()) as {
+			incarnation: string;
+			intentRevision: number;
+			pending: boolean;
+			lastSuccessfulHome: unknown;
+		};
+		expect(status.intentRevision).toBe(1);
+		expect(status.pending).toBe(false);
+		expect(status.lastSuccessfulHome).not.toBeNull();
+		const body = JSON.stringify({
+			incarnation: status.incarnation,
+			expectedIntentRevision: status.intentRevision,
+			idempotencyToken: "one-retry",
+		});
+		const retry = () =>
+			dispatch(
+				new Request(`${url}/retry-preferred`, {
+					method: "POST",
+					headers: { ...credential, "content-type": "application/json" },
+					body,
+				}),
+			);
+		const accepted = await (await retry()).json();
+		expect(accepted).toMatchObject({ status: "ready", intentRevision: 2 });
+		expect(await (await retry()).json()).toEqual(accepted);
+		const pending = (await (
+			await dispatch(new Request(url, { headers: credential }))
+		).json()) as { pending: boolean; lastSuccessfulHome: unknown };
+		expect(pending.pending).toBe(true);
+		expect(pending.lastSuccessfulHome).toEqual(status.lastSuccessfulHome);
+		expect(sends.length).toBe(1);
+		const next = await dispatch(request(undefined, credential));
+		expect(next.status).toBe(200);
+		await next.text();
+		await flush();
+		expect(sends.length).toBe(2);
+		const settled = await service.status(scope);
+		expect(settled?.intentRevision).toBe(2);
+		expect(settled?.conversations[0]?.pending).toBe(false);
+		expect(settled?.conversations[0]?.home?.intentRevision).toBe(2);
+	} finally {
+		await flush();
+		await operations.close();
+		rmSync(directory, { recursive: true });
+	}
+});
+it("adds enabled quality choices to local discovery without catalog or inference traffic", async () => {
+	const local = [
+		{ id: "claude-bccf-route-existing", display_name: "Existing" },
+	];
+	ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry([
+		{
+			id: "existing",
+			publicModelId: "claude-bccf-route-existing",
+			discoveryModelId: "claude-bccf-route-existing",
+			displayName: "Existing",
+			accountId: "a",
+			logicalModel: "claude-opus-5-5",
+		},
+	]);
+	let fetches = 0;
+	globalThis.fetch = Object.assign(
+		async () => {
+			fetches++;
+			throw new Error("Discovery must be local");
+		},
+		{ preconnect: () => {} },
+	) as typeof fetch;
+	const response = await send(new Request("http://localhost/v1/models"));
+	const body = (await response.json()) as {
+		data: { id: string; display_name: string }[];
+	};
+	expect(body.data).toEqual([
+		...local,
+		{ id: "claude-bccf-quality-auto", display_name: "Auto" },
+		{ id: "claude-bccf-quality-fable", display_name: "Fable-preferred" },
+		{ id: "claude-bccf-quality-astra", display_name: "Astra-preferred" },
+		{ id: "claude-bccf-quality-opus", display_name: "Opus-latest" },
+	]);
+	expect(fetches).toBe(0);
+	const registry = ctx.modelRouteSessionRegistry;
+	ctx.modelRouteSessionRegistry = undefined;
+	expect(
+		await (await send(new Request("http://localhost/v1/models"))).json(),
+	).toEqual({ data: body.data.slice(1), has_more: false });
+	ctx.modelRouteSessionRegistry = registry;
+	ctx.qualityRouteService = undefined;
+	expect(
+		await (await send(new Request("http://localhost/v1/models"))).json(),
+	).toEqual({ data: local, has_more: false });
+	expect(fetches).toBe(0);
 });
 it("sends the exact physical model and settles a real SQLite home only after valid completion", async () => {
 	const response = await send();
