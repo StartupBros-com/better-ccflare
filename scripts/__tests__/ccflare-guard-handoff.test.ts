@@ -7,8 +7,36 @@ import net from "node:net";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createGuard } from "../ccflare-guard.mjs";
+import { createGuard, matchesPinnedSourceId } from "../ccflare-guard.mjs";
 import { resolveNodeExecutable } from "./node-runtime";
+
+const sourceSha = "0123456789abcdef0123456789abcdef01234567";
+test.each([
+	[sourceSha, sourceSha, true],
+	[sourceSha.slice(0, 7), sourceSha, true],
+	[sourceSha.slice(0, 8), sourceSha, true],
+	[sourceSha.slice(0, 12), sourceSha, true],
+	[sourceSha.slice(0, 39), sourceSha, true],
+	["11234567", sourceSha, false],
+	[`${sourceSha.slice(0, 39)}8`, sourceSha, false],
+	[sourceSha.slice(0, 6), sourceSha, false],
+	[`${sourceSha}0`, sourceSha, false],
+	["0123456G", sourceSha, false],
+	["0123456789ABCDEF", sourceSha, false],
+	["01234567\n", sourceSha, false],
+	["", sourceSha, false],
+	[null, sourceSha, false],
+	[1234567, sourceSha, false],
+	["fixture", "fixture-sha", false],
+	["fixture-sha", "fixture-sha", true],
+	[sourceSha.slice(0, 7), sourceSha.slice(0, 8), false],
+	[sourceSha.slice(0, 8), sourceSha.toUpperCase(), false],
+])(
+	"replacement health source %j against %j matches=%j",
+	(reported, pinned, expected) => {
+		expect(matchesPinnedSourceId(reported, pinned)).toBe(expected);
+	},
+);
 
 const cleanups: Array<() => Promise<unknown> | void> = [];
 afterEach(async () => {
