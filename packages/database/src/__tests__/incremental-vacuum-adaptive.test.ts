@@ -38,18 +38,23 @@ async function seedRows(
 	const adapter = dbOps.getAdapter();
 	const blob = "x".repeat(bytesPerRow);
 	const now = Date.now();
+	const statements = [];
 	for (let i = 0; i < count; i++) {
 		const id = `seed-${i}-${now}`;
-		await adapter.run(
-			`INSERT INTO requests (id, timestamp, method, path, account_used, status_code, success, error_message, response_time_ms, failover_attempts)
+		statements.push({
+			sql: `INSERT INTO requests (id, timestamp, method, path, account_used, status_code, success, error_message, response_time_ms, failover_attempts)
 			 VALUES (?, ?, 'POST', '/v1/messages', NULL, 200, 1, NULL, 100, 0)`,
-			[id, now],
-		);
-		await adapter.run(
-			`INSERT INTO request_payloads (id, json, timestamp) VALUES (?, ?, ?)`,
-			[id, blob, now],
-		);
+			params: [id, now],
+			expectedChanges: 1,
+		});
+		statements.push({
+			sql: "INSERT INTO request_payloads (id, json, timestamp) VALUES (?, ?, ?)",
+			params: [id, blob, now],
+			expectedChanges: 1,
+		});
 	}
+	// Seed the same real rows without measuring thousands of durable commits.
+	await adapter.runBatchWithChanges(statements);
 }
 
 describe("DatabaseOperations.getFreelistCount", () => {

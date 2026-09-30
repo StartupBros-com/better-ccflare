@@ -234,10 +234,7 @@ async function ensureQualityRouteSchemaPg(
   enrolled INTEGER NOT NULL DEFAULT 1, ingress_until BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (principal_id, session_id)
  )`);
-	const columns = await adapter.query<{ column_name: string }>(
-		"SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'quality_route_sessions'",
-	);
-	if (!columns.some((column) => column.column_name === "enrolled")) {
+	if (!(await columnExists(adapter, "quality_route_sessions", "enrolled"))) {
 		await adapter.unsafe(
 			"ALTER TABLE quality_route_sessions ADD COLUMN enrolled INTEGER NOT NULL DEFAULT 1",
 		);
