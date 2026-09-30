@@ -181,6 +181,9 @@ export interface RoutingSelectionDiagnostics {
 export type RoutePhysicalModelPolicy = "exact" | "catalog-role";
 
 export interface RequestMeta {
+	/** Dedicated quality provenance; persisted separately by the U7 consumer. */
+	qualityDecision?: import("./quality-routing").QualityDecisionEnvelope;
+	qualityAccounting?: import("./quality-routing").QualityAdmissionDecision["accounting"];
 	id: string;
 	/** Authenticated guard attempt join key. Absent for direct or invalid traffic. */
 	guardAttemptOrdinal?: number;

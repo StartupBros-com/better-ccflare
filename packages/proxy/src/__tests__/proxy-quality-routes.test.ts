@@ -1,0 +1,1205 @@
+import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, expect, it, spyOn } from "bun:test";
+import { compileQualityRoutingPolicy } from "@better-ccflare/core";
+import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
+import { getProvider, usageCache } from "@better-ccflare/providers";
+import type { Account, QualityVerifiedSession } from "@better-ccflare/types";
+import { BunSqlAdapter } from "../../../database/src/adapters/bun-sql-adapter";
+import { ensureSchema } from "../../../database/src/migrations";
+import { QualityRouteRepository } from "../../../database/src/repositories/quality-route.repository";
+import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
+import {
+	clearCodexModelCacheForTests,
+	getCodexModels,
+} from "../codex-model-catalog";
+import type { ProxyContext } from "../handlers/proxy-types";
+import { fetchLiveModels, resetModelCatalogForTest } from "../model-catalog";
+import { handleProxy } from "../proxy";
+import { compileQualityCandidates } from "../quality-route-candidates";
+import { QualityRouteService } from "../quality-route-service";
+import * as collectors from "../usage-collector";
+
+const scope: QualityVerifiedSession = {
+	verified: true,
+	principalId: "test-principal",
+	sessionId: "test-session",
+};
+const originalFetch = globalThis.fetch;
+let db: Database;
+let service: QualityRouteService;
+let ctx: ProxyContext;
+let accounts: Account[];
+let sends: { model: string; authorization: string | null }[];
+let upstream: () => Response;
+let restores: (() => void)[];
+function account(id: string): Account {
+	return {
+		id,
+		name: id,
+		provider: "anthropic",
+		api_key: `synthetic-${id}`,
+		access_token: null,
+		refresh_token: null,
+		expires_at: null,
+		created_at: 1,
+		request_count: 0,
+		total_requests: 0,
+		last_used: null,
+		rate_limited_until: null,
+		rate_limited_reason: null,
+		rate_limited_at: null,
+		session_start: null,
+		session_request_count: 0,
+		paused: false,
+		requires_reauth: false,
+		rate_limit_reset: null,
+		rate_limit_status: null,
+		rate_limit_remaining: null,
+		priority: 0,
+		auto_fallback_enabled: false,
+		auto_refresh_enabled: false,
+		auto_pause_on_overage_enabled: false,
+		peak_hours_pause_enabled: false,
+		custom_endpoint: null,
+		model_mappings: null,
+		cross_region_mode: null,
+		model_fallbacks: null,
+		billing_type: null,
+		pause_reason: null,
+		refresh_token_issued_at: null,
+		consecutive_rate_limits: 0,
+	};
+}
+function request(
+	model = "claude-bccf-quality-auto",
+	headers: Record<string, string> = {},
+	body: Record<string, unknown> = {},
+): Request {
+	return new Request("https://proxy.invalid/v1/messages", {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			"x-claude-code-session-id": scope.sessionId,
+			...headers,
+		},
+		body: JSON.stringify({
+			model,
+			messages: [{ role: "user", content: "hello" }],
+			max_tokens: 20,
+			...body,
+		}),
+	});
+}
+async function send(
+	req = request(),
+	principal: string | null = scope.principalId,
+) {
+	return handleProxy(req, new URL(req.url), ctx, principal);
+}
+async function home(key = "$root") {
+	return (await service.status(scope))?.conversations.find((c) => c.key === key)
+		?.home?.target;
+}
+async function flush() {
+	for (let i = 0; i < 20; i++)
+		await new Promise((resolve) => setTimeout(resolve, 0));
+}
+const complete = () =>
+	Response.json({
+		id: "msg-test",
+		type: "message",
+		role: "assistant",
+		model: "claude-fable-5-1",
+		content: [{ type: "text", text: "ok" }],
+		stop_reason: "end_turn",
+		usage: { input_tokens: 1, output_tokens: 1 },
+	});
+beforeEach(async () => {
+	db = new Database(":memory:");
+	ensureSchema(db);
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db)),
+	);
+	accounts = [account("a"), account("b")];
+	sends = [];
+	upstream = complete;
+	const policy = compileQualityRoutingPolicy({
+		version: 1,
+		assignments: [
+			{
+				line: "claude-fable",
+				lane: "fable",
+				priority: 0,
+				upgrade: "same-line-supported",
+			},
+			{
+				line: "claude-opus",
+				lane: "opus",
+				priority: 0,
+				upgrade: "same-line-supported",
+			},
+			{
+				line: "claude-sonnet",
+				lane: "standard",
+				priority: 0,
+				upgrade: "same-line-supported",
+			},
+			{
+				line: "claude-haiku",
+				lane: "lightweight",
+				priority: 0,
+				upgrade: "same-line-supported",
+			},
+		],
+		accounts: accounts.map((a) => ({
+			accountId: a.id,
+			provider: "anthropic",
+			lines: ["claude-fable", "claude-opus", "claude-sonnet", "claude-haiku"],
+			priority: 0,
+		})),
+		fallbacks: [
+			{ from: "fable", to: "astra" },
+			{ from: "astra", to: "opus" },
+		],
+		spendGrants: [],
+	});
+	const coordinator = new AnthropicDegradedModeCoordinator();
+	ctx = {
+		qualityRouteService: service,
+		strategy: { select: async () => accounts },
+		anthropicDegradedMode: coordinator,
+		dbOps: {
+			getAllAccounts: async () => accounts,
+			getAccount: async (id: string) =>
+				accounts.find((a) => a.id === id) ?? null,
+			getAgentPreference: async () => null,
+			getActiveComboForFamily: async () => null,
+			recordSuccess: async () => {},
+			incrementRequestCount: async () => {},
+			updateAccount: async () => {},
+		},
+		config: {
+			getQualityRoutingPolicy: () => policy,
+			getSystemPromptCacheTtl1h: () => false,
+			getAgentFrontmatterModelFallback: () => false,
+			getStorePayloads: () => false,
+			getUsageThrottlingFiveHourEnabled: () => false,
+			getUsageThrottlingWeeklyEnabled: () => false,
+		},
+		runtime: { port: 8080, clientId: "synthetic" },
+		provider: { name: "anthropic", canHandle: () => true },
+		refreshInFlight: new Map(),
+		asyncWriter: { enqueue: () => {} },
+	} as unknown as ProxyContext;
+	const collector = {
+		handleStart: () => {},
+		handleChunk: () => {},
+		handleEnd: async () => {},
+	} as unknown as collectors.UsageCollector;
+	restores = [
+		spyOn(collectors, "getUsageCollector").mockReturnValue(collector),
+		spyOn(collectors, "tryGetUsageCollector").mockReturnValue(collector),
+	].map((s) => () => s.mockRestore());
+	globalThis.fetch = Object.assign(
+		async (input: RequestInfo | URL, init?: RequestInit) => {
+			const req = input instanceof Request ? input : new Request(input, init);
+			if (req.method === "GET")
+				return Response.json({
+					data: [
+						"claude-fable-5-1",
+						"claude-opus-5-5",
+						"claude-sonnet-5-5",
+						"claude-haiku-4-5",
+					].map((id) => ({
+						id,
+						max_input_tokens: 100000,
+						max_tokens: 1000,
+						input_modalities: ["text"],
+					})),
+					has_more: false,
+				});
+			const body = (await req.json()) as { model: string };
+			sends.push({
+				model: body.model,
+				authorization:
+					req.headers.get("x-api-key") ?? req.headers.get("authorization"),
+			});
+			return upstream();
+		},
+		{ preconnect: () => {} },
+	) as typeof fetch;
+	for (const a of accounts)
+		await fetchLiveModels(ctx, { allowOAuth: true, accountId: a.id });
+	for (const a of accounts)
+		usageCache.set(a.id, {
+			limits: [
+				{ kind: "weekly_all", percent: 10, resets_at: Date.now() + 60000 },
+			],
+			spend: { enabled: false },
+		} as never);
+});
+afterEach(async () => {
+	await flush();
+	globalThis.fetch = originalFetch;
+	for (const restore of restores) restore();
+	resetModelCatalogForTest();
+	clearCodexModelCacheForTests();
+	usageCache.clear();
+	db.close();
+});
+it("sends the exact physical model and settles a real SQLite home only after valid completion", async () => {
+	const response = await send();
+	expect(response.status).toBe(200);
+	expect(await home()).toBeUndefined();
+	await response.text();
+	await flush();
+	expect(sends).toEqual([
+		{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+	]);
+	expect((await home())?.physicalModel).toBe("claude-fable-5-1");
+});
+it("rejects unknown quality IDs and hard-route conflicts without provider sends or accepted intent", async () => {
+	expect((await send(request("claude-bccf-quality-unknown"))).status).toBe(400);
+	expect(
+		(await send(request(undefined, { "x-better-ccflare-account-id": "a" })))
+			.status,
+	).toBe(400);
+	expect(sends).toHaveLength(0);
+	expect(await service.status(scope)).toBeNull();
+});
+it("requires a verified API principal, not raw authorization", async () => {
+	expect(
+		(await send(request(undefined, { authorization: "Bearer spoof" }), null))
+			.status,
+	).toBe(400);
+	expect(sends).toHaveLength(0);
+});
+it("HTTP 200 with invalid JSON cannot install a home", async () => {
+	upstream = () =>
+		new Response("{}", { headers: { "content-type": "application/json" } });
+	await (await send()).text();
+	await flush();
+	expect(sends).toHaveLength(1);
+	expect(await home()).toBeUndefined();
+});
+function sse(events: unknown[]) {
+	return new Response(
+		events
+			.map(
+				(event) =>
+					`event: ${(event as { type: string }).type}\ndata: ${JSON.stringify(event)}\n\n`,
+			)
+			.join(""),
+		{ headers: { "content-type": "text/event-stream" } },
+	);
+}
+const startEvent = {
+	type: "message_start",
+	message: {
+		id: "msg",
+		type: "message",
+		role: "assistant",
+		model: "claude-fable-5-1",
+		content: [],
+		usage: { input_tokens: 1, output_tokens: 0 },
+	},
+};
+const successEvents = [
+	startEvent,
+	{
+		type: "content_block_start",
+		index: 0,
+		content_block: { type: "text", text: "" },
+	},
+	{
+		type: "content_block_delta",
+		index: 0,
+		delta: { type: "text_delta", text: "ok" },
+	},
+	{ type: "content_block_stop", index: 0 },
+	{
+		type: "message_delta",
+		delta: { stop_reason: "end_turn", stop_sequence: null },
+		usage: { output_tokens: 1 },
+	},
+	{ type: "message_stop" },
+];
+it.each([
+	"auto",
+	"fable",
+	"astra",
+	"opus",
+])("preference %s begins on its approved suffix", async (preference) => {
+	await (await send(request(`claude-bccf-quality-${preference}`))).text();
+	await flush();
+	expect(sends[0]?.model).toBe(
+		preference === "auto" || preference === "fable"
+			? "claude-fable-5-1"
+			: "claude-opus-5-5",
+	);
+});
+it("synthesized terminal recovery is not provider success evidence for a home", async () => {
+	upstream = () => sse(successEvents.slice(0, -1));
+	const response = await send(request(undefined, {}, { stream: true }));
+	await response.text();
+	await flush();
+	expect(sends).toHaveLength(1);
+	expect(await home()).toBeUndefined();
+});
+it("valid native terminal stream installs a home; HTTP headers alone do not", async () => {
+	upstream = () => sse(successEvents);
+	const response = await send(request(undefined, {}, { stream: true }));
+	expect(await home()).toBeUndefined();
+	await response.text();
+	await flush();
+	expect((await home())?.physicalModel).toBe("claude-fable-5-1");
+	expect(sends).toHaveLength(1);
+});
+it.each([
+	"eof",
+	"error",
+])("%s after stream output never replays or installs a home", async (kind) => {
+	upstream = () =>
+		sse([
+			startEvent,
+			successEvents[1],
+			successEvents[2],
+			...(kind === "error"
+				? [
+						{
+							type: "error",
+							error: { type: "overloaded_error", message: "synthetic" },
+						},
+					]
+				: []),
+		]);
+	await (await send(request(undefined, {}, { stream: true }))).text();
+	await flush();
+	expect(sends).toHaveLength(1);
+	expect(await home()).toBeUndefined();
+});
+it("downstream cancellation cannot install a home", async () => {
+	upstream = () =>
+		new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(
+						new TextEncoder().encode(`data: ${JSON.stringify(startEvent)}\n\n`),
+					);
+				},
+			}),
+			{ headers: { "content-type": "text/event-stream" } },
+		);
+	const response = await send(request(undefined, {}, { stream: true }));
+	await response.body?.cancel();
+	await flush();
+	expect(sends).toHaveLength(1);
+	expect(await home()).toBeUndefined();
+});
+it("children get independent standard and light homes while root stream is running", async () => {
+	upstream = () =>
+		new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(
+						new TextEncoder().encode(`data: ${JSON.stringify(startEvent)}\n\n`),
+					);
+				},
+			}),
+			{ headers: { "content-type": "text/event-stream" } },
+		);
+	const root = await send(request(undefined, {}, { stream: true }));
+	expect(await home()).toBeUndefined();
+	upstream = complete;
+	for (const [id, model] of [
+		["standard-child", "claude-sonnet-5-5"],
+		["light-child", "claude-haiku-4-5"],
+	])
+		await (await send(request(model, { "x-claude-code-agent-id": id }))).text();
+	await flush();
+	const status = await service.status(scope);
+	expect(
+		status?.conversations
+			.filter((c) => c.key !== "$root")
+			.map((c) => c.home?.target.physicalModel),
+	).toEqual(["claude-sonnet-5-5", "claude-haiku-4-5"]);
+	expect(sends.map((s) => s.model)).toEqual([
+		"claude-fable-5-1",
+		"claude-sonnet-5-5",
+		"claude-haiku-4-5",
+	]);
+	await root.body?.cancel();
+});
+it("authorized marker-only worker is request-only and never gets a guessed home", async () => {
+	await (await send()).text();
+	await flush();
+	await (
+		await send(
+			request("claude-sonnet-5-5", {
+				"x-anthropic-billing-header": "cc_is_subagent=true",
+			}),
+		)
+	).text();
+	await flush();
+	expect(sends[1]?.model).toBe("claude-sonnet-5-5");
+	expect((await service.status(scope))?.conversations).toHaveLength(1);
+});
+it("healthy home survives priority changes and temporary request-only fallback", async () => {
+	await (await send()).text();
+	await flush();
+	accounts[0].priority = 100;
+	accounts[1].priority = 0;
+	await (await send()).text();
+	await flush();
+	expect(sends[1]?.authorization).toBe("synthetic-a");
+	accounts[0].rate_limited_until = Date.now() + 60000;
+	await (await send()).text();
+	await flush();
+	expect(sends[2]?.authorization).toBe("synthetic-b");
+	expect((await home())?.accountId).toBe("a");
+	accounts[0].rate_limited_until = null;
+	await (await send()).text();
+	expect(sends[3]?.authorization).toBe("synthetic-a");
+});
+it("same-account Opus remains eligible when Fable scoped quota is exhausted", async () => {
+	for (const a of accounts)
+		usageCache.set(a.id, {
+			limits: [
+				{ kind: "weekly_all", percent: 10, resets_at: Date.now() + 60000 },
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: Date.now() + 60000,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+			spend: { enabled: false },
+		} as never);
+	await (await send()).text();
+	await flush();
+	expect(sends).toEqual([
+		{ model: "claude-opus-5-5", authorization: "synthetic-a" },
+	]);
+	expect((await home())?.lane).toBe("opus");
+});
+it("missing capabilities, output overflow, and removed enrollment produce zero sends", async () => {
+	expect(
+		(await send(request(undefined, {}, { max_tokens: 1001 }))).status,
+	).toBe(503);
+	expect(sends).toHaveLength(0);
+	resetModelCatalogForTest();
+	expect((await send()).status).toBe(503);
+	expect(sends).toHaveLength(0);
+});
+it("persistent settlement failure retains a restart-visible fence without replay", async () => {
+	const fail = spyOn(service, "settleDispatch").mockRejectedValue(
+		new Error("synthetic SQLite write failure"),
+	);
+	await (await send()).text();
+	await flush();
+	expect(fail).toHaveBeenCalledTimes(3);
+	expect(sends).toHaveLength(1);
+	expect(await home()).toBeUndefined();
+	fail.mockRestore();
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db)),
+	);
+	ctx.qualityRouteService = service;
+	expect((await service.status(scope))?.unresolved).toHaveLength(1);
+	expect((await send()).status).toBe(503);
+	expect(sends).toHaveLength(1);
+});
+it("lost settlement response retries only persistence", async () => {
+	const settle = service.settleDispatch.bind(service);
+	const lost = spyOn(service, "settleDispatch").mockImplementationOnce(
+		async (identity, outcome) => {
+			await settle(identity, outcome);
+			throw new Error("synthetic committed reply loss");
+		},
+	);
+	await (await send()).text();
+	await flush();
+	expect(lost).toHaveBeenCalledTimes(2);
+	expect(sends).toHaveLength(1);
+	expect((await home())?.accountId).toBe("a");
+	lost.mockRestore();
+});
+it.each([
+	"active",
+	"fresh",
+	"left",
+])("older buffered root cannot reinstate enrollment after newer native intent (%s)", async (state) => {
+	if (state !== "fresh") {
+		await (await send()).text();
+		await flush();
+	}
+	if (state === "left") {
+		await (await send(request("claude-opus-5-5"))).text();
+		await flush();
+	}
+	let release: (chunk: Uint8Array) => void = () => {};
+	const delayed = new Request("https://proxy.invalid/v1/messages", {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			"x-claude-code-session-id": scope.sessionId,
+		},
+		body: new ReadableStream({
+			start(controller) {
+				release = (chunk) => {
+					controller.enqueue(chunk);
+					controller.close();
+				};
+			},
+		}),
+		duplex: "half",
+	} as RequestInit);
+	const pending = send(delayed);
+	await flush();
+	await (await send(request("claude-opus-5-5"))).text();
+	await flush();
+	const before = sends.length;
+	release(
+		new TextEncoder().encode(
+			JSON.stringify({
+				model: "claude-bccf-quality-auto",
+				messages: [{ role: "user", content: "old" }],
+				max_tokens: 20,
+			}),
+		),
+	);
+	expect((await pending).status).toBe(503);
+	expect(sends).toHaveLength(before);
+	expect((await service.status(scope))?.preference).toBeNull();
+});
+it("candidate authority is immutable and exhausts each lane before the next", () => {
+	accounts[0].priority = 100;
+	accounts[1].priority = 0;
+	const policy = ctx.config.getQualityRoutingPolicy();
+	if (!policy) throw new Error("policy fixture missing");
+	const plan = compileQualityCandidates(
+		policy,
+		{ kind: "main", preference: "auto" },
+		accounts,
+	);
+	expect(plan.map((c) => [c.target.accountId, c.target.physicalModel])).toEqual(
+		[
+			["b", "claude-fable-5-1"],
+			["a", "claude-fable-5-1"],
+			["b", "claude-opus-5-5"],
+			["a", "claude-opus-5-5"],
+		],
+	);
+	expect(Object.isFrozen(plan)).toBe(true);
+	expect(
+		plan.every((c) => Object.isFrozen(c) && Object.isFrozen(c.target)),
+	).toBe(true);
+});
+it("existing strategy route circuits veto exact candidates without installing a parallel home", async () => {
+	const strategy = new SessionAffinityStrategy();
+	ctx.strategy = strategy;
+	const select = strategy.select.bind(strategy);
+	let selectedMeta: Parameters<typeof select>[1] | null = null;
+	const observer = spyOn(strategy, "select").mockImplementation(
+		async (accounts, meta) => {
+			selectedMeta = meta;
+			return select(accounts, meta);
+		},
+	);
+	try {
+		await (await send()).text();
+		await flush();
+		expect(strategy.affinityEntries).toBe(0);
+		if (!selectedMeta) throw new Error("missing real strategy selection");
+		strategy.reportCandidateFailure(selectedMeta, {
+			candidateId: JSON.stringify(["a", "claude-fable-5-1", "claude-fable"]),
+			reason: "synthetic-timeout",
+			suppressForMs: 60000,
+		});
+		await (await send()).text();
+		await flush();
+		expect(sends[1]?.authorization).toBe("synthetic-b");
+		expect((await home())?.accountId).toBe("a");
+		expect(strategy.affinityEntries).toBe(0);
+	} finally {
+		observer.mockRestore();
+	}
+});
+it("proven native no-work rejection tries another account with that account's credentials", async () => {
+	upstream = () =>
+		sends.length === 1
+			? Response.json(
+					{
+						type: "error",
+						error: { type: "rate_limit_error", message: "synthetic limit" },
+					},
+					{
+						status: 429,
+						headers: { "anthropic-ratelimit-unified-status": "rejected" },
+					},
+				)
+			: complete();
+	const response = await send();
+	expect(response.status).toBe(200);
+	await response.text();
+	await flush();
+	expect(sends).toEqual([
+		{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+		{ model: "claude-fable-5-1", authorization: "synthetic-b" },
+	]);
+	expect((await home())?.accountId).toBe("b");
+});
+it("hard no-work rejection of the exact healthy home authorizes its replacement", async () => {
+	await (await send()).text();
+	await flush();
+	expect((await home())?.accountId).toBe("a");
+	upstream = () =>
+		sends.length === 2
+			? Response.json(
+					{ error: { type: "rate_limit_error" } },
+					{
+						status: 429,
+						headers: { "anthropic-ratelimit-unified-status": "rejected" },
+					},
+				)
+			: complete();
+	await (await send()).text();
+	await flush();
+	expect(sends.map((s) => s.authorization)).toEqual([
+		"synthetic-a",
+		"synthetic-a",
+		"synthetic-b",
+	]);
+	expect((await home())?.accountId).toBe("b");
+});
+it("complete generic 429 settles failure without replay or replacing the home", async () => {
+	await (await send()).text();
+	await flush();
+	const settlement = spyOn(service, "settleDispatch");
+	upstream = () =>
+		Response.json({ error: { type: "rate_limit_error" } }, { status: 429 });
+	const rejected = await send();
+	const rejectedBody = await rejected.text();
+	expect([rejected.status, rejectedBody]).toEqual([
+		429,
+		JSON.stringify({ error: { type: "rate_limit_error" } }),
+	]);
+	await flush();
+	expect(sends).toHaveLength(2);
+	expect((await home())?.accountId).toBe("a");
+	expect(settlement).toHaveBeenCalledTimes(1);
+	expect(settlement.mock.calls[0]?.[1]).toEqual({ kind: "failed" });
+	expect(
+		usageCache.getModelScopedExhaustion("a", "claude-fable-5-1"),
+	).not.toBeNull();
+	upstream = complete;
+	accounts[0].rate_limited_until = Date.now() + 60000;
+	const next = await send();
+	expect(next.status).toBe(200);
+	await next.text();
+	await flush();
+	expect(sends).toHaveLength(3);
+	expect((await home())?.accountId).toBe("a");
+	settlement.mockRestore();
+});
+it.each([
+	["claude-opus-5-5", "claude-sonnet-5-5"],
+	["claude-sonnet-5-5", "claude-opus-5-5"],
+])("child role uses intercepted %s → %s, not parent preference", async (original, rewritten) => {
+	await (await send()).text();
+	await flush();
+	const preference = spyOn(ctx.dbOps, "getAgentPreference").mockResolvedValue({
+		model: rewritten,
+	} as never);
+	try {
+		const response = await send(
+			request(original, {
+				"x-better-ccflare-agent-id": "rewritten-worker",
+				"x-claude-code-agent-id": "rewritten-worker",
+			}),
+		);
+		expect(response.status).toBe(200);
+		await response.text();
+		await flush();
+		expect(sends[1]?.model).toBe(rewritten);
+		expect((await service.status(scope))?.preference).toBe("auto");
+		expect((await home())?.physicalModel).toBe("claude-fable-5-1");
+		expect(
+			(await service.status(scope))?.conversations.find(
+				(c) => c.key !== "$root",
+			)?.home?.target.physicalModel,
+		).toBe(rewritten);
+	} finally {
+		preference.mockRestore();
+	}
+});
+it.each([
+	["larger than analytics", 300 * 1024, "", true],
+	["exact analytics boundary", 256 * 1024, "", true],
+	["invalid tail past analytics", 256 * 1024, "invalid", false],
+	["exact validation bound", 8 * 1024 * 1024, "", true],
+	["oversized validation", 8 * 1024 * 1024, " ", false],
+] as const)("whole nonstream validation: %s", async (_label, size, tail, valid) => {
+	let json = await complete().text();
+	if (valid) {
+		const message = JSON.parse(json);
+		message.content[0].text = "x".repeat(size - json.length + 2);
+		json = JSON.stringify(message);
+	}
+	const payload = json + " ".repeat(size - json.length) + tail;
+	upstream = () =>
+		new Response(payload, { headers: { "content-type": "application/json" } });
+	const settlement = spyOn(service, "settleDispatch");
+	const response = await send();
+	expect(await response.text()).toBe(payload);
+	await flush();
+	expect(Boolean(await home())).toBe(valid);
+	expect(settlement).toHaveBeenCalledTimes(1);
+	expect(settlement.mock.calls[0]?.[1]).toEqual({
+		kind: valid ? "validated-success" : "failed",
+	});
+	expect(sends).toHaveLength(1);
+	settlement.mockRestore();
+});
+it.each([
+	400, 401, 403, 429, 500, 529, 204,
+])("terminal status %s settles one failure and permits a later continuation", async (status) => {
+	upstream = () =>
+		status === 204
+			? new Response(null, { status })
+			: Response.json({ error: { type: "synthetic_error" } }, { status });
+	const settlement = spyOn(service, "settleDispatch");
+	const response = await send();
+	expect(response.status).toBe(status);
+	await response.text();
+	await flush();
+	expect(sends).toHaveLength(1);
+	expect(settlement).toHaveBeenCalledTimes(1);
+	expect(settlement.mock.calls[0]?.[1]).toEqual({ kind: "failed" });
+	expect(await home()).toBeUndefined();
+	upstream = complete;
+	const next = await send();
+	expect(next.status).toBe(200);
+	await next.text();
+	await flush();
+	expect(sends).toHaveLength(2);
+	settlement.mockRestore();
+});
+it.each([
+	"eof",
+	"error",
+	"cancel",
+])("nonstream %s settles exactly once without a home or replay", async (ending) => {
+	let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+	upstream = () =>
+		new Response(
+			new ReadableStream<Uint8Array>({
+				start(c) {
+					controller = c;
+					c.enqueue(new TextEncoder().encode('{"type":"message"'));
+				},
+			}),
+			{ headers: { "content-type": "application/json" } },
+		);
+	const settlement = spyOn(service, "settleDispatch");
+	const response = await send();
+	if (!controller) throw new Error("missing synthetic response controller");
+	if (ending === "cancel") {
+		const cancelled = response.body?.cancel();
+		await flush();
+		expect(settlement).toHaveBeenCalledTimes(1);
+		// The existing usage clone owns the other tee branch. Release that
+		// synthetic source after observing cancellation, not before it.
+		controller.close();
+		await cancelled;
+	} else {
+		const reading = response.text();
+		if (ending === "error") {
+			controller.error(new Error("synthetic read error"));
+			await expect(reading).rejects.toThrow("synthetic read error");
+		} else {
+			controller.close();
+			await reading;
+		}
+	}
+	await flush();
+	expect(settlement).toHaveBeenCalledTimes(1);
+	expect(settlement.mock.calls[0]?.[1]).toEqual({
+		kind: ending === "cancel" ? "cancelled" : "failed",
+	});
+	expect(await home()).toBeUndefined();
+	expect(sends).toHaveLength(1);
+	settlement.mockRestore();
+});
+it.each([
+	"claude-bccf-quality-unknown",
+	"claude-bccf-route-unknown",
+	"",
+])("invalid model %s cannot erase accepted intent", async (model) => {
+	await (await send()).text();
+	await flush();
+	await (await send(request(model))).text();
+	expect((await service.status(scope))?.preference).toBe("auto");
+});
+it("unproven 429 does not replay", async () => {
+	upstream = () =>
+		Response.json({ error: { type: "rate_limit_error" } }, { status: 429 });
+	await (await send()).text();
+	await flush();
+	expect(sends).toHaveLength(1);
+	expect(await home()).toBeUndefined();
+});
+it.each([
+	"credential",
+	"catalog",
+	"grant",
+	"intent",
+])("%s changed during real preparation blocks the prepared target", async (change) => {
+	const provider = getProvider("anthropic");
+	if (!provider?.transformRequestBody)
+		throw new Error("missing native provider");
+	const transform = provider.transformRequestBody.bind(provider);
+	let changed = false;
+	const spy = spyOn(provider, "transformRequestBody").mockImplementation(
+		async (...args) => {
+			const prepared = await transform(...args);
+			if (!changed) {
+				changed = true;
+				if (change === "credential")
+					for (const a of accounts) a.api_key = "rotated";
+				if (change === "catalog") resetModelCatalogForTest();
+				if (change === "grant") ctx.config.getQualityRoutingPolicy = () => null;
+				if (change === "intent") {
+					const ticket = await service.reserveIngress(scope);
+					await service.acceptRoot(ticket, null);
+				}
+			}
+			return prepared;
+		},
+	);
+	try {
+		expect((await send()).status).toBe(503);
+		expect(sends).toHaveLength(0);
+		expect(await home()).toBeUndefined();
+	} finally {
+		spy.mockRestore();
+	}
+});
+it("new durable intent while dispatch persistence awaits still blocks the physical send", async () => {
+	const begin = service.beginDispatch.bind(service);
+	const spy = spyOn(service, "beginDispatch").mockImplementationOnce(
+		async (...args) => {
+			await begin(...args);
+			const ticket = await service.reserveIngress(scope);
+			await service.acceptRoot(ticket, null);
+		},
+	);
+	try {
+		expect((await send()).status).toBe(503);
+		expect(sends).toHaveLength(0);
+		expect((await service.status(scope))?.preference).toBeNull();
+	} finally {
+		spy.mockRestore();
+	}
+});
+it("revoked affirmative overage grant blocks transport after preparation", async () => {
+	const base = ctx.config.getQualityRoutingPolicy();
+	if (!base) throw new Error("missing fixture policy");
+	const config = {
+		version: base.version,
+		assignments: base.assignments,
+		accounts: base.accounts,
+		fallbacks: base.fallbacks,
+		spendGrants: accounts.map((a) => ({
+			accountId: a.id,
+			line: "claude-fable",
+			authorization: "operator-approved",
+			scope: "outside-subscription",
+		})),
+	};
+	let current = compileQualityRoutingPolicy(config);
+	ctx.config.getQualityRoutingPolicy = () => current;
+	for (const a of accounts)
+		usageCache.set(a.id, {
+			limits: [
+				{ kind: "weekly_all", percent: 10, resets_at: Date.now() + 60000 },
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: Date.now() + 60000,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+			spend: { enabled: true, percent: 10 },
+		} as never);
+	const provider = getProvider("anthropic");
+	if (!provider?.transformRequestBody) throw new Error("missing provider");
+	const transform = provider.transformRequestBody.bind(provider);
+	let preparations = 0;
+	const spy = spyOn(provider, "transformRequestBody").mockImplementation(
+		async (...args) => {
+			preparations++;
+			const prepared = await transform(...args);
+			current = compileQualityRoutingPolicy({ ...config, spendGrants: [] });
+			return prepared;
+		},
+	);
+	try {
+		expect((await send()).status).toBe(503);
+		expect(preparations).toBeGreaterThan(0);
+		expect(sends).toHaveLength(0);
+	} finally {
+		spy.mockRestore();
+	}
+});
+it("unknown legacy profile cannot withdraw accepted quality intent", async () => {
+	await (await send()).text();
+	await flush();
+	const before = sends.length;
+	expect((await send(request("claude-bccf-route-unknown"))).status).not.toBe(
+		200,
+	);
+	expect(sends).toHaveLength(before);
+	expect((await service.status(scope))?.preference).toBe("auto");
+});
+it("unsupported hosted work remains typed unavailable rather than bypassing accounting", async () => {
+	const response = await send(
+		request(
+			undefined,
+			{},
+			{ tools: [{ type: "web_search_20250305", name: "web_search" }] },
+		),
+	);
+	expect(response.status).toBe(503);
+	expect(
+		((await response.json()) as { error: { code: string } }).error.code,
+	).toBe("quality_route_unavailable");
+	expect(sends).toHaveLength(0);
+	expect(await home()).toBeUndefined();
+});
+it("original output reserve cannot be weakened during provider transformation", async () => {
+	const provider = getProvider("anthropic");
+	if (!provider?.transformRequestBody)
+		throw new Error("missing native provider");
+	const transform = provider.transformRequestBody.bind(provider);
+	const spy = spyOn(provider, "transformRequestBody").mockImplementation(
+		async (...args) => {
+			const prepared = await transform(...args);
+			const body = await prepared.json();
+			return new Request(prepared, {
+				body: JSON.stringify({ ...body, max_tokens: 1 }),
+			});
+		},
+	);
+	try {
+		expect((await send()).status).toBe(503);
+		expect(sends).toHaveLength(0);
+	} finally {
+		spy.mockRestore();
+	}
+});
+it("root leave preserves existing child lifecycle but never enrolls new children", async () => {
+	await (await send()).text();
+	await flush();
+	await (
+		await send(
+			request("claude-sonnet-5-5", { "x-claude-code-agent-id": "existing" }),
+		)
+	).text();
+	await flush();
+	await (await send(request("claude-opus-5-5"))).text();
+	await flush();
+	expect((await service.status(scope))?.preference).toBeNull();
+	await (
+		await send(
+			request("claude-sonnet-5-5", { "x-claude-code-agent-id": "existing" }),
+		)
+	).text();
+	await flush();
+	const before = (await service.status(scope))?.conversations.length;
+	await (
+		await send(
+			request("claude-sonnet-5-5", { "x-claude-code-agent-id": "new" }),
+		)
+	).text();
+	await flush();
+	expect((await service.status(scope))?.conversations).toHaveLength(
+		before ?? 0,
+	);
+	expect(
+		(await service.status(scope))?.conversations.find(
+			(c) => c.role === "standard",
+		)?.home,
+	).not.toBeNull();
+});
+it("stale successful root completion cannot reinstate enrollment", async () => {
+	const old = await send();
+	await (await send(request("claude-opus-5-5"))).text();
+	await old.text();
+	await flush();
+	expect((await service.status(scope))?.preference).toBeNull();
+	expect(await home()).toBeUndefined();
+	expect(sends).toHaveLength(2);
+});
+it("two first requests cannot both cross the durable dispatch boundary", async () => {
+	const responses = await Promise.all([send(), send()]);
+	await Promise.all(responses.map((r) => r.text()));
+	await flush();
+	expect(sends).toHaveLength(1);
+	expect((await home())?.accountId).toBe("a");
+});
+it("disabled service preserves ordinary native routing without durable enrollment", async () => {
+	ctx.qualityRouteService = undefined;
+	await (await send(request("claude-opus-5-5"))).text();
+	expect(sends[0]?.model).toBe("claude-opus-5-5");
+	expect(await service.status(scope)).toBeNull();
+	expect((await send()).status).toBe(503);
+	expect(sends).toHaveLength(1);
+});
+it("missing stable session rejects an explicit quality ID", async () => {
+	const req = request();
+	req.headers.delete("x-claude-code-session-id");
+	expect((await send(req)).status).toBe(400);
+	expect(sends).toHaveLength(0);
+});
+it("owned Codex transport keeps an exact Sol predecessor after successor arrival and retry selects latest", async () => {
+	const codex = {
+		...account("c"),
+		provider: "codex",
+		api_key: null,
+		access_token: "synthetic-c",
+		expires_at: Date.now() + 3600000,
+	};
+	accounts = [codex];
+	const models = ["gpt-5.6-sol"];
+	const policy = compileQualityRoutingPolicy({
+		version: 1,
+		assignments: [
+			{
+				line: "gpt-sol",
+				lane: "opus",
+				priority: 0,
+				upgrade: "same-line-supported",
+			},
+		],
+		accounts: [
+			{ accountId: "c", provider: "codex", lines: ["gpt-sol"], priority: 0 },
+		],
+		fallbacks: [
+			{ from: "fable", to: "astra" },
+			{ from: "astra", to: "opus" },
+		],
+		spendGrants: [
+			{
+				accountId: "c",
+				line: "gpt-sol",
+				authorization: "operator-approved",
+				scope: "outside-subscription",
+			},
+		],
+	});
+	ctx.config.getQualityRoutingPolicy = () => policy;
+	globalThis.fetch = Object.assign(
+		async (input: RequestInfo | URL, init?: RequestInit) => {
+			const req = input instanceof Request ? input : new Request(input, init);
+			if (req.method === "GET")
+				return Response.json({
+					models: models.map((slug) => ({
+						slug,
+						context_window: 100000,
+						max_context_window: 100000,
+						max_output_tokens: 1000,
+						input_modalities: ["text"],
+					})),
+				});
+			const body = (await req.json()) as { model: string };
+			sends.push({
+				model: body.model,
+				authorization: req.headers.get("authorization"),
+			});
+			return sse([
+				{
+					type: "response.created",
+					response: { id: "resp-synthetic", model: body.model },
+				},
+				{ type: "response.output_text.delta", delta: "ok" },
+				{
+					type: "response.completed",
+					response: {
+						id: "resp-synthetic",
+						model: body.model,
+						status: "completed",
+						usage: { input_tokens: 1, output_tokens: 1 },
+					},
+				},
+			]);
+		},
+		{ preconnect: () => {} },
+	) as typeof fetch;
+	await getCodexModels(codex.id, ctx);
+	usageCache.set(codex.id, {
+		limits: [
+			{ kind: "weekly_all", percent: 10, resets_at: Date.now() + 60000 },
+		],
+		spend: { enabled: false },
+	} as never);
+	const response = await send(request("claude-bccf-quality-opus"));
+	expect({
+		status: response.status,
+		body: response.status === 200 ? null : await response.clone().text(),
+	}).toMatchObject({ status: 200 });
+	await response.text();
+	await flush();
+	expect((await home())?.physicalModel).toBe("gpt-5.6-sol");
+	models.push("gpt-6.1-sol");
+	await getCodexModels(codex.id, ctx);
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db)),
+	);
+	ctx.qualityRouteService = service;
+	await (await send(request("claude-bccf-quality-opus"))).text();
+	await flush();
+	expect(sends[1]?.model).toBe("gpt-5.6-sol");
+	const status = await service.status(scope);
+	if (!status) throw new Error("missing durable root");
+	const exactPolicy = compileQualityRoutingPolicy({
+		version: policy.version,
+		accounts: policy.accounts,
+		fallbacks: policy.fallbacks,
+		spendGrants: policy.spendGrants,
+		assignments: policy.assignments.map((assignment) => ({
+			...assignment,
+			upgrade: "exact-only",
+		})),
+	});
+	expect(
+		compileQualityCandidates(
+			exactPolicy,
+			{ kind: "main", preference: "opus" },
+			accounts,
+			status.conversations[0],
+		).map((candidate) => candidate.target.physicalModel),
+	).toEqual(["gpt-5.6-sol"]);
+	await service.retryPreferred({
+		session: scope,
+		incarnation: status.incarnation,
+		expectedIntentRevision: status.intentRevision,
+		idempotencyToken: "retry-once",
+	});
+	await (await send(request("claude-bccf-quality-opus"))).text();
+	await flush();
+	expect(sends[2]?.model).toBe("gpt-6.1-sol");
+	expect((await home())?.physicalModel).toBe("gpt-6.1-sol");
+	expect(sends.every((s) => s.authorization === "Bearer synthetic-c")).toBe(
+		true,
+	);
+});
+it("ambiguous send failure never replays against a second account", async () => {
+	upstream = () => {
+		throw new Error("synthetic connection loss after write");
+	};
+	await (await send()).text();
+	await flush();
+	expect(sends).toHaveLength(1);
+	expect(await home()).toBeUndefined();
+});

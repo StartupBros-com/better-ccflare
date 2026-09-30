@@ -639,6 +639,12 @@ export function handleProxy(
 	);
 }
 
+import { captureAutoRequestRequirements } from "@better-ccflare/providers";
+import {
+	reserveQualityIngress,
+	routeQualityRequest,
+} from "./quality-route-candidates";
+
 async function handleProxyImpl(
 	req: Request,
 	url: URL,
@@ -647,6 +653,7 @@ async function handleProxyImpl(
 	apiKeyName?: string | null,
 	observation?: RequestObservation,
 ): Promise<Response> {
+	reserveQualityIngress(req, url, ctx, apiKeyId);
 	// Reserve root intent synchronously, before body buffering or agent
 	// interception can await and invert same-session request order. Discovery,
 	// unrelated paths, children, credentialless callers, and zero-profile
@@ -901,6 +908,9 @@ async function handleProxyCoreImpl(
 	}
 	const requestBodyContext = new RequestBodyContext(requestBodyBuffer);
 	const originalParsedBody = requestBodyContext.getParsedJson();
+	const qualityRequirements = ctx.qualityRouteService
+		? captureAutoRequestRequirements(originalParsedBody)
+		: undefined;
 	// Scheduler auth has already been consumed above. Only an explicitly
 	// streaming Anthropic Messages request may activate the outer SSE rescue;
 	// non-streaming callers must retain their eventual JSON status/headers/body,
@@ -1153,6 +1163,31 @@ async function handleProxyCoreImpl(
 		finalBodyBuffer === requestBodyContext.getBuffer()
 			? requestBodyContext
 			: new RequestBodyContext(finalBodyBuffer);
+	requestMeta.agentAttributionSource = agentAttributionSource;
+	const qualityResponse = await routeQualityRequest({
+		req,
+		url,
+		ctx,
+		meta: requestMeta,
+		originalBody: originalParsedBody,
+		body: finalRequestBodyContext,
+		apiKeyId,
+		apiKeyName,
+		requirements: qualityRequirements,
+		serverToolQueryPresent: hasServerToolCapabilityQuery(url),
+		onRootAccepted: () =>
+			modelRouteRegistry?.commitNative(
+				{
+					callerIdentity: routeCallerIdentity(req, apiKeyId),
+					sessionId: req.headers.get("x-claude-code-session-id"),
+					requestModel: normalizedRequestModel,
+					isSubagent: false,
+				},
+				{ kind: "native" },
+				rootIntentGeneration,
+			),
+	});
+	if (qualityResponse) return qualityResponse;
 	const effectiveModelAfterInterception =
 		finalRequestBodyContext.getModel()?.trim() ?? null;
 	requestMeta.requestedLogicalModel = effectiveModelAfterInterception;
