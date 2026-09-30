@@ -113,7 +113,7 @@ export class QualityRouteService {
 	acquireLease(
 		session: QualityVerifiedSession,
 		incarnation: string,
-		conversation: string,
+		conversation: string | null,
 		revision: number,
 	) {
 		return this.repository.acquireLease(

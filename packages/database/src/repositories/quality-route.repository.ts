@@ -88,6 +88,8 @@ export interface QualityLease {
 	expectedHomeVersion: number;
 	leaseId: string;
 }
+/** Internal dispatch namespace, never a child identity or home-bearing conversation. */
+const REQUEST_ONLY = "$request-only";
 interface StoredLease {
 	identity: QualityLease;
 	expiresAt: number;
@@ -107,6 +109,11 @@ export interface QualityRouteState {
 	root: { preference: QualityRootPreference | null; revision: number } | null;
 	conversations: QualityConversation[];
 	leases: StoredLease[];
+	/** Bounded acknowledgement recovery only; no conversation identity or model home. */
+	requestOnlySettlements?: {
+		identity: QualityLease;
+		outcome: QualitySettlement;
+	}[];
 	commands: {
 		tokenDigest: string;
 		payloadDigest: string;
@@ -203,8 +210,11 @@ function supersedeRoot(
 	root.pending = true;
 	root.lastSettlement = null;
 	root.decision = null;
+	state.requestOnlySettlements = [];
 	state.leases = state.leases.filter(
-		(lease) => lease.identity.conversation !== "$root",
+		(lease) =>
+			lease.identity.conversation !== "$root" &&
+			lease.identity.conversation !== REQUEST_ONLY,
 	);
 }
 
@@ -572,22 +582,24 @@ export class QualityRouteRepository extends BaseRepository<never> {
 	async acquireLease(
 		session: QualityVerifiedSession,
 		incarnation: string,
-		key: string,
+		key: string | null,
 		revision: number,
 		now: number,
 	): Promise<QualityLease> {
 		checkNow(now);
+		const dispatchKey = key ?? REQUEST_ONLY;
 		return this.mutate(session, (state) => {
 			current(state, incarnation, now);
-			const item = conversation(state, key);
+			const item = key === null ? null : conversation(state, key);
 			if (
-				item.revision !== revision ||
-				(key === "$root" && state.root?.preference === null)
+				(item ? item.revision : state.root?.revision) !== revision ||
+				((key === "$root" || key === null) && state.root?.preference === null)
 			)
 				throw new QualityRouteError("stale");
 			if (
 				state.leases.some(
-					(lease) => lease.identity.conversation === key && lease.dispatch,
+					(lease) =>
+						lease.identity.conversation === dispatchKey && lease.dispatch,
 				)
 			)
 				throw new QualityRouteError("unresolved");
@@ -599,9 +611,9 @@ export class QualityRouteRepository extends BaseRepository<never> {
 			const identity: QualityLease = {
 				session,
 				incarnation,
-				conversation: key,
+				conversation: dispatchKey,
 				revision,
-				expectedHomeVersion: item.homeVersion,
+				expectedHomeVersion: item?.homeVersion ?? 0,
 				leaseId: randomUUID(),
 			};
 			state.leases.push({
@@ -619,16 +631,20 @@ export class QualityRouteRepository extends BaseRepository<never> {
 		state: QualityRouteState,
 		identity: QualityLease,
 		now: number,
-	): { lease: StoredLease; item: QualityConversation } {
+	): { lease: StoredLease; item: QualityConversation | null } {
 		current(state, identity.incarnation, now);
-		const item = conversation(state, identity.conversation);
+		const item =
+			identity.conversation === REQUEST_ONLY
+				? null
+				: conversation(state, identity.conversation);
 		const lease = state.leases.find(
 			(entry) => entry.identity.leaseId === identity.leaseId,
 		);
 		if (
 			!lease ||
-			item.revision !== identity.revision ||
-			item.homeVersion !== identity.expectedHomeVersion ||
+			(item ? item.revision : state.root?.revision) !== identity.revision ||
+			(!item && state.root?.preference === null) ||
+			(item?.homeVersion ?? 0) !== identity.expectedHomeVersion ||
 			JSON.stringify(lease.identity) !== JSON.stringify(identity)
 		)
 			throw new QualityRouteError("stale");
@@ -667,6 +683,11 @@ export class QualityRouteRepository extends BaseRepository<never> {
 				)
 			)
 				throw new QualityRouteError("unresolved");
+			if (!item) {
+				lease.dispatch = { target: { ...target }, installHome: false };
+				this.refreshActivity(state, now);
+				return;
+			}
 			const sameHome =
 				item.home?.target.accountId === target.accountId &&
 				item.home.target.physicalModel === target.physicalModel &&
@@ -693,6 +714,35 @@ export class QualityRouteRepository extends BaseRepository<never> {
 		checkNow(now);
 		return this.mutate(identity.session, (state) => {
 			current(state, identity.incarnation, now);
+			if (identity.conversation === REQUEST_ONLY) {
+				if (
+					state.root?.revision !== identity.revision ||
+					state.root.preference === null
+				)
+					throw new QualityRouteError("stale");
+				const history = state.requestOnlySettlements ?? [];
+				const previous = history.find(
+					(entry) => entry.identity.leaseId === identity.leaseId,
+				);
+				if (previous) {
+					if (JSON.stringify(previous.identity) !== JSON.stringify(identity))
+						throw new QualityRouteError("stale");
+					if (previous.outcome.kind !== outcome.kind)
+						throw new QualityRouteError("conflict");
+					return null;
+				}
+				const { lease } = this.findLease(state, identity, now);
+				if (!lease.dispatch) throw new QualityRouteError("stale");
+				state.leases = state.leases.filter(
+					(entry) => entry.identity.leaseId !== identity.leaseId,
+				);
+				state.requestOnlySettlements = [
+					...history,
+					{ identity, outcome },
+				].slice(-this.limits.maxCommands);
+				this.refreshActivity(state, now);
+				return null;
+			}
 			const item = conversation(state, identity.conversation);
 			if (item.revision !== identity.revision)
 				throw new QualityRouteError("stale");

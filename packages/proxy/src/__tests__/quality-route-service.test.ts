@@ -142,6 +142,72 @@ describe("QualityRouteService persistence-only lifecycle", () => {
 			service.settleDispatch(lease, { kind: "failed" }),
 		).rejects.toMatchObject({ code: "conflict" });
 	});
+	it.each([
+		"validated-success",
+		"failed",
+	] as const)("request-only %s lost acknowledgement recovers after restart without a home", async (kind) => {
+		const adapter = new BunSqlAdapter(db);
+		service = new QualityRouteService(
+			new QualityRouteRepository(adapter),
+			() => now,
+		);
+		const ticket = await service.reserveIngress(scope);
+		await service.acceptRoot(ticket, "auto");
+		const before = (await service.status(scope))?.conversations;
+		const lease = await service.acquireLease(
+			scope,
+			ticket.incarnation,
+			null,
+			1,
+		);
+		await service.beginDispatch(lease, astra, null);
+		const update = adapter.runWithChanges.bind(adapter);
+		spyOn(adapter, "runWithChanges").mockImplementationOnce(
+			async (sql, params) => {
+				expect(await update(sql, params)).toBe(1);
+				throw new Error("committed response lost");
+			},
+		);
+		await expect(service.settleDispatch(lease, { kind })).rejects.toThrow(
+			"committed response lost",
+		);
+		db.close();
+		reopen();
+		expect(await service.settleDispatch(lease, { kind })).toBeNull();
+		expect((await service.status(scope))?.conversations).toEqual(before);
+		expect((await service.status(scope))?.unresolved).toHaveLength(0);
+	});
+	it("request-only failed persistence retains its unresolved fence through restart and cleanup", async () => {
+		const ticket = await service.reserveIngress(scope);
+		await service.acceptRoot(ticket, "auto");
+		const before = (await service.status(scope))?.conversations;
+		const lease = await service.acquireLease(
+			scope,
+			ticket.incarnation,
+			null,
+			1,
+		);
+		await service.beginDispatch(lease, astra, null);
+		db.run(
+			"CREATE TRIGGER fail_request_only BEFORE UPDATE ON quality_route_sessions BEGIN SELECT RAISE(ABORT, 'settlement unavailable'); END",
+		);
+		await expect(
+			service.settleDispatch(lease, { kind: "validated-success" }),
+		).rejects.toThrow("settlement unavailable");
+		db.close();
+		reopen();
+		now += 100_000_000;
+		expect(await service.cleanup()).toBe(0);
+		expect((await service.status(scope))?.unresolved).toHaveLength(1);
+		await expect(
+			service.acquireLease(scope, ticket.incarnation, null, 1),
+		).rejects.toMatchObject({ code: "unresolved" });
+		db.run("DROP TRIGGER fail_request_only");
+		expect(
+			await service.settleDispatch(lease, { kind: "validated-success" }),
+		).toBeNull();
+		expect((await service.status(scope))?.conversations).toEqual(before);
+	});
 	it("failed settlement survives restart and expired lease; recovery persists only the saved candidate", async () => {
 		const ticket = await service.reserveIngress(scope);
 		await service.acceptRoot(ticket, "auto");

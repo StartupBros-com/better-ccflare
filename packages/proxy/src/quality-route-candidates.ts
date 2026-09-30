@@ -824,9 +824,26 @@ export async function routeQualityRequest(input: {
 						// the fence, selected-account read and session-status await.
 						await refreshHomeAccount();
 					} else {
+						// Null child identity is a request-only dispatch slot, not a guessed home.
+						// Parent revision binds admission and recovery across process restarts.
+						if (!status)
+							throw new QualityAttemptRejected("parent-not-enrolled");
+						lease = await service.acquireLease(
+							session,
+							incarnation,
+							null,
+							status.intentRevision,
+						);
+						await service.beginDispatch(lease, candidate.target, null);
+						fenced = true;
+						const finalAccount = await ctx.dbOps.getAccount(account.id);
+						if (!finalAccount)
+							throw new QualityAttemptRejected("account-unavailable");
+						latestAccount = finalAccount;
 						const current = await service.status(session);
 						if (
 							current?.incarnation !== incarnation ||
+							current.intentRevision !== lease.revision ||
 							current.preference === null
 						)
 							throw new QualityAttemptRejected("parent-not-enrolled");

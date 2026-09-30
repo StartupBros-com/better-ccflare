@@ -47,6 +47,29 @@ describe("durable quality routing", () => {
 		new QualityRouteRepository(new BunSqlAdapter(connections[1]), limits),
 	]);
 
+	it("stored sessions without request-only acknowledgement history accept non-home dispatch", async () => {
+		const ticket = await first.reserveIngress(scope, 100);
+		const state = await first.acceptRoot(ticket, "auto", 100);
+		delete state.requestOnlySettlements;
+		connections[0].run(
+			"UPDATE quality_route_sessions SET state_json = ? WHERE principal_id = ? AND session_id = ?",
+			[JSON.stringify(state), scope.principalId, scope.sessionId],
+		);
+		const lease = await second.acquireLease(
+			scope,
+			ticket.incarnation,
+			null,
+			1,
+			101,
+		);
+		await second.beginDispatch(lease, target, null, 101);
+		expect(
+			await second.settleDispatch(lease, { kind: "validated-success" }, 102),
+		).toBeNull();
+		expect((await first.status(scope, 102))?.conversations).toEqual(
+			state.conversations,
+		);
+	});
 	it("upgrade separates legacy provisional rows without deleting live homes or fences", async () => {
 		const adapter = new BunSqlAdapter(connections[0]);
 		const ticket = await first.reserveIngress(scope, 100);

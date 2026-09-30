@@ -589,13 +589,16 @@ describe.skipIf(!postgresUrl)(
 			}
 		});
 
-		it("failed and ambiguous settlement retain exactly the right fence and recover persistence only", async () => {
+		it.each([
+			"$root",
+			null,
+		])("failed and ambiguous settlement retains %s fence and recovers persistence only", async (key) => {
 			const ticket = await first.reserveIngress(scope, 100);
 			await first.acceptRoot(ticket, "auto", 100);
 			const lease = await first.acquireLease(
 				scope,
 				ticket.incarnation,
-				"$root",
+				key,
 				1,
 				100,
 			);
@@ -610,7 +613,7 @@ describe.skipIf(!postgresUrl)(
 			second = new QualityRouteRepository(adapters[1]);
 			expect(await second.cleanup(100_000_000)).toBe(0);
 			await expect(
-				second.acquireLease(scope, ticket.incarnation, "$root", 1, 100_000_000),
+				second.acquireLease(scope, ticket.incarnation, key, 1, 100_000_000),
 			).rejects.toMatchObject({ code: "unresolved" });
 			spyOn(adapters[0], "runWithChanges").mockImplementationOnce(
 				async (sql, params) => {
@@ -633,7 +636,7 @@ describe.skipIf(!postgresUrl)(
 			expect(
 				(await second.status(scope, 100_000_004))?.conversations[0]
 					?.homeVersion,
-			).toBe(1);
+			).toBe(key === null ? 0 : 1);
 			expect((await second.status(scope, 100_000_004))?.expiresAt).toBe(
 				before?.expiresAt,
 			);

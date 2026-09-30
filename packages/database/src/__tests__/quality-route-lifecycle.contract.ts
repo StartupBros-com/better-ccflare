@@ -16,6 +16,200 @@ export function qualityIngressContract(
 		principalId: "lifecycle",
 		sessionId: "root",
 	};
+	const target = {
+		accountId: "a",
+		provider: "anthropic",
+		lane: "standard",
+		line: "claude-sonnet",
+		physicalModel: "claude-sonnet-5-5",
+		catalogRevision: "catalog",
+		evidenceRef: "evidence",
+	} as const;
+	it("request-only dispatch CAS is durable before send and survives expiry without creating homes", async () => {
+		const [first, second] = repositories({
+			idleTtlMs: 10,
+			leaseMs: 5,
+			maxLeaseLifetimeMs: 10,
+		});
+		const ticket = await first.reserveIngress(scope, 100);
+		await first.acceptRoot(ticket, "auto", 100);
+		const before = (await first.status(scope, 100))?.conversations;
+		const leases = await Promise.all([
+			first.acquireLease(scope, ticket.incarnation, null, 1, 101),
+			second.acquireLease(scope, ticket.incarnation, null, 1, 101),
+		]);
+		const attempts = await Promise.allSettled([
+			first.beginDispatch(leases[0], target, null, 102),
+			second.beginDispatch(leases[1], target, null, 102),
+		]);
+		expect(
+			attempts.filter((result) => result.status === "fulfilled"),
+		).toHaveLength(1);
+		const winner =
+			leases[attempts.findIndex((result) => result.status === "fulfilled")];
+		expect(
+			(await second.status(scope, 103))?.leases.find((lease) => lease.dispatch)
+				?.identity,
+		).toEqual(winner);
+		expect(await second.cleanup(1000)).toBe(0);
+		await expect(
+			second.acquireLease(scope, ticket.incarnation, null, 1, 1000),
+		).rejects.toMatchObject({ code: "unresolved" });
+		await second.acceptRoot(
+			await second.reserveIngress(scope, 1000),
+			"auto",
+			1000,
+		);
+		await expect(
+			second.acquireLease(scope, ticket.incarnation, null, 1, 1001),
+		).rejects.toMatchObject({ code: "unresolved" });
+		expect((await second.status(scope, 1001))?.conversations).toEqual(before);
+		for (const other of [
+			{ ...scope, principalId: "other" },
+			{ ...scope, sessionId: "other" },
+		]) {
+			const otherTicket = await second.reserveIngress(other, 1001);
+			await second.acceptRoot(otherTicket, "auto", 1001);
+			const lease = await second.acquireLease(
+				other,
+				otherTicket.incarnation,
+				null,
+				1,
+				1001,
+			);
+			await second.beginDispatch(lease, target, null, 1001);
+			await second.settleDispatch(lease, { kind: "validated-success" }, 1001);
+		}
+	});
+	it.each([
+		"validated-success",
+		"failed",
+		"cancelled",
+		"truncated",
+		"losing",
+	] as const)("request-only %s settlement is idempotent and never changes root or sibling homes", async (kind) => {
+		const [first, second] = repositories({ maxCommands: 2 });
+		const ticket = await first.reserveIngress(scope, 100);
+		await first.acceptRoot(ticket, "auto", 100);
+		await first.acceptChild(
+			scope,
+			ticket.incarnation,
+			{ trusted: true, conversationId: "sibling" },
+			"standard",
+			null,
+			100,
+		);
+		for (const key of ["$root", "child:sibling"]) {
+			const lease = await first.acquireLease(
+				scope,
+				ticket.incarnation,
+				key,
+				1,
+				100,
+			);
+			await first.beginDispatch(lease, target, null, 100);
+			await first.settleDispatch(lease, { kind: "validated-success" }, 100);
+		}
+		const before = (await first.status(scope, 100))?.conversations;
+		for (let n = 0; n < 3; n++) {
+			const lease = await first.acquireLease(
+				scope,
+				ticket.incarnation,
+				null,
+				1,
+				101,
+			);
+			await first.beginDispatch(lease, target, null, 101);
+			expect(await second.settleDispatch(lease, { kind }, 102)).toBeNull();
+			expect(await first.settleDispatch(lease, { kind }, 103)).toBeNull();
+			await expect(
+				first.settleDispatch(
+					lease,
+					{ kind: kind === "failed" ? "validated-success" : "failed" },
+					103,
+				),
+			).rejects.toMatchObject({ code: "conflict" });
+		}
+		const after = await second.status(scope, 104);
+		expect(after?.conversations).toEqual(before);
+		expect(after?.leases).toHaveLength(0);
+		expect(after?.requestOnlySettlements).toHaveLength(2);
+	});
+	it.each([
+		"retry",
+		"new-intent",
+	])("explicit parent %s supersedes request-only fence but not identified child state", async (action) => {
+		const [first, second] = repositories({});
+		const ticket = await first.reserveIngress(scope, 100);
+		await first.acceptRoot(ticket, "auto", 100);
+		await first.acceptChild(
+			scope,
+			ticket.incarnation,
+			{ trusted: true, conversationId: "sibling" },
+			"standard",
+			null,
+			100,
+		);
+		const child = await first.acquireLease(
+			scope,
+			ticket.incarnation,
+			"child:sibling",
+			1,
+			100,
+		);
+		await first.beginDispatch(child, target, null, 100);
+		const before = (await first.status(scope, 100))?.conversations.find(
+			(item) => item.key === "child:sibling",
+		);
+		const old = await first.acquireLease(
+			scope,
+			ticket.incarnation,
+			null,
+			1,
+			100,
+		);
+		await first.beginDispatch(old, target, null, 100);
+		if (action === "retry")
+			await second.retryPreferred(
+				{
+					session: scope,
+					incarnation: ticket.incarnation,
+					expectedIntentRevision: 1,
+					idempotencyToken: "retry",
+				},
+				101,
+			);
+		else
+			await second.acceptRoot(
+				await second.reserveIngress(scope, 101),
+				"opus",
+				101,
+			);
+		await expect(
+			first.settleDispatch(old, { kind: "validated-success" }, 102),
+		).rejects.toMatchObject({ code: "stale" });
+		const reopened = await second.acquireLease(
+			scope,
+			ticket.incarnation,
+			null,
+			2,
+			102,
+		);
+		await second.beginDispatch(reopened, target, null, 102);
+		await second.settleDispatch(reopened, { kind: "validated-success" }, 102);
+		expect(
+			(await first.status(scope, 103))?.conversations.find(
+				(item) => item.key === "child:sibling",
+			),
+		).toEqual(before);
+		expect(
+			(await first.status(scope, 103))?.leases.some(
+				(lease) =>
+					lease.identity.leaseId === child.leaseId && lease.dispatch !== null,
+			),
+		).toBe(true);
+		await first.settleDispatch(child, { kind: "validated-success" }, 103);
+	});
 	it("withdrawal preserves another active reservation and prevents withdrawn-token resurrection", async () => {
 		const [first, second] = repositories({ maxSessions: 1 });
 		const older = await first.reserveIngress(scope, 100);

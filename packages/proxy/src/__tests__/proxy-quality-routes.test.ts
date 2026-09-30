@@ -1068,16 +1068,77 @@ it("children get independent standard and light homes while root stream is runni
 it("authorized marker-only worker is request-only and never gets a guessed home", async () => {
 	await (await send()).text();
 	await flush();
-	await (
-		await send(
-			request("claude-sonnet-5-5", {
-				"x-anthropic-billing-header": "cc_is_subagent=true",
-			}),
-		)
-	).text();
+	const before = (await service.status(scope))?.conversations;
+	for (let n = 0; n < 2; n++) {
+		await (
+			await send(
+				request("claude-sonnet-5-5", {
+					"x-anthropic-billing-header": "cc_is_subagent=true",
+				}),
+			)
+		).text();
+		await flush();
+		expect((await service.status(scope))?.unresolved).toHaveLength(0);
+	}
+	expect(sends.map((s) => s.model)).toEqual([
+		"claude-fable-5-1",
+		"claude-sonnet-5-5",
+		"claude-sonnet-5-5",
+	]);
+	expect((await service.status(scope))?.conversations).toEqual(before);
+});
+it("marker-only proven no-work rejection settles its fence before safe account failover", async () => {
+	await (await send()).text();
 	await flush();
-	expect(sends[1]?.model).toBe("claude-sonnet-5-5");
-	expect((await service.status(scope))?.conversations).toHaveLength(1);
+	const before = (await service.status(scope))?.conversations;
+	upstream = () =>
+		sends.length === 2
+			? Response.json(
+					{ error: { type: "rate_limit_error" } },
+					{
+						status: 429,
+						headers: { "anthropic-ratelimit-unified-status": "rejected" },
+					},
+				)
+			: complete();
+	const response = await send(
+		request("claude-sonnet-5-5", {
+			"x-anthropic-billing-header": "cc_is_subagent=true",
+		}),
+	);
+	expect(response.status).toBe(200);
+	await response.text();
+	await flush();
+	expect(sends.slice(1)).toEqual([
+		{ model: "claude-sonnet-5-5", authorization: "synthetic-a" },
+		{ model: "claude-sonnet-5-5", authorization: "synthetic-b" },
+	]);
+	expect((await service.status(scope))?.unresolved).toHaveLength(0);
+	expect((await service.status(scope))?.conversations).toEqual(before);
+});
+it("marker-only ambiguous send stays fenced across service and repository restart", async () => {
+	await (await send()).text();
+	await flush();
+	const before = (await service.status(scope))?.conversations;
+	const worker = () =>
+		request("claude-sonnet-5-5", {
+			"x-anthropic-billing-header": "cc_is_subagent=true",
+		});
+	upstream = () => {
+		throw new Error("synthetic connection loss after write");
+	};
+	await (await send(worker())).text();
+	await flush();
+	expect(sends).toHaveLength(2);
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db)),
+	);
+	ctx.qualityRouteService = service;
+	await (await send(worker())).text();
+	await flush();
+	expect(sends).toHaveLength(2);
+	expect((await service.status(scope))?.unresolved).toHaveLength(1);
+	expect((await service.status(scope))?.conversations).toEqual(before);
 });
 it("request-only fallback records the actual winner without relabeling the healthy home", async () => {
 	await withRealQualityHistory(async (operations, collector) => {
