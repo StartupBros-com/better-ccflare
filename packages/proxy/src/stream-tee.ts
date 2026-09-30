@@ -8,7 +8,7 @@ export function teeStream(
 	upstream: ReadableStream<Uint8Array>,
 	options: {
 		onChunk?: (chunk: Uint8Array) => void;
-		onClose?: (buffered: Uint8Array[]) => void;
+		onClose?: (buffered: Uint8Array[], truncated: boolean) => void;
 		onError?: (error: Error) => void;
 		onCancel?: (reason: unknown) => void;
 		maxBytes?: number; // Max bytes to buffer (default: 1MB)
@@ -43,7 +43,7 @@ export function teeStream(
 
 				if (done) {
 					terminalState = "closed";
-					runCollectorCallback(() => onClose?.(buffered));
+					runCollectorCallback(() => onClose?.(buffered, truncated));
 					controller.close();
 					reader.releaseLock();
 					return;

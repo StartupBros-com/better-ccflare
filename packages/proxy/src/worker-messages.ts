@@ -14,6 +14,9 @@ import type {
 // ===== MAIN THREAD → WORKER =====
 
 export interface StartMessage {
+	qualityDecision?:
+		| import("@better-ccflare/types").QualityDecisionRecord
+		| null;
 	accounting?: RequestAccountingContext;
 	type: "start";
 	messageId: string; // envelope ID for ack tracking

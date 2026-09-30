@@ -639,6 +639,13 @@ export function handleProxy(
 	);
 }
 
+import { captureAutoRequestRequirements } from "@better-ccflare/providers";
+import {
+	reserveQualityIngress,
+	routeQualityRequest,
+	withdrawQualityIngress,
+} from "./quality-route-candidates";
+
 async function handleProxyImpl(
 	req: Request,
 	url: URL,
@@ -647,6 +654,7 @@ async function handleProxyImpl(
 	apiKeyName?: string | null,
 	observation?: RequestObservation,
 ): Promise<Response> {
+	reserveQualityIngress(req, url, ctx, apiKeyId);
 	// Reserve root intent synchronously, before body buffering or agent
 	// interception can await and invert same-session request order. Discovery,
 	// unrelated paths, children, credentialless callers, and zero-profile
@@ -746,6 +754,7 @@ async function handleProxyImpl(
 			rootIntentInput,
 			rootIntentGeneration,
 		);
+		await withdrawQualityIngress(req, ctx);
 	}
 }
 
@@ -850,17 +859,29 @@ async function handleProxyCoreImpl(
 		});
 	}
 
-	// handleProxy is entered only after the server's authentication layer. When
-	// profiles are configured, Claude Code gateway discovery is a local metadata
-	// read: never validate a provider, query accounts, or forward this request.
+	// handleProxy is entered only after the server's authentication layer. These
+	// choices describe intent, not live candidate availability; admission remains
+	// authoritative. Discovery must never refresh catalogs or query providers.
+	const qualityChoices =
+		req.method === "GET" &&
+		url.pathname === "/v1/models" &&
+		ctx.qualityRouteService
+			? (ctx.config?.getQualityRoutingPolicy?.()?.choices ?? [])
+			: [];
 	if (
 		req.method === "GET" &&
 		url.pathname === "/v1/models" &&
-		ctx.modelRouteSessionRegistry?.hasProfiles
+		(ctx.modelRouteSessionRegistry?.hasProfiles || qualityChoices.length > 0)
 	) {
 		return new Response(
 			JSON.stringify({
-				data: ctx.modelRouteSessionRegistry.getDiscoveryModels(),
+				data: [
+					...(ctx.modelRouteSessionRegistry?.getDiscoveryModels() ?? []),
+					...qualityChoices.map((choice) => ({
+						id: choice.publicModelId,
+						display_name: choice.displayName,
+					})),
+				],
 				has_more: false,
 			}),
 			{
@@ -901,6 +922,9 @@ async function handleProxyCoreImpl(
 	}
 	const requestBodyContext = new RequestBodyContext(requestBodyBuffer);
 	const originalParsedBody = requestBodyContext.getParsedJson();
+	const qualityRequirements = ctx.qualityRouteService
+		? captureAutoRequestRequirements(originalParsedBody)
+		: undefined;
 	// Scheduler auth has already been consumed above. Only an explicitly
 	// streaming Anthropic Messages request may activate the outer SSE rescue;
 	// non-streaming callers must retain their eventual JSON status/headers/body,
@@ -1153,6 +1177,31 @@ async function handleProxyCoreImpl(
 		finalBodyBuffer === requestBodyContext.getBuffer()
 			? requestBodyContext
 			: new RequestBodyContext(finalBodyBuffer);
+	requestMeta.agentAttributionSource = agentAttributionSource;
+	const qualityResponse = await routeQualityRequest({
+		req,
+		url,
+		ctx,
+		meta: requestMeta,
+		originalBody: originalParsedBody,
+		body: finalRequestBodyContext,
+		apiKeyId,
+		apiKeyName,
+		requirements: qualityRequirements,
+		serverToolQueryPresent: hasServerToolCapabilityQuery(url),
+		onRootAccepted: () =>
+			modelRouteRegistry?.commitNative(
+				{
+					callerIdentity: routeCallerIdentity(req, apiKeyId),
+					sessionId: req.headers.get("x-claude-code-session-id"),
+					requestModel: normalizedRequestModel,
+					isSubagent: false,
+				},
+				{ kind: "native" },
+				rootIntentGeneration,
+			),
+	});
+	if (qualityResponse) return qualityResponse;
 	const effectiveModelAfterInterception =
 		finalRequestBodyContext.getModel()?.trim() ?? null;
 	requestMeta.requestedLogicalModel = effectiveModelAfterInterception;

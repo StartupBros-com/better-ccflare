@@ -1,3 +1,10 @@
+import {
+	type QualityDecisionRecord,
+	sanitizeQualityDecision,
+} from "./quality-routing";
+
+export type { QualityDecisionRecord } from "./quality-routing";
+export { sanitizeQualityDecision } from "./quality-routing";
 /**
  * This module is deliberately import-free and is re-exported unchanged through
  * the package barrel. `@better-ccflare/types` has a documented runtime cycle
@@ -173,6 +180,7 @@ export function toStreamTerminalState(
 
 // Database row type
 export interface RequestRow {
+	quality_decision?: string | null;
 	id: string;
 	timestamp: number;
 	method: string;
@@ -249,6 +257,7 @@ export interface Request {
 	agentAttributionSource?: AgentAttributionSource;
 	clientSessionId?: string;
 	streamTerminalState?: ReportedStreamTerminalState;
+	qualityDecision?: QualityDecisionRecord | null;
 	routeProvenance?: RouteProvenance;
 }
 
@@ -309,11 +318,13 @@ export interface RequestResponse {
 	 */
 	clientSessionId?: string;
 	streamTerminalState?: ReportedStreamTerminalState;
+	qualityDecision?: QualityDecisionRecord | null;
 	routeProvenance?: RouteProvenance;
 }
 
 // Detailed request with payload
 export interface RequestPayload {
+	qualityDecision?: QualityDecisionRecord | null;
 	id: string;
 	request: {
 		headers: Record<string, string>;
@@ -447,6 +458,7 @@ export function toRequest(row: RequestRow): Request {
 		),
 		clientSessionId: row.client_session_id || undefined,
 		streamTerminalState: toStreamTerminalState(row.stream_terminal_state),
+		qualityDecision: sanitizeQualityDecision(row.quality_decision),
 		routeProvenance: toRouteProvenance(row),
 	};
 }
@@ -486,6 +498,7 @@ export function toRequestResponse(request: Request): RequestResponse {
 		agentAttributionSource: request.agentAttributionSource,
 		clientSessionId: request.clientSessionId,
 		streamTerminalState: request.streamTerminalState,
+		qualityDecision: sanitizeQualityDecision(request.qualityDecision),
 		routeProvenance: request.routeProvenance,
 	};
 }

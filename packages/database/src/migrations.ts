@@ -322,6 +322,46 @@ function ensureRoutingPolicyRevisionSchema(db: Database): void {
 	}
 }
 
+function ensureQualityRouteSchema(db: Database): void {
+	db.run(`CREATE TABLE IF NOT EXISTS quality_route_sessions (
+  principal_id TEXT NOT NULL, session_id TEXT NOT NULL, incarnation TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version >= 0), state_json TEXT NOT NULL,
+  expires_at INTEGER NOT NULL, lease_until INTEGER NOT NULL DEFAULT 0,
+  unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0, 1)),
+  enrolled INTEGER NOT NULL DEFAULT 1, ingress_until INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (principal_id, session_id)
+ )`);
+	const columns = db
+		.query<{ name: string }, []>("PRAGMA table_info(quality_route_sessions)")
+		.all();
+	if (!columns.some((column) => column.name === "enrolled")) {
+		db.run(
+			"ALTER TABLE quality_route_sessions ADD COLUMN enrolled INTEGER NOT NULL DEFAULT 1",
+		);
+		// Legacy unaccepted rows have no homes, leases or usable tickets after restart.
+		db.run(
+			"UPDATE quality_route_sessions SET enrolled = 0, expires_at = 0 WHERE json_extract(state_json, '$.root') IS NULL AND json_array_length(state_json, '$.leases') = 0 AND json_array_length(state_json, '$.conversations') = 0",
+		);
+	}
+	if (!columns.some((column) => column.name === "ingress_until"))
+		db.run(
+			"ALTER TABLE quality_route_sessions ADD COLUMN ingress_until INTEGER NOT NULL DEFAULT 0",
+		);
+	db.run(
+		"CREATE INDEX IF NOT EXISTS idx_quality_route_enrolled ON quality_route_sessions(enrolled)",
+	);
+
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_quality_route_expiry ON quality_route_sessions(unresolved, expires_at, lease_until)`,
+	);
+	db.run(
+		`CREATE TABLE IF NOT EXISTS quality_route_admission (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL)`,
+	);
+	db.run(
+		`INSERT INTO quality_route_admission (id, revision) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`,
+	);
+}
+
 function ensureServerToolReplayIssuanceSchema(db: Database): void {
 	db.run(`
 		CREATE TABLE IF NOT EXISTS server_tool_replay_issuance (
@@ -453,6 +493,7 @@ export function ensureSchema(db: Database): void {
 			account_generation BIGINT,
 			cache_health_native INTEGER,
 			internal_origin INTEGER,
+ quality_decision TEXT,
 			client_session_id TEXT,
 			route_profile_id TEXT,
 			requested_route_model TEXT,
@@ -599,6 +640,7 @@ export function ensureSchema(db: Database): void {
 		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_account
 		 ON device_setup_jobs(account_id)`,
 	);
+	ensureQualityRouteSchema(db);
 	ensureServerToolReplayIssuanceSchema(db);
 
 	// Create agent_preferences table for storing user-defined agent settings
@@ -1522,6 +1564,7 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 }
 
 export function runMigrations(db: Database, dbPath?: string): void {
+	ensureQualityRouteSchema(db);
 	// Ensure base schema exists first (outside transaction as it creates tables)
 	ensureSchema(db);
 	db.run(CACHE_HEALTH_STATE_SCHEMA);
@@ -1529,6 +1572,7 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		["account_generation", "BIGINT"],
 		["cache_health_native", "INTEGER"],
 		["internal_origin", "INTEGER"],
+		["quality_decision", "TEXT"],
 	]) {
 		if (!tableHasColumn(db, "requests", column)) {
 			db.run(`ALTER TABLE requests ADD COLUMN ${column} ${type}`);

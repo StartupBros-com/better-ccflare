@@ -19,11 +19,14 @@ if (process.argv[1]) {
 	possibleEnvPaths.push(require("node:path").join(execPath, ".env"));
 }
 
-// Try each possible .env location
-for (const envPath of possibleEnvPaths) {
-	const result = config({ path: envPath, quiet: true });
-	if (result.parsed && Object.keys(result.parsed).length > 0) {
-		break; // Stop after finding the first .env with variables
+// Quality controls accept only an explicitly named, already-present variable;
+// never search dotenv files for a credential (all other commands stay unchanged).
+if (!process.argv.slice(2).some((arg) => arg.startsWith("--quality-routing"))) {
+	for (const envPath of possibleEnvPaths) {
+		const result = config({ path: envPath, quiet: true });
+		if (result.parsed && Object.keys(result.parsed).length > 0) {
+			break; // Stop after finding the first .env with variables
+		}
 	}
 }
 
@@ -174,6 +177,11 @@ ${formatModeHelpBreakdown()}
   --set-priority <name> <priority>  Set account priority
 
 ${getManagedRoutingHelpText()}
+
+  --quality-routing-status <session>  Read this key's quality-routing status (JSON)
+  --quality-routing-retry-preferred <session>  Mark preferred intent pending; sends no inference
+    --origin <loopback-origin> --credential-env <ENV_NAME>  Required; existing inference key only
+                       Ambient HTTP(S)_PROXY / ALL_PROXY must be unset; redirects are refused
 
   --analyze            Analyze database performance
   --repair-db          Check and repair database integrity
@@ -1267,6 +1275,27 @@ async function main() {
 		fastExit(0);
 		return;
 	}
+	// Local quality controls never initialize the DB, look up credentials, or
+	// start a server. The only authority is the explicitly named inference key.
+	if (args.some((arg) => arg.startsWith("--quality-routing"))) {
+		try {
+			const { parseQualityRouteCommand, runQualityRouteCommand } = await import(
+				"./quality-route-control"
+			);
+			const command = parseQualityRouteCommand(args);
+			if (!command) throw new Error("Invalid quality-routing command.");
+			const result = await runQualityRouteCommand(command);
+			console.log(JSON.stringify(result.data));
+			fastExit(result.exitCode);
+			return;
+		} catch {
+			console.error(
+				"Invalid quality-routing command. Use --quality-routing-status <session> or --quality-routing-retry-preferred <session> --origin <loopback-origin> --credential-env <ENV_NAME>.",
+			);
+			fastExit(2);
+			return;
+		}
+	}
 	const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
 	let routingCommand: ManagedRoutingCliCommand | null;
 	try {
@@ -1975,7 +2004,7 @@ async function main() {
 	await new Promise(() => {});
 }
 
-if (import.meta.main) {
+export function startCli() {
 	// Run main and handle errors
 	main().catch(async (error) => {
 		console.error("Error:", error.message);
@@ -1994,3 +2023,5 @@ if (import.meta.main) {
 		await exitGracefully(0);
 	});
 }
+
+if (import.meta.main) startCli();

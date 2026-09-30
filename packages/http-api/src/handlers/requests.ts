@@ -7,6 +7,7 @@ import { jsonResponse } from "@better-ccflare/http-common";
 // the barrel first trips the documented types↔core cycle (see the header of
 // packages/types/src/request.ts). `types/request` imports nothing.
 import {
+	sanitizeQualityDecision,
 	toAgentAttributionSource,
 	toProjectAttributionSource,
 	toRouteProvenance,
@@ -86,6 +87,7 @@ export function createRequestsSummaryHandler(db: BunSqlAdapter) {
 			route_home_action: string | null;
 			route_repin_reason: string | null;
 			route_candidate_id: string | null;
+			quality_decision: string | null;
 		}>(
 			`
 			SELECT r.*, a.name as account_name
@@ -144,6 +146,7 @@ export function createRequestsSummaryHandler(db: BunSqlAdapter) {
 			streamTerminalState: toStreamTerminalState(request.stream_terminal_state),
 			clientSessionId: request.client_session_id || undefined,
 			routeProvenance: toRouteProvenance(request),
+			qualityDecision: sanitizeQualityDecision(request.quality_decision),
 			rateLimited: request.status_code === 429,
 		}));
 
@@ -211,7 +214,11 @@ export function createRequestsDetailHandler(dbOps: DatabaseOperations) {
 				}
 				data.meta = meta;
 
-				return { id: r.id, ...data };
+				return {
+					id: r.id,
+					...data,
+					qualityDecision: sanitizeQualityDecision(r.quality_decision),
+				};
 			} catch {
 				return { id: r.id, error: "Failed to parse payload" };
 			}
@@ -249,6 +256,18 @@ export function createRequestPayloadHandler(dbOps: DatabaseOperations) {
 			);
 		}
 
+		if (typeof payload === "object" && !Array.isArray(payload)) {
+			const row = await dbOps
+				.getAdapter()
+				.get<{ quality_decision: string | null }>(
+					"SELECT quality_decision FROM requests WHERE id = ?",
+					[requestId],
+				);
+			return jsonResponse({
+				...payload,
+				qualityDecision: sanitizeQualityDecision(row?.quality_decision),
+			});
+		}
 		return jsonResponse(payload);
 	};
 }

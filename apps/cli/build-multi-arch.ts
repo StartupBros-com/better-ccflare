@@ -213,8 +213,9 @@ async function buildPlatform(platform: Platform) {
 	const evidence = readTombiiTaggedBuildEvidence(version, releaseContext);
 	const buildArgs = [
 		"build",
-		"src/main.ts",
+		"src/compiled.ts",
 		"--compile",
+		"--no-compile-autoload-dotenv",
 		"--outfile",
 		`dist/${platform.outfile}`,
 		`--target=${platform.target}`,

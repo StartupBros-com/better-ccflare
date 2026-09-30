@@ -1,6 +1,41 @@
 import { describe, expect, it } from "bun:test";
 import type { CanonicalUsageWindow } from "@better-ccflare/types";
-import { normalizeProviderUsageWindows } from "./usage-windows";
+import {
+	collectAutoCapacityEvidence,
+	normalizeProviderUsageWindows,
+} from "./usage-windows";
+
+describe("Auto capacity source precedence", () => {
+	it("retains inactive and malformed authoritative rows without resurrecting flat mirrors", () => {
+		const rows = collectAutoCapacityEvidence(
+			{
+				seven_day: { utilization: 100, resets_at: 2000 },
+				seven_day_fable: { utilization: 100, resets_at: 2000 },
+				limits: [
+					{ kind: "weekly_all", percent: -1, is_active: false },
+					{
+						kind: "weekly_scoped",
+						percent: "bad",
+						scope: { model: { display_name: "Fable" } },
+					},
+				],
+			},
+			"anthropic",
+		);
+		expect(rows).toHaveLength(2);
+		expect(rows[0]).toMatchObject({
+			source: "limits",
+			active: false,
+			utilization: null,
+		});
+		expect(rows[1]).toMatchObject({
+			source: "limits",
+			scope: "family",
+			model: "fable",
+			utilization: null,
+		});
+	});
+});
 
 describe("normalizeProviderUsageWindows", () => {
 	const reset = "2026-08-12T12:00:00.000Z";

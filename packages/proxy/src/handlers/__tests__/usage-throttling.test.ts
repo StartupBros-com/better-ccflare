@@ -3,11 +3,245 @@ import type { Account } from "@better-ccflare/types";
 import {
 	compareQuotaPressure,
 	createUsageThrottledResponse,
+	evaluateAutoCapacity,
 	evaluateHardCapacity,
 	getUsageThrottleStatus,
 	getUsageThrottleUntil,
 	getWeeklyQuotaPressure,
 } from "../usage-throttling";
+
+describe("mandatory Auto capacity and spend", () => {
+	const now = 1000;
+	const opts = {
+		accountId: "a",
+		line: "claude-fable" as const,
+		provider: "anthropic" as const,
+		requestModel: "claude-fable-5-1",
+		observedAt: now,
+		now,
+		spendGrants: [],
+	};
+	const weekly = { kind: "weekly_all", percent: 60, resets_at: 10000 };
+	const fable = {
+		kind: "weekly_scoped",
+		percent: 120,
+		resets_at: 10000,
+		scope: { model: { display_name: "Fable" } },
+	};
+	it("blocks Fable only, independent of optional switches and without a 50% cutoff", () => {
+		const data = { limits: [weekly, fable], spend: { enabled: false } };
+		expect(evaluateAutoCapacity(data, opts)).toMatchObject({
+			status: "reject",
+			reason: "subscription-exhausted",
+		});
+		expect(
+			evaluateAutoCapacity(data, { ...opts, requestModel: "claude-opus-5-5" })
+				.status,
+		).toBe("admit");
+	});
+	it("admits Sonnet and Opus with nonbinding shared headroom while only Fable binds", () => {
+		const resets_at = new Date(now + 60000).toISOString();
+		const data = {
+			limits: [
+				{ kind: "session", percent: 8, resets_at, is_active: false },
+				{ ...weekly, percent: 28, resets_at, is_active: false },
+				{ ...fable, percent: 100, resets_at, is_active: true },
+			],
+			five_hour: { utilization: 8, resets_at },
+			seven_day: { utilization: 28, resets_at },
+			spend: { enabled: false },
+		};
+		expect(evaluateAutoCapacity(data, opts)).toEqual({
+			status: "reject",
+			reason: "subscription-exhausted",
+		});
+		for (const requestModel of ["claude-sonnet-5-5", "claude-opus-5-5"]) {
+			expect(evaluateAutoCapacity(data, { ...opts, requestModel })).toEqual({
+				status: "admit",
+			});
+		}
+	});
+	it("does not resurrect inactive generic mirrors or call malformed evidence exhaustion", () => {
+		const data = {
+			limits: [
+				{ ...weekly, percent: 100, is_active: false },
+				{ ...fable, percent: 10 },
+			],
+			seven_day: { utilization: 100, resets_at: 10000 },
+			spend: { enabled: false },
+		};
+		expect(evaluateAutoCapacity(data, opts).status).toBe("unknown");
+		expect(
+			evaluateAutoCapacity(
+				{ ...data, limits: [{ ...weekly, percent: -1 }] },
+				opts,
+			).status,
+		).toBe("unknown");
+	});
+	it("requires valid future-reset inactive shared headroom and preserves independent blockers", () => {
+		for (const invalid of [
+			{ percent: 100 },
+			{ percent: 120 },
+			{ percent: -1 },
+			{ percent: null },
+			{ percent: Number.NaN },
+			{ resets_at: null },
+			{ resets_at: "invalid" },
+			{ resets_at: now },
+			{ resets_at: now - 1 },
+		]) {
+			const inactive = { ...weekly, is_active: false, ...invalid };
+			for (const utilization of [10, 100]) {
+				const data = {
+					limits: [inactive],
+					seven_day: { utilization, resets_at: 10000 },
+					spend: { enabled: false },
+				};
+				expect(evaluateAutoCapacity(data, opts)).toEqual({
+					status: "unknown",
+					reason: "capacity-evidence-unknown",
+				});
+				expect(
+					evaluateAutoCapacity(
+						{
+							...data,
+							limits: [inactive, { ...weekly, percent: 100, is_active: true }],
+						},
+						opts,
+					),
+				).toEqual({
+					status: "reject",
+					reason: "provider-capacity-exhausted",
+				});
+				expect(
+					evaluateAutoCapacity(
+						{ ...data, limits: [inactive, { ...fable, is_active: true }] },
+						opts,
+					),
+				).toEqual({
+					status: "reject",
+					reason: "subscription-exhausted",
+				});
+			}
+		}
+	});
+	it("nonbinding headroom cannot bypass freshness, active validity or spending checks", () => {
+		const data = {
+			limits: [{ ...weekly, is_active: false }],
+			spend: { enabled: false },
+		};
+		for (const observedAt of [now - 180000, now + 1]) {
+			expect(evaluateAutoCapacity(data, { ...opts, observedAt }).status).toBe(
+				"unknown",
+			);
+		}
+		expect(
+			evaluateAutoCapacity({ ...data, spend: { enabled: true } }, opts),
+		).toEqual({ status: "unknown", reason: "spend-not-authorized" });
+		expect(
+			evaluateAutoCapacity(
+				{
+					...data,
+					limits: [...data.limits, { ...weekly, percent: -1, is_active: true }],
+				},
+				opts,
+			).status,
+		).toBe("unknown");
+		expect(
+			evaluateAutoCapacity(
+				{
+					...data,
+					limits: [
+						...data.limits,
+						{ ...weekly, percent: 100, is_active: true },
+					],
+				},
+				opts,
+			),
+		).toEqual({ status: "reject", reason: "provider-capacity-exhausted" });
+	});
+	it("requires permission AND availability, and grants cannot override a hard account blocker", () => {
+		const grant = {
+			accountId: "a",
+			line: "claude-fable" as const,
+			authorization: "operator-approved" as const,
+			scope: "outside-subscription" as const,
+		};
+		for (const enabled of [true, undefined]) {
+			const data = { limits: [weekly, fable], spend: { enabled, percent: 10 } };
+			expect(evaluateAutoCapacity(data, opts)).toMatchObject({
+				status: "reject",
+				reason: "spend-not-authorized",
+			});
+			expect(
+				evaluateAutoCapacity(data, { ...opts, spendGrants: [grant] }).status,
+			).toBe(enabled ? "admit" : "unknown");
+		}
+		expect(
+			evaluateAutoCapacity(
+				{ limits: [{ ...weekly, percent: 100 }], spend: { enabled: true } },
+				{ ...opts, spendGrants: [grant] },
+			),
+		).toMatchObject({
+			status: "reject",
+			reason: "provider-capacity-exhausted",
+		});
+	});
+	it("does not use an old disabled billing mirror to prove free execution", () => {
+		expect(
+			evaluateAutoCapacity(
+				{
+					limits: [weekly],
+					spend: { enabled: null },
+					extra_usage: { is_enabled: false },
+				},
+				opts,
+			),
+		).toMatchObject({ status: "unknown", reason: "spend-not-authorized" });
+	});
+	it("does not equate provider billing enablement or an operator grant with paid capacity", () => {
+		const granted = {
+			...opts,
+			spendGrants: [
+				{
+					accountId: "a",
+					line: "claude-fable" as const,
+					authorization: "operator-approved" as const,
+					scope: "outside-subscription" as const,
+				},
+			],
+		};
+		expect(
+			evaluateAutoCapacity(
+				{ limits: [weekly, fable], spend: { enabled: true } },
+				granted,
+			),
+		).toEqual({ status: "unknown", reason: "billing-evidence-unknown" });
+		expect(
+			evaluateAutoCapacity(
+				{ limits: [weekly, fable], spend: { enabled: true, percent: 110 } },
+				granted,
+			),
+		).toEqual({ status: "reject", reason: "provider-capacity-exhausted" });
+	});
+	it("keeps independently valid blockers despite duplicate invalid rows; rejects stale/future/reset proof as unknown", () => {
+		const data = {
+			limits: [weekly, fable, { ...fable, percent: -1 }],
+			spend: { enabled: false },
+		};
+		expect(evaluateAutoCapacity(data, opts).status).toBe("reject");
+		for (const observedAt of [-500000, 1001])
+			expect(evaluateAutoCapacity(data, { ...opts, observedAt }).status).toBe(
+				"unknown",
+			);
+		expect(
+			evaluateAutoCapacity(
+				{ ...data, limits: [{ ...weekly, resets_at: now }] },
+				opts,
+			).status,
+		).toBe("unknown");
+	});
+});
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
 	return {

@@ -20,6 +20,8 @@ import type { ServerToolReplayRuntimeState } from "../server-tool-replay-runtime
 import type { GuardCorrelationVerifier } from "./guard-correlation-auth";
 
 export interface ProxyContext {
+	/** Explicit service injection only; absent until U6 server activation. */
+	qualityRouteService?: import("../quality-route-service").QualityRouteService;
 	strategy: LoadBalancingStrategy;
 	cacheAffinityOrderer?: CacheAffinityOrderer;
 	/** Process-local producer for immutable cache-flight cohort receipts. */

@@ -139,6 +139,27 @@ describe("teeStream", () => {
 		expect(() => upstream.getReader()).not.toThrow();
 	});
 
+	it.each([
+		5, 10, 15,
+	])("reports completeness independently of a %s-byte buffer cap", async (maxBytes) => {
+		const { stream } = makeTrackedUpstream([
+			textChunk("12345"),
+			textChunk("67890"),
+		]);
+		let result: boolean | undefined;
+		const received = await readAll(
+			teeStream(stream, {
+				maxBytes,
+				onClose: (_buffer, truncated) => {
+					result = truncated;
+				},
+			}),
+		);
+		expect(new TextDecoder().decode(combineChunks(received))).toBe(
+			"1234567890",
+		);
+		expect(result).toBe(maxBytes < 10);
+	});
 	it("respects maxBytes when buffering, while still passing all bytes through", async () => {
 		const chunks = [textChunk("12345"), textChunk("67890"), textChunk("abcde")];
 		const { stream } = makeTrackedUpstream(chunks);

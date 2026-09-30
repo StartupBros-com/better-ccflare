@@ -777,6 +777,30 @@ bun run cli --list
 bun run cli --logs
 ```
 
+## Auto quality session controls
+
+These commands operate on an already enrolled durable session; they do not create credentials, start the proxy, read its database or make inference requests. The policy is disabled by default. Use the same verified inference API-key principal that owns the session. The required `--origin` must be an explicit loopback HTTP(S) origin with no userinfo/path/query/fragment, and `--credential-env` names an already supplied environment variable. Do not put the secret itself in arguments, output, examples or a request URL.
+
+The following commands are examples for a separately authorized **local test instance**, not production activation. `EXISTING_INFERENCE_KEY` denotes an existing process environment variable; these commands do not set it:
+
+```bash
+better-ccflare --quality-routing-status session-example \
+  --origin http://127.0.0.1:8081 --credential-env EXISTING_INFERENCE_KEY
+better-ccflare --quality-routing-retry-preferred session-example \
+  --origin http://127.0.0.1:8081 --credential-env EXISTING_INFERENCE_KEY
+```
+
+Status is read-only. Retry first reads the incarnation/revision, then submits one idempotency token and the expected revision. A lost transport response gets one identical redelivery, not a new operation. A new invocation is a new operation. Retry does not immediately send inference; the next authorized root request performs selection. Re-selecting the same `/model` choice merely continues the session and is not a substitute for explicit retry.
+
+The equivalent authenticated API is:
+
+- `GET /v1/quality-routing/sessions/:sessionId`
+- `POST /v1/quality-routing/sessions/:sessionId/retry-preferred` with `Content-Type: application/json` and exactly `incarnation`, positive integer `expectedIntentRevision`, and a nonempty `idempotencyToken` (maximum 512 characters). The body limit is 4096 bytes, including streamed bodies.
+
+Status returns `known`, intent revision/preference, pending/in-flight state, current decision and last successful home/decision. Unknown/expired sessions are not resurrected. Disabled/unknown routes return 404, missing authority 401, stale/conflicting/unresolved mutations 409, and bounded-state capacity refusal 429. Commands emit JSON and exit nonzero on refusal. Redirects are refused. Ambient HTTP/HTTPS/ALL proxy variables cause `proxy-environment-denied` before credential access or transport, even for loopback; `NO_PROXY` is not a bypass.
+
+**Compiled-runtime acceptance remains blocked:** the tested standalone Bun build automatically loaded a synthetic local `.env` credential before application startup. Its missing-process-credential check incorrectly succeeded, while source tests with `bun --no-env-file` correctly refused it. Do not rely on a compiled binary's no-dotenv guarantee until its startup/build behavior is corrected without breaking legacy environment loading and the isolated compiled smoke suite passes. See [troubleshooting](troubleshooting.md#auto-quality-routing).
+
 ### Getting Support
 
 1. Check existing documentation in `/docs`

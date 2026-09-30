@@ -105,12 +105,14 @@ export {
 	CATALOG_REFRESH_INTERVAL_MS,
 	clearCodexModelCacheForAccount,
 	clearCodexModelCacheForTests,
+	getCodexAutoCatalogEvidence,
 	getCodexCatalogRoleTarget,
 	getCodexModels,
 	getKnownCodexModels,
 	getKnownOrSharedCodexModels,
 	initCodexModelCatalogRefresh,
 	lowestTierCodexModel,
+	validateCodexAutoCatalogCredentials,
 } from "./codex-model-catalog";
 export {
 	recordCodexUsageSnapshot,
@@ -162,6 +164,10 @@ export {
 } from "./handlers/pending-rotation-registry";
 export { createPendingRotationWal } from "./handlers/pending-rotation-wal";
 export {
+	evaluateQualityRouteAdmission,
+	type QualityRouteAdmissionInput,
+} from "./handlers/quality-route-admission";
+export {
 	clearRoutingObservations,
 	getRoutingObservations,
 	type RoutingObservation,
@@ -175,13 +181,17 @@ export {
 	startIntegrityScheduler,
 } from "./integrity-scheduler";
 export {
+	type AutoResolvedCredentials,
+	clearNativeAutoCatalogEvidence,
 	fetchLiveModels,
 	getModelCatalog,
+	getNativeAutoCatalogEvidence,
 	initModelCatalogRefresh,
 	type ModelCatalog,
 	type ModelCatalogEntry,
 	type ModelCatalogRefreshResult,
 	refreshModelCatalog,
+	validateNativeAutoCatalogCredentials,
 } from "./model-catalog";
 export {
 	MODEL_ROUTE_PROFILE_MODEL_PREFIX,
@@ -217,6 +227,10 @@ export {
 	initProxy,
 	type ProxyContext,
 } from "./proxy";
+export {
+	QualityRouteService,
+	type QualityRouteStatus,
+} from "./quality-route-service";
 export {
 	forwardToClient,
 	type ResponseHandlerOptions,

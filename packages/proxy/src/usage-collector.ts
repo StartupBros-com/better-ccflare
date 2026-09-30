@@ -19,7 +19,10 @@ import {
 } from "@better-ccflare/types";
 // Cycle-free subpath (see packages/types/src/request.ts header) — same guard
 // the REST handler uses, so both write surfaces narrow identically.
-import { toStreamTerminalState } from "@better-ccflare/types/request";
+import {
+	sanitizeQualityDecision,
+	toStreamTerminalState,
+} from "@better-ccflare/types/request";
 import { formatCost } from "@better-ccflare/ui-common";
 import { cacheBodyStore } from "./cache-body-store";
 import {
@@ -920,6 +923,10 @@ export class UsageCollector {
 	}
 
 	handleStart(msg: StartMessage): void {
+		msg = {
+			...msg,
+			qualityDecision: sanitizeQualityDecision(msg.qualityDecision),
+		};
 		// A reused request ID is a new lifecycle and should be eligible for a fresh
 		// missing-state warning if it is later evicted.
 		this.missingStateWarnings.delete(msg.requestId);
@@ -1806,6 +1813,7 @@ export class UsageCollector {
 					startMessage.clientSessionId ?? null,
 					startMessage.routeProvenance ?? null,
 					startMessage.accounting,
+					sanitizeQualityDecision(startMessage.qualityDecision),
 				);
 			} catch (error) {
 				log.error(
@@ -1964,6 +1972,7 @@ export class UsageCollector {
 			agentAttributionSource: state.agentAttributionSource ?? undefined,
 			clientSessionId: startMessage.clientSessionId ?? undefined,
 			routeProvenance: startMessage.routeProvenance ?? undefined,
+			qualityDecision: sanitizeQualityDecision(startMessage.qualityDecision),
 			// Same value handed to saveRequest above, so a dashboard does not have
 			// to reload before a request shows its terminal state. Note this is
 			// the value as REPORTED, not as persisted: the save is an

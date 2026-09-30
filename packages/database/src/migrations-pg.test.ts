@@ -38,7 +38,7 @@ import type {
 } from "@better-ccflare/core";
 import { CACHE_HEALTH_STATE_SCHEMA } from "./cache-health-schema";
 import { ensureSchema, runMigrations } from "./migrations";
-import { runMigrationsPg } from "./migrations-pg";
+import { ensureSchemaPg, runMigrationsPg } from "./migrations-pg";
 
 const PG_SOURCE_PATH = path.join(__dirname, "migrations-pg.ts");
 
@@ -337,6 +337,65 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 			}
 		}
 		expect(gaps).toEqual([]);
+	});
+
+	it("quality routing fresh and upgrade entry points install matching cleanup indexes and admission guards", async () => {
+		const db = new Database(":memory:");
+		try {
+			ensureSchema(db);
+			for (const upgrade of [false, true]) {
+				if (upgrade) {
+					db.run("DROP TABLE quality_route_sessions");
+					db.run("DROP TABLE quality_route_admission");
+					runMigrations(db);
+				}
+				expect(
+					db
+						.query<{ name: string }, []>(
+							"PRAGMA index_info(idx_quality_route_expiry)",
+						)
+						.all()
+						.map((row) => row.name),
+				).toEqual(["unresolved", "expires_at", "lease_until"]);
+				expect(db.query("SELECT * FROM quality_route_admission").all()).toEqual(
+					[{ id: 1, revision: 0 }],
+				);
+				expect(() =>
+					db.run("INSERT INTO quality_route_admission VALUES (2, 0)"),
+				).toThrow();
+				// This is DDL invocation evidence, not live PostgreSQL execution.
+				const statements: string[] = [];
+				const adapter = {
+					unsafe: async (sql: string) => {
+						statements.push(sql.replace(/\s+/g, " ").trim());
+						return [];
+					},
+					get: async () => ({ exists: 1 }),
+					query: async () => [],
+					run: async () => {},
+					runWithChanges: async () => 0,
+				};
+				await (upgrade ? runMigrationsPg : ensureSchemaPg)(adapter as never);
+				for (const table of [
+					"quality_route_sessions",
+					"quality_route_admission",
+				]) {
+					expect(
+						statements.some((sql) =>
+							sql.startsWith(`CREATE TABLE IF NOT EXISTS ${table} (`),
+						),
+					).toBe(true);
+				}
+				expect(statements).toContain(
+					"CREATE INDEX IF NOT EXISTS idx_quality_route_expiry ON quality_route_sessions(unresolved, expires_at, lease_until)",
+				);
+				expect(statements).toContain(
+					"INSERT INTO quality_route_admission (id, revision) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
+				);
+			}
+		} finally {
+			db.close();
+		}
 	});
 
 	it("spot check: strategies table is present on both backends", () => {

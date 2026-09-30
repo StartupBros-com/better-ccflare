@@ -138,6 +138,7 @@ export {
 	type TokenBreakdown,
 } from "./pricing";
 export * from "./probe-backoff";
+export * from "./quality-routing-policy";
 export * from "./request-events";
 export {
 	SseFrameBuffer,

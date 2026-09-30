@@ -3,7 +3,11 @@ import type {
 	BunSqlAdapter,
 	DatabaseOperations,
 } from "@better-ccflare/database";
-import type { CircuitBreaker, ModelRouteProfile } from "@better-ccflare/proxy";
+import type {
+	CircuitBreaker,
+	ModelRouteProfile,
+	QualityRouteService,
+} from "@better-ccflare/proxy";
 import type { Account } from "./account";
 import type { AlertEvent } from "./alerts";
 import type { AffinityOwnerSnapshot, RequestMeta } from "./api";
@@ -52,6 +56,8 @@ export interface RouteCircuitRecoveryHint {
 
 // API context for HTTP handlers
 export interface APIContext {
+	/** Same restart-scoped persistence service used by inference; absent when disabled. */
+	qualityRouteService?: QualityRouteService;
 	db: BunSqlAdapter;
 	config: Config;
 	dbOps: DatabaseOperations;

@@ -11,6 +11,7 @@ mock.module("@better-ccflare/database", () => ({
 	CacheHealthRepository: class CacheHealthRepository {},
 	DatabaseFactory: class DatabaseFactory {},
 	DatabaseOperations: class DatabaseOperations {},
+	QualityRouteError: class QualityRouteError extends Error {},
 	ModelTranslationRepository: class ModelTranslationRepository {},
 	runIntegrityCheckInWorker: mock(async () => ({
 		kind: "quick",

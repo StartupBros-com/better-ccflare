@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { sanitizeRequestHeaders } from "@better-ccflare/http-common";
 import type { RequestMeta, RouteProvenance } from "@better-ccflare/types";
+import { sanitizeQualityDecision } from "@better-ccflare/types/request";
 import {
 	type EndMessage,
 	isModelRewrite,
@@ -201,6 +202,11 @@ export function recordRoutingTerminalRequest(
 						requestMeta.projectAttributionSource ?? "none",
 					agentAttributionSource: requestMeta.agentAttributionSource ?? "none",
 					clientSessionId: requestMeta.clientSessionId ?? null,
+					qualityDecision: sanitizeQualityDecision(
+						requestMeta.qualityDecision
+							? { ...requestMeta.qualityDecision, selected: null }
+							: null,
+					),
 					routeProvenance,
 					responseStatus: options.response.status,
 					responseHeaders: Object.fromEntries(

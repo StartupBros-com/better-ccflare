@@ -68,9 +68,7 @@ describe("issue #354 — terminal-529 responseForRateLimitCheck clone disposal",
 
 	it("the disposal call sits after processProxyResponse resolves, gated on needsRateLimitCheckClone", () => {
 		const source = readSource();
-		const processIdx = source.indexOf(
-			"const isRateLimited = await processProxyResponse(",
-		);
+		const processIdx = source.indexOf("await processProxyResponse(");
 		const disposeIdx = source.indexOf(
 			"cancelDiscardedResponseBody(responseForRateLimitCheck);",
 		);

@@ -134,6 +134,10 @@ import {
 	createQwenReauthHandler,
 } from "./handlers/oauth";
 import {
+	handleQualityControl,
+	isQualityControlPath,
+} from "./handlers/quality-routes";
+import {
 	createRequestPayloadHandler,
 	createRequestsDetailHandler,
 	createRequestsSummaryHandler,
@@ -696,6 +700,17 @@ export class APIRouter {
 					Unauthorized(authzResult.reason || "Authorization failed"),
 				);
 			}
+		}
+
+		if (isQualityControlPath(path)) {
+			return this.wrapHandler(() =>
+				handleQualityControl(
+					req,
+					path,
+					authResult.apiKeyId,
+					this.context.qualityRouteService,
+				),
+			)(req, url);
 		}
 
 		// Logs-stream token minting (#379): needs the authenticated caller's

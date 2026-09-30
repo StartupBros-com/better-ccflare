@@ -270,6 +270,24 @@ routinely lags the default branch — which makes the pin, not the branch, the c
 the pinned build and can already be stale with respect to fixes that have merged but not
 shipped.
 
+## Auto quality routing
+
+### Quality lane and approved line
+
+A lane expresses operator quality intent, not a model capability. Approved lines map Fable to `fable`, Astra to `astra`, Opus and Sol to `opus`, Sonnet to `standard`, and Haiku to `lightweight`. Account enrollment and current exact-model support are separate requirements. Catalog position never assigns a new model to a quality role.
+
+### Accepted intent versus successful home
+
+Accepted intent is the durable principal/session preference and revision. A home is a per-conversation exact account/physical-model target installed only after validated success. Root and child homes are independent. Continuation may use an exact supported predecessor even after recovery/new discovery. A temporary request-only fallback is not automatically a new home. An explicit authenticated retry changes intent revision and fences older work; selecting the same choice does not.
+
+### Admission estimate versus capability fact
+
+`local-envelope-v1` counts the entire final JSON envelope conservatively (UTF-8 bytes, 25% plus 1024 headroom, full original output reserve). It is an operational estimate, not a tokenizer guarantee or proof of subscription entitlement. Deferral and planned history clearing do not remove bytes from the estimate. Source-owned fresh account capability facts remain necessary; unknown output, media, opaque thinking or billing contracts cannot be invented from the estimate.
+
+### Dispatch fence and decision provenance
+
+The dispatch fence durably distinguishes a possibly sent inference from work that is still safe to select. A storage failure after output retries persistence, never inference. Decision provenance is a bounded sanitized explanation, not a second authority for dispatch: current, pending/in-flight and last successful decisions differ. First-writer request history cannot be overwritten by a late usage update. The historical worker-message naming describes an in-process collector contract, not evidence of an active inference worker thread.
+
 ## Flagged ambiguities
 
 - *Active* on a usage window means "currently binding" only in the shapes that report an

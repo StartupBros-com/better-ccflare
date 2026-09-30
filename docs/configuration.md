@@ -1236,6 +1236,52 @@ If issues occur after configuration changes:
 2. **File restoration**: Restore from backup configuration file
 3. **Environment override**: Use environment variables to override problematic settings
 
+## Opt-in Auto quality routing
+
+Auto quality routing is **disabled by default**. `quality_routing_policy` in the application config, or its higher-precedence `CCFLARE_QUALITY_ROUTING_POLICY_JSON` environment override, is a strict version-1 policy object. Absence disables it; malformed, duplicate-key, unknown-field or oversized JSON aborts policy loading rather than silently enrolling accounts. Do not use an empty string as a disable switch. Account enrollment is explicit: model mappings, catalog rank, existing route profiles and provider billing enablement do not enroll an account or authorize spending.
+
+The following is **synthetic configuration**, not production activation advice. `synthetic-native` is not a real account ID. It grants no paid overage and proves no provider entitlement:
+
+```json
+{
+  "quality_routing_policy": {
+    "version": 1,
+    "assignments": [
+      { "line": "claude-fable", "lane": "fable", "priority": 0, "upgrade": "same-line-supported" },
+      { "line": "claude-opus", "lane": "opus", "priority": 0, "upgrade": "same-line-supported" },
+      { "line": "claude-sonnet", "lane": "standard", "priority": 0, "upgrade": "same-line-supported" },
+      { "line": "claude-haiku", "lane": "lightweight", "priority": 0, "upgrade": "same-line-supported" }
+    ],
+    "accounts": [
+      { "accountId": "synthetic-native", "provider": "anthropic", "lines": ["claude-fable", "claude-opus", "claude-sonnet", "claude-haiku"], "priority": 0 }
+    ],
+    "fallbacks": [{ "from": "fable", "to": "astra" }, { "from": "astra", "to": "opus" }],
+    "spendGrants": []
+  }
+}
+```
+
+All five top-level fields are required. Assignments specify approved line/lane pairs, nonnegative integer priority and `same-line-supported` or `exact-only` upgrade policy. Accounts specify an exact ID, `anthropic` or `codex`, nonempty assigned lines and priority. Lower priority values sort first; all eligible accounts in a lane are considered before advancing to the permitted suffix. Fallback edges may only advance Fable → Astra → Opus; they cannot invent cross-role fallbacks. The two additional approved assignments are `gpt-astra` → `astra` and `gpt-sol` → `opus`. These are **operator quality-role assignments**, not capability facts or automatic catalog-ordinal roles.
+
+A spend grant, when separately authorized, has exactly `accountId`, `line`, `authorization: "operator-approved"`, and `scope: "outside-subscription"`. It does not replace fresh quota, available paid capacity or model capabilities. Provider-side extra-usage enablement alone never authorizes spend. There is no universal 50% Fable cutoff. Auto quota enforcement remains mandatory even when manual/predictive usage throttles are disabled; family exhaustion is not an account-wide ban. Authoritative inactive generic limits suppress stale flat mirrors.
+
+### Capability and accounting boundaries
+
+Admission uses the selected account's own fresh catalog, exact supported model identity and current transport-credential epoch. Borrowed/shared listings do not prove entitlement. Codex evidence lasts at most 15 minutes; native evidence lasts at most its configured refresh interval capped at 168 hours. Reads and failed refreshes do not renew evidence. Usage evidence must be less than three minutes old. Missing facts remain unknown.
+
+`local-envelope-v1` is an explicitly **conservative estimate**, not a tokenizer or subscription guarantee: one token per UTF-8 byte of the entire final JSON envelope, plus `ceil(bytes / 4) + 1024` headroom, plus the entire original requested output reserve. The smaller current/maximum context window and any established effective-window percentage constrain the total. All schemas, signatures and history count, including deferred tools and history a future context edit might clear. Auto never truncates content, drops tools, removes thinking or clamps output to make a request fit.
+
+Native text admission recognizes ordinary object-schema client tools, boolean `defer_loading`, text/tool-use/tool-result history, signed textual thinking, `thinking: {"type":"adaptive"}` or `{"type":"disabled"}`, `output_config` containing only a known effort (`low`, `medium`, `high`, `max`), and `context_management.edits` containing the type-only `clear_thinking_20251015` / `clear_tool_uses_20250919` forms. Clearing thinking requires adaptive thinking in this bounded contract. These are forwarding/accounting shape checks, not a promise that every model supports every setting; existing known incompatibilities still veto admission. Enabled thinking budgets and additional edit parameters are not yet recognized. Arbitrary fields, typed `custom` tools, opaque/redacted thinking, media/hardware-dependent accounting and unsupported hosted-tool work remain unavailable. Codex recognition remains the existing lossless ordinary text/function adapter, not permission to strip native-only settings.
+
+### Activation and reverse-disable
+
+1. Obtain separate deployment/activation approval and selected-account evidence: subscription output ceiling, tool support, quota and no-unapproved-spend assurance. Astra/Sol subscription output/billing evidence remains an external acceptance gate; API documentation or synthetic fixtures do not establish it. Missing native catalog modality/tool facts also remain unknown.
+2. Deploy an approved build from current main using the deployment procedure. A merge does not deploy. Review account enrollment and retain the previous policy/config; do not change client settings, hooks or credentials as an implicit part of activation.
+3. Verify the deployed build identity, authenticated discovery/status and expected routing with authorized interactive use. Scripted Anthropic traffic remains forbidden. Correcting the reported GPT-5.6 picker row requires observing the actual affected UI/source first; no correction has been established by this implementation.
+4. To reverse-disable, remove the new environment override **and** file policy (or restore their prior absent state), then apply the separately authorized normal service configuration/restart procedure. Do not delete routing tables, homes or history; preserve legacy profiles, IDs and mappings. Verify disabled controls and ordinary routing afterward. Removing only the override can reveal an underlying file policy and leave Auto enabled.
+
+Compiled CLI credential isolation still needs the runtime verification described in [troubleshooting](troubleshooting.md#auto-quality-routing). Do not treat a source-only test pass as compiled-binary acceptance.
+
 ## Troubleshooting
 
 ### Common Issues

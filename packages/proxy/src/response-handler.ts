@@ -21,6 +21,7 @@ import {
 	type RequestMeta,
 	type RouteProvenance,
 } from "@better-ccflare/types";
+import { sanitizeQualityDecision } from "@better-ccflare/types/request";
 import type { AnthropicDegradedResponseLifecycle } from "./anthropic-degraded-response-lifecycle";
 import { createAnthropicSemanticLivenessStream } from "./anthropic-semantic-liveness";
 import {
@@ -725,6 +726,10 @@ function createOpenRouterModelNormalizationStream(
 }
 
 export interface ResponseHandlerOptions {
+	/** Transport completion, not HTTP status; never changes usage accounting. */
+	qualityCompletion?: (
+		outcome: import("@better-ccflare/database").QualitySettlement,
+	) => void;
 	requestId: string;
 	method: string;
 	path: string;
@@ -978,6 +983,14 @@ export async function forwardToClient(
 			accountName: account?.name ?? null,
 			agentUsed: agentUsed || null,
 			clientSessionId: clientSessionId ?? null,
+			qualityDecision: sanitizeQualityDecision(
+				options.routingMeta?.qualityDecision
+					? {
+							...options.routingMeta.qualityDecision,
+							accounting: options.routingMeta.qualityAccounting,
+						}
+					: null,
+			),
 			routeProvenance,
 			// Persist the pair only for an actual swap — an agent-detected but
 			// unmodified request would otherwise record two equal values that
@@ -1307,6 +1320,22 @@ export async function forwardToClient(
 			streamTerminalHandled = true;
 
 			const anthropicOutcome = anthropicOutcomeTracker?.finish();
+			options.qualityCompletion?.({
+				kind:
+					termination.kind === "cancel"
+						? "cancelled"
+						: termination.kind === "error"
+							? "failed"
+							: response.ok &&
+									(isDownstreamAnthropicMessagesStream
+										? anthropicCleanTerminalSuccessSeen
+										: streamTerminalState === "complete") &&
+									anthropicOutcome?.status === "completed" &&
+									anthropicOutcome.parseState === "clean" &&
+									!anthropicOutcome.truncatedTailSeen
+								? "validated-success"
+								: "truncated",
+			});
 			if (anthropicDegradedLifecycle) {
 				if (response.status === 529) {
 					anthropicDegradedLifecycle.settle(
@@ -1479,6 +1508,7 @@ export async function forwardToClient(
 	 *  NON-STREAMING RESPONSES — read body in background, send END once
 	 *********************************************************************/
 	if (!response.body) {
+		options.qualityCompletion?.({ kind: "failed" });
 		if (shouldProcessRequest) {
 			logNonStreamingUpstream403(
 				requestId,
@@ -1539,6 +1569,10 @@ export async function forwardToClient(
 	}
 
 	const MAX_NON_STREAM_BODY_BYTES = 256 * 1024; // 256KB cap for stored body
+	// A separate, enforced validation budget, never a delivery limit. Oversized
+	// nonstream responses pass through in full but cannot certify a durable home.
+	// Streaming responses retain their existing incremental terminal observer.
+	const MAX_QUALITY_VALIDATION_BYTES = 8 * 1024 * 1024;
 
 	// A non-streaming body can terminate with EOF, an upstream read error, or
 	// downstream cancellation. Observe each response at most once so a
@@ -1557,9 +1591,36 @@ export async function forwardToClient(
 	};
 
 	const passthroughBody = teeStream(response.body, {
-		maxBytes: MAX_NON_STREAM_BODY_BYTES,
-		onClose(buffered) {
-			const cappedBuf = combineChunks(buffered);
+		maxBytes: options.qualityCompletion
+			? MAX_QUALITY_VALIDATION_BYTES
+			: MAX_NON_STREAM_BODY_BYTES,
+		onClose(buffered, truncated) {
+			const validationBuf = combineChunks(buffered);
+			const cappedBuf = validationBuf.subarray(0, MAX_NON_STREAM_BODY_BYTES);
+			if (options.qualityCompletion) {
+				let valid = false;
+				try {
+					// Never parse a capped prefix, even if that prefix is valid JSON.
+					const message = truncated
+						? null
+						: JSON.parse(validationBuf.toString("utf-8"));
+					valid =
+						response.ok &&
+						message !== null &&
+						message.type === "message" &&
+						message.role === "assistant" &&
+						typeof message.id === "string" &&
+						Array.isArray(message.content) &&
+						["end_turn", "tool_use", "max_tokens", "stop_sequence"].includes(
+							message.stop_reason,
+						);
+				} catch {
+					/* Invalid/truncated JSON is not terminal success. */
+				}
+				options.qualityCompletion({
+					kind: valid ? "validated-success" : "failed",
+				});
+			}
 			if (shouldProcessRequest) {
 				observeNonStreaming403(cappedBuf);
 			}
@@ -1611,6 +1672,7 @@ export async function forwardToClient(
 		onError(err) {
 			if (shouldProcessRequest) observeNonStreaming403(null);
 			anthropicDegradedLifecycle?.settle("failed");
+			options.qualityCompletion?.({ kind: "failed" });
 			if (!shouldProcessRequest) return;
 			fireAndForgetEnd(
 				{
@@ -1625,6 +1687,7 @@ export async function forwardToClient(
 		onCancel() {
 			if (shouldProcessRequest) observeNonStreaming403(null);
 			anthropicDegradedLifecycle?.settle("cancelled");
+			options.qualityCompletion?.({ kind: "cancelled" });
 			if (!shouldProcessRequest) return;
 			fireAndForgetEnd(
 				{

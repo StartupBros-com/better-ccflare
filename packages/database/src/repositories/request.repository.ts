@@ -6,6 +6,10 @@ import type {
 	RequestAccountingContext,
 	RouteProvenance,
 } from "@better-ccflare/types";
+import {
+	type QualityDecisionRecord,
+	sanitizeQualityDecision,
+} from "@better-ccflare/types/request";
 import { getCleanupBatchSize } from "../adapters/bun-sql-adapter";
 import { decryptPayload, encryptPayload } from "../payload-encryption";
 import { BaseRepository } from "./base.repository";
@@ -92,6 +96,7 @@ async function decryptForList(id: string, json: string): Promise<string> {
 }
 
 export interface RequestData {
+	qualityDecision?: QualityDecisionRecord | null;
 	accounting?: RequestAccountingContext;
 	id: string;
 	method: string;
@@ -155,6 +160,7 @@ export interface RequestData {
 export class RequestRepository extends BaseRepository<RequestData> {
 	async save(data: RequestData): Promise<void> {
 		const { usage } = data;
+		const decision = sanitizeQualityDecision(data.qualityDecision);
 		const projectRankIncoming = projectRank(
 			"EXCLUDED.project_attribution_source",
 		);
@@ -185,9 +191,9 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				stream_terminal_state, client_session_id,
 				route_profile_id, requested_route_model, routed_provider, routed_model,
 				route_fallback_rung, route_home_action, route_repin_reason, route_candidate_id,
-				account_generation, cache_health_native, internal_origin
+				account_generation, cache_health_native, internal_origin, quality_decision
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (id) DO UPDATE SET
 				timestamp = EXCLUDED.timestamp,
 				method = EXCLUDED.method,
@@ -247,7 +253,8 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				route_candidate_id = COALESCE(EXCLUDED.route_candidate_id, requests.route_candidate_id),
 				account_generation = COALESCE(requests.account_generation, EXCLUDED.account_generation),
 				cache_health_native = COALESCE(requests.cache_health_native, EXCLUDED.cache_health_native),
-				internal_origin = COALESCE(requests.internal_origin, EXCLUDED.internal_origin)
+				internal_origin = COALESCE(requests.internal_origin, EXCLUDED.internal_origin),
+ quality_decision = COALESCE(requests.quality_decision, EXCLUDED.quality_decision)
 		`,
 			[
 				data.id,
@@ -295,6 +302,7 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				data.accounting?.accountGeneration ?? null,
 				data.accounting ? (data.accounting.nativeCache ? 1 : 0) : null,
 				data.accounting ? (data.accounting.internal ? 1 : 0) : null,
+				decision ? JSON.stringify(decision) : null,
 			],
 		);
 	}
@@ -404,6 +412,7 @@ export class RequestRepository extends BaseRepository<RequestData> {
 			json: string | null;
 			timestamp: number;
 			account_name: string | null;
+			quality_decision: string | null;
 		}>
 	> {
 		const rows = await this.query<{
@@ -411,9 +420,10 @@ export class RequestRepository extends BaseRepository<RequestData> {
 			json: string | null;
 			timestamp: number;
 			account_name: string | null;
+			quality_decision: string | null;
 		}>(
 			`
-			SELECT r.id, r.timestamp, rp.json, a.name as account_name
+			SELECT r.id, r.timestamp, rp.json, a.name as account_name, r.quality_decision
 			FROM requests r
 			LEFT JOIN request_payloads rp ON rp.id = r.id
 			LEFT JOIN accounts a ON r.account_used = a.id
@@ -428,6 +438,7 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				timestamp: row.timestamp,
 				json: row.json ? await decryptForList(row.id, row.json) : null,
 				account_name: row.account_name,
+				quality_decision: row.quality_decision,
 			})),
 		);
 	}

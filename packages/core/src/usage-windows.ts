@@ -80,6 +80,137 @@ function makeWindow(
 	};
 }
 
+export interface AutoCapacityEvidence {
+	readonly source: "limits" | "flat";
+	readonly window: string;
+	readonly scope: "account" | "family" | "model" | "unknown";
+	readonly model: string | null;
+	readonly active: boolean | null;
+	readonly utilization: number | null;
+	readonly resetsAtMs: number | null;
+	/** Only Anthropic scoped allowance semantics are established here. */
+	readonly semantics: "included-allowance" | "provider-limit";
+}
+
+/** Auto-only projection. History and manual throttling retain their contracts.
+ * Keep duplicate and invalid rows: omission must not manufacture capacity.
+ * Generic presence, not validity, suppresses a legacy mirror.
+ */
+export function collectAutoCapacityEvidence(
+	usage: unknown,
+	provider: string,
+): readonly AutoCapacityEvidence[] {
+	const data = asRecord(usage);
+	if (!data || (provider !== "anthropic" && provider !== "codex")) return [];
+	const rows: AutoCapacityEvidence[] = [];
+	const mirrored = new Set<string>();
+	const add = (
+		source: "limits" | "flat",
+		window: string,
+		scope: AutoCapacityEvidence["scope"],
+		model: string | null,
+		row: UsageRecord,
+		percent: unknown,
+		reset: unknown,
+	) => {
+		const parsed = resetMs(reset);
+		rows.push(
+			Object.freeze({
+				source,
+				window,
+				scope,
+				model,
+				active:
+					row.is_active === undefined
+						? true
+						: typeof row.is_active === "boolean"
+							? row.is_active
+							: null,
+				utilization: finitePercent(percent),
+				resetsAtMs: parsed.valid ? parsed.value : null,
+				semantics:
+					provider === "anthropic" && scope !== "account" && scope !== "unknown"
+						? "included-allowance"
+						: "provider-limit",
+			}),
+		);
+	};
+	if (Array.isArray(data.limits)) {
+		for (const value of data.limits) {
+			const row = asRecord(value);
+			if (!row) {
+				add("limits", "unknown", "unknown", null, {}, null, null);
+				continue;
+			}
+			if (row.kind === "session" || row.kind === "weekly_all") {
+				const key = row.kind === "session" ? "five_hour" : "seven_day";
+				mirrored.add(key);
+				add("limits", key, "account", null, row, row.percent, row.resets_at);
+			} else if (row.kind === "weekly_scoped") {
+				const model = asRecord(asRecord(row.scope)?.model);
+				const id =
+					typeof model?.id === "string" && model.id.trim()
+						? model.id.trim()
+						: null;
+				const name =
+					typeof model?.display_name === "string"
+						? model.display_name.trim()
+						: null;
+				// A concrete ID is never widened into a whole-family restriction.
+				const identity = id || name;
+				const family = identity ? getModelFamily(identity) : null;
+				const exact = id !== null && id !== family;
+				const key = identity
+					? weeklyScopedWindowKey(identity)
+					: "seven_day_unknown";
+				mirrored.add(key);
+				if (name) mirrored.add(weeklyScopedWindowKey(name));
+				add(
+					"limits",
+					key,
+					exact ? "model" : family ? "family" : "unknown",
+					exact ? id : family,
+					row,
+					row.percent,
+					row.resets_at,
+				);
+			} else {
+				add(
+					"limits",
+					"unknown",
+					"unknown",
+					null,
+					row,
+					row.percent,
+					row.resets_at,
+				);
+			}
+		}
+	}
+	for (const [key, value] of Object.entries(data)) {
+		if (
+			mirrored.has(key) ||
+			(key !== "five_hour" &&
+				key !== "seven_day" &&
+				!key.startsWith("seven_day_"))
+		)
+			continue;
+		const row = asRecord(value);
+		if (!row) continue;
+		const identity = scopeForKey(key);
+		add(
+			"flat",
+			key,
+			identity.scope === "other" ? "unknown" : identity.scope,
+			identity.modelFamily,
+			row,
+			row.utilization,
+			row.resets_at,
+		);
+	}
+	return Object.freeze(rows);
+}
+
 /** Normalize one provider payload into the shared, persistence-safe window shape. */
 export function normalizeProviderUsageWindows(
 	usage: unknown,
