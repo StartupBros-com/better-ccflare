@@ -10,7 +10,10 @@ import { createRequestPayloadHandler } from "../requests";
  */
 
 function dbWithPayload(payload: unknown) {
-	return { getRequestPayload: async () => payload } as never;
+	return {
+		getRequestPayload: async () => payload,
+		getAdapter: () => ({ get: async () => null }),
+	} as never;
 }
 
 describe("createRequestPayloadHandler", () => {
@@ -22,7 +25,10 @@ describe("createRequestPayloadHandler", () => {
 		const response = await handler("req-1");
 
 		expect(response.status).toBe(200);
-		expect(await response.json()).toEqual({ requestBody: "e30=" });
+		expect(await response.json()).toEqual({
+			requestBody: "e30=",
+			qualityDecision: null,
+		});
 	});
 
 	it("does not claim the request is missing when only the payload is absent", async () => {

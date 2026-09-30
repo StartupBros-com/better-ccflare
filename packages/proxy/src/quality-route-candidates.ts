@@ -28,6 +28,10 @@ import type {
 	QualityWorkerRole,
 	RequestMeta,
 } from "@better-ccflare/types";
+import {
+	type QualityDecisionRecord,
+	sanitizeQualityDecision,
+} from "@better-ccflare/types/request";
 import { classifyAnthropicReplayRisk } from "./anthropic-degraded-mode";
 import { circuitKeyFor, shouldAllow } from "./circuit-breaker";
 import {
@@ -49,7 +53,9 @@ import { evaluateAutoCapacity } from "./handlers/usage-throttling";
 import { getNativeAutoCatalogEvidence } from "./model-catalog";
 import { opaqueRuntimeId } from "./opaque-runtime-id";
 import type { RequestBodyContext } from "./request-body-context";
+import { recordRoutingTerminalRequest } from "./routing-terminal-recorder";
 import { bindRequestPrivateServerToolReplay } from "./server-tool-replay-runtime";
+import { tryGetUsageCollector } from "./usage-collector";
 
 export const QUALITY_MODEL_PREFIX = "claude-bccf-quality-";
 const ingress = new WeakMap<Request, Promise<QualityIngressTicket | null>>();
@@ -628,6 +634,7 @@ export async function routeQualityRequest(input: {
 				}
 				accounting = decision.accounting;
 			};
+			let attemptDecision: QualityDecisionRecord | null = null;
 			const settle = async (outcome: QualitySettlement) => {
 				if (!lease || !fenced) return true;
 				if (settling) return false;
@@ -636,7 +643,10 @@ export async function routeQualityRequest(input: {
 				// the pre-dispatch fence, even across restart and lease expiry.
 				for (let attempt = 0; attempt < 3; attempt++) {
 					try {
-						await service.settleDispatch(lease, outcome);
+						await service.settleDispatch(lease, outcome, {
+							requestId: meta.id,
+							decision: attemptDecision,
+						});
 						return true;
 					} catch (error) {
 						if ((error as { code?: string }).code === "stale") return false;
@@ -701,6 +711,10 @@ export async function routeQualityRequest(input: {
 						skippedLanes: meta.qualityDecision?.skippedLanes ?? [],
 					};
 					meta.qualityAccounting = accounting;
+					attemptDecision = sanitizeQualityDecision({
+						...meta.qualityDecision,
+						accounting,
+					});
 				},
 				assertDispatch() {
 					if (dispatched) throw new QualityAttemptRejected("replay-forbidden");
@@ -807,7 +821,33 @@ export async function routeQualityRequest(input: {
 					return unavailable("attempt-unavailable");
 			}
 		}
-		return unavailable(lastAdmissionReason);
+		if (conversation) {
+			try {
+				await service.recordRejectedDecision(
+					session,
+					incarnation,
+					conversation.key,
+					conversation.revision,
+					meta.id,
+					meta.qualityDecision,
+				);
+			} catch {
+				/* Explanation failure never triggers inference or changes routing. */
+			}
+		}
+		const response = unavailable(lastAdmissionReason);
+		void recordRoutingTerminalRequest({
+			collector: tryGetUsageCollector(),
+			requestMeta: meta,
+			requestHeaders: req.headers,
+			response,
+			providerName: ctx.provider.name,
+			terminalKind: "quality_route_unavailable",
+			upstreamAttempts: ledger.attemptedCount,
+			apiKeyId,
+			apiKeyName,
+		});
+		return response;
 	} catch {
 		return unavailable("durable-state-unavailable");
 	}

@@ -14,6 +14,24 @@ import type {
 	QualityVerifiedSession,
 	QualityWorkerRole,
 } from "@better-ccflare/types";
+import { sanitizeQualityDecision } from "@better-ccflare/types/request";
+
+function safeDecisionSnapshot(
+	snapshot: QualityConversation["decision"],
+): QualityConversation["decision"] {
+	const value = sanitizeQualityDecision(snapshot?.value);
+	if (
+		!snapshot ||
+		!value ||
+		!Number.isSafeInteger(snapshot.revision) ||
+		snapshot.revision < 1 ||
+		typeof snapshot.requestId !== "string" ||
+		snapshot.requestId.length > 128 ||
+		!/^[A-Za-z0-9._:-]+$/.test(snapshot.requestId)
+	)
+		return null;
+	return { requestId: snapshot.requestId, revision: snapshot.revision, value };
+}
 
 export interface QualityRouteStatus {
 	incarnation: string;
@@ -69,7 +87,16 @@ export class QualityRouteService {
 			intentRevision: state.root.revision,
 			preference: state.root.preference,
 			expiresAt: state.expiresAt,
-			conversations: state.conversations,
+			conversations: state.conversations.map((item) => ({
+				...item,
+				decision:
+					item.decision?.revision === item.revision
+						? safeDecisionSnapshot(item.decision)
+						: null,
+				lastSuccessfulDecision: safeDecisionSnapshot(
+					item.lastSuccessfulDecision,
+				),
+			})),
 			unresolved: state.leases.flatMap((lease) =>
 				lease.dispatch
 					? [{ identity: lease.identity, target: lease.dispatch.target }]
@@ -109,8 +136,38 @@ export class QualityRouteService {
 			this.now(),
 		);
 	}
-	settleDispatch(identity: QualityLease, outcome: QualitySettlement) {
-		return this.repository.settleDispatch(identity, outcome, this.now());
+	settleDispatch(
+		identity: QualityLease,
+		outcome: QualitySettlement,
+		diagnostics?: {
+			requestId: string;
+			decision: import("@better-ccflare/types").QualityDecisionRecord | null;
+		},
+	) {
+		return this.repository.settleDispatch(
+			identity,
+			outcome,
+			this.now(),
+			diagnostics,
+		);
+	}
+	recordRejectedDecision(
+		session: QualityVerifiedSession,
+		incarnation: string,
+		key: string,
+		revision: number,
+		requestId: string,
+		decision: unknown,
+	) {
+		return this.repository.recordRejectedDecision(
+			session,
+			incarnation,
+			key,
+			revision,
+			requestId,
+			decision,
+			this.now(),
+		);
 	}
 	cleanup(limit = 100) {
 		return this.repository.cleanup(this.now(), limit);

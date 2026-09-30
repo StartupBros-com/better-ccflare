@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compileQualityRoutingPolicy } from "@better-ccflare/core";
-import { DatabaseOperations } from "@better-ccflare/database";
+import { AsyncDbWriter, DatabaseOperations } from "@better-ccflare/database";
 import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
 import { getProvider, usageCache } from "@better-ccflare/providers";
 import type {
@@ -16,6 +16,11 @@ import { NodeCryptoUtils } from "@better-ccflare/types/api-key";
 import { BunSqlAdapter } from "../../../database/src/adapters/bun-sql-adapter";
 import { ensureSchema } from "../../../database/src/migrations";
 import { QualityRouteRepository } from "../../../database/src/repositories/quality-route.repository";
+import {
+	createRequestPayloadHandler,
+	createRequestsDetailHandler,
+	createRequestsSummaryHandler,
+} from "../../../http-api/src/handlers/requests";
 import { APIRouter } from "../../../http-api/src/router";
 import { AuthService } from "../../../http-api/src/services/auth-service";
 import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
@@ -262,7 +267,28 @@ afterEach(async () => {
 it("one service connects verified inference enrollment, status, retry and next inference with no control sends", async () => {
 	const directory = mkdtempSync(join(tmpdir(), "quality-lifecycle-"));
 	const operations = new DatabaseOperations(join(directory, "test.db"));
+	const writer = new AsyncDbWriter();
+	const collector = new collectors.UsageCollector(
+		operations,
+		writer,
+		() => false,
+		() => {},
+	);
+	for (const restore of restores) restore();
+	restores = [
+		spyOn(collectors, "getUsageCollector").mockReturnValue(collector),
+		spyOn(collectors, "tryGetUsageCollector").mockReturnValue(collector),
+	].map((spy) => () => spy.mockRestore());
+	ctx.dbOps = operations;
+	ctx.asyncWriter = writer;
 	try {
+		for (const a of accounts)
+			await operations
+				.getAdapter()
+				.run(
+					"INSERT INTO accounts (id, name, provider, api_key, created_at) VALUES (?, ?, ?, ?, ?)",
+					[a.id, a.name, a.provider, a.api_key, 1],
+				);
 		const secret = "synthetic-lifecycle-credential";
 		await operations.createApiKey({
 			id: scope.principalId,
@@ -314,7 +340,15 @@ it("one service connects verified inference enrollment, status, retry and next i
 			intentRevision: number;
 			pending: boolean;
 			lastSuccessfulHome: unknown;
+			decision: unknown;
+			lastSuccessfulDecision: unknown;
 		};
+		expect(status.decision).toMatchObject({
+			version: 1,
+			requested: { kind: "main", preference: "auto" },
+			selected: { lane: "fable" },
+		});
+		expect(status.lastSuccessfulDecision).toEqual(status.decision);
 		expect(status.intentRevision).toBe(1);
 		expect(status.pending).toBe(false);
 		expect(status.lastSuccessfulHome).not.toBeNull();
@@ -336,7 +370,14 @@ it("one service connects verified inference enrollment, status, retry and next i
 		expect(await (await retry()).json()).toEqual(accepted);
 		const pending = (await (
 			await dispatch(new Request(url, { headers: credential }))
-		).json()) as { pending: boolean; lastSuccessfulHome: unknown };
+		).json()) as {
+			pending: boolean;
+			lastSuccessfulHome: unknown;
+			decision: unknown;
+			lastSuccessfulDecision: unknown;
+		};
+		expect(pending.decision).toBeNull();
+		expect(pending.lastSuccessfulDecision).toEqual(status.decision);
 		expect(pending.pending).toBe(true);
 		expect(pending.lastSuccessfulHome).toEqual(status.lastSuccessfulHome);
 		expect(sends.length).toBe(1);
@@ -349,12 +390,265 @@ it("one service connects verified inference enrollment, status, retry and next i
 		expect(settled?.intentRevision).toBe(2);
 		expect(settled?.conversations[0]?.pending).toBe(false);
 		expect(settled?.conversations[0]?.home?.intentRevision).toBe(2);
+		await collector.drain();
+		const history = await (
+			await createRequestsSummaryHandler(operations.getAdapter())()
+		).json();
+		expect(history).toHaveLength(2);
+		expect(history[0].qualityDecision).toMatchObject({
+			version: 1,
+			selected: {
+				lane: "fable",
+				accountId: "a",
+				physicalModel: "claude-fable-5-1",
+			},
+			accounting: { kind: "estimate", source: "local-envelope-v1" },
+		});
+		expect(history[0].qualityDecision.selected.evidenceRef).toBeUndefined();
+		expect(history[0].qualityDecision.selected.catalogRevision).toBeUndefined();
 	} finally {
 		await flush();
+		await collector.drain();
+		collector.dispose();
 		await operations.close();
 		rmSync(directory, { recursive: true });
 	}
 });
+async function withRealQualityHistory(
+	run: (
+		operations: DatabaseOperations,
+		collector: collectors.UsageCollector,
+	) => Promise<void>,
+) {
+	const directory = mkdtempSync(join(tmpdir(), "quality-history-"));
+	const operations = new DatabaseOperations(join(directory, "test.db"));
+	const writer = new AsyncDbWriter();
+	const collector = new collectors.UsageCollector(
+		operations,
+		writer,
+		() => false,
+		() => {},
+	);
+	for (const restore of restores) restore();
+	restores = [
+		spyOn(collectors, "getUsageCollector").mockReturnValue(collector),
+		spyOn(collectors, "tryGetUsageCollector").mockReturnValue(collector),
+	].map((spy) => () => spy.mockRestore());
+	ctx.dbOps = operations;
+	ctx.asyncWriter = writer;
+	service = new QualityRouteService(operations.getQualityRouteRepository());
+	ctx.qualityRouteService = service;
+	try {
+		for (const a of accounts)
+			await operations
+				.getAdapter()
+				.run(
+					"INSERT INTO accounts (id, name, provider, api_key, access_token, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+					[
+						a.id,
+						a.name,
+						a.provider,
+						a.api_key,
+						a.access_token,
+						a.expires_at,
+						1,
+					],
+				);
+		await run(operations, collector);
+	} finally {
+		await flush();
+		await collector.drain();
+		collector.dispose();
+		await operations.close();
+		rmSync(directory, { recursive: true });
+	}
+}
+
+it("first Auto fallback persists Astra stream winner and Fable rejection through the real worker/history chain", async () => {
+	const codex = {
+		...account("c"),
+		provider: "codex",
+		api_key: null,
+		access_token: "synthetic-codex",
+		expires_at: Date.now() + 3600000,
+	};
+	accounts.push(codex);
+	const base = ctx.config.getQualityRoutingPolicy();
+	if (!base) throw new Error("Missing policy fixture");
+	const policy = compileQualityRoutingPolicy({
+		version: base.version,
+		fallbacks: base.fallbacks,
+		assignments: [
+			...base.assignments,
+			{
+				line: "gpt-astra",
+				lane: "astra",
+				priority: 0,
+				upgrade: "same-line-supported",
+			},
+		],
+		accounts: [
+			...base.accounts,
+			{ accountId: "c", provider: "codex", lines: ["gpt-astra"], priority: 0 },
+		],
+		spendGrants: [
+			{
+				accountId: "c",
+				line: "gpt-astra",
+				authorization: "operator-approved",
+				scope: "outside-subscription",
+			},
+		],
+	});
+	ctx.config.getQualityRoutingPolicy = () => policy;
+	for (const a of accounts)
+		usageCache.set(a.id, {
+			limits: [
+				{
+					kind: "weekly_all",
+					percent: a.id === "c" ? 10 : 100,
+					resets_at: Date.now() + 60000,
+				},
+			],
+			spend: { enabled: false },
+		} as never);
+	globalThis.fetch = Object.assign(
+		async (input: RequestInfo | URL, init?: RequestInit) => {
+			const req = input instanceof Request ? input : new Request(input, init);
+			if (req.method === "GET")
+				return Response.json({
+					models: [
+						{
+							slug: "gpt-6-astra",
+							context_window: 100000,
+							max_context_window: 100000,
+							max_output_tokens: 1000,
+							input_modalities: ["text"],
+						},
+					],
+				});
+			const body = (await req.json()) as { model: string };
+			sends.push({
+				model: body.model,
+				authorization: req.headers.get("authorization"),
+			});
+			return sse([
+				{
+					type: "response.created",
+					response: { id: "resp-synthetic", model: body.model },
+				},
+				{ type: "response.output_text.delta", delta: "ok" },
+				{
+					type: "response.completed",
+					response: {
+						id: "resp-synthetic",
+						model: body.model,
+						status: "completed",
+						usage: { input_tokens: 1, output_tokens: 1 },
+					},
+				},
+			]);
+		},
+		{ preconnect: () => {} },
+	) as typeof fetch;
+	await withRealQualityHistory(async (operations, collector) => {
+		await getCodexModels(codex.id, ctx);
+		const response = await send();
+		expect({
+			status: response.status,
+			error: response.ok ? null : await response.clone().text(),
+			state: response.ok ? null : await service.status(scope),
+		}).toMatchObject({ status: 200 });
+		await response.text();
+		await flush();
+		await collector.drain();
+		expect(sends).toHaveLength(1);
+		const history = await (
+			await createRequestsSummaryHandler(operations.getAdapter())()
+		).json();
+		expect(history).toHaveLength(1);
+		expect(history[0].qualityDecision).toMatchObject({
+			requested: { kind: "main", preference: "auto" },
+			selected: { accountId: "c", lane: "astra", physicalModel: "gpt-6-astra" },
+			skippedLanes: [
+				{ lane: "fable", reasons: { "provider-capacity-exhausted": 2 } },
+			],
+			accounting: { kind: "estimate" },
+		});
+		expect(history[0].routeProvenance?.repinReason ?? null).toBeNull();
+		const state = await service.status(scope);
+		expect(state?.conversations[0]?.lastSuccessfulDecision?.requestId).toBe(
+			history[0].id,
+		);
+		expect(state?.conversations[0]?.lastSuccessfulDecision?.value).toEqual(
+			history[0].qualityDecision,
+		);
+		await operations.updateRequestUsage(history[0].id, {
+			model: "gpt-6-astra",
+			inputTokens: 15,
+			outputTokens: 7,
+		});
+		const late = await (
+			await createRequestsSummaryHandler(operations.getAdapter())()
+		).json();
+		expect(late[0].qualityDecision).toEqual(history[0].qualityDecision);
+		const detail = await (
+			await createRequestsDetailHandler(operations)()
+		).json();
+		expect(detail[0].qualityDecision).toEqual(history[0].qualityDecision);
+		await operations.saveRequestPayload(history[0].id, {
+			meta: {},
+			qualityDecision: { secret: "must-not-escape" },
+		});
+		const payload = await (
+			await createRequestPayloadHandler(operations)(history[0].id)
+		).json();
+		expect(payload.qualityDecision).toEqual(history[0].qualityDecision);
+		await operations
+			.getAdapter()
+			.run("UPDATE requests SET quality_decision = ? WHERE id = ?", [
+				"{malformed",
+				history[0].id,
+			]);
+		const malformed = await (
+			await createRequestPayloadHandler(operations)(history[0].id)
+		).json();
+		expect(malformed.qualityDecision).toBeNull();
+	});
+});
+
+it("all rejected candidates persist a zero-send explanation without a selected home", async () => {
+	for (const a of accounts)
+		usageCache.set(a.id, {
+			limits: [
+				{ kind: "weekly_all", percent: 100, resets_at: Date.now() + 60000 },
+			],
+			spend: { enabled: false },
+		} as never);
+	await withRealQualityHistory(async (operations, collector) => {
+		const response = await send();
+		expect(response.status).toBe(503);
+		await response.text();
+		await flush();
+		await collector.drain();
+		expect(sends).toHaveLength(0);
+		const history = await (
+			await createRequestsSummaryHandler(operations.getAdapter())()
+		).json();
+		expect(history).toHaveLength(1);
+		expect(history[0].accountUsed).toBeNull();
+		expect(history[0].qualityDecision.selected).toBeNull();
+		expect(history[0].qualityDecision.skippedLanes[0]).toEqual({
+			lane: "fable",
+			reasons: { "provider-capacity-exhausted": 2 },
+		});
+		const root = (await service.status(scope))?.conversations[0];
+		expect(root?.home).toBeNull();
+		expect(root?.decision?.value).toEqual(history[0].qualityDecision);
+		expect(root?.decision?.requestId).toBe(history[0].id);
+	});
+});
+
 it("adds enabled quality choices to local discovery without catalog or inference traffic", async () => {
 	const local = [
 		{ id: "claude-bccf-route-existing", display_name: "Existing" },
@@ -598,6 +892,34 @@ it("authorized marker-only worker is request-only and never gets a guessed home"
 	expect(sends[1]?.model).toBe("claude-sonnet-5-5");
 	expect((await service.status(scope))?.conversations).toHaveLength(1);
 });
+it("request-only fallback records the actual winner without relabeling the healthy home", async () => {
+	await withRealQualityHistory(async (operations, collector) => {
+		await (await send()).text();
+		await flush();
+		expect((await home())?.accountId).toBe("a");
+		await operations
+			.getAdapter()
+			.run("UPDATE accounts SET rate_limited_until = ? WHERE id = ?", [
+				Date.now() + 60000,
+				"a",
+			]);
+		await (await send()).text();
+		await flush();
+		await collector.drain();
+		expect(sends[1]?.authorization).toBe("synthetic-b");
+		expect((await home())?.accountId).toBe("a");
+		const history = await (
+			await createRequestsSummaryHandler(operations.getAdapter())()
+		).json();
+		expect(history).toHaveLength(2);
+		expect(history[0].qualityDecision.selected.accountId).toBe("b");
+		expect(history[1].qualityDecision.selected.accountId).toBe("a");
+		const root = (await service.status(scope))?.conversations[0];
+		expect(root?.lastSuccessfulDecision?.value.selected?.accountId).toBe("b");
+		expect(root?.lastSuccessfulDecision?.requestId).toBe(history[0].id);
+	});
+});
+
 it("healthy home survives priority changes and temporary request-only fallback", async () => {
 	await (await send()).text();
 	await flush();

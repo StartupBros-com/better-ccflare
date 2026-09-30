@@ -21,6 +21,7 @@ import {
 	type RequestMeta,
 	type RouteProvenance,
 } from "@better-ccflare/types";
+import { sanitizeQualityDecision } from "@better-ccflare/types/request";
 import type { AnthropicDegradedResponseLifecycle } from "./anthropic-degraded-response-lifecycle";
 import { createAnthropicSemanticLivenessStream } from "./anthropic-semantic-liveness";
 import {
@@ -982,6 +983,14 @@ export async function forwardToClient(
 			accountName: account?.name ?? null,
 			agentUsed: agentUsed || null,
 			clientSessionId: clientSessionId ?? null,
+			qualityDecision: sanitizeQualityDecision(
+				options.routingMeta?.qualityDecision
+					? {
+							...options.routingMeta.qualityDecision,
+							accounting: options.routingMeta.qualityAccounting,
+						}
+					: null,
+			),
 			routeProvenance,
 			// Persist the pair only for an actual swap — an agent-detected but
 			// unmodified request would otherwise record two equal values that

@@ -1512,6 +1512,7 @@ OAuth tokens will need to be re-authenticated.
 		clientSessionId?: string | null,
 		routeProvenance?: RouteProvenance | null,
 		accounting?: RequestData["accounting"],
+		qualityDecision?: RequestData["qualityDecision"],
 	): Promise<void> {
 		await withDatabaseRetry(
 			() =>
@@ -1540,6 +1541,7 @@ OAuth tokens will need to be re-authenticated.
 					clientSessionId,
 					routeProvenance,
 					accounting,
+					qualityDecision,
 				}),
 			this.retryConfig,
 			"saveRequest",
@@ -1614,6 +1616,7 @@ OAuth tokens will need to be re-authenticated.
 			json: string | null;
 			timestamp: number;
 			account_name: string | null;
+			quality_decision?: string | null;
 		}>
 	> {
 		return this.requests.listPayloadsWithAccountNames(limit);

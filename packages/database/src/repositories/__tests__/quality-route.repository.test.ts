@@ -41,6 +41,69 @@ describe("durable quality routing", () => {
 		for (const db of connections) db.close();
 		rmSync(directory, { recursive: true });
 	});
+	it("diagnostics cannot extend expiry, cross principals, or overwrite retry intent", async () => {
+		const ticket = await first.reserveIngress(scope, 100);
+		await first.acceptRoot(ticket, "auto", 100);
+		const before = await first.status(scope, 101);
+		const decision = {
+			version: 1,
+			policyRevision: "quality-policy-v1:fixture",
+			requested: { kind: "main", preference: "auto" },
+			selected: null,
+			skippedLanes: [{ lane: "fable", reasons: { "account-unavailable": 1 } }],
+		};
+		await first.recordRejectedDecision(
+			scope,
+			ticket.incarnation,
+			"$root",
+			1,
+			"request-one",
+			decision,
+			102,
+		);
+		const after = await second.status(scope, 103);
+		expect(after?.expiresAt).toBe(before?.expiresAt);
+		expect(after?.root).toEqual(before?.root);
+		expect(after?.conversations[0]?.home).toBeNull();
+		expect(after?.conversations[0]?.decision?.value).toEqual(decision);
+		await expect(
+			first.recordRejectedDecision(
+				{ ...scope, principalId: "other" },
+				ticket.incarnation,
+				"$root",
+				1,
+				"request-other",
+				decision,
+				104,
+			),
+		).rejects.toThrow();
+		await second.retryPreferred(
+			{
+				session: scope,
+				incarnation: ticket.incarnation,
+				expectedIntentRevision: 1,
+				idempotencyToken: "retry",
+			},
+			105,
+		);
+		await expect(
+			first.recordRejectedDecision(
+				scope,
+				ticket.incarnation,
+				"$root",
+				1,
+				"request-old",
+				decision,
+				106,
+			),
+		).rejects.toThrow();
+		expect(
+			(await first.status(scope, 107))?.conversations[0]?.decision,
+		).toBeNull();
+		if (!after) throw new Error("Missing session fixture");
+		expect(await first.status(scope, after.expiresAt + 1000)).toBeNull();
+	});
+
 	it("delayed old child activity cannot shorten newer root expiry across connections", async () => {
 		const db = connections[0];
 		if (!db) throw new Error("Missing fixture connection");

@@ -154,6 +154,9 @@ export async function handleQualityControl(
 	const root = state.conversations.find(
 		(conversation) => conversation.key === "$root",
 	);
+	const inFlight = state.unresolved.some(
+		(item) => item.identity.conversation === "$root",
+	);
 	return reply(200, {
 		status: "known",
 		incarnation: state.incarnation,
@@ -164,6 +167,17 @@ export async function handleQualityControl(
 		lastSuccessfulHome: root?.home ?? null,
 		conversations: state.conversations,
 		unresolved: state.unresolved,
-		decision: null,
+		decisionState: inFlight
+			? "in-flight"
+			: root?.decision
+				? "settled"
+				: root?.pending
+					? "pending"
+					: "none",
+		decision: inFlight ? null : (root?.decision?.value ?? null),
+		decisionRequestId: inFlight ? null : (root?.decision?.requestId ?? null),
+		lastSuccessfulDecision: root?.lastSuccessfulDecision?.value ?? null,
+		lastSuccessfulDecisionRequestId:
+			root?.lastSuccessfulDecision?.requestId ?? null,
 	} satisfies QualitySessionControlStatus);
 }

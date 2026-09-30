@@ -6,6 +6,10 @@ import type {
 	QualityVerifiedSession,
 	QualityWorkerRole,
 } from "@better-ccflare/types";
+import {
+	type QualityDecisionRecord,
+	sanitizeQualityDecision,
+} from "@better-ccflare/types/request";
 import type { BunSqlAdapter } from "../adapters/bun-sql-adapter";
 import { BaseRepository } from "./base.repository";
 
@@ -49,7 +53,14 @@ export interface QualityHome {
 	intentRevision: number;
 	target: QualityPhysicalTarget;
 }
+export interface QualityDecisionSnapshot {
+	requestId: string;
+	revision: number;
+	value: QualityDecisionRecord;
+}
 export interface QualityConversation {
+	decision?: QualityDecisionSnapshot | null;
+	lastSuccessfulDecision?: QualityDecisionSnapshot | null;
 	key: string;
 	role: "main" | QualityWorkerRole;
 	revision: number;
@@ -181,6 +192,7 @@ function supersedeRoot(
 	root.revision = revision;
 	root.pending = true;
 	root.lastSettlement = null;
+	root.decision = null;
 	state.leases = state.leases.filter(
 		(lease) => lease.identity.conversation !== "$root",
 	);
@@ -580,6 +592,7 @@ export class QualityRouteRepository extends BaseRepository<never> {
 		identity: QualityLease,
 		outcome: QualitySettlement,
 		now: number,
+		diagnostics?: { requestId: string; decision: QualityDecisionRecord | null },
 	): Promise<QualityHome | null> {
 		checkNow(now);
 		return this.mutate(identity.session, (state) => {
@@ -610,8 +623,53 @@ export class QualityRouteRepository extends BaseRepository<never> {
 				outcome,
 				home: item.home,
 			};
+			const decision = sanitizeQualityDecision(diagnostics?.decision);
+			if (decision && diagnostics && diagnostics.requestId.length <= 128) {
+				const target = lease.dispatch.target;
+				const selected = decision.selected;
+				// Never attach another candidate's explanation to this settled attempt.
+				if (
+					selected?.accountId === target.accountId &&
+					selected.physicalModel === target.physicalModel &&
+					selected.provider === target.provider &&
+					selected.line === target.line &&
+					selected.lane === target.lane
+				) {
+					item.decision = {
+						requestId: diagnostics.requestId,
+						revision: item.revision,
+						value:
+							outcome.kind === "validated-success"
+								? decision
+								: { ...decision, selected: null },
+					};
+					if (outcome.kind === "validated-success")
+						item.lastSuccessfulDecision = item.decision;
+				}
+			}
 			this.refreshActivity(state, now);
 			return item.home;
+		});
+	}
+	/** Diagnostics are not activity or authority: no home/intent/lease/expiry changes. */
+	async recordRejectedDecision(
+		session: QualityVerifiedSession,
+		incarnation: string,
+		key: string,
+		revision: number,
+		requestId: string,
+		raw: unknown,
+		now: number,
+	): Promise<void> {
+		const decision = sanitizeQualityDecision(raw);
+		if (!decision || decision.selected !== null) return;
+		bounded(requestId, 128);
+		checkNow(now);
+		await this.mutate(session, (state) => {
+			current(state, incarnation, now);
+			const item = conversation(state, key);
+			if (item.revision !== revision) throw new QualityRouteError("stale");
+			item.decision = { requestId, revision, value: decision };
 		});
 	}
 	/** Bounded lifecycle cleanup, never a timer; unresolved output fences survive forever

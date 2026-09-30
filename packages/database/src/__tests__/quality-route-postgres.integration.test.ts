@@ -2,11 +2,17 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { randomUUID } from "node:crypto";
 import type { QualityVerifiedSession } from "@better-ccflare/types";
+import {
+	type RequestRow,
+	sanitizeQualityDecision,
+	toRequest,
+} from "@better-ccflare/types/request";
 import { SQL } from "bun";
 import { BunSqlAdapter } from "../adapters/bun-sql-adapter";
 import { ensureSchema } from "../migrations";
 import { ensureSchemaPg, runMigrationsPg } from "../migrations-pg";
 import { QualityRouteRepository } from "../repositories/quality-route.repository";
+import { RequestRepository } from "../repositories/request.repository";
 
 // Deliberately never consumes an ambient production DATABASE_URL.
 const configuredUrl = process.env.BETTER_CCFLARE_TEST_POSTGRES_URL;
@@ -84,6 +90,62 @@ describe.skipIf(!postgresUrl)(
 					if (admin) await admin.end();
 				}
 			}
+		});
+
+		it("quality explanations survive fresh/upgrade, late saves and cross-connection readback", async () => {
+			const repo = new RequestRepository(adapters[0]);
+			const data = {
+				id: "quality-history",
+				method: "POST",
+				path: "/v1/messages",
+				accountUsed: null,
+				statusCode: 200,
+				success: true,
+				errorMessage: null,
+				responseTime: 10,
+				failoverAttempts: 0,
+			};
+			const decision = sanitizeQualityDecision({
+				version: 1,
+				policyRevision: "quality-policy-v1:synthetic",
+				requested: { kind: "main", preference: "auto" },
+				selected: target,
+				skippedLanes: [
+					{ lane: "fable", reasons: { "subscription-exhausted": 1 } },
+				],
+			});
+			expect(decision).not.toBeNull();
+			await repo.save({ ...data, qualityDecision: decision });
+			await repo.save(data);
+			const row = await adapters[1].get<RequestRow>(
+				"SELECT * FROM requests WHERE id = ?",
+				[data.id],
+			);
+			if (!row) throw new Error("Missing request fixture row");
+			expect(toRequest(row).qualityDecision).toEqual(decision);
+			await adapters[0].unsafe(
+				"ALTER TABLE requests DROP COLUMN quality_decision",
+			);
+			await runMigrationsPg(adapters[0]);
+			const old = await adapters[1].get<RequestRow>(
+				"SELECT * FROM requests WHERE id = ?",
+				[data.id],
+			);
+			if (!old) throw new Error("Missing request fixture row");
+			expect(toRequest(old).qualityDecision).toBeNull();
+			await repo.save({ ...data, qualityDecision: decision });
+			await repo.updateUsage(data.id, {
+				model: target.physicalModel,
+				inputTokens: 12,
+				outputTokens: 4,
+			});
+			const upgraded = await adapters[1].get<RequestRow>(
+				"SELECT * FROM requests WHERE id = ?",
+				[data.id],
+			);
+			if (!upgraded) throw new Error("Missing request fixture row");
+			expect(toRequest(upgraded).qualityDecision).toEqual(decision);
+			expect(upgraded?.model).toBe(target.physicalModel);
 		});
 
 		it("fresh and upgrade schema have SQLite column/index parity and preserve existing session state", async () => {

@@ -184,6 +184,213 @@ export interface QualityDecisionEnvelope {
 	readonly skippedLanes: QualitySkippedLanes;
 }
 
+/** Durable diagnostics only; catalog/evidence references never cross this boundary. */
+export interface QualityDecisionRecord
+	extends Omit<QualityDecisionEnvelope, "selected"> {
+	readonly selected: Pick<
+		QualityPhysicalTarget,
+		"accountId" | "provider" | "lane" | "line" | "physicalModel"
+	> | null;
+	readonly accounting?: QualityAdmissionDecision["accounting"];
+}
+
+const QUALITY_LANES = ["fable", "astra", "opus", "standard", "lightweight"];
+const QUALITY_LINES = [
+	"claude-fable",
+	"gpt-astra",
+	"claude-opus",
+	"gpt-sol",
+	"claude-sonnet",
+	"claude-haiku",
+];
+const QUALITY_REASONS = [
+	"account-not-enrolled",
+	"line-not-approved",
+	"account-unavailable",
+	"model-unsupported",
+	"evidence-missing",
+	"context-unsupported",
+	"subscription-exhausted",
+	"spend-not-authorized",
+	"lane-unavailable",
+	"provider-capacity-exhausted",
+	"capacity-evidence-unknown",
+	"billing-evidence-unknown",
+	"catalog-evidence-stale",
+	"credential-evidence-unknown",
+	"input-accounting-unknown",
+	"output-unsupported",
+	"modality-unsupported",
+	"tools-unsupported",
+	"request-preservation-unknown",
+];
+function qualityObject(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function qualityKeys(
+	value: Record<string, unknown>,
+	allowed: readonly string[],
+): boolean {
+	return Object.keys(value).every((key) => allowed.includes(key));
+}
+function qualityEnum(
+	value: unknown,
+	allowed: readonly string[],
+): value is string {
+	return typeof value === "string" && allowed.includes(value);
+}
+function qualityId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length <= 128 &&
+		/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(value)
+	);
+}
+/** 8KiB JSON, 3 ordered lanes, 19 enumerated reasons/lane, counts <= 1e6.
+ * Reject unknown fields/enums and invalid scalars; return a fresh allowlisted value.
+ * References on an internal target are accepted only to discard them. Never route on this data.
+ */
+export function sanitizeQualityDecision(
+	raw: unknown,
+): QualityDecisionRecord | null {
+	try {
+		const json = typeof raw === "string" ? raw : JSON.stringify(raw);
+		if (
+			!json ||
+			json.length > 8192 ||
+			new TextEncoder().encode(json).length > 8192
+		)
+			return null;
+		const value: unknown = JSON.parse(json);
+		if (
+			!qualityObject(value) ||
+			!qualityKeys(value, [
+				"version",
+				"policyRevision",
+				"requested",
+				"selected",
+				"skippedLanes",
+				"accounting",
+			]) ||
+			value.version !== 1 ||
+			!qualityId(value.policyRevision) ||
+			!value.policyRevision.startsWith("quality-policy-v1:")
+		)
+			return null;
+		const requested = value.requested;
+		if (!qualityObject(requested)) return null;
+		if (requested.kind === "main") {
+			if (
+				!qualityKeys(requested, ["kind", "preference"]) ||
+				!qualityEnum(requested.preference, ["auto", "fable", "astra", "opus"])
+			)
+				return null;
+		} else if (requested.kind === "worker") {
+			if (
+				!qualityKeys(requested, ["kind", "role"]) ||
+				!qualityEnum(requested.role, QUALITY_LANES)
+			)
+				return null;
+		} else return null;
+		let selected: QualityDecisionRecord["selected"] = null;
+		if (value.selected !== null) {
+			const target = value.selected;
+			if (
+				!qualityObject(target) ||
+				!qualityKeys(target, [
+					"accountId",
+					"provider",
+					"lane",
+					"line",
+					"physicalModel",
+					"catalogRevision",
+					"evidenceRef",
+				]) ||
+				!qualityId(target.accountId) ||
+				!qualityId(target.physicalModel) ||
+				!qualityEnum(target.provider, ["anthropic", "codex"]) ||
+				!qualityEnum(target.lane, QUALITY_LANES) ||
+				!qualityEnum(target.line, QUALITY_LINES)
+			)
+				return null;
+			selected = {
+				accountId: target.accountId,
+				physicalModel: target.physicalModel,
+				provider: target.provider as QualityProvider,
+				lane: target.lane as QualityLane,
+				line: target.line as QualityApprovedLine,
+			};
+		}
+		if (!Array.isArray(value.skippedLanes) || value.skippedLanes.length > 3)
+			return null;
+		const skipped: QualitySkippedLaneSummary[] = [];
+		for (const entry of value.skippedLanes) {
+			if (
+				!qualityObject(entry) ||
+				!qualityKeys(entry, ["lane", "reasons"]) ||
+				!qualityEnum(entry.lane, QUALITY_LANES) ||
+				!qualityObject(entry.reasons) ||
+				!qualityKeys(entry.reasons, QUALITY_REASONS)
+			)
+				return null;
+			const reasons: Partial<Record<QualityAdmissionReason, number>> = {};
+			for (const [reason, count] of Object.entries(entry.reasons)) {
+				if (
+					typeof count !== "number" ||
+					!Number.isSafeInteger(count) ||
+					count < 1 ||
+					count > 1_000_000
+				)
+					return null;
+				reasons[reason as QualityAdmissionReason] = count;
+			}
+			skipped.push({ lane: entry.lane as QualityLane, reasons });
+		}
+		let accounting: QualityDecisionRecord["accounting"];
+		if (value.accounting !== undefined) {
+			const a = value.accounting;
+			const numbers = [
+				"envelopeBytes",
+				"inputEstimate",
+				"headroom",
+				"requestedOutput",
+			] as const;
+			if (
+				!qualityObject(a) ||
+				!qualityKeys(a, ["source", "kind", ...numbers]) ||
+				a.source !== "local-envelope-v1" ||
+				a.kind !== "estimate" ||
+				numbers.some(
+					(key) =>
+						typeof a[key] !== "number" ||
+						!Number.isSafeInteger(a[key]) ||
+						Number(a[key]) < 0 ||
+						Number(a[key]) > 1_000_000_000,
+				)
+			)
+				return null;
+			accounting = {
+				source: "local-envelope-v1",
+				kind: "estimate",
+				envelopeBytes: Number(a.envelopeBytes),
+				inputEstimate: Number(a.inputEstimate),
+				headroom: Number(a.headroom),
+				requestedOutput: Number(a.requestedOutput),
+			};
+		}
+		return {
+			version: 1,
+			policyRevision: value.policyRevision as QualityPolicyRevision,
+			requested: requested as unknown as QualityRequestIntent,
+			selected,
+			skippedLanes: skipped as unknown as QualitySkippedLanes,
+			...(accounting ? { accounting } : {}),
+		};
+	} catch {
+		return null;
+	}
+}
+
 /** Filled only after the control boundary verifies principal/session ownership. */
 export interface QualityVerifiedSession {
 	readonly verified: true;

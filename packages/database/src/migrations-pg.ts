@@ -681,6 +681,7 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			account_generation BIGINT,
 			cache_health_native INTEGER,
 			internal_origin INTEGER,
+ quality_decision TEXT,
 			client_session_id TEXT,
 			route_profile_id TEXT,
 			requested_route_model TEXT,
@@ -1598,6 +1599,7 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			["account_generation", "BIGINT"],
 			["cache_health_native", "INTEGER"],
 			["internal_origin", "INTEGER"],
+			["quality_decision", "TEXT"],
 		].map(([column, type]) => ({
 			table: "requests",
 			column,

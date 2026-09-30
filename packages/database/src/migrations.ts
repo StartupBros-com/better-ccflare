@@ -472,6 +472,7 @@ export function ensureSchema(db: Database): void {
 			account_generation BIGINT,
 			cache_health_native INTEGER,
 			internal_origin INTEGER,
+ quality_decision TEXT,
 			client_session_id TEXT,
 			route_profile_id TEXT,
 			requested_route_model TEXT,
@@ -1550,6 +1551,7 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		["account_generation", "BIGINT"],
 		["cache_health_native", "INTEGER"],
 		["internal_origin", "INTEGER"],
+		["quality_decision", "TEXT"],
 	]) {
 		if (!tableHasColumn(db, "requests", column)) {
 			db.run(`ALTER TABLE requests ADD COLUMN ${column} ${type}`);
