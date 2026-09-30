@@ -19,6 +19,7 @@ export class QualityRouteError extends Error {
 			| "stale"
 			| "unavailable"
 			| "capacity"
+			| "provisional-capacity"
 			| "unresolved"
 			| "conflict",
 	) {
@@ -30,6 +31,9 @@ export interface QualityRouteLimits {
 	leaseMs: number;
 	maxLeaseLifetimeMs: number;
 	maxSessions: number;
+	maxProvisionalSessions: number;
+	maxIngress: number;
+	ingressTtlMs: number;
 	maxCommands: number;
 	maxConversations: number;
 	maxLeases: number;
@@ -39,6 +43,9 @@ const DEFAULT_LIMITS: QualityRouteLimits = {
 	leaseMs: 120_000,
 	maxLeaseLifetimeMs: 1_800_000,
 	maxSessions: 10_000,
+	maxProvisionalSessions: 10_000,
+	maxIngress: 128,
+	ingressTtlMs: 120_000,
 	maxCommands: 256,
 	maxConversations: 128,
 	maxLeases: 64,
@@ -91,6 +98,8 @@ export type QualitySettlement =
 	| { kind: "validated-success" }
 	| { kind: "failed" | "cancelled" | "truncated" | "losing" };
 export interface QualityRouteState {
+	enrolled: boolean;
+	ingress: { order: number; expiresAt: number }[];
 	incarnation: string;
 	nextOrder: number;
 	acceptedOrder: number;
@@ -120,6 +129,7 @@ export type QualityReplacementAuthority = {
 	homeVersion: number;
 } | null;
 interface StateRow {
+	enrolled: number;
 	incarnation: string;
 	version: number | string;
 	state_json: string;
@@ -225,7 +235,7 @@ export class QualityRouteRepository extends BaseRepository<never> {
 	private async load(scope: QualityVerifiedSession): Promise<StateRow | null> {
 		checkScope(scope);
 		return this.get<StateRow>(
-			"SELECT incarnation, version, state_json FROM quality_route_sessions WHERE principal_id = ? AND session_id = ?",
+			"SELECT incarnation, version, state_json, enrolled FROM quality_route_sessions WHERE principal_id = ? AND session_id = ?",
 			[scope.principalId, scope.sessionId],
 		);
 	}
@@ -245,11 +255,14 @@ export class QualityRouteRepository extends BaseRepository<never> {
 	private async mutate<T>(
 		scope: QualityVerifiedSession,
 		apply: (state: QualityRouteState) => T,
+		admit = false,
 	): Promise<T> {
 		for (let attempt = 0; attempt < 32; attempt++) {
 			const row = await this.load(scope);
 			if (!row) throw new QualityRouteError("unavailable");
 			const state = JSON.parse(row.state_json) as QualityRouteState;
+			state.enrolled = Boolean(row.enrolled);
+			state.ingress ??= [];
 			const result = apply(state);
 			const json = JSON.stringify(state);
 			if (json.length > 1_048_576) throw new QualityRouteError("capacity");
@@ -260,19 +273,41 @@ export class QualityRouteRepository extends BaseRepository<never> {
 				0,
 				...state.leases.map((lease) => lease.expiresAt),
 			);
-			const changed = await this.runWithChanges(
-				`UPDATE quality_route_sessions SET state_json = ?, version = version + 1, expires_at = ?, lease_until = ?, unresolved = ? WHERE principal_id = ? AND session_id = ? AND incarnation = ? AND version = ?`,
-				[
+			const statement = {
+				sql: `UPDATE quality_route_sessions SET state_json = ?, version = version + 1, expires_at = ?, lease_until = ?, unresolved = ?, enrolled = ?, ingress_until = ? WHERE principal_id = ? AND session_id = ? AND incarnation = ? AND version = ?${admit ? " AND (enrolled = 1 OR (SELECT COUNT(*) FROM quality_route_sessions WHERE enrolled = 1) < ?)" : ""}`,
+				params: [
 					json,
 					state.expiresAt,
 					leaseUntil,
 					unresolved,
+					state.enrolled ? 1 : 0,
+					Math.max(0, ...state.ingress.map((item) => item.expiresAt)),
 					scope.principalId,
 					scope.sessionId,
 					row.incarnation,
 					Number(row.version),
+					...(admit ? [this.limits.maxSessions] : []),
 				],
-			);
+			};
+			const changed = admit
+				? (
+						await this.adapter.runBatchWithChanges([
+							{
+								sql: "UPDATE quality_route_admission SET revision = revision + 1 WHERE id = 1",
+								expectedChanges: 1,
+							},
+							statement,
+						])
+					)[1]
+				: await this.runWithChanges(statement.sql, statement.params);
+			if (changed === 0 && admit) {
+				const latest = await this.load(scope);
+				if (
+					latest?.incarnation === row.incarnation &&
+					Number(latest.version) === Number(row.version)
+				)
+					throw new QualityRouteError("capacity");
+			}
 			if (changed === 1) return result;
 		}
 		throw new QualityRouteError("conflict");
@@ -306,10 +341,12 @@ export class QualityRouteRepository extends BaseRepository<never> {
 		await this.cleanup(now);
 		if (!(await this.load(session))) {
 			const state: QualityRouteState = {
+				enrolled: false,
+				ingress: [],
 				incarnation: randomUUID(),
 				nextOrder: 0,
 				acceptedOrder: 0,
-				expiresAt: now + this.limits.idleTtlMs,
+				expiresAt: now + this.limits.ingressTtlMs,
 				root: null,
 				conversations: [],
 				leases: [],
@@ -323,26 +360,28 @@ export class QualityRouteRepository extends BaseRepository<never> {
 					expectedChanges: 1,
 				},
 				{
-					sql: `INSERT INTO quality_route_sessions (principal_id, session_id, incarnation, version, state_json, expires_at) SELECT ?, ?, ?, 0, ?, ? WHERE (SELECT COUNT(*) FROM quality_route_sessions) < ? ON CONFLICT (principal_id, session_id) DO NOTHING`,
+					sql: `INSERT INTO quality_route_sessions (principal_id, session_id, incarnation, version, state_json, expires_at, enrolled) SELECT ?, ?, ?, 0, ?, ?, 0 WHERE (SELECT COUNT(*) FROM quality_route_sessions WHERE enrolled = 0) < ? ON CONFLICT (principal_id, session_id) DO NOTHING`,
 					params: [
 						session.principalId,
 						session.sessionId,
 						state.incarnation,
 						JSON.stringify(state),
 						state.expiresAt,
-						this.limits.maxSessions,
+						this.limits.maxProvisionalSessions,
 					],
 				},
 			]);
-			if (!(await this.load(session))) throw new QualityRouteError("capacity");
+			if (!(await this.load(session)))
+				throw new QualityRouteError("provisional-capacity");
 		}
 		return this.mutate(session, (state) => {
-			if (!live(state, now)) throw new QualityRouteError("unavailable");
-			return {
-				session,
-				incarnation: state.incarnation,
-				order: ++state.nextOrder,
-			};
+			state.ingress = state.ingress.filter((item) => item.expiresAt > now);
+			if (state.ingress.length >= this.limits.maxIngress)
+				throw new QualityRouteError("capacity");
+			const order = ++state.nextOrder;
+			state.ingress.push({ order, expiresAt: now + this.limits.ingressTtlMs });
+			if (!state.enrolled) state.expiresAt = now + this.limits.ingressTtlMs;
+			return { session, incarnation: state.incarnation, order };
 		});
 	}
 	async acceptRoot(
@@ -356,21 +395,78 @@ export class QualityRouteRepository extends BaseRepository<never> {
 			!["auto", "fable", "astra", "opus"].includes(preference)
 		)
 			throw new TypeError("Invalid preference");
-		return this.mutate(ticket.session, (state) => {
+		return this.mutate(
+			ticket.session,
+			(state) => {
+				if (
+					state.incarnation !== ticket.incarnation ||
+					!Number.isSafeInteger(ticket.order) ||
+					ticket.order <= state.acceptedOrder ||
+					ticket.order > state.nextOrder ||
+					!state.ingress.some(
+						(item) => item.order === ticket.order && item.expiresAt > now,
+					)
+				)
+					throw new QualityRouteError("stale");
+				state.acceptedOrder = ticket.order;
+				if (!state.root || state.root.preference !== preference)
+					supersedeRoot(state, preference);
+				state.ingress = state.ingress.filter(
+					(item) => item.order !== ticket.order && item.expiresAt > now,
+				);
+				if (preference !== null && !state.enrolled) {
+					state.enrolled = true;
+					state.expiresAt = now + this.limits.idleTtlMs;
+				}
+				if (state.enrolled) this.refreshActivity(state, now);
+				return state;
+			},
+			preference !== null,
+		);
+	}
+	/** Idempotent, exact-ticket removal. CAS protects reservations added concurrently;
+	 * incarnation + membership prevent old tickets restoring state after cleanup. */
+	async withdrawIngress(
+		ticket: QualityIngressTicket,
+		now: number,
+	): Promise<void> {
+		checkNow(now);
+		try {
+			await this.mutate(ticket.session, (state) => {
+				if (state.incarnation !== ticket.incarnation)
+					throw new QualityRouteError("stale");
+				state.ingress = state.ingress.filter(
+					(item) => item.order !== ticket.order && item.expiresAt > now,
+				);
+			});
+			// Delete only an empty, never-accepted provisional row. Manual watermarks
+			// have a short finite TTL; they never occupy the accepted pool.
+			await this.runWithChanges(
+				`DELETE FROM quality_route_sessions WHERE principal_id = ? AND session_id = ? AND incarnation = ? AND enrolled = 0 AND ingress_until = 0 AND unresolved = 0 AND state_json = ?`,
+				[
+					ticket.session.principalId,
+					ticket.session.sessionId,
+					ticket.incarnation,
+					await this.emptyProvisionalJson(ticket.session),
+				],
+			);
+		} catch (error) {
 			if (
-				state.incarnation !== ticket.incarnation ||
-				!Number.isSafeInteger(ticket.order) ||
-				ticket.order <= state.acceptedOrder ||
-				ticket.order > state.nextOrder ||
-				!live(state, now)
+				!(error instanceof QualityRouteError) ||
+				!["stale", "unavailable"].includes(error.code)
 			)
-				throw new QualityRouteError("stale");
-			state.acceptedOrder = ticket.order;
-			if (!state.root || state.root.preference !== preference)
-				supersedeRoot(state, preference);
-			this.refreshActivity(state, now);
-			return state;
-		});
+				throw error;
+		}
+	}
+	private async emptyProvisionalJson(
+		session: QualityVerifiedSession,
+	): Promise<string | null> {
+		const row = await this.load(session);
+		if (!row) return null;
+		const state = JSON.parse(row.state_json) as QualityRouteState;
+		return !state.root && !state.conversations.length && !state.leases.length
+			? row.state_json
+			: null;
 	}
 	async retryPreferred(
 		input: QualityRetryInput,
@@ -680,8 +776,8 @@ export class QualityRouteRepository extends BaseRepository<never> {
 		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
 			throw new TypeError("Invalid cleanup bound");
 		return this.runWithChanges(
-			`DELETE FROM quality_route_sessions WHERE (principal_id, session_id) IN (SELECT principal_id, session_id FROM quality_route_sessions WHERE expires_at <= ? AND lease_until <= ? AND unresolved = 0 ORDER BY expires_at LIMIT ?) AND expires_at <= ? AND lease_until <= ? AND unresolved = 0`,
-			[now, now, limit, now, now],
+			`DELETE FROM quality_route_sessions WHERE (principal_id, session_id) IN (SELECT principal_id, session_id FROM quality_route_sessions WHERE expires_at <= ? AND lease_until <= ? AND ingress_until <= ? AND unresolved = 0 ORDER BY expires_at LIMIT ?) AND expires_at <= ? AND lease_until <= ? AND ingress_until <= ? AND unresolved = 0`,
+			[now, now, now, limit, now, now, now],
 		);
 	}
 }

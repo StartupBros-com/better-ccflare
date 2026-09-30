@@ -467,7 +467,13 @@ async function withRealQualityHistory(
 	}
 }
 
-it("first Auto fallback persists Astra stream winner and Fable rejection through the real worker/history chain", async () => {
+it.each([
+	"success",
+	"context-overflow",
+	"missing-catalog",
+])("first Auto fallback persists Astra winner after %s through real history", async (mode) => {
+	let rejectContext = mode === "context-overflow";
+	if (mode === "missing-catalog") resetModelCatalogForTest();
 	const codex = {
 		...account("c"),
 		provider: "codex",
@@ -535,6 +541,16 @@ it("first Auto fallback persists Astra stream winner and Fable rejection through
 				model: body.model,
 				authorization: req.headers.get("authorization"),
 			});
+			if (rejectContext)
+				return Response.json(
+					{
+						error: {
+							code: "context_length_exceeded",
+							message: "synthetic overflow",
+						},
+					},
+					{ status: 400 },
+				);
 			return sse([
 				{
 					type: "response.created",
@@ -556,6 +572,25 @@ it("first Auto fallback persists Astra stream winner and Fable rejection through
 	) as typeof fetch;
 	await withRealQualityHistory(async (operations, collector) => {
 		await getCodexModels(codex.id, ctx);
+		if (rejectContext) {
+			const settlement = spyOn(service, "settleDispatch");
+			try {
+				const failed = await send();
+				expect(failed.status).toBe(400);
+				expect(await failed.json()).toMatchObject({
+					error: { code: "context_length_exceeded" },
+				});
+				await flush();
+				expect(sends).toHaveLength(1);
+				expect(settlement).toHaveBeenCalledTimes(1);
+				expect(settlement.mock.calls[0]?.[1]).toEqual({ kind: "failed" });
+				expect((await service.status(scope))?.unresolved).toEqual([]);
+				expect(await home()).toBeUndefined();
+			} finally {
+				settlement.mockRestore();
+			}
+			rejectContext = false;
+		}
 		const response = await send();
 		expect({
 			status: response.status,
@@ -565,16 +600,23 @@ it("first Auto fallback persists Astra stream winner and Fable rejection through
 		await response.text();
 		await flush();
 		await collector.drain();
-		expect(sends).toHaveLength(1);
+		expect(sends).toHaveLength(mode === "context-overflow" ? 2 : 1);
 		const history = await (
 			await createRequestsSummaryHandler(operations.getAdapter())()
 		).json();
-		expect(history).toHaveLength(1);
+		expect(history).toHaveLength(mode === "context-overflow" ? 2 : 1);
 		expect(history[0].qualityDecision).toMatchObject({
 			requested: { kind: "main", preference: "auto" },
 			selected: { accountId: "c", lane: "astra", physicalModel: "gpt-6-astra" },
 			skippedLanes: [
-				{ lane: "fable", reasons: { "provider-capacity-exhausted": 2 } },
+				{
+					lane: "fable",
+					reasons: {
+						[mode === "missing-catalog"
+							? "evidence-missing"
+							: "provider-capacity-exhausted"]: 2,
+					},
+				},
 			],
 			accounting: { kind: "estimate" },
 		});
@@ -1150,6 +1192,10 @@ it.each([
 	"fresh",
 	"left",
 ])("older buffered root cannot reinstate enrollment after newer native intent (%s)", async (state) => {
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db), { maxSessions: 1 }),
+	);
+	ctx.qualityRouteService = service;
 	if (state !== "fresh") {
 		await (await send()).text();
 		await flush();
@@ -1203,17 +1249,19 @@ it("candidate authority is immutable and exhausts each lane before the next", ()
 		{ kind: "main", preference: "auto" },
 		accounts,
 	);
-	expect(plan.map((c) => [c.target.accountId, c.target.physicalModel])).toEqual(
-		[
-			["b", "claude-fable-5-1"],
-			["a", "claude-fable-5-1"],
-			["b", "claude-opus-5-5"],
-			["a", "claude-opus-5-5"],
-		],
-	);
+	expect(
+		plan.candidates.map((c) => [c.target.accountId, c.target.physicalModel]),
+	).toEqual([
+		["b", "claude-fable-5-1"],
+		["a", "claude-fable-5-1"],
+		["b", "claude-opus-5-5"],
+		["a", "claude-opus-5-5"],
+	]);
 	expect(Object.isFrozen(plan)).toBe(true);
 	expect(
-		plan.every((c) => Object.isFrozen(c) && Object.isFrozen(c.target)),
+		plan.candidates.every(
+			(c) => Object.isFrozen(c) && Object.isFrozen(c.target),
+		),
 	).toBe(true);
 });
 it("existing strategy route circuits veto exact candidates without installing a parallel home", async () => {
@@ -1826,7 +1874,7 @@ it("owned Codex transport keeps an exact Sol predecessor after successor arrival
 			{ kind: "main", preference: "opus" },
 			accounts,
 			status.conversations[0],
-		).map((candidate) => candidate.target.physicalModel),
+		).candidates.map((candidate) => candidate.target.physicalModel),
 	).toEqual(["gpt-5.6-sol"]);
 	await service.retryPreferred({
 		session: scope,
@@ -1850,4 +1898,329 @@ it("ambiguous send failure never replays against a second account", async () => 
 	await flush();
 	expect(sends).toHaveLength(1);
 	expect(await home()).toBeUndefined();
+});
+
+it.each([
+	"invalid",
+	"manual",
+	"legacy",
+	"reverse-native",
+])("provisional ingress isolates accepted capacity: %s", async (mode) => {
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db), { maxSessions: 1 }),
+	);
+	ctx.qualityRouteService = service;
+	if (mode === "invalid") {
+		const bad = new Request("https://proxy.invalid/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-claude-code-session-id": "rejected",
+			},
+			body: "{}",
+		});
+		expect((await send(bad, "other-principal")).status).toBe(400);
+		const good = await send();
+		expect(good.status).toBe(200);
+		await good.text();
+		expect(sends).toHaveLength(1);
+	} else if (mode === "manual" || mode === "legacy") {
+		await (await send()).text();
+		await flush();
+		const before = await service.status(scope);
+		if (mode === "legacy")
+			ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry([
+				{
+					id: "existing",
+					publicModelId: "claude-bccf-route-existing",
+					discoveryModelId: "claude-bccf-route-existing",
+					displayName: "Existing",
+					accountId: "a",
+					logicalModel: "claude-opus-5-5",
+				},
+			]);
+		const manual = await send(
+			request(
+				mode === "legacy" ? "claude-bccf-route-existing" : "claude-opus-5-5",
+				{
+					"x-claude-code-session-id": "fresh-manual",
+				},
+			),
+		);
+		expect(manual.status).toBe(200);
+		await manual.text();
+		expect(sends).toHaveLength(2);
+		expect((await service.status(scope))?.conversations).toEqual(
+			before?.conversations,
+		);
+	} else {
+		let release = () => {};
+		const delayed = new Request("https://proxy.invalid/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-claude-code-session-id": scope.sessionId,
+			},
+			body: new ReadableStream({
+				start(controller) {
+					release = () => {
+						controller.enqueue(
+							new TextEncoder().encode(
+								JSON.stringify({
+									model: "claude-opus-5-5",
+									messages: [{ role: "user", content: "old" }],
+									max_tokens: 20,
+								}),
+							),
+						);
+						controller.close();
+					};
+				},
+			}),
+			duplex: "half",
+		} as RequestInit);
+		const pending = send(delayed);
+		await flush();
+		const newer = await send(request("claude-opus-5-5"));
+		expect(newer.status).toBe(200);
+		await newer.text();
+		release();
+		const older = await pending;
+		expect(older.status).toBe(200);
+		await older.text();
+		expect(sends).toHaveLength(2);
+	}
+});
+
+it("exhausted standard worker never escalates to a healthy flagship", async () => {
+	await (await send()).text();
+	await flush();
+	for (const a of accounts)
+		usageCache.set(a.id, {
+			limits: [
+				{ kind: "weekly_all", percent: 10, resets_at: Date.now() + 60000 },
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: Date.now() + 60000,
+					scope: { model: { display_name: "Sonnet" } },
+				},
+			],
+			spend: { enabled: false },
+		} as never);
+	const worker = await send(
+		request("claude-sonnet-5-5", {
+			"x-better-ccflare-agent-id": "exhausted-worker",
+			"x-claude-code-agent-id": "exhausted-worker",
+		}),
+	);
+	expect(worker.status).toBe(503);
+	expect(sends).toHaveLength(1);
+	expect((await home())?.physicalModel).toBe("claude-fable-5-1");
+});
+
+it.each([
+	"missing",
+	"stale",
+	"unsupported",
+])("catalog compilation preserves %s reasons in fallback and zero-send history", async (mode) => {
+	const transport = globalThis.fetch;
+	resetModelCatalogForTest();
+	if (mode !== "missing") {
+		globalThis.fetch = Object.assign(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const req = input instanceof Request ? input : new Request(input, init);
+				if (req.method === "GET")
+					return Response.json({
+						data: [
+							{
+								id: "claude-opus-5-5",
+								max_input_tokens: 100000,
+								max_tokens: 1000,
+								input_modalities: ["text"],
+							},
+						],
+						has_more: false,
+					});
+				return transport(input, init);
+			},
+			{ preconnect: () => {} },
+		) as typeof fetch;
+		if (mode === "stale") {
+			const clock = spyOn(Date, "now").mockReturnValue(
+				Date.now() - 8 * 86_400_000,
+			);
+			try {
+				for (const a of accounts)
+					await fetchLiveModels(ctx, { allowOAuth: true, accountId: a.id });
+			} finally {
+				clock.mockRestore();
+			}
+		} else
+			for (const a of accounts)
+				await fetchLiveModels(ctx, { allowOAuth: true, accountId: a.id });
+	}
+	await withRealQualityHistory(async (operations, collector) => {
+		const response = await send();
+		expect(response.status).toBe(mode === "unsupported" ? 200 : 503);
+		await response.text();
+		await flush();
+		await collector.drain();
+		const history = await (
+			await createRequestsSummaryHandler(operations.getAdapter())()
+		).json();
+		expect(history).toHaveLength(1);
+		const reason =
+			mode === "unsupported"
+				? "model-unsupported"
+				: mode === "missing"
+					? "evidence-missing"
+					: "catalog-evidence-stale";
+		expect(history[0].qualityDecision.skippedLanes).toEqual(
+			mode === "unsupported"
+				? [{ lane: "fable", reasons: { [reason]: 2 } }]
+				: [
+						{ lane: "fable", reasons: { [reason]: 2 } },
+						{ lane: "opus", reasons: { [reason]: 2 } },
+					],
+		);
+		const state = await service.status(scope);
+		expect(state?.conversations[0]?.decision?.requestId).toBe(history[0].id);
+		expect(state?.conversations[0]?.decision?.value).toEqual(
+			history[0].qualityDecision,
+		);
+		expect(sends).toHaveLength(mode === "unsupported" ? 1 : 0);
+	});
+});
+
+it.each([
+	"invalid-body",
+	"unknown-profile",
+	"unknown-quality",
+])("rejected newer %s leaves accepted quality intent unchanged", async (mode) => {
+	await (await send()).text();
+	await flush();
+	const before = await service.status(scope);
+	const invalid =
+		mode === "invalid-body"
+			? request("claude-opus-5-5", {}, { messages: null })
+			: request(
+					mode === "unknown-profile"
+						? "claude-bccf-route-missing"
+						: "claude-bccf-quality-missing",
+				);
+	expect((await send(invalid)).status).toBe(
+		mode === "unknown-profile" ? 503 : 400,
+	);
+	const after = await service.status(scope);
+	expect(after).toEqual(before);
+	expect(sends).toHaveLength(1);
+});
+
+it("provisional saturation cannot block a new manual request, but storage failure cannot withdraw active intent", async () => {
+	service = new QualityRouteService(
+		new QualityRouteRepository(new BunSqlAdapter(db), {
+			maxSessions: 1,
+			maxProvisionalSessions: 1,
+		}),
+	);
+	ctx.qualityRouteService = service;
+	const abandoned = await service.reserveIngress({
+		...scope,
+		sessionId: "pending",
+	});
+	const manual = await send(request("claude-opus-5-5"));
+	expect(manual.status).toBe(200);
+	await manual.text();
+	await service.withdrawIngress(abandoned);
+	await (await send()).text();
+	await flush();
+	const before = await service.status(scope);
+	const fail = spyOn(service, "acceptRoot").mockRejectedValue(
+		new Error("synthetic storage failure"),
+	);
+	try {
+		expect((await send(request("claude-opus-5-5"))).status).toBe(503);
+	} finally {
+		fail.mockRestore();
+	}
+	expect(await service.status(scope)).toEqual(before);
+	expect(sends).toHaveLength(2);
+});
+
+it("all three missing lanes persist once per account-line even for stored and current targets", async () => {
+	const base = ctx.config.getQualityRoutingPolicy();
+	if (!base) throw new Error("missing policy fixture");
+	accounts.push({ ...account("c"), provider: "codex" });
+	const policy = compileQualityRoutingPolicy({
+		version: base.version,
+		assignments: [
+			...base.assignments,
+			{
+				line: "gpt-astra",
+				lane: "astra",
+				priority: 0,
+				upgrade: "same-line-supported",
+			},
+		],
+		accounts: [
+			...base.accounts,
+			{ accountId: "c", provider: "codex", lines: ["gpt-astra"], priority: 0 },
+		],
+		fallbacks: base.fallbacks,
+		spendGrants: [],
+	});
+	ctx.config.getQualityRoutingPolicy = () => policy;
+	await withRealQualityHistory(async (operations, collector) => {
+		await (await send()).text();
+		await flush();
+		resetModelCatalogForTest();
+		const state = await service.status(scope);
+		const compiled = compileQualityCandidates(
+			policy,
+			{ kind: "main", preference: "auto" },
+			accounts,
+			state?.conversations[0],
+		);
+		const expected = [
+			{ lane: "fable", reasons: { "evidence-missing": 2 } },
+			{ lane: "astra", reasons: { "evidence-missing": 1 } },
+			{ lane: "opus", reasons: { "evidence-missing": 2 } },
+		];
+		expect(compiled.candidates).toEqual([]);
+		expect(compiled.skippedLanes).toEqual(expected);
+		expect(() =>
+			compileQualityCandidates(
+				{
+					...policy,
+					mainLadders: {
+						...policy.mainLadders,
+						auto: ["fable", "astra", "opus", "standard"],
+					},
+				} as never,
+				{ kind: "main", preference: "auto" },
+				accounts,
+			),
+		).toThrow("Invalid quality lane ladder");
+		const response = await send();
+		expect(response.status).toBe(503);
+		await response.text();
+		await flush();
+		await collector.drain();
+		const history = await (
+			await createRequestsSummaryHandler(operations.getAdapter())()
+		).json();
+		expect(history).toHaveLength(2);
+		const rejection = history.find(
+			(row: { statusCode: number }) => row.statusCode === 503,
+		);
+		expect(rejection.qualityDecision.skippedLanes).toEqual(expected);
+		expect(
+			(await service.status(scope))?.conversations[0]?.decision,
+		).toMatchObject({
+			requestId: rejection.id,
+			value: { skippedLanes: expected },
+		});
+		expect(sends).toHaveLength(1);
+	});
 });

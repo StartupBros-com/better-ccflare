@@ -4872,6 +4872,8 @@ export async function proxyWithAccount(
 			candidateResponse: Response,
 		): Promise<boolean> => {
 			if (
+				// Quality attempts own terminal completion and never replay this rejection.
+				modelFallbackPolicy?.qualityAttempt !== undefined ||
 				attemptPlan.providerName !== "codex" ||
 				account.provider !== "codex" ||
 				getCurrentCodexWebSocketReceipt()?.frameWritten === true

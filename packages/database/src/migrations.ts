@@ -328,8 +328,29 @@ function ensureQualityRouteSchema(db: Database): void {
   version INTEGER NOT NULL CHECK (version >= 0), state_json TEXT NOT NULL,
   expires_at INTEGER NOT NULL, lease_until INTEGER NOT NULL DEFAULT 0,
   unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0, 1)),
+  enrolled INTEGER NOT NULL DEFAULT 1, ingress_until INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (principal_id, session_id)
  )`);
+	const columns = db
+		.query<{ name: string }, []>("PRAGMA table_info(quality_route_sessions)")
+		.all();
+	if (!columns.some((column) => column.name === "enrolled")) {
+		db.run(
+			"ALTER TABLE quality_route_sessions ADD COLUMN enrolled INTEGER NOT NULL DEFAULT 1",
+		);
+		// Legacy unaccepted rows have no homes, leases or usable tickets after restart.
+		db.run(
+			"UPDATE quality_route_sessions SET enrolled = 0, expires_at = 0 WHERE json_extract(state_json, '$.root') IS NULL AND json_array_length(state_json, '$.leases') = 0 AND json_array_length(state_json, '$.conversations') = 0",
+		);
+	}
+	if (!columns.some((column) => column.name === "ingress_until"))
+		db.run(
+			"ALTER TABLE quality_route_sessions ADD COLUMN ingress_until INTEGER NOT NULL DEFAULT 0",
+		);
+	db.run(
+		"CREATE INDEX IF NOT EXISTS idx_quality_route_enrolled ON quality_route_sessions(enrolled)",
+	);
+
 	db.run(
 		`CREATE INDEX IF NOT EXISTS idx_quality_route_expiry ON quality_route_sessions(unresolved, expires_at, lease_until)`,
 	);

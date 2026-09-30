@@ -17,6 +17,7 @@ import { ensureSchemaPg, runMigrationsPg } from "../migrations-pg";
 import { ApiKeyRepository } from "../repositories/api-key.repository";
 import { QualityRouteRepository } from "../repositories/quality-route.repository";
 import { RequestRepository } from "../repositories/request.repository";
+import { qualityIngressContract } from "./quality-route-lifecycle.contract";
 
 // Deliberately never consumes an ambient production DATABASE_URL.
 const configuredUrl = process.env.BETTER_CCFLARE_TEST_POSTGRES_URL;
@@ -94,6 +95,66 @@ describe.skipIf(!postgresUrl)(
 					if (admin) await admin.end();
 				}
 			}
+		});
+
+		qualityIngressContract((limits) => [
+			new QualityRouteRepository(adapters[0], limits),
+			new QualityRouteRepository(adapters[1], limits),
+		]);
+
+		it("upgrade separates legacy provisional rows without deleting live homes or fences", async () => {
+			const adapter = adapters[0];
+			const ticket = await first.reserveIngress(scope, 100);
+			await first.acceptRoot(ticket, "auto", 101);
+			const lease = await first.acquireLease(
+				scope,
+				ticket.incarnation,
+				"$root",
+				1,
+				102,
+			);
+			await first.beginDispatch(lease, target, null, 103);
+			const before = await first.status(scope, 104);
+			await adapter.run(
+				"INSERT INTO quality_route_sessions (principal_id, session_id, incarnation, version, state_json, expires_at) VALUES (?, ?, ?, 0, ?, ?)",
+				[
+					"bad",
+					"body",
+					"legacy",
+					JSON.stringify({
+						incarnation: "legacy",
+						nextOrder: 1,
+						acceptedOrder: 0,
+						expiresAt: 86400100,
+						root: null,
+						conversations: [],
+						leases: [],
+						commands: [],
+					}),
+					86400100,
+				],
+			);
+			await adapter.unsafe("DROP INDEX idx_quality_route_enrolled");
+			await adapter.unsafe(
+				"ALTER TABLE quality_route_sessions DROP COLUMN enrolled",
+			);
+			await adapter.unsafe(
+				"ALTER TABLE quality_route_sessions DROP COLUMN ingress_until",
+			);
+			await runMigrationsPg(adapters[0]);
+			await runMigrationsPg(adapters[0]);
+			expect(await second.status(scope, 104)).toEqual(before);
+			expect(await second.cleanup(105)).toBe(1);
+			expect(await second.status(scope, 106)).toEqual(before);
+			const columns = await adapter.get<{
+				enrolled: number;
+				ingress_until: number | string;
+			}>(
+				"SELECT enrolled, ingress_until FROM quality_route_sessions WHERE principal_id = ? AND session_id = ?",
+				[scope.principalId, scope.sessionId],
+			);
+			expect(Number(columns?.enrolled)).toBe(1);
+			expect(Number(columns?.ingress_until)).toBe(0);
 		});
 
 		it("authenticated HTTP exposes durable provenance after reconstruction and fences retry duplicates", async () => {
@@ -297,8 +358,12 @@ describe.skipIf(!postgresUrl)(
 			first = new QualityRouteRepository(adapters[0], { maxSessions: 1 });
 			second = new QualityRouteRepository(adapters[1], { maxSessions: 1 });
 			const outcomes = await Promise.allSettled([
-				first.reserveIngress(scope, 100),
-				second.reserveIngress({ ...scope, sessionId: "other" }, 100),
+				first
+					.reserveIngress(scope, 100)
+					.then((ticket) => first.acceptRoot(ticket, "auto", 100)),
+				second
+					.reserveIngress({ ...scope, sessionId: "other" }, 100)
+					.then((ticket) => second.acceptRoot(ticket, "auto", 100)),
 			]);
 			expect(
 				outcomes.filter((result) => result.status === "fulfilled"),
@@ -308,7 +373,7 @@ describe.skipIf(!postgresUrl)(
 				throw new Error("Expected capacity rejection");
 			expect(rejection.reason).toMatchObject({ code: "capacity" });
 			const count = await adapters[0].get<{ count: string | number }>(
-				"SELECT COUNT(*) AS count FROM quality_route_sessions",
+				"SELECT COUNT(*) AS count FROM quality_route_sessions WHERE enrolled = 1",
 			);
 			expect(Number(count?.count)).toBe(1);
 		});
@@ -478,6 +543,9 @@ describe.skipIf(!postgresUrl)(
 			const ticket = await first.reserveIngress(scope, 100);
 			await first.acceptRoot(ticket, "auto", 100);
 			const next = await second.reserveIngress(scope, 101);
+			// Finish the body reservation before testing idle cleanup, otherwise the
+			// new ingress deadline correctly protects this row before DELETE can wait.
+			await second.withdrawIngress(next, 102);
 			// Hold the row lock while DELETE starts with the old expired snapshot.
 			if (!postgresUrl) throw new Error("Missing disposable PG URL");
 			const writer = new SQL({

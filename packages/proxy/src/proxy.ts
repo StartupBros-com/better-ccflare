@@ -643,6 +643,7 @@ import { captureAutoRequestRequirements } from "@better-ccflare/providers";
 import {
 	reserveQualityIngress,
 	routeQualityRequest,
+	withdrawQualityIngress,
 } from "./quality-route-candidates";
 
 async function handleProxyImpl(
@@ -753,6 +754,7 @@ async function handleProxyImpl(
 			rootIntentInput,
 			rootIntentGeneration,
 		);
+		await withdrawQualityIngress(req, ctx);
 	}
 }
 

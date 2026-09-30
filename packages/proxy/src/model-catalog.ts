@@ -137,9 +137,13 @@ export function validateNativeAutoCatalogCredentials(
  */
 export function getNativeAutoCatalogEvidence(
 	accountId: string,
+	/** Diagnostic compilation only; admission still checks freshness. */
+	includeStale = false,
 ): AutoCatalogEvidence | null {
 	const evidence = nativeOwnEvidence.get(accountId) ?? null;
-	return isAutoCatalogEvidenceCurrent(evidence) ? evidence : null;
+	return includeStale || isAutoCatalogEvidenceCurrent(evidence)
+		? evidence
+		: null;
 }
 
 /** Integrators must call on account deletion/replacement, before reusing its ID. */

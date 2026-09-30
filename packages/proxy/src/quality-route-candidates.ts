@@ -6,6 +6,7 @@ import type {
 	QualityReplacementAuthority,
 	QualitySettlement,
 } from "@better-ccflare/database";
+import { QualityRouteError } from "@better-ccflare/database";
 import {
 	type AutoModelTargetEvidence,
 	type AutoRequestRequirements,
@@ -96,6 +97,22 @@ export function reserveQualityIngress(
 	ingress.set(req, pending);
 	void pending.catch(() => {});
 }
+/** Every body rejection/throw/completed acceptance releases only its own reservation.
+ * Failed persistence remains bounded by the provisional TTL, never by session TTL. */
+export async function withdrawQualityIngress(
+	req: Request,
+	ctx: ProxyContext,
+): Promise<void> {
+	const pending = ingress.get(req);
+	ingress.delete(req);
+	if (!pending || !ctx.qualityRouteService) return;
+	try {
+		const ticket = await pending;
+		if (ticket) await ctx.qualityRouteService.withdrawIngress(ticket);
+	} catch {
+		/* Failed reservations have no token; storage failures expire bounded ingress. */
+	}
+}
 export class QualityAttemptRejected extends Error {
 	constructor(readonly reason: string) {
 		super(`Quality routing: ${reason}`);
@@ -119,11 +136,11 @@ export interface QualityRouteCandidate {
 	readonly evidence: AutoModelTargetEvidence;
 	readonly policyRevision: QualityRoutingPolicy["revision"];
 }
-function catalogFor(accountId: string, provider: string) {
+function catalogFor(accountId: string, provider: string, includeStale = false) {
 	return provider === "anthropic"
-		? getNativeAutoCatalogEvidence(accountId)
+		? getNativeAutoCatalogEvidence(accountId, includeStale)
 		: provider === "codex"
-			? getCodexAutoCatalogEvidence(accountId)
+			? getCodexAutoCatalogEvidence(accountId, includeStale)
 			: null;
 }
 /** One immutable exact-account/model authority. Distinct models on the same account
@@ -133,12 +150,22 @@ export function compileQualityCandidates(
 	intent: QualityRequestIntent,
 	accounts: readonly Account[],
 	conversation?: QualityConversation | null,
-): readonly QualityRouteCandidate[] {
+): Readonly<{
+	candidates: readonly QualityRouteCandidate[];
+	skippedLanes: QualitySkippedLanes;
+}> {
 	const lanes =
 		intent.kind === "main"
 			? policy.mainLadders[intent.preference]
 			: policy.workerLanes[intent.role];
+	if (lanes.length > 3 || new Set(lanes).size !== lanes.length)
+		throw new TypeError("Invalid quality lane ladder");
 	const candidates: QualityRouteCandidate[] = [];
+	const rejected = new Map<
+		QualityLane,
+		Partial<Record<QualityAdmissionReason, number>>
+	>();
+	const seenRejections = new Set<string>();
 	const append = (
 		account: Account,
 		line: QualityPhysicalTarget["line"],
@@ -165,7 +192,24 @@ export function compileQualityCandidates(
 						previous.physicalModel,
 					).stored
 				: resolved.current;
-		if (!evidence) return;
+		if (!evidence) {
+			const catalog = catalogFor(account.id, account.provider, true);
+			const reason: QualityAdmissionReason = !catalog
+				? "evidence-missing"
+				: !isAutoCatalogEvidenceCurrent(catalog)
+					? "catalog-evidence-stale"
+					: "model-unsupported";
+			// A stored predecessor and current target must not double-count one
+			// account/line evidence failure. Only bounded enums and counts survive.
+			const key = JSON.stringify([account.id, line, reason]);
+			if (!seenRejections.has(key)) {
+				seenRejections.add(key);
+				const reasons = rejected.get(lane) ?? {};
+				reasons[reason] = Math.min(1_000_000, (reasons[reason] ?? 0) + 1);
+				rejected.set(lane, reasons);
+			}
+			return;
+		}
 		const id = JSON.stringify([account.id, evidence.physicalModel, line]);
 		if (candidates.some((c) => c.id === id)) return;
 		const target = Object.freeze({
@@ -225,7 +269,17 @@ export function compileQualityCandidates(
 				);
 			for (const { account } of enrolled) append(account, line, lane);
 		}
-	return Object.freeze(candidates);
+	return Object.freeze({
+		candidates: Object.freeze(candidates),
+		skippedLanes: Object.freeze(
+			lanes.flatMap((lane) => {
+				const reasons = rejected.get(lane);
+				return reasons
+					? [Object.freeze({ lane, reasons: Object.freeze(reasons) })]
+					: [];
+			}),
+		) as QualitySkippedLanes,
+	});
 }
 function unavailable(reason: string, status = 503): Response {
 	return Response.json(
@@ -388,9 +442,18 @@ export async function routeQualityRequest(input: {
 				return null;
 			// Ordinary explicit root intent leaves Auto, but children never mutate roots.
 			if (!descendant && model) {
-				const ticket = await ingress.get(req);
-				if (!ticket) return unavailable("ingress-unavailable");
-				await service.acceptRoot(ticket, null);
+				try {
+					const ticket = await ingress.get(req);
+					if (!ticket) return unavailable("ingress-unavailable");
+					await service.acceptRoot(ticket, null);
+				} catch (error) {
+					if (!(error instanceof QualityRouteError)) throw error;
+					const code = error.code;
+					// Stale native requests still infer, but never mutate newer intent.
+					// Only a refused *new* provisional row is unrelated to live state.
+					if (code !== "stale" && !(code === "provisional-capacity" && !status))
+						throw error;
+				}
 			}
 			return null;
 		}
@@ -435,12 +498,17 @@ export async function routeQualityRequest(input: {
 		const requirements =
 			input.requirements ?? captureAutoRequestRequirements(input.originalBody);
 		const accounts = await ctx.dbOps.getAllAccounts();
-		const candidates = compileQualityCandidates(
+		const compilation = compileQualityCandidates(
 			policy,
 			intent,
 			accounts,
 			conversation,
 		);
+		const { candidates } = compilation;
+		const lanes =
+			intent.kind === "main"
+				? policy.mainLadders[intent.preference]
+				: policy.workerLanes[intent.role];
 		// The existing strategy retains eligibility and circuit veto authority, but
 		// may neither reorder this quality ladder nor install a speculative home.
 		meta.affinityLaneKey = opaqueRuntimeId(
@@ -488,20 +556,36 @@ export async function routeQualityRequest(input: {
 			Partial<Record<QualityAdmissionReason, number>>
 		>();
 		let lastAdmissionReason: QualityAdmissionReason = "lane-unavailable";
-		const recordSkip = (lane: QualityLane, reason: QualityAdmissionReason) => {
+		const attemptedLanes = new Set<QualityLane>();
+		const summaries = (through?: QualityLane): QualitySkippedLanes =>
+			lanes
+				.filter(
+					(lane, index) =>
+						through === undefined ||
+						attemptedLanes.has(lane) ||
+						index <= lanes.indexOf(through),
+				)
+				.flatMap((lane) => {
+					const reasons = skipped.get(lane);
+					return reasons ? [{ lane, reasons: { ...reasons } }] : [];
+				}) as unknown as QualitySkippedLanes;
+		const recordSkip = (
+			lane: QualityLane,
+			reason: QualityAdmissionReason,
+			count = 1,
+			compilationOnly = false,
+		) => {
+			if (!compilationOnly) attemptedLanes.add(lane);
 			lastAdmissionReason = reason;
 			const reasons = skipped.get(lane) ?? {};
-			reasons[reason] = (reasons[reason] ?? 0) + 1;
+			reasons[reason] = Math.min(1_000_000, (reasons[reason] ?? 0) + count);
 			skipped.set(lane, reasons);
 			meta.qualityDecision = {
 				version: 1,
 				policyRevision: policy.revision,
 				requested: intent,
 				selected: null,
-				skippedLanes: [...skipped].slice(0, 3).map(([lane, reasons]) => ({
-					lane,
-					reasons: { ...reasons },
-				})) as unknown as QualitySkippedLanes,
+				skippedLanes: summaries(),
 			};
 		};
 		meta.originalModel = model;
@@ -512,6 +596,10 @@ export async function routeQualityRequest(input: {
 			selected: null,
 			skippedLanes: [],
 		};
+		for (const summary of compilation.skippedLanes)
+			for (const [reason, count] of Object.entries(summary.reasons))
+				recordSkip(summary.lane, reason as QualityAdmissionReason, count, true);
+
 		const ledger = new RoutingAttemptLedger();
 		const serverTools = body.finalizeServerToolRequirements();
 		if (serverTools) {
@@ -708,7 +796,7 @@ export async function routeQualityRequest(input: {
 						policyRevision: candidate.policyRevision,
 						requested: intent,
 						selected: candidate.target,
-						skippedLanes: meta.qualityDecision?.skippedLanes ?? [],
+						skippedLanes: summaries(candidate.target.lane),
 					};
 					meta.qualityAccounting = accounting;
 					attemptDecision = sanitizeQualityDecision({

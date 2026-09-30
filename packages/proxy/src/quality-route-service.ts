@@ -55,6 +55,9 @@ export class QualityRouteService {
 	reserveIngress(session: QualityVerifiedSession) {
 		return this.repository.reserveIngress(session, this.now());
 	}
+	withdrawIngress(ticket: QualityIngressTicket) {
+		return this.repository.withdrawIngress(ticket, this.now());
+	}
 	acceptRoot(
 		ticket: QualityIngressTicket,
 		preference: QualityRootPreference | null,

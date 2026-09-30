@@ -231,8 +231,27 @@ async function ensureQualityRouteSchemaPg(
   version BIGINT NOT NULL CHECK (version >= 0), state_json TEXT NOT NULL,
   expires_at BIGINT NOT NULL, lease_until BIGINT NOT NULL DEFAULT 0,
   unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0, 1)),
+  enrolled INTEGER NOT NULL DEFAULT 1, ingress_until BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (principal_id, session_id)
  )`);
+	const columns = await adapter.query<{ column_name: string }>(
+		"SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'quality_route_sessions'",
+	);
+	if (!columns.some((column) => column.column_name === "enrolled")) {
+		await adapter.unsafe(
+			"ALTER TABLE quality_route_sessions ADD COLUMN enrolled INTEGER NOT NULL DEFAULT 1",
+		);
+		await adapter.unsafe(
+			"UPDATE quality_route_sessions SET enrolled = 0, expires_at = 0 WHERE state_json::jsonb->>'root' IS NULL AND jsonb_array_length(state_json::jsonb->'leases') = 0 AND jsonb_array_length(state_json::jsonb->'conversations') = 0",
+		);
+	}
+	await adapter.unsafe(
+		"ALTER TABLE quality_route_sessions ADD COLUMN IF NOT EXISTS ingress_until BIGINT NOT NULL DEFAULT 0",
+	);
+	await adapter.unsafe(
+		"CREATE INDEX IF NOT EXISTS idx_quality_route_enrolled ON quality_route_sessions(enrolled)",
+	);
+
 	await adapter.unsafe(
 		`CREATE INDEX IF NOT EXISTS idx_quality_route_expiry ON quality_route_sessions(unresolved, expires_at, lease_until)`,
 	);

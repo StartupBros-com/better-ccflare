@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { QualityVerifiedSession } from "@better-ccflare/types";
+import { qualityIngressContract } from "../../__tests__/quality-route-lifecycle.contract";
 import { BunSqlAdapter } from "../../adapters/bun-sql-adapter";
 import { ensureSchema, runMigrations } from "../../migrations";
 import { QualityRouteRepository } from "../quality-route.repository";
@@ -41,6 +42,66 @@ describe("durable quality routing", () => {
 		for (const db of connections) db.close();
 		rmSync(directory, { recursive: true });
 	});
+	qualityIngressContract((limits) => [
+		new QualityRouteRepository(new BunSqlAdapter(connections[0]), limits),
+		new QualityRouteRepository(new BunSqlAdapter(connections[1]), limits),
+	]);
+
+	it("upgrade separates legacy provisional rows without deleting live homes or fences", async () => {
+		const adapter = new BunSqlAdapter(connections[0]);
+		const ticket = await first.reserveIngress(scope, 100);
+		await first.acceptRoot(ticket, "auto", 101);
+		const lease = await first.acquireLease(
+			scope,
+			ticket.incarnation,
+			"$root",
+			1,
+			102,
+		);
+		await first.beginDispatch(lease, target, null, 103);
+		const before = await first.status(scope, 104);
+		await adapter.run(
+			"INSERT INTO quality_route_sessions (principal_id, session_id, incarnation, version, state_json, expires_at) VALUES (?, ?, ?, 0, ?, ?)",
+			[
+				"bad",
+				"body",
+				"legacy",
+				JSON.stringify({
+					incarnation: "legacy",
+					nextOrder: 1,
+					acceptedOrder: 0,
+					expiresAt: 86400100,
+					root: null,
+					conversations: [],
+					leases: [],
+					commands: [],
+				}),
+				86400100,
+			],
+		);
+		await adapter.unsafe("DROP INDEX idx_quality_route_enrolled");
+		await adapter.unsafe(
+			"ALTER TABLE quality_route_sessions DROP COLUMN enrolled",
+		);
+		await adapter.unsafe(
+			"ALTER TABLE quality_route_sessions DROP COLUMN ingress_until",
+		);
+		runMigrations(connections[0]);
+		runMigrations(connections[0]);
+		expect(await second.status(scope, 104)).toEqual(before);
+		expect(await second.cleanup(105)).toBe(1);
+		expect(await second.status(scope, 106)).toEqual(before);
+		const columns = await adapter.get<{
+			enrolled: number;
+			ingress_until: number | string;
+		}>(
+			"SELECT enrolled, ingress_until FROM quality_route_sessions WHERE principal_id = ? AND session_id = ?",
+			[scope.principalId, scope.sessionId],
+		);
+		expect(Number(columns?.enrolled)).toBe(1);
+		expect(Number(columns?.ingress_until)).toBe(0);
+	});
+
 	it("diagnostics cannot extend expiry, cross principals, or overwrite retry intent", async () => {
 		const ticket = await first.reserveIngress(scope, 100);
 		await first.acceptRoot(ticket, "auto", 100);
@@ -433,8 +494,12 @@ describe("durable quality routing", () => {
 			maxSessions: 1,
 		});
 		const results = await Promise.allSettled([
-			first.reserveIngress(scope, 100),
-			second.reserveIngress({ ...scope, sessionId: "other" }, 100),
+			first
+				.reserveIngress(scope, 100)
+				.then((ticket) => first.acceptRoot(ticket, "auto", 100)),
+			second
+				.reserveIngress({ ...scope, sessionId: "other" }, 100)
+				.then((ticket) => second.acceptRoot(ticket, "auto", 100)),
 		]);
 		expect(
 			results.filter((result) => result.status === "fulfilled"),
@@ -519,7 +584,9 @@ describe("durable quality routing", () => {
 		const ticket = await first.reserveIngress(scope, 1000);
 		await first.acceptRoot(ticket, "auto", 1001);
 		await expect(
-			first.reserveIngress({ ...scope, sessionId: "extra" }, 1002),
+			first
+				.reserveIngress({ ...scope, sessionId: "extra" }, 1002)
+				.then((ticket) => first.acceptRoot(ticket, "auto", 1002)),
 		).rejects.toMatchObject({ code: "capacity" });
 		const input = {
 			session: scope,
