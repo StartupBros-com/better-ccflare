@@ -52,7 +52,8 @@ export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 // without changing cache denominators. Schema 21 adds the subscription-backend
 // affinity header receipts (session-id source, routing hint) so a cache-read
 // regression can be split by whether the wire carried them.
-const TRACE_SCHEMA_VERSION = 21;
+// Schema 22 adds content-free per-attempt stream diagnostics.
+const TRACE_SCHEMA_VERSION = 22;
 const DEFAULT_FANOUT_WARN = 8;
 const TURN_STATE_COHORT_PATTERN = /^[0-9a-f]{16}$/;
 // Derived from the canonical vocabularies so a new category cannot be emitted
@@ -362,7 +363,70 @@ interface TraceInputs {
 	codexRequest?: unknown;
 }
 
+/** Fixed vocabulary only: no upstream-controlled event names or content. */
+export const CODEX_STREAM_EVENT_CATEGORIES = [
+	"created",
+	"in_progress",
+	"encrypted_reasoning_done",
+	"visible_summary_delta",
+	"output_text_delta",
+	"function_call_added",
+	"argument_delta",
+	"function_call_done",
+	"completed",
+	"incomplete",
+	"failed",
+	"error",
+	"other",
+	"malformed_frame",
+	"ignored_frame",
+] as const;
+export type CodexStreamEventCategory =
+	(typeof CODEX_STREAM_EVENT_CATEGORIES)[number];
+export interface CodexStreamDiagnostics {
+	event_counts: Record<CodexStreamEventCategory, number>;
+	raw_bytes: number;
+	argument_delta_bytes: number;
+	pending_tool_bytes: number;
+	peak_pending_tool_bytes: number;
+	pending_reasoning_bytes: number;
+	peak_pending_reasoning_bytes: number;
+	pending_reasoning_count: number;
+	peak_pending_reasoning_count: number;
+	last_raw_event_age_ms: number | null;
+	last_visible_event_age_ms: number | null;
+	last_argument_event_age_ms: number | null;
+}
+
+/** Runtime allowlist as well as a type: never serialize arbitrary extra properties. */
+function safeStreamDiagnostics(
+	d: CodexStreamDiagnostics,
+): CodexStreamDiagnostics {
+	const count = (n: number) =>
+		Number.isFinite(n)
+			? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(n)))
+			: 0;
+	const age = (n: number | null) => (n === null ? null : count(n));
+	return {
+		event_counts: Object.fromEntries(
+			CODEX_STREAM_EVENT_CATEGORIES.map((k) => [k, count(d.event_counts[k])]),
+		) as Record<CodexStreamEventCategory, number>,
+		raw_bytes: count(d.raw_bytes),
+		argument_delta_bytes: count(d.argument_delta_bytes),
+		pending_tool_bytes: count(d.pending_tool_bytes),
+		peak_pending_tool_bytes: count(d.peak_pending_tool_bytes),
+		pending_reasoning_bytes: count(d.pending_reasoning_bytes),
+		peak_pending_reasoning_bytes: count(d.peak_pending_reasoning_bytes),
+		pending_reasoning_count: count(d.pending_reasoning_count),
+		peak_pending_reasoning_count: count(d.peak_pending_reasoning_count),
+		last_raw_event_age_ms: age(d.last_raw_event_age_ms),
+		last_visible_event_age_ms: age(d.last_visible_event_age_ms),
+		last_argument_event_age_ms: age(d.last_argument_event_age_ms),
+	};
+}
+
 interface ResponseTraceInputs {
+	streamDiagnostics?: CodexStreamDiagnostics;
 	requestId?: string;
 	attemptId?: string;
 	modelOut?: string;
@@ -622,6 +686,9 @@ export function writeCodexResponseTrace(inputs: ResponseTraceInputs): void {
 					)
 				: null,
 		...inputs.summary,
+		...(inputs.streamDiagnostics
+			? { stream_diagnostics: safeStreamDiagnostics(inputs.streamDiagnostics) }
+			: {}),
 	});
 }
 

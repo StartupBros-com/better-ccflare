@@ -7523,6 +7523,10 @@ export async function proxyWithAccount(
 							bufferedBytes: error.bufferedBytes,
 							framesSeen: error.framesSeen,
 							validProtocolFramesSeen: error.validProtocolFramesSeen,
+							frameKindCounts: error.frameKindCounts,
+							lastValidProtocolActivityAgeMs:
+								error.lastValidProtocolActivityAgeMs,
+							terminalEvidenceSeen: error.terminalEvidenceSeen,
 							commitmentDeadlineAt: semanticCommitmentDeadlineAt ?? null,
 							transportCommitmentDeadlineAt:
 								attemptCommitmentDeadlineAt ?? null,

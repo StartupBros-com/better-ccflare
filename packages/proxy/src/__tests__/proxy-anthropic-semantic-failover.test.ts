@@ -9,6 +9,7 @@ import {
 } from "bun:test";
 import { ANTHROPIC_DEGRADED_MODE_DEFAULTS } from "@better-ccflare/config";
 import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
+import { logBus } from "@better-ccflare/logger";
 import type {
 	Account,
 	ComboWithSlots,
@@ -990,7 +991,20 @@ function makeAuthorizedCodexRequest(
 	});
 }
 
+const precommitDiagnostics: Array<{ msg: string; data?: unknown }> = [];
+const capturePrecommitDiagnostics = (event: {
+	msg: string;
+	data?: unknown;
+}) => {
+	if (
+		event.msg === "codex_precommit_cache_lane_rescue" ||
+		event.msg === "codex_precommit_sse_retry"
+	)
+		precommitDiagnostics.push(event);
+};
 beforeEach(() => {
+	precommitDiagnostics.length = 0;
+	logBus.on("log", capturePrecommitDiagnostics);
 	resetCachePacing();
 	process.env[TIMEOUT_ENV] = "20";
 	delete process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV];
@@ -1016,6 +1030,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	logBus.off("log", capturePrecommitDiagnostics);
 	resetRateLimitProbeGatesForTests();
 	restoreUsageCollector();
 	restoreUsageCollector = (): void => {};
@@ -1066,6 +1081,19 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const request = makeCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
+
+		const firstAttemptDiagnostics = precommitDiagnostics.find(
+			(e) => e.msg === "codex_precommit_sse_retry",
+		)?.data as Record<string, unknown>;
+		expect(
+			(firstAttemptDiagnostics.frameKindCounts as Record<string, number>)
+				.meaningful,
+		).toBe(0);
+		expect(
+			(firstAttemptDiagnostics.frameKindCounts as Record<string, number>).error,
+		).toBeGreaterThan(0);
+		expect(firstAttemptDiagnostics.lastValidProtocolActivityAgeMs).toBeNumber();
+		expect(firstAttemptDiagnostics.terminalEvidenceSeen).toBe(false);
 
 		expect(response.status).toBe(200);
 		expect(outboundAccounts).toEqual([
@@ -1390,6 +1418,20 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const request = makeCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
+
+		const firstAttemptDiagnostics = precommitDiagnostics.find(
+			(e) => e.msg === "codex_precommit_cache_lane_rescue",
+		)?.data as Record<string, unknown>;
+		expect(
+			(firstAttemptDiagnostics.frameKindCounts as Record<string, number>)
+				.meaningful,
+		).toBe(0);
+		expect(
+			(firstAttemptDiagnostics.frameKindCounts as Record<string, number>)
+				.structural,
+		).toBeGreaterThan(0);
+		expect(firstAttemptDiagnostics.lastValidProtocolActivityAgeMs).toBeNumber();
+		expect(firstAttemptDiagnostics.terminalEvidenceSeen).toBe(false);
 
 		expect(response.status).toBe(200);
 		expect(outboundKeys).toHaveLength(2);
