@@ -1132,10 +1132,14 @@ describe("run-ccflare-stack supervisor lifecycle", () => {
 
 
 describe("persistent guard memory replacement (real Node guard, mock upstream only)", () => {
-	async function start(extra: Record<string, string> = {}) {
+	async function start(extra: Record<string, string> = {}, guardStartupDelayMs = 0) {
 		const nodeExecutable = resolveNodeExecutable();
 		const dir = tempDir("ccflare-persistent-fixture-");
 		const programs = writeFixturePrograms(dir);
+		const startupDelayModule = join(dir, "guard-start-delay.mjs");
+		writeFileSync(startupDelayModule,
+			`if (process.argv[1] === ${JSON.stringify(join(repoRoot, "scripts/ccflare-guard.mjs"))}) await new Promise(resolve => setTimeout(resolve, ${guardStartupDelayMs}));`,
+		);
 		let source = readFileSync(programs.upstream, "utf8");
 		// The runner owns PATH; pin this mock to the same verified native runtime.
 		source = source.replace("#!/usr/bin/env node", `#!${nodeExecutable}`);
@@ -1158,6 +1162,10 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 				...rssPolicy({ RUNNER_RSS_POLL_INTERVAL_MS: "20" }),
 				RUNNER_PERSISTENT_GUARD: "1",
 				NODE_BIN: nodeExecutable,
+				// Native identity inspection hashes the real executable before listen;
+				// the lightweight mock fixture's one-second readiness budget is too short.
+				RUNNER_HEALTH_MAX_ATTEMPTS: "500",
+				...(guardStartupDelayMs > 0 ? { NODE_OPTIONS: `--import=${startupDelayModule}` } : {}),
 				GUARD_PORT: String(guardPort),
 				GUARD_SOURCE_ID: "0123456789abcdef0123456789abcdef01234567",
 				GUARD_TOTAL_DEADLINE_MS: "2000",
@@ -1171,10 +1179,13 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 		return { runner, base: `http://127.0.0.1:${guardPort}` };
 	}
 	test("retains guard pid, drains old work, rotates credentials and reaps old owner before replacement", async () => {
-		const { runner, base } = await start();
+		// Real Node startup hashes executable artifacts before opening the listener.
+		// Exercise a cold start longer than the old mock-only one-second budget.
+		const { runner, base } = await start({}, 1500);
 		try {
 			const before = await (await fetch(`${base}/_guard/health`)).json();
 			const initialStartCount = generationCount(runner);
+			expect(initialStartCount).toBe(1);
 			const initialLogLength = runner.getOutput().stdout.length;
 			const stream = await fetch(`${base}/hold`);
 			const body = stream.text();
