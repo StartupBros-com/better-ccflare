@@ -32,7 +32,10 @@ import {
 	getRepresentativeNanoGPTWindow,
 	type NanoGPTUsageData,
 } from "./nanogpt-usage-fetcher";
-import { fetchCodexUsageData } from "./providers/codex/api-usage";
+import {
+	bindCodexUsageObservation,
+	fetchCodexUsageData,
+} from "./providers/codex/api-usage";
 import {
 	fetchXaiUsageData,
 	getRepresentativeXaiUtilization,
@@ -877,6 +880,7 @@ type PollRegistration = {
 	timer?: NodeJS.Timeout;
 	abortController: AbortController;
 	failureCount: number;
+	cacheRevision: number;
 };
 
 /**
@@ -909,6 +913,17 @@ class UsageCache {
 			promise: Promise<{ success: boolean; retryAfterMs: number | null }>;
 		}
 	>();
+
+	/** Keep the fence on the registration so delete/recreate cannot cause ABA. */
+	private invalidateCodexAcquisition(accountId: string): void {
+		const registration = this.registrations.get(accountId);
+		if (registration?.provider === "codex") registration.cacheRevision++;
+	}
+
+	private deleteCacheEntry(accountId: string): void {
+		this.invalidateCodexAcquisition(accountId);
+		this.cache.delete(accountId);
+	}
 
 	/** True only while this exact registration still owns its account. */
 	private isCurrent(registration: PollRegistration): boolean {
@@ -958,6 +973,22 @@ class UsageCache {
 		data: AnyUsageData,
 	): void {
 		if (!this.isCurrent(registration)) return;
+		if (registration.provider === "codex") {
+			// The exact cache-entry identity fences invalidation/replacement/replay;
+			// registration identity additionally fences teardown and late fetches.
+			const entry = { data, timestamp: Date.now() };
+			entry.data =
+				bindCodexUsageObservation(
+					data as UsageData,
+					registration.accountId,
+					() =>
+						this.isCurrent(registration) &&
+						this.cache.get(registration.accountId) === entry,
+				) ?? data;
+			this.invalidateCodexAcquisition(registration.accountId);
+			this.cache.set(registration.accountId, entry);
+			return;
+		}
 		this.setAuthoritative(registration.accountId, data);
 	}
 
@@ -1087,6 +1118,7 @@ class UsageCache {
 			onSnapshot,
 			abortController: new AbortController(),
 			failureCount: 0,
+			cacheRevision: 0,
 		};
 		this.registrations.set(accountId, registration);
 
@@ -1137,7 +1169,7 @@ class UsageCache {
 		// _doFetchAndCache remain the correctness guard for fetchers that don't.
 		registration.abortController.abort();
 		// Clean up cache entry when polling stops to prevent memory leaks
-		this.cache.delete(accountId);
+		this.deleteCacheEntry(accountId);
 		this.usageRateLimitedUntil.delete(accountId);
 		this.modelScopedDepletions.delete(accountId);
 		this.familyScopedDepletions.delete(accountId);
@@ -1155,6 +1187,12 @@ class UsageCache {
 		registration: PollRegistration,
 	): Promise<{ success: boolean; retryAfterMs: number | null }> {
 		const { accountId, tokenProvider, provider, customEndpoint } = registration;
+		// Capture before token acquisition: even a write during credential refresh
+		// supersedes this poll. Scope ordering to Codex; other providers are unchanged.
+		const cacheRevision = registration.cacheRevision;
+		const canPublishCodex = () =>
+			this.isCurrent(registration) &&
+			registration.cacheRevision === cacheRevision;
 		try {
 			// Get a fresh access token or API key on each fetch
 			let token: string;
@@ -1327,12 +1365,11 @@ class UsageCache {
 				const result = await fetchCodexUsageData(
 					token,
 					registration.abortController.signal,
+					accountId,
 				);
-				if (!this.isCurrent(registration)) {
-					// Polling was stopped while this fetch was in flight (e.g. the
-					// account's endpoint changed away from the subscription
-					// backend): discard the snapshot rather than resurrecting
-					// stale subscription quota after teardown (pro-gate round 2).
+				if (!canPublishCodex()) {
+					// Teardown or any intervening account-local cache mutation wins.
+					// Discard before reset/history callbacks or rate-limit changes.
 					return { success: false, retryAfterMs: null };
 				}
 				if (result.data) {
@@ -1343,6 +1380,10 @@ class UsageCache {
 						result.data,
 						"codex",
 					);
+					// A reset callback may synchronously invalidate or replace the cache.
+					if (!canPublishCodex()) {
+						return { success: false, retryAfterMs: null };
+					}
 					this.setRegistrationCache(registration, result.data);
 					this.notifySnapshot(registration, result.data);
 					const utilization = getRepresentativeUtilization(
@@ -1476,7 +1517,7 @@ class UsageCache {
 
 		for (const [accountId, cached] of this.cache.entries()) {
 			if (now - cached.timestamp > maxAgeMs) {
-				this.cache.delete(accountId);
+				this.deleteCacheEntry(accountId);
 				cleanedCount++;
 			}
 		}
@@ -1497,7 +1538,7 @@ class UsageCache {
 		const age = Date.now() - cached.timestamp;
 		if (age > USAGE_CACHE_MAX_AGE_MS) {
 			// 10 minutes max age
-			this.cache.delete(accountId);
+			this.deleteCacheEntry(accountId);
 			log.debug(
 				`Removed stale cache entry for account ${accountId} (age: ${Math.round(age / 1000)}s)`,
 			);
@@ -1698,6 +1739,7 @@ class UsageCache {
 	 * registered but never invoked for them (pro-gate finding).
 	 */
 	private setAuthoritative(accountId: string, data: AnyUsageData): void {
+		this.invalidateCodexAcquisition(accountId);
 		this.cache.set(accountId, { data, timestamp: Date.now() });
 		// Ordinary usage snapshots do not prove a recent model+client-beta-specific
 		// out_of_credits condition has cleared, and an older in-flight poll can
@@ -1776,7 +1818,7 @@ class UsageCache {
 		// Clean up if too old
 		if (age > USAGE_CACHE_MAX_AGE_MS) {
 			// 10 minutes max age
-			this.cache.delete(accountId);
+			this.deleteCacheEntry(accountId);
 			return null;
 		}
 
@@ -1787,7 +1829,7 @@ class UsageCache {
 	 * Clear cached data for a specific account
 	 */
 	delete(accountId: string): void {
-		this.cache.delete(accountId);
+		this.deleteCacheEntry(accountId);
 		this.modelScopedDepletions.delete(accountId);
 		this.familyScopedDepletions.delete(accountId);
 		log.debug(`Cleared usage cache for account ${accountId}`);

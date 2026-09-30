@@ -1992,7 +1992,11 @@ export default async function startServer(options?: {
 			let freeResult: Awaited<ReturnType<typeof fetchCodexUsageData>> | null =
 				null;
 			try {
-				freeResult = await fetchCodexUsageData(accessToken);
+				freeResult = await fetchCodexUsageData(
+					accessToken,
+					undefined,
+					accountId,
+				);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				log.warn(
