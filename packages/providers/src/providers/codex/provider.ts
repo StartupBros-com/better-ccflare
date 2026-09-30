@@ -110,6 +110,9 @@ import {
 	type CodexStreamLivenessOptions,
 } from "./stream-liveness";
 import {
+	CODEX_STREAM_EVENT_CATEGORIES,
+	type CodexStreamDiagnostics,
+	type CodexStreamEventCategory,
 	summarizeCodexResponse,
 	type ToolCallSummary,
 	writeCodexAbortedAttemptTrace,
@@ -938,8 +941,124 @@ interface ContextWindow {
 // throttled event can move that window by at most one second less than the
 // latest observed upstream activity.
 const CODEX_PROGRESS_PING_MIN_INTERVAL_MS = 1_000;
+// Match the parser tail's finite byte budget while independently bounding tiny
+// deferred objects. These are per-stream retention limits, not output truncation.
+const DEFERRED_REASONING_BYTE_CAP = BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES;
+const DEFERRED_REASONING_COUNT_CAP = 1024;
+const saturatingAdd = (value: number, delta = 1): number =>
+	Math.min(Number.MAX_SAFE_INTEGER, value + delta);
+
+function recordCodexStreamEvent(
+	state: StreamState,
+	event: string,
+	data: Record<string, unknown>,
+): void {
+	let category: CodexStreamEventCategory = "other";
+	const now = performance.now();
+	state.lastRawEventAt = now;
+	switch (event) {
+		case "response.created":
+			category = "created";
+			break;
+		case "response.in_progress":
+			category = "in_progress";
+			break;
+		case "response.output_item.added":
+			if (
+				(data.item as Record<string, unknown> | undefined)?.type ===
+				"function_call"
+			)
+				category = "function_call_added";
+			break;
+		case "response.output_item.done": {
+			const item = data.item as Record<string, unknown> | undefined;
+			if (item?.type === "function_call") category = "function_call_done";
+			else if (
+				item?.type === "reasoning" &&
+				typeof item.encrypted_content === "string" &&
+				item.encrypted_content.length > 0
+			)
+				category = "encrypted_reasoning_done";
+			break;
+		}
+		case "response.reasoning_summary_text.delta":
+			category = "visible_summary_delta";
+			if (typeof data.delta === "string" && data.delta.length > 0)
+				state.lastVisibleEventAt = now;
+			break;
+		case "response.output_text.delta":
+			category = "output_text_delta";
+			if (typeof data.delta === "string" && data.delta.length > 0)
+				state.lastVisibleEventAt = now;
+			break;
+		case "response.function_call_arguments.delta":
+			category = "argument_delta";
+			if (typeof data.delta === "string" && data.delta.length > 0) {
+				state.argumentDeltaBytes = saturatingAdd(
+					state.argumentDeltaBytes,
+					Buffer.byteLength(data.delta, "utf8"),
+				);
+				state.lastArgumentEventAt = now;
+			}
+			break;
+		case "response.completed":
+			category = "completed";
+			break;
+		case "response.incomplete":
+			category = "incomplete";
+			break;
+		case "response.failed":
+			category = "failed";
+			break;
+		case "error":
+			category = "error";
+			break;
+	}
+	state.rawEventCounts[category] = saturatingAdd(
+		state.rawEventCounts[category],
+	);
+}
+
+function codexStreamDiagnostics(state: StreamState): CodexStreamDiagnostics {
+	const now = performance.now();
+	const age = (at: number | null) =>
+		at === null
+			? null
+			: Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(now - at)));
+	return {
+		event_counts: state.rawEventCounts,
+		raw_bytes: state.rawBytes,
+		argument_delta_bytes: state.argumentDeltaBytes,
+		pending_tool_bytes: state.functionCallBytesTotal,
+		peak_pending_tool_bytes: state.functionCallBytesPeak,
+		pending_reasoning_bytes: state.pendingReasoningBytes,
+		peak_pending_reasoning_bytes: state.pendingReasoningBytesPeak,
+		pending_reasoning_count: state.pendingReasoningBlocks.length,
+		peak_pending_reasoning_count: state.pendingReasoningCountPeak,
+		last_raw_event_age_ms: age(state.lastRawEventAt),
+		last_visible_event_age_ms: age(state.lastVisibleEventAt),
+		last_argument_event_age_ms: age(state.lastArgumentEventAt),
+	};
+}
+
+function clearCodexStreamBuffers(state: StreamState): void {
+	state.pendingReasoningBlocks = [];
+	state.pendingReasoningBytes = 0;
+	state.functionCallBlocks.clear();
+	state.functionCallBytesTotal = 0;
+}
 
 interface StreamState {
+	rawEventCounts: Record<CodexStreamEventCategory, number>;
+	rawBytes: number;
+	argumentDeltaBytes: number;
+	functionCallBytesPeak: number;
+	pendingReasoningBytes: number;
+	pendingReasoningBytesPeak: number;
+	pendingReasoningCountPeak: number;
+	lastRawEventAt: number | null;
+	lastVisibleEventAt: number | null;
+	lastArgumentEventAt: number | null;
 	messageId: string;
 	model: string;
 	contentBlockIndex: number;
@@ -1051,6 +1170,7 @@ function writeCodexStreamTerminalTrace(
 		outputLineage,
 	);
 	writeCodexResponseTrace({
+		streamDiagnostics: codexStreamDiagnostics(state),
 		requestId: state.traceRequestId,
 		attemptId: state.traceAttemptId,
 		modelOut: state.model,
@@ -1094,6 +1214,7 @@ function writeCodexStreamTerminalTrace(
 			},
 		),
 	});
+	clearCodexStreamBuffers(state);
 }
 
 /**
@@ -4998,6 +5119,18 @@ export class CodexProvider extends BaseProvider {
 			: null,
 	): Response {
 		const state: StreamState = {
+			rawEventCounts: Object.fromEntries(
+				CODEX_STREAM_EVENT_CATEGORIES.map((k) => [k, 0]),
+			) as Record<CodexStreamEventCategory, number>,
+			rawBytes: 0,
+			argumentDeltaBytes: 0,
+			functionCallBytesPeak: 0,
+			pendingReasoningBytes: 0,
+			pendingReasoningBytesPeak: 0,
+			pendingReasoningCountPeak: 0,
+			lastRawEventAt: null,
+			lastVisibleEventAt: null,
+			lastArgumentEventAt: null,
 			messageId: `msg_${crypto.randomUUID().replace(/-/g, "").substring(0, 24)}`,
 			model: finalModel,
 			contentBlockIndex: 0,
@@ -5320,6 +5453,7 @@ export class CodexProvider extends BaseProvider {
 					// frame and an unterminated tail). It may throw a
 					// StreamResourceLimitError (SseLimitError), which is handled by
 					// the dedicated branch in the catch below.
+					state.rawBytes = saturatingAdd(state.rawBytes, value.byteLength);
 					const frames = sseFrameBuffer.push(value);
 
 					// Process complete SSE events extracted from this chunk
@@ -5354,20 +5488,43 @@ export class CodexProvider extends BaseProvider {
 
 						const { eventLine, dataLine } = findCodexSseFrameLines(eventText);
 
-						if (!eventLine || !dataLine) continue;
+						if (!eventLine || !dataLine) {
+							state.rawEventCounts.ignored_frame = saturatingAdd(
+								state.rawEventCounts.ignored_frame,
+							);
+							state.lastRawEventAt = performance.now();
+							continue;
+						}
 
 						const eventName = eventLine.slice("event:".length).trim();
 						const dataStr = dataLine.slice("data:".length).trim();
 
-						if (dataStr === "[DONE]") continue;
+						if (dataStr === "[DONE]") {
+							state.rawEventCounts.ignored_frame = saturatingAdd(
+								state.rawEventCounts.ignored_frame,
+							);
+							state.lastRawEventAt = performance.now();
+							continue;
+						}
 
 						let data: Record<string, unknown>;
 						try {
 							data = JSON.parse(dataStr);
+							if (
+								data === null ||
+								typeof data !== "object" ||
+								Array.isArray(data)
+							)
+								throw new Error("Invalid SSE object");
 						} catch {
+							state.rawEventCounts.malformed_frame = saturatingAdd(
+								state.rawEventCounts.malformed_frame,
+							);
+							state.lastRawEventAt = performance.now();
 							continue;
 						}
 
+						recordCodexStreamEvent(state, eventName, data);
 						await this.handleCodexEvent(
 							eventName,
 							data,
@@ -5478,6 +5635,10 @@ export class CodexProvider extends BaseProvider {
 							type: "sse_limit_exceeded",
 							message: error.message,
 						};
+						writeCodexStreamTerminalTrace(state, "error", capError);
+						// Releasing the owned upstream must not depend on a stalled
+						// consumer accepting the close/error frames below.
+						cancelUpstreamOnce(error);
 						try {
 							await this.closeOpenBlockAndWriteError(
 								state,
@@ -5524,6 +5685,7 @@ export class CodexProvider extends BaseProvider {
 				}
 				cancelUpstreamOnce(error);
 			} finally {
+				clearCodexStreamBuffers(state);
 				streamLiveness.stop();
 				if (!upstreamDrainStarted) {
 					await streamLiveness.settlePendingReadForCleanup();
@@ -5904,6 +6066,10 @@ export class CodexProvider extends BaseProvider {
 						buffer.arguments.push(delta);
 						buffer.bytes += deltaBytes;
 						state.functionCallBytesTotal += deltaBytes;
+						state.functionCallBytesPeak = Math.max(
+							state.functionCallBytesPeak,
+							state.functionCallBytesTotal,
+						);
 						// Per-call cap: guards a single runaway tool call.
 						if (buffer.bytes > TOOL_ARGS_PER_CALL_BYTE_CAP) {
 							throw new StreamResourceLimitError(
@@ -6032,6 +6198,7 @@ export class CodexProvider extends BaseProvider {
 								state.contentBlockIndex++;
 							}
 							state.pendingReasoningBlocks = [];
+							state.pendingReasoningBytes = 0;
 						}
 					}
 					break;
@@ -6056,7 +6223,30 @@ export class CodexProvider extends BaseProvider {
 							// emission: closing a live text block here would orphan its later
 							// deltas at an index with no content_block_start. Flushed after
 							// the owning output item closes, or at stream end.
+							const reasoningBytes = Buffer.byteLength(reasoningData, "utf8");
+							const nextBytes = state.pendingReasoningBytes + reasoningBytes;
+							if (
+								nextBytes > DEFERRED_REASONING_BYTE_CAP ||
+								state.pendingReasoningBlocks.length >=
+									DEFERRED_REASONING_COUNT_CAP
+							) {
+								throw new StreamResourceLimitError(
+									`Deferred reasoning would retain ${state.pendingReasoningBlocks.length + 1} items / ${nextBytes} bytes, exceeding ${DEFERRED_REASONING_COUNT_CAP} items or ${DEFERRED_REASONING_BYTE_CAP} bytes`,
+									"deferred_reasoning",
+									DEFERRED_REASONING_BYTE_CAP,
+									nextBytes,
+								);
+							}
 							state.pendingReasoningBlocks.push(reasoningData);
+							state.pendingReasoningBytes = nextBytes;
+							state.pendingReasoningBytesPeak = Math.max(
+								state.pendingReasoningBytesPeak,
+								nextBytes,
+							);
+							state.pendingReasoningCountPeak = Math.max(
+								state.pendingReasoningCountPeak,
+								state.pendingReasoningBlocks.length,
+							);
 							break;
 						}
 
@@ -6118,6 +6308,7 @@ export class CodexProvider extends BaseProvider {
 						state.contentBlockIndex++;
 					}
 					state.pendingReasoningBlocks = [];
+					state.pendingReasoningBytes = 0;
 				}
 				break;
 			}
@@ -6285,6 +6476,7 @@ export class CodexProvider extends BaseProvider {
 					state.contentBlockIndex++;
 				}
 				state.pendingReasoningBlocks = [];
+				state.pendingReasoningBytes = 0;
 
 				const incompleteDetails = resp?.incomplete_details as
 					| { reason?: string }

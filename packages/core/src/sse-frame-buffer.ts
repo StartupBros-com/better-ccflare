@@ -19,7 +19,7 @@ const encoder = new TextEncoder();
  * Discriminant for every kind of stream resource limit this codebase
  * enforces. `sse_frame` and `sse_tail` are raised by SseFrameBuffer itself
  * (the parser layer, see SseLimitError below); `translated_output_total`,
- * `tool_arguments_per_call`, and `tool_arguments_total` are raised by
+ * `tool_arguments_per_call`, `tool_arguments_total`, and `deferred_reasoning` are raised by
  * translators accumulating semantic output derived from parsed frames, not
  * by the parser. Keeping these as one shared discriminant lets a caller
  * catch StreamResourceLimitError once and branch on `kind`, instead of
@@ -30,12 +30,15 @@ export type StreamResourceLimitKind =
 	| "sse_tail"
 	| "translated_output_total"
 	| "tool_arguments_per_call"
-	| "tool_arguments_total";
+	| "tool_arguments_total"
+	| "deferred_reasoning";
 
 /**
  * Shared base for every stream resource limit failure. Carries the exact
  * kind of limit tripped plus its limit/actual byte counts, deliberately
- * never the payload itself: the message and fields are safe to log without
+ * never the payload itself. Deferred reasoning additionally enforces an item
+ * count cap; that cap and actual count are stated in its safe message while
+ * limitBytes/actualBytes retain byte units. The fields are safe to log without
  * risking sensitive stream content leaking into logs or error reports.
  */
 export class StreamResourceLimitError extends Error {
