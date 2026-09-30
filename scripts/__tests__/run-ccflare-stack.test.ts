@@ -1174,6 +1174,8 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 		const { runner, base } = await start();
 		try {
 			const before = await (await fetch(`${base}/_guard/health`)).json();
+			const initialStartCount = generationCount(runner);
+			const initialLogLength = runner.getOutput().stdout.length;
 			const stream = await fetch(`${base}/hold`);
 			const body = stream.text();
 			setRssKiB(runner, 20);
@@ -1201,7 +1203,32 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 				.trim()
 				.split("\n")
 				.map((x) => JSON.parse(x));
-			expect(starts).toHaveLength(2);
+			try {
+				expect(starts).toHaveLength(2);
+			} catch (error) {
+				// Keep startup retries distinct from replacement attempts. Never print
+				// upstream.json: it deliberately captures synthetic credentials.
+				const output = runner.getOutput();
+				const redact = (value: string) => starts.reduce(
+					(text, record) => typeof record.secret === "string"
+						? text.replaceAll(record.secret, "[redacted]") : text,
+					value,
+				);
+				console.error(JSON.stringify({
+					event: "persistent_handoff_fixture_failure",
+					initialStartCount,
+					initialUpstreamPid: before.runtime.process.upstreamPid,
+					initialGeneration: before.lifecycle.generation,
+					finalUpstreamPid: after.runtime.process.upstreamPid,
+					finalGeneration: after.lifecycle.generation,
+					startedPids: starts.map((record) => record.pid),
+					startupLog: redact(output.stdout.slice(0, initialLogLength)),
+					handoffLog: redact(output.stdout.slice(initialLogLength)),
+					stderr: redact(output.stderr),
+					lifecycle: readFileSync(join(runner.captureDir, "lifecycle.log"), "utf8"),
+				}));
+				throw error;
+			}
 			expect(starts[1].secret).not.toBe(starts[0].secret);
 			const events = readFileSync(
 				join(runner.captureDir, "lifecycle.log"),
