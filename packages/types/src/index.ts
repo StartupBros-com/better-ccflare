@@ -14,6 +14,7 @@ export * from "./conversation";
 export * from "./insights";
 export * from "./logging";
 export * from "./provider-capabilities";
+export * from "./quality-routing";
 export * from "./rate-limit-reason";
 export * from "./request";
 export * from "./routing-attempt";

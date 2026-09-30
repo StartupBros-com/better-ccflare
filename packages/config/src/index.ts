@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { dirname, posix } from "node:path";
 import {
+	compileQualityRoutingPolicy,
 	DEFAULT_AGENT_MODEL,
 	DEFAULT_STRATEGY,
 	isValidStrategy,
@@ -32,10 +33,40 @@ import {
 	CACHE_HEALTH_BUCKET_MS,
 	CACHE_HEALTH_DEFAULT_POLICY,
 	isAlertType,
+	type QualityRoutingPolicy,
+	type QualityRoutingPolicyConfig,
 } from "@better-ccflare/types";
 import { resolveConfigPath } from "./paths";
 
 const log = new Logger("Config");
+
+export const QUALITY_ROUTING_POLICY_ENV =
+	"CCFLARE_QUALITY_ROUTING_POLICY_JSON" as const;
+const MAX_QUALITY_ROUTING_POLICY_JSON_BYTES = 256 * 1024;
+
+/** Separate from legacy route profiles; nonempty malformed policy is fatal. */
+export function parseQualityRoutingPolicy(
+	raw: unknown,
+): QualityRoutingPolicy | null {
+	if (typeof raw !== "string") return compileQualityRoutingPolicy(raw);
+	if (Buffer.byteLength(raw, "utf8") > MAX_QUALITY_ROUTING_POLICY_JSON_BYTES) {
+		throw new Error("quality_routing_policy: JSON exceeds 262144 bytes");
+	}
+	if (raw.trim() === "") return null;
+	// Reuse the existing bounded scanner to reject duplicate (including escaped)
+	// member names instead of letting JSON.parse silently replace authorizations.
+	if (!new StrictJsonScanner(raw).scan()) {
+		throw new Error(
+			"quality_routing_policy: must be strict JSON without duplicate keys or excessive depth",
+		);
+	}
+	const value: unknown = JSON.parse(raw);
+	if (typeof value === "string")
+		throw new Error(
+			"quality_routing_policy: JSON must contain a policy object",
+		);
+	return compileQualityRoutingPolicy(value);
+}
 
 export type ModelScopedCapacityRoutingMode = "off" | "exhausted";
 
@@ -879,6 +910,7 @@ export function filterEnabledProviderModelDefaultOverrides(
 }
 
 export interface ConfigData {
+	quality_routing_policy?: QualityRoutingPolicyConfig | string;
 	lb_strategy?: StrategyName;
 	client_id?: string;
 	retry_attempts?: number;
@@ -967,6 +999,7 @@ export interface ConfigData {
 		| number
 		| boolean
 		| ProviderModelDefaultOverrides
+		| QualityRoutingPolicyConfig
 		| undefined;
 }
 
@@ -1300,6 +1333,16 @@ export class Config extends EventEmitter {
 			description: "config file",
 		});
 		this.loadConfig();
+		// Outside loadConfig's legacy parse-recovery catch: invalid policy must
+		// abort startup, never silently disable an explicitly enrolled route.
+		this.getQualityRoutingPolicy();
+	}
+
+	getQualityRoutingPolicy(): QualityRoutingPolicy | null {
+		const fromEnv = process.env[QUALITY_ROUTING_POLICY_ENV];
+		return parseQualityRoutingPolicy(
+			fromEnv !== undefined ? fromEnv : this.data.quality_routing_policy,
+		);
 	}
 
 	private loadConfig(): void {
@@ -1355,6 +1398,7 @@ export class Config extends EventEmitter {
 	}
 
 	set(key: string, value: string | number | boolean): void {
+		if (key === "quality_routing_policy") parseQualityRoutingPolicy(value);
 		const oldValue = this.data[key];
 		this.data[key] = value;
 		this.saveConfig();
@@ -2474,9 +2518,21 @@ export class Config extends EventEmitter {
 
 	getAllSettings(): Record<string, string | number | boolean | undefined> {
 		const anthropicDegradedMode = this.getAnthropicDegradedModeConfig();
+		const { quality_routing_policy: qualityRoutingPolicy, ...settings } =
+			this.data;
 		// Include current strategy (which might come from env)
 		return {
-			...this.data,
+			...settings,
+			// Keep the existing scalar settings API; structured policy has its
+			// own validated getter and is represented here as configuration JSON.
+			...(qualityRoutingPolicy !== undefined
+				? {
+						quality_routing_policy:
+							typeof qualityRoutingPolicy === "string"
+								? qualityRoutingPolicy
+								: JSON.stringify(qualityRoutingPolicy),
+					}
+				: {}),
 			lb_strategy: this.getStrategy(),
 			default_agent_model: this.getDefaultAgentModel(),
 			data_retention_days: this.getDataRetentionDays(),
