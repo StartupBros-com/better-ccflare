@@ -52,6 +52,7 @@ import { handleResponsesRequest } from "@better-ccflare/openai-responses-adapter
 import {
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_PING_MODEL,
+	type CodexSubscriptionFacts,
 	extractWeeklyResetTime,
 	fetchCodexUsageData,
 	fetchCodexUsageOnDemand,
@@ -254,6 +255,151 @@ export async function persistForwardOnlyCodexRateLimitReset(
 		   AND (rate_limit_reset IS NULL OR rate_limit_reset < ?)`,
 		[resetTime, Date.now(), accountId, resetTime],
 	);
+}
+
+/** Refresh metadata without consuming inference quota; null requests the ping fallback. */
+export async function refreshCodexUsageFromMetadata(
+	account: Account,
+	accessToken: string,
+	dbOps: Pick<DatabaseOperations, "getAccount">,
+	db: { run(sql: string, params?: unknown[]): Promise<void> },
+	log: Pick<Logger, "info" | "warn"> = new Logger("Server"),
+): Promise<{ success: boolean; message: string } | null> {
+	const accountId = account.id;
+	let freeResult: Awaited<ReturnType<typeof fetchCodexUsageData>> | null = null;
+	try {
+		freeResult = await fetchCodexUsageData(accessToken, undefined, accountId);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		log.warn(
+			`Codex usage refresh: free usage endpoint failed for ${account.name}, falling back to on-demand ping: ${message}`,
+		);
+	}
+
+	if (freeResult?.data) {
+		// Re-check endpoint eligibility AFTER the network fetch: a
+		// custom_endpoint switch while the wham request was in flight
+		// must not resurrect a subscription snapshot post-teardown
+		// (pro-gate round 3). This narrows the race from the fetch
+		// duration to milliseconds; full closure needs per-registration
+		// identity (follow-up issue).
+		const currentRow = await dbOps.getAccount(accountId);
+		if (
+			!currentRow ||
+			!isCodexSubscriptionEndpoint(
+				resolveCodexEndpoint(currentRow.custom_endpoint, currentRow.name),
+			)
+		) {
+			return {
+				success: false,
+				message: `Account '${account.name}' switched endpoints during the refresh — discarded the subscription usage snapshot`,
+			};
+		}
+		usageCache.set(accountId, freeResult.data);
+
+		const windows = [
+			freeResult.data.five_hour,
+			freeResult.data.seven_day,
+		].flatMap((w) => {
+			const resetMs = w?.resets_at
+				? new Date(w.resets_at).getTime()
+				: Number.NaN;
+			return Number.isFinite(resetMs)
+				? [{ utilization: w?.utilization ?? 0, resetMs }]
+				: [];
+		});
+		const exhausted = windows.filter((w) => w.utilization >= 100);
+		// The auto-refresh scheduler treats an account as probe-due once
+		// rate_limit_reset passes (its query includes codex). Persisting
+		// the EARLIEST reset while a LATER hard window is exhausted would
+		// schedule guaranteed-fail probes at the short-window boundary —
+		// when any window is exhausted, persist the latest exhausted
+		// window's reset instead (pro-gate round 2).
+		const candidateMs =
+			exhausted.length > 0
+				? Math.max(...exhausted.map((w) => w.resetMs))
+				: windows.length > 0
+					? Math.min(...windows.map((w) => w.resetMs))
+					: null;
+		if (candidateMs !== null) {
+			// Preservation decided INSIDE the UPDATE against the current
+			// row (pro-gate round 3): while a response-endpoint cooldown
+			// is active, an already-later reset — possibly persisted by a
+			// concurrent real 429 after our row read — must not be pulled
+			// earlier on introspection data alone.
+			try {
+				await db.run(
+					`UPDATE accounts SET rate_limit_reset = ?, rate_limit_reset_at = ?
+					 WHERE id = ?
+					   AND NOT (
+					     rate_limited_until IS NOT NULL AND rate_limited_until > ?
+					     AND rate_limit_reset IS NOT NULL AND rate_limit_reset > ?
+					   )`,
+					[candidateMs, Date.now(), account.id, Date.now(), candidateMs],
+				);
+			} catch (error) {
+				log.warn(
+					`Codex usage refresh: failed to update rate_limit_reset for ${account.name}:`,
+					error,
+				);
+			}
+		}
+
+		// Legacy windows synthesize zero for absent/malformed utilization. Use
+		// source facts for display, retaining the mapper's 5h/7d slot assignment
+		// (a lone primary window can be weekly, notably on the free plan).
+		const facts = freeResult.data.codex_subscription as
+			| CodexSubscriptionFacts
+			| undefined;
+		const fiveHourOmitted = facts?.omittedLegacyWindows.includes("five_hour");
+		const weekly =
+			fiveHourOmitted && facts?.primary.presence === "window"
+				? facts.primary
+				: facts?.secondary;
+		const fiveHour =
+			!fiveHourOmitted &&
+			facts?.primary.presence === "window" &&
+			typeof facts.primary.utilization === "number"
+				? facts.primary.utilization
+				: null;
+		const sevenDay =
+			!facts?.omittedLegacyWindows.includes("seven_day") &&
+			weekly?.presence === "window" &&
+			typeof weekly.utilization === "number"
+				? weekly.utilization
+				: null;
+		const fiveHourDisplay = fiveHour === null ? "unavailable" : `${fiveHour}%`;
+		const sevenDayDisplay = sevenDay === null ? "unavailable" : `${sevenDay}%`;
+		// The free endpoint reports quota utilization but knows nothing of
+		// live cooldowns on the responses endpoint (429/529 set
+		// rate_limited_until via real traffic). The old ping-based path
+		// surfaced those implicitly through its own HTTP status — keep
+		// that honesty by consulting the account row too.
+		const cooldownActive =
+			account.rate_limited_until != null &&
+			Number(account.rate_limited_until) > Date.now();
+		const isRateLimited =
+			facts?.allowed === false ||
+			facts?.limitReached === true ||
+			(fiveHour !== null && fiveHour >= 100) ||
+			(sevenDay !== null && sevenDay >= 100) ||
+			cooldownActive;
+		log.info(
+			`Codex usage refreshed (free endpoint) for '${account.name}': 5h=${fiveHourDisplay}, 7d=${sevenDayDisplay}${
+				isRateLimited ? " (rate-limited)" : ""
+			}`,
+		);
+
+		// Mirror the on-demand path's message tone: 429-equivalent
+		// exhaustion must not read as an unqualified success. See
+		// tombii's PR #219 review note.
+		const message = isRateLimited
+			? `Usage refreshed for '${account.name}' — account is rate limited (5h: ${fiveHourDisplay}, 7d: ${sevenDayDisplay}).`
+			: `Usage refreshed for '${account.name}' (5h: ${fiveHourDisplay}, 7d: ${sevenDayDisplay}).`;
+
+		return { success: true, message };
+	}
+	return null;
 }
 
 /**
@@ -1989,117 +2135,14 @@ export default async function startServer(options?: {
 			account.name,
 		);
 		if (isCodexSubscriptionEndpoint(resolvedEndpoint)) {
-			let freeResult: Awaited<ReturnType<typeof fetchCodexUsageData>> | null =
-				null;
-			try {
-				freeResult = await fetchCodexUsageData(
-					accessToken,
-					undefined,
-					accountId,
-				);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				log.warn(
-					`Codex usage refresh: free usage endpoint failed for ${account.name}, falling back to on-demand ping: ${message}`,
-				);
-			}
-
-			if (freeResult?.data) {
-				// Re-check endpoint eligibility AFTER the network fetch: a
-				// custom_endpoint switch while the wham request was in flight
-				// must not resurrect a subscription snapshot post-teardown
-				// (pro-gate round 3). This narrows the race from the fetch
-				// duration to milliseconds; full closure needs per-registration
-				// identity (follow-up issue).
-				const currentRow = await dbOps.getAccount(accountId);
-				if (
-					!currentRow ||
-					!isCodexSubscriptionEndpoint(
-						resolveCodexEndpoint(currentRow.custom_endpoint, currentRow.name),
-					)
-				) {
-					return {
-						success: false,
-						message: `Account '${account.name}' switched endpoints during the refresh — discarded the subscription usage snapshot`,
-					};
-				}
-				usageCache.set(accountId, freeResult.data);
-
-				const windows = [
-					freeResult.data.five_hour,
-					freeResult.data.seven_day,
-				].flatMap((w) => {
-					const resetMs = w?.resets_at
-						? new Date(w.resets_at).getTime()
-						: Number.NaN;
-					return Number.isFinite(resetMs)
-						? [{ utilization: w?.utilization ?? 0, resetMs }]
-						: [];
-				});
-				const exhausted = windows.filter((w) => w.utilization >= 100);
-				// The auto-refresh scheduler treats an account as probe-due once
-				// rate_limit_reset passes (its query includes codex). Persisting
-				// the EARLIEST reset while a LATER hard window is exhausted would
-				// schedule guaranteed-fail probes at the short-window boundary —
-				// when any window is exhausted, persist the latest exhausted
-				// window's reset instead (pro-gate round 2).
-				const candidateMs =
-					exhausted.length > 0
-						? Math.max(...exhausted.map((w) => w.resetMs))
-						: windows.length > 0
-							? Math.min(...windows.map((w) => w.resetMs))
-							: null;
-				if (candidateMs !== null) {
-					// Preservation decided INSIDE the UPDATE against the current
-					// row (pro-gate round 3): while a response-endpoint cooldown
-					// is active, an already-later reset — possibly persisted by a
-					// concurrent real 429 after our row read — must not be pulled
-					// earlier on introspection data alone.
-					try {
-						await db.run(
-							`UPDATE accounts SET rate_limit_reset = ?, rate_limit_reset_at = ?
-							 WHERE id = ?
-							   AND NOT (
-							     rate_limited_until IS NOT NULL AND rate_limited_until > ?
-							     AND rate_limit_reset IS NOT NULL AND rate_limit_reset > ?
-							   )`,
-							[candidateMs, Date.now(), account.id, Date.now(), candidateMs],
-						);
-					} catch (error) {
-						log.warn(
-							`Codex usage refresh: failed to update rate_limit_reset for ${account.name}:`,
-							error,
-						);
-					}
-				}
-
-				const fiveHour = freeResult.data.five_hour?.utilization ?? 0;
-				const sevenDay = freeResult.data.seven_day?.utilization ?? 0;
-				// The free endpoint reports quota utilization but knows nothing of
-				// live cooldowns on the responses endpoint (429/529 set
-				// rate_limited_until via real traffic). The old ping-based path
-				// surfaced those implicitly through its own HTTP status — keep
-				// that honesty by consulting the account row too.
-				const cooldownActive =
-					account.rate_limited_until != null &&
-					Number(account.rate_limited_until) > Date.now();
-				const isRateLimited =
-					fiveHour >= 100 || sevenDay >= 100 || cooldownActive;
-				log.info(
-					`Codex usage refreshed (free endpoint) for '${account.name}': 5h=${fiveHour}%, 7d=${sevenDay}%${
-						isRateLimited ? " (rate-limited)" : ""
-					}`,
-				);
-
-				// Mirror the on-demand path's message tone: 429-equivalent
-				// exhaustion must not read as an unqualified success. See
-				// tombii's PR #219 review note.
-				const message = isRateLimited
-					? `Usage refreshed for '${account.name}' — account is rate limited (5h: ${fiveHour}%, 7d: ${sevenDay}%).`
-					: `Usage refreshed for '${account.name}' (5h: ${fiveHour}%, 7d: ${sevenDay}%).`;
-
-				return { success: true, message };
-			}
+			const outcome = await refreshCodexUsageFromMetadata(
+				account,
+				accessToken,
+				dbOps,
+				db,
+				log,
+			);
+			if (outcome) return outcome;
 			// Free fetch yielded no data (or errored) — fall through to the
 			// quota-consuming ping below.
 		}

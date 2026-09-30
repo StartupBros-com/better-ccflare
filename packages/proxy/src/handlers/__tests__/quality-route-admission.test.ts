@@ -223,7 +223,7 @@ it.each([
 		await new Promise<void>((resolve) =>
 			usageCache.startPolling(
 				account.id,
-				"synthetic-token",
+				async () => account.access_token as string,
 				"codex",
 				60_000,
 				undefined,
@@ -234,6 +234,7 @@ it.each([
 		);
 		const snapshot = usageCache.getSnapshot(account.id);
 		if (!snapshot) throw new Error("poll did not publish a snapshot");
+		let rotationInput: QualityRouteAdmissionInput | undefined;
 		for (const ceiling of [20, 19, undefined]) {
 			outputCeiling = ceiling;
 			await getCodexModels(account.id, ctx);
@@ -292,6 +293,7 @@ it.each([
 						},
 			);
 			if (!withGrant && ceiling === 20) {
+				rotationInput = input;
 				expect(
 					evaluateQualityRouteAdmission({
 						...input,
@@ -311,6 +313,32 @@ it.each([
 					}).status,
 				).not.toBe("admit");
 			}
+		}
+		if (!withGrant) {
+			if (!rotationInput) throw new Error("missing admitted rotation baseline");
+			// Catalog and dispatch own token B, while usage still owns token A.
+			// Catalog rejection must not mask lost forwarding of the dispatch token.
+			account.access_token = "rotated";
+			outputCeiling = 20;
+			await getCodexModels(account.id, ctx);
+			const catalog = getCodexAutoCatalogEvidence(account.id);
+			const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
+			if (!catalog || !target) throw new Error("missing rotated catalog");
+			const rotated: QualityRouteAdmissionInput = {
+				...rotationInput,
+				selectedCredentials: { account, accessToken: "rotated" },
+				request: { ...rotationInput.request, catalog, target },
+			};
+			expect(evaluateQualityRouteAdmission(rotated).status).not.toBe("admit");
+			expect(await usageCache.refreshNow(account.id)).toBe(true);
+			const refreshed = usageCache.getSnapshot(account.id);
+			if (!refreshed) throw new Error("missing rotated usage");
+			expect(
+				evaluateQualityRouteAdmission({
+					...rotated,
+					usage: { ...refreshed, accountId: account.id, provider: "codex" },
+				}),
+			).toMatchObject({ status: "admit", accounting: { requestedOutput: 20 } });
 		}
 	} finally {
 		usageCache.stopPolling(account.id);

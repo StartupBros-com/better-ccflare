@@ -215,6 +215,16 @@ describe("Codex subscription-only source evidence (fake metadata transport)", ()
 		const started = Promise.withResolvers<void>();
 		const response = Promise.withResolvers<Response>();
 		const credential = Promise.withResolvers<string>();
+		const writeDuringAcquisition =
+			intervention === "header" || intervention === "token";
+		const exhaustedData = {
+			seven_day: {
+				utilization: 100,
+				resets_at: new Date(now + 600_000).toISOString(),
+			},
+		};
+		// Deletion/expiry must be the only invalidation while the poll is pending.
+		if (!writeDuringAcquisition) usageCache.set(accountId, exhaustedData);
 		let resets = 0;
 		let restored = 0;
 		let snapshots = 0;
@@ -236,12 +246,7 @@ describe("Codex subscription-only source evidence (fake metadata transport)", ()
 		if (intervention !== "token") await started.promise;
 		// A newer exhausted header must remain authoritative even though the
 		// older metadata reply advertises a later reset and spare capacity.
-		usageCache.set(accountId, {
-			seven_day: {
-				utilization: 100,
-				resets_at: new Date(now + 600_000).toISOString(),
-			},
-		});
+		if (writeDuringAcquisition) usageCache.set(accountId, exhaustedData);
 		const newer = usageCache.getSnapshot(accountId);
 		expect(decision(newer, { accessToken: token }).status).toBe("reject");
 		if (intervention === "delete") usageCache.delete(accountId);
