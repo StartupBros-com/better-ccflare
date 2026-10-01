@@ -59,6 +59,7 @@ import {
 } from "../../request-capabilities";
 import type {
 	ProviderAttemptPlanContext,
+	ProviderPathCapability,
 	ProviderServerToolCapabilityContext,
 	ProviderServerToolReplayIssuer,
 	RateLimitInfo,
@@ -2610,6 +2611,21 @@ export class CodexProvider extends BaseProvider {
 	): CodexToolSchemaInfo | undefined {
 		if (!requestId) return undefined;
 		return this.requestToolSchemasById.get(requestId)?.tools.get(toolName);
+	}
+
+	getPathCapability(path: string): ProviderPathCapability {
+		if (path === "/v1/messages/count_tokens") {
+			return { operation: "count_tokens", support: "local-advisory" };
+		}
+		return {
+			operation:
+				path === "/v1/messages" ||
+				path === "/v1/chat/completions" ||
+				path === "/v1/responses"
+					? "generation"
+					: "other",
+			support: this.canHandle(path) ? "native" : "unknown",
+		};
 	}
 
 	canHandle(path: string): boolean {

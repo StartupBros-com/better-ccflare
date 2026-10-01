@@ -16,6 +16,7 @@ import { DatabaseFactory } from "@better-ccflare/database";
 import { sanitizeRequestHeaders } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import {
+	CountTokensUnsupportedError,
 	canonicalizeBetaSignature,
 	deriveCacheFlightRecorderId,
 	deriveXaiConversationIdentity,
@@ -131,6 +132,7 @@ import {
 	admitBoundedModelRouteProfileRequest,
 	createAnthropicDegradedNoAccountDenial,
 	createBoundedModelRouteAdmissionResponse,
+	createCountTokensUnsupportedResponse,
 	discardUpstreamBody,
 	isAnthropicDegradedSendDenied,
 	type ProxyWithAccountResult,
@@ -907,8 +909,10 @@ async function handleProxyCoreImpl(
 	// replay reaching a clear exit can't wipe the active session's real mapping.
 	const sessionId = sessionIdForObservation(req.headers);
 
-	// 2. Validate provider can handle path
-	validateProviderPath(ctx.provider, url.pathname);
+	// Count helpers use the concrete enrolled provider contract during selection;
+	// the default adapter cannot reject a count supported by another enrolled lane.
+	if (url.pathname !== "/v1/messages/count_tokens")
+		validateProviderPath(ctx.provider, url.pathname);
 
 	// 3. Prepare request body before parsing, metadata, selection, persistence, or fetch.
 	let requestBodyBuffer: ArrayBuffer | null;
@@ -1224,8 +1228,10 @@ async function handleProxyCoreImpl(
 		effectiveModelAfterInterception !== null &&
 		modelRouteRegistry?.hasPublicModelId(effectiveModelAfterInterception) ===
 			true;
-	const serverToolPreview =
-		finalRequestBodyContext.previewServerToolRequirements();
+	const isCountHelper = url.pathname === "/v1/messages/count_tokens";
+	const serverToolPreview = isCountHelper
+		? undefined
+		: finalRequestBodyContext.previewServerToolRequirements();
 	const isServerToolHelper =
 		serverToolPreview !== undefined &&
 		!isSubagent &&
@@ -1534,8 +1540,18 @@ async function handleProxyCoreImpl(
 		if (!finalBodyBuffer) return undefined;
 		return new Response(finalBodyBuffer).body ?? undefined;
 	};
-	const serverToolRequirements =
+	const derivedServerToolRequirements =
 		finalRequestBodyContext.finalizeServerToolRequirements();
+	// Counting declarations does not execute hosted tools. Keep bounded syntax
+	// validation, but do not request execution proof or replay authority for helpers.
+	if (isCountHelper && derivedServerToolRequirements?.invalid?.length) {
+		return createUnservedServerToolRoutingErrorResponse(
+			new ServerToolRoutingError({ reason: "invalid_requirement" }),
+		);
+	}
+	const serverToolRequirements = isCountHelper
+		? undefined
+		: derivedServerToolRequirements;
 	if (serverToolRequirements) {
 		requestMeta.serverToolRequirements = serverToolRequirements;
 		// Selection needs only the semantic presence bit. Keep the raw query out of
@@ -1862,6 +1878,12 @@ async function handleProxyCoreImpl(
 		if (error instanceof PreTransportPhaseTimeoutError) {
 			return accountSelectionTimeoutResponse(pacingObservation?.slot ?? null);
 		}
+		if (error instanceof CountTokensUnsupportedError) {
+			return finishPacing(
+				pacingObservation?.slot ?? null,
+				createCountTokensUnsupportedResponse(error.providers),
+			);
+		}
 		if (error instanceof ServerToolRoutingError) {
 			return finishPacing(
 				pacingObservation?.slot ?? null,
@@ -2124,6 +2146,12 @@ async function handleProxyCoreImpl(
 		} catch (error) {
 			if (error instanceof PreTransportPhaseTimeoutError) {
 				return accountSelectionTimeoutResponse(pacingObservation?.slot ?? null);
+			}
+			if (error instanceof CountTokensUnsupportedError) {
+				return finishPacing(
+					pacingObservation?.slot ?? null,
+					createCountTokensUnsupportedResponse(error.providers),
+				);
 			}
 			if (error instanceof ServerToolRoutingError) {
 				return finishPacing(
@@ -3809,6 +3837,13 @@ async function handleProxyCoreImpl(
 					await retainedTerminalResponse.discard();
 				}
 				return accountSelectionTimeoutResponse(pacingSlot);
+			}
+			if (error instanceof CountTokensUnsupportedError) {
+				await routingAttemptLedger.discardTerminalResponse();
+				return finishPacing(
+					pacingSlot,
+					createCountTokensUnsupportedResponse(error.providers),
+				);
 			}
 			if (error instanceof ServerToolRoutingError) {
 				const retainedTerminalResponse =

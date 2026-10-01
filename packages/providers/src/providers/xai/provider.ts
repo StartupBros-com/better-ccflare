@@ -7,6 +7,7 @@ import {
 	OAuthRefreshTokenError,
 	readBoundedOAuthResponseText,
 	resolveXaiContextWindow,
+	ValidationError,
 	validateEndpointUrl,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
@@ -17,7 +18,11 @@ import {
 	registerProviderModelDefaultFactory,
 	resolveProviderModelDefault,
 } from "../../provider-model-defaults";
-import type { RateLimitInfo, TokenRefreshResult } from "../../types";
+import type {
+	ProviderPathCapability,
+	RateLimitInfo,
+	TokenRefreshResult,
+} from "../../types";
 import { OpenAICompatibleProvider } from "../openai/provider";
 import {
 	applyXaiConvIdHeader,
@@ -59,6 +64,33 @@ function resolvedXaiModelMappings(): Record<string, string> {
 
 export class XaiProvider extends OpenAICompatibleProvider {
 	override name = "xai";
+
+	override getPathCapability(path: string): ProviderPathCapability {
+		if (path === "/v1/messages/count_tokens") {
+			return { operation: "count_tokens", support: "unsupported" };
+		}
+		if (path === "/v1/messages" || path === "/v1/chat/completions") {
+			return { operation: "generation", support: "native" };
+		}
+		// Preserve the established native Responses URL path without claiming
+		// parity for the inherited Anthropic/Chat body and response converters.
+		if (path === "/v1/responses") {
+			return { operation: "generation", support: "unknown" };
+		}
+		return {
+			operation: "other",
+			support: path === "/v1/models" ? "native" : "unknown",
+		};
+	}
+
+	override canHandle(path: string): boolean {
+		return [
+			"/v1/messages",
+			"/v1/chat/completions",
+			"/v1/responses",
+			"/v1/models",
+		].includes(path);
+	}
 
 	protected override resolveStreamContextWindow(
 		model: string,
@@ -181,6 +213,12 @@ export class XaiProvider extends OpenAICompatibleProvider {
 	}
 
 	override buildUrl(path: string, query: string, account?: Account): string {
+		if (!this.canHandle(path)) {
+			throw new ValidationError(
+				"xAI does not support this request path",
+				"path",
+			);
+		}
 		let endpoint = XAI_DEFAULT_ENDPOINT;
 		try {
 			endpoint = account?.custom_endpoint

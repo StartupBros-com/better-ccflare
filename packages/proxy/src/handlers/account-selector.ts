@@ -15,8 +15,10 @@ import { Logger } from "@better-ccflare/logger";
 import type { Provider } from "@better-ccflare/providers";
 import {
 	buildServerToolCapabilityProofKey,
+	CountTokensUnsupportedError,
 	canonicalizeBetaSignature,
 	deriveComboRouteClass,
+	getProviderPathCapability,
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
 	resolveAccountLogicalModelCapability,
@@ -2479,6 +2481,34 @@ function alignCapabilityCandidates(
 	});
 }
 
+/** Filter only enrolled count helpers; generation ranking and route policy stay intact. */
+function filterCountHelperAccounts(
+	meta: RequestMeta,
+	ctx: ProxyContext,
+	enrolledAccounts: Account[],
+	rejectAllUnsupported = true,
+): Account[] {
+	if (
+		meta.path !== "/v1/messages/count_tokens" ||
+		enrolledAccounts.length === 0
+	)
+		return enrolledAccounts;
+	const unsupportedProviders: string[] = [];
+	const compatible = enrolledAccounts.filter((account) => {
+		const provider = resolveProviderForAccount(account.provider, ctx.provider);
+		if (!provider) return true;
+		const capability = getProviderPathCapability(provider, meta.path);
+		if (capability.support !== "unsupported") return true;
+		unsupportedProviders.push(provider.name);
+		return false;
+	});
+	// Unknown legacy contracts retain their existing canHandle validation at
+	// dispatch. Their presence is not promoted into a native counting claim.
+	if (compatible.length === 0 && rejectAllUnsupported)
+		throw new CountTokensUnsupportedError(unsupportedProviders);
+	return compatible;
+}
+
 async function selectCapabilityDescendantAccounts(
 	meta: RequestMeta,
 	ctx: ProxyContext,
@@ -2491,16 +2521,16 @@ async function selectCapabilityDescendantAccounts(
 	const rootModel = meta.routeProfileLogicalModel?.trim();
 	if (!rootModel) throw capabilityRouteUnavailable(meta, []);
 	const excludedProviders = getExcludedProviders(meta);
-	const rootPool = allAccounts.filter(
+	const enrolledRootPool = allAccounts.filter(
 		(account) =>
 			isAccountEligibleForRouteIntent(account, meta, ctx) &&
 			matchesCapabilityRouteProfile(account, meta) &&
 			!isProviderExcludedForRequest(account, excludedProviders),
 	);
-	if (rootPool.length === 0) {
+	if (enrolledRootPool.length === 0) {
 		throw capabilityRouteUnavailable(
 			meta,
-			rootPool,
+			enrolledRootPool,
 			allAccounts.filter(
 				(account) =>
 					isAccountEligibleForRouteIntent(account, meta, ctx) &&
@@ -2509,16 +2539,22 @@ async function selectCapabilityDescendantAccounts(
 		);
 	}
 
-	const globalPool = applyImplicitFallbackPolicy(
-		allAccounts.filter(
-			(account) =>
-				isAccountEligibleForRouteIntent(account, meta, ctx) &&
-				!isProviderExcludedForRequest(account, excludedProviders) &&
-				isOrdinaryStockModelAccountEligible(account, effectiveModel),
-		),
-		ctx,
-		"normal",
+	const rootPool = filterCountHelperAccounts(meta, ctx, enrolledRootPool);
+	const globalPool = filterCountHelperAccounts(
 		meta,
+		ctx,
+		applyImplicitFallbackPolicy(
+			allAccounts.filter(
+				(account) =>
+					isAccountEligibleForRouteIntent(account, meta, ctx) &&
+					!isProviderExcludedForRequest(account, excludedProviders) &&
+					isOrdinaryStockModelAccountEligible(account, effectiveModel),
+			),
+			ctx,
+			"normal",
+			meta,
+		),
+		false,
 	);
 	const specifications = [
 		...rootPool.map((account) => ({
@@ -2690,12 +2726,17 @@ export async function getOrderedAccounts(
 		const excludedProviders = meta.serverToolRequirements
 			? getExcludedProviders(meta)
 			: [];
-		const structuralAccounts = meta.serverToolRequirements
+		const enrolledStructuralAccounts = meta.serverToolRequirements
 			? allAccounts.filter(
 					(account) =>
 						!isProviderExcludedForRequest(account, excludedProviders),
 				)
 			: allAccounts;
+		const structuralAccounts = filterCountHelperAccounts(
+			meta,
+			ctx,
+			enrolledStructuralAccounts,
+		);
 		setXaiCacheEligibleAccounts(meta, structuralAccounts);
 		const eligibleAccounts = prepareNormalRoutingMetadata(
 			meta,
@@ -2790,7 +2831,11 @@ export async function getOrderedAccounts(
 		return affinityOrdered;
 	} catch (error) {
 		capacityDeferredModelRoutesMap.delete(meta);
-		if (error instanceof ServerToolRoutingError) throw error;
+		if (
+			error instanceof ServerToolRoutingError ||
+			error instanceof CountTokensUnsupportedError
+		)
+			throw error;
 		reportAccountDatabaseError(error);
 		if (meta.serverToolRequirements) throw serverToolSelectionFailure(meta);
 		// Return empty array to gracefully handle database errors
@@ -2996,6 +3041,7 @@ async function selectAccountsForRequestInternal(
 					);
 				}
 
+				filterCountHelperAccounts(meta, ctx, [forcedAccount]);
 				if (effectiveModel) {
 					const now = Date.now();
 					const evaluation = evaluateCandidateCapacity(
@@ -3062,6 +3108,7 @@ async function selectAccountsForRequestInternal(
 		} catch (error) {
 			if (
 				error instanceof ForceRouteUnavailableError ||
+				error instanceof CountTokensUnsupportedError ||
 				error instanceof ServerToolRoutingError
 			) {
 				throw error;
@@ -3434,11 +3481,15 @@ async function selectAccountsForRequestInternal(
 								isAccountEligibleForRouteIntent(account, meta, ctx) &&
 								!isProviderExcluded(account),
 						);
-					const implicitComboAccounts = applyImplicitFallbackPolicy(
-						comboPolicyAccounts,
-						ctx,
-						"combo",
+					const implicitComboAccounts = filterCountHelperAccounts(
 						meta,
+						ctx,
+						applyImplicitFallbackPolicy(
+							comboPolicyAccounts,
+							ctx,
+							"combo",
+							meta,
+						),
 					);
 					const implicitComboAccountIds = new Set(
 						implicitComboAccounts.map((account) => account.id),

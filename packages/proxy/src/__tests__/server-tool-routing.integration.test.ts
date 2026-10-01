@@ -30,6 +30,9 @@ import {
 // Focused proxy tests must not load ignored embedded worker artifacts.
 const { buildServerToolCapabilityProofKey, getProvider, usageCache } =
 	await import("@better-ccflare/providers");
+const { selectAccountsForRequest } = await import(
+	"../handlers/account-selector"
+);
 const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");
 const { codexWebSocketTransport } = await import(
@@ -1612,5 +1615,333 @@ describe("server-tool routing integration", () => {
 				process.env.CCFLARE_CONTEXT_ADMISSION = originalContextAdmission;
 			}
 		}
+	});
+});
+
+describe("xAI count helpers preserve exact provider intent", () => {
+	it.each([
+		false,
+		true,
+	])("returns unsupported without hosted execution or a sibling route (hosted=%s)", async (hosted) => {
+		const xai = makeAccount({
+			id: "forced-xai-count",
+			provider: "xai",
+			access_token: null,
+			expires_at: null,
+			custom_endpoint: null,
+			model_mappings: null,
+		});
+		const sibling = makeAccount({ id: "count-sibling" });
+		const { ctx, refreshCalls, mutations } = makeContext([xai, sibling]);
+		const provider = getProvider("xai");
+		if (!provider) throw new Error("xAI provider missing");
+		const refresh = spyOn(provider, "refreshToken").mockResolvedValue({
+			accessToken: "mock-token",
+			expiresAt: Date.now() + 60_000,
+		});
+		globalThis.fetch = mock(
+			async () => new Response("not expected", { status: 500 }),
+		);
+		const request = new Request(
+			"https://proxy.local/v1/messages/count_tokens",
+			{
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"x-better-ccflare-account-id": xai.id,
+				},
+				body: JSON.stringify({
+					model: MODEL,
+					messages: [{ role: "user", content: "hello" }],
+					...(hosted
+						? { tools: [{ type: "web_search_20250305", name: "web_search" }] }
+						: {}),
+				}),
+			},
+		);
+		try {
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(501);
+			expect(await response.json()).toMatchObject({
+				error: { code: "count_tokens_unsupported", provider: "xai" },
+			});
+			expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			expect(refresh).toHaveBeenCalledTimes(0);
+			expect(refreshCalls.value).toBe(0);
+			expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+			expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+			expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+			expect(mutations.updateAccountUsage).toHaveBeenCalledTimes(0);
+			expect(mutations.reportFailure).toHaveBeenCalledTimes(0);
+		} finally {
+			refresh.mockRestore();
+		}
+	});
+	it("keeps forced xAI hosted generation fail-closed", async () => {
+		const xai = makeAccount({
+			id: "forced-xai-generation",
+			provider: "xai",
+			custom_endpoint: null,
+			model_mappings: null,
+		});
+		const { ctx, refreshCalls } = makeContext([
+			xai,
+			makeAccount({ id: "generation-sibling" }),
+		]);
+		globalThis.fetch = mock(
+			async () => new Response("not expected", { status: 500 }),
+		);
+		const request = makeServerToolRequest({ forcedAccountId: xai.id });
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({
+			error: {
+				code: "server_tool_force_route_unavailable",
+				reason: "forced_incapable",
+			},
+		});
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+	});
+});
+
+describe("count helper declaration validation", () => {
+	it("rejects malformed hosted declaration options before credentials without executing them", async () => {
+		const xai = makeAccount({
+			id: "invalid-xai-count",
+			provider: "xai",
+			custom_endpoint: null,
+			model_mappings: null,
+		});
+		const { ctx, refreshCalls } = makeContext(xai);
+		globalThis.fetch = mock(
+			async () => new Response("not expected", { status: 500 }),
+		);
+		const generation = makeServerToolRequest({
+			forcedAccountId: xai.id,
+			invalid: true,
+		});
+		const request = new Request(
+			"https://proxy.local/v1/messages/count_tokens",
+			{
+				method: "POST",
+				headers: generation.headers,
+				body: await generation.text(),
+			},
+		);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({
+			error: { code: "server_tool_invalid_requirement" },
+		});
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+	});
+	it("fails a forced unknown xAI path locally without URL forwarding or sibling routing", async () => {
+		const xai = makeAccount({
+			id: "unknown-xai-path",
+			provider: "xai",
+			custom_endpoint: null,
+			model_mappings: null,
+		});
+		const { ctx, refreshCalls, mutations } = makeContext([
+			xai,
+			makeAccount({ id: "unknown-sibling" }),
+		]);
+		globalThis.fetch = mock(
+			async () => new Response("not expected", { status: 500 }),
+		);
+		const request = new Request("https://proxy.local/v1/arbitrary", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-account-id": xai.id,
+			},
+			body: JSON.stringify({ model: MODEL, messages: [] }),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		expect(response.status).toBe(404);
+		expect(await response.json()).toMatchObject({
+			error: { code: "provider_path_unknown", provider: "xai" },
+		});
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+		expect(mutations.reportFailure).toHaveBeenCalledTimes(0);
+	});
+});
+
+describe("count helper capability before ranking", () => {
+	it.each([
+		"ordinary",
+		"profile",
+		"combo",
+	] as const)("rejects an all-unsupported %s enrollment before ranking without borrowing another pool", async (enrollment) => {
+		const xai = makeAccount({
+			id: "enrolled-xai-count",
+			provider: "xai",
+			custom_endpoint: null,
+			model_mappings: JSON.stringify({
+				sonnet: enrollment === "profile" ? "grok-count-test" : MODEL,
+			}),
+		});
+		const outside = makeAccount({ id: "outside-count-pool" });
+		const { ctx, refreshCalls, mutations } = makeContext(
+			enrollment === "ordinary" ? [xai] : [xai, outside],
+		);
+		if (enrollment === "profile") {
+			ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+				parseModelRouteProfiles(
+					JSON.stringify([
+						{
+							id: "count-only-xai",
+							displayName: "Count only xAI",
+							selection: "capability",
+							logicalModel: MODEL,
+							expectedProvider: "xai",
+							expectedPhysicalModel: "grok-count-test",
+						},
+					]),
+				),
+			);
+		} else if (enrollment === "combo") {
+			installComboRoutingPolicy(ctx, makeComboRoutingPolicy(xai));
+		}
+		const xaiProvider = getProvider("xai");
+		if (!xaiProvider) throw new Error("xAI provider missing");
+		const refresh = spyOn(xaiProvider, "refreshToken").mockResolvedValue({
+			accessToken: "unexpected-token",
+			expiresAt: Date.now() + 60_000,
+		});
+		globalThis.fetch = mock(async () => new Response(null, { status: 500 }));
+		const request = new Request(
+			"https://proxy.local/v1/messages/count_tokens",
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model:
+						enrollment === "profile"
+							? "claude-bccf-route-count-only-xai"
+							: MODEL,
+					messages: [{ role: "user", content: "hello" }],
+					tools: [{ type: "web_search_20250305", name: "web_search" }],
+				}),
+			},
+		);
+		try {
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(501);
+			expect(await response.json()).toMatchObject({
+				error: { code: "count_tokens_unsupported", provider: "xai" },
+			});
+			expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+			expect(refresh).toHaveBeenCalledTimes(0);
+			expect(refreshCalls.value).toBe(0);
+			expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+			expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+			expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+			expect(mutations.updateAccountUsage).toHaveBeenCalledTimes(0);
+			expect(mutations.reportFailure).toHaveBeenCalledTimes(0);
+		} finally {
+			refresh.mockRestore();
+		}
+	});
+	it.each([
+		false,
+		true,
+	])("returns typed unsupported with a default xAI adapter (empty=%s)", async (empty) => {
+		const xai = makeAccount({ id: "default-xai-count", provider: "xai" });
+		const { ctx, refreshCalls, mutations } = makeContext(empty ? [] : [xai]);
+		const provider = getProvider("xai");
+		if (!provider) throw new Error("xAI provider missing");
+		ctx.provider = provider;
+		globalThis.fetch = mock(async () => new Response(null, { status: 500 }));
+		const request = new Request(
+			"https://proxy.local/v1/messages/count_tokens",
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: MODEL,
+					messages: [{ role: "user", content: "hello" }],
+				}),
+			},
+		);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		expect(response.status).toBe(501);
+		expect(await response.json()).toMatchObject({
+			error: { code: "count_tokens_unsupported", provider: "xai" },
+		});
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+		if (!empty) expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+	});
+	it("rejects an unsupported descendant root before constructing a global count fallback", async () => {
+		const xai = makeAccount({
+			id: "descendant-count-root",
+			provider: "xai",
+			model_mappings: JSON.stringify({ sonnet: "grok-count-test" }),
+		});
+		const outside = makeAccount({ id: "outside-descendant-count" });
+		const { ctx, refreshCalls, mutations } = makeContext([xai, outside]);
+		const meta = {
+			id: "descendant-count-fixture",
+			path: "/v1/messages/count_tokens",
+			headers: new Headers(),
+			originalModel: MODEL,
+			appliedModel: null,
+			routeProfileId: "count-xai-profile",
+			routeProfileSelection: "capability",
+			routeProfileLogicalModel: MODEL,
+			routeExpectedProvider: "xai",
+			routeExpectedPhysicalModel: "grok-count-test",
+			routeProfileExpectedPhysicalModel: "grok-count-test",
+			routeLineage: { kind: "descendant" },
+		} as RequestMeta;
+		await expect(
+			selectAccountsForRequest(meta, ctx, MODEL),
+		).rejects.toMatchObject({
+			name: "CountTokensUnsupportedError",
+			providers: ["xai"],
+		});
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+		expect(meta.routingCandidateCatalog).toBeNull();
+		expect(meta.quotaPressureByAccountId).toBeNull();
+		expect(refreshCalls.value).toBe(0);
+		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+	});
+	it.each([
+		"count_tokens",
+		"generation",
+	] as const)("filters only count helpers and preserves enrolled unknown compatibility (%s)", async (operation) => {
+		const xai = makeAccount({ id: "unsupported-count", provider: "xai" });
+		const legacy = makeAccount({ id: "unknown-count" });
+		const { ctx } = makeContext([xai, legacy]);
+		const seen: string[][] = [];
+		ctx.strategy.select = mock(async (accounts: Account[]) => {
+			seen.push(accounts.map((account) => account.id));
+			// Ordering cannot reintroduce an account excluded by helper capability.
+			return [xai, legacy];
+		});
+		const meta = {
+			id: "helper-ranking-fixture",
+			path:
+				operation === "count_tokens"
+					? "/v1/messages/count_tokens"
+					: "/v1/messages",
+			headers: new Headers(),
+			originalModel: MODEL,
+			appliedModel: null,
+		} as RequestMeta;
+		const accounts = await selectAccountsForRequest(meta, ctx, MODEL);
+		expect(seen).toEqual([
+			operation === "count_tokens" ? [legacy.id] : [xai.id, legacy.id],
+		]);
+		expect(accounts.map((account) => account.id)).toEqual(
+			operation === "count_tokens" ? [legacy.id] : [xai.id, legacy.id],
+		);
 	});
 });

@@ -36,6 +36,7 @@ import {
 	captureSynchronousAttemptIdentity,
 	decideContextAdmission,
 	estimateAnthropicAdmissionTokens,
+	getProviderPathCapability,
 	hasDeferredCustomTool,
 	isAnthropicExtraUsageExhausted,
 	isAnthropicOrgPermissionDenied,
@@ -2379,6 +2380,26 @@ class AnthropicPreCommitAttemptScope {
 	}
 }
 
+export function createCountTokensUnsupportedResponse(
+	providers: readonly string[],
+): Response {
+	const provider = providers.length === 1 ? providers[0] : undefined;
+	return Response.json(
+		{
+			type: "error",
+			error: {
+				type: "not_implemented_error",
+				code: "count_tokens_unsupported",
+				...(provider ? { provider } : { providers: [...providers] }),
+				message: provider
+					? `${provider} does not support structured message token counting.`
+					: "Enrolled providers do not support structured message token counting.",
+			},
+		},
+		{ status: 501 },
+	);
+}
+
 /**
  * Handles proxy request without authentication
  * @param req - The incoming request
@@ -2402,6 +2423,14 @@ export async function proxyUnauthenticated(
 	anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext,
 	routingAttemptLedger?: RoutingAttemptLedger,
 ): Promise<Response> {
+	if (url.pathname === "/v1/messages/count_tokens") {
+		if (
+			getProviderPathCapability(ctx.provider, url.pathname).support ===
+			"unsupported"
+		)
+			return createCountTokensUnsupportedResponse([ctx.provider.name]);
+		validateProviderPath(ctx.provider, url.pathname);
+	}
 	log.warn(ERROR_MESSAGES.NO_ACCOUNTS);
 
 	const identity = captureSynchronousAttemptIdentity(
@@ -2907,6 +2936,33 @@ export async function proxyWithAccount(
 			});
 		}
 		const provider = resolvedProvider;
+		const pathCapability = getProviderPathCapability(provider, url.pathname);
+		if (
+			pathCapability.operation === "count_tokens" &&
+			pathCapability.support === "unsupported"
+		) {
+			// A local terminal, not an unavailable account or a retryable transport failure.
+			return createCountTokensUnsupportedResponse([provider.name]);
+		}
+
+		if (
+			pathCapability.support === "unknown" &&
+			!provider.canHandle(url.pathname)
+		) {
+			return Response.json(
+				{
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						code: "provider_path_unknown",
+						provider: provider.name,
+						message:
+							"This provider has no implementation for the requested path.",
+					},
+				},
+				{ status: 404 },
+			);
+		}
 		const requestedModelBeforeAdmission = effectiveBodyContext.getModel();
 		const cacheReplayPhysicalModel = req.headers.get(CACHE_REPLAY_MODEL_HEADER);
 		const requestedConfiguredModelMapping = requestedModelBeforeAdmission
@@ -3488,14 +3544,14 @@ export async function proxyWithAccount(
 		};
 		let currentReplayBody = effectiveBodyBuffer;
 
-		const isSyntheticCodexCountTokens =
-			attemptPlan.providerName === "codex" &&
-			url.pathname === "/v1/messages/count_tokens";
+		const isLocalAdvisoryCountTokens =
+			pathCapability.operation === "count_tokens" &&
+			pathCapability.support === "local-advisory";
 
 		// Synthetic Codex count_tokens never calls upstream, so it should not require
 		// or refresh OAuth credentials just to return an advisory local estimate.
 		let accessToken = "";
-		if (!isSyntheticCodexCountTokens) {
+		if (!isLocalAdvisoryCountTokens) {
 			try {
 				accessToken = await runWithPreTransportDeadline({
 					phase: "credential_resolution",
