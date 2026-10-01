@@ -70,7 +70,14 @@ import {
 	poolFloorApproachingThreshold,
 } from "./pool-floor-event";
 import { isInternalProbe, type ProxyContext } from "./proxy-types";
-import { boundedRoutingSelectionCount } from "./routing-selection-diagnostics";
+import {
+	boundedRoutingSelectionCount,
+	completeRoutingSelectionStage,
+	loadRoutingInventory,
+	observeRoutingCapacity,
+	observeRoutingSelectionCandidate,
+	routingDiagnosticCandidateKey,
+} from "./routing-selection-diagnostics";
 import {
 	evaluateHardCapacity,
 	getWeeklyQuotaPressure,
@@ -1292,6 +1299,7 @@ interface CandidateCapacityEvaluation {
 type CapacityRouteIntent = "ordinary" | "capability" | "combo" | "force";
 
 interface CandidateCapacityEvaluationOptions {
+	readonly observationMeta?: RequestMeta;
 	readonly modelScopedCapacityRouting: ModelScopedCapacityRoutingMode;
 	readonly routeIntent: CapacityRouteIntent;
 	readonly syntheticProbe: boolean;
@@ -1376,6 +1384,28 @@ function evaluateCandidateCapacity(
 		if (reactive) blockers.push(reactive);
 	}
 
+	if (options.observationMeta) {
+		const key = routingDiagnosticCandidateKey(account.id, model);
+		observeRoutingSelectionCandidate(
+			options.observationMeta,
+			"capacity",
+			key,
+			blockers.length === 0
+				? null
+				: blockers[0].scope === "account"
+					? "account_capacity"
+					: "model_capacity",
+		);
+		observeRoutingCapacity(
+			options.observationMeta,
+			key,
+			snapshot?.observedAt ?? null,
+			blockers.length
+				? Math.min(...blockers.map((blocker) => blocker.evidenceExpiresAt))
+				: null,
+			now,
+		);
+	}
 	return {
 		blockers,
 		blockedUntil:
@@ -1679,6 +1709,7 @@ function prepareNormalRoutingMetadata(
 			quotaPressure.set(account.id, evaluation.quotaPressure);
 		}
 	}
+	completeRoutingSelectionStage(meta, "capacity");
 	meta.hardExcludedAccountIds = excludedIds.size > 0 ? excludedIds : null;
 	meta.quotaPressureByAccountId = quotaPressure.size > 0 ? quotaPressure : null;
 	capacityDeferredModelRoutesMap.set(meta, deferredRoutes);
@@ -1813,6 +1844,7 @@ function finalizeNormalServerToolRoutingMetadata(
 	}
 
 	const catalog = [...baseCatalog, ...deferredCatalog];
+	completeRoutingSelectionStage(meta, "capacity");
 	meta.hardExcludedAccountIds = excludedIds.size > 0 ? excludedIds : null;
 	meta.quotaPressureByAccountId = quotaPressure.size > 0 ? quotaPressure : null;
 	capacityDeferredModelRoutesMap.set(meta, deferredRoutes);
@@ -2196,6 +2228,7 @@ function setImplicitFallbackSelectionDiagnostics(
 		eligibleCandidateCount: eligible,
 		excludedCandidateCount: structural - eligible,
 		selectedCandidateCount: existing?.selectedCandidateCount ?? 0,
+		reasonEvidence: exactPolicyExclusion ? "exact" : "inferred",
 		zeroAttemptReason: exactPolicyExclusion
 			? "policy_excluded"
 			: "all_unavailable",
@@ -2245,9 +2278,21 @@ function applyImplicitFallbackPolicy(
 		const decision = evaluateImplicitFallbackPolicy(account, policy);
 		if (decision.reason === "unknown") unknownCount += 1;
 		if (!decision.allowed) deniedCount += 1;
+		if (meta)
+			observeRoutingSelectionCandidate(
+				meta,
+				"implicit_policy",
+				account.id,
+				!decision.allowed && policy.mode === "enforce"
+					? decision.reason === "unknown"
+						? "policy_unknown"
+						: "policy_denied"
+					: null,
+			);
 		return decision.allowed;
 	});
 	if (meta) {
+		completeRoutingSelectionStage(meta, "implicit_policy");
 		setImplicitFallbackSelectionDiagnostics(
 			meta,
 			policy,
@@ -2291,9 +2336,20 @@ function applyOrdinaryStockModelEligibility(
 		return accounts;
 	}
 
-	const eligible = accounts.filter((account) =>
-		isOrdinaryStockModelAccountEligible(account, effectiveModel),
-	);
+	const eligible = accounts.filter((account) => {
+		const admitted = isOrdinaryStockModelAccountEligible(
+			account,
+			effectiveModel,
+		);
+		observeRoutingSelectionCandidate(
+			meta,
+			"model_mapping",
+			routingDiagnosticCandidateKey(account.id, effectiveModel),
+			admitted ? null : "model_ineligible",
+		);
+		return admitted;
+	});
+	completeRoutingSelectionStage(meta, "model_mapping");
 	if (eligible.length === accounts.length) return accounts;
 
 	const existing = meta.routingSelectionDiagnostics;
@@ -2310,6 +2366,7 @@ function applyOrdinaryStockModelEligibility(
 		eligibleCandidateCount: eligibleCount,
 		excludedCandidateCount: structural - eligibleCount,
 		selectedCandidateCount: existing?.selectedCandidateCount ?? 0,
+		reasonEvidence: eligibleCount === 0 ? "exact" : "inferred",
 		zeroAttemptReason:
 			eligibleCount === 0 ? "policy_excluded" : "all_unavailable",
 		forcedRoute: false,
@@ -2334,10 +2391,24 @@ function matchesCapabilityRouteProfile(
 	const expectedProvider = meta.routeExpectedProvider?.trim().toLowerCase();
 	const logicalModel = meta.routeProfileLogicalModel?.trim();
 	if (meta.routeProfilePhysicalModelPolicy === "catalog-role") {
-		if (!expectedProvider || !logicalModel) return false;
+		if (!expectedProvider || !logicalModel) {
+			observeRoutingSelectionCandidate(
+				meta,
+				"profile_constraint",
+				account.id,
+				"model_mapping_mismatch",
+			);
+			return false;
+		}
 		const evaluation = evaluateRootCatalogRoleConstraint(account, meta);
 		const admitted =
 			evaluation.violation === null && evaluation.catalogRoleTarget !== null;
+		observeRoutingSelectionCandidate(
+			meta,
+			"profile_constraint",
+			account.id,
+			evaluation.violation,
+		);
 		recordCatalogRoleAdmission(
 			meta,
 			account.id,
@@ -2347,18 +2418,26 @@ function matchesCapabilityRouteProfile(
 	}
 	const expectedPhysicalModel = meta.routeProfileExpectedPhysicalModel?.trim();
 	if (!expectedProvider || !expectedPhysicalModel || !logicalModel) {
+		observeRoutingSelectionCandidate(
+			meta,
+			"profile_constraint",
+			account.id,
+			"model_mapping_mismatch",
+		);
 		return false;
 	}
-	return (
-		getRouteProfileConstraintViolation(
-			account,
-			{
-				...meta,
-				routeExpectedPhysicalModel: expectedPhysicalModel,
-			},
-			logicalModel,
-		) === null
+	const violation = getRouteProfileConstraintViolation(
+		account,
+		{ ...meta, routeExpectedPhysicalModel: expectedPhysicalModel },
+		logicalModel,
 	);
+	observeRoutingSelectionCandidate(
+		meta,
+		"profile_constraint",
+		account.id,
+		violation,
+	);
+	return violation === null;
 }
 
 /**
@@ -2496,12 +2575,25 @@ function filterCountHelperAccounts(
 	const unsupportedProviders: string[] = [];
 	const compatible = enrolledAccounts.filter((account) => {
 		const provider = resolveProviderForAccount(account.provider, ctx.provider);
-		if (!provider) return true;
+		if (!provider) {
+			observeRoutingSelectionCandidate(meta, "count_helper", account.id, null);
+			return true;
+		}
 		const capability = getProviderPathCapability(provider, meta.path);
-		if (capability.support !== "unsupported") return true;
+		if (capability.support !== "unsupported") {
+			observeRoutingSelectionCandidate(meta, "count_helper", account.id, null);
+			return true;
+		}
+		observeRoutingSelectionCandidate(
+			meta,
+			"count_helper",
+			account.id,
+			"count_unsupported",
+		);
 		unsupportedProviders.push(provider.name);
 		return false;
 	});
+	completeRoutingSelectionStage(meta, "count_helper");
 	// Unknown legacy contracts retain their existing canHandle validation at
 	// dispatch. Their presence is not promoted into a native counting claim.
 	if (compatible.length === 0 && rejectAllUnsupported)
@@ -2527,6 +2619,7 @@ async function selectCapabilityDescendantAccounts(
 			matchesCapabilityRouteProfile(account, meta) &&
 			!isProviderExcludedForRequest(account, excludedProviders),
 	);
+	completeRoutingSelectionStage(meta, "profile_constraint");
 	if (enrolledRootPool.length === 0) {
 		throw capabilityRouteUnavailable(
 			meta,
@@ -2621,6 +2714,7 @@ async function selectCapabilityDescendantAccounts(
 				modelScopedCapacityRouting,
 				routeIntent:
 					specification.constraint === "profile" ? "capability" : "ordinary",
+				observationMeta: meta,
 				syntheticProbe,
 			},
 		);
@@ -2709,6 +2803,7 @@ export async function getOrderedAccounts(
 ): Promise<Account[]> {
 	try {
 		const capacityOptions: CandidateCapacityEvaluationOptions = {
+			observationMeta: meta,
 			modelScopedCapacityRouting,
 			routeIntent: isCapabilityRouteSelection(meta.routeProfileSelection)
 				? "capability"
@@ -2716,13 +2811,22 @@ export async function getOrderedAccounts(
 			syntheticProbe,
 		};
 		const loadedAccounts =
-			preloadedAccounts ?? (await ctx.dbOps.getAllAccounts());
+			preloadedAccounts ??
+			(await loadRoutingInventory(meta, () => ctx.dbOps.getAllAccounts()));
 		const preselectedAccounts = preselectionFilter
 			? preselectionFilter(loadedAccounts)
 			: loadedAccounts;
-		const allAccounts = preselectedAccounts.filter((account) =>
-			isAccountEligibleForRouteIntent(account, meta, ctx),
-		);
+		const allAccounts = preselectedAccounts.filter((account) => {
+			const eligible = isAccountEligibleForRouteIntent(account, meta, ctx);
+			observeRoutingSelectionCandidate(
+				meta,
+				"route_intent",
+				account.id,
+				eligible ? null : "profile_only",
+			);
+			return eligible;
+		});
+		completeRoutingSelectionStage(meta, "route_intent");
 		const excludedProviders = meta.serverToolRequirements
 			? getExcludedProviders(meta)
 			: [];
@@ -2914,7 +3018,9 @@ async function selectAccountsForRequestInternal(
 	}
 	if (forcedAccountId) {
 		try {
-			const allAccounts = await ctx.dbOps.getAllAccounts();
+			const allAccounts = await loadRoutingInventory(meta, () =>
+				ctx.dbOps.getAllAccounts(),
+			);
 			const forcedAccount = allAccounts.find(
 				(acc) => acc.id === forcedAccountId,
 			);
@@ -2951,6 +3057,13 @@ async function selectAccountsForRequestInternal(
 					{ ...meta, routeCatalogRoleTargetByAccountId: null },
 					effectiveModel,
 				);
+				observeRoutingSelectionCandidate(
+					meta,
+					"profile_constraint",
+					forcedAccount.id,
+					constraint.violation,
+				);
+				completeRoutingSelectionStage(meta, "profile_constraint");
 				if (constraint.violation) {
 					throw new ForceRouteUnavailableError(
 						forcedAccountId,
@@ -3052,6 +3165,7 @@ async function selectAccountsForRequestInternal(
 						{
 							modelScopedCapacityRouting,
 							routeIntent: "force",
+							observationMeta: meta,
 							syntheticProbe: options.syntheticProbe === true,
 						},
 					);
@@ -3143,7 +3257,8 @@ async function selectAccountsForRequestInternal(
 		let allAccounts: Account[];
 		try {
 			allAccounts =
-				options.preloadedAccounts ?? (await ctx.dbOps.getAllAccounts());
+				options.preloadedAccounts ??
+				(await loadRoutingInventory(meta, () => ctx.dbOps.getAllAccounts()));
 		} catch (error) {
 			log.error(
 				"Failed to get accounts from database for capability route lookup:",
@@ -3223,9 +3338,16 @@ async function selectAccountsForRequestInternal(
 				);
 			};
 			await refreshImplicitAccountProofs(allAccounts);
-			matchesRoute = (account) =>
-				proofsByAccountId.get(account.id)?.serves === true &&
-				matchesCapabilityRouteProfile(account, meta);
+			matchesRoute = (account) => {
+				const serves = proofsByAccountId.get(account.id)?.serves === true;
+				observeRoutingSelectionCandidate(
+					meta,
+					"model_mapping",
+					account.id,
+					serves ? null : "model_mapping_mismatch",
+				);
+				return serves && matchesCapabilityRouteProfile(account, meta);
+			};
 		} else {
 			matchesRoute = (account) => matchesCapabilityRouteProfile(account, meta);
 		}
@@ -3260,6 +3382,8 @@ async function selectAccountsForRequestInternal(
 				matchesRoute(account) &&
 				!isProviderExcludedForRequest(account, excludedProviders),
 		);
+		completeRoutingSelectionStage(meta, "profile_constraint");
+		completeRoutingSelectionStage(meta, "model_mapping");
 		if (matchingAccounts.length === 0) {
 			if (meta.routeLineage?.kind === "helper") {
 				return selectGlobalHelperFallback();
@@ -3335,7 +3459,17 @@ async function selectAccountsForRequestInternal(
 
 	const applyExclusions = (accounts: Account[]): Account[] => {
 		if (excludeProviders.length === 0) return accounts;
-		const filtered = accounts.filter((account) => !isProviderExcluded(account));
+		const filtered = accounts.filter((account) => {
+			const excluded = isProviderExcluded(account);
+			observeRoutingSelectionCandidate(
+				meta,
+				"provider_constraint",
+				account.id,
+				excluded ? "provider_excluded" : null,
+			);
+			return !excluded;
+		});
+		completeRoutingSelectionStage(meta, "provider_constraint");
 		const skipped = accounts.length - filtered.length;
 		if (skipped > 0) {
 			log.warn(
@@ -3417,7 +3551,9 @@ async function selectAccountsForRequestInternal(
 				}
 				let allAccounts: Account[];
 				try {
-					allAccounts = await ctx.dbOps.getAllAccounts();
+					allAccounts = await loadRoutingInventory(meta, () =>
+						ctx.dbOps.getAllAccounts(),
+					);
 				} catch (error) {
 					reportAccountDatabaseError(error, pendingNativeContext !== null);
 					if (meta.serverToolRequirements) {
@@ -3517,6 +3653,7 @@ async function selectAccountsForRequestInternal(
 					// Effective members are structural candidates. The resolver owns
 					// manual/managed precedence and its order is the stable ordinal.
 					const capacityOptions: CandidateCapacityEvaluationOptions = {
+						observationMeta: meta,
 						modelScopedCapacityRouting,
 						routeIntent: "combo",
 						syntheticProbe: options.syntheticProbe === true,

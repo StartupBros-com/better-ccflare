@@ -279,6 +279,90 @@ afterEach(() => {
 	}
 });
 
+describe("routing decision local return coverage", () => {
+	it.each([
+		"reactive",
+		"predictive",
+		"force_model",
+		"inventory",
+		"policy",
+	] as const)("records %s terminal exactly once with no serving identity or physical send", async (kind) => {
+		const account = makeAccount({
+			id: `local-decision-${kind}`,
+			provider: kind === "policy" ? "codex" : "claude-console-api",
+		});
+		const ctx = makeContext([account]);
+		let sends = 0;
+		globalThis.fetch = mock(async () => {
+			sends++;
+			throw new Error("no transport authorized in local-return fixture");
+		}) as unknown as typeof fetch;
+		if (kind === "reactive") {
+			ctx.config.getModelScopedCapacityRouting = () => "off";
+			usageCache.markModelScopedExhausted(
+				account.id,
+				"claude-sonnet-4-5",
+				"",
+				Date.now() + 60_000,
+			);
+		} else if (kind === "predictive") {
+			ctx.config.getUsageThrottlingFiveHourEnabled = () => true;
+			usageCache.set(account.id, {
+				five_hour: {
+					utilization: 80,
+					resets_at: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+				},
+				seven_day: { utilization: 0, resets_at: null },
+			} as never);
+		} else if (kind === "force_model") {
+			account.model_mappings = JSON.stringify({ sonnet: "other-model" });
+			ctx.config.getForceAccountModel = () => true;
+		} else if (kind === "inventory")
+			ctx.dbOps.getAllAccounts = mock(async () => {
+				throw new Error("inventory fixture failure");
+			}) as never;
+		try {
+			const request = makeRequest();
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			await response.text();
+			await Promise.resolve();
+			expect(response.status).toBe(kind === "predictive" ? 529 : 503);
+			expect(sends).toBe(0);
+			expect(usageStarts).toHaveLength(1);
+			expect(usageEnds).toHaveLength(1);
+			expect(usageStarts[0].accountId).toBeNull();
+			const reason =
+				kind === "reactive"
+					? "model_pool_exhausted"
+					: kind === "predictive"
+						? "predictive_throttle"
+						: kind === "force_model"
+							? "force_model_denied"
+							: kind === "inventory"
+								? "inventory_failed"
+								: "policy_excluded";
+			expect(usageEnds[0]).toMatchObject({
+				routingAttemptSummary: {
+					physicalAttemptCount: 0,
+					winnerOrdinal: null,
+					decision: {
+						reason,
+						requestedLogicalModel: "claude-sonnet-4-5",
+						operation: "messages",
+						evidence: "exact",
+					},
+				},
+			});
+			if (kind === "inventory")
+				expect(usageEnds[0]).toMatchObject({
+					routingAttemptSummary: { decision: { inventory: "failed" } },
+				});
+		} finally {
+			usageCache.delete(account.id);
+		}
+	});
+});
+
 describe("routing terminal — 503 response", () => {
 	it.each([
 		"reject",
@@ -501,7 +585,10 @@ describe("routing terminal — 503 response", () => {
 		});
 	});
 
-	it("records a delayed local non-SSE terminal only when the outer rescue owns its translation", async () => {
+	it.each([
+		"resolves",
+		"rejects",
+	] as const)("records a delayed local selection timeout once when its late selector %s", async (lateOutcome) => {
 		process.env[MEANINGFUL_PROGRESS_ENV] = "100";
 		process.env[RESCUE_ACTIVATION_ENV] = "1";
 		process.env[RESCUE_PING_ENV] = "5";
@@ -510,6 +597,8 @@ describe("routing terminal — 503 response", () => {
 		ctx.strategy = {
 			select: async () => {
 				await delay(30);
+				if (lateOutcome === "rejects")
+					throw new Error("late selector fixture rejection");
 				return [];
 			},
 		} as never;
@@ -528,13 +617,28 @@ describe("routing terminal — 503 response", () => {
 		expect(usageStarts[0]).toMatchObject({
 			requestId: usageEnds[0].requestId,
 			accountId: null,
-			responseStatus: 200,
-			isStream: true,
+			responseStatus: 503,
+			isStream: false,
 		});
 		expect(usageEnds[0]).toMatchObject({
 			success: false,
-			error: "anthropic_rescue_non_sse_response",
+			error: "selection_timeout",
+			routingAttemptSummary: {
+				nativeStatus: 503,
+				wireStatus: 200,
+				physicalAttemptCount: 0,
+				winnerOrdinal: null,
+				decision: {
+					reason: "selection_timeout",
+					evidence: "exact",
+					requestedLogicalModel: "claude-sonnet-4-5",
+				},
+			},
 		});
+		// Late selector completion cannot create another lifecycle or dispatch.
+		await delay(40);
+		expect(usageStarts).toHaveLength(1);
+		expect(usageEnds).toHaveLength(1);
 	});
 
 	it("records the outer commitment deadline once when routing never settles", async () => {

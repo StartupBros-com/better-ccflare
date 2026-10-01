@@ -1,4 +1,12 @@
 import {
+	type RoutingDecision,
+	type RoutingDecisionGap,
+	sanitizeRoutingDecision,
+} from "./routing-decision";
+
+export * from "./routing-decision";
+
+import {
 	type QualityDecisionRecord,
 	sanitizeQualityDecision,
 } from "./quality-routing";
@@ -364,6 +372,8 @@ export interface RoutingPhysicalAttempt {
 	readonly streamEvidence?: RoutingStreamEvidence | null;
 }
 export interface RequestRoutingAttemptSummary {
+	readonly decision?: RoutingDecision | null;
+	readonly decisionGap?: RoutingDecisionGap | null;
 	readonly version: 1;
 	readonly physicalAttemptCount: number;
 	readonly routeCount: number;
@@ -512,7 +522,16 @@ export function sanitizeRequestRoutingAttemptSummary(
 				} satisfies RoutingPhysicalAttempt,
 			];
 		});
+	const decisionResult = sanitizeRoutingDecision(source.decision);
+	const decisionGap =
+		decisionResult.gap ??
+		(source.decisionGap === "oversize" || source.decisionGap === "invalid"
+			? source.decisionGap
+			: null);
 	const result: RequestRoutingAttemptSummary = {
+		...(source.decision === undefined && source.decisionGap === undefined
+			? {}
+			: { decision: decisionResult.decision, decisionGap }),
 		version: 1,
 		physicalAttemptCount,
 		routeCount: routingCounter(source.routeCount),
@@ -521,6 +540,7 @@ export function sanitizeRequestRoutingAttemptSummary(
 			source.truncated === true || physicalAttemptCount > attempts.length,
 		completeness:
 			source.completeness === "complete" &&
+			!decisionGap &&
 			!identityDropped &&
 			source.truncated !== true &&
 			physicalAttemptCount === attempts.length &&
@@ -555,6 +575,17 @@ export function sanitizeRequestRoutingAttemptSummary(
 	// exceed the same compact persistence/read envelope. Explicitly report gaps.
 	const retained = [...result.attempts];
 	let bounded = result;
+	if (
+		JSON.stringify(bounded).length > MAX_ROUTING_ATTEMPT_SUMMARY_CHARS &&
+		bounded.decision
+	) {
+		bounded = {
+			...bounded,
+			decision: null,
+			decisionGap: "oversize",
+			completeness: "partial",
+		};
+	}
 	for (
 		let i = retained.length - 1;
 		JSON.stringify(bounded).length > MAX_ROUTING_ATTEMPT_SUMMARY_CHARS &&

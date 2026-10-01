@@ -167,6 +167,7 @@ export interface RoutingSelectionDiagnostics {
 	readonly excludedCandidateCount: number;
 	readonly selectedCandidateCount: number;
 	readonly zeroAttemptReason: RoutingSelectionZeroAttemptReason;
+	readonly reasonEvidence?: "exact" | "inferred" | "unknown";
 	readonly forcedRoute: boolean;
 	readonly capabilityProfile: boolean;
 	readonly routeProfile: boolean;
@@ -181,6 +182,11 @@ export interface RoutingSelectionDiagnostics {
 export type RoutePhysicalModelPolicy = "exact" | "catalog-role";
 
 export interface RequestMeta {
+	/** Observational original intent captured before routing rewrites. */
+	routingRequestedLogicalModel?: string | null;
+	routingInventoryOutcome?: "complete" | "failed" | "unknown";
+	routingTrustedKeepalive?: boolean;
+	routingDeclaredConstraints?: import("./routing-decision").RoutingDecision["constraints"];
 	/** Dedicated quality provenance; persisted separately by the U7 consumer. */
 	qualityDecision?: import("./quality-routing").QualityDecisionEnvelope;
 	qualityAccounting?: import("./quality-routing").QualityAdmissionDecision["accounting"];

@@ -3,6 +3,7 @@ import { sanitizeRequestHeaders } from "@better-ccflare/http-common";
 import type { RequestMeta, RouteProvenance } from "@better-ccflare/types";
 import { sanitizeQualityDecision } from "@better-ccflare/types/request";
 import type { RoutingAttemptLedger } from "./handlers/routing-attempt-ledger";
+import { captureRoutingDecision } from "./handlers/routing-selection-diagnostics";
 import {
 	type EndMessage,
 	isModelRewrite,
@@ -59,6 +60,13 @@ export class RequestLifecycleCoordinator {
 		wireStatus(nativeStatus: number): number;
 	};
 	private nativeStatus = 200;
+
+	observeRoutingDecision(requestMeta: RequestMeta, terminalKind: string): void {
+		if (this.state !== "finalized")
+			this.observation?.ledger.observeRoutingDecision(
+				captureRoutingDecision(requestMeta, terminalKind),
+			);
+	}
 
 	get attemptedIdentity() {
 		return this.observation?.ledger.lastPhysicalObservation ?? null;
@@ -136,6 +144,7 @@ export class RequestLifecycleCoordinator {
 						routingAttemptSummary,
 						error:
 							message.error === "route_unavailable" &&
+							routingAttemptSummary.physicalAttemptCount > 0 &&
 							routingAttemptSummary.terminalCause !== "unknown"
 								? (routingAttemptSummary.terminalCause ?? message.error)
 								: message.error,
@@ -204,6 +213,7 @@ export function recordRoutingTerminalRequest(
 
 	try {
 		const { requestMeta } = options;
+		coordinator.observeRoutingDecision(requestMeta, options.terminalKind);
 		if (coordinator.state === "unclaimed") {
 			const { collector } = options;
 			if (!collector) return Promise.resolve();
