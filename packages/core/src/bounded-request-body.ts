@@ -212,7 +212,13 @@ export async function readBoundedRequestBody(
 		}
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
-		reader.releaseLock();
+		try {
+			reader.releaseLock();
+		} catch {
+			// Native stream cleanup must not replace complete EOF bytes or the
+			// authoritative read, abort, or body-size failure. No new read/cancel
+			// is started here; cancellation already belongs to its terminal path.
+		}
 	}
 
 	if (directBuffer && chunks.length === 0) {
