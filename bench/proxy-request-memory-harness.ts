@@ -16,12 +16,15 @@
  *   PROXY_MEMORY_TRANSFORM_MODE=passthrough bun bench/proxy-request-memory-harness.ts
  *   PROXY_MEMORY_SOAK=1 PROXY_MEMORY_BODY_BYTES=4194304 bun bench/proxy-request-memory-harness.ts
  *
+ * PROXY_MEMORY_DIAGNOSTIC=1 selects bounded normal-GC controls. It requires
+ * PROXY_MEMORY_CHECKPOINT and the private namespace/cgroup envelope documented
+ * in proxy-resource-diagnostic.ts; legacy mode remains a forced-GC control.
+ *
  * Soak profiles support 1 MiB (1048576), 4 MiB (4194304), and 8 MiB
  * (8388608) bodies. This harness reports measurements but deliberately does
  * not enforce allocator or RSS thresholds.
  */
-// @ts-expect-error bun:jsc's heapStats is available at runtime but incomplete in Bun's types.
-import { heapStats } from "bun:jsc";
+import { heapStats, heapSize, memoryUsage as jscMemoryUsage } from "bun:jsc";
 import type { Account } from "@better-ccflare/types";
 import {
 	BodyAdmissionController,
@@ -75,7 +78,8 @@ type RequestBodyPhaseName =
 	| "loopback-response-received"
 	| "proxy-with-account-complete"
 	| "response-consumed"
-	| "post-gc-heap-settled";
+	| "post-gc-heap-settled"
+	| "post-quiet-normal-gc";
 
 type LifecycleUpstreamCounts = {
 	requests: number;
@@ -132,6 +136,7 @@ export type ProxyRequestBodyWorkloadResult = {
 		arrayBuffers: string;
 		phaseDeltas: string;
 		childIsolation: string;
+		gc: string;
 	};
 	phases: RequestBodyPhaseSample[];
 	generatedBodyBytes: number[];
@@ -153,11 +158,12 @@ type WaveResult = {
 	responseLifecycle: ResponseLifecycleResult;
 };
 
-type RequestBodyWorkloadOptions = {
+export type RequestBodyWorkloadOptions = {
 	bodyBytes: number;
 	concurrency: number;
 	transformMode?: ProxyMemoryTransformMode;
 	onSample?: (observed: Sample) => void;
+	samplingMode?: "normal-gc" | "forced-gc-control";
 };
 
 const encoder = new TextEncoder();
@@ -322,10 +328,12 @@ function numericFields(value: unknown): NumericRecord {
 	) as NumericRecord;
 }
 
-function sample(): Sample {
+function sample(normalGc = false): Sample {
 	return {
 		memory: numericFields(process.memoryUsage()),
-		heapStats: numericFields(heapStats()),
+		heapStats: numericFields(
+			normalGc ? { heapSize: heapSize(), ...jscMemoryUsage() } : heapStats(),
+		),
 	};
 }
 
@@ -333,11 +341,20 @@ function forceGc(): void {
 	if (typeof Bun.gc === "function") Bun.gc(true);
 }
 
-export function isHeapSettled(previousHeapUsed: number, heapUsed: number): boolean {
-	return previousHeapUsed >= 0 && Math.abs(heapUsed - previousHeapUsed) < 256 * 1024;
+export function isHeapSettled(
+	previousHeapUsed: number,
+	heapUsed: number,
+): boolean {
+	return (
+		previousHeapUsed >= 0 && Math.abs(heapUsed - previousHeapUsed) < 256 * 1024
+	);
 }
 
-async function settleHeap(): Promise<Sample> {
+async function settleHeap(normalGc = false): Promise<Sample> {
+	if (normalGc) {
+		await Bun.sleep(50);
+		return sample(true);
+	}
 	let previous = -1;
 	let current = sample();
 	for (let iteration = 0; iteration < 10; iteration += 1) {
@@ -399,13 +416,14 @@ function createPhaseRecorder(
 	baseline: Sample,
 	phaseOrder: readonly RequestBodyPhaseName[],
 	onSample: ((observed: Sample) => void) | undefined,
+	normalGc = false,
 ): {
 	record: (name: RequestBodyPhaseName, observed?: Sample) => void;
 	finish: () => RequestBodyPhaseSample[];
 } {
 	const accumulated = new Map<RequestBodyPhaseName, PhaseAccumulator>();
 	const allowedPhases = new Set(phaseOrder);
-	const record = (name: RequestBodyPhaseName, observed = sample()) => {
+	const record = (name: RequestBodyPhaseName, observed = sample(normalGc)) => {
 		if (!allowedPhases.has(name)) {
 			throw new Error(`unexpected memory phase for transform mode: ${name}`);
 		}
@@ -738,8 +756,11 @@ async function startRequestBodyUpstream(options: {
 	};
 	let stopPromise: Promise<RequestBodyUpstreamProcessState> | undefined;
 	const stop = (): Promise<RequestBodyUpstreamProcessState> => {
-		stopPromise ??= terminateRequestBodyUpstream(child, stderrPromise, lifecycle)
-			.finally(() => managedRequestBodyUpstreamStops.delete(stop));
+		stopPromise ??= terminateRequestBodyUpstream(
+			child,
+			stderrPromise,
+			lifecycle,
+		).finally(() => managedRequestBodyUpstreamStops.delete(stop));
 		return stopPromise;
 	};
 	managedRequestBodyUpstreamStops.add(stop);
@@ -816,7 +837,7 @@ async function startRequestBodyUpstream(options: {
 		},
 		stop,
 	};
-	if (import.meta.main) {
+	if (import.meta.main && process.env.PROXY_MEMORY_DIAGNOSTIC !== "1") {
 		process.stdout.write(
 			`${JSON.stringify({
 				type: PROXY_MEMORY_CHILD_READY_TYPE,
@@ -955,7 +976,7 @@ function makeMemoryProxyContext(
 		asyncWriter: { enqueue: () => undefined } as never,
 		config: { getStorePayloads: () => false } as never,
 		internalProbeSecret: "memory-loopback-secret",
-	} as ProxyContext;
+	} as unknown as ProxyContext;
 }
 
 /**
@@ -971,7 +992,9 @@ export async function runProxyRequestBodyWorkload(
 		concurrency,
 		onSample,
 		transformMode = "clone-rewrite",
+		samplingMode = "forced-gc-control",
 	} = options;
+	const normalGc = samplingMode === "normal-gc";
 	if (!Number.isSafeInteger(concurrency) || concurrency <= 0) {
 		throw new Error("concurrency must be a positive integer");
 	}
@@ -999,15 +1022,20 @@ export async function runProxyRequestBodyWorkload(
 		// Establish the baseline only after the child has reached its explicit
 		// ready state. Child RSS is never part of process.memoryUsage(), and the
 		// parent's small subprocess bookkeeping is now present in every phase.
-		const baseline = await settleHeap();
-		phaseRecorder = createPhaseRecorder(
-			baseline,
+		const baseline = await settleHeap(normalGc);
+		const phases =
 			transformMode === "passthrough"
 				? PASSTHROUGH_PHASE_ORDER
 				: transformMode === "consume-rebuild"
 					? CONSUME_REBUILD_PHASE_ORDER
-					: CLONE_REWRITE_PHASE_ORDER,
+					: CLONE_REWRITE_PHASE_ORDER;
+		phaseRecorder = createPhaseRecorder(
+			baseline,
+			phases.map((p) =>
+				normalGc && p === "post-gc-heap-settled" ? "post-quiet-normal-gc" : p,
+			),
 			onSample,
+			normalGc,
 		);
 		phaseRecorder.record("pre-body-baseline", baseline);
 		const account = makeMemoryAccount();
@@ -1016,11 +1044,12 @@ export async function runProxyRequestBodyWorkload(
 			transformMode,
 			phaseRecorder.record,
 		);
+		const recorder = phaseRecorder;
 		responses = await Promise.all(
 			Array.from({ length: concurrency }, async () => {
 				const generated = createClaudeRequestBody(bodyBytes);
 				generatedBodyBytes.push(generated.byteLength);
-				phaseRecorder.record("exact-size-body-generated");
+				recorder.record("exact-size-body-generated");
 				const request = new Request("http://proxy.memory.local/v1/messages", {
 					method: "POST",
 					headers: {
@@ -1030,7 +1059,7 @@ export async function runProxyRequestBodyWorkload(
 					},
 					body: generated,
 				});
-				phaseRecorder.record("inbound-request-constructed");
+				recorder.record("inbound-request-constructed");
 				// Materialize the actual inbound Request before the provider-level path
 				// builds, clones, rewrites, and fetches its outbound Request.
 				const prepared = await prepareRequestBody(request);
@@ -1039,9 +1068,9 @@ export async function runProxyRequestBodyWorkload(
 						"prepared request body did not preserve its boundary",
 					);
 				}
-				phaseRecorder.record("prepare-request-body-complete");
+				recorder.record("prepare-request-body-complete");
 				const bodyContext = new RequestBodyContext(prepared.buffer);
-				phaseRecorder.record("request-body-context-constructed");
+				recorder.record("request-body-context-constructed");
 				const parsedBody = bodyContext.getParsedJson();
 				if (
 					!parsedBody ||
@@ -1051,7 +1080,7 @@ export async function runProxyRequestBodyWorkload(
 						"request body context did not parse the source model",
 					);
 				}
-				phaseRecorder.record("request-body-context-parsed");
+				recorder.record("request-body-context-parsed");
 				const requestUrl = new URL(request.url);
 				const response = await proxyWithAccount(
 					request,
@@ -1067,14 +1096,14 @@ export async function runProxyRequestBodyWorkload(
 					undefined,
 					bodyContext,
 				);
-				phaseRecorder.record("proxy-with-account-complete");
-				if (!response) {
+				recorder.record("proxy-with-account-complete");
+				if (!(response instanceof Response)) {
 					throw new Error(
 						`isolated loopback proxy request did not return a response (child pid ${upstream.pid})`,
 					);
 				}
 				const responseText = await response.text();
-				phaseRecorder.record("response-consumed");
+				recorder.record("response-consumed");
 				return {
 					status: response.status,
 					responseBytes: encoder.encode(responseText).byteLength,
@@ -1104,7 +1133,10 @@ export async function runProxyRequestBodyWorkload(
 				`isolated loopback request-body oracle mismatch: ${JSON.stringify({ responses, upstream: snapshot })}`,
 			);
 		}
-		phaseRecorder.record("post-gc-heap-settled", await settleHeap());
+		phaseRecorder.record(
+			normalGc ? "post-quiet-normal-gc" : "post-gc-heap-settled",
+			await settleHeap(normalGc),
+		);
 	} catch (error) {
 		workloadFailed = true;
 		workloadError = error;
@@ -1136,7 +1168,12 @@ export async function runProxyRequestBodyWorkload(
 		concurrency,
 		transformMode,
 		expectedModel,
-		memoryAccounting: { ...MEMORY_ACCOUNTING_NOTES },
+		memoryAccounting: {
+			...MEMORY_ACCOUNTING_NOTES,
+			gc: normalGc
+				? "normal scheduling; 50ms quiet; no forced GC or full heap counting"
+				: "forced GC/full heap counting offline control; not representative",
+		},
 		phases: phaseRecorder.finish(),
 		generatedBodyBytes,
 		responses,
@@ -1214,7 +1251,7 @@ async function readOne(response: Response): Promise<void> {
 	reader.releaseLock();
 }
 
-async function runResponseLifecycleModes(
+export async function runResponseLifecycleModes(
 	onSample: () => void,
 ): Promise<ResponseLifecycleResult> {
 	const upstream = startLifecycleUpstream(responseChunkBytes);
@@ -1492,7 +1529,12 @@ async function main(): Promise<void> {
 
 if (import.meta.main) {
 	installMainSignalHandlers();
-	main()
+	(process.env.PROXY_MEMORY_DIAGNOSTIC === "1"
+		? import("./proxy-resource-diagnostic").then((m) =>
+				m.runBoundedResourceDiagnostic(),
+			)
+		: main()
+	)
 		.then(() => process.exit(0))
 		.catch((error) => {
 			console.error("proxy request memory harness crashed:", error);

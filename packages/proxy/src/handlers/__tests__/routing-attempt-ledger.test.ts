@@ -1,4 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
+import { sanitizeRequestRoutingAttemptSummary } from "@better-ccflare/types/request";
 import {
 	formatRoutingAttemptMessage,
 	MAX_REQUEST_PHYSICAL_ATTEMPTS,
@@ -7,6 +8,239 @@ import {
 } from "../routing-attempt-ledger";
 
 describe("RoutingAttemptLedger", () => {
+	it("preserves failed physical attempts separately from a successful rescue winner", () => {
+		const ledger = new RoutingAttemptLedger();
+		ledger.claim("account-a", "physical-model");
+		ledger.recordPhysicalAttempt({
+			accountId: "account-a",
+			provider: "codex",
+			logicalModel: "logical-model",
+			physicalModel: "physical-model",
+		});
+		ledger.recordPhysicalOutcome("meaningful_progress_timeout", "failed", {
+			validProtocolFramesSeen: 79,
+			terminalEvidenceSeen: false,
+		});
+		ledger.recordPhysicalOutcome("transport_error"); // cleanup cannot replace first cause
+		ledger.recordPhysicalAttempt({
+			accountId: "account-a",
+			provider: "codex",
+			logicalModel: "logical-model",
+			physicalModel: "physical-model",
+		});
+		ledger.observeOutputOrigin("account-a");
+		const result = ledger.terminalSummary({
+			success: true,
+			nativeStatus: 200,
+			wireStatus: 200,
+		});
+		expect(result.physicalAttemptCount).toBe(2);
+		expect(result.routeCount).toBe(1);
+		expect(result.attempts[0]).toMatchObject({
+			outcome: "failed",
+			cause: "meaningful_progress_timeout",
+			protocolFrames: 79,
+			meaningfulProgress: "absent",
+		});
+		expect(result.attempts[1]?.outcome).toBe("succeeded");
+		expect(result.outputOriginOrdinal).toBe(2);
+		expect(result.winnerOrdinal).toBe(2);
+		expect(result.terminalCause).toBeNull();
+	});
+
+	it("never invents preselection attempts and keeps failed output origin distinct from winner", () => {
+		const ledger = new RoutingAttemptLedger();
+		expect(
+			ledger.terminalSummary({
+				success: false,
+				error: "routing_rejected",
+				nativeStatus: 503,
+				wireStatus: 503,
+			}),
+		).toMatchObject({
+			physicalAttemptCount: 0,
+			attempts: [],
+			outputOriginOrdinal: null,
+			winnerOrdinal: null,
+		});
+		ledger.recordPhysicalAttempt({ accountId: "account-a", provider: "codex" });
+		ledger.observeOutputOrigin("account-a");
+		expect(
+			ledger.terminalSummary({
+				success: false,
+				error: "client_cancelled",
+				nativeStatus: 200,
+				wireStatus: 200,
+			}),
+		).toMatchObject({
+			outputOriginOrdinal: 1,
+			winnerOrdinal: null,
+			cancellationOrigin: "unknown",
+		});
+	});
+
+	it("caps observations without losing true send count or a winner beyond the cap", () => {
+		const ledger = new RoutingAttemptLedger();
+		for (let n = 0; n < 32; n++)
+			ledger.recordPhysicalAttempt({
+				accountId: `account-${n}`,
+				provider: "codex",
+			});
+		ledger.observeOutputOrigin("account-31");
+		const result = ledger.terminalSummary({
+			success: true,
+			nativeStatus: 200,
+			wireStatus: 200,
+		});
+		expect(result.attempts).toHaveLength(16);
+		expect(result.physicalAttemptCount).toBe(32);
+		expect(result.winnerOrdinal).toBe(32);
+		expect(result.truncated).toBe(true);
+	});
+
+	it("strips arbitrary content and saturates bounded observation counters", () => {
+		const result = sanitizeRequestRoutingAttemptSummary({
+			version: 1,
+			physicalAttemptCount: 500,
+			routeCount: 500,
+			attempts: [
+				{
+					ordinal: 1,
+					accountId: "safe-account",
+					provider: "codex",
+					logicalModel: "raw\npayload",
+					physicalModel: "safe-model",
+					outcome: "failed",
+					cause: "raw secret event",
+					protocolFrames: 9999999,
+					prompt: "private-content",
+				},
+			],
+			terminalCause: "arbitrary-content",
+			completeness: "complete",
+			requestBody: "private-content",
+		});
+		expect(result).toMatchObject({
+			physicalAttemptCount: 32,
+			routeCount: 32,
+			terminalCause: "unknown",
+			truncated: true,
+			attempts: [
+				{ logicalModel: null, cause: "unknown", protocolFrames: 65535 },
+			],
+		});
+		expect(JSON.stringify(result)).not.toContain("private-content");
+		expect(sanitizeRequestRoutingAttemptSummary("{malformed")).toBeNull();
+		expect(sanitizeRequestRoutingAttemptSummary("x".repeat(16385))).toBeNull();
+	});
+
+	it("round-trips maximum observational identity input through bounded persistence", () => {
+		for (const identityLength of [128, 256]) {
+			const identity = "m".repeat(identityLength);
+			const write = sanitizeRequestRoutingAttemptSummary({
+				version: 1,
+				physicalAttemptCount: 16,
+				routeCount: 16,
+				truncated: false,
+				completeness: "complete",
+				outputOriginOrdinal: null,
+				winnerOrdinal: null,
+				nativeStatus: 503,
+				wireStatus: 200,
+				terminalCause: "meaningful_progress_timeout",
+				cancellationOrigin: null,
+				attempts: Array.from({ length: 16 }, (_, i) => ({
+					ordinal: i + 1,
+					accountId: identity,
+					provider: identity,
+					logicalModel: identity,
+					physicalModel: identity,
+					outcome: "failed",
+					cause: "meaningful_progress_timeout",
+					startedAt: Number.MAX_SAFE_INTEGER,
+					outcomeObservedAt: Number.MAX_SAFE_INTEGER,
+					nativeStatus: 200,
+					protocolFrames: 65535,
+					meaningfulProgress: "absent",
+					terminalEvidenceSeen: false,
+				})),
+			});
+			expect(write).not.toBeNull();
+			const encoded = JSON.stringify(write);
+			expect(sanitizeRequestRoutingAttemptSummary(encoded)).toEqual(write);
+			expect(encoded.length).toBeLessThanOrEqual(16384);
+			expect(write?.physicalAttemptCount).toBe(16);
+			if (identityLength === 128) {
+				expect(write?.attempts[0]?.accountId).toBe(identity);
+				expect(write?.completeness).toBe("complete");
+			} else {
+				expect(write?.attempts[0]?.accountId).toBeNull();
+				expect(write?.attempts[0]?.physicalModel).toBeNull();
+				expect(write?.completeness).toBe("partial");
+			}
+		}
+	});
+
+	it("round-trips all maximal new diagnostics within the summary cap without erasing cause", () => {
+		const ledger = new RoutingAttemptLedger();
+		const identity = "m".repeat(128);
+		for (let ordinal = 1; ordinal <= 16; ordinal++) {
+			ledger.recordPhysicalAttempt({
+				accountId: identity,
+				provider: identity,
+				logicalModel: identity,
+				physicalModel: identity,
+			});
+			ledger.observePhysicalStream({
+				rawEventCounts: Object.fromEntries(
+					[
+						"created",
+						"in_progress",
+						"function_call_added",
+						"function_call_done",
+						"encrypted_reasoning_done",
+						"visible_summary_delta",
+						"output_text_delta",
+						"argument_delta",
+						"completed",
+						"incomplete",
+						"failed",
+						"error",
+						"other",
+					].map((k) => [k, Number.MAX_SAFE_INTEGER]),
+				),
+				rawVisibleEvents: Number.MAX_SAFE_INTEGER,
+				meaningfulFrames: Number.MAX_SAFE_INTEGER,
+				protocolFrames: Number.MAX_SAFE_INTEGER,
+				providerTerminal: "resource_limit",
+				gateOutcome: "buffer_limit",
+				remainingCommitmentMs: Number.MAX_SAFE_INTEGER,
+				cancellationOrigin: "semantic_deadline",
+				diagnosis: "translation_or_gating_candidate",
+			});
+			ledger.recordPhysicalOutcome("buffer_limit");
+		}
+		const summary = ledger.terminalSummary({
+			success: false,
+			error: "route_unavailable",
+			nativeStatus: 503,
+			wireStatus: 200,
+		});
+		const encoded = JSON.stringify(summary);
+		expect(encoded.length).toBeLessThanOrEqual(16384);
+		expect(Buffer.byteLength(encoded)).toBeLessThanOrEqual(16384);
+		expect(sanitizeRequestRoutingAttemptSummary(encoded)).toEqual(summary);
+		expect(summary?.attempts).toHaveLength(16);
+		expect(
+			summary?.attempts.every(
+				(a) => a.accountId === identity && a.cause === "buffer_limit",
+			),
+		).toBe(true);
+		expect(summary?.terminalCause).toBe("buffer_limit");
+		expect(summary?.completeness).toBe("partial");
+		expect(summary?.truncated).toBe(true);
+	});
+
 	it("claims hosted dispatch exactly once and exposes its monotonic state", () => {
 		const ledger = new RoutingAttemptLedger();
 

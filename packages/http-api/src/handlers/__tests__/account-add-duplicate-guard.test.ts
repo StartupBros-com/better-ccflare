@@ -29,12 +29,12 @@ describe("createAccountAddHandler — duplicate (name, provider, custom_endpoint
 		handler = createAccountAddHandler(dbOps, null as never);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		// Close BEFORE unlinking: deleting the file under an open connection
 		// makes close()'s `PRAGMA wal_checkpoint(TRUNCATE)` fail with
 		// SQLITE_IOERR_VNODE, which surfaces as an unhandled error between
 		// tests and can leave the next beforeEach unable to open the database.
-		DatabaseFactory.reset();
+		await DatabaseFactory.reset();
 		cleanupDbFiles();
 	});
 

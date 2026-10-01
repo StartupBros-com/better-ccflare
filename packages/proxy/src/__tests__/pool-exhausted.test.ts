@@ -420,7 +420,24 @@ describe("routing terminal — 503 response", () => {
 		});
 		expect(usageEnds[0]).toMatchObject({
 			success: false,
-			error: "route_unavailable",
+			error: "transport_error",
+			routingAttemptSummary: {
+				physicalAttemptCount: 1,
+				attempts: [
+					{
+						accountId: account.id,
+						provider: "anthropic",
+						logicalModel: "claude-sonnet-4-5",
+						physicalModel: "claude-sonnet-4-5",
+						outcome: "failed",
+						cause: "transport_error",
+					},
+				],
+				nativeStatus: 503,
+				wireStatus: 200,
+				terminalCause: "transport_error",
+				winnerOrdinal: null,
+			},
 		});
 	});
 
@@ -463,7 +480,24 @@ describe("routing terminal — 503 response", () => {
 		});
 		expect(usageEnds[0]).toMatchObject({
 			success: false,
-			error: "route_unavailable",
+			error: "transport_error",
+			routingAttemptSummary: {
+				physicalAttemptCount: 1,
+				attempts: [
+					{
+						accountId: account.id,
+						provider: "anthropic",
+						logicalModel: "claude-sonnet-4-5",
+						physicalModel: "claude-sonnet-4-5",
+						outcome: "failed",
+						cause: "transport_error",
+					},
+				],
+				nativeStatus: 503,
+				wireStatus: 200,
+				terminalCause: "transport_error",
+				winnerOrdinal: null,
+			},
 		});
 	});
 

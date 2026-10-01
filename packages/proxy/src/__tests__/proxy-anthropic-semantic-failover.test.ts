@@ -1394,6 +1394,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 	it("retries one official Codex precommit stall on the same route with a rotated cache lane", async () => {
 		process.env[MEANINGFUL_PROGRESS_ENV] = "80";
 		const account = makeCodexAccount("codex-stall-a");
+		const persistence = installPersistingUsageCollector();
 		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
 			[account],
 			makeCombo([account]),
@@ -1418,6 +1419,8 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const request = makeCodexRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const body = await response.text();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await persistence.collector.drain();
 
 		const firstAttemptDiagnostics = precommitDiagnostics.find(
 			(e) => e.msg === "codex_precommit_cache_lane_rescue",
@@ -1442,8 +1445,20 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(body).toContain('"text":"codex recovered"');
 		expect(body.match(/event: message_start/g)).toHaveLength(1);
 		expect(body).not.toContain("resp-stalled");
-		expect(usageHandleStart).toHaveBeenCalledTimes(1);
-		expect(usageHandleEnd).toHaveBeenCalledTimes(1);
+		expect(persistence.handleStart).toHaveBeenCalledTimes(1);
+		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
+		expect(persistence.savedRequests).toHaveLength(1);
+		expect(persistence.savedRequests[0]?.at(-1)).toMatchObject({
+			physicalAttemptCount: 2,
+			routeCount: 1,
+			outputOriginOrdinal: 2,
+			winnerOrdinal: 2,
+			terminalCause: null,
+			attempts: [
+				{ ordinal: 1, cause: "semantic_timeout", outcome: "failed" },
+				{ ordinal: 2, outcome: "succeeded", cause: null },
+			],
+		});
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 		expect(reportCandidateSuccess).toHaveBeenCalledTimes(1);
 	});
@@ -3235,12 +3250,14 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			expiresAt: secondary.expires_at,
 		}).toEqual(secondaryCredentials);
 		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
-		expect(persistence.handleEnd).toHaveBeenCalledWith({
-			type: "end",
-			requestId: expect.any(String),
-			success: false,
-			error: "context_length_exceeded",
-		});
+		expect(persistence.handleEnd).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: "end",
+				requestId: expect.any(String),
+				success: false,
+				error: "context_length_exceeded",
+			}),
+		);
 		expect(persistence.savedRequests).toHaveLength(1);
 		expect(persistence.savedRequests[0]?.[3]).toBe(primary.id);
 		expect(persistence.savedRequests[0]?.[4]).toBe(400);
@@ -3632,12 +3649,14 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(anthropic.rate_limited_until).toBeNull();
 		expect(anthropic.consecutive_rate_limits).toBe(0);
 		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
-		expect(persistence.handleEnd).toHaveBeenCalledWith({
-			type: "end",
-			requestId: expect.any(String),
-			success: false,
-			error: "context_length_exceeded",
-		});
+		expect(persistence.handleEnd).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: "end",
+				requestId: expect.any(String),
+				success: false,
+				error: "context_length_exceeded",
+			}),
+		);
 		expect(persistence.savedRequests).toHaveLength(1);
 		expect(persistence.savedRequests[0]?.[3]).toBe(codex.id);
 		expect(persistence.savedRequests[0]?.[4]).toBe(expectedStatus);
@@ -4011,12 +4030,14 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(codex.consecutive_rate_limits).toBe(0);
 		expect(persistence.handleStart).toHaveBeenCalledTimes(1);
 		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
-		expect(persistence.handleEnd).toHaveBeenCalledWith({
-			type: "end",
-			requestId: expect.any(String),
-			success: false,
-			error: "context_length_exceeded",
-		});
+		expect(persistence.handleEnd).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: "end",
+				requestId: expect.any(String),
+				success: false,
+				error: "context_length_exceeded",
+			}),
+		);
 		expect(persistence.savedRequests).toHaveLength(1);
 		expect(persistence.savedRequests[0]?.[3]).toBe(codex.id);
 		expect(persistence.savedRequests[0]?.[4]).toBe(400);
@@ -4064,18 +4085,116 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(codex.consecutive_rate_limits).toBe(0);
 		expect(persistence.handleStart).toHaveBeenCalledTimes(1);
 		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
-		expect(persistence.handleEnd).toHaveBeenCalledWith({
-			type: "end",
-			requestId: expect.any(String),
-			success: false,
-			error: "context_length_exceeded",
-		});
+		expect(persistence.handleEnd).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: "end",
+				requestId: expect.any(String),
+				success: false,
+				error: "context_length_exceeded",
+			}),
+		);
 		expect(persistence.savedRequests).toHaveLength(1);
 		expect(persistence.savedRequests[0]?.[3]).toBe(codex.id);
 		expect(persistence.savedRequests[0]?.[4]).toBe(200);
 		expect(persistence.savedRequests[0]?.[5]).toBe(false);
 		expect(persistence.savedRequests[0]?.[6]).toBe("context_length_exceeded");
 		expect(persistence.savedRequests[0]?.[8]).toBe(0);
+	});
+
+	it("persists both encrypted-only stalled attempts and semantic cause behind rescue HTTP 200", async () => {
+		process.env[TIMEOUT_ENV] = "1000";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "200";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "10";
+		process.env[RESCUE_DEADLINE_ENV] = "1000";
+		const account = makeCodexAccount("codex-attribution-stall");
+		const persistence = installPersistingUsageCollector();
+		const { ctx } = makeContext([account]);
+		let sends = 0;
+		const originalNow = Date.now;
+		let offset = 0;
+		const clock = spyOn(Date, "now").mockImplementation(
+			() => originalNow() + offset,
+		);
+		globalThis.fetch = mock(async () => {
+			sends++;
+			// Advance only the private deadline's clock on rescue, before its
+			// actual wall timer/outer commitment timer fires. This deterministically
+			// selects the routed native terminal rather than racing two owners.
+			if (sends === 2) offset = 50;
+			return sseResponse(
+				stalledCodexEventStream(
+					[
+						CODEX_STRUCTURAL_FRAMES[0],
+						{
+							event: "response.output_item.added",
+							data: {
+								item: {
+									type: "reasoning",
+									encrypted_content: "private-fixture-content",
+									summary: [],
+								},
+							},
+						},
+					],
+					() => undefined,
+				),
+			);
+		}) as unknown as typeof fetch;
+		const request = makeAuthorizedCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+		clock.mockRestore();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await persistence.collector.drain();
+		expect(response.status).toBe(200);
+		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+		expect(sends).toBe(2);
+		expect(persistence.savedRequests).toHaveLength(1);
+		const saved = persistence.savedRequests[0];
+		if (!saved) throw new Error("Expected one persisted terminal");
+		expect(saved[3]).toBeNull(); // no output-origin account won
+		expect(saved[4]).toBe(503); // native final, independent of HTTP 200 SSE
+		expect(saved[6]).toBe("meaningful_progress_timeout");
+		expect(saved[22]).toMatchObject({
+			routedProvider: "codex",
+			routedModel: "gpt-5.3-codex",
+			profileId: null,
+		});
+		expect(saved.at(-1)).toMatchObject({
+			version: 1,
+			physicalAttemptCount: 2,
+			routeCount: 1,
+			nativeStatus: 503,
+			wireStatus: 200,
+			terminalCause: "meaningful_progress_timeout",
+			outputOriginOrdinal: null,
+			winnerOrdinal: null,
+			truncated: false,
+			attempts: [
+				{
+					ordinal: 1,
+					accountId: account.id,
+					provider: "codex",
+					logicalModel: FABLE,
+					physicalModel: "gpt-5.3-codex",
+					outcome: "failed",
+					cause: "meaningful_progress_timeout",
+				},
+				{
+					ordinal: 2,
+					accountId: account.id,
+					provider: "codex",
+					logicalModel: FABLE,
+					physicalModel: "gpt-5.3-codex",
+					outcome: "failed",
+					cause: "meaningful_progress_timeout",
+				},
+			],
+		});
+		expect(JSON.stringify(saved.at(-1))).not.toContain(
+			"private-fixture-content",
+		);
 	});
 
 	it("returns the existing 503 after exactly two stalled Codex cache-lane attempts", async () => {
@@ -5795,12 +5914,14 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			expect(body).not.toContain("must-not-forward");
 			expect(persistence.handleStart).toHaveBeenCalledTimes(1);
 			expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
-			expect(persistence.handleEnd).toHaveBeenCalledWith({
-				type: "end",
-				requestId: expect.any(String),
-				success: false,
-				error: "anthropic_rescue_non_sse_response",
-			});
+			expect(persistence.handleEnd).toHaveBeenCalledWith(
+				expect.objectContaining({
+					type: "end",
+					requestId: expect.any(String),
+					success: false,
+					error: "anthropic_rescue_non_sse_response",
+				}),
+			);
 			expect(persistence.savedRequests).toHaveLength(1);
 			expect(persistence.savedRequests[0]?.[4]).toBe(200);
 			expect(persistence.savedRequests[0]?.[5]).toBe(false);

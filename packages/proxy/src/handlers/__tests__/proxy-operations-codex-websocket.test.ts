@@ -17,6 +17,12 @@ import type {
 	ProviderAttemptPlanContext,
 } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
+import {
+	bindManagedRequest,
+	createAcceptedTiming,
+	monotonicNowNs,
+	registerManagedTerminal,
+} from "../../../../../scripts/ccflare-managed-timing.mjs";
 import { ANTHROPIC_DRAIN_DEADLINE_MS } from "../../anthropic-terminal-recovery";
 import { CACHE_REPLAY_MODEL_HEADER } from "../../cache-transport-staging";
 import {
@@ -489,9 +495,11 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		const proxyContext = { ...makeProxyContext(), provider: anthropic };
 		const observeResponse = mock((response: Response) => response);
 		const observeError = mock(() => undefined);
+		const observeDispatched = mock((_transport: string) => undefined);
 		const observeUpstream = spyOn(codex, "observeUpstream").mockResolvedValue({
 			response: observeResponse,
 			error: observeError,
+			dispatched: observeDispatched,
 		});
 		const plannedModels: Array<string | null> = [];
 		const restorePlanner = installCountingCodexAttemptPlanner((context) => {
@@ -564,12 +572,15 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(plannedModels).toEqual([]);
 		expect(websocketCalls).toBe(2);
 		expect(httpCalls).toBe(1);
-		// Anthropic-shaped ingress uses Codex's final-wire observer after HTTP
-		// fallback. A successful WebSocket send never invokes the HTTP observer.
-		expect(observeUpstream).toHaveBeenCalledTimes(1);
-		expect(observeResponse).toHaveBeenCalledTimes(1);
+		// Both physical transports share the bounded observation, with independent
+		// physical-send callbacks instead of inferring transport from response SSE.
+		expect(observeUpstream).toHaveBeenCalledTimes(2);
+		expect(observeResponse).toHaveBeenCalledTimes(2);
+		expect(
+			observeDispatched.mock.calls.map(([transport]) => transport),
+		).toEqual(["websocket", "http"]);
 		expect(observeError).not.toHaveBeenCalled();
-		const [wireRequest, observationContext] = observeUpstream.mock.calls[0];
+		const [wireRequest, observationContext] = observeUpstream.mock.calls[1];
 		expect(await wireRequest.clone().json()).toMatchObject({
 			model: "gpt-5.4",
 		});
@@ -578,6 +589,45 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			account: { id: "codex-ws-account", provider: "codex" },
 			nativeResponses: false,
 		});
+	});
+
+	it("final HTTP gate runs after asynchronous quality preparation and before dispatch observation", async () => {
+		installUsageCollector();
+		const codex = getProvider("codex");
+		if (!codex) throw new Error("Codex provider is not registered");
+		const dispatched = mock((_transport: string) => undefined);
+		spyOn(codex, "observeUpstream").mockResolvedValue({
+			dispatched,
+			response: (response) => response,
+			error: () => {},
+		});
+		const http = mock(
+			async () => new Response("must never send", { status: 500 }),
+		);
+		globalThis.fetch = http as never;
+		const deadline = Date.now() + 1_000;
+		const policy: ModelFallbackExecutionPolicy = {
+			...makePolicy(30_000),
+			nativeQuotaAdmission: () => Date.now() < deadline,
+			qualityAttempt: {
+				beforeDispatch: async () => {
+					await Promise.resolve();
+					setSystemTime(deadline + 1);
+				},
+				assertDispatch: () => {},
+				observeResponse: () => {},
+				complete: () => {},
+			} as never,
+		};
+		const body = makeRequestBody();
+		await runProxy(
+			makeRequest(body),
+			body,
+			policy,
+			"quality-preparation-final-gate",
+		);
+		expect(http).not.toHaveBeenCalled();
+		expect(dispatched).not.toHaveBeenCalled();
 	});
 
 	it("aborts a Codex attempt when its commitment budget expires before dispatch", async () => {
@@ -1032,6 +1082,63 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		]);
 	});
 
+	it.each([
+		"websocket",
+		"http",
+	])("absolute accepted clock vetoes the real %s boundary before any frame or HTTP replay", async (lane) => {
+		installUsageCollector();
+		const body = makeRequestBody(),
+			controller = new AbortController();
+		const req = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			body,
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			signal: controller.signal,
+		});
+		bindManagedRequest(
+			req,
+			createAcceptedTiming(monotonicNowNs(), "2000"),
+			(error) => controller.abort(error),
+		);
+		const fetchMock = mock(async () => new Response("unexpected HTTP send"));
+		globalThis.fetch = fetchMock as unknown as typeof fetch;
+		let frameWrites = 0;
+		const causes: string[] = [];
+		spyOn(codexWebSocketTransport, "tryRequest").mockImplementation(
+			async (input) => {
+				// The absolute contract expires after preparation without an idle/header
+				// timer firing. The transport callback itself must fence this write.
+				// Expire relative to this host's boot-time clock. Acceptance at boot
+				// with the default cap is still live on a CI VM younger than 24 minutes.
+				bindManagedRequest(
+					req,
+					createAcceptedTiming(monotonicNowNs() - 2_000_000_000n, "1000"),
+					(error) => controller.abort(error),
+				);
+				registerManagedTerminal(req, (cause) => causes.push(cause));
+				if (lane === "http") return null;
+				input.onBeforeFrameSend?.();
+				input.onBeforeFrameWrite?.();
+				frameWrites++;
+				throw new Error("expired frame reached wire");
+			},
+		);
+		await runProxy(
+			req,
+			body,
+			makePolicy(1000),
+			"managed-expired-frame",
+			undefined,
+			{ originalModel: "claude-sonnet-4-5" },
+		).catch(() => null);
+		expect(frameWrites).toBe(0);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(causes).toEqual(["accepted_request_deadline"]);
+		expect(controller.signal.aborted).toBe(true);
+	});
 	it("counts a non-hosted WebSocket frame at its pre-write transport boundary", async () => {
 		installUsageCollector();
 		const ledger = new RoutingAttemptLedger();

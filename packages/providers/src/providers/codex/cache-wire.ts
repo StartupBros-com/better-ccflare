@@ -41,6 +41,10 @@ export async function observeCodexWire(
 	request: Request,
 	context: UpstreamObservationContext,
 	extractSession: (source: Record<string, unknown>) => string | null,
+	epochs: Pick<
+		CacheObservationContext,
+		"buildEpoch" | "capabilityRevision" | "keyEpoch"
+	> = {},
 ): Promise<UpstreamObservation> {
 	const id = context.requestId;
 	// Never capture the source-body/header context in response/timer closures.
@@ -74,6 +78,8 @@ export async function observeCodexWire(
 	}
 	const observation: CacheObservationContext = {
 		path: context.nativeResponses ? "native" : "legacy",
+		wireHeaders: request.headers,
+		...epochs,
 		headers: context.sourceHeaders,
 		// Omit query strings: credentials or request-specific values can occur there.
 		endpoint: new URL(request.url).origin + new URL(request.url).pathname,
@@ -161,6 +167,13 @@ export async function observeCodexWire(
 		} else if (!type && data.status === "failed") abort("upstream_error");
 	};
 	return {
+		dispatched(transport) {
+			try {
+				diagnostics.dispatched(id, transport);
+			} catch {
+				/* observation cannot veto send */
+			}
+		},
 		error(error) {
 			abort(
 				signal.aborted
@@ -186,6 +199,8 @@ export async function observeCodexWire(
 			diagnostics.annotate(id, {
 				status_code: response.status,
 				transport: mode,
+				response_mode:
+					mode === "sse" ? "sse" : mode === "http" ? "json" : "unknown",
 				upstream_request_digest:
 					upstreamId && upstreamId.length <= 256
 						? cacheDigest(upstreamId)
@@ -222,7 +237,10 @@ export async function observeCodexWire(
 						buffer.length >= 14)
 				) {
 					mode = /^(event:|data:|:)/.test(buffer.trimStart()) ? "sse" : "http";
-					diagnostics.annotate(id, { transport: mode });
+					diagnostics.annotate(id, {
+						transport: mode,
+						response_mode: mode === "sse" ? "sse" : "json",
+					});
 				}
 				if (mode === "sse") {
 					const events = buffer.split(/\r?\n\r?\n/);

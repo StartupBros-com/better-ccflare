@@ -36,6 +36,7 @@ import {
 	captureSynchronousAttemptIdentity,
 	decideContextAdmission,
 	estimateAnthropicAdmissionTokens,
+	getProviderPathCapability,
 	hasDeferredCustomTool,
 	isAnthropicExtraUsageExhausted,
 	isAnthropicOrgPermissionDenied,
@@ -71,6 +72,7 @@ import {
 	RECOVERY_STATUS_EXHAUSTED,
 	RECOVERY_STATUS_HEADER,
 } from "@better-ccflare/types/routing-recovery";
+import { assertManagedWorkAvailable } from "../../../../scripts/ccflare-managed-timing.mjs";
 import { isNativeAnthropicOAuthDegradedModeEligible } from "../anthropic-degraded-eligibility";
 import {
 	type AnthropicDegradedAdmissionDecision,
@@ -2379,6 +2381,26 @@ class AnthropicPreCommitAttemptScope {
 	}
 }
 
+export function createCountTokensUnsupportedResponse(
+	providers: readonly string[],
+): Response {
+	const provider = providers.length === 1 ? providers[0] : undefined;
+	return Response.json(
+		{
+			type: "error",
+			error: {
+				type: "not_implemented_error",
+				code: "count_tokens_unsupported",
+				...(provider ? { provider } : { providers: [...providers] }),
+				message: provider
+					? `${provider} does not support structured message token counting.`
+					: "Enrolled providers do not support structured message token counting.",
+			},
+		},
+		{ status: 501 },
+	);
+}
+
 /**
  * Handles proxy request without authentication
  * @param req - The incoming request
@@ -2402,6 +2424,14 @@ export async function proxyUnauthenticated(
 	anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext,
 	routingAttemptLedger?: RoutingAttemptLedger,
 ): Promise<Response> {
+	if (url.pathname === "/v1/messages/count_tokens") {
+		if (
+			getProviderPathCapability(ctx.provider, url.pathname).support ===
+			"unsupported"
+		)
+			return createCountTokensUnsupportedResponse([ctx.provider.name]);
+		validateProviderPath(ctx.provider, url.pathname);
+	}
 	log.warn(ERROR_MESSAGES.NO_ACCOUNTS);
 
 	const identity = captureSynchronousAttemptIdentity(
@@ -2453,6 +2483,10 @@ export async function proxyUnauthenticated(
 		}
 
 		routingAttemptLedger?.recordPhysicalAttempt({
+			provider: ctx.provider.name,
+			logicalModel:
+				requestMeta.originalModel ?? requestMeta.requestedLogicalModel ?? null,
+			physicalModel: null,
 			laneKey: requestMeta.affinityLaneKey ?? null,
 		});
 		const dispatchSignal = AbortSignal.any([
@@ -2475,8 +2509,9 @@ export async function proxyUnauthenticated(
 				nativeResponses: isResponsesAdapterRequest(req.headers, ctx),
 				signal: dispatchSignal,
 			},
-			() =>
-				makeProxyRequest(
+			() => {
+				assertManagedWorkAvailable(req);
+				return makeProxyRequest(
 					targetUrl,
 					req.method,
 					headers,
@@ -2489,7 +2524,8 @@ export async function proxyUnauthenticated(
 					// drain controller must be present when fetch is created so
 					// terminal recovery can later tear down a stuck response body.
 					dispatchSignal,
-				),
+				);
+			},
 		);
 
 		if (
@@ -2720,6 +2756,7 @@ export async function proxyWithAccount(
 		optionalOutboundTransport?: (
 			signal: AbortSignal,
 			markDispatched: () => void,
+			markObservedDispatch: (transport: "http" | "websocket") => void,
 		) => Promise<Response | null>,
 		onHttpDispatch?: () => void,
 		onDispatchStarted?: () => void,
@@ -2746,26 +2783,6 @@ export async function proxyWithAccount(
 					signal,
 					drainAbortController.signal,
 				]);
-				const optionalResponse = await optionalOutboundTransport?.(
-					attemptSignal,
-					markDispatched,
-				);
-				if (optionalResponse) return optionalResponse;
-				// This hook is the last thing that can refuse the send: it asserts the
-				// request-local physical budget and claims a hosted dispatch, and it
-				// throws instead of returning when either fails. Mark only after it
-				// returns, when nothing remains between here and the fetch below.
-				onHttpDispatch?.();
-				markDispatched();
-				// KTD8 final-wire observation: purely diagnostic (see
-				// forwardObservedUpstream). `request` here is the fully-transformed
-				// wire request for this physical attempt -- after model forcing,
-				// provider body transforms, and header preparation. `sourceBody`
-				// is this attempt's replay body (reflecting model forcing and any
-				// retry-loop delta), passed in by the caller for diagnostic
-				// correlation only, never re-sent. Skipped entirely for the
-				// websocket/optional-transport path above, which never reaches
-				// this line.
 				return await forwardObservedUpstream(
 					provider,
 					request,
@@ -2777,10 +2794,21 @@ export async function proxyWithAccount(
 						nativeResponses: isResponsesAdapterRequest(req.headers, ctx),
 						signal: attemptSignal,
 					},
-					async () => {
+					async (markObservedDispatch) => {
+						const optionalResponse = await optionalOutboundTransport?.(
+							attemptSignal,
+							markDispatched,
+							markObservedDispatch,
+						);
+						if (optionalResponse) return optionalResponse;
 						if (qualityPrepare) await qualityPrepare();
 						modelFallbackPolicy?.qualityAttempt?.assertDispatch();
-						return makeProxyRequest(
+						// No await after the final authoritative gates. Observation is
+						// fail-open and cannot make an expired attempt dispatchable.
+						assertManagedWorkAvailable(req);
+						onHttpDispatch?.();
+						markDispatched();
+						const pendingHttp = makeProxyRequest(
 							request,
 							undefined,
 							undefined,
@@ -2788,6 +2816,8 @@ export async function proxyWithAccount(
 							undefined,
 							attemptSignal,
 						);
+						markObservedDispatch("http");
+						return pendingHttp;
 					},
 				);
 			};
@@ -2840,6 +2870,9 @@ export async function proxyWithAccount(
 		// Apply model override from combo slot (per D-04, REQ-12)
 		const baseBodyContext =
 			requestBodyContext ?? new RequestBodyContext(requestBodyBuffer);
+		// Capture logical provenance before overrides, admission, or helper sends.
+		const clientRequestedModel =
+			requestMeta.originalModel ?? baseBodyContext.getModel();
 		let effectiveBodyContext = baseBodyContext;
 		let effectiveBodyBuffer = baseBodyContext.getBuffer();
 		// True only once the override is actually patched into the outgoing body —
@@ -2903,6 +2936,33 @@ export async function proxyWithAccount(
 			});
 		}
 		const provider = resolvedProvider;
+		const pathCapability = getProviderPathCapability(provider, url.pathname);
+		if (
+			pathCapability.operation === "count_tokens" &&
+			pathCapability.support === "unsupported"
+		) {
+			// A local terminal, not an unavailable account or a retryable transport failure.
+			return createCountTokensUnsupportedResponse([provider.name]);
+		}
+
+		if (
+			pathCapability.support === "unknown" &&
+			!provider.canHandle(url.pathname)
+		) {
+			return Response.json(
+				{
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						code: "provider_path_unknown",
+						provider: provider.name,
+						message:
+							"This provider has no implementation for the requested path.",
+					},
+				},
+				{ status: 404 },
+			);
+		}
 		const requestedModelBeforeAdmission = effectiveBodyContext.getModel();
 		const cacheReplayPhysicalModel = req.headers.get(CACHE_REPLAY_MODEL_HEADER);
 		const requestedConfiguredModelMapping = requestedModelBeforeAdmission
@@ -3296,15 +3356,17 @@ export async function proxyWithAccount(
 				capabilityProofKey: capability?.proofKey ?? null,
 				inputReplayMode: capability?.inputReplayMode ?? [],
 				outputReplayMode: capability?.outputReplayMode ?? [],
-				beforePhysicalTransport: routingAttemptLedger
-					? () => {
-							routingAttemptLedger.recordPhysicalAttempt({
-								accountId: account.id,
-								candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
-								laneKey: requestMeta.affinityLaneKey ?? null,
-							});
-						}
-					: undefined,
+				beforePhysicalTransport: () => {
+					assertManagedWorkAvailable(req);
+					routingAttemptLedger?.recordPhysicalAttempt({
+						provider: provider.name,
+						logicalModel: clientRequestedModel,
+						physicalModel,
+						accountId: account.id,
+						candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
+						laneKey: requestMeta.affinityLaneKey ?? null,
+					});
+				},
 				serverToolHistoryProjector:
 					capability?.replay.serverToolHistoryProjector,
 				serverToolReplayIssuer: capability?.replay.serverToolReplayIssuer,
@@ -3480,21 +3542,24 @@ export async function proxyWithAccount(
 		};
 		let currentReplayBody = effectiveBodyBuffer;
 
-		const isSyntheticCodexCountTokens =
-			attemptPlan.providerName === "codex" &&
-			url.pathname === "/v1/messages/count_tokens";
+		const isLocalAdvisoryCountTokens =
+			pathCapability.operation === "count_tokens" &&
+			pathCapability.support === "local-advisory";
 
 		// Synthetic Codex count_tokens never calls upstream, so it should not require
 		// or refresh OAuth credentials just to return an advisory local estimate.
 		let accessToken = "";
-		if (!isSyntheticCodexCountTokens) {
+		if (!isLocalAdvisoryCountTokens) {
 			try {
 				accessToken = await runWithPreTransportDeadline({
 					phase: "credential_resolution",
 					timeoutMs:
 						getPreTransportDeadlineConfig().credentialResolutionTimeoutMs,
 					signal: routingSignal,
-					operation: () => getValidAccessToken(account, ctx),
+					operation: () => {
+						assertManagedWorkAvailable(req);
+						return getValidAccessToken(account, ctx);
+					},
 				});
 			} catch (error) {
 				if (error instanceof PreTransportPhaseTimeoutError) {
@@ -4277,6 +4342,9 @@ export async function proxyWithAccount(
 				const recordPhysicalDispatch = (): void => {
 					ensureNativeQuotaDispatch();
 					routingAttemptLedger?.recordPhysicalAttempt({
+						provider: attemptPlan.providerName,
+						logicalModel: clientRequestedModel,
+						physicalModel: resolvedModel ?? null,
 						accountId: account.id,
 						candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
 						laneKey: requestMeta.affinityLaneKey ?? null,
@@ -4314,6 +4382,7 @@ export async function proxyWithAccount(
 					claimCurrentHostedDispatch();
 				};
 				const claimHostedAndRecordHttpDispatch = (): void => {
+					assertManagedWorkAvailable(req);
 					ensureNativeQuotaDispatch();
 					routingAttemptLedger?.assertPhysicalAttemptAvailable(
 						physicalAttemptVetoContext(),
@@ -4331,7 +4400,7 @@ export async function proxyWithAccount(
 					attemptPlan.providerName === "codex" &&
 						!hasCodexTurnStateReplay &&
 						!modelFallbackPolicy?.qualityAttempt
-						? async (signal, markDispatched) => {
+						? async (signal, markDispatched, markObservedDispatch) => {
 								currentCodexWebSocketReceipt = null;
 								// Capture the concrete stamped attempt before any later retry mutates the
 								// surrounding attempt variable. These are the same join keys written to
@@ -4347,22 +4416,21 @@ export async function proxyWithAccount(
 										conversationIdentity: webSocketConversationIdentity,
 										request: transportRequest,
 										signal,
-										onBeforeFrameSend: () =>
+										onBeforeFrameSend: () => {
+											assertManagedWorkAvailable(req);
 											routingAttemptLedger?.assertPhysicalAttemptAvailable(
 												physicalAttemptVetoContext(),
-											),
-										onBeforeFrameWrite: hostedAttempt
-											? () => {
-													// Order matters: the budget assertion inside this claim
-													// can still veto, and a vetoed attempt never wrote a
-													// frame. Only once the hosted claim succeeds has the
-													// attempt passed the point where annulling it would
-													// discard a send that may have reached upstream.
-													claimHostedDispatchAfterBudgetAssertion();
-													markDispatched();
-												}
-											: undefined,
+											);
+										},
+										onBeforeFrameWrite: () => {
+											assertManagedWorkAvailable(req);
+											if (hostedAttempt) {
+												claimHostedDispatchAfterBudgetAssertion();
+												markDispatched();
+											}
+										},
 										onFrameWritten: (receipt) => {
+											markObservedDispatch("websocket");
 											markDispatched();
 											recordPhysicalDispatch();
 											currentCodexWebSocketReceipt = receipt;
@@ -4383,7 +4451,10 @@ export async function proxyWithAccount(
 						: undefined,
 					hostedAttempt
 						? claimHostedAndRecordHttpDispatch
-						: recordPhysicalDispatch,
+						: () => {
+								assertManagedWorkAvailable(req);
+								recordPhysicalDispatch();
+							},
 					() => {
 						dispatchStarted = true;
 						// The irreversible boundary: only now is this attempt's route
@@ -4657,7 +4728,10 @@ export async function proxyWithAccount(
 						timeoutMs:
 							getPreTransportDeadlineConfig().credentialResolutionTimeoutMs,
 						signal: routingSignal,
-						operation: () => refreshAccessTokenSafe(account, ctx),
+						operation: () => {
+							assertManagedWorkAvailable(req);
+							return refreshAccessTokenSafe(account, ctx);
+						},
 					});
 				} catch (error) {
 					const capturedRefreshToken = getRefreshTokenUsedForFailure(error);
@@ -4885,6 +4959,7 @@ export async function proxyWithAccount(
 				readAttemptBoundJson,
 			);
 			if (!classification) return false;
+			routingAttemptLedger?.recordPhysicalOutcome("context_length_exceeded");
 			const authoritative = classification === "authoritative";
 			const retainedLegacyContextOverflow = hasRetainedLegacyContextOverflow();
 			const canReplayAuthoritativeOverflow =
@@ -6141,6 +6216,7 @@ export async function proxyWithAccount(
 			failureResponse: Response,
 			attemptedModel = currentTransportModel || effectiveBodyContext.getModel(),
 		): Promise<RawAttemptFailureClassification> => {
+			routingAttemptLedger?.observePhysicalResponse(failureResponse.status);
 			const classification =
 				(await handleExtraUsageExhausted400(failureResponse, attemptedModel)) ??
 				(await handleOrgPermissionDenied403(failureResponse, attemptedModel)) ??
@@ -6155,6 +6231,7 @@ export async function proxyWithAccount(
 					stopAccountAttempt: false,
 				};
 			}
+			routingAttemptLedger?.recordPhysicalOutcome("upstream_error");
 			await finalizeCurrentCodexTransport(failureResponse);
 			if (!classification.retainedTerminalResponse) {
 				await discardUpstreamBody(failureResponse);
@@ -7405,6 +7482,8 @@ export async function proxyWithAccount(
 				const gatedBody = await gateAnthropicSsePreCommit(
 					downstreamAnthropicResponseBody,
 					{
+						observe: (evidence) =>
+							routingAttemptLedger?.observePhysicalStream(evidence),
 						semanticTimeoutMs: streamConfig.semanticTimeoutMs,
 						disableProtocolIdleTimeout: hasIrreversibleCodexWebSocketWrite,
 						meaningfulProgressTimeoutMs:
@@ -7429,6 +7508,13 @@ export async function proxyWithAccount(
 				}
 				break;
 			} catch (error) {
+				if (error instanceof AnthropicPreCommitStallError) {
+					routingAttemptLedger?.recordPhysicalOutcome(
+						error.reason,
+						"failed",
+						error,
+					);
+				}
 				const websocketReceipt = getCurrentCodexWebSocketReceipt();
 				if (websocketReceipt?.frameWritten) {
 					activeAttemptCommitment?.abortIfDeadlineElapsed();
@@ -8074,8 +8160,6 @@ export async function proxyWithAccount(
 			requestMeta.originalModel,
 			attemptAppliedModel,
 		);
-		const clientRequestedModel =
-			requestMeta.originalModel ?? baseBodyContext.getModel();
 		const hasTransportModelProvenance =
 			response.ok &&
 			!hasLogicalModelRewrite &&
@@ -8187,6 +8271,15 @@ export async function proxyWithAccount(
 			},
 		} satisfies PreparedProxyAccountResponse;
 	} catch (err) {
+		if (err instanceof AnthropicPreCommitStallError)
+			routingAttemptLedger?.recordPhysicalOutcome(err.reason, "failed", err);
+		else if (req.signal.aborted)
+			routingAttemptLedger?.recordPhysicalOutcome(
+				"client_cancelled",
+				"cancelled",
+			);
+		else if (!(err instanceof NativeQuotaAdmissionDenied))
+			routingAttemptLedger?.recordPhysicalOutcome("transport_error");
 		if (err instanceof QualityAttemptRejected) throw err;
 		const committedLifecycle = anthropicDegradedState?.lifecycle;
 		if (req.signal.aborted) {

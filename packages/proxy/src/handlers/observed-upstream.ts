@@ -30,7 +30,9 @@ export async function forwardObservedUpstream(
 	provider: Provider,
 	request: Request,
 	context: UpstreamObservationContext,
-	dispatch: () => Promise<Response>,
+	dispatch: (
+		markDispatched: (transport: "http" | "websocket") => void,
+	) => Promise<Response>,
 ): Promise<Response> {
 	let observation:
 		| Awaited<ReturnType<NonNullable<Provider["observeUpstream"]>>>
@@ -45,12 +47,18 @@ export async function forwardObservedUpstream(
 	}
 
 	if (!observation) {
-		return dispatch();
+		return dispatch(() => {});
 	}
 
 	let response: Response;
 	try {
-		response = await dispatch();
+		response = await dispatch((transport) => {
+			try {
+				observation?.dispatched?.(transport);
+			} catch {
+				/* observation cannot alter a send */
+			}
+		});
 	} catch (error) {
 		try {
 			observation.error(error);

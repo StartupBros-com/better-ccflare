@@ -486,6 +486,8 @@ describe("render_systemd_pin", () => {
 				"Environment=KEEP_ME=unchanged",
 				"Environment=OPERATOR_OVERRIDE=must-not-survive",
 				"Environment=CCFLARE_BIN=/new/bin",
+				"Environment=GUARD_ACCEPTED_CAP_MS=1470000",
+				"Environment=CCFLARE_MANAGED_TIMING=1",
 				"Environment=CCFLARE_DISTRIBUTION=v1:startupbros-managed-source",
 				"Environment=CCFLARE_PRODUCER=startupbros",
 				"Environment=CCFLARE_ARTIFACT_MODE=managed-source",
@@ -997,8 +999,8 @@ describe("deployment provenance pin", () => {
 		writeFileSync(input, "# legacy pin without provenance\n");
 		const result = bash(
 			[
-			`source ${shellQuote(helperScriptForShell)}`,
-			`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abcdef1234567890abcdef1234567890abcdef12 policy-v1 ${shellQuote(shellPath(policy))}`,
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abcdef1234567890abcdef1234567890abcdef12 policy-v1 ${shellQuote(shellPath(policy))}`,
 			].join("\n"),
 		);
 		expect(result.exitCode).toBe(0);
@@ -1102,10 +1104,10 @@ describe("validate_deployment_timing", () => {
 					"guard_shutdown_grace_ms=600000",
 					"guard_max_recovery_waits=12",
 					"stop_timeout_ms=720000",
-						"guard_max_request_body_bytes=33554432",
-						"guard_max_buffered_request_body_bytes=268435456",
-						"body_admission_budget_bytes=268435456",
-						"body_admission_queue_limit=500",
+					"guard_max_request_body_bytes=33554432",
+					"guard_max_buffered_request_body_bytes=268435456",
+					"body_admission_budget_bytes=268435456",
+					"body_admission_queue_limit=500",
 				].join("\n"),
 			],
 			[
@@ -1121,10 +1123,10 @@ describe("validate_deployment_timing", () => {
 					"guard_shutdown_grace_ms=900000",
 					"guard_max_recovery_waits=12",
 					"stop_timeout_ms=1020000",
-						"guard_max_request_body_bytes=33554432",
-						"guard_max_buffered_request_body_bytes=268435456",
-						"body_admission_budget_bytes=268435456",
-						"body_admission_queue_limit=500",
+					"guard_max_request_body_bytes=33554432",
+					"guard_max_buffered_request_body_bytes=268435456",
+					"body_admission_budget_bytes=268435456",
+					"body_admission_queue_limit=500",
 				].join("\n"),
 			],
 		] as const) {
@@ -1166,30 +1168,32 @@ describe("validate_deployment_timing", () => {
 		}
 	});
 
-	test.each(["120001", "180000", "0", "malformed"])(
-		"rejects max recovery silence %s even when the deadline is larger",
-		(maxSleep) => {
-			const dir = tempDir();
-			const pin = join(dir, "pin.conf");
-			writeFileSync(
-				pin,
-				[
-					"[Service]",
-					"Environment=GUARD_TOTAL_DEADLINE_MS=900000",
-					"Environment=GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000",
-					`Environment=GUARD_MAX_RECOVERY_SLEEP_MS=${maxSleep}`,
-					"Environment=GUARD_MAX_RECOVERY_WAITS=12",
-					"Environment=GUARD_SHUTDOWN_GRACE_MS=900000",
-					"KillMode=mixed",
-					"TimeoutStopSec=17min",
-				].join("\n"),
-			);
-			const result = bash(
-				`source ${shellQuote(helperScriptForShell)}\nvalidate_deployment_timing ${shellQuote(shellPath(pin))}`,
-			);
-			expect(result.exitCode).not.toBe(0);
-		},
-	);
+	test.each([
+		"120001",
+		"180000",
+		"0",
+		"malformed",
+	])("rejects max recovery silence %s even when the deadline is larger", (maxSleep) => {
+		const dir = tempDir();
+		const pin = join(dir, "pin.conf");
+		writeFileSync(
+			pin,
+			[
+				"[Service]",
+				"Environment=GUARD_TOTAL_DEADLINE_MS=900000",
+				"Environment=GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000",
+				`Environment=GUARD_MAX_RECOVERY_SLEEP_MS=${maxSleep}`,
+				"Environment=GUARD_MAX_RECOVERY_WAITS=12",
+				"Environment=GUARD_SHUTDOWN_GRACE_MS=900000",
+				"KillMode=mixed",
+				"TimeoutStopSec=17min",
+			].join("\n"),
+		);
+		const result = bash(
+			`source ${shellQuote(helperScriptForShell)}\nvalidate_deployment_timing ${shellQuote(shellPath(pin))}`,
+		);
+		expect(result.exitCode).not.toBe(0);
+	});
 
 	test("rejects a rendered policy with a missing recovery silence ceiling", () => {
 		const dir = tempDir();
@@ -1316,12 +1320,12 @@ describe("effective systemd policy validation", () => {
 				'if [[ "$*" == *"--property=RestartUSec"* ]]; then printf \'%s\\n\' "${CCFLARE_TEST_RESTART_SEC:-5s}"; exit 0; fi',
 				'if [[ "$*" == *"--property=RestartPreventExitStatus"* ]]; then printf \'%s\\n\' "${CCFLARE_TEST_RESTART_PREVENT_EXIT_STATUS:-143}"; exit 0; fi',
 				'if [[ "$*" == *"--property=Restart"* ]]; then printf \'%s\\n\' "${CCFLARE_TEST_RESTART:-on-failure}"; exit 0; fi',
-			'if [[ "$*" == *"--property=Environment"* ]]; then',
-			'  if [[ -n "${CCFLARE_TEST_SAFE_POLICY_PIN:-}" && -n "${CCFLARE_TEST_SAFE_POLICY_BACKUP:-}" ]] && cmp -s "$CCFLARE_TEST_SAFE_POLICY_PIN" "$CCFLARE_TEST_SAFE_POLICY_BACKUP" && [[ -n "${CCFLARE_TEST_RESTORED_ENVIRONMENT+x}" ]]; then',
+				'if [[ "$*" == *"--property=Environment"* ]]; then',
+				'  if [[ -n "${CCFLARE_TEST_SAFE_POLICY_PIN:-}" && -n "${CCFLARE_TEST_SAFE_POLICY_BACKUP:-}" ]] && cmp -s "$CCFLARE_TEST_SAFE_POLICY_PIN" "$CCFLARE_TEST_SAFE_POLICY_BACKUP" && [[ -n "${CCFLARE_TEST_RESTORED_ENVIRONMENT+x}" ]]; then',
 				"    printf '%s\\n' \"$CCFLARE_TEST_RESTORED_ENVIRONMENT\"",
-			"  else",
-			'    environment="$CCFLARE_TEST_ENVIRONMENT"',
-			'    if [[ "${CCFLARE_TEST_OMIT_FAILURE_STOP_BUDGET:-0}" != "1" && "$environment" != *"RUNNER_FAILURE_STOP_BUDGET_MS="* ]]; then environment="$environment RUNNER_FAILURE_STOP_BUDGET_MS=${CCFLARE_TEST_FAILURE_STOP_BUDGET:-30000}"; fi',
+				"  else",
+				'    environment="$CCFLARE_TEST_ENVIRONMENT"',
+				'    if [[ "${CCFLARE_TEST_OMIT_FAILURE_STOP_BUDGET:-0}" != "1" && "$environment" != *"RUNNER_FAILURE_STOP_BUDGET_MS="* ]]; then environment="$environment RUNNER_FAILURE_STOP_BUDGET_MS=${CCFLARE_TEST_FAILURE_STOP_BUDGET:-30000}"; fi',
 				"    printf '%s\\n' \"$environment\"",
 				"  fi",
 				"  exit 0",
@@ -1495,9 +1499,9 @@ describe("effective systemd policy validation", () => {
 			"GUARD_MAX_REQUEST_BODY_BYTES=33554432 GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456 CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456 CCFLARE_MAX_BODY_ADMISSION_QUEUE=500 GUARD_TOTAL_DEADLINE_MS=600000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000 GUARD_MAX_RECOVERY_SLEEP_MS=120000 GUARD_MAX_RECOVERY_WAITS=12 GUARD_SHUTDOWN_GRACE_MS=600000 RUNNER_RSS_THRESHOLD_BYTES=4294967296 RUNNER_RSS_POLL_INTERVAL_MS=60000 RUNNER_RSS_MIN_UPTIME_MS=1800000 RUNNER_RSS_CONSECUTIVE_SAMPLES=5 RUNNER_RSS_RECYCLE_COOLDOWN_MS=3600000 RUNNER_RSS_MAX_RECYCLES=8 RUNNER_RSS_RECYCLE_WINDOW_MS=86400000";
 		const good = bash(
 			[
-			...base,
-			`export CCFLARE_TEST_ENVIRONMENT='${safe}'`,
-			"validate_effective_systemd_policy ccflare-stack.service",
+				...base,
+				`export CCFLARE_TEST_ENVIRONMENT='${safe}'`,
+				"validate_effective_systemd_policy ccflare-stack.service",
 			].join("\n"),
 		);
 		expect(good.exitCode).toBe(0);
@@ -1556,9 +1560,9 @@ describe("effective systemd policy validation", () => {
 		]) {
 			const invalid = bash(
 				[
-				...base,
-				`export CCFLARE_TEST_ENVIRONMENT='${environment}'`,
-				"validate_effective_systemd_policy ccflare-stack.service",
+					...base,
+					`export CCFLARE_TEST_ENVIRONMENT='${environment}'`,
+					"validate_effective_systemd_policy ccflare-stack.service",
 				].join("\n"),
 			);
 			expect(invalid.exitCode).not.toBe(0);
@@ -1862,7 +1866,7 @@ describe("validate_deploy_health", () => {
 					maxInspectionBytes: 65_536,
 					maxRequestBodyBytes: 33_554_432,
 					maxBufferedRequestBodyBytes: 268_435_456,
-					},
+				},
 			},
 		});
 		const good = bash(
@@ -1927,7 +1931,7 @@ describe("rollback identity proof", () => {
 					jitterMs: 2_000,
 					maxInspectionBytes: 65_536,
 					maxRequestBodyBytes: 4_194_304,
-					},
+				},
 			},
 		});
 		const good = bash(
@@ -1980,8 +1984,8 @@ describe("rollback identity proof", () => {
 		});
 		const result = bash(
 			[
-			`source ${shellQuote(helperScriptForShell)}`,
-			`validate_rollback_health ${shellQuote(proxy)} ${shellQuote(incompleteCurrentGuard)} ${shellQuote(proxy)} ${shellQuote(incompleteCurrentGuard)}`,
+				`source ${shellQuote(helperScriptForShell)}`,
+				`validate_rollback_health ${shellQuote(proxy)} ${shellQuote(incompleteCurrentGuard)} ${shellQuote(proxy)} ${shellQuote(incompleteCurrentGuard)}`,
 			].join("\n"),
 		);
 		expect(result.exitCode).toBe(70);
@@ -2208,7 +2212,7 @@ describe("source-controlled stack runner", () => {
 		expect(source).toContain('GUARD_UPSTREAM_PID="${upstream_pid}"');
 		expect(source).toContain('wait -n -p exited_pid "${child_pids[@]}"');
 		expect(source).toContain(
-			'stop_child "better-ccflare upstream" "$upstream_pid" 5000',
+			'stop_child "better-ccflare upstream" "$upstream_pid" "$UPSTREAM_STOP_BUDGET_MS"',
 		);
 		expect(source).toContain(
 			'stop_child "ai-gateway ssh tunnel" "$ai_gateway_tunnel_pid" 5000',
@@ -2383,9 +2387,9 @@ process.on("SIGTERM", () => {
 				signal: NodeJS.Signals | null;
 				at: number;
 			}>((resolve) => {
-					runner.once("exit", (code, signal) =>
-						resolve({ code, signal, at: Date.now() }),
-					);
+				runner.once("exit", (code, signal) =>
+					resolve({ code, signal, at: Date.now() }),
+				);
 			});
 			if (process.platform === "win32") {
 				// child_process.kill terminates the Windows interop wrapper without
@@ -2966,4 +2970,85 @@ describe("deployment flow safety contracts", () => {
 		expect(verify).toBeGreaterThan(restart);
 		expect(hardFailure).toBeGreaterThan(verify);
 	});
+});
+
+test("renderer retains a validated narrower accepted cap", () => {
+	const dir = tempDir(),
+		input = join(dir, "prior.conf"),
+		output = join(dir, "next.conf"),
+		files = writeDigestFixtures(dir);
+	writeFileSync(
+		input,
+		"# BEGIN better-ccflare managed deployment\n[Service]\nEnvironment=GUARD_ACCEPTED_CAP_MS=900000\nEnvironment=CCFLARE_SERVER_DRAIN_MS=90000\n# END better-ccflare managed deployment\n",
+	);
+	const result = bash(
+		`source ${helperScriptForShell}; render_systemd_pin '${input}' '${output}' '${join(dir, "binary")}' '${files.runner}' '${files.guard}' '${"a".repeat(40)}' 'fixture' '${files.policy}'`,
+	);
+	expectCommandOk(result);
+	expect(readFileSync(output, "utf8")).toContain(
+		"Environment=GUARD_ACCEPTED_CAP_MS=900000",
+	);
+	expect(readFileSync(output, "utf8")).toContain(
+		"CCFLARE_SERVER_DRAIN_MS=90000",
+	);
+});
+
+test("rendered policy rejects retirement exceeding effective systemd stop timeout", () => {
+	const dir = tempDir(),
+		input = join(dir, "prior.conf"),
+		output = join(dir, "next.conf"),
+		files = writeDigestFixtures(dir);
+	writeFileSync(
+		input,
+		"# BEGIN better-ccflare managed deployment\n[Service]\nEnvironment=CCFLARE_SERVER_DRAIN_MS=900000\n# END better-ccflare managed deployment\n",
+	);
+	expectCommandOk(
+		bash(
+			`source ${helperScriptForShell}; render_systemd_pin '${input}' '${output}' '${join(dir, "binary")}' '${files.runner}' '${files.guard}' '${"a".repeat(40)}' 'fixture' '${files.policy}'`,
+		),
+	);
+	const result = bash(
+		`source ${helperScriptForShell}; validate_deployment_timing '${output}'`,
+	);
+	expect(result.exitCode).toBe(1);
+	expect(capturedOutput(result.stderr, "stderr")).toContain(
+		"unsafe TimeoutStopSec",
+	);
+});
+
+describe("immutable_binary_name", () => {
+	test("same source retries reuse equal bytes and retain distinct compiled content", () => {
+		const first = bash(
+			`source ${helperScriptForShell}; immutable_binary_name 3.5.78 abcdef012345 ${"a".repeat(64)}`,
+		);
+		const equal = bash(
+			`source ${helperScriptForShell}; immutable_binary_name 3.5.78 abcdef012345 ${"a".repeat(64)}`,
+		);
+		const different = bash(
+			`source ${helperScriptForShell}; immutable_binary_name 3.5.78 abcdef012345 ${"b".repeat(64)}`,
+		);
+		expect(first.exitCode).toBe(0);
+		expect(first.stdout.toString().trim()).toBe(
+			`better-ccflare-v3.5.78-abcdef012345-${"a".repeat(64)}`,
+		);
+		expect(equal.stdout.toString()).toBe(first.stdout.toString());
+		expect(different.stdout.toString()).not.toBe(first.stdout.toString());
+		const invalid = bash(
+			`source ${helperScriptForShell}; immutable_binary_name 3.5.78 abcdef012345 bad`,
+		);
+		expect(invalid.exitCode).not.toBe(0);
+	});
+});
+
+test("artifact module pruning recognizes only exact legacy or managed module sets", () => {
+	const dir = tempDir();
+	writeFileSync(join(dir, "ccflare-guard.mjs"), "guard");
+	writeFileSync(join(dir, "ccflare-guard-policy.mjs"), "policy");
+	const command = `source ${helperScriptForShell}; artifact_module_set_matches ${shellQuote(dir)} ccflare-guard.mjs ccflare-guard-policy.mjs`;
+	expect(bash(command).exitCode).toBe(0);
+	writeFileSync(join(dir, "ccflare-managed-timing.mjs"), "timing");
+	expect(bash(command).exitCode).not.toBe(0);
+	expect(bash(command + " ccflare-managed-timing.mjs").exitCode).toBe(0);
+	writeFileSync(join(dir, "unexpected"), "preserve");
+	expect(bash(command + " ccflare-managed-timing.mjs").exitCode).not.toBe(0);
 });

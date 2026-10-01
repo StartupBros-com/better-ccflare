@@ -44,7 +44,8 @@ describe("Auto-Refresh Token Hierarchy", () => {
 		scheduler = new AutoRefreshScheduler(db, mockProxyContext);
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await DatabaseFactory.reset();
 		// Clean up test database
 		try {
 			if (existsSync(TEST_DB_PATH)) {
@@ -53,7 +54,6 @@ describe("Auto-Refresh Token Hierarchy", () => {
 		} catch (error) {
 			console.warn("Failed to clean up test database:", error);
 		}
-		DatabaseFactory.reset();
 	});
 
 	describe("Window Refresh Logic", () => {

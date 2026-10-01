@@ -31,12 +31,9 @@ test.each([
 	["fixture-sha", "fixture-sha", true],
 	[sourceSha.slice(0, 7), sourceSha.slice(0, 8), false],
 	[sourceSha.slice(0, 8), sourceSha.toUpperCase(), false],
-])(
-	"replacement health source %j against %j matches=%j",
-	(reported, pinned, expected) => {
-		expect(matchesPinnedSourceId(reported, pinned)).toBe(expected);
-	},
-);
+])("replacement health source %j against %j matches=%j", (reported, pinned, expected) => {
+	expect(matchesPinnedSourceId(reported, pinned)).toBe(expected);
+});
 
 const cleanups: Array<() => Promise<unknown> | void> = [];
 afterEach(async () => {
@@ -103,6 +100,7 @@ async function fixture(options: Record<string, unknown> = {}) {
 		calls,
 		signatures,
 		release: () => hold!.end("last"),
+		chunk: () => hold!.write("tick"),
 	};
 }
 
@@ -466,4 +464,27 @@ test("native fixture runtime resolution rejects Bun instead of silently weakenin
 	expect(() =>
 		resolveNodeExecutable({ ...process.env, GUARD_NODE_BIN: process.execPath }),
 	).toThrow("require Node");
+});
+
+test("productive response chunks cannot renew the new accepted-work ceiling", async () => {
+	const f = await fixture({
+		acceptedCapMs: 120,
+		responseIdleTimeoutMs: 1000,
+		totalDeadlineMs: 700,
+	});
+	const response = await fetch(`${f.base}/hold`, {
+		headers: {
+			"x-better-ccflare-managed-timing": "forged",
+			"x-better-ccflare-timeout-ms": "1800000",
+		},
+	});
+	const outcome = response.text().catch(() => "accepted-cutoff");
+	const timer = setInterval(() => f.chunk(), 10);
+	try {
+		expect(await outcome).toBe("accepted-cutoff");
+		expect(f.guard.state.counters.acceptedDeadlineExceeded).toBe(1);
+		expect(f.calls).toEqual(["/hold"]);
+	} finally {
+		clearInterval(timer);
+	}
 });

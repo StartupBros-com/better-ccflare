@@ -120,7 +120,10 @@ function makeContext(
 	};
 }
 
-function makeProtectedAttempt(events?: DegradedModeDiagnosticEvent[]) {
+function makeProtectedAttempt(
+	events?: DegradedModeDiagnosticEvent[],
+	model = "claude-opus-4-6",
+) {
 	let now = 0;
 	const coordinator = new AnthropicDegradedModeCoordinator({
 		config: {
@@ -150,7 +153,7 @@ function makeProtectedAttempt(events?: DegradedModeDiagnosticEvent[]) {
 	now = coordinator.config.retryFallbackMs;
 	const body = new TextEncoder().encode(
 		JSON.stringify({
-			model: "claude-opus-4-6",
+			model,
 			messages: [{ role: "user", content: "large" }],
 			max_tokens: 16,
 		}),
@@ -207,17 +210,24 @@ function makeProtectedAttempt(events?: DegradedModeDiagnosticEvent[]) {
 async function runAttempt(
 	fixture: ReturnType<typeof makeProtectedAttempt>,
 	modelFallbackPolicy?: unknown,
+	overrides: {
+		requestMeta?: RequestMeta;
+		account?: Account;
+		modelOverride?: string;
+		context?: ProxyContext;
+	} = {},
 ) {
 	return proxyWithAccount(
 		fixture.request,
 		new URL(fixture.request.url),
-		makeAccount(),
-		makeRequestMeta(),
+		overrides.account ?? makeAccount(),
+		overrides.requestMeta ?? makeRequestMeta(),
 		fixture.body.buffer,
 		() => undefined,
 		0,
-		makeContext(fixture.coordinator, fixture.observability),
-		undefined,
+		overrides.context ??
+			makeContext(fixture.coordinator, fixture.observability),
+		overrides.modelOverride,
 		undefined,
 		undefined,
 		undefined,
@@ -275,6 +285,58 @@ describe("Anthropic degraded dispatch-time observability", () => {
 			droppedEvents: 0,
 		});
 	});
+
+	for (const helperSend of [false, true]) {
+		for (const originalModel of [undefined, "client-logical-model"]) {
+			it(`captures the logical model before ${helperSend ? "helper and HTTP" : "HTTP"} sends with ${originalModel ? "explicit metadata" : "body-only metadata"}`, async () => {
+				const fixture = makeProtectedAttempt(undefined, "body-logical-model");
+				const context = makeContext(fixture.coordinator, fixture.observability);
+				const meta = { ...makeRequestMeta(), originalModel };
+				const expectedLogicalModel = originalModel ?? "body-logical-model";
+				let helperCount = 0;
+				context.provider.name = "logical-model-test";
+				if (helperSend) {
+					context.provider.transformRequestBody = async (
+						request,
+						_account,
+						beforePhysicalTransport,
+					) => {
+						beforePhysicalTransport?.();
+						helperCount++;
+						expect(fixture.ledger.lastPhysicalObservation).toMatchObject({
+							logicalModel: expectedLogicalModel,
+							physicalModel: "claude-opus-4-6",
+						});
+						meta.originalModel = "late-metadata-change";
+						return request;
+					};
+				}
+				globalThis.fetch = mock(async () => {
+					expect(fixture.ledger.lastPhysicalObservation).toMatchObject({
+						logicalModel: expectedLogicalModel,
+						physicalModel: "claude-opus-4-6",
+					});
+					return new Response('{"ok":true}', {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					});
+				}) as unknown as typeof fetch;
+
+				const result = await runAttempt(fixture, undefined, {
+					requestMeta: meta,
+					account: { ...makeAccount(), provider: "logical-model-test" },
+					modelOverride: "claude-opus-4-6",
+					context,
+				});
+				expect(result).toBeInstanceOf(Response);
+				if (!(result instanceof Response)) throw new Error("expected response");
+				await result.text();
+				expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+				expect(helperCount).toBe(helperSend ? 1 : 0);
+				expect(fixture.ledger.physicalAttemptCount).toBe(helperSend ? 2 : 1);
+			});
+		}
+	}
 
 	it("does not count a physical or probe send when the attempt budget is already zero", async () => {
 		const fixture = makeProtectedAttempt();

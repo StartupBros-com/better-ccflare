@@ -15,6 +15,7 @@ import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import type {
 	CacheReplayModelStrategy,
+	ProviderPathCapability,
 	RateLimitInfo,
 	TokenRefreshResult,
 } from "../../types";
@@ -190,6 +191,22 @@ export class AnthropicProvider extends BaseProvider {
 	}
 	override readonly cacheReplayModelStrategy: CacheReplayModelStrategy =
 		"transformed-body";
+
+	getPathCapability(path: string): ProviderPathCapability {
+		if (path === "/v1/messages/count_tokens") {
+			return { operation: "count_tokens", support: "native" };
+		}
+		return {
+			operation:
+				path === "/v1/messages" ||
+				path === "/v1/chat/completions" ||
+				path === "/v1/responses"
+					? "generation"
+					: "other",
+			support:
+				path === "/v1/messages" || path === "/v1/models" ? "native" : "unknown",
+		};
+	}
 
 	canHandle(_path: string): boolean {
 		// Handle all paths for now since this is Anthropic-specific

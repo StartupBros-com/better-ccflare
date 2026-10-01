@@ -93,9 +93,9 @@ describe("CLI notify-server calls send the local-control-secret (#216)", () => {
 		}) as typeof fetch;
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		globalThis.fetch = originalFetch;
-		DatabaseFactory.reset();
+		await DatabaseFactory.reset();
 		for (const path of [dbPath, `${dbPath}-shm`, `${dbPath}-wal`]) {
 			if (existsSync(path)) {
 				rmSync(path, { recursive: true, force: true });

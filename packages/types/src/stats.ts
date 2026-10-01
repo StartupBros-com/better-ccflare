@@ -301,6 +301,21 @@ export interface AnthropicDegradedRuntimeHealth {
  * so consumers must keep both fields separate rather than summing them into
  * an invented native-memory metric.
  */
+export interface MemoryMaintenanceOwnerSnapshot {
+	workersAcquired: number;
+	workersRetired: number;
+	/** Live logical worker leases; not a native thread census. */
+	workersLive: number;
+	objectUrlsAcquired: number;
+	objectUrlsRevoked: number;
+	objectUrlsLive: number;
+	activeJobs: number;
+	queuedJobs: number;
+	closing: boolean;
+	retiring: boolean;
+	held: boolean;
+}
+
 export interface MemorySnapshot {
 	rss: number;
 	heapTotal: number;
@@ -311,6 +326,15 @@ export interface MemorySnapshot {
 	peakRss: number;
 	rssGrowth: number;
 	uptimeSeconds: number;
+	/** Cheap JSC counters, independently reported; never added to process fields. */
+	jsc?: {
+		heapSize: number;
+		current: number;
+		peak: number;
+		currentCommit: number;
+		peakCommit: number;
+		pageFaults: number;
+	};
 	lifecycle?: {
 		bodyAdmission?: {
 			activeLeases: number;
@@ -319,6 +343,16 @@ export interface MemorySnapshot {
 		};
 		trackedStreams?: number;
 		pendingRequests?: number;
+		maintenance?: {
+			periodic?: MemoryMaintenanceOwnerSnapshot;
+			compaction?: MemoryMaintenanceOwnerSnapshot;
+		};
+		/** payloadBytesPending includes queued AND running payload jobs; it is an estimate. */
+		writer?: {
+			metadataQueuedJobs: number;
+			payloadQueuedJobs: number;
+			payloadBytesPending: number;
+		};
 	};
 }
 

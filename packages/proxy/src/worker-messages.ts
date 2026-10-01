@@ -138,6 +138,9 @@ export interface ChunkMessage {
 }
 
 export interface EndMessage {
+	routingAttemptSummary?:
+		| import("@better-ccflare/types").RequestRoutingAttemptSummary
+		| null;
 	type: "end";
 	requestId: string;
 	responseBody?: string | null; // base64 encoded, for non-streaming

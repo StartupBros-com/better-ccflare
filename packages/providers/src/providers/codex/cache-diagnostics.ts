@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 
 export const CODEX_CACHE_DIAGNOSTICS_ENV = "CCFLARE_CODEX_CACHE_DIAGNOSTICS";
 const TTL_MS = 30 * 60 * 1000;
@@ -19,6 +19,9 @@ type Fingerprint = {
 	key: string;
 	parameters: string;
 	at: number;
+	dispatchedAt: number | null;
+	physicalTransport: "http" | "websocket" | null;
+	cachedReadTokens: number | null;
 };
 type Facts = Record<string, number | boolean | string | null>;
 type Pending = { fingerprint: Fingerprint; facts: Facts };
@@ -28,6 +31,10 @@ export type CacheObservationContext = {
 	headers?: Headers;
 	endpoint?: string;
 	source?: { input?: unknown; instructions?: unknown; tools?: unknown };
+	wireHeaders?: Headers;
+	buildEpoch?: string | null;
+	capabilityRevision?: string | null;
+	keyEpoch?: string | null;
 };
 
 function hash(value: unknown): string {
@@ -51,11 +58,27 @@ export class CodexCacheDiagnostics {
 	private pending = new Map<string, Pending>();
 	private instance = randomUUID();
 	private sequence = 0;
+	#digestKey = randomBytes(32);
 	constructor(
 		private emit: (facts: Facts) => void,
 		private now = Date.now,
 		private lifecycle: (facts: Facts) => void = () => {},
 	) {}
+
+	private emitSafe(facts: Facts): void {
+		try {
+			this.emit(facts);
+		} catch {
+			/* observation cannot fail inference */
+		}
+	}
+	private lifecycleSafe(facts: Facts): void {
+		try {
+			this.lifecycle(facts);
+		} catch {
+			/* observation cannot fail inference */
+		}
+	}
 
 	sweep(): void {
 		const now = this.now();
@@ -72,6 +95,20 @@ export class CodexCacheDiagnostics {
 		session: string,
 		body: Record<string, unknown>,
 		context: CacheObservationContext = {},
+	): void {
+		try {
+			this.prepareBounded(requestId, account, session, body, context);
+		} catch {
+			this.gap(requestId, "observation_error");
+		}
+	}
+
+	private prepareBounded(
+		requestId: string,
+		account: string,
+		session: string,
+		body: Record<string, unknown>,
+		context: CacheObservationContext,
 	): void {
 		const now = this.now();
 		this.sweep();
@@ -95,7 +132,18 @@ export class CodexCacheDiagnostics {
 		const metadata: Facts = {
 			event: "prepared",
 			ts_ms: now,
-			request_digest: hash(requestId),
+			prepared_at_ms: now,
+			dispatched_at_ms: null,
+			terminal_at_ms: null,
+			physical_transport: "unknown",
+			response_mode: "unknown",
+			cache_cohort_qualification: "unknown",
+			cache_cohort_reason: "missing_dispatch",
+			strict_prior_support: 0,
+			upstream_cache_residency: "unknown",
+			usage_input_semantics: "physical_inclusive",
+			digest_epoch_digest: hash([this.instance, "hmac-sha256-v1"]),
+			request_digest: requestId.length <= 512 ? hash(requestId) : null,
 			attempt_digest: hash([this.instance, attempt]),
 			observer_attempt_sequence: attempt,
 			gateway_request_digest: gatewayIdentity(
@@ -104,8 +152,11 @@ export class CodexCacheDiagnostics {
 			gateway_attempt_digest: gatewayIdentity(
 				"x-better-ccflare-gateway-attempt-digest",
 			),
-			account_digest: account ? hash(account) : null,
-			session_digest: session ? hash([account, session]) : null,
+			account_digest: account && account.length <= 512 ? hash(account) : null,
+			session_digest:
+				session && account.length <= 512 && session.length <= 512
+					? hash([account, session])
+					: null,
 			conversation_digest: conversation,
 			agent_digest:
 				suppliedDigest("x-better-ccflare-agent-digest") ??
@@ -122,8 +173,14 @@ export class CodexCacheDiagnostics {
 					? "inferred"
 					: "missing",
 			path: context.path ?? "legacy",
-			model_digest: hash(body.model),
-			endpoint_digest: context.endpoint ? hash(context.endpoint) : null,
+			model_digest:
+				typeof body.model === "string" && body.model.length <= 256
+					? hash(body.model)
+					: null,
+			endpoint_digest:
+				context.endpoint && context.endpoint.length <= 512
+					? hash(context.endpoint)
+					: null,
 			cache_key_present:
 				typeof body.prompt_cache_key === "string" &&
 				body.prompt_cache_key.length > 0,
@@ -135,19 +192,30 @@ export class CodexCacheDiagnostics {
 			const facts = {
 				...metadata,
 				fingerprint_complete: false,
+				cache_cohort_reason: "coverage_gap",
 				input_items: Array.isArray(body.input) ? body.input.length : null,
 			};
-			this.lifecycle(facts);
-			this.lifecycle({ ...facts, event: "coverage_gap", gap_reason: reason });
+			this.lifecycleSafe(facts);
+			this.lifecycleSafe({
+				...facts,
+				event: "coverage_gap",
+				gap_reason: reason,
+			});
 			this.retain(requestId, {
 				facts,
 				fingerprint: {
 					group: "",
-					requestDigest: hash(requestId),
+					requestDigest:
+						typeof metadata.request_digest === "string"
+							? metadata.request_digest
+							: hash(null),
 					attemptDigest: metadata.attempt_digest as string,
 					complete: false,
 					dimensions: {},
 					at: now,
+					dispatchedAt: null,
+					physicalTransport: null,
+					cachedReadTokens: null,
 					items: [],
 					bytes: [],
 					instructions: "",
@@ -163,137 +231,253 @@ export class CodexCacheDiagnostics {
 			[session, "missing_session"],
 		]) {
 			if (!present)
-				this.lifecycle({
+				this.lifecycleSafe({
 					...metadata,
 					event: "coverage_gap",
 					gap_reason: reason,
 				});
 		}
+		if (
+			[requestId, account, session].some((value) => value.length > 512) ||
+			typeof body.model !== "string" ||
+			body.model.length > 256
+		) {
+			skip("identity_limit");
+			return;
+		}
 		if (!Array.isArray(body.input) || body.input.length > MAX_ITEMS) {
 			skip(!Array.isArray(body.input) ? "invalid_input" : "item_limit");
 			return;
 		}
-		const items: string[] = [];
-		const bytes: number[] = [];
-		let totalBytes = 0;
-		for (const item of body.input) {
-			const serialized = JSON.stringify(item);
-			if (serialized === undefined) {
-				skip("invalid_input");
-				return;
+		let hashBytes = 0;
+		let visited = 0;
+		const boundedSerialize = (value: unknown): string => {
+			let strings = 0;
+			const serialized = JSON.stringify(value ?? null, (_key, item) => {
+				if (++visited > MAX_ITEMS * 64) throw new Error("item_limit");
+				if (typeof item === "string") {
+					strings += Buffer.byteLength(item);
+					if (strings + hashBytes > MAX_BYTES) throw new Error("byte_limit");
+				}
+				return item;
+			});
+			if (serialized === undefined) throw new Error("invalid_input");
+			hashBytes += Buffer.byteLength(serialized);
+			if (hashBytes > MAX_BYTES) throw new Error("byte_limit");
+			return serialized;
+		};
+		const fingerprintHash = (value: unknown) =>
+			createHmac("sha256", this.#digestKey)
+				.update(boundedSerialize(value))
+				.digest("hex");
+		try {
+			const items: string[] = [];
+			const bytes: number[] = [];
+			let totalBytes = 0;
+			for (const item of body.input) {
+				const serialized = boundedSerialize(item);
+				if (serialized === undefined) {
+					skip("invalid_input");
+					return;
+				}
+				const size = Buffer.byteLength(serialized);
+				totalBytes += size;
+				if (totalBytes > MAX_BYTES) {
+					skip("byte_limit");
+					return;
+				}
+				items.push(
+					createHmac("sha256", this.#digestKey)
+						.update(serialized)
+						.digest("hex"),
+				);
+				bytes.push(size);
 			}
-			const size = Buffer.byteLength(serialized);
-			totalBytes += size;
-			if (totalBytes > MAX_BYTES) {
-				skip("byte_limit");
-				return;
+			const {
+				input: _input,
+				instructions,
+				tools,
+				prompt_cache_key,
+				...parameters
+			} = body;
+			const fingerprint: Fingerprint = {
+				group: hash([account || requestId, session || requestId, body.model]),
+				requestDigest: hash(requestId),
+				attemptDigest: metadata.attempt_digest as string,
+				complete: true,
+				dimensions: {
+					client_build:
+						context.headers?.get("user-agent") &&
+						context.wireHeaders?.get("user-agent") &&
+						context.wireHeaders?.get("version")
+							? fingerprintHash([
+									context.headers.get("user-agent"),
+									context.wireHeaders.get("user-agent"),
+									context.wireHeaders.get("version"),
+								])
+							: null,
+					build_epoch: context.buildEpoch
+						? fingerprintHash(context.buildEpoch)
+						: null,
+					capability_revision: context.capabilityRevision
+						? fingerprintHash(context.capabilityRevision)
+						: null,
+					key_epoch: context.keyEpoch
+						? fingerprintHash(context.keyEpoch)
+						: null,
+					digest_epoch: hash([this.instance, "hmac-sha256-v1"]),
+					reasoning: fingerprintHash(body.reasoning),
+					text_format: fingerprintHash(body.text),
+					service_tier: fingerprintHash(body.service_tier),
+					cache_options: fingerprintHash(body.prompt_cache_options),
+					parallel_tools: fingerprintHash(body.parallel_tool_calls),
+					source_input: context.source
+						? fingerprintHash(context.source.input)
+						: null,
+					source_instructions: context.source
+						? fingerprintHash(context.source.instructions)
+						: null,
+					source_tools: context.source
+						? fingerprintHash(context.source.tools)
+						: null,
+				},
+				items,
+				bytes,
+				at: now,
+				dispatchedAt: null,
+				physicalTransport: null,
+				cachedReadTokens: null,
+				instructions: fingerprintHash(instructions),
+				tools: fingerprintHash(tools),
+				key: fingerprintHash(prompt_cache_key),
+				parameters: fingerprintHash(parameters),
+			};
+			let best: Fingerprint | undefined;
+			let matchedItems = 0;
+			let matchedBytes = 0;
+			let candidates = 0;
+			for (const prior of this.history) {
+				if (prior.group !== fingerprint.group) continue;
+				candidates++;
+				let n = 0;
+				let size = 0;
+				while (
+					n < items.length &&
+					n < prior.items.length &&
+					items[n] === prior.items[n]
+				)
+					size += bytes[n++];
+				// On equal prefix overlap prefer the most recent completed candidate.
+				if (!best || size >= matchedBytes) {
+					best = prior;
+					matchedItems = n;
+					matchedBytes = size;
+				}
 			}
-			items.push(createHash("sha256").update(serialized).digest("hex"));
-			bytes.push(size);
-		}
-		const {
-			input: _input,
-			instructions,
-			tools,
-			prompt_cache_key,
-			...parameters
-		} = body;
-		const fingerprint: Fingerprint = {
-			group: hash([account || requestId, session || requestId, body.model]),
-			requestDigest: hash(requestId),
-			attemptDigest: metadata.attempt_digest as string,
-			complete: true,
-			dimensions: {
-				reasoning: hash(body.reasoning),
-				text_format: hash(body.text),
-				service_tier: hash(body.service_tier),
-				cache_options: hash(body.prompt_cache_options),
-				parallel_tools: hash(body.parallel_tool_calls),
-				source_input: context.source ? hash(context.source.input) : null,
-				source_instructions: context.source
-					? hash(context.source.instructions)
+			const facts: Facts = {
+				...metadata,
+				event: "prepared",
+				ts_ms: now,
+				request_digest: fingerprint.requestDigest,
+				comparison_group_digest: fingerprint.group,
+				fingerprint_complete: true,
+				inferred_conversation_digest: hash([
+					session,
+					fingerprint.instructions,
+					items[0],
+				]),
+				input_digest: hash(items),
+				instructions_digest: fingerprint.instructions,
+				tools_digest: fingerprint.tools,
+				cache_key_digest: fingerprint.key,
+				parameters_digest: fingerprint.parameters,
+				prior_candidates: candidates,
+				prior_request_digest: best?.requestDigest ?? null,
+				prior_attempt_digest: best?.attemptDigest ?? null,
+				prior_age_ms: best ? Math.max(0, now - best.at) : null,
+				prior_completed_at_ms: best?.at ?? null,
+				prior_completed_to_prepare_ms: best ? Math.max(0, now - best.at) : null,
+				prior_physical_transport: best?.physicalTransport ?? "unknown",
+				prior_cached_tokens: best?.cachedReadTokens ?? null,
+				prior_cache_read_positive:
+					best?.cachedReadTokens == null ? null : best.cachedReadTokens > 0,
+				hashed_bytes: hashBytes,
+				history_count: this.history.length,
+				pending_count: Math.min(MAX_ENTRIES, this.pending.size + 1),
+				input_items: items.length,
+				input_bytes: totalBytes,
+				matched_input_items: best ? matchedItems : null,
+				matched_input_bytes: best ? matchedBytes : null,
+				prior_input_items: best?.items.length ?? null,
+				prior_input_prefix_preserved: best
+					? matchedItems === best.items.length
 					: null,
-				source_tools: context.source ? hash(context.source.tools) : null,
-			},
-			items,
-			bytes,
-			at: now,
-			instructions: hash(instructions),
-			tools: hash(tools),
-			key: hash(prompt_cache_key),
-			parameters: hash(parameters),
-		};
-		let best: Fingerprint | undefined;
-		let matchedItems = 0;
-		let matchedBytes = 0;
-		let candidates = 0;
-		for (const prior of this.history) {
-			if (prior.group !== fingerprint.group) continue;
-			candidates++;
-			let n = 0;
-			let size = 0;
-			while (
-				n < items.length &&
-				n < prior.items.length &&
-				items[n] === prior.items[n]
-			)
-				size += bytes[n++];
-			// On equal prefix overlap prefer the most recent completed candidate.
-			if (!best || size >= matchedBytes) {
-				best = prior;
-				matchedItems = n;
-				matchedBytes = size;
+				instructions_changed: best
+					? best.instructions !== fingerprint.instructions
+					: null,
+				tools_changed: best ? best.tools !== fingerprint.tools : null,
+				cache_key_changed: best ? best.key !== fingerprint.key : null,
+				parameters_changed: best
+					? best.parameters !== fingerprint.parameters
+					: null,
+				cache_key_present:
+					typeof prompt_cache_key === "string" && prompt_cache_key.length > 0,
+			};
+			for (const [name, digest] of Object.entries(fingerprint.dimensions)) {
+				facts[`${name}_digest`] = digest;
+				facts[`${name}_changed`] =
+					best && best.dimensions[name] != null && digest != null
+						? best.dimensions[name] !== digest
+						: null;
 			}
+			const required = [
+				"client_build",
+				"build_epoch",
+				"capability_revision",
+				"key_epoch",
+				"digest_epoch",
+			];
+			facts.cache_cohort_reason = !best
+				? "no_prior"
+				: !requestId ||
+						!account ||
+						!session ||
+						!facts.cache_key_present ||
+						!required.every(
+							(name) => fingerprint.dimensions[name] && best.dimensions[name],
+						)
+					? "missing_dimensions"
+					: best.items.length === 0 ||
+							facts.previous_response_present ||
+							!best.key
+						? "prefix_unobserved"
+						: matchedItems !== best.items.length
+							? "prefix_changed"
+							: best.instructions !== fingerprint.instructions ||
+									best.tools !== fingerprint.tools ||
+									best.key !== fingerprint.key ||
+									best.parameters !== fingerprint.parameters ||
+									required.some(
+										(name) =>
+											best.dimensions[name] !== fingerprint.dimensions[name],
+									)
+								? "changed_controls"
+								: "missing_dispatch";
+			if (
+				facts.cache_cohort_reason === "prefix_changed" ||
+				facts.cache_cohort_reason === "changed_controls"
+			)
+				facts.cache_cohort_qualification = "excluded";
+			this.lifecycleSafe(facts);
+			this.retain(requestId, { fingerprint, facts });
+		} catch (error) {
+			const reason =
+				error instanceof Error &&
+				["byte_limit", "item_limit", "invalid_input"].includes(error.message)
+					? error.message
+					: "observation_error";
+			skip(reason);
 		}
-		const facts: Facts = {
-			...metadata,
-			event: "prepared",
-			ts_ms: now,
-			request_digest: fingerprint.requestDigest,
-			comparison_group_digest: fingerprint.group,
-			fingerprint_complete: true,
-			inferred_conversation_digest: hash([
-				session,
-				fingerprint.instructions,
-				items[0],
-			]),
-			input_digest: hash(items),
-			instructions_digest: fingerprint.instructions,
-			tools_digest: fingerprint.tools,
-			cache_key_digest: fingerprint.key,
-			parameters_digest: fingerprint.parameters,
-			prior_candidates: candidates,
-			prior_request_digest: best?.requestDigest ?? null,
-			prior_attempt_digest: best?.attemptDigest ?? null,
-			prior_age_ms: best ? now - best.at : null,
-			input_items: items.length,
-			input_bytes: totalBytes,
-			matched_input_items: best ? matchedItems : null,
-			matched_input_bytes: best ? matchedBytes : null,
-			prior_input_items: best?.items.length ?? null,
-			prior_input_prefix_preserved: best
-				? matchedItems === best.items.length
-				: null,
-			instructions_changed: best
-				? best.instructions !== fingerprint.instructions
-				: null,
-			tools_changed: best ? best.tools !== fingerprint.tools : null,
-			cache_key_changed: best ? best.key !== fingerprint.key : null,
-			parameters_changed: best
-				? best.parameters !== fingerprint.parameters
-				: null,
-			cache_key_present:
-				typeof prompt_cache_key === "string" && prompt_cache_key.length > 0,
-		};
-		for (const [name, digest] of Object.entries(fingerprint.dimensions)) {
-			facts[`${name}_digest`] = digest;
-			facts[`${name}_changed`] =
-				best && best.dimensions[name] != null && digest != null
-					? best.dimensions[name] !== digest
-					: null;
-		}
-		this.lifecycle(facts);
-		this.retain(requestId, { fingerprint, facts });
 	}
 
 	private retain(requestId: string, pending: Pending): void {
@@ -358,9 +542,31 @@ export class CodexCacheDiagnostics {
 				"input_changed",
 				"service_tier_changed",
 			].find((value) => value === diagnostic.reason) ?? null;
-		this.emit({
+		this.emitSafe({
 			...pending.facts,
 			event: completed ? "completed" : "incomplete",
+			terminal_at_ms: this.now(),
+			dispatch_to_terminal_ms:
+				pending.fingerprint.dispatchedAt === null
+					? null
+					: Math.max(0, this.now() - pending.fingerprint.dispatchedAt),
+			cache_cohort_qualification: completed
+				? pending.facts.cache_cohort_qualification
+				: "unknown",
+			strict_prior_support:
+				completed && pending.facts.cache_cohort_qualification === "qualified"
+					? 1
+					: 0,
+			context_band:
+				input === null
+					? "unknown"
+					: input < 100000
+						? "below_100k"
+						: input < 200000
+							? "100k_200k"
+							: input < 300000
+								? "200k_300k"
+								: "300k_plus",
 			attempt_terminal: true,
 			ts_ms: this.now(),
 			duration_ms: this.now() - pending.fingerprint.at,
@@ -390,6 +596,8 @@ export class CodexCacheDiagnostics {
 		});
 		if (completed && pending.fingerprint.complete) {
 			pending.fingerprint.at = this.now();
+			pending.fingerprint.cachedReadTokens =
+				input !== null && cached !== null && cached <= input ? cached : null;
 			this.history.push(pending.fingerprint);
 			if (this.history.length > MAX_ENTRIES) this.history.shift();
 		}
@@ -399,12 +607,15 @@ export class CodexCacheDiagnostics {
 		const pending = this.pending.get(requestId);
 		this.pending.delete(requestId);
 		if (pending)
-			this.lifecycle({
+			this.lifecycleSafe({
 				...pending.facts,
 				...facts,
 				event,
 				attempt_terminal: true,
 				ts_ms: this.now(),
+				terminal_at_ms: this.now(),
+				cache_cohort_qualification: "unknown",
+				strict_prior_support: 0,
 				cache_counters_known: false,
 				input_tokens: null,
 				cached_tokens: null,
@@ -414,13 +625,59 @@ export class CodexCacheDiagnostics {
 			});
 	}
 
+	dispatched(requestId: string, transport: "http" | "websocket"): void {
+		const pending = this.pending.get(requestId);
+		if (!pending || pending.fingerprint.dispatchedAt !== null) return;
+		const now = this.now();
+		pending.fingerprint.dispatchedAt = now;
+		pending.fingerprint.physicalTransport = transport;
+		const facts = pending.facts;
+		facts.physical_transport = transport;
+		facts.dispatched_at_ms = now;
+		facts.prepare_to_dispatch_ms = Math.max(0, now - pending.fingerprint.at);
+		const priorAt =
+			typeof facts.prior_completed_at_ms === "number"
+				? facts.prior_completed_at_ms
+				: null;
+		facts.prior_completed_to_dispatch_ms =
+			priorAt === null ? null : Math.max(0, now - priorAt);
+		facts.idle_band =
+			priorAt === null
+				? "unknown"
+				: now - priorAt < 60000
+					? "below_1m"
+					: now - priorAt < 300000
+						? "1m_5m"
+						: "5m_plus";
+		if (
+			pending.fingerprint.complete &&
+			facts.cache_cohort_reason === "missing_dispatch"
+		) {
+			facts.cache_cohort_reason =
+				facts.prior_physical_transport === "unknown"
+					? "missing_dimensions"
+					: facts.prior_physical_transport !== transport
+						? "changed_controls"
+						: transport === "websocket"
+							? "physical_parameters_unobserved"
+							: "exact_prefix";
+			facts.cache_cohort_qualification =
+				facts.cache_cohort_reason === "exact_prefix"
+					? "qualified"
+					: facts.cache_cohort_reason === "changed_controls"
+						? "excluded"
+						: "unknown";
+		}
+		this.lifecycleSafe({ ...facts, event: "dispatched", ts_ms: now });
+	}
+
 	annotate(requestId: string, facts: Facts): void {
 		const pending = this.pending.get(requestId);
 		if (pending) Object.assign(pending.facts, facts);
 	}
 
 	gap(requestId: string | null, reason: string): void {
-		this.lifecycle({
+		this.lifecycleSafe({
 			...(requestId ? this.pending.get(requestId)?.facts : {}),
 			event: "coverage_gap",
 			ts_ms: this.now(),
@@ -432,4 +689,39 @@ export class CodexCacheDiagnostics {
 	forget(requestId: string): void {
 		this.abort(requestId, "coverage_gap", { gap_reason: "missing_terminal" });
 	}
+}
+
+/** Physical counters are inclusive; logical persisted Anthropic counters are additive.
+ * A logical retry aggregate must never be compared with one physical terminal. */
+export function reconcileCacheUsage(
+	physical: Facts,
+	logical: Facts,
+): "matched" | "mismatch" | "unknown" {
+	if (
+		logical.physical_attempt_count !== 1 ||
+		!["gateway_request_digest", "gateway_attempt_digest"].every(
+			(name) =>
+				typeof physical[name] === "string" &&
+				/^[0-9a-f]{64}$/.test(physical[name] as string) &&
+				physical[name] === logical[name],
+		)
+	)
+		return "unknown";
+	const total = count(physical.input_tokens),
+		read = count(physical.cached_tokens),
+		input = count(logical.input_tokens),
+		logicalRead = count(logical.cache_read_input_tokens),
+		write = count(logical.cache_creation_input_tokens);
+	if (
+		total === null ||
+		read === null ||
+		input === null ||
+		logicalRead === null ||
+		write === null ||
+		read > total
+	)
+		return "unknown";
+	return input + logicalRead + write === total && logicalRead === read
+		? "matched"
+		: "mismatch";
 }

@@ -82,7 +82,8 @@ describe("OAuth Handler - Backward Compatibility", () => {
 		handler = createOAuthInitHandler(dbOps);
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await DatabaseFactory.reset();
 		// Clean up test database
 		try {
 			if (existsSync(TEST_DB_PATH)) {
@@ -91,7 +92,6 @@ describe("OAuth Handler - Backward Compatibility", () => {
 		} catch (error) {
 			console.warn("Failed to clean up test database:", error);
 		}
-		DatabaseFactory.reset();
 	});
 
 	describe('Deprecated "max" mode handling', () => {

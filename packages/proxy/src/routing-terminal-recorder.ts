@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { sanitizeRequestHeaders } from "@better-ccflare/http-common";
 import type { RequestMeta, RouteProvenance } from "@better-ccflare/types";
 import { sanitizeQualityDecision } from "@better-ccflare/types/request";
+import type { RoutingAttemptLedger } from "./handlers/routing-attempt-ledger";
 import {
 	type EndMessage,
 	isModelRewrite,
@@ -53,6 +54,22 @@ export class RequestLifecycleCoordinator {
 	private finalizationDeferred = false;
 	private pendingEnd: EndMessage | null = null;
 	private completion: Promise<void> = Promise.resolve();
+	private observation?: {
+		ledger: RoutingAttemptLedger;
+		wireStatus(nativeStatus: number): number;
+	};
+	private nativeStatus = 200;
+
+	get attemptedIdentity() {
+		return this.observation?.ledger.lastPhysicalObservation ?? null;
+	}
+
+	bindRoutingObservation(
+		ledger: RoutingAttemptLedger,
+		wireStatus: (nativeStatus: number) => number,
+	): void {
+		this.observation ??= { ledger, wireStatus };
+	}
 
 	deferFinalization(): void {
 		if (this.state !== "finalized") this.finalizationDeferred = true;
@@ -61,6 +78,9 @@ export class RequestLifecycleCoordinator {
 	start(options: RequestLifecycleStartOptions): boolean {
 		if (this.state !== "unclaimed") return false;
 		this.state = "started";
+		this.nativeStatus = options.message.responseStatus;
+		if (options.message.responseStatus < 400)
+			this.observation?.ledger.observeOutputOrigin(options.message.accountId);
 		this.collector = options.collector;
 		this.onError = options.onError;
 		try {
@@ -97,6 +117,34 @@ export class RequestLifecycleCoordinator {
 	private commitFinalization(message: EndMessage): Promise<void> {
 		if (this.state !== "started") return this.completion;
 		this.state = "finalized";
+		try {
+			if (this.observation) {
+				const routingAttemptSummary = this.observation.ledger.terminalSummary({
+					success:
+						message.success &&
+						message.streamTerminalState !== "client_cancelled",
+					error:
+						message.streamTerminalState === "client_cancelled"
+							? "client_cancelled"
+							: message.error,
+					nativeStatus: this.nativeStatus,
+					wireStatus: this.observation.wireStatus(this.nativeStatus),
+				});
+				if (routingAttemptSummary)
+					message = {
+						...message,
+						routingAttemptSummary,
+						error:
+							message.error === "route_unavailable" &&
+							routingAttemptSummary.terminalCause !== "unknown"
+								? (routingAttemptSummary.terminalCause ?? message.error)
+								: message.error,
+					};
+			}
+		} catch (error) {
+			reportRecorderFailure(this.onError, error);
+		}
+
 		const collector = this.collector;
 		this.completion = Promise.resolve()
 			.then(() => collector?.handleEnd(message))
@@ -171,18 +219,20 @@ export function recordRoutingTerminalRequest(
 			const terminalCandidate =
 				requestMeta.routingCandidates?.at(-1) ??
 				requestMeta.routingCandidateCatalog?.at(-1);
-			const routeProvenance: RouteProvenance | null = requestMeta.routeProfileId
-				? {
-						profileId: requestMeta.routeProfileId,
-						requestedModel: requestMeta.requestedLogicalModel ?? null,
-						routedProvider: null,
-						routedModel: null,
-						fallbackRung: terminalCandidate?.routeFallbackRung ?? null,
-						homeAction: requestMeta.routeHomeAction ?? "none",
-						repinReason: requestMeta.routeRepinReason ?? null,
-						candidateId: null,
-					}
-				: null;
+			const attemptedIdentity = coordinator.attemptedIdentity;
+			const routeProvenance: RouteProvenance | null =
+				requestMeta.routeProfileId || attemptedIdentity
+					? {
+							profileId: requestMeta.routeProfileId ?? null,
+							requestedModel: requestMeta.requestedLogicalModel ?? null,
+							routedProvider: attemptedIdentity?.provider ?? null,
+							routedModel: attemptedIdentity?.physicalModel ?? null,
+							fallbackRung: terminalCandidate?.routeFallbackRung ?? null,
+							homeAction: requestMeta.routeHomeAction ?? "none",
+							repinReason: requestMeta.routeRepinReason ?? null,
+							candidateId: null,
+						}
+					: null;
 
 			coordinator.start({
 				collector,
@@ -217,7 +267,7 @@ export function recordRoutingTerminalRequest(
 							.get("content-type")
 							?.toLowerCase()
 							.includes("text/event-stream") === true,
-					providerName: options.providerName,
+					providerName: attemptedIdentity?.provider ?? options.providerName,
 					accountBillingType: null,
 					accountAutoPauseOnOverageEnabled: 0,
 					accountName: null,

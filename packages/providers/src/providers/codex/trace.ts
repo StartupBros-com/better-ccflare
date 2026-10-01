@@ -26,6 +26,7 @@ import type {
 	AnthropicReasoningEffortSource,
 	ReasoningEffort,
 } from "@better-ccflare/openai-formats";
+import { ROUTING_RAW_STREAM_CATEGORIES } from "@better-ccflare/types/request";
 import type {
 	OrchestrationAdmission,
 	OrchestrationAdmissionBasis,
@@ -364,23 +365,7 @@ interface TraceInputs {
 }
 
 /** Fixed vocabulary only: no upstream-controlled event names or content. */
-export const CODEX_STREAM_EVENT_CATEGORIES = [
-	"created",
-	"in_progress",
-	"encrypted_reasoning_done",
-	"visible_summary_delta",
-	"output_text_delta",
-	"function_call_added",
-	"argument_delta",
-	"function_call_done",
-	"completed",
-	"incomplete",
-	"failed",
-	"error",
-	"other",
-	"malformed_frame",
-	"ignored_frame",
-] as const;
+export const CODEX_STREAM_EVENT_CATEGORIES = ROUTING_RAW_STREAM_CATEGORIES;
 export type CodexStreamEventCategory =
 	(typeof CODEX_STREAM_EVENT_CATEGORIES)[number];
 export interface CodexStreamDiagnostics {

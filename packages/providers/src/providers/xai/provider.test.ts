@@ -600,3 +600,91 @@ describe("xAI endpoint fallback (R3 isolation — xAI keeps its own default)", (
 		expect(url).toBe("https://proxy.example.com/v1/chat/completions");
 	});
 });
+
+describe("xAI provider-owned path capabilities", () => {
+	it("blocks the old Anthropic count URL passthrough", () => {
+		const provider = new XaiProvider();
+		expect(provider.canHandle("/v1/messages/count_tokens")).toBe(false);
+		expect(() =>
+			provider.buildUrl("/v1/messages/count_tokens", "", account()),
+		).toThrow();
+	});
+	it("never invents support for arbitrary xAI paths", () => {
+		const provider = new XaiProvider();
+		expect(provider.getPathCapability("/v1/arbitrary")).toEqual({
+			operation: "other",
+			support: "unknown",
+		});
+		expect(provider.canHandle("/v1/arbitrary")).toBe(false);
+		expect(() => provider.buildUrl("/v1/arbitrary", "", account())).toThrow();
+	});
+	it("distinguishes unsupported structured counting from supported generation", () => {
+		const provider = new XaiProvider();
+		expect(provider.getPathCapability("/v1/messages/count_tokens")).toEqual({
+			operation: "count_tokens",
+			support: "unsupported",
+		});
+		expect(provider.getPathCapability("/v1/messages")).toEqual({
+			operation: "generation",
+			support: "native",
+		});
+	});
+});
+
+describe("count path capability evidence", () => {
+	it("keeps native, advisory, unsupported, and legacy unknown distinct", async () => {
+		const { getProvider, getProviderPathCapability, OpenAICompatibleProvider } =
+			await import("../../index");
+		const count = "/v1/messages/count_tokens";
+		const anthropic = getProvider("anthropic");
+		const codex = getProvider("codex");
+		if (!anthropic || !codex) throw new Error("Provider missing");
+		expect(getProviderPathCapability(anthropic, count)).toEqual({
+			operation: "count_tokens",
+			support: "native",
+		});
+		expect(getProviderPathCapability(codex, count)).toEqual({
+			operation: "count_tokens",
+			support: "local-advisory",
+		});
+		expect(getProviderPathCapability(new XaiProvider(), count)).toEqual({
+			operation: "count_tokens",
+			support: "unsupported",
+		});
+		expect(
+			getProviderPathCapability(new OpenAICompatibleProvider(), count),
+		).toEqual({ operation: "count_tokens", support: "unknown" });
+		expect(Object.isFrozen(getProviderPathCapability(codex, count))).toBe(true);
+	});
+	it("does not promote canHandle or malformed declarations into capability evidence", async () => {
+		const { getProviderPathCapability } = await import("../../index");
+		const legacy = { canHandle: () => true } as never;
+		expect(
+			getProviderPathCapability(legacy, "/v1/messages/count_tokens"),
+		).toEqual({ operation: "count_tokens", support: "unknown" });
+		const invalid = {
+			getPathCapability: () => ({
+				operation: "generation",
+				support: "local-advisory",
+			}),
+		} as never;
+		expect(() => getProviderPathCapability(invalid, "/v1/messages")).toThrow(
+			"Invalid provider path capability",
+		);
+	});
+});
+
+describe("xAI evidenced legacy Responses path", () => {
+	it("preserves Responses URL handling without claiming converter parity", async () => {
+		const { getProviderPathCapability } = await import("../../index");
+		const provider = new XaiProvider();
+		expect(provider.canHandle("/v1/responses")).toBe(true);
+		expect(provider.buildUrl("/v1/responses", "?native=1", account())).toBe(
+			`${XAI_DEFAULT_ENDPOINT}/responses?native=1`,
+		);
+		expect(getProviderPathCapability(provider, "/v1/responses")).toEqual({
+			operation: "generation",
+			support: "unknown",
+		});
+	});
+});

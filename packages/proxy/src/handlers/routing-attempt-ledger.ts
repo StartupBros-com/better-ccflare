@@ -1,3 +1,12 @@
+import {
+	MAX_ROUTING_ATTEMPT_SNAPSHOTS,
+	type RequestRoutingAttemptSummary,
+	type RoutingPhysicalAttempt,
+	type RoutingStreamEvidence,
+	sanitizeRequestRoutingAttemptSummary,
+	sanitizeRoutingStreamEvidence,
+	toRoutingAttemptCause,
+} from "@better-ccflare/types/request";
 import type {
 	DegradedModePhysicalAttemptKind,
 	DegradedModeRequestTracker,
@@ -71,6 +80,9 @@ export interface RetainedTerminalResponse {
 
 export interface PhysicalAttemptTelemetryInput {
 	readonly accountId?: string | null;
+	readonly provider?: string | null;
+	readonly logicalModel?: string | null;
+	readonly physicalModel?: string | null;
 	readonly candidateId?: string | null;
 	readonly laneKey?: string | null;
 	readonly recoveryProbe?: boolean;
@@ -174,6 +186,156 @@ export class RoutingAttemptLedger {
 	private readonly authFailures = new Map<string, UpstreamAuthFailureReason>();
 	private readonly deterministicFailures = new Set<string>();
 	private physicalAttempts = 0;
+	private observations: RoutingPhysicalAttempt[] = [];
+	private latestObservation: RoutingPhysicalAttempt | null = null;
+	private outputOriginOrdinal: number | null = null;
+
+	/** Immutable snapshots are separate from all dispatch claims and fences. */
+	recordPhysicalOutcome(
+		cause: unknown,
+		outcome: RoutingPhysicalAttempt["outcome"] = "failed",
+		evidence?: {
+			validProtocolFramesSeen?: number;
+			terminalEvidenceSeen?: boolean;
+		},
+	): void {
+		const index = this.observations.findLastIndex(
+			(a) => a.ordinal === this.physicalAttempts,
+		);
+		const previous = this.latestObservation;
+		if (!previous || previous.outcome !== "pending") return;
+		this.latestObservation = Object.freeze({
+			...previous,
+			outcome,
+			outcomeObservedAt: Date.now(),
+			cause:
+				outcome === "succeeded"
+					? null
+					: previous.streamEvidence?.providerTerminal === "resource_limit"
+						? "buffer_limit"
+						: previous.streamEvidence?.providerTerminal === "cancelled"
+							? "provider_cancelled"
+							: previous.streamEvidence?.cancellationOrigin === "maintenance"
+								? "maintenance_retired"
+								: previous.streamEvidence?.cancellationOrigin ===
+										"accepted_deadline"
+									? toRoutingAttemptCause("accepted_request_deadline")
+									: previous.streamEvidence?.cancellationOrigin ===
+											"downstream_abort"
+										? "client_cancelled"
+										: toRoutingAttemptCause(cause),
+			protocolFrames:
+				evidence?.validProtocolFramesSeen ?? previous.protocolFrames,
+			terminalEvidenceSeen:
+				evidence?.terminalEvidenceSeen ?? previous.terminalEvidenceSeen,
+			meaningfulProgress:
+				cause === "meaningful_progress_timeout" || cause === "semantic_timeout"
+					? "absent"
+					: previous.meaningfulProgress,
+		});
+		if (index >= 0) this.observations[index] = this.latestObservation;
+	}
+
+	/** Observational snapshot only, frozen before cancellation or later rescue. */
+	observePhysicalStream(evidence: RoutingStreamEvidence): void {
+		const previous = this.latestObservation;
+		if (!previous || previous.outcome !== "pending") return;
+		const sanitized = sanitizeRoutingStreamEvidence(evidence);
+		const streamEvidence = sanitized
+			? Object.freeze({
+					...sanitized,
+					rawEventCounts: sanitized.rawEventCounts
+						? Object.freeze({ ...sanitized.rawEventCounts })
+						: null,
+				})
+			: null;
+		this.latestObservation = Object.freeze({
+			...previous,
+			streamEvidence,
+			protocolFrames: streamEvidence?.protocolFrames ?? previous.protocolFrames,
+			meaningfulProgress:
+				streamEvidence?.meaningfulFrames == null
+					? "unknown"
+					: streamEvidence.meaningfulFrames > 0
+						? "observed"
+						: "absent",
+		});
+		const index = this.observations.findIndex(
+			(a) => a.ordinal === previous.ordinal,
+		);
+		if (index >= 0) this.observations[index] = this.latestObservation;
+	}
+
+	observePhysicalResponse(status: number): void {
+		const previous = this.latestObservation;
+		if (!previous || previous.outcome !== "pending") return;
+		this.latestObservation = Object.freeze({
+			...previous,
+			nativeStatus: status,
+		});
+		const index = this.observations.findIndex(
+			(a) => a.ordinal === previous.ordinal,
+		);
+		if (index >= 0) this.observations[index] = this.latestObservation;
+	}
+
+	observeOutputOrigin(accountId: string | null): void {
+		this.outputOriginOrdinal ??=
+			(this.latestObservation?.accountId === accountId
+				? this.latestObservation.ordinal
+				: this.observations.findLast((a) => a.accountId === accountId)
+						?.ordinal) ?? null;
+	}
+
+	terminalSummary(input: {
+		success: boolean;
+		error?: string;
+		nativeStatus: number;
+		wireStatus: number;
+	}): RequestRoutingAttemptSummary | null {
+		const last = this.latestObservation;
+		const selectedCause =
+			(input.error === "route_unavailable" ||
+				input.error === "client_cancelled" ||
+				input.error === "downstream_cancelled") &&
+			last?.cause
+				? last.cause
+				: toRoutingAttemptCause(input.error);
+		if (last?.outcome === "pending")
+			this.recordPhysicalOutcome(
+				input.success ? null : selectedCause,
+				input.success
+					? "succeeded"
+					: input.error === "client_cancelled"
+						? "cancelled"
+						: "failed",
+			);
+		return sanitizeRequestRoutingAttemptSummary({
+			version: 1,
+			physicalAttemptCount: this.physicalAttempts,
+			routeCount: this.attemptedCount,
+			attempts: this.observations,
+			truncated: this.physicalAttempts > this.observations.length,
+			completeness: this.observations.every((a) => a.outcome !== "pending")
+				? "complete"
+				: "partial",
+			outputOriginOrdinal:
+				input.error === "anthropic_rescue_non_sse_response"
+					? null
+					: this.outputOriginOrdinal,
+			winnerOrdinal: input.success ? this.outputOriginOrdinal : null,
+			nativeStatus: input.nativeStatus,
+			wireStatus: input.wireStatus,
+			terminalCause: input.success
+				? null
+				: (this.latestObservation?.cause ?? selectedCause),
+			cancellationOrigin:
+				last?.streamEvidence?.cancellationOrigin === "downstream_abort"
+					? "downstream"
+					: (last?.streamEvidence?.cancellationOrigin ??
+						(input.error === "client_cancelled" ? "unknown" : null)),
+		});
+	}
 	private degradedTracker: DegradedModeRequestTracker | null = null;
 	private guardAttemptOrdinal: number | undefined;
 	private lastPhysicalAccountId: string | null | undefined;
@@ -184,6 +346,10 @@ export class RoutingAttemptLedger {
 		| PhysicalAttemptBudgetTerminalizer
 		| undefined;
 	private physicalBudgetError: PhysicalAttemptBudgetExceededError | null = null;
+
+	get lastPhysicalObservation(): RoutingPhysicalAttempt | null {
+		return this.latestObservation;
+	}
 
 	get attemptedCount(): number {
 		return this.attempted.size;
@@ -276,7 +442,25 @@ export class RoutingAttemptLedger {
 
 	recordPhysicalAttempt(input: PhysicalAttemptTelemetryInput = {}): number {
 		this.assertPhysicalAttemptAvailable(input);
+		this.recordPhysicalOutcome("unknown");
 		this.physicalAttempts++;
+		this.latestObservation = Object.freeze({
+			ordinal: this.physicalAttempts,
+			accountId: input.accountId ?? null,
+			provider: input.provider ?? null,
+			logicalModel: input.logicalModel ?? null,
+			physicalModel: input.physicalModel ?? null,
+			outcome: "pending",
+			cause: null,
+			startedAt: Date.now(),
+			outcomeObservedAt: null,
+			nativeStatus: null,
+			protocolFrames: null,
+			meaningfulProgress: "unknown",
+			terminalEvidenceSeen: null,
+		});
+		if (this.observations.length < MAX_ROUTING_ATTEMPT_SNAPSHOTS)
+			this.observations.push(this.latestObservation);
 		const accountId = input.accountId?.trim() || null;
 		let kind: DegradedModePhysicalAttemptKind;
 		if (input.recoveryProbe === true) {

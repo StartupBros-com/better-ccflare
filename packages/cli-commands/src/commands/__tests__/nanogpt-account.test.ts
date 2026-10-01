@@ -25,7 +25,8 @@ describe("CLI NanoGPT Account Creation", () => {
 		dbOps = DatabaseFactory.getInstance();
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await DatabaseFactory.reset();
 		// Clean up test database
 		try {
 			if (existsSync(TEST_DB_PATH)) {
@@ -34,7 +35,6 @@ describe("CLI NanoGPT Account Creation", () => {
 		} catch (error) {
 			console.warn("Failed to clean up test database:", error);
 		}
-		DatabaseFactory.reset();
 	});
 
 	describe("createNanoGPTAccount", () => {

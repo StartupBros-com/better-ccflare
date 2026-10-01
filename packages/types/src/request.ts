@@ -179,7 +179,402 @@ export function toStreamTerminalState(
 }
 
 // Database row type
+/** Fixed, observational attribution. It never grants routing or replay authority. */
+export const MAX_ROUTING_ATTEMPT_SNAPSHOTS = 16;
+// Four ASCII identity fields per snapshot fit the same compact write/read envelope.
+export const MAX_ROUTING_ATTEMPT_IDENTITY_CHARS = 128;
+export const MAX_ROUTING_ATTEMPT_SUMMARY_CHARS = 16384;
+export type RoutingAttemptCause =
+	| "accepted_request_deadline"
+	| "meaningful_progress_timeout"
+	| "semantic_timeout"
+	| "buffer_limit"
+	| "provider_cancelled"
+	| "maintenance_retired"
+	| "context_length_exceeded"
+	| "upstream_error"
+	| "transport_error"
+	| "client_cancelled"
+	| "routing_rejected"
+	| "unknown";
+/** Fixed raw categories shared with schema-22 Codex diagnostics. */
+export const ROUTING_RAW_STREAM_CATEGORIES = [
+	"created",
+	"in_progress",
+	"encrypted_reasoning_done",
+	"visible_summary_delta",
+	"output_text_delta",
+	"function_call_added",
+	"argument_delta",
+	"function_call_done",
+	"completed",
+	"incomplete",
+	"failed",
+	"error",
+	"other",
+	"malformed_frame",
+	"ignored_frame",
+] as const;
+export type RoutingProviderTerminal =
+	| "completed"
+	| "incomplete"
+	| "failed"
+	| "error"
+	| "cancelled"
+	| "eof"
+	| "read_error"
+	| "resource_limit"
+	| "downstream_abort"
+	| "unknown";
+export interface RoutingStreamEvidence {
+	readonly rawEventCounts: Partial<
+		Record<(typeof ROUTING_RAW_STREAM_CATEGORIES)[number], number>
+	> | null;
+	readonly rawVisibleEvents: number | null;
+	readonly meaningfulFrames: number | null;
+	readonly protocolFrames: number | null;
+	readonly providerTerminal: RoutingProviderTerminal | null;
+	readonly gateOutcome:
+		| "committed"
+		| "semantic_timeout"
+		| "meaningful_progress_timeout"
+		| "terminal_grace_timeout"
+		| "buffer_limit"
+		| "upstream_eof"
+		| "upstream_error"
+		| "context_length_exceeded"
+		| "transient_sse_error"
+		| "aborted"
+		| "unknown";
+	readonly remainingCommitmentMs: number | null;
+	readonly cancellationOrigin:
+		| "downstream_abort"
+		| "provider"
+		| "accepted_deadline"
+		| "semantic_deadline"
+		| "maintenance"
+		| "unknown"
+		| null;
+	/** A discriminating observation, never an upstream root-cause diagnosis. */
+	readonly diagnosis:
+		| "meaningful_output"
+		| "translation_or_gating_candidate"
+		| "no_usable_output"
+		| "unknown";
+}
+const PROVIDER_TERMINALS = new Set([
+	"completed",
+	"incomplete",
+	"failed",
+	"error",
+	"cancelled",
+	"eof",
+	"read_error",
+	"resource_limit",
+	"downstream_abort",
+	"unknown",
+]);
+const GATE_OUTCOMES = new Set([
+	"committed",
+	"semantic_timeout",
+	"meaningful_progress_timeout",
+	"terminal_grace_timeout",
+	"buffer_limit",
+	"upstream_eof",
+	"upstream_error",
+	"context_length_exceeded",
+	"transient_sse_error",
+	"aborted",
+	"unknown",
+]);
+const STREAM_CANCELLATION_ORIGINS = new Set([
+	"downstream_abort",
+	"provider",
+	"accepted_deadline",
+	"semantic_deadline",
+	"maintenance",
+	"unknown",
+]);
+function streamCounter(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value)
+		? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.floor(value)))
+		: null;
+}
+/** Drop arbitrary event keys and payloads before retaining or writing a snapshot. */
+export function sanitizeRoutingStreamEvidence(
+	value: unknown,
+): RoutingStreamEvidence | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const s = value as Record<string, unknown>;
+	const raw =
+		s.rawEventCounts && typeof s.rawEventCounts === "object"
+			? (s.rawEventCounts as Record<string, unknown>)
+			: null;
+	const meaningfulFrames = streamCounter(s.meaningfulFrames);
+	const rawVisibleEvents = streamCounter(s.rawVisibleEvents);
+	return {
+		rawEventCounts: raw
+			? Object.fromEntries(
+					ROUTING_RAW_STREAM_CATEGORIES.map((k) => [
+						k,
+						streamCounter(raw[k]) ?? 0,
+					]),
+				)
+			: null,
+		rawVisibleEvents,
+		meaningfulFrames,
+		protocolFrames: streamCounter(s.protocolFrames),
+		providerTerminal: PROVIDER_TERMINALS.has(s.providerTerminal as string)
+			? (s.providerTerminal as RoutingProviderTerminal)
+			: null,
+		gateOutcome: GATE_OUTCOMES.has(s.gateOutcome as string)
+			? (s.gateOutcome as RoutingStreamEvidence["gateOutcome"])
+			: "unknown",
+		remainingCommitmentMs: streamCounter(s.remainingCommitmentMs),
+		cancellationOrigin: STREAM_CANCELLATION_ORIGINS.has(
+			s.cancellationOrigin as string,
+		)
+			? (s.cancellationOrigin as RoutingStreamEvidence["cancellationOrigin"])
+			: null,
+		diagnosis:
+			meaningfulFrames === null
+				? "unknown"
+				: meaningfulFrames > 0
+					? "meaningful_output"
+					: rawVisibleEvents !== null && rawVisibleEvents > 0
+						? "translation_or_gating_candidate"
+						: "no_usable_output",
+	};
+}
+
+export interface RoutingPhysicalAttempt {
+	readonly ordinal: number;
+	readonly accountId: string | null;
+	readonly provider: string | null;
+	readonly logicalModel: string | null;
+	readonly physicalModel: string | null;
+	readonly outcome: "pending" | "failed" | "succeeded" | "cancelled";
+	readonly startedAt: number | null;
+	readonly outcomeObservedAt: number | null;
+	readonly nativeStatus: number | null;
+	readonly protocolFrames: number | null;
+	readonly meaningfulProgress: "absent" | "observed" | "unknown";
+	readonly terminalEvidenceSeen: boolean | null;
+	readonly cause: RoutingAttemptCause | null;
+	readonly streamEvidence?: RoutingStreamEvidence | null;
+}
+export interface RequestRoutingAttemptSummary {
+	readonly version: 1;
+	readonly physicalAttemptCount: number;
+	readonly routeCount: number;
+	readonly attempts: readonly RoutingPhysicalAttempt[];
+	readonly truncated: boolean;
+	readonly completeness: "complete" | "partial";
+	readonly outputOriginOrdinal: number | null;
+	readonly winnerOrdinal: number | null;
+	readonly nativeStatus: number | null;
+	readonly wireStatus: number | null;
+	readonly terminalCause: RoutingAttemptCause | null;
+	readonly cancellationOrigin:
+		| "client"
+		| "downstream"
+		| "provider"
+		| "accepted_deadline"
+		| "semantic_deadline"
+		| "maintenance"
+		| "unknown"
+		| null;
+}
+const ROUTING_CAUSES = new Set<RoutingAttemptCause>([
+	"accepted_request_deadline",
+	"meaningful_progress_timeout",
+	"semantic_timeout",
+	"buffer_limit",
+	"provider_cancelled",
+	"maintenance_retired",
+	"context_length_exceeded",
+	"upstream_error",
+	"transport_error",
+	"client_cancelled",
+	"routing_rejected",
+	"unknown",
+]);
+export function toRoutingAttemptCause(value: unknown): RoutingAttemptCause {
+	return typeof value === "string" &&
+		ROUTING_CAUSES.has(value as RoutingAttemptCause)
+		? (value as RoutingAttemptCause)
+		: "unknown";
+}
+function routingIdentity(value: unknown): string | null {
+	return typeof value === "string" &&
+		value.length <= MAX_ROUTING_ATTEMPT_IDENTITY_CHARS &&
+		/^[a-zA-Z0-9_.:/[\]@+-]+$/.test(value)
+		? value
+		: null;
+}
+function routingCounter(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value)
+		? Math.max(0, Math.min(32, Math.floor(value)))
+		: 0;
+}
+function routingOrdinal(value: unknown, count: number): number | null {
+	return typeof value === "number" &&
+		Number.isInteger(value) &&
+		value > 0 &&
+		value <= count
+		? value
+		: null;
+}
+function routingTimestamp(value: unknown): number | null {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+		? value
+		: null;
+}
+function routingStatus(value: unknown): number | null {
+	return typeof value === "number" &&
+		Number.isInteger(value) &&
+		value >= 100 &&
+		value <= 599
+		? value
+		: null;
+}
+/** Reject arbitrary fields/events/content at both persistence and read boundaries. */
+export function sanitizeRequestRoutingAttemptSummary(
+	value: unknown,
+): RequestRoutingAttemptSummary | null {
+	if (typeof value === "string") {
+		if (value.length > MAX_ROUTING_ATTEMPT_SUMMARY_CHARS) return null;
+		try {
+			value = JSON.parse(value);
+		} catch {
+			return null;
+		}
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const source = value as Record<string, unknown>;
+	if (source.version !== 1 || !Array.isArray(source.attempts)) return null;
+	const physicalAttemptCount = routingCounter(source.physicalAttemptCount);
+	let identityDropped = false;
+	const ordinals = new Set<number>();
+	const attempts = source.attempts
+		.slice(0, MAX_ROUTING_ATTEMPT_SNAPSHOTS)
+		.flatMap((item) => {
+			if (!item || typeof item !== "object") return [];
+			const a = item as Record<string, unknown>;
+			const ordinal = routingOrdinal(a.ordinal, physicalAttemptCount);
+			if (ordinal === null || ordinals.has(ordinal)) return [];
+			ordinals.add(ordinal);
+			for (const identity of [
+				a.accountId,
+				a.provider,
+				a.logicalModel,
+				a.physicalModel,
+			]) {
+				if (identity != null && routingIdentity(identity) === null)
+					identityDropped = true;
+			}
+			return [
+				{
+					ordinal,
+					accountId: routingIdentity(a.accountId),
+					provider: routingIdentity(a.provider),
+					logicalModel: routingIdentity(a.logicalModel),
+					physicalModel: routingIdentity(a.physicalModel),
+					outcome:
+						a.outcome === "failed" ||
+						a.outcome === "succeeded" ||
+						a.outcome === "cancelled"
+							? a.outcome
+							: "pending",
+					cause: a.cause === null ? null : toRoutingAttemptCause(a.cause),
+					startedAt: routingTimestamp(a.startedAt),
+					outcomeObservedAt: routingTimestamp(a.outcomeObservedAt),
+					nativeStatus: routingStatus(a.nativeStatus),
+					protocolFrames:
+						typeof a.protocolFrames === "number" &&
+						Number.isFinite(a.protocolFrames)
+							? Math.max(0, Math.min(65535, Math.floor(a.protocolFrames)))
+							: null,
+					meaningfulProgress:
+						a.meaningfulProgress === "observed" ||
+						a.meaningfulProgress === "absent"
+							? a.meaningfulProgress
+							: "unknown",
+					...(a.streamEvidence === undefined
+						? {}
+						: {
+								streamEvidence: sanitizeRoutingStreamEvidence(a.streamEvidence),
+							}),
+					terminalEvidenceSeen:
+						typeof a.terminalEvidenceSeen === "boolean"
+							? a.terminalEvidenceSeen
+							: null,
+				} satisfies RoutingPhysicalAttempt,
+			];
+		});
+	const result: RequestRoutingAttemptSummary = {
+		version: 1,
+		physicalAttemptCount,
+		routeCount: routingCounter(source.routeCount),
+		attempts,
+		truncated:
+			source.truncated === true || physicalAttemptCount > attempts.length,
+		completeness:
+			source.completeness === "complete" &&
+			!identityDropped &&
+			source.truncated !== true &&
+			physicalAttemptCount === attempts.length &&
+			attempts.every((a) => a.outcome !== "pending")
+				? "complete"
+				: "partial",
+		outputOriginOrdinal: routingOrdinal(
+			source.outputOriginOrdinal,
+			physicalAttemptCount,
+		),
+		winnerOrdinal: routingOrdinal(source.winnerOrdinal, physicalAttemptCount),
+		nativeStatus: routingStatus(source.nativeStatus),
+		wireStatus: routingStatus(source.wireStatus),
+		terminalCause:
+			source.terminalCause === null
+				? null
+				: toRoutingAttemptCause(source.terminalCause),
+		cancellationOrigin: [
+			"client",
+			"downstream",
+			"provider",
+			"accepted_deadline",
+			"semantic_deadline",
+			"maintenance",
+		].includes(source.cancellationOrigin as string)
+			? (source.cancellationOrigin as RequestRoutingAttemptSummary["cancellationOrigin"])
+			: source.cancellationOrigin === "unknown"
+				? "unknown"
+				: null,
+	};
+	// Keep attempted identity and the first cause when optional evidence would
+	// exceed the same compact persistence/read envelope. Explicitly report gaps.
+	const retained = [...result.attempts];
+	let bounded = result;
+	for (
+		let i = retained.length - 1;
+		JSON.stringify(bounded).length > MAX_ROUTING_ATTEMPT_SUMMARY_CHARS &&
+		i >= 0;
+		i--
+	) {
+		if (!retained[i].streamEvidence) continue;
+		retained[i] = { ...retained[i], streamEvidence: null };
+		bounded = {
+			...bounded,
+			attempts: [...retained],
+			truncated: true,
+			completeness: "partial",
+		};
+	}
+	return bounded;
+}
+
 export interface RequestRow {
+	routing_attempt_summary?: string | null;
 	quality_decision?: string | null;
 	id: string;
 	timestamp: number;
@@ -225,6 +620,7 @@ export interface RequestRow {
 
 // Domain model
 export interface Request {
+	routingAttemptSummary?: RequestRoutingAttemptSummary | null;
 	id: string;
 	timestamp: number;
 	method: string;
@@ -263,6 +659,7 @@ export interface Request {
 
 // API response type
 export interface RequestResponse {
+	routingAttemptSummary?: RequestRoutingAttemptSummary | null;
 	id: string;
 	timestamp: string;
 	method: string;
@@ -459,6 +856,9 @@ export function toRequest(row: RequestRow): Request {
 		clientSessionId: row.client_session_id || undefined,
 		streamTerminalState: toStreamTerminalState(row.stream_terminal_state),
 		qualityDecision: sanitizeQualityDecision(row.quality_decision),
+		routingAttemptSummary: sanitizeRequestRoutingAttemptSummary(
+			row.routing_attempt_summary,
+		),
 		routeProvenance: toRouteProvenance(row),
 	};
 }
@@ -498,6 +898,7 @@ export function toRequestResponse(request: Request): RequestResponse {
 		agentAttributionSource: request.agentAttributionSource,
 		clientSessionId: request.clientSessionId,
 		streamTerminalState: request.streamTerminalState,
+		routingAttemptSummary: request.routingAttemptSummary,
 		qualityDecision: sanitizeQualityDecision(request.qualityDecision),
 		routeProvenance: request.routeProvenance,
 	};

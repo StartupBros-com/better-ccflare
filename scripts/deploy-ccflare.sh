@@ -75,6 +75,8 @@ PIN_RENDERED=""
 PIN_STAGED=""
 PIN_ROLLBACK_ARMED=0
 SERVICE_RESTART_ATTEMPTED=0
+BACKEND_DEPLOYMENT=0
+HANDOFF_DIR="$DEST/handoff"
 GUARD_STAGE_DIR=""
 RUNNER_STAGE_DIR=""
 BUILD_SNAPSHOT_PARENT=""
@@ -141,14 +143,19 @@ rollback_on_failure() {
 	if [[ -n "$GUARD_STAGE_DIR" && -d "$GUARD_STAGE_DIR" ]]; then
 		rm -f \
 			"$GUARD_STAGE_DIR/ccflare-guard.mjs" \
-			"$GUARD_STAGE_DIR/ccflare-guard-policy.mjs"
+			"$GUARD_STAGE_DIR/ccflare-guard-policy.mjs" \
+			"$GUARD_STAGE_DIR/ccflare-managed-timing.mjs"
 		rmdir "$GUARD_STAGE_DIR" 2>/dev/null
 	fi
 	if [[ -n "$RUNNER_STAGE_DIR" && -d "$RUNNER_STAGE_DIR" ]]; then
-		rm -f "$RUNNER_STAGE_DIR/run-ccflare-stack.sh"
+		rm -f "$RUNNER_STAGE_DIR/run-ccflare-stack.sh" "$RUNNER_STAGE_DIR/ccflare-deployment-transaction.mjs"
 		rmdir "$RUNNER_STAGE_DIR" 2>/dev/null
 	fi
 
+	if [[ "$status" -ne 0 && "$BACKEND_DEPLOYMENT" == "1" ]]; then
+		echo "HARD FAILURE: backend transaction did not verify; retained guard remains fenced. Inspect $HANDOFF_DIR/intent.json before recovery." >&2
+		PIN_ROLLBACK_ARMED=0
+	fi
 	if [[ "$status" -ne 0 && "$PIN_ROLLBACK_ARMED" == "1" ]]; then
 		echo "ERROR: deployment failed; restoring systemd pin from $PIN_BACKUP" >&2
 		local rollback_stage="${PIN}.rollback-$$"
@@ -320,18 +327,20 @@ BUILD_SOURCE_ROOT="$BUILD_SNAPSHOT_PARENT/source"
 create_verified_source_snapshot "$REPO_ROOT" "$BUILD_SOURCE_ROOT" "$HEAD_SHA"
 BUILD_SOURCE_REGISTERED=1
 
-BIN_NAME="better-ccflare-v${VERSION}-${SHORT}"
 GUARDS_ROOT="${DEST}/guards"
 GUARD_DIR="${GUARDS_ROOT}/${HEAD_SHA}"
 GUARD_SCRIPT="${GUARD_DIR}/ccflare-guard.mjs"
 GUARD_POLICY="${GUARD_DIR}/ccflare-guard-policy.mjs"
+GUARD_TIMING="${GUARD_DIR}/ccflare-managed-timing.mjs"
 RUNNERS_ROOT="${DEST}/runners"
 RUNNER_DIR="${RUNNERS_ROOT}/${HEAD_SHA}"
 RUNNER_SCRIPT="${RUNNER_DIR}/run-ccflare-stack.sh"
 GUARD_SOURCE_ID="$HEAD_SHA"
 SOURCE_GUARD="$BUILD_SOURCE_ROOT/scripts/ccflare-guard.mjs"
 SOURCE_GUARD_POLICY="$BUILD_SOURCE_ROOT/scripts/ccflare-guard-policy.mjs"
+SOURCE_GUARD_TIMING="$BUILD_SOURCE_ROOT/scripts/ccflare-managed-timing.mjs"
 SOURCE_RUNNER="$BUILD_SOURCE_ROOT/scripts/run-ccflare-stack.sh"
+SOURCE_TRANSACTION="$BUILD_SOURCE_ROOT/scripts/ccflare-deployment-transaction.mjs"
 
 echo "==> Building better-ccflare v${VERSION} (${SHORT}) from verified source snapshot…"
 (
@@ -349,11 +358,16 @@ fi
 # ---------------------------------------------------------------------------
 # 3) Install the binary
 # ---------------------------------------------------------------------------
+BUILT_BIN_SHA256="$(sha256_file "$BUILT_BIN")"
+BIN_NAME="$(immutable_binary_name "$VERSION" "$SHORT" "$BUILT_BIN_SHA256")"
 mkdir -p "$DEST"
 DEST_BIN="${DEST}/${BIN_NAME}"
-cp "$BUILT_BIN" "$DEST_BIN"
-chmod +x "$DEST_BIN"
-BUILT_BIN_SHA256="$(sha256_file "$BUILT_BIN")"
+if [[ -e "$DEST_BIN" ]]; then
+ if ! cmp -s "$BUILT_BIN" "$DEST_BIN"; then echo "ERROR: immutable binary path already has different bytes" >&2; exit 1; fi
+else
+ cp "$BUILT_BIN" "$DEST_BIN"
+fi
+chmod 0555 "$DEST_BIN"
 DEST_BIN_SHA256="$(sha256_file "$DEST_BIN")"
 if [[ "$BUILT_BIN_SHA256" != "$DEST_BIN_SHA256" ]]; then
 	echo "ERROR: installed binary digest differs from build output" >&2
@@ -372,7 +386,8 @@ fi
 mkdir -p "$GUARDS_ROOT"
 if [[ -d "$GUARD_DIR" ]]; then
 	if ! cmp -s "$SOURCE_GUARD" "$GUARD_SCRIPT" \
-		|| ! cmp -s "$SOURCE_GUARD_POLICY" "$GUARD_POLICY"; then
+		|| ! cmp -s "$SOURCE_GUARD_POLICY" "$GUARD_POLICY" \
+		|| ! cmp -s "$SOURCE_GUARD_TIMING" "$GUARD_TIMING"; then
 		echo "ERROR: immutable guard directory $GUARD_DIR does not match deployed source" >&2
 		exit 1
 	fi
@@ -382,8 +397,9 @@ else
 	mkdir "$GUARD_STAGE_DIR"
 	cp "$SOURCE_GUARD" "$GUARD_STAGE_DIR/ccflare-guard.mjs"
 	cp "$SOURCE_GUARD_POLICY" "$GUARD_STAGE_DIR/ccflare-guard-policy.mjs"
+	cp "$SOURCE_GUARD_TIMING" "$GUARD_STAGE_DIR/ccflare-managed-timing.mjs"
 	chmod 0555 "$GUARD_STAGE_DIR/ccflare-guard.mjs"
-	chmod 0444 "$GUARD_STAGE_DIR/ccflare-guard-policy.mjs"
+	chmod 0444 "$GUARD_STAGE_DIR/ccflare-guard-policy.mjs" "$GUARD_STAGE_DIR/ccflare-managed-timing.mjs"
 	mv "$GUARD_STAGE_DIR" "$GUARD_DIR"
 	GUARD_STAGE_DIR=""
 	echo "==> Installed immutable guard pair $GUARD_DIR"
@@ -391,7 +407,7 @@ fi
 
 mkdir -p "$RUNNERS_ROOT"
 if [[ -d "$RUNNER_DIR" ]]; then
-	if ! cmp -s "$SOURCE_RUNNER" "$RUNNER_SCRIPT"; then
+	if ! cmp -s "$SOURCE_RUNNER" "$RUNNER_SCRIPT" || ! cmp -s "$SOURCE_TRANSACTION" "$RUNNER_DIR/ccflare-deployment-transaction.mjs"; then
 		echo "ERROR: immutable runner directory $RUNNER_DIR does not match deployed source" >&2
 		exit 1
 	fi
@@ -400,7 +416,9 @@ else
 	RUNNER_STAGE_DIR="${RUNNER_DIR}.tmp-$$"
 	mkdir "$RUNNER_STAGE_DIR"
 	cp "$SOURCE_RUNNER" "$RUNNER_STAGE_DIR/run-ccflare-stack.sh"
+	cp "$SOURCE_TRANSACTION" "$RUNNER_STAGE_DIR/ccflare-deployment-transaction.mjs"
 	chmod 0555 "$RUNNER_STAGE_DIR/run-ccflare-stack.sh"
+	chmod 0444 "$RUNNER_STAGE_DIR/ccflare-deployment-transaction.mjs"
 	mv "$RUNNER_STAGE_DIR" "$RUNNER_DIR"
 	RUNNER_STAGE_DIR=""
 	echo "==> Installed immutable runner $RUNNER_DIR"
@@ -412,7 +430,9 @@ POLICY_SHA256="$(sha256_file "$GUARD_POLICY")"
 for digest_pair in \
 	"$(sha256_file "$SOURCE_RUNNER"):$RUNNER_SHA256:runner" \
 	"$(sha256_file "$SOURCE_GUARD"):$GUARD_SHA256:guard" \
-	"$(sha256_file "$SOURCE_GUARD_POLICY"):$POLICY_SHA256:policy"; do
+	"$(sha256_file "$SOURCE_GUARD_POLICY"):$POLICY_SHA256:policy" \
+	"$(sha256_file "$SOURCE_GUARD_TIMING"):$(sha256_file "$GUARD_TIMING"):timing" \
+	"$(sha256_file "$SOURCE_TRANSACTION"):$(sha256_file "$RUNNER_DIR/ccflare-deployment-transaction.mjs"):transaction"; do
 	IFS=: read -r source_digest installed_digest artifact_name <<<"$digest_pair"
 	if [[ "$source_digest" != "$installed_digest" ]]; then
 		echo "ERROR: installed $artifact_name digest differs from source" >&2
@@ -436,6 +456,19 @@ sudo cp --preserve=all "$PIN" "$PIN_BACKUP"
 # Render from the exact backup snapshot, not the mutable live path. This binds
 # the proposed pin to the file revision that rollback will restore and that the
 # compare-and-swap installation below requires to remain current.
+SCHEMA_DIGEST="$(node - "$BUILD_SOURCE_ROOT" <<'NODE'
+const fs=require("node:fs"),crypto=require("node:crypto"),root=process.argv[2],h=crypto.createHash("sha256");for(const p of ["packages/database/src/migrations.ts","packages/database/src/migrations-pg.ts"]){const b=fs.readFileSync(root+"/"+p);h.update(p+"\0"+b.length+"\0");h.update(b);}process.stdout.write(h.digest("hex"));
+NODE
+)"
+if [[ -f "$HANDOFF_DIR/runtime.json" ]] && backend_handoff_eligible "$HANDOFF_DIR/runtime.json" "$DEST_BIN" "$RUNNER_SCRIPT" "$GUARD_SCRIPT" "$GUARD_POLICY" "$GUARD_TIMING" "$SOURCE_TRANSACTION" "$SCHEMA_DIGEST"; then
+	BACKEND_DEPLOYMENT=1
+	readarray -t retained_paths < <(node - "$PRIOR_GUARD_HEALTH_JSON" <<'NODE'
+const h=JSON.parse(process.argv[2]);for(const v of [h.runtime.artifacts.runner.path,h.runtime.artifacts.guard.path,h.runtime.artifacts.policy.path,h.sourceId])console.log(v);
+NODE
+)
+	RUNNER_SCRIPT="${retained_paths[0]}"; GUARD_SCRIPT="${retained_paths[1]}"; GUARD_POLICY="${retained_paths[2]}"; GUARD_SOURCE_ID="${retained_paths[3]}"
+	echo "==> Backend-only transaction: retaining existing ingress and runner artifacts."
+fi
 PIN_RENDERED="$(mktemp)"
 render_systemd_pin \
 	"$PIN_BACKUP" \
@@ -445,7 +478,9 @@ render_systemd_pin \
 	"$GUARD_SCRIPT" \
 	"$GUARD_SOURCE_ID" \
 	"$GUARD_POLICY_ID" \
-	"$GUARD_POLICY"
+	"$GUARD_POLICY" \
+	"$HEAD_SHA" \
+	"$SCHEMA_DIGEST"
 
 if ! CONFIGURED_DEPLOYMENT_TIMING="$(
 	validate_deployment_timing "$PIN_RENDERED"
@@ -464,6 +499,15 @@ CONFIGURED_BODY_ADMISSION_BUDGET_BYTES="$(deployment_timing_value "$CONFIGURED_D
 CONFIGURED_BODY_ADMISSION_QUEUE_LIMIT="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" body_admission_queue_limit)"
 CONFIGURED_STOP_TIMEOUT_MS="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" stop_timeout_ms)"
 
+if ((BACKEND_DEPLOYMENT)); then
+	request_backend_handoff "$HANDOFF_DIR" "$(dirname "$RUNNER_SCRIPT")/ccflare-deployment-transaction.mjs" "$DEST_BIN" "$HEAD_SHA" "$PIN_RENDERED" "$SCHEMA_DIGEST"
+	await_backend_handoff_phase "$HANDOFF_DIR" candidate_verified 800 || { echo "ERROR: candidate verification failed or timed out" >&2; exit 70; }
+fi
+if ((!BACKEND_DEPLOYMENT)); then
+ sudo node --input-type=module - "$SOURCE_TRANSACTION" "$HANDOFF_DIR" "$DEST_BIN" "$HEAD_SHA" "$SCHEMA_DIGEST" "$(sha256_file "$PIN_RENDERED")" <<'NODE'
+const {pathToFileURL}=await import("node:url");const [modulePath,dir,binary,sourceSha,schemaDigest,pinHash]=process.argv.slice(2);const {prepareBootstrap,fileHash}=await import(pathToFileURL(modulePath));prepareBootstrap(dir,{binary,binaryHash:fileHash(binary),sourceSha,schemaDigest,pinHash});
+NODE
+fi
 PIN_STAGED="${PIN}.new-${SHORT}-$$"
 replace_systemd_pin_if_snapshot_current \
 	"$PIN" \
@@ -540,9 +584,14 @@ CONFIGURED_BODY_ADMISSION_BUDGET_BYTES="$(deployment_timing_value "$EFFECTIVE_DE
 CONFIGURED_BODY_ADMISSION_QUEUE_LIMIT="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" body_admission_queue_limit)"
 CONFIGURED_STOP_TIMEOUT_MS="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" stop_timeout_ms)"
 
-echo "==> Restarting ccflare-stack.service…"
-SERVICE_RESTART_ATTEMPTED=1
-sudo systemctl restart ccflare-stack.service
+if ((BACKEND_DEPLOYMENT)); then
+	commit_backend_handoff "$HANDOFF_DIR" "$(dirname "$RUNNER_SCRIPT")/ccflare-deployment-transaction.mjs"
+	await_backend_handoff_phase "$HANDOFF_DIR" attached 60 || { echo "ERROR: committed candidate did not attach" >&2; exit 70; }
+else
+	echo "==> Restarting ccflare-stack.service (bootstrap lifecycle/schema change)…"
+	SERVICE_RESTART_ATTEMPTED=1
+	sudo systemctl restart ccflare-stack.service
+fi
 
 # ---------------------------------------------------------------------------
 # 6) Wait for proxy and guard health
@@ -642,7 +691,11 @@ if ! validate_deploy_health \
 	echo "ERROR: deployment health identity verification failed" >&2
 	exit 1
 fi
-echo "==> Verified binary, runner, guard, policy, process start, and effective guard limits."
+EXPECTED_ACCEPTED_CAP="$(systemd_environment_text_value "$(sudo systemctl show ccflare-stack.service --property=Environment --value)" GUARD_ACCEPTED_CAP_MS)"
+node - "$PROXY_HEALTH_JSON" "$GUARD_HEALTH_JSON" "$HEAD_SHA" "$GUARD_SOURCE_ID" "$SCHEMA_DIGEST" "$EXPECTED_ACCEPTED_CAP" "$(readlink -f "$(dirname "$GUARD_SCRIPT")/ccflare-managed-timing.mjs")" "$(sha256_file "$SOURCE_GUARD_TIMING")" "$(readlink -f "$(dirname "$RUNNER_SCRIPT")/ccflare-deployment-transaction.mjs")" "$(sha256_file "$SOURCE_TRANSACTION")" <<'NODE'
+const [proxyJson,guardJson,backendSource,ingressSource,schema,cap,timingPath,timingHash,transactionPath,transactionHash]=process.argv.slice(2);const proxy=JSON.parse(proxyJson),guard=JSON.parse(guardJson);const timing=guard.runtime.artifacts.timing,transaction=guard.runtime.artifacts.transaction;if(guard.sourceId!==ingressSource || guard.backendSourceSha!==backendSource || guard.acceptedCapMs!==Number(cap) || guard.timingContract!=="v1" || proxy.managedIngress?.schemaDigest!==schema || proxy.managedIngress?.timingContract!=="v1" || !Number.isSafeInteger(proxy.managedIngress?.generation) || timing?.path!==timingPath || timing?.sha256!==timingHash || transaction?.path!==transactionPath || transaction?.sha256!==transactionHash)process.exit(1);
+NODE
+echo "==> Verified backend and ingress sources, timing/transaction artifacts, schema, process identity and effective guard limits."
 
 # ---------------------------------------------------------------------------
 # 8) Prune old artifacts. Conservative: never touch the binary we just
@@ -691,16 +744,17 @@ mapfile -t OLD_GUARD_DIRS < <(
 )
 for guard_dir in "${OLD_GUARD_DIRS[@]:-}"; do
 	[[ -n "$guard_dir" ]] || continue
-	if [[ "$guard_dir" != "$GUARDS_ROOT/"* \
-		|| ! -f "$guard_dir/ccflare-guard.mjs" \
-		|| ! -f "$guard_dir/ccflare-guard-policy.mjs" \
-		|| "$(find "$guard_dir" -mindepth 1 -maxdepth 1 | wc -l)" -ne 2 ]]; then
+	if [[ "$guard_dir" != "$GUARDS_ROOT/"* ]] || ! {
+		artifact_module_set_matches "$guard_dir" ccflare-guard.mjs ccflare-guard-policy.mjs ||
+		artifact_module_set_matches "$guard_dir" ccflare-guard.mjs ccflare-guard-policy.mjs ccflare-managed-timing.mjs
+	}; then
 		echo "    skipped non-standard guard directory $guard_dir" >&2
 		continue
 	fi
 	rm -f \
 		"$guard_dir/ccflare-guard.mjs" \
-		"$guard_dir/ccflare-guard-policy.mjs"
+		"$guard_dir/ccflare-guard-policy.mjs" \
+		"$guard_dir/ccflare-managed-timing.mjs"
 	rmdir "$guard_dir"
 	echo "    removed $guard_dir"
 done
@@ -710,13 +764,14 @@ mapfile -t OLD_RUNNER_DIRS < <(
 )
 for runner_dir in "${OLD_RUNNER_DIRS[@]:-}"; do
 	[[ -n "$runner_dir" ]] || continue
-	if [[ "$runner_dir" != "$RUNNERS_ROOT/"* \
-		|| ! -f "$runner_dir/run-ccflare-stack.sh" \
-		|| "$(find "$runner_dir" -mindepth 1 -maxdepth 1 | wc -l)" -ne 1 ]]; then
+	if [[ "$runner_dir" != "$RUNNERS_ROOT/"* ]] || ! {
+		artifact_module_set_matches "$runner_dir" run-ccflare-stack.sh ||
+		artifact_module_set_matches "$runner_dir" run-ccflare-stack.sh ccflare-deployment-transaction.mjs
+	}; then
 		echo "    skipped non-standard runner directory $runner_dir" >&2
 		continue
 	fi
-	rm -f "$runner_dir/run-ccflare-stack.sh"
+	rm -f "$runner_dir/run-ccflare-stack.sh" "$runner_dir/ccflare-deployment-transaction.mjs"
 	rmdir "$runner_dir"
 	echo "    removed $runner_dir"
 done

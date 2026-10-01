@@ -1,3 +1,4 @@
+import { heapSize, memoryUsage as jscMemoryUsage } from "bun:jsc";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
@@ -130,6 +131,7 @@ import {
 	BodyAdmissionController,
 	withBodyAdmission,
 } from "./body-admission";
+import { createManagedIngress } from "./managed-ingress";
 import { scheduleAdaptiveVacuumAfterRetentionCleanup } from "./retention-cleanup";
 import {
 	createUsagePollingTrackingClearer,
@@ -1473,7 +1475,9 @@ export default async function startServer(options?: {
 		queueLimit: config.getMaxBodyAdmissionQueue(),
 	});
 	activeBodyAdmission = bodyAdmission;
-	const memoryMonitor = new MemoryMonitor();
+	const memoryMonitor = new MemoryMonitor({
+		readJscMemoryUsage: () => ({ heapSize: heapSize(), ...jscMemoryUsage() }),
+	});
 	// Route profiles are strict operator intent. Validate before database startup,
 	// background jobs, or the HTTP listener can make this process look healthy.
 	const modelRouteProfiles = parseModelRouteProfiles();
@@ -1834,6 +1838,8 @@ export default async function startServer(options?: {
 						reservedBytes: admission.reservedBytes,
 						queuedRequests: admission.queuedRequests,
 					},
+					maintenance: dbOps.getMaintenanceStatus(),
+					writer: asyncWriter.getHealth(),
 					trackedStreams: inflightStreams.size,
 					pendingRequests: serverInstance?.pendingRequests ?? 0,
 				});
@@ -1914,18 +1920,17 @@ export default async function startServer(options?: {
 	// vacuum worker held the write lock, freezing the event loop.
 	const unregisterWalCheckpoint = registerCleanup({
 		id: "wal-checkpoint",
-		callback: () => {
-			dbOps
-				.optimizeAsync()
-				.then(async (result) => {
-					const walBytes = result.ok ? await dbOps.getWalSizeBytes() : 0;
-					const { level, message } = formatWalCheckpointLog(result, walBytes);
-					log[level](message);
-				})
-				.catch((err) => {
-					log.error(`WAL checkpoint error: ${err}`);
-				});
+		callback: async () => {
+			try {
+				const result = await dbOps.optimizeAsync();
+				const walBytes = result.ok ? await dbOps.getWalSizeBytes() : 0;
+				const { level, message } = formatWalCheckpointLog(result, walBytes);
+				log[level](message);
+			} catch (err) {
+				log.error(`WAL checkpoint error: ${err}`);
+			}
 		},
+		maxConcurrent: 1,
 		minutes: 1,
 		description: "WAL checkpoint to prevent unbounded WAL file growth",
 	});
@@ -2293,6 +2298,15 @@ export default async function startServer(options?: {
 		// store_payloads changes are picked up automatically via the getStorePayloads getter
 	});
 
+	const managedIngress = createManagedIngress({
+		enabled: process.env.CCFLARE_MANAGED_TIMING === "1",
+		onSecondary: (cause) => log.warn(`Managed request cleanup: ${cause}`),
+		secret: readGuardCorrelationSecret(),
+		generation: Number(process.env.CCFLARE_MANAGED_GENERATION ?? 1),
+		candidateNonce: process.env.CCFLARE_MANAGED_CANDIDATE_NONCE ?? "",
+		ingressNonce: process.env.CCFLARE_MANAGED_INGRESS_NONCE ?? "",
+		sourceSha: process.env.CCFLARE_SOURCE_SHA ?? "",
+	});
 	// Main server
 	// Build server configuration with optional TLS and hostname binding
 	const hostname = process.env.BETTER_CCFLARE_HOST || "0.0.0.0"; // Allow binding configuration
@@ -2309,60 +2323,203 @@ export default async function startServer(options?: {
 						},
 					}
 				: {}),
-			async fetch(req: Request): Promise<Response> {
-				const url = new URL(req.url);
+			async fetch(original: Request): Promise<Response> {
+				return managedIngress(original, async (req) => {
+					const url = new URL(req.url);
 
-				// Serve the dashboard SPA + static assets BEFORE the
-				// authentication-gated API router. The dashboard shell is
-				// public content and the initial browser navigation cannot
-				// carry an API key, so it must be reachable without auth.
-				// Auth-exempting these paths inside the SHARED
-				// authenticateRequest() path instead reopened an
-				// unauthenticated proxy bypass when the dashboard was
-				// disabled/unavailable (GET /foo fell through to the proxy,
-				// and providers accept arbitrary paths). Serving here, gated
-				// on the dashboard actually being available, means only
-				// genuine dashboard content skips auth; every other path
-				// (API and proxy) is still authenticated below.
-				if (withDashboard && dashboardManifest) {
-					const decision = resolveDashboardRoute(
-						url.pathname,
-						req.method,
-						Boolean(dashboardManifest[url.pathname]),
-					);
-					if (decision === "static-asset") {
-						return serveDashboardFile(
+					// Serve the dashboard SPA + static assets BEFORE the
+					// authentication-gated API router. The dashboard shell is
+					// public content and the initial browser navigation cannot
+					// carry an API key, so it must be reachable without auth.
+					// Auth-exempting these paths inside the SHARED
+					// authenticateRequest() path instead reopened an
+					// unauthenticated proxy bypass when the dashboard was
+					// disabled/unavailable (GET /foo fell through to the proxy,
+					// and providers accept arbitrary paths). Serving here, gated
+					// on the dashboard actually being available, means only
+					// genuine dashboard content skips auth; every other path
+					// (API and proxy) is still authenticated below.
+					if (withDashboard && dashboardManifest) {
+						const decision = resolveDashboardRoute(
 							url.pathname,
-							undefined,
-							CACHE.CACHE_CONTROL_STATIC,
+							req.method,
+							Boolean(dashboardManifest[url.pathname]),
 						);
+						if (decision === "static-asset") {
+							return serveDashboardFile(
+								url.pathname,
+								undefined,
+								CACHE.CACHE_CONTROL_STATIC,
+							);
+						}
+						if (decision === "spa-index") {
+							return serveDashboardFile("/index.html", "text/html");
+						}
 					}
-					if (decision === "spa-index") {
-						return serveDashboardFile("/index.html", "text/html");
+
+					// API routes (authenticated inside the router)
+					const apiResponse = await apiRouter.handleRequest(url, req);
+					if (apiResponse) {
+						return apiResponse;
 					}
-				}
 
-				// API routes (authenticated inside the router)
-				const apiResponse = await apiRouter.handleRequest(url, req);
-				if (apiResponse) {
-					return apiResponse;
-				}
+					// All other paths go to proxy
+					// Authenticate the proxy request with error handling to prevent bypass
+					try {
+						const authResult = await authService.authenticateRequest(
+							req,
+							url.pathname,
+							req.method,
+						);
+						if (!authResult.isAuthenticated) {
+							return new Response(
+								JSON.stringify({
+									type: "error",
+									error: {
+										type: "authentication_error",
+										message: authResult.error || "Authentication failed",
+									},
+								}),
+								{
+									status: 401,
+									headers: { "Content-Type": "application/json" },
+								},
+							);
+						}
 
-				// All other paths go to proxy
-				// Authenticate the proxy request with error handling to prevent bypass
-				try {
-					const authResult = await authService.authenticateRequest(
-						req,
-						url.pathname,
-						req.method,
-					);
-					if (!authResult.isAuthenticated) {
+						// Authorization check - verify API key has permission for this endpoint
+						if (authResult.apiKey) {
+							const authzResult = await authService.authorizeEndpoint(
+								authResult.apiKey,
+								url.pathname,
+								req.method,
+							);
+
+							if (!authzResult.authorized) {
+								return new Response(
+									JSON.stringify({
+										type: "error",
+										error: {
+											type: "authorization_error",
+											message: authzResult.reason || "Access denied",
+										},
+									}),
+									{
+										status: 403,
+										headers: { "Content-Type": "application/json" },
+									},
+								);
+							}
+						}
+
+						try {
+							// Codex CLI first tries WebSocket transport for /v1/responses.
+							// We only support HTTP — reject the upgrade cleanly so Codex
+							// falls back to HTTPS without hitting the proxy with an empty body.
+							if (
+								req.headers.get("upgrade")?.toLowerCase() === "websocket" &&
+								(url.pathname === "/v1/responses" ||
+									url.pathname === "/v1/responses/compact")
+							) {
+								return new Response(
+									JSON.stringify({
+										type: "error",
+										error: {
+											type: "not_supported_error",
+											message:
+												"WebSocket transport is not supported. Codex will retry over HTTPS automatically.",
+										},
+									}),
+									{
+										status: 503,
+										headers: { "Content-Type": "application/json" },
+									},
+								);
+							}
+
+							const proxyResponse =
+								req.method === "POST" &&
+								(url.pathname === "/v1/responses" ||
+									url.pathname === "/v1/responses/compact")
+									? await withBodyAdmission(
+											req,
+											bodyAdmission,
+											(lease) =>
+												handleResponsesRequest(
+													req,
+													url,
+													handleProxy as Parameters<
+														typeof handleResponsesRequest
+													>[2],
+													proxyContext,
+													authResult.apiKeyId,
+													authResult.apiKeyName,
+													{
+														onBodySizeKnown: (actualBytes) => {
+															lease.reduceTo(
+																Math.min(
+																	bodyAdmission.snapshot().budgetBytes,
+																	actualBytes *
+																		BODY_ADMISSION_RESERVATION_MULTIPLIER,
+																),
+															);
+														},
+													},
+												),
+											{ forceFull: true },
+										)
+									: await withBodyAdmission(req, bodyAdmission, () =>
+											handleProxy(
+												req,
+												url,
+												proxyContext,
+												authResult.apiKeyId,
+												authResult.apiKeyName,
+											),
+										);
+							return trackStreamForShutdown(proxyResponse);
+						} catch (proxyError) {
+							const statusCode =
+								typeof proxyError === "object" &&
+								proxyError !== null &&
+								"statusCode" in proxyError &&
+								typeof (proxyError as { statusCode: unknown }).statusCode ===
+									"number"
+									? (proxyError as { statusCode: number }).statusCode
+									: HTTP_STATUS.INTERNAL_SERVER_ERROR;
+
+							log.error("Proxy request failed:", proxyError);
+
+							const isServiceUnavailable =
+								statusCode === HTTP_STATUS.SERVICE_UNAVAILABLE;
+
+							return new Response(
+								JSON.stringify({
+									type: "error",
+									error: {
+										type: isServiceUnavailable
+											? "service_unavailable_error"
+											: "proxy_error",
+										message: isServiceUnavailable
+											? "Service temporarily unavailable. Please try again later."
+											: "Proxy request failed",
+									},
+								}),
+								{
+									status: statusCode,
+									headers: { "Content-Type": "application/json" },
+								},
+							);
+						}
+					} catch (authError) {
+						// Log authentication errors for security monitoring
+						log.error("Authentication service error:", authError);
 						return new Response(
 							JSON.stringify({
 								type: "error",
 								error: {
 									type: "authentication_error",
-									message: authResult.error || "Authentication failed",
+									message: "Authentication service error",
 								},
 							}),
 							{
@@ -2371,148 +2528,7 @@ export default async function startServer(options?: {
 							},
 						);
 					}
-
-					// Authorization check - verify API key has permission for this endpoint
-					if (authResult.apiKey) {
-						const authzResult = await authService.authorizeEndpoint(
-							authResult.apiKey,
-							url.pathname,
-							req.method,
-						);
-
-						if (!authzResult.authorized) {
-							return new Response(
-								JSON.stringify({
-									type: "error",
-									error: {
-										type: "authorization_error",
-										message: authzResult.reason || "Access denied",
-									},
-								}),
-								{
-									status: 403,
-									headers: { "Content-Type": "application/json" },
-								},
-							);
-						}
-					}
-
-					try {
-						// Codex CLI first tries WebSocket transport for /v1/responses.
-						// We only support HTTP — reject the upgrade cleanly so Codex
-						// falls back to HTTPS without hitting the proxy with an empty body.
-						if (
-							req.headers.get("upgrade")?.toLowerCase() === "websocket" &&
-							(url.pathname === "/v1/responses" ||
-								url.pathname === "/v1/responses/compact")
-						) {
-							return new Response(
-								JSON.stringify({
-									type: "error",
-									error: {
-										type: "not_supported_error",
-										message:
-											"WebSocket transport is not supported. Codex will retry over HTTPS automatically.",
-									},
-								}),
-								{
-									status: 503,
-									headers: { "Content-Type": "application/json" },
-								},
-							);
-						}
-
-						const proxyResponse =
-							req.method === "POST" &&
-							(url.pathname === "/v1/responses" ||
-								url.pathname === "/v1/responses/compact")
-								? await withBodyAdmission(
-										req,
-										bodyAdmission,
-										(lease) =>
-											handleResponsesRequest(
-												req,
-												url,
-												handleProxy as Parameters<
-													typeof handleResponsesRequest
-												>[2],
-												proxyContext,
-												authResult.apiKeyId,
-												authResult.apiKeyName,
-												{
-													onBodySizeKnown: (actualBytes) => {
-														lease.reduceTo(
-															Math.min(
-																bodyAdmission.snapshot().budgetBytes,
-																actualBytes *
-																	BODY_ADMISSION_RESERVATION_MULTIPLIER,
-															),
-														);
-													},
-												},
-											),
-										{ forceFull: true },
-									)
-								: await withBodyAdmission(req, bodyAdmission, () =>
-										handleProxy(
-											req,
-											url,
-											proxyContext,
-											authResult.apiKeyId,
-											authResult.apiKeyName,
-										),
-									);
-						return trackStreamForShutdown(proxyResponse);
-					} catch (proxyError) {
-						const statusCode =
-							typeof proxyError === "object" &&
-							proxyError !== null &&
-							"statusCode" in proxyError &&
-							typeof (proxyError as { statusCode: unknown }).statusCode ===
-								"number"
-								? (proxyError as { statusCode: number }).statusCode
-								: HTTP_STATUS.INTERNAL_SERVER_ERROR;
-
-						log.error("Proxy request failed:", proxyError);
-
-						const isServiceUnavailable =
-							statusCode === HTTP_STATUS.SERVICE_UNAVAILABLE;
-
-						return new Response(
-							JSON.stringify({
-								type: "error",
-								error: {
-									type: isServiceUnavailable
-										? "service_unavailable_error"
-										: "proxy_error",
-									message: isServiceUnavailable
-										? "Service temporarily unavailable. Please try again later."
-										: "Proxy request failed",
-								},
-							}),
-							{
-								status: statusCode,
-								headers: { "Content-Type": "application/json" },
-							},
-						);
-					}
-				} catch (authError) {
-					// Log authentication errors for security monitoring
-					log.error("Authentication service error:", authError);
-					return new Response(
-						JSON.stringify({
-							type: "error",
-							error: {
-								type: "authentication_error",
-								message: "Authentication service error",
-							},
-						}),
-						{
-							status: 401,
-							headers: { "Content-Type": "application/json" },
-						},
-					);
-				}
+				});
 			},
 		};
 

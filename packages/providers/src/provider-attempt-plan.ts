@@ -7,11 +7,53 @@ import type {
 	ProviderAttemptNoExecutionSnapshot,
 	ProviderAttemptPlan,
 	ProviderAttemptPlanContext,
+	ProviderPathCapability,
 	ProviderServerToolHistoryProjector,
 	ProviderServerToolReplayIssuer,
 	ProviderUsageInfo,
 	RateLimitInfo,
 } from "./types";
+
+/** Explicit local rejection of a helper path, never a quota or retry signal. */
+export class CountTokensUnsupportedError extends Error {
+	readonly providers: readonly string[];
+	constructor(providers: readonly string[]) {
+		super(
+			"Enrolled providers do not support structured message token counting.",
+		);
+		this.name = "CountTokensUnsupportedError";
+		this.providers = Object.freeze([...new Set(providers)].sort());
+	}
+}
+
+/** Snapshot a provider's path contract without credential, catalog, or transport work. */
+export function getProviderPathCapability(
+	provider: Provider,
+	path: string,
+): Readonly<ProviderPathCapability> {
+	const operation =
+		path === "/v1/messages/count_tokens"
+			? "count_tokens"
+			: path === "/v1/messages" ||
+					path === "/v1/chat/completions" ||
+					path === "/v1/responses"
+				? "generation"
+				: "other";
+	if (!provider.getPathCapability)
+		return Object.freeze({ operation, support: "unknown" });
+	const contract = provider.getPathCapability(path);
+	if (
+		!contract ||
+		contract.operation !== operation ||
+		!["native", "local-advisory", "unsupported", "unknown"].includes(
+			contract.support,
+		) ||
+		(contract.support === "local-advisory" && operation !== "count_tokens")
+	) {
+		throw new TypeError("Invalid provider path capability");
+	}
+	return Object.freeze({ operation, support: contract.support });
+}
 
 const REPLAY_ATOMS = new Set<ServerToolReplayAtom>([
 	"native-Anthropic",

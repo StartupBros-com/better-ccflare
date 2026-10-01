@@ -12,7 +12,8 @@
 		"./bedrock": "./src/providers/bedrock/index.ts",
 		"./codex": "./src/providers/codex/index.ts",
 		"./qwen": "./src/providers/qwen/index.ts",
-		"./xai": "./src/providers/xai/index.ts"
+		"./xai": "./src/providers/xai/index.ts",
+		"./stream-evidence": "./src/utils/stream-evidence.ts"
 	},
 	"scripts": {
 		"typecheck": "bunx tsc --noEmit"

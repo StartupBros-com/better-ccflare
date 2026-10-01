@@ -602,3 +602,23 @@ describe("proxy response-body ownership baseline", () => {
 		expect(upstream.state.completed).toBe(2);
 	});
 });
+
+it("representative body mode uses normal GC and reports post-quiet without heap traversal", async () => {
+	const result = await runProxyRequestBodyWorkload({
+		bodyBytes: 64 * 1024,
+		concurrency: 1,
+		transformMode: "consume-rebuild",
+		samplingMode: "normal-gc",
+	});
+	expect(result.phases.at(-1)?.name).toBe("post-quiet-normal-gc");
+	expect(Object.keys(result.phases[0].absolute.heapStats).sort()).toEqual([
+		"current",
+		"currentCommit",
+		"heapSize",
+		"pageFaults",
+		"peak",
+		"peakCommit",
+	]);
+	expect(result.memoryAccounting.gc).toContain("no forced GC");
+	expect(result.upstreamProcess.exited).toBe(true);
+});

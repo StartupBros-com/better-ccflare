@@ -85,7 +85,8 @@ describe("Agent Interceptor - Directory Traversal Security", () => {
 		process.env[AUTODISCOVER_ENV] = "true";
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await DatabaseFactory.reset();
 		// Cleanup test database
 		try {
 			if (existsSync(TEST_DB_PATH)) {
@@ -94,7 +95,6 @@ describe("Agent Interceptor - Directory Traversal Security", () => {
 		} catch (error) {
 			console.warn("Failed to clean up test database:", error);
 		}
-		DatabaseFactory.reset();
 
 		// Restore env
 		if (originalAutoDiscoverEnv === undefined) {

@@ -3,6 +3,7 @@ import { getCodexReasoningRetention } from "@better-ccflare/config";
 import {
 	BUFFER_SIZES,
 	getExactOAuthErrorCode,
+	getGitSha,
 	getModelFamily,
 	getOAuthErrorCode,
 	isForceAccountModelEnabled,
@@ -38,7 +39,9 @@ import {
 	RECOVERY_STATUS_EXHAUSTED,
 	RECOVERY_STATUS_HEADER,
 } from "@better-ccflare/types";
+import type { RoutingProviderTerminal } from "@better-ccflare/types/request";
 import { BaseProvider } from "../../base";
+import { attachStreamEvidenceReader } from "../../utils/stream-evidence";
 import {
 	type CodexClientIdentity,
 	resolveCodexClientIdentity,
@@ -59,6 +62,7 @@ import {
 } from "../../request-capabilities";
 import type {
 	ProviderAttemptPlanContext,
+	ProviderPathCapability,
 	ProviderServerToolCapabilityContext,
 	ProviderServerToolReplayIssuer,
 	RateLimitInfo,
@@ -956,6 +960,22 @@ function recordCodexStreamEvent(
 	let category: CodexStreamEventCategory = "other";
 	const now = performance.now();
 	state.lastRawEventAt = now;
+	if (
+		[
+			"response.reasoning_summary_text.delta",
+			"response.output_text.delta",
+			"response.function_call_arguments.delta",
+		].includes(event) &&
+		typeof data.delta === "string" &&
+		data.delta.length > 0
+	)
+		state.rawVisibleEvents = saturatingAdd(state.rawVisibleEvents);
+	if (
+		event === "response.cancelled" ||
+		(data.response as Record<string, unknown> | undefined)?.status ===
+			"cancelled"
+	)
+		state.providerTerminal ??= "cancelled";
 	switch (event) {
 		case "response.created":
 			category = "created";
@@ -1049,6 +1069,8 @@ function clearCodexStreamBuffers(state: StreamState): void {
 }
 
 interface StreamState {
+	providerTerminal: RoutingProviderTerminal | null;
+	rawVisibleEvents: number;
 	rawEventCounts: Record<CodexStreamEventCategory, number>;
 	rawBytes: number;
 	argumentDeltaBytes: number;
@@ -1149,6 +1171,24 @@ function writeCodexStreamTerminalTrace(
 ): void {
 	if (state.terminalTraceWritten) return;
 	state.terminalTraceWritten = true;
+	state.providerTerminal ??=
+		error?.type === "sse_limit_exceeded"
+			? "resource_limit"
+			: error?.type === "downstream_cancelled"
+				? "downstream_abort"
+				: state.rawEventCounts.completed > 0
+					? "completed"
+					: state.rawEventCounts.incomplete > 0
+						? "incomplete"
+						: state.rawEventCounts.failed > 0
+							? "failed"
+							: state.rawEventCounts.error > 0
+								? "error"
+								: error?.type === "abrupt_stream_eof"
+									? "eof"
+									: error
+										? "read_error"
+										: "unknown";
 	// A buffer still open at the terminal is a call the client was handed but that
 	// never completed upstream. Its fingerprint is missing, so the lineage would
 	// be an exact-looking subset of the turn upstream actually produced, and a
@@ -2612,6 +2652,21 @@ export class CodexProvider extends BaseProvider {
 		return this.requestToolSchemasById.get(requestId)?.tools.get(toolName);
 	}
 
+	getPathCapability(path: string): ProviderPathCapability {
+		if (path === "/v1/messages/count_tokens") {
+			return { operation: "count_tokens", support: "local-advisory" };
+		}
+		return {
+			operation:
+				path === "/v1/messages" ||
+				path === "/v1/chat/completions" ||
+				path === "/v1/responses"
+					? "generation"
+					: "other",
+			support: this.canHandle(path) ? "native" : "unknown",
+		};
+	}
+
 	canHandle(path: string): boolean {
 		return (
 			path === "/v1/messages" ||
@@ -2861,6 +2916,11 @@ export class CodexProvider extends BaseProvider {
 			context,
 			(source) =>
 				this.extractSessionId(source as unknown as AnthropicRequest) ?? null,
+			{
+				buildEpoch: getGitSha(),
+				capabilityRevision: "codex-responses-observation-v1",
+				keyEpoch: "codex-wire-key-v1",
+			},
 		);
 	}
 
@@ -5119,6 +5179,8 @@ export class CodexProvider extends BaseProvider {
 			: null,
 	): Response {
 		const state: StreamState = {
+			providerTerminal: null,
+			rawVisibleEvents: 0,
 			rawEventCounts: Object.fromEntries(
 				CODEX_STREAM_EVENT_CATEGORIES.map((k) => [k, 0]),
 			) as Record<CodexStreamEventCategory, number>,
@@ -5709,6 +5771,11 @@ export class CodexProvider extends BaseProvider {
 			}
 		};
 
+		attachStreamEvidenceReader(readable, () => ({
+			rawEventCounts: { ...state.rawEventCounts },
+			rawVisibleEvents: state.rawVisibleEvents,
+			providerTerminal: state.providerTerminal,
+		}));
 		void processEvents().catch((error) => {
 			log.error("Unhandled Codex SSE processing failure:", error);
 		});

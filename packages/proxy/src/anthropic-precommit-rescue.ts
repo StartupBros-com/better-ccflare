@@ -1,4 +1,8 @@
 import { extractClaudeVersion } from "@better-ccflare/core";
+import {
+	assertManagedWorkAvailable,
+	managedRemainingMs,
+} from "../../../scripts/ccflare-managed-timing.mjs";
 
 export const ANTHROPIC_PRECOMMIT_RESCUE_PING_FRAME =
 	'event: ping\ndata: {"type":"ping"}\n\n';
@@ -186,7 +190,7 @@ export function getAnthropicPreCommitRescueConfig(
 	// only as a deprecated fallback, and never let an inherited long value undo
 	// the client-specific safe default. A deliberate operator override must use
 	// the canonical meaningful-progress variable, which wins when both are set.
-	const commitmentDeadlineMs = canonicalConfigured
+	const stageCommitmentDeadlineMs = canonicalConfigured
 		? canonicalDeadlineMs
 		: Math.min(
 				boundedEnvInteger(
@@ -197,6 +201,12 @@ export function getAnthropicPreCommitRescueConfig(
 				defaultCommitmentDeadlineMs,
 			);
 
+	if (request) assertManagedWorkAvailable(request);
+	const remaining = request ? managedRemainingMs(request) : null;
+	const commitmentDeadlineMs = Math.max(
+		1,
+		Math.min(stageCommitmentDeadlineMs, remaining ?? stageCommitmentDeadlineMs),
+	);
 	return {
 		// Rescue writes its first ping immediately on activation. Keep activation
 		// inside even a deliberately tiny commitment window instead of silently

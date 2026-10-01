@@ -52,7 +52,7 @@ describe("UsageCollector - comboModelOverride summary field (real collector, end
 	afterAll(async () => {
 		collector.dispose();
 		await collector.drain();
-		DatabaseFactory.reset();
+		await DatabaseFactory.reset();
 		try {
 			if (existsSync(TEST_DB_PATH)) unlinkSync(TEST_DB_PATH);
 		} catch (error) {

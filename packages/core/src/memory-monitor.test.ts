@@ -85,3 +85,113 @@ describe("MemoryMonitor", () => {
 		expect(JSON.stringify(snapshot)).not.toContain("/v1/messages");
 	});
 });
+
+test("reports fixed maintenance balances and writer ownership without arbitrary fields", () => {
+	const monitor = new MemoryMonitor({ readMemoryUsage: () => usage(100) });
+	const owner = {
+		workersAcquired: 3,
+		workersRetired: 2,
+		objectUrlsAcquired: 3,
+		objectUrlsRevoked: 2,
+		activeJobs: 0,
+		queuedJobs: 0,
+		closing: false,
+		retiring: false,
+		held: false,
+		source: "secret",
+	};
+	const result = monitor.snapshot({
+		maintenance: {
+			periodic: owner,
+			compaction: {
+				...owner,
+				workersAcquired: 0,
+				workersRetired: 0,
+				objectUrlsAcquired: 0,
+				objectUrlsRevoked: 0,
+			},
+		},
+		writer: {
+			metadataQueuedJobs: 2,
+			payloadQueuedJobs: 0,
+			payloadBytesPending: 8192,
+			requestId: "secret",
+		},
+	} as never);
+	expect(result.lifecycle?.maintenance?.periodic).toEqual({
+		workersAcquired: 3,
+		workersRetired: 2,
+		workersLive: 1,
+		objectUrlsAcquired: 3,
+		objectUrlsRevoked: 2,
+		objectUrlsLive: 1,
+		activeJobs: 0,
+		queuedJobs: 0,
+		closing: false,
+		retiring: false,
+		held: false,
+	});
+	expect(result.lifecycle?.writer).toEqual({
+		metadataQueuedJobs: 2,
+		payloadQueuedJobs: 0,
+		payloadBytesPending: 8192,
+	});
+	expect(JSON.stringify(result)).not.toContain("secret");
+});
+
+test("sanitizes resource gauges and keeps cheap JSC metrics independent", () => {
+	const monitor = new MemoryMonitor({
+		readMemoryUsage: () => usage(100),
+		readJscMemoryUsage: () => ({
+			heapSize: 17,
+			current: 25,
+			peak: 30,
+			currentCommit: 40,
+			peakCommit: 45,
+			pageFaults: 2,
+			extraMemorySize: 999,
+		}),
+	} as never);
+	const result = monitor.snapshot({
+		maintenance: {
+			periodic: {
+				workersAcquired: NaN,
+				workersRetired: -4,
+				objectUrlsAcquired: Infinity,
+				objectUrlsRevoked: 0,
+				activeJobs: 1,
+				queuedJobs: 0,
+				closing: false,
+				retiring: true,
+				held: true,
+			},
+		},
+		writer: {
+			metadataQueuedJobs: -1,
+			payloadQueuedJobs: NaN,
+			payloadBytesPending: Infinity,
+		},
+	} as never);
+	expect(result.jsc).toEqual({
+		heapSize: 17,
+		current: 25,
+		peak: 30,
+		currentCommit: 40,
+		peakCommit: 45,
+		pageFaults: 2,
+	});
+	expect(result.lifecycle?.maintenance?.periodic.workersLive).toBe(0);
+	expect(result.lifecycle?.writer).toEqual({
+		metadataQueuedJobs: 0,
+		payloadQueuedJobs: 0,
+		payloadBytesPending: 0,
+	});
+	expect(Object.keys(result.jsc ?? {}).sort()).toEqual([
+		"current",
+		"currentCommit",
+		"heapSize",
+		"pageFaults",
+		"peak",
+		"peakCommit",
+	]);
+});

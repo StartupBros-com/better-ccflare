@@ -67,27 +67,29 @@ import { Database } from "bun:sqlite";
  */
 const ANALYZE_ANALYSIS_LIMIT = 400;
 
-export type IncrementalVacuumRequest =
-	| {
-			kind?: "vacuum";
-			dbPath: string;
-			pages: number;
-	  }
-	| {
-			kind: "optimize";
-			dbPath: string;
-	  };
+export type IncrementalVacuumRequest = (
+	| { kind?: "vacuum"; dbPath: string; pages: number }
+	| { kind: "optimize"; dbPath: string }
+	| { kind: "retire" }
+) & { generation?: number; jobId?: number };
 
 export type IncrementalVacuumResult =
 	| { ok: true; mode: number }
 	| { ok: true; skipped: boolean }
 	| { ok: false; error: string };
 
-/**
- * Connection hygiene shared by both kinds: small page cache, no RAM temp
- * spill, no mmap (see the per-PRAGMA rationale in the header comment).
- * `busy_timeout` deliberately differs per kind and is set by the caller.
- */
+// A failed connection close must never be mistaken for released DB ownership.
+let retirementSafe = true;
+let retired = false;
+function closeConnection(db: Database | undefined): void {
+	try {
+		db?.close();
+	} catch (error) {
+		retirementSafe = false;
+		throw error;
+	}
+}
+
 function applyWorkerPragmas(db: Database): void {
 	db.exec("PRAGMA cache_size = -2000");
 	db.exec("PRAGMA temp_store = FILE");
@@ -103,102 +105,80 @@ function isSqliteBusy(err: unknown): boolean {
 	);
 }
 
-function runIncrementalVacuum(dbPath: string, pages: number): void {
+function runIncrementalVacuum(
+	dbPath: string,
+	pages: number,
+): IncrementalVacuumResult {
 	let db: Database | undefined;
 	try {
 		db = new Database(dbPath);
-		// Small wait to absorb a brief write burst from the post-processor
-		// flushing a batched insert, see the header comment. (Greptile #230)
 		db.exec("PRAGMA busy_timeout = 200");
 		applyWorkerPragmas(db);
-
 		const mode = (
 			db.query("PRAGMA auto_vacuum").get() as { auto_vacuum: number }
 		).auto_vacuum;
-		if (mode !== 2) {
-			db.close();
-			db = undefined;
-			self.postMessage({
+		if (mode !== 2)
+			return {
 				ok: false,
 				error: `auto_vacuum=${mode}; expected 2 (INCREMENTAL). Run startup bootstrap migration first.`,
-			} satisfies IncrementalVacuumResult);
-			return;
-		}
-
+			};
 		const n = Math.max(1, Math.trunc(Number(pages) || 1));
 		db.exec(`PRAGMA incremental_vacuum(${n})`);
-
-		db.close();
-		db = undefined;
-		self.postMessage({ ok: true, mode } satisfies IncrementalVacuumResult);
+		return { ok: true, mode };
 	} catch (err) {
-		self.postMessage({
+		return {
 			ok: false,
 			error: err instanceof Error ? err.message : String(err),
-		} satisfies IncrementalVacuumResult);
+		};
 	} finally {
-		db?.close();
+		closeConnection(db);
 	}
 }
 
-function runOptimize(dbPath: string): void {
+function runOptimize(dbPath: string): IncrementalVacuumResult {
 	let db: Database | undefined;
 	try {
 		db = new Database(dbPath);
-		// Zero wait: if another connection (e.g. the hourly vacuum kind or a
-		// large retention DELETE) holds the writer slot, skip this cycle
-		// instead of parking the worker in SQLite's busy handler. Do NOT
-		// inherit the vacuum kind's busy_timeout here: the 5-minute cadence
-		// makes a skipped cycle free, whereas any wait is wasted time.
+		// Never park a maintenance worker in a long busy handler during traffic.
 		db.exec("PRAGMA busy_timeout = 0");
 		applyWorkerPragmas(db);
-
-		// Bound ANALYZE's writer-slot hold to ~ms. Must be set on THIS connection
-		// before `PRAGMA optimize` runs its internal ANALYZE. See
-		// ANALYZE_ANALYSIS_LIMIT above for the full rationale.
 		db.exec(`PRAGMA analysis_limit = ${ANALYZE_ANALYSIS_LIMIT}`);
 		db.exec("PRAGMA optimize");
-		// TRUNCATE (not PASSIVE): actively reclaim and zero the WAL off-thread so
-		// it stays bounded now that the main connection's autocheckpoint is
-		// disabled (see `PRAGMA wal_autocheckpoint = 0` in database-operations.ts).
-		// With busy_timeout=0 a concurrent reader/writer yields either a partial
-		// checkpoint (busy>0, WAL not truncated, no throw) or a transient-lock
-		// skip, it never blocks. When no reader holds frames, TRUNCATE copies all
-		// frames back to the DB file and truncates the WAL to zero bytes; over
-		// successive ticks that keeps the WAL bounded to ~one reader-idle window
-		// of writes.
 		db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-
-		self.postMessage({
-			ok: true,
-			skipped: false,
-		} satisfies IncrementalVacuumResult);
+		return { ok: true, skipped: false };
 	} catch (err) {
-		if (isSqliteBusy(err)) {
-			// Contention during maintenance is normal, report a clean skip,
-			// the next 5-minute tick retries.
-			self.postMessage({
-				ok: true,
-				skipped: true,
-			} satisfies IncrementalVacuumResult);
-		} else {
-			self.postMessage({
-				ok: false,
-				error: err instanceof Error ? err.message : String(err),
-			} satisfies IncrementalVacuumResult);
-		}
+		return isSqliteBusy(err)
+			? { ok: true, skipped: true }
+			: { ok: false, error: err instanceof Error ? err.message : String(err) };
 	} finally {
-		db?.close();
+		closeConnection(db);
 	}
 }
 
 self.onmessage = (event: MessageEvent<IncrementalVacuumRequest>) => {
 	const request = event.data;
-	if (request.kind === "optimize") {
-		runOptimize(request.dbPath);
-	} else {
-		// kind "vacuum" or absent (backward compat: kind-less messages
-		// predate the discriminator and always meant incremental_vacuum).
-		runIncrementalVacuum(request.dbPath, request.pages);
+	if (request.kind === "retire") {
+		retired = true;
+		if (retirementSafe) {
+			self.postMessage({
+				kind: "retired",
+				generation: request.generation,
+				closed: true,
+			});
+			self.close();
+		}
+		return;
 	}
+	if (retired || !retirementSafe) return;
+	// Synchronous functions complete their finally-close before the result receipt.
+	const result =
+		request.kind === "optimize"
+			? runOptimize(request.dbPath)
+			: runIncrementalVacuum(request.dbPath, request.pages);
+	self.postMessage({
+		...result,
+		generation: request.generation,
+		jobId: request.jobId,
+		closed: true,
+	});
 };

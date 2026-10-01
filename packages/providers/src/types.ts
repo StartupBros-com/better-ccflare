@@ -71,6 +71,8 @@ export interface UpstreamObservationContext {
  * client (see `forwardObservedUpstream`, the sole caller).
  */
 export interface UpstreamObservation {
+	/** Observation only; called at the authorized physical-send seam. */
+	dispatched?(transport: "http" | "websocket"): void;
 	response(response: Response): Response;
 	error(error: unknown): void;
 }
@@ -253,6 +255,12 @@ export interface ProviderAttemptPlan {
 	) => Promise<ProviderUsageInfo | null>;
 }
 
+/** Provider-owned endpoint behavior. Advisory counts never prove capacity or entitlement. */
+export interface ProviderPathCapability {
+	readonly operation: "generation" | "count_tokens" | "other";
+	readonly support: "native" | "local-advisory" | "unsupported" | "unknown";
+}
+
 export interface Provider {
 	name: string;
 
@@ -303,6 +311,10 @@ export interface Provider {
 	 * Check if this provider can handle the given request path
 	 */
 	canHandle(path: string): boolean;
+
+	/** Optional synchronous path contract, evaluated before credentials or execution admission.
+	 * Omission means unknown; legacy canHandle does not prove native counting. */
+	getPathCapability?(path: string): ProviderPathCapability;
 
 	/**
 	 * Refresh the access token for an account

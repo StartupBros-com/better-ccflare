@@ -155,7 +155,7 @@ const deployOwned = new Set([
   "CCFLARE_ARTIFACT_MODE",
   "CCFLARE_GIT_SHA",
   "CCFLARE_GIT_REF",
-  "CCFLARE_SOURCE_SHA",
+  "CCFLARE_SOURCE_SHA", "CCFLARE_SCHEMA_DIGEST", "CCFLARE_PIN_PATH", "CCFLARE_MANAGED_TIMING", "GUARD_ACCEPTED_CAP_MS",
   "CCFLARE_SOURCE_REF",
   "CCFLARE_UPDATE_CHANNEL",
   "CCFLARE_VERSION",
@@ -353,13 +353,16 @@ NODE
 }
 
 render_systemd_pin() {
-	if [[ "$#" -ne 8 ]]; then
+	if [[ "$#" -ne 8 && "$#" -ne 10 ]]; then
 		echo "render_systemd_pin requires: input output binary runner guard source-id policy-id guard-policy-script" >&2
 		return 2
 	fi
 
 	local input="$1" output="$2" binary="$3" runner="$4"
 	local guard_script="$5" source_id="$6" policy_id="$7" guard_policy_script="$8"
+	local backend_source_id="${9:-$6}" schema_digest="${10:-}" accepted_cap_ms
+	accepted_cap_ms="$(configured_systemd_environment_value "$input" GUARD_ACCEPTED_CAP_MS 2>/dev/null || printf 1470000)"
+	if [[ ! "$accepted_cap_ms" =~ ^[1-9][0-9]{0,6}$ ]] || ((accepted_cap_ms > 1470000)); then echo "invalid accepted request cap" >&2; return 2; fi
 	local deadline_ms=600000 retry_attempt_headroom_ms=30000 max_recovery_sleep_ms=120000 shutdown_grace_ms=600000 max_recovery_waits=12
 	local kill_mode=mixed stop_timeout=720s
 	local restart=on-failure restart_sec=5s restart_prevent_exit_status=143
@@ -399,14 +402,20 @@ render_systemd_pin() {
 			printf '%s\n' "$preserved_environment_lines"
 		fi
 		printf 'Environment=%s\n' "CCFLARE_BIN=$binary"
+		if [[ -n "$schema_digest" ]]; then
+			printf 'Environment=%s\n' "CCFLARE_SCHEMA_DIGEST=$schema_digest"
+			printf '%s\n' "Environment=CCFLARE_PIN_PATH=/etc/systemd/system/ccflare-stack.service.d/50-pinned-build.conf"
+		fi
+		printf 'Environment=%s\n' "GUARD_ACCEPTED_CAP_MS=$accepted_cap_ms"
+		printf '%s\n' "Environment=CCFLARE_MANAGED_TIMING=1"
 		# A production source deployment is an exact, non-actionable identity.
 		# Keep redundant fields adjacent so stale or conflicting pins fail closed.
 		printf '%s\n' "Environment=CCFLARE_DISTRIBUTION=v1:startupbros-managed-source"
 		printf '%s\n' "Environment=CCFLARE_PRODUCER=startupbros"
 		printf '%s\n' "Environment=CCFLARE_ARTIFACT_MODE=managed-source"
-		printf 'Environment=%s\n' "CCFLARE_GIT_SHA=$source_id"
+		printf 'Environment=%s\n' "CCFLARE_GIT_SHA=$backend_source_id"
 		printf '%s\n' "Environment=CCFLARE_GIT_REF=refs/heads/main"
-		printf 'Environment=%s\n' "CCFLARE_SOURCE_SHA=$source_id"
+		printf 'Environment=%s\n' "CCFLARE_SOURCE_SHA=$backend_source_id"
 		printf '%s\n' "Environment=CCFLARE_SOURCE_REF=refs/heads/main"
 		printf 'Environment=%s\n' "GUARD_SCRIPT=$guard_script"
 		printf 'Environment=%s\n' "GUARD_SOURCE_ID=$source_id"
@@ -906,7 +915,14 @@ validate_deployment_timing() {
 		echo "unsupported TimeoutStopSec=${stop_timeout}" >&2
 		return 1
 	}
-	minimum_stop_timeout_usec=$(((shutdown_grace_ms + 120000) * 1000))
+	local app_drain_ms cushion_ms stop_reserve_ms accepted_cap_ms
+ app_drain_ms="$(configured_systemd_environment_value "$pin" CCFLARE_SERVER_DRAIN_MS 2>/dev/null || printf 60000)"
+ cushion_ms="$(configured_systemd_environment_value "$pin" GUARD_SHUTDOWN_CUSHION_MS 2>/dev/null || printf 5000)"
+ accepted_cap_ms="$(configured_systemd_environment_value "$pin" GUARD_ACCEPTED_CAP_MS 2>/dev/null || printf 1470000)"
+ if [[ ! "$app_drain_ms" =~ ^(0|[1-9][0-9]{0,9})$ || ! "$cushion_ms" =~ ^(0|[1-9][0-9]{0,4})$ || ! "$accepted_cap_ms" =~ ^[1-9][0-9]{0,6}$ ]] || ((app_drain_ms > 2147403647 || cushion_ms > 60000 || accepted_cap_ms > 1470000)); then echo "invalid retirement or accepted timing policy" >&2; return 1; fi
+ stop_reserve_ms=$((app_drain_ms + 20000 + cushion_ms + 5000))
+ ((stop_reserve_ms < 120000)) && stop_reserve_ms=120000
+ minimum_stop_timeout_usec=$(((shutdown_grace_ms + stop_reserve_ms) * 1000))
 	if ((stop_timeout_usec < minimum_stop_timeout_usec)); then
 		echo "unsafe TimeoutStopSec=${stop_timeout}; expected at least ${minimum_stop_timeout_usec}us" >&2
 		return 1
@@ -1193,7 +1209,14 @@ validate_effective_systemd_policy() {
 		echo "unsupported effective TimeoutStopUSec=${stop_timeout}" >&2
 		return 1
 	}
-	minimum_stop_timeout_usec=$(((effective_shutdown_grace_ms + 120000) * 1000))
+	local app_drain_ms cushion_ms stop_reserve_ms accepted_cap_ms
+ app_drain_ms="$(systemd_environment_text_value "$effective_environment" CCFLARE_SERVER_DRAIN_MS 2>/dev/null || printf 60000)"
+ cushion_ms="$(systemd_environment_text_value "$effective_environment" GUARD_SHUTDOWN_CUSHION_MS 2>/dev/null || printf 5000)"
+ accepted_cap_ms="$(systemd_environment_text_value "$effective_environment" GUARD_ACCEPTED_CAP_MS 2>/dev/null || printf 1470000)"
+ if [[ ! "$app_drain_ms" =~ ^(0|[1-9][0-9]{0,9})$ || ! "$cushion_ms" =~ ^(0|[1-9][0-9]{0,4})$ || ! "$accepted_cap_ms" =~ ^[1-9][0-9]{0,6}$ ]] || ((app_drain_ms > 2147403647 || cushion_ms > 60000 || accepted_cap_ms > 1470000)); then echo "invalid effective retirement or accepted timing policy" >&2; return 1; fi
+ stop_reserve_ms=$((app_drain_ms + 20000 + cushion_ms + 5000))
+ ((stop_reserve_ms < 120000)) && stop_reserve_ms=120000
+ minimum_stop_timeout_usec=$(((effective_shutdown_grace_ms + stop_reserve_ms) * 1000))
 	if ((stop_timeout_usec < minimum_stop_timeout_usec)); then
 		echo "effective TimeoutStopUSec=${stop_timeout}; expected at least ${minimum_stop_timeout_usec}us" >&2
 		return 1
@@ -1473,6 +1496,14 @@ sha256_file() {
 	fi
 }
 
+immutable_binary_name() {
+ if [[ "$#" -ne 3 || ! "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ || ! "$2" =~ ^[0-9a-f]{7,40}$ || ! "$3" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "immutable_binary_name requires: version source-id sha256" >&2
+  return 2
+ fi
+ printf 'better-ccflare-v%s-%s-%s\n' "$1" "$2" "$3"
+}
+
 verify_process_start_identity() {
 	if [[ "$#" -lt 2 || "$#" -gt 3 ]]; then
 		echo "verify_process_start_identity requires: pid expected-runner [proc-root]" >&2
@@ -1489,6 +1520,17 @@ verify_process_start_identity() {
 		fi
 	done <"$proc_root/$pid/cmdline"
 	return 1
+}
+
+artifact_module_set_matches() {
+ [[ "$#" -ge 2 && -d "$1" && ! -L "$1" ]] || return 1
+ local dir="$1" entry count
+ shift
+ count="$(find "$dir" -mindepth 1 -maxdepth 1 | wc -l)" || return 1
+ [[ "$count" -eq "$#" ]] || return 1
+ for entry in "$@"; do
+  [[ "$entry" =~ ^[A-Za-z0-9._-]+$ && -f "$dir/$entry" && ! -L "$dir/$entry" ]] || return 1
+ done
 }
 
 artifact_prune_candidates() {
@@ -1523,4 +1565,43 @@ guard_prune_candidates() {
 	fi
 
 	artifact_prune_candidates "$1" "$4" "$2" "$3"
+}
+
+# Backend-only deployment uses the running runner's authenticated control. It
+# requires identical ingress/protocol bytes and unchanged migration code. Any
+# mismatch deliberately takes the ordinary full-stack bootstrap path.
+backend_handoff_eligible() {
+ local runtime="$1" binary="$2" runner="$3" guard="$4" policy="$5" timing="$6" transaction="$7" schema="$8"
+ sudo node - "$runtime" "$binary" "$runner" "$guard" "$policy" "$timing" "$transaction" "$schema" <<'NODE'
+const fs=require("node:fs"),crypto=require("node:crypto");const [file,binary,runner,guard,policy,timing,transaction,schema]=process.argv.slice(2);try{const r=JSON.parse(fs.readFileSync(file)),hash=p=>crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");if(r.schemaDigest!==schema||r.ingress.runner!==hash(runner)||r.ingress.guard!==hash(guard)||r.ingress.policy!==hash(policy)||r.ingress.timing!==hash(timing)||r.ingress.transaction!==hash(transaction)||r.pinHash!==hash(r.pinPath)||!fs.existsSync(r.controlDir+"/deploy.sock"))process.exit(1);for(const key of ["oldPid","generation"])if(!Number.isSafeInteger(r[key]))process.exit(1);}catch{process.exit(1);}
+NODE
+}
+request_backend_handoff() {
+ local dir="$1" module="$2" binary="$3" source="$4" rendered="$5" schema="$6" command
+ command="$(mktemp)"
+ sudo node - "$dir/runtime.json" "$binary" "$source" "$rendered" "$schema" "$command" <<'NODE'
+const fs=require("node:fs"),crypto=require("node:crypto");const [file,binary,source,pin,schema,out]=process.argv.slice(2),r=JSON.parse(fs.readFileSync(file)),hash=p=>crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");const manifest={transactionId:crypto.randomUUID(),expectedGeneration:r.generation,oldPid:r.oldPid,oldStartTime:r.oldStartTime,previousPinHash:r.pinHash,candidatePinHash:hash(pin),candidateBinary:fs.realpathSync(binary),candidateHash:hash(binary),candidateSourceSha:source,candidateNonce:crypto.randomBytes(16).toString("hex"),schemaDigest:schema,ingress:r.ingress};fs.writeFileSync(out,JSON.stringify({command:"prepare",manifest}),{mode:0o600});
+NODE
+ local status=0
+ sudo node "$module" client "$dir" "$command" || status=$?
+ rm -f "$command";return "$status"
+}
+await_backend_handoff_phase() {
+ local dir="$1" expected="$2" budget="${3:-800}" elapsed=0 phase_status
+ while ((elapsed<budget)); do
+  phase_status=0
+  sudo node - "$dir/intent.json" "$expected" <<'NODE' || phase_status=$?
+const fs=require("node:fs");try{const t=JSON.parse(fs.readFileSync(process.argv[2]));if(t.phase===process.argv[3])process.exit(0);process.exit(["held","rolled_back"].includes(t.phase)?2:1);}catch{process.exit(1);}
+NODE
+  ((phase_status == 0)) && return 0
+  ((phase_status == 2)) && return 1
+  sleep 1;((elapsed+=1))
+ done
+ return 1
+}
+commit_backend_handoff() {
+ local dir="$1" module="$2"
+ sudo node --input-type=module - "$dir" "$module" <<'NODE'
+import fs from "node:fs";import {pathToFileURL} from "node:url";const [dir,path]=process.argv.slice(2),{durableWrite,fileHash}=await import(pathToFileURL(path));const t=JSON.parse(fs.readFileSync(dir+"/intent.json"));if(t.phase!=="candidate_verified"||fileHash(t.previous.pinPath)!==t.manifest.candidatePinHash)throw new Error("pin or transaction mismatch");durableWrite(dir+"/commit.json",{transactionId:t.manifest.transactionId,pinHash:t.manifest.candidatePinHash});
+NODE
 }

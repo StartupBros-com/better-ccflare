@@ -27,6 +27,8 @@ GUARD_EFFECTIVE_MAX_ACTIVE=${CCFLARE_GUARD_MAX_ACTIVE:-${GUARD_MAX_ACTIVE:-12}}
 GUARD_MAX_RECOVERY_WAITS=${GUARD_MAX_RECOVERY_WAITS:-$GUARD_EFFECTIVE_MAX_ACTIVE}
 GUARD_SHUTDOWN_GRACE_MS=${GUARD_SHUTDOWN_GRACE_MS:-600000}
 GUARD_SHUTDOWN_CUSHION_MS=${GUARD_SHUTDOWN_CUSHION_MS:-5000}
+CCFLARE_SERVER_DRAIN_MS=${CCFLARE_SERVER_DRAIN_MS:-60000}
+UPSTREAM_STOP_BUDGET_MS=$((CCFLARE_SERVER_DRAIN_MS + 20000))
 RUNNER_FAILURE_STOP_BUDGET_MS=${RUNNER_FAILURE_STOP_BUDGET_MS:-30000}
 STOP_POLL_INTERVAL_MS=200
 RUNNER_HEALTH_POLL_INTERVAL_MS=${RUNNER_HEALTH_POLL_INTERVAL_MS:-1000}
@@ -64,6 +66,14 @@ RUNNER_CIRCUIT_HOLD=${RUNNER_CIRCUIT_HOLD:-auto}
 RUNNER_CIRCUIT_EXIT_STATUS=75
 RUNNER_PERSISTENT_GUARD=${RUNNER_PERSISTENT_GUARD:-1}
 case "$RUNNER_PERSISTENT_GUARD" in 0 | 1) ;; *) printf 'invalid RUNNER_PERSISTENT_GUARD\n' >&2; exit 64 ;; esac
+TRANSACTION_MODULE="$(dirname "${BASH_SOURCE[0]}")/ccflare-deployment-transaction.mjs"
+TRANSACTION_DIR=${CCFLARE_TRANSACTION_DIR:-$HOME/.config/better-ccflare/handoff}
+deployment_pid=""
+pending_deployment=0
+pending_rollback=0
+transaction_enabled=0
+if [[ "${CCFLARE_SCHEMA_DIGEST:-}" =~ ^[0-9a-f]{64}$ && -n "${CCFLARE_PIN_PATH:-}" && -f "$TRANSACTION_MODULE" ]]; then transaction_enabled=1; fi
+if ((transaction_enabled)); then "$NODE_BIN" "$TRANSACTION_MODULE" recover "$TRANSACTION_DIR" >/dev/null || { printf "unfinished backend transaction requires operator recovery\n" >&2; exit 70; }; fi
 control_dir=""
 control_pid=""
 guard_control_secret=""
@@ -107,6 +117,7 @@ validate_bounded_int() {
 	fi
 }
 
+validate_bounded_ms CCFLARE_SERVER_DRAIN_MS "$CCFLARE_SERVER_DRAIN_MS" 0 2147403647
 validate_bounded_ms GUARD_TOTAL_DEADLINE_MS "$GUARD_TOTAL_DEADLINE_MS" 1 2147483647
 validate_bounded_ms GUARD_RETRY_ATTEMPT_HEADROOM_MS "$GUARD_RETRY_ATTEMPT_HEADROOM_MS" 1 2147483647
 validate_bounded_ms GUARD_MAX_RECOVERY_SLEEP_MS "$GUARD_MAX_RECOVERY_SLEEP_MS" 1 120000
@@ -226,13 +237,29 @@ remaining_stop_budget() {
 	fi
 }
 
+deployment_field() {
+ "$NODE_BIN" - "$TRANSACTION_DIR/intent.json" "$1" <<'NODE'
+const fs=require("node:fs");const [path,key]=process.argv.slice(2);const t=JSON.parse(fs.readFileSync(path));const value=key.split(".").reduce((v,k)=>v?.[k],t);if(value==null)process.exit(1);process.stdout.write(String(value));
+NODE
+}
+transaction_advance() { "$NODE_BIN" "$TRANSACTION_MODULE" advance "$TRANSACTION_DIR" "$@" >/dev/null; }
+start_deployment_listener() {
+ local initial="$TRANSACTION_DIR/runtime-input.json"
+ mkdir -p "$TRANSACTION_DIR"; chmod 700 "$TRANSACTION_DIR"
+ CCFLARE_ACTIVE_PID="$upstream_pid" CCFLARE_ACTIVE_START="$(proc_start_time "$upstream_pid" /proc)" CCFLARE_ACTIVE_GENERATION="$upstream_generation" CCFLARE_ACTIVE_CONTROL="$control_dir" CCFLARE_ACTIVE_BIN="$CCFLARE_BIN" CCFLARE_ACTIVE_RUNNER="${BASH_SOURCE[0]}" CCFLARE_ACTIVE_GUARD="$GUARD_SCRIPT" "$NODE_BIN" - "$initial" <<'NODE'
+const fs=require("node:fs"),crypto=require("node:crypto"),path=require("node:path");const e=process.env;const hash=p=>crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");const r={generation:Number(e.CCFLARE_ACTIVE_GENERATION),oldPid:Number(e.CCFLARE_ACTIVE_PID),oldStartTime:e.CCFLARE_ACTIVE_START,binary:fs.realpathSync(e.CCFLARE_ACTIVE_BIN),binaryHash:hash(e.CCFLARE_ACTIVE_BIN),backendSourceSha:e.CCFLARE_SOURCE_SHA,schemaDigest:e.CCFLARE_SCHEMA_DIGEST,ingress:{runner:hash(e.CCFLARE_ACTIVE_RUNNER),guard:hash(e.CCFLARE_ACTIVE_GUARD),policy:hash(path.join(path.dirname(e.CCFLARE_ACTIVE_GUARD),"ccflare-guard-policy.mjs")),timing:hash(path.join(path.dirname(e.CCFLARE_ACTIVE_GUARD),"ccflare-managed-timing.mjs")),transaction:hash(path.join(path.dirname(e.CCFLARE_ACTIVE_RUNNER),"ccflare-deployment-transaction.mjs"))},pinPath:e.CCFLARE_PIN_PATH,pinHash:hash(e.CCFLARE_PIN_PATH),controlDir:e.CCFLARE_ACTIVE_CONTROL};fs.writeFileSync(process.argv[2],JSON.stringify(r),{mode:0o600});
+NODE
+ "$NODE_BIN" "$TRANSACTION_MODULE" serve "$TRANSACTION_DIR" "$initial" &
+ deployment_pid=$!
+}
 stop_stack_children() {
+ if [[ -n "$deployment_pid" ]]; then kill "$deployment_pid" 2>/dev/null || true; wait "$deployment_pid" 2>/dev/null || true; deployment_pid=""; fi
 	if (($# == 0)); then
 		# Intentional TERM/INT keeps the full guard drain grace and the existing
 		# short child budgets. It is deliberately not an aggregate deadline.
 		log "stopping stack children; cleanup_budget_ms=${GUARD_STOP_BUDGET_MS}; mode=intentional"
 		stop_child "ccflare guard" "$guard_pid" "$GUARD_STOP_BUDGET_MS"
-		stop_child "better-ccflare upstream" "$upstream_pid" 5000
+		stop_child "better-ccflare upstream" "$upstream_pid" "$UPSTREAM_STOP_BUDGET_MS"
 		stop_child "ai-gateway ssh tunnel" "$ai_gateway_tunnel_pid" 5000
 	else
 		# Unexpected failures use one aggregate deadline so a stubborn child
@@ -395,7 +422,7 @@ stop_stack_for_memory_recycle() {
 		*) log "memory recycle failed: unknown guard drain status=${guard_status}"; return 1 ;;
 	esac
 	guard_pid=""
-	stop_child "better-ccflare upstream" "$upstream_pid" 5000
+	stop_child "better-ccflare upstream" "$upstream_pid" "$UPSTREAM_STOP_BUDGET_MS"
 	stop_child "ai-gateway ssh tunnel" "$ai_gateway_tunnel_pid" 5000
 	[[ -n "$watchdog_pid" ]] && { kill "$watchdog_pid" 2>/dev/null || true; wait "$watchdog_pid" 2>/dev/null || true; }
 	wait "${upstream_pid:-0}" 2>/dev/null || true
@@ -412,7 +439,7 @@ cleanup() {
 	if [[ -n "$control_pid" ]]; then kill "$control_pid" 2>/dev/null || true; wait "$control_pid" 2>/dev/null || true; control_pid=""; fi
 	log "stopping ccflare stack"
 	stop_stack_children
-	if [[ -n "$control_dir" ]]; then rm -f -- "$control_dir/control.sock"; rmdir -- "$control_dir" 2>/dev/null || true; fi
+	if [[ -n "$control_dir" ]]; then rm -f -- "$control_dir/control.sock" "$control_dir/deploy.sock" "$control_dir/deploy-credential"; rmdir -- "$control_dir" 2>/dev/null || true; fi
 }
 
 terminate() {
@@ -570,7 +597,7 @@ generate_guard_correlation_secret() {
 # interrupts a pending drain instead of waiting for a long synchronous command.
 guard_control() {
 	local command="$1" target_generation="$2" candidate_pid="${3:-0}" candidate_start="${4:-0}" status
-	GUARD_CONTROL_SECRET="$guard_control_secret" CCFLARE_GUARD_CORRELATION_SECRET="$guard_correlation_secret" \
+	GUARD_CONTROL_SECRET="$guard_control_secret" CCFLARE_GUARD_CORRELATION_SECRET="$guard_correlation_secret" CCFLARE_MANAGED_CANDIDATE_NONCE="${CCFLARE_MANAGED_CANDIDATE_NONCE:-}" CCFLARE_DEPLOYMENT_TRANSACTION_ID="${CCFLARE_DEPLOYMENT_TRANSACTION_ID:-}" CCFLARE_DEPLOYMENT_ROLLBACK="${CCFLARE_DEPLOYMENT_ROLLBACK:-0}" CCFLARE_DEPLOYMENT_INTENT_PATH="$TRANSACTION_DIR/intent.json" \
 		"$NODE_BIN" - "$control_dir/control.sock" "$command" "$target_generation" "$candidate_pid" "$candidate_start" "$GUARD_STOP_BUDGET_MS" <<'NODE' &
 const net = require("node:net");
 const [path, command, generation, pid, startTime, budget] = process.argv.slice(2);
@@ -579,7 +606,7 @@ let output = "", settled = false;
 const fail = () => { if (settled) return; settled = true; socket.destroy(); process.exitCode = 1; };
 socket.setTimeout(Number(budget) + 3000, fail);
 socket.on("error", fail);
-socket.on("connect", () => socket.write(JSON.stringify({ command, generation: Number(generation), pid: Number(pid), startTime, secret: process.env.GUARD_CONTROL_SECRET, correlationSecret: process.env.CCFLARE_GUARD_CORRELATION_SECRET }) + "\n"));
+socket.on("connect", () => socket.write(JSON.stringify({ command, generation: Number(generation), pid: Number(pid), startTime, secret: process.env.GUARD_CONTROL_SECRET, correlationSecret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, candidateNonce: process.env.CCFLARE_MANAGED_CANDIDATE_NONCE, transactionId: process.env.CCFLARE_DEPLOYMENT_TRANSACTION_ID || undefined, rollback: process.env.CCFLARE_DEPLOYMENT_ROLLBACK === "1", manifest: command === "prepare" ? (()=>{const t=JSON.parse(require("node:fs").readFileSync(process.env.CCFLARE_DEPLOYMENT_INTENT_PATH));return {...t.manifest,intentPath:process.env.CCFLARE_DEPLOYMENT_INTENT_PATH,pinPath:t.previous.pinPath};})() : undefined }) + "\n"));
 socket.on("data", chunk => { output += chunk.toString(); if (output.length > 4096) fail(); });
 socket.on("end", () => {
  if (settled) return;
@@ -593,12 +620,43 @@ NODE
 	return "$status"
 }
 
+begin_backend_deployment() {
+ deployment_pid=""
+ export CCFLARE_DEPLOYMENT_ROLLBACK=0
+ export CCFLARE_DEPLOYMENT_TRANSACTION_ID="$(deployment_field manifest.transactionId)"
+ export CCFLARE_MANAGED_CANDIDATE_NONCE="$(deployment_field manifest.candidateNonce)"
+ guard_control prepare "$upstream_generation" || return 1
+ transaction_advance prepared draining || return 1
+ guard_control begin "$upstream_generation" || return 1
+ [[ "$(proc_start_time "$upstream_pid" /proc)" == "$(deployment_field previous.oldStartTime)" ]] || return 1
+ stop_child "better-ccflare upstream" "$upstream_pid" "$UPSTREAM_STOP_BUDGET_MS"
+ wait "$upstream_pid" 2>/dev/null || true
+ transaction_advance draining old_reaped || return 1
+ upstream_pid=""
+ if [[ -n "$watchdog_pid" ]]; then kill "$watchdog_pid" 2>/dev/null || true; wait "$watchdog_pid" 2>/dev/null || true; watchdog_pid=""; fi
+ CCFLARE_BIN="$(deployment_field manifest.candidateBinary)"
+ export CCFLARE_SOURCE_SHA="$(deployment_field manifest.candidateSourceSha)" CCFLARE_GIT_SHA="$(deployment_field manifest.candidateSourceSha)"
+ ((upstream_generation+=1));pending_replacement=1;pending_deployment=1
+}
+verify_and_commit_backend_deployment() {
+ local start="$(proc_start_time "$upstream_pid" /proc)" waited=0
+ guard_control verify "$upstream_generation" "$upstream_pid" "$start" || return 1
+ transaction_advance candidate_started candidate_verified || return 1
+ while ((waited<600 && !shutdown_requested)); do
+  if "$NODE_BIN" - "$TRANSACTION_DIR" <<'NODE'
+const fs=require("node:fs"),crypto=require("node:crypto");try{const d=process.argv[2],t=JSON.parse(fs.readFileSync(d+"/intent.json")),r=JSON.parse(fs.readFileSync(d+"/commit.json")),hash=crypto.createHash("sha256").update(fs.readFileSync(t.previous.pinPath)).digest("hex");if(r.transactionId!==t.manifest.transactionId||r.pinHash!==t.manifest.candidatePinHash||hash!==r.pinHash)process.exit(1);}catch{process.exit(1);}
+NODE
+  then transaction_advance candidate_verified committed; return 0; fi
+  sleep_ms 100;((waited+=1))
+ done
+ return 1
+}
 recycle_upstream_with_persistent_guard() {
 	log "memory recycle drain starting; ordering=guard-barrier,upstream; grace_ms=${GUARD_SHUTDOWN_GRACE_MS}; guard_listener=retained"
 	guard_control begin "$upstream_generation" || return 1
 	# The guard has fenced all old dispatches. Reap the sole DB owner before
 	# allowing a replacement to bind the same upstream port.
-	stop_child "better-ccflare upstream" "$upstream_pid" 5000
+	stop_child "better-ccflare upstream" "$upstream_pid" "$UPSTREAM_STOP_BUDGET_MS"
 	wait "$upstream_pid" 2>/dev/null || true
 	upstream_pid=""
 	[[ -n "$watchdog_pid" ]] && { wait "$watchdog_pid" 2>/dev/null || true; }
@@ -670,7 +728,7 @@ run_stack_once() {
 	fi
 
 	if [[ -z "$guard_pid" && "$RUNNER_PERSISTENT_GUARD" == "1" ]]; then
-		if [[ -n "$control_dir" ]]; then rm -f -- "$control_dir/control.sock"; rmdir -- "$control_dir" 2>/dev/null || true; fi
+		if [[ -n "$control_dir" ]]; then rm -f -- "$control_dir/control.sock" "$control_dir/deploy.sock" "$control_dir/deploy-credential"; rmdir -- "$control_dir" 2>/dev/null || true; fi
 		control_dir="$(mktemp -d "${TMPDIR:-/tmp}/ccflare-control.XXXXXX")"
 		chmod 700 "$control_dir"
 		guard_control_secret="$(LC_ALL=C head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
@@ -679,6 +737,11 @@ run_stack_once() {
 		pending_replacement=0
 	fi
 
+	CCFLARE_MANAGED_INGRESS_NONCE=${CCFLARE_MANAGED_INGRESS_NONCE:-$(LC_ALL=C head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}
+	if ((pending_deployment || pending_rollback)); then CCFLARE_MANAGED_CANDIDATE_NONCE="$(deployment_field manifest.candidateNonce)"; else CCFLARE_MANAGED_CANDIDATE_NONCE=$(LC_ALL=C head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'); fi
+	export CCFLARE_MANAGED_TIMING="${CCFLARE_MANAGED_TIMING:-0}" CCFLARE_MANAGED_INGRESS_NONCE CCFLARE_MANAGED_CANDIDATE_NONCE
+	export CCFLARE_MANAGED_GENERATION="$upstream_generation"
+	if ((transaction_enabled)); then "$NODE_BIN" "$TRANSACTION_MODULE" owner-spawning "$TRANSACTION_DIR" || return 1; fi
 	log "starting better-ccflare upstream on 127.0.0.1:${UPSTREAM_PORT}"
 	HOME="$HOME" \
 		USER="$USER" \
@@ -692,6 +755,16 @@ run_stack_once() {
 		CCFLARE_DEBUG_CODEX_STREAM="${CCFLARE_DEBUG_CODEX_STREAM:-1}" \
 		"$CCFLARE_BIN" --serve --port "$UPSTREAM_PORT" &
 	upstream_pid=$!
+	if ((transaction_enabled)); then
+		local candidate_start
+		if ! candidate_start="$(proc_start_time "$upstream_pid" /proc)"; then
+			if ((pending_deployment)); then transaction_advance old_reaped held '{"reason":"candidate_start_identity_unavailable"}' || true; fi
+			log "backend start held: candidate_start_identity_unavailable"
+			return 1
+		fi
+		"$NODE_BIN" "$TRANSACTION_MODULE" owner-started "$TRANSACTION_DIR" "$upstream_pid" "$candidate_start" || return 1
+		if ((pending_deployment)); then transaction_advance old_reaped candidate_started "{\"candidatePid\":$upstream_pid,\"candidateStartTime\":\"$candidate_start\"}" || return 1; fi
+	fi
 	if ! wait_for_url better-ccflare "http://127.0.0.1:${UPSTREAM_PORT}/health" "$upstream_pid"; then
 		if [[ -z "$child_exit_name" ]]; then
 			child_exit_name="better-ccflare upstream"
@@ -702,11 +775,14 @@ run_stack_once() {
 	fi
 
 	if [[ -n "$guard_pid" ]]; then
+		if ((pending_deployment)) && ! verify_and_commit_backend_deployment; then log "candidate failed before committed handoff"; return 1; fi
 		if ! guard_control attach "$upstream_generation" "$upstream_pid" "$(proc_start_time "$upstream_pid" /proc)"; then
 			log "replacement generation verification failed; admission remains fenced"
 			return 1
 		fi
 		pending_replacement=0
+		if ((pending_deployment)); then transaction_advance committed attached; pending_deployment=0; unset CCFLARE_DEPLOYMENT_TRANSACTION_ID; fi
+		if ((pending_rollback)); then pending_rollback=0; unset CCFLARE_DEPLOYMENT_TRANSACTION_ID CCFLARE_DEPLOYMENT_ROLLBACK; fi
 	else
 	log "starting ccflare guard on 127.0.0.1:${GUARD_PORT} -> 127.0.0.1:${UPSTREAM_PORT}; failure_cleanup_budget_ms=${RUNNER_FAILURE_STOP_BUDGET_MS}; intentional_stop_budget_ms=${GUARD_STOP_BUDGET_MS}"
 	HOME="$HOME" \
@@ -743,6 +819,7 @@ run_stack_once() {
 	stack_started_ms="$(epoch_ms)"
 	log "ccflare stack ready; upstream_pid=${upstream_pid} guard_pid=${guard_pid}"
 	local -a child_pids=("$upstream_pid" "$guard_pid")
+	if ((transaction_enabled)); then start_deployment_listener; child_pids+=("$deployment_pid"); fi
 	# Use Bash's PID-reporting form for deterministic child classification and
 	# include a required or optional tunnel when one is owned by this cycle.
 	# Once a tunnel process is owned by this runner, supervise it regardless of
@@ -764,7 +841,9 @@ run_stack_once() {
 	wait -n -p exited_pid "${child_pids[@]}"
 	child_exit_status=$?
 	set -e
-	if [[ -n "$watchdog_pid" && "$exited_pid" == "$watchdog_pid" && "$child_exit_status" == "66" ]]; then
+	if [[ -n "$deployment_pid" && "$exited_pid" == "$deployment_pid" && "$child_exit_status" == "67" ]]; then
+		child_exit_name="backend deployment"; child_exit_class="deployment"
+	elif [[ -n "$watchdog_pid" && "$exited_pid" == "$watchdog_pid" && "$child_exit_status" == "66" ]]; then
 		child_exit_name="RSS watchdog"
 		child_exit_class="memory-recycle"
 	else
@@ -865,7 +944,34 @@ while :; do
 		exit 143
 	fi
 
+	if [[ "$child_exit_class" == "deployment" ]]; then
+		if begin_backend_deployment; then continue; fi
+		log "backend deployment failed; dispatch held for operator recovery"; wait_for_operator; exit 70
+	fi
+	if ((pending_deployment)); then
+		stop_child "failed candidate" "$upstream_pid" "$UPSTREAM_STOP_BUDGET_MS"; wait "${upstream_pid:-0}" 2>/dev/null || true; upstream_pid=""
+		phase="$(deployment_field phase)"
+		if transaction_advance "$phase" rolled_back; then
+			CCFLARE_BIN="$(deployment_field previous.binary)"; export CCFLARE_SOURCE_SHA="$(deployment_field previous.backendSourceSha)" CCFLARE_GIT_SHA="$(deployment_field previous.backendSourceSha)" CCFLARE_DEPLOYMENT_ROLLBACK=1
+			pending_deployment=0;pending_rollback=1;continue
+		fi
+		log "backend deployment recovery held; pin or ownership ambiguity"; wait_for_operator; exit 70
+	fi
 	if [[ "$child_exit_class" == "memory-recycle" ]]; then
+		if ((transaction_enabled)); then
+			# Serialize mutable lifecycle intent: after the daemon is reaped it
+			# cannot accept a stale-generation manifest during an RSS handoff.
+			stop_child "backend deployment listener" "$deployment_pid" 5000
+			wait "${deployment_pid:-0}" 2>/dev/null || true
+			deployment_pid=""
+			if [[ -f "$TRANSACTION_DIR/intent.json" && "$(deployment_field phase)" == "prepared" ]]; then
+				if [[ "$(deployment_field manifest.expectedGeneration)" == "$upstream_generation" ]] && begin_backend_deployment; then
+					log "prepared deployment superseded RSS recycle after listener retirement"
+					continue
+				fi
+				log "RSS recycle held by incompatible prepared transaction"; wait_for_operator; exit 70
+			fi
+		fi
 		now_ms="$(epoch_ms)"
 		if ((rss_recycle_window_started_ms == 0 || now_ms - rss_recycle_window_started_ms >= RUNNER_RSS_RECYCLE_WINDOW_MS)); then
 			rss_recycle_window_started_ms=$now_ms; rss_recycle_count=0

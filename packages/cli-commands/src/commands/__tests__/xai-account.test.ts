@@ -45,8 +45,8 @@ describe("CLI xAI account import", () => {
 		dbOps = DatabaseFactory.getInstance();
 	});
 
-	afterEach(() => {
-		DatabaseFactory.reset();
+	afterEach(async () => {
+		await DatabaseFactory.reset();
 		if (previousGrokAuthPath === undefined) {
 			delete process.env.BETTER_CCFLARE_GROK_AUTH_PATH;
 		} else {

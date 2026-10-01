@@ -15,7 +15,11 @@ import {
 } from "@better-ccflare/openai-formats";
 import type { Account } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
-import type { RateLimitInfo, TokenRefreshResult } from "../../types";
+import type {
+	ProviderPathCapability,
+	RateLimitInfo,
+	TokenRefreshResult,
+} from "../../types";
 import {
 	applySkillElision,
 	resolveSkillElisionBlockedSkills,
@@ -33,6 +37,21 @@ export class OpenAICompatibleProvider extends BaseProvider {
 
 	canHandle(_path: string): boolean {
 		return true;
+	}
+
+	getPathCapability(path: string): ProviderPathCapability {
+		// Compatible endpoint configuration is not proof of a structured count API.
+		return {
+			operation:
+				path === "/v1/messages/count_tokens"
+					? "count_tokens"
+					: path === "/v1/messages" ||
+							path === "/v1/chat/completions" ||
+							path === "/v1/responses"
+						? "generation"
+						: "other",
+			support: "unknown",
+		};
 	}
 
 	async refreshToken(

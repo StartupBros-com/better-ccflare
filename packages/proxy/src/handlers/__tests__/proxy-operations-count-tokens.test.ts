@@ -2205,3 +2205,142 @@ describe("bounded model-route profile admission", () => {
 		});
 	});
 });
+
+describe("proxyWithAccount — xAI unsupported count helper", () => {
+	let originalFetch: typeof globalThis.fetch;
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+	});
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+	it.each([
+		false,
+		true,
+	])("rejects locally before credentials and dispatch (expired=%s)", async (expired) => {
+		const provider = getProvider("xai");
+		if (!provider) throw new Error("xAI provider missing");
+		const refresh = spyOn(provider, "refreshToken").mockResolvedValue({
+			accessToken: "mock-refreshed",
+			expiresAt: Date.now() + 60_000,
+		});
+		const fetchedPaths: string[] = [];
+		const fetchMock = mock(async (input: RequestInfo | URL) => {
+			fetchedPaths.push(
+				new URL(input instanceof Request ? input.url : String(input)).pathname,
+			);
+			return new Response(
+				JSON.stringify({ error: { message: "unsupported path" } }),
+				{ status: 404 },
+			);
+		});
+		globalThis.fetch = fetchMock;
+		const ctx = makeProxyContext(provider);
+		const collector = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(async () => {}),
+		} as never);
+		const body = new TextEncoder().encode(
+			JSON.stringify({
+				model: "grok-4.7",
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		).buffer;
+		try {
+			const result = await proxyWithAccount(
+				makeCountTokensRequest(body),
+				new URL("https://proxy.local/v1/messages/count_tokens"),
+				makeCodexAccount({
+					provider: "xai",
+					id: "xai-count",
+					access_token: expired ? null : "mock-token",
+					expires_at: expired ? null : Date.now() + 60 * 60_000,
+				}),
+				makeRequestMeta(),
+				body,
+				() => undefined,
+				0,
+				ctx,
+			);
+			expect(fetchedPaths).toEqual([]);
+			expect(refresh).toHaveBeenCalledTimes(0);
+			expect(result).toBeInstanceOf(Response);
+			if (!(result instanceof Response))
+				throw new Error("Expected local unsupported response");
+			expect(result.status).toBe(501);
+			expect(await result.json()).toMatchObject({
+				type: "error",
+				error: {
+					type: "not_implemented_error",
+					code: "count_tokens_unsupported",
+					provider: "xai",
+				},
+			});
+			expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(0);
+			expect(ctx.dbOps.updateAccountUsage).toHaveBeenCalledTimes(0);
+			expect(ctx.asyncWriter.enqueue).toHaveBeenCalledTimes(0);
+		} finally {
+			refresh.mockRestore();
+			collector.mockRestore();
+		}
+	});
+});
+
+describe("legacy compatible count path", () => {
+	it("keeps unknown compatible endpoints distinct while preserving existing passthrough", async () => {
+		const originalFetch = globalThis.fetch;
+		const provider = getProvider("openai-compatible");
+		if (!provider) throw new Error("Compatible provider missing");
+		const collector = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(async () => {}),
+		} as never);
+		const paths: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			paths.push(
+				new URL(input instanceof Request ? input.url : String(input)).pathname,
+			);
+			return Response.json({ input_tokens: 3 });
+		});
+		const body = new TextEncoder().encode(
+			JSON.stringify({
+				model: "test-model",
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		).buffer;
+		try {
+			const result = await proxyWithAccount(
+				makeCountTokensRequest(body),
+				new URL("https://proxy.local/v1/messages/count_tokens"),
+				makeCodexAccount({
+					provider: "openai-compatible",
+					id: "legacy-compatible",
+					api_key: "mock-key",
+					refresh_token: "",
+					custom_endpoint: "https://compatible.invalid/v1",
+				}),
+				makeRequestMeta(),
+				body,
+				() => undefined,
+				0,
+				makeProxyContext(provider),
+			);
+			expect(paths).toEqual(["/v1/messages/count_tokens"]);
+			expect(result).toBeInstanceOf(Response);
+			if (!(result instanceof Response))
+				throw new Error("Expected legacy response");
+			expect(result.status).toBe(200);
+		} finally {
+			globalThis.fetch = originalFetch;
+			collector.mockRestore();
+		}
+	});
+});
