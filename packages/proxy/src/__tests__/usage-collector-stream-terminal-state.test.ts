@@ -189,6 +189,55 @@ describe("UsageCollector - stream terminal state in the live summary", () => {
 		expect(JSON.parse(row.routing_attempt_summary).winnerOrdinal).toBeNull();
 	});
 
+	test("late downstream cancellation cannot erase a semantic cause or claim human intent", async () => {
+		const requestId = "u2-late-downstream-cancel";
+		collector.handleStart(makeStart(requestId));
+		await collector.handleEnd({
+			type: "end",
+			requestId,
+			success: false,
+			error: "downstream_cancelled",
+			streamTerminalState: "client_cancelled",
+			routingAttemptSummary: {
+				version: 1,
+				physicalAttemptCount: 1,
+				routeCount: 1,
+				attempts: [
+					{
+						ordinal: 1,
+						accountId: "test-account",
+						provider: "codex",
+						logicalModel: "logical",
+						physicalModel: "physical",
+						outcome: "failed",
+						cause: "meaningful_progress_timeout",
+						startedAt: 1000,
+						outcomeObservedAt: 841000,
+						nativeStatus: 200,
+						protocolFrames: 9,
+						meaningfulProgress: "absent",
+						terminalEvidenceSeen: false,
+					},
+				],
+				truncated: false,
+				completeness: "complete",
+				outputOriginOrdinal: 1,
+				winnerOrdinal: null,
+				nativeStatus: 503,
+				wireStatus: 200,
+				terminalCause: "meaningful_progress_timeout",
+				cancellationOrigin: "semantic_deadline",
+			},
+		});
+		const summary = summaries.get(requestId);
+		expect(summary?.routingAttemptSummary).toMatchObject({
+			terminalCause: "meaningful_progress_timeout",
+			cancellationOrigin: "semantic_deadline",
+			attempts: [{ cause: "meaningful_progress_timeout" }],
+		});
+		await collector.drain();
+	});
+
 	test("a client-cancelled stream reaches the live summary", async () => {
 		const summary = await runRequestAndGetSummary(
 			"terminal-state-cancelled",

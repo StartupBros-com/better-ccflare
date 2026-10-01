@@ -75,7 +75,7 @@ describe("RoutingAttemptLedger", () => {
 		).toMatchObject({
 			outputOriginOrdinal: 1,
 			winnerOrdinal: null,
-			cancellationOrigin: "client",
+			cancellationOrigin: "unknown",
 		});
 	});
 
@@ -179,6 +179,66 @@ describe("RoutingAttemptLedger", () => {
 				expect(write?.completeness).toBe("partial");
 			}
 		}
+	});
+
+	it("round-trips all maximal new diagnostics within the summary cap without erasing cause", () => {
+		const ledger = new RoutingAttemptLedger();
+		const identity = "m".repeat(128);
+		for (let ordinal = 1; ordinal <= 16; ordinal++) {
+			ledger.recordPhysicalAttempt({
+				accountId: identity,
+				provider: identity,
+				logicalModel: identity,
+				physicalModel: identity,
+			});
+			ledger.observePhysicalStream({
+				rawEventCounts: Object.fromEntries(
+					[
+						"created",
+						"in_progress",
+						"function_call_added",
+						"function_call_done",
+						"encrypted_reasoning_done",
+						"visible_summary_delta",
+						"output_text_delta",
+						"argument_delta",
+						"completed",
+						"incomplete",
+						"failed",
+						"error",
+						"other",
+					].map((k) => [k, Number.MAX_SAFE_INTEGER]),
+				),
+				rawVisibleEvents: Number.MAX_SAFE_INTEGER,
+				meaningfulFrames: Number.MAX_SAFE_INTEGER,
+				protocolFrames: Number.MAX_SAFE_INTEGER,
+				providerTerminal: "resource_limit",
+				gateOutcome: "buffer_limit",
+				remainingCommitmentMs: Number.MAX_SAFE_INTEGER,
+				cancellationOrigin: "semantic_deadline",
+				diagnosis: "translation_or_gating_candidate",
+			});
+			ledger.recordPhysicalOutcome("buffer_limit");
+		}
+		const summary = ledger.terminalSummary({
+			success: false,
+			error: "route_unavailable",
+			nativeStatus: 503,
+			wireStatus: 200,
+		});
+		const encoded = JSON.stringify(summary);
+		expect(encoded.length).toBeLessThanOrEqual(16384);
+		expect(Buffer.byteLength(encoded)).toBeLessThanOrEqual(16384);
+		expect(sanitizeRequestRoutingAttemptSummary(encoded)).toEqual(summary);
+		expect(summary?.attempts).toHaveLength(16);
+		expect(
+			summary?.attempts.every(
+				(a) => a.accountId === identity && a.cause === "buffer_limit",
+			),
+		).toBe(true);
+		expect(summary?.terminalCause).toBe("buffer_limit");
+		expect(summary?.completeness).toBe("partial");
+		expect(summary?.truncated).toBe(true);
 	});
 
 	it("claims hosted dispatch exactly once and exposes its monotonic state", () => {

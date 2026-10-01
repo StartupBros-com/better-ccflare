@@ -7477,6 +7477,8 @@ export async function proxyWithAccount(
 				const gatedBody = await gateAnthropicSsePreCommit(
 					downstreamAnthropicResponseBody,
 					{
+						observe: (evidence) =>
+							routingAttemptLedger?.observePhysicalStream(evidence),
 						semanticTimeoutMs: streamConfig.semanticTimeoutMs,
 						disableProtocolIdleTimeout: hasIrreversibleCodexWebSocketWrite,
 						meaningfulProgressTimeoutMs:

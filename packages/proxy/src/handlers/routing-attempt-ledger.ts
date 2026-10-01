@@ -2,7 +2,9 @@ import {
 	MAX_ROUTING_ATTEMPT_SNAPSHOTS,
 	type RequestRoutingAttemptSummary,
 	type RoutingPhysicalAttempt,
+	type RoutingStreamEvidence,
 	sanitizeRequestRoutingAttemptSummary,
+	sanitizeRoutingStreamEvidence,
 	toRoutingAttemptCause,
 } from "@better-ccflare/types/request";
 import type {
@@ -206,7 +208,22 @@ export class RoutingAttemptLedger {
 			...previous,
 			outcome,
 			outcomeObservedAt: Date.now(),
-			cause: outcome === "succeeded" ? null : toRoutingAttemptCause(cause),
+			cause:
+				outcome === "succeeded"
+					? null
+					: previous.streamEvidence?.providerTerminal === "resource_limit"
+						? "buffer_limit"
+						: previous.streamEvidence?.providerTerminal === "cancelled"
+							? "provider_cancelled"
+							: previous.streamEvidence?.cancellationOrigin === "maintenance"
+								? "maintenance_retired"
+								: previous.streamEvidence?.cancellationOrigin ===
+										"accepted_deadline"
+									? toRoutingAttemptCause("accepted_request_deadline")
+									: previous.streamEvidence?.cancellationOrigin ===
+											"downstream_abort"
+										? "client_cancelled"
+										: toRoutingAttemptCause(cause),
 			protocolFrames:
 				evidence?.validProtocolFramesSeen ?? previous.protocolFrames,
 			terminalEvidenceSeen:
@@ -216,6 +233,36 @@ export class RoutingAttemptLedger {
 					? "absent"
 					: previous.meaningfulProgress,
 		});
+		if (index >= 0) this.observations[index] = this.latestObservation;
+	}
+
+	/** Observational snapshot only, frozen before cancellation or later rescue. */
+	observePhysicalStream(evidence: RoutingStreamEvidence): void {
+		const previous = this.latestObservation;
+		if (!previous || previous.outcome !== "pending") return;
+		const sanitized = sanitizeRoutingStreamEvidence(evidence);
+		const streamEvidence = sanitized
+			? Object.freeze({
+					...sanitized,
+					rawEventCounts: sanitized.rawEventCounts
+						? Object.freeze({ ...sanitized.rawEventCounts })
+						: null,
+				})
+			: null;
+		this.latestObservation = Object.freeze({
+			...previous,
+			streamEvidence,
+			protocolFrames: streamEvidence?.protocolFrames ?? previous.protocolFrames,
+			meaningfulProgress:
+				streamEvidence?.meaningfulFrames == null
+					? "unknown"
+					: streamEvidence.meaningfulFrames > 0
+						? "observed"
+						: "absent",
+		});
+		const index = this.observations.findIndex(
+			(a) => a.ordinal === previous.ordinal,
+		);
 		if (index >= 0) this.observations[index] = this.latestObservation;
 	}
 
@@ -248,7 +295,10 @@ export class RoutingAttemptLedger {
 	}): RequestRoutingAttemptSummary | null {
 		const last = this.latestObservation;
 		const selectedCause =
-			input.error === "route_unavailable" && last?.cause
+			(input.error === "route_unavailable" ||
+				input.error === "client_cancelled" ||
+				input.error === "downstream_cancelled") &&
+			last?.cause
 				? last.cause
 				: toRoutingAttemptCause(input.error);
 		if (last?.outcome === "pending")
@@ -276,8 +326,14 @@ export class RoutingAttemptLedger {
 			winnerOrdinal: input.success ? this.outputOriginOrdinal : null,
 			nativeStatus: input.nativeStatus,
 			wireStatus: input.wireStatus,
-			terminalCause: input.success ? null : selectedCause,
-			cancellationOrigin: input.error === "client_cancelled" ? "client" : null,
+			terminalCause: input.success
+				? null
+				: (this.latestObservation?.cause ?? selectedCause),
+			cancellationOrigin:
+				last?.streamEvidence?.cancellationOrigin === "downstream_abort"
+					? "downstream"
+					: (last?.streamEvidence?.cancellationOrigin ??
+						(input.error === "client_cancelled" ? "unknown" : null)),
 		});
 	}
 	private degradedTracker: DegradedModeRequestTracker | null = null;

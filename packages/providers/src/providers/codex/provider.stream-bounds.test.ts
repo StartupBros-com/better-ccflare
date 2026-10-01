@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gateAnthropicSsePreCommit } from "../../../../proxy/src/anthropic-semantic-preflight";
+import { readStreamEvidence } from "../../utils/stream-evidence";
 import { CodexProvider } from "./provider";
 import {
 	CODEX_TRACE_DIR_ENV,
@@ -467,5 +469,41 @@ describe("Codex stream retention bounds", () => {
 		const terminal = records().filter((r) => r.phase === "response");
 		expect(terminal).toHaveLength(1);
 		expect(terminal[0].error_type).toBe("sse_limit_exceeded");
+	});
+});
+
+describe("Codex raw-to-transformed observation", () => {
+	it("joins a visible raw argument with zero meaningful transformed frames without diagnosing cause", async () => {
+		const provider = new CodexProvider();
+		const raw = frame("response.function_call_arguments.delta", {
+			output_index: 99,
+			delta: "private-argument",
+		});
+		const response = await provider.processResponse(
+			new Response(enc.encode(raw + completed), {
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const transformedBody = response.body;
+		if (!transformedBody) throw new Error("Expected transformed stream");
+		let observed: unknown;
+		const body = await gateAnthropicSsePreCommit(transformedBody, {
+			observe: (e) => {
+				observed = e;
+			},
+		});
+		await new Response(body).text();
+		expect(observed).toMatchObject({
+			rawVisibleEvents: 1,
+			meaningfulFrames: 0,
+			rawEventCounts: { argument_delta: 1, completed: 1 },
+			providerTerminal: "completed",
+			diagnosis: "translation_or_gating_candidate",
+		});
+		expect(readStreamEvidence(transformedBody)).toMatchObject({
+			providerTerminal: "completed",
+		});
+		expect(JSON.stringify(observed)).not.toContain("private-argument");
 	});
 });

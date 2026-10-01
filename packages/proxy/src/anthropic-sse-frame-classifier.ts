@@ -143,6 +143,9 @@ function classifyContentDelta(
 				parsed.delta.partial_json.length > 0
 				? "meaningful"
 				: "structural";
+		case "encrypted_content_delta":
+		case "encrypted_reasoning_delta":
+		case "redacted_thinking_delta":
 		case "signature_delta":
 			// Anthropic emits this integrity signature immediately before the
 			// thinking block stops. With `display=omitted`, Opus can emit an empty
@@ -156,6 +159,9 @@ function classifyContentDelta(
 			const hasContent = Object.entries(parsed.delta).some(
 				([key, value]) =>
 					key !== "type" &&
+					key !== "signature" &&
+					key !== "encrypted_content" &&
+					key !== "encrypted_reasoning" &&
 					value !== null &&
 					value !== undefined &&
 					(typeof value !== "string" || value.length > 0),

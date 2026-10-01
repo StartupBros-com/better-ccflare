@@ -1236,18 +1236,18 @@ export class UsageCollector {
 				msg.streamTerminalState === "truncated")
 		) {
 			const cancelled = msg.streamTerminalState === "client_cancelled";
-			const cause = cancelled
-				? "client_cancelled"
-				: (observedSummary.terminalCause ?? "unknown");
+			const cause =
+				observedSummary.terminalCause ??
+				(cancelled ? "client_cancelled" : "unknown");
 			msg = {
 				...msg,
 				routingAttemptSummary: {
 					...observedSummary,
 					winnerOrdinal: null,
 					terminalCause: cause,
-					cancellationOrigin: cancelled
-						? "client"
-						: observedSummary.cancellationOrigin,
+					cancellationOrigin:
+						observedSummary.cancellationOrigin ??
+						(cancelled ? "downstream" : null),
 					attempts: observedSummary.attempts.map((a) =>
 						a.ordinal === observedSummary.winnerOrdinal
 							? { ...a, outcome: cancelled ? "cancelled" : "failed", cause }

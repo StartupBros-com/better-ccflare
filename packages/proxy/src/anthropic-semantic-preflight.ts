@@ -3,6 +3,11 @@ import {
 	SseFrameBuffer,
 	SseLimitError,
 } from "@better-ccflare/core";
+import { readStreamEvidence } from "@better-ccflare/providers/stream-evidence";
+import {
+	type RoutingStreamEvidence,
+	sanitizeRoutingStreamEvidence,
+} from "@better-ccflare/types/request";
 import {
 	ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV,
 	ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
@@ -333,6 +338,8 @@ export class AnthropicPreCommitAbortedError extends Error {
 }
 
 export interface AnthropicSemanticPreflightOptions {
+	/** Content-free snapshot published once before transport cleanup. */
+	observe?: (evidence: RoutingStreamEvidence) => void;
 	/** Maximum idle time between valid complete protocol events before content. */
 	semanticTimeoutMs?: number;
 	/**
@@ -534,6 +541,45 @@ export async function gateAnthropicSsePreCommit(
 	let terminalDeadline: number | undefined;
 	let cancelPromise: Promise<void> | null = null;
 
+	let observationPublished = false;
+	const observe = (gateOutcome: RoutingStreamEvidence["gateOutcome"]): void => {
+		if (observationPublished) return;
+		observationPublished = true;
+		const raw = readStreamEvidence(upstream);
+		const reason = options.signal?.reason as { code?: unknown } | undefined;
+		const cancellationOrigin: RoutingStreamEvidence["cancellationOrigin"] =
+			gateOutcome === "aborted"
+				? reason?.code === "ACCEPTED_REQUEST_DEADLINE" ||
+					reason?.code === "GUARD_ACCEPTED_DEADLINE"
+					? "accepted_deadline"
+					: reason?.code === "GUARD_RECYCLE_UNAVAILABLE"
+						? "maintenance"
+						: "downstream_abort"
+				: raw?.providerTerminal === "cancelled"
+					? "provider"
+					: gateOutcome === "meaningful_progress_timeout" ||
+							gateOutcome === "semantic_timeout" ||
+							gateOutcome === "terminal_grace_timeout"
+						? "semantic_deadline"
+						: null;
+		const evidence = sanitizeRoutingStreamEvidence({
+			...raw,
+			meaningfulFrames: frameKindCounts.meaningful,
+			protocolFrames: validProtocolFramesSeen,
+			gateOutcome,
+			remainingCommitmentMs: Math.max(
+				0,
+				meaningfulProgressDeadline - Date.now(),
+			),
+			cancellationOrigin,
+		});
+		try {
+			if (evidence) options.observe?.(evidence);
+		} catch {
+			/* Observation never changes recovery policy. */
+		}
+	};
+
 	const metadata = (
 		reason: AnthropicPreCommitStallReason,
 		limitBytes?: number,
@@ -580,6 +626,7 @@ export async function gateAnthropicSsePreCommit(
 		const error = new AnthropicPreCommitStallError(
 			metadata(reason, limitBytes, undefined, contextOverflowAuthoritative),
 		);
+		observe(reason);
 		cancelBestEffort(error);
 		throw error;
 	};
@@ -593,6 +640,7 @@ export async function gateAnthropicSsePreCommit(
 			lastValidProtocolActivityAgeMs: boundedAgeMs(lastValidProtocolActivityAt),
 			terminalEvidenceSeen,
 		});
+		observe("aborted");
 		cancelBestEffort(error);
 		throw error;
 	};
@@ -619,6 +667,7 @@ export async function gateAnthropicSsePreCommit(
 			},
 			errorType,
 		);
+		observe("transient_sse_error");
 		cancelBestEffort(error);
 		throw error;
 	};
@@ -737,6 +786,7 @@ export async function gateAnthropicSsePreCommit(
 		}
 
 		if (frames.some(applyFrameDecision)) {
+			observe("committed");
 			return createReleasedStream(reader, bufferedChunks);
 		}
 	}
