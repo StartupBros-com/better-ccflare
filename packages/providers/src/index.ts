@@ -24,7 +24,11 @@ export {
 	createProviderForService,
 	PresetProviders,
 } from "./providers/anthropic-compatible/factory";
-export { extractChatGptAccountId } from "./providers/codex/api-usage";
+export {
+	type CodexSubscriptionFacts,
+	extractChatGptAccountId,
+	getCodexSubscriptionFacts,
+} from "./providers/codex/api-usage";
 // Export providers
 export * from "./providers/index";
 // Export registry functions

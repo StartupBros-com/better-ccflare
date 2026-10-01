@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Logger } from "@better-ccflare/logger";
 import type {
 	UsageData,
@@ -48,6 +49,8 @@ interface WhamUsageWindow {
 }
 
 interface WhamUsageRateLimit {
+	allowed?: boolean | null;
+	limit_reached?: boolean | null;
 	primary_window?: WhamUsageWindow | null;
 	secondary_window?: WhamUsageWindow | null;
 }
@@ -56,7 +59,154 @@ interface WhamUsageResponse {
 	plan_type?: string | null;
 	rate_limit?: WhamUsageRateLimit | null;
 	code_review_rate_limit?: WhamUsageRateLimit | null;
-	credits?: { balance?: number | string | null } | null;
+	credits?: {
+		balance?: number | string | null;
+		has_credits?: boolean | null;
+		unlimited?: boolean | null;
+	} | null;
+	additional_rate_limits?: unknown;
+}
+
+type CodexFact<T> = T | null | undefined | "invalid";
+export type CodexQuotaWindow =
+	| { readonly presence: "missing" | "null" | "malformed" }
+	| {
+			readonly presence: "window";
+			readonly utilization: CodexFact<number>;
+			readonly resetsAt: CodexFact<number>;
+	  };
+
+/** Separate from legacy display/history mirrors. No ownership or credential material. */
+export interface CodexSubscriptionFacts {
+	readonly allowed: CodexFact<boolean>;
+	readonly limitReached: CodexFact<boolean>;
+	readonly hasCredits: CodexFact<boolean>;
+	readonly unlimited: CodexFact<boolean>;
+	readonly balance: CodexFact<number>;
+	readonly primary: CodexQuotaWindow;
+	readonly secondary: CodexQuotaWindow;
+	readonly additionalLimitsUnknown: boolean;
+	readonly omittedLegacyWindows: readonly string[];
+}
+interface CodexObservation {
+	readonly accountId: string;
+	readonly facts: CodexSubscriptionFacts;
+	readonly fingerprint: string;
+	readonly acquiredAt: number;
+}
+const decodedFacts = new WeakMap<object, CodexSubscriptionFacts>();
+const acquisitions = new WeakMap<object, CodexObservation>();
+const ownedObservations = new WeakMap<
+	object,
+	CodexObservation & {
+		readonly isCurrent: () => boolean;
+	}
+>();
+function flag(value: unknown): CodexFact<boolean> {
+	return value === null || value === undefined || typeof value === "boolean"
+		? value
+		: "invalid";
+}
+function numberFact(value: unknown): CodexFact<number> {
+	return value === null || value === undefined
+		? value
+		: typeof value === "number" && Number.isFinite(value)
+			? value
+			: "invalid";
+}
+function quotaWindow(value: unknown): CodexQuotaWindow {
+	if (value === undefined) return Object.freeze({ presence: "missing" });
+	if (value === null) return Object.freeze({ presence: "null" });
+	if (typeof value !== "object" || Array.isArray(value))
+		return Object.freeze({ presence: "malformed" });
+	const window = value as Record<string, unknown>;
+	const reset = numberFact(window.reset_at);
+	return Object.freeze({
+		presence: "window",
+		utilization: numberFact(window.used_percent),
+		resetsAt:
+			typeof reset === "number"
+				? numberFact(new Date(reset * 1000).getTime())
+				: reset,
+	});
+}
+function subscriptionFacts(
+	body: WhamUsageResponse,
+	fiveHour: UsageWindow | null,
+	sevenDay: UsageWindow | null,
+): CodexSubscriptionFacts {
+	const rawBalance = body.credits?.balance;
+	const balance =
+		rawBalance === null || rawBalance === undefined
+			? rawBalance
+			: (coerceCreditsBalance(rawBalance) ?? "invalid");
+	return Object.freeze({
+		allowed: flag(body.rate_limit?.allowed),
+		limitReached: flag(body.rate_limit?.limit_reached),
+		hasCredits: flag(body.credits?.has_credits),
+		unlimited: flag(body.credits?.unlimited),
+		balance,
+		primary: quotaWindow(body.rate_limit?.primary_window),
+		secondary: quotaWindow(body.rate_limit?.secondary_window),
+		additionalLimitsUnknown:
+			body.additional_rate_limits !== undefined &&
+			!(
+				Array.isArray(body.additional_rate_limits) &&
+				body.additional_rate_limits.length === 0
+			),
+		omittedLegacyWindows: Object.freeze([
+			...(fiveHour ? [] : ["five_hour"]),
+			...(sevenDay ? [] : ["seven_day"]),
+		]),
+	});
+}
+
+/** Consume a real fetch exactly once into one cache-entry/registration lifetime.
+ * Ordinary set(), manual refresh, JSON copies and passive headers cannot mint this.
+ */
+export function bindCodexUsageObservation(
+	data: UsageData,
+	accountId: string,
+	isCurrent: () => boolean,
+): UsageData | null {
+	const observation = acquisitions.get(data);
+	if (!observation || observation.accountId !== accountId) return null;
+	acquisitions.delete(data);
+	const owned = structuredClone(data);
+	owned.codex_subscription = observation.facts;
+	for (const value of Object.values(owned))
+		if (value && typeof value === "object") Object.freeze(value);
+	Object.freeze(owned);
+	ownedObservations.set(owned, { ...observation, accountId, isCurrent });
+	return owned;
+}
+
+/** Validate private source ownership; the optional token is mandatory at dispatch. */
+export function getCodexSubscriptionFacts(
+	data: unknown,
+	accountId: string,
+	now: number,
+	maxAgeMs: number,
+	accessToken?: string | null,
+): CodexSubscriptionFacts | null {
+	if (!data || typeof data !== "object") return null;
+	const observation = ownedObservations.get(data);
+	if (
+		!observation ||
+		observation.accountId !== accountId ||
+		!observation.isCurrent() ||
+		!Number.isFinite(now) ||
+		!Number.isFinite(observation.acquiredAt) ||
+		observation.acquiredAt < 0 ||
+		observation.acquiredAt > now ||
+		now - observation.acquiredAt >= maxAgeMs ||
+		(accessToken !== undefined &&
+			(!accessToken ||
+				createHash("sha256").update(accessToken).digest("hex") !==
+					observation.fingerprint))
+	)
+		return null;
+	return observation.facts;
 }
 
 /**
@@ -104,6 +254,7 @@ function toUsageWindow(window: WhamUsageWindow): UsageWindow {
 	const resetsAt =
 		typeof window.reset_at === "number" &&
 		Number.isFinite(window.reset_at) &&
+		Number.isFinite(new Date(window.reset_at * 1000).getTime()) &&
 		window.reset_at > 0
 			? new Date(window.reset_at * 1000).toISOString()
 			: null;
@@ -199,6 +350,9 @@ export function mapWhamUsageResponse(
 		data.code_review_resets_at = codeReview.resets_at;
 	}
 
+	const facts = subscriptionFacts(body, fiveHour, sevenDay);
+	data.codex_subscription = facts;
+	decodedFacts.set(data, facts);
 	return data;
 }
 
@@ -237,11 +391,13 @@ async function requestWhamUsage(
 export async function fetchCodexUsageData(
 	accessToken: string,
 	externalSignal?: AbortSignal,
+	accountId?: string,
 ): Promise<UsageFetchResult> {
 	if (!accessToken || accessToken.trim() === "") {
 		return { data: null, retryAfterMs: null };
 	}
 
+	const acquiredAt = Date.now();
 	const chatgptAccountId = extractChatGptAccountId(accessToken);
 
 	// One deadline covers the request(s) AND body consumption: fetch resolves
@@ -317,7 +473,28 @@ export async function fetchCodexUsageData(
 			return { data: null, retryAfterMs: null };
 		}
 
-		return { data: mapWhamUsageResponse(body), retryAfterMs: null };
+		// Recognize windowless state only from actual rate-limit booleans, not
+		// an arbitrary JSON 200 or coerced flags. Explicit exhaustion must still
+		// replace earlier headroom; unrecognized metadata remains a fetch failure.
+		// Keep the legacy unscoped mapper/fetch contract (null with no windows).
+		const hasRateLimitState =
+			typeof body.rate_limit?.allowed === "boolean" ||
+			typeof body.rate_limit?.limit_reached === "boolean";
+		const data =
+			mapWhamUsageResponse(body) ??
+			(accountId && hasRateLimitState
+				? { codex_subscription: subscriptionFacts(body, null, null) }
+				: null);
+		const facts = data && decodedFacts.get(data);
+		if (data && facts && accountId && !controller.signal.aborted) {
+			acquisitions.set(data, {
+				accountId,
+				facts,
+				acquiredAt,
+				fingerprint: createHash("sha256").update(accessToken).digest("hex"),
+			});
+		}
+		return { data, retryAfterMs: null };
 	} catch (error) {
 		const errorMessage =
 			error instanceof Error

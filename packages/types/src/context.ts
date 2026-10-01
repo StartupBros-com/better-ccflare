@@ -156,6 +156,15 @@ export interface APIContext {
 				maxContextWindow: number | null;
 				/** Usable share of capacity, e.g. 95. */
 				effectiveContextPercent: number | null;
+				/** Listing facts only; shared listings are not account entitlement. */
+				capabilities?: {
+					readonly contextWindow: number | null;
+					readonly maxContextWindow: number | null;
+					readonly effectiveContextPercent: number | null;
+					readonly maxOutputTokens: number | null;
+					readonly inputModalities: readonly string[] | null;
+					readonly toolEvidence: Readonly<Record<string, unknown>>;
+				};
 				supersededBy: string | null;
 			}>;
 			fetchedAt: number;

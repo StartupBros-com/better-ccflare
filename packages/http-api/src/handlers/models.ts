@@ -16,6 +16,42 @@ import {
 } from "@better-ccflare/proxy";
 import type { APIContext } from "../types";
 
+type CodexListing = NonNullable<
+	Awaited<
+		ReturnType<
+			NonNullable<NonNullable<APIContext["modelCatalog"]>["codexModels"]>
+		>
+	>
+>;
+function publicCodexCapabilities(
+	capabilities: CodexListing["models"][number]["capabilities"],
+) {
+	if (!capabilities) return undefined;
+	const toolEvidence: Record<string, boolean | string | string[]> = {};
+	for (const key of [
+		"supports_search_tool",
+		"supports_image_detail_original",
+	]) {
+		if (typeof capabilities.toolEvidence[key] === "boolean")
+			toolEvidence[key] = capabilities.toolEvidence[key];
+	}
+	for (const key of ["tool_mode", "web_search_tool_type"]) {
+		if (typeof capabilities.toolEvidence[key] === "string")
+			toolEvidence[key] = capabilities.toolEvidence[key];
+	}
+	const tools = capabilities.toolEvidence.experimental_supported_tools;
+	if (Array.isArray(tools) && tools.every((tool) => typeof tool === "string"))
+		toolEvidence.experimental_supported_tools = tools;
+	return {
+		contextWindow: capabilities.contextWindow,
+		maxContextWindow: capabilities.maxContextWindow,
+		effectiveContextPercent: capabilities.effectiveContextPercent,
+		maxOutputTokens: capabilities.maxOutputTokens,
+		inputModalities: capabilities.inputModalities,
+		toolEvidence,
+	};
+}
+
 /**
  * Where a listed model id came from — the whole point of the endpoint.
  *
@@ -38,7 +74,9 @@ export type ModelListingSource =
 	 * tell an entitled model from one the plan does not reach — which is the
 	 * distinction that matters when the choice ends up in a request.
 	 */
-	| "account";
+	| "account"
+	/** Borrowed provider listing; never selected-account entitlement. */
+	| "shared";
 
 export interface ProviderModelEntry {
 	id: string;
@@ -115,7 +153,11 @@ export function createModelsHandler(context: APIContext) {
 					models: listing.models.map((model) => ({
 						id: model.id,
 						displayName: model.displayName,
-						source: "account" as const,
+						source:
+							listing.source === "shared"
+								? ("shared" as const)
+								: ("account" as const),
+						capabilities: publicCodexCapabilities(model.capabilities),
 						description: model.description,
 						contextWindow: model.contextWindow,
 						maxContextWindow: model.maxContextWindow,
