@@ -1111,8 +1111,12 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			async (input) => {
 				// The absolute contract expires after preparation without an idle/header
 				// timer firing. The transport callback itself must fence this write.
-				bindManagedRequest(req, createAcceptedTiming(0n), (error) =>
-					controller.abort(error),
+				// Expire relative to this host's boot-time clock. Acceptance at boot
+				// with the default cap is still live on a CI VM younger than 24 minutes.
+				bindManagedRequest(
+					req,
+					createAcceptedTiming(monotonicNowNs() - 2_000_000_000n, "1000"),
+					(error) => controller.abort(error),
 				);
 				registerManagedTerminal(req, (cause) => causes.push(cause));
 				if (lane === "http") return null;
