@@ -143,7 +143,9 @@ export type QualityAdmissionDecision = (
 			readonly envelopeBytes: number;
 			readonly inputEstimate: number;
 			readonly headroom: number;
+			/** Original caller reserve for estimated fit; not a wire-enforced Codex subscription cap. */
 			readonly requestedOutput: number;
+			/** Model ceiling metadata, not a per-request cap; null delegates acceptance/length to the provider. */
 			readonly outputLimit?:
 				| Readonly<{ kind: "provider-managed"; tokens: null }>
 				| Readonly<{ kind: "catalog"; tokens: number }>;

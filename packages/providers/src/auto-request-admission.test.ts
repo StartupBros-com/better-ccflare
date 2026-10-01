@@ -199,6 +199,71 @@ describe("documented native Models capabilities reach request admission", () => 
 });
 
 describe("Auto request suitability (fixtures are not activation proof)", () => {
+	it("reserves caller output, not the Codex catalog ceiling, with distinct limit diagnostics", async () => {
+		const original = { ...body, model: "gpt-6-astra" };
+		const transformed = await new CodexProvider().transformRequestBody(
+			new Request("https://chatgpt.com/backend-api/codex/responses", {
+				method: "POST",
+				body: JSON.stringify(original),
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const finalBody = await transformed.json();
+		expect(finalBody.max_output_tokens).toBeUndefined();
+		const envelopeBytes = new TextEncoder().encode(
+			JSON.stringify(finalBody),
+		).length;
+		const headroom = Math.ceil(envelopeBytes / 4) + 1024;
+		const exactFit = envelopeBytes + headroom + original.max_tokens;
+		const knownCeiling = original.max_tokens + 100;
+		for (const ceiling of [knownCeiling, undefined, null]) {
+			for (const contextWindow of [exactFit, exactFit - 1]) {
+				const catalog = createAutoCatalogEvidence({
+					accountId: "codex-fixture",
+					provider: "codex",
+					source: "live",
+					fetchedAt: Date.now(),
+					expiresAt: Date.now() + 60000,
+					models: [
+						{
+							id: original.model,
+							capabilities: normalizeAutoModelCapabilities("codex", {
+								context_window: contextWindow,
+								max_context_window: contextWindow,
+								input_modalities: ["text"],
+								...(ceiling === undefined
+									? {}
+									: { max_output_tokens: ceiling }),
+							}),
+						},
+					],
+				});
+				const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
+				if (!catalog || !target) throw new Error("missing Codex target");
+				expect(
+					evaluateAutoRequestAdmission({
+						catalog,
+						target,
+						finalBody,
+						requirements: captureAutoRequestRequirements(original),
+					}),
+				).toMatchObject({
+					...(contextWindow === exactFit
+						? { status: "admit" }
+						: { status: "reject", reason: "context-unsupported" }),
+					accounting: {
+						inputEstimate: envelopeBytes,
+						headroom,
+						requestedOutput: original.max_tokens,
+						outputLimit:
+							ceiling === knownCeiling
+								? { kind: "catalog", tokens: knownCeiling }
+								: { kind: "provider-managed", tokens: null },
+					},
+				});
+			}
+		}
+	});
 	it.each([
 		undefined,
 		null,
