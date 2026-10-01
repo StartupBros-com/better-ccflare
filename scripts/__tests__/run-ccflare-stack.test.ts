@@ -2,9 +2,11 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import {
 	chmodSync,
+	closeSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
@@ -54,7 +56,7 @@ function writeFixturePrograms(dir: string): {
 		upstream,
 		[
 			"#!/usr/bin/env node",
-			'import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";',
+			'import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";',
 			'import http from "node:http";',
 			'const portIndex = process.argv.indexOf("--port");',
 			"const port = Number(process.argv[portIndex + 1]);",
@@ -66,7 +68,17 @@ function writeFixturePrograms(dir: string): {
 			"const rssControl = `${process.env.CAPTURE_DIR}/rss-kib`;",
 			"const swapControl = `${process.env.CAPTURE_DIR}/swap-kib`;",
 			'const omitSwap = process.env.FAKE_PROC_OMIT_SWAP === "1";',
-			'const writeStatus = () => { if (!procEnabled) return; const rss = existsSync(rssControl) ? readFileSync(rssControl, "utf8").trim() : "1"; const swap = existsSync(swapControl) ? readFileSync(swapControl, "utf8").trim() : "0"; const swapLine = omitSwap ? "" : `VmSwap:\\t${swap} kB\\n`; writeFileSync(`${procDir}/status`, `Name:\\tfake\\nVmRSS:\\t${rss} kB\\n${swapLine}`); };',
+			"const writeStatus = () => {",
+			"  if (!procEnabled) return;",
+			// RSS must be read before swap: tests corrupt swap before raising RSS.
+			'  const rss = existsSync(rssControl) ? readFileSync(rssControl, "utf8").trim() : "1";',
+			'  const swap = existsSync(swapControl) ? readFileSync(swapControl, "utf8").trim() : "0";',
+			'  const swapLine = omitSwap ? "" : `VmSwap:\\t${swap} kB\\n`;',
+			// Publish a complete snapshot without truncating an active shell reader's
+			// inode, which could otherwise see RSS but miss the malformed swap line.
+			"  writeFileSync(`${procDir}/status.next`, `Name:\\tfake\\nVmRSS:\\t${rss} kB\\n${swapLine}`);",
+			"  renameSync(`${procDir}/status.next`, `${procDir}/status`);",
+			"};",
 			"writeStatus();",
 			"const rssTimer = procEnabled ? setInterval(writeStatus, 2) : undefined;",
 			'appendFileSync(`${process.env.CAPTURE_DIR}/upstream.json`, JSON.stringify({ pid: process.pid, secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, logLevel: process.env.LOG_LEVEL, argv: process.argv }) + "\\n");',
@@ -474,6 +486,41 @@ describe("run-ccflare-stack upstream environment", () => {
 });
 
 describe("run-ccflare-stack RSS containment behavior", () => {
+	test("publishes proc status snapshots without changing an open reader's sample", async () => {
+		const fixtureDir = tempDir("ccflare-stack-proc-snapshot-");
+		const runner = await spawnRunner(writeFixturePrograms(fixtureDir));
+		let statusFd: number | undefined;
+		try {
+			await waitForOutput(runner, "ccflare stack ready");
+			const record = JSON.parse(
+				readFileSync(join(runner.captureDir, "upstream.json"), "utf8").trim(),
+			);
+			statusFd = openSync(
+				join(runner.captureDir, "proc", String(record.pid), "status"),
+				"r",
+			);
+			// Hold the same open file description across a publication, as the
+			// shell's linewise reader does. No watchdog or timing race is needed.
+			setSwapRaw(runner, "abc");
+			setRssKiB(runner, 20);
+			const nextSample = "Name:\tfake\nVmRSS:\t20 kB\nVmSwap:\tabc kB\n";
+			const started = Date.now();
+			while (
+				readProcStatus(runner) !== nextSample &&
+				Date.now() - started < 5_000
+			) {
+				await Bun.sleep(10);
+			}
+			expect(readProcStatus(runner)).toBe(nextSample);
+			expect(readFileSync(statusFd, "utf8")).toBe(
+				"Name:\tfake\nVmRSS:\t1 kB\nVmSwap:\t0 kB\n",
+			);
+		} finally {
+			if (statusFd !== undefined) closeSync(statusFd);
+			await stopRunner(runner);
+		}
+	}, 10_000);
+
 	test("keeps the watchdog disabled when the tuple is omitted or threshold is zero", async () => {
 		const fixtureDir = tempDir("ccflare-stack-rss-disabled-");
 		const programs = writeFixturePrograms(fixtureDir);
