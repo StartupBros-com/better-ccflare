@@ -197,6 +197,35 @@ describe("manual Codex metadata refresh (fake transport)", () => {
 		});
 	});
 
+	it.each(
+		[
+			{},
+			{ error: "unavailable" },
+			[],
+			{ rate_limit: "bad" },
+			{ rate_limit: { allowed: "false", limit_reached: 1 } },
+		].map((body) => ({ body })),
+	)("returns the fallback signal without caching invalid JSON 200 payload %j", async ({
+		body,
+	}) => {
+		const calls: string[] = [];
+		globalThis.fetch = (async (url: string | URL | Request) => {
+			calls.push(String(url));
+			return Response.json(body);
+		}) as typeof fetch;
+		expect(
+			await refreshCodexUsageFromMetadata(
+				account,
+				"fake-token",
+				{ getAccount: async () => account },
+				{ run: async () => {} },
+			),
+		).toBeNull();
+		expect(usageCache.getSnapshot(account.id)).toBeNull();
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toContain("/usage");
+	});
+
 	it("returns the fallback signal only when metadata actually fails", async () => {
 		globalThis.fetch = (async () =>
 			new Response("unavailable", { status: 503 })) as typeof fetch;

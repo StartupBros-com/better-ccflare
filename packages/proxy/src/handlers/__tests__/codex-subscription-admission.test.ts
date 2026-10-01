@@ -286,7 +286,8 @@ describe("Codex subscription-only source evidence (fake metadata transport)", ()
 		expect(snapshots).toBe(1);
 	});
 	it("a successful metadata response with no windows revokes earlier headroom", async () => {
-		await poll(payload());
+		const earlier = await poll(payload());
+		expect(decision(earlier).status).toBe("admit");
 		globalThis.fetch = (async () =>
 			Response.json({
 				rate_limit: {
@@ -297,10 +298,15 @@ describe("Codex subscription-only source evidence (fake metadata transport)", ()
 				},
 				credits: payload().credits,
 			})) as typeof fetch;
-		await usageCache.refreshNow(accountId);
-		expect(decision(usageCache.getSnapshot(accountId)).status).not.toBe(
-			"admit",
-		);
+		expect(await usageCache.refreshNow(accountId)).toBe(true);
+		const exhausted = usageCache.getSnapshot(accountId);
+		expect(exhausted?.data).not.toBe(earlier.data);
+		expect(exhausted?.data.codex_subscription).toMatchObject({
+			allowed: false,
+			limitReached: true,
+		});
+		expect(decision(exhausted).status).not.toBe("admit");
+		expect(decision(earlier).status).not.toBe("admit");
 	});
 	it("an out-of-range reset must not retain a previous admissible observation", async () => {
 		await poll(payload());

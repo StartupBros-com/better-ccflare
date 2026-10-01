@@ -331,6 +331,53 @@ describe("fetchCodexUsageData", () => {
 		expect(result.retryAfterMs).toBeNull();
 	});
 
+	it.each(
+		[
+			{},
+			{ error: "unavailable" },
+			[],
+			{ rate_limit: "bad" },
+			{ rate_limit: [] },
+			{ rate_limit: null },
+			{ rate_limit: {} },
+			{ rate_limit: { allowed: "false", limit_reached: 1 } },
+			{ rate_limit: { allowed: null, limit_reached: null } },
+		].map((body) => ({ body })),
+	)("rejects unrecognized account-scoped JSON 200 payload %j", async ({
+		body,
+	}) => {
+		globalThis.fetch = mock(async () =>
+			Response.json(body),
+		) as unknown as typeof fetch;
+		expect(
+			await fetchCodexUsageData(ACCOUNT_TOKEN, undefined, "acct-123"),
+		).toEqual({ data: null, retryAfterMs: null });
+	});
+
+	it.each([
+		{ allowed: false },
+		{ limit_reached: true },
+		{ allowed: true, limit_reached: false },
+	])("retains recognized windowless state without inventing windows %j", async (rate_limit) => {
+		globalThis.fetch = mock(async () =>
+			Response.json({ rate_limit }),
+		) as unknown as typeof fetch;
+		const result = await fetchCodexUsageData(
+			ACCOUNT_TOKEN,
+			undefined,
+			"acct-123",
+		);
+		expect(result.data?.codex_subscription).toMatchObject({
+			allowed: rate_limit.allowed,
+			limitReached: rate_limit.limit_reached,
+			primary: { presence: "missing" },
+			secondary: { presence: "missing" },
+		});
+		expect(result.data?.five_hour).toBeUndefined();
+		expect(result.data?.seven_day).toBeUndefined();
+		expect((await fetchCodexUsageData(ACCOUNT_TOKEN)).data).toBeNull();
+	});
+
 	it("retries at the flipped path on a 404 and succeeds within the same call", async () => {
 		const calls: string[] = [];
 		const fetchMock = mock(async (input: RequestInfo | URL) => {

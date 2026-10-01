@@ -473,12 +473,16 @@ export async function fetchCodexUsageData(
 			return { data: null, retryAfterMs: null };
 		}
 
-		// Account-scoped consumers must observe a successful windowless response,
-		// too: retaining earlier headroom could hide a newly exhausted account.
+		// Recognize windowless state only from actual rate-limit booleans, not
+		// an arbitrary JSON 200 or coerced flags. Explicit exhaustion must still
+		// replace earlier headroom; unrecognized metadata remains a fetch failure.
 		// Keep the legacy unscoped mapper/fetch contract (null with no windows).
+		const hasRateLimitState =
+			typeof body.rate_limit?.allowed === "boolean" ||
+			typeof body.rate_limit?.limit_reached === "boolean";
 		const data =
 			mapWhamUsageResponse(body) ??
-			(accountId
+			(accountId && hasRateLimitState
 				? { codex_subscription: subscriptionFacts(body, null, null) }
 				: null);
 		const facts = data && decodedFacts.get(data);
