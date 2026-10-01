@@ -11,6 +11,7 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
@@ -3051,4 +3052,152 @@ test("artifact module pruning recognizes only exact legacy or managed module set
 	expect(bash(command + " ccflare-managed-timing.mjs").exitCode).toBe(0);
 	writeFileSync(join(dir, "unexpected"), "preserve");
 	expect(bash(command + " ccflare-managed-timing.mjs").exitCode).not.toBe(0);
+});
+
+describe("request_backend_handoff temporary command ownership", () => {
+	for (const privileged of [false, true]) {
+		const run =
+			privileged &&
+			(process.platform !== "linux" ||
+				process.env.CCFLARE_TEST_PRIVILEGED_HANDOFF !== "1")
+				? test.skip
+				: test;
+		run(
+			`${privileged ? "real sudo" : "sudo shim"} keeps the command private and removes it after success or failure`,
+			() => {
+				if (privileged) {
+					expect(process.getuid?.()).not.toBe(0);
+					expect(
+						Number(readFileSync("/proc/sys/fs/protected_regular", "utf8")),
+					).toBeGreaterThan(0);
+					expect(statSync("/tmp").mode & 0o1000).toBe(0o1000);
+				}
+				for (const failure of ["none", "client", "manifest"] as const) {
+					const dir = tempDir();
+					const binDir = join(dir, "bin");
+					mkdirSync(binDir);
+					const commandLog = join(dir, "command-path");
+					const sudoLog = join(dir, "sudo-calls");
+					const sudo = join(binDir, "sudo");
+					const execute = privileged ? "/usr/bin/sudo -n" : "";
+					writeFileSync(
+						sudo,
+						[
+							"#!/usr/bin/env bash",
+							"set -euo pipefail",
+							`printf '%s\\n' "$*" >>${shellQuote(shellPath(sudoLog))}`,
+							'case "$1" in',
+							"mktemp)",
+							`  command="$(${execute} "$@")"`,
+							`  printf '%s\\n' "$command" >${shellQuote(shellPath(commandLog))}`,
+							"  printf '%s\\n' \"$command\" ;;",
+							`node|rm) exec ${execute} "$@" ;;`,
+							"*) exit 99 ;;",
+							"esac",
+							"",
+						].join("\n"),
+					);
+					chmodSync(sudo, 0o755);
+					const mktemp = join(binDir, "mktemp");
+					writeFileSync(
+						mktemp,
+						[
+							"#!/usr/bin/env bash",
+							"set -euo pipefail",
+							'command="$(/usr/bin/mktemp "$@")"',
+							`printf '%s\\n' "$command" >${shellQuote(shellPath(commandLog))}`,
+							"printf '%s\\n' \"$command\"",
+							"",
+						].join("\n"),
+					);
+					chmodSync(mktemp, 0o755);
+					const binary = join(dir, "candidate");
+					const pin = join(dir, "candidate.conf");
+					writeFileSync(binary, "private candidate fixture\n");
+					writeFileSync(pin, "private pin fixture\n");
+					writeFileSync(
+						join(dir, "runtime.json"),
+						failure === "manifest"
+							? "invalid JSON"
+							: JSON.stringify({
+									generation: 7,
+									oldPid: 12345,
+									oldStartTime: "45678",
+									pinHash: "a".repeat(64),
+									ingress: { runner: "private fixture" },
+								}),
+					);
+					const client = join(dir, "client.cjs");
+					writeFileSync(
+						client,
+						[
+							'const fs = require("node:fs");',
+							'if (process.argv[2] !== "client") throw new Error("unexpected command");',
+							"const path = process.argv[4], stat = fs.statSync(path);",
+							"console.log(JSON.stringify({path, uid: stat.uid, mode: stat.mode & 0o777, clientUid: process.getuid(), command: JSON.parse(fs.readFileSync(path))}));",
+							`process.exit(${failure === "client" ? 23 : 0});`,
+						].join("\n"),
+					);
+					const source = "b".repeat(40);
+					const schema = "c".repeat(64);
+					const result = bash(
+						[
+							"set -euo pipefail",
+							"export TMPDIR=/tmp",
+							`export PATH=${shellQuote(shellPath(binDir))}:$PATH`,
+							`source ${shellQuote(helperScriptForShell)}`,
+							`request_backend_handoff ${[dir, client, binary, source, pin, schema].map((value) => shellQuote(shellPath(value))).join(" ")}`,
+						].join("\n"),
+					);
+					const command = readFileSync(commandLog, "utf8").trim();
+					try {
+						const calls = readFileSync(sudoLog, "utf8").trim().split("\n");
+						expect(calls[0]).toBe("mktemp");
+						expect(calls.at(-1)).toBe(`rm -f -- ${command}`);
+						expect(
+							existsSync(command),
+							capturedOutput(result.stderr, "stderr"),
+						).toBe(false);
+						expect(result.exitCode).toBe(
+							failure === "none" ? 0 : failure === "client" ? 23 : 1,
+						);
+						if (failure === "manifest") {
+							expect(capturedOutput(result.stdout, "stdout")).toBe("");
+							continue;
+						}
+						const evidence = JSON.parse(
+							capturedOutput(result.stdout, "stdout"),
+						);
+						expect(evidence.path).toBe(command);
+						expect(evidence.uid).toBe(privileged ? 0 : evidence.clientUid);
+						expect(evidence.mode).toBe(0o600);
+						expect(evidence.command.command).toBe("prepare");
+						expect(evidence.command.manifest).toMatchObject({
+							expectedGeneration: 7,
+							oldPid: 12345,
+							oldStartTime: "45678",
+							previousPinHash: "a".repeat(64),
+							candidatePinHash: createHash("sha256")
+								.update(readFileSync(pin))
+								.digest("hex"),
+							candidateHash: createHash("sha256")
+								.update(readFileSync(binary))
+								.digest("hex"),
+							candidateSourceSha: source,
+							schemaDigest: schema,
+						});
+					} finally {
+						// Clean up a failed regression run without relaxing /tmp protections.
+						if (privileged) {
+							expectCommandOk(
+								bash(`/usr/bin/sudo -n rm -f -- ${shellQuote(command)}`),
+							);
+						} else {
+							rmSync(command, { force: true });
+						}
+					}
+				}
+			},
+		);
+	}
 });
