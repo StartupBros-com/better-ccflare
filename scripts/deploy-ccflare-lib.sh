@@ -1578,13 +1578,15 @@ NODE
 }
 request_backend_handoff() {
  local dir="$1" module="$2" binary="$3" source="$4" rendered="$5" schema="$6" command
- command="$(mktemp)"
- sudo node - "$dir/runtime.json" "$binary" "$source" "$rendered" "$schema" "$command" <<'NODE'
+ local status=0
+ command="$(sudo mktemp)" || return $?
+ sudo node - "$dir/runtime.json" "$binary" "$source" "$rendered" "$schema" "$command" <<'NODE' || status=$?
 const fs=require("node:fs"),crypto=require("node:crypto");const [file,binary,source,pin,schema,out]=process.argv.slice(2),r=JSON.parse(fs.readFileSync(file)),hash=p=>crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");const manifest={transactionId:crypto.randomUUID(),expectedGeneration:r.generation,oldPid:r.oldPid,oldStartTime:r.oldStartTime,previousPinHash:r.pinHash,candidatePinHash:hash(pin),candidateBinary:fs.realpathSync(binary),candidateHash:hash(binary),candidateSourceSha:source,candidateNonce:crypto.randomBytes(16).toString("hex"),schemaDigest:schema,ingress:r.ingress};fs.writeFileSync(out,JSON.stringify({command:"prepare",manifest}),{mode:0o600});
 NODE
- local status=0
- sudo node "$module" client "$dir" "$command" || status=$?
- rm -f "$command";return "$status"
+ if ((status == 0)); then
+  sudo node "$module" client "$dir" "$command" || status=$?
+ fi
+ sudo rm -f -- "$command";return "$status"
 }
 await_backend_handoff_phase() {
  local dir="$1" expected="$2" budget="${3:-800}" elapsed=0 phase_status
