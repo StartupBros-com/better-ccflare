@@ -143,7 +143,12 @@ export type QualityAdmissionDecision = (
 			readonly envelopeBytes: number;
 			readonly inputEstimate: number;
 			readonly headroom: number;
+			/** Original caller reserve for estimated fit; not a wire-enforced Codex subscription cap. */
 			readonly requestedOutput: number;
+			/** Model ceiling metadata, not a per-request cap; null delegates acceptance/length to the provider. */
+			readonly outputLimit?:
+				| Readonly<{ kind: "provider-managed"; tokens: null }>
+				| Readonly<{ kind: "catalog"; tokens: number }>;
 		};
 	}>;
 
@@ -357,7 +362,7 @@ export function sanitizeQualityDecision(
 			] as const;
 			if (
 				!qualityObject(a) ||
-				!qualityKeys(a, ["source", "kind", ...numbers]) ||
+				!qualityKeys(a, ["source", "kind", "outputLimit", ...numbers]) ||
 				a.source !== "local-envelope-v1" ||
 				a.kind !== "estimate" ||
 				numbers.some(
@@ -369,6 +374,24 @@ export function sanitizeQualityDecision(
 				)
 			)
 				return null;
+			let outputLimit: NonNullable<
+				QualityDecisionRecord["accounting"]
+			>["outputLimit"];
+			if (a.outputLimit !== undefined) {
+				const limit = a.outputLimit;
+				if (!qualityObject(limit) || !qualityKeys(limit, ["kind", "tokens"]))
+					return null;
+				if (limit.kind === "provider-managed" && limit.tokens === null) {
+					outputLimit = { kind: "provider-managed", tokens: null };
+				} else if (
+					limit.kind === "catalog" &&
+					typeof limit.tokens === "number" &&
+					Number.isSafeInteger(limit.tokens) &&
+					limit.tokens > 0
+				) {
+					outputLimit = { kind: "catalog", tokens: limit.tokens };
+				} else return null;
+			}
 			accounting = {
 				source: "local-envelope-v1",
 				kind: "estimate",
@@ -376,6 +399,7 @@ export function sanitizeQualityDecision(
 				inputEstimate: Number(a.inputEstimate),
 				headroom: Number(a.headroom),
 				requestedOutput: Number(a.requestedOutput),
+				...(outputLimit ? { outputLimit } : {}),
 			};
 		}
 		return {

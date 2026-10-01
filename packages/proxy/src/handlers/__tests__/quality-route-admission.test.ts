@@ -102,7 +102,10 @@ it("admits through the real owner guard and blocks replacement/expiry during pre
 						id: "claude-fable-5-1",
 						max_input_tokens: 10000,
 						max_tokens: 20,
-						input_modalities: ["text"],
+						capabilities: {
+							image_input: { supported: false },
+							pdf_input: { supported: false },
+						},
 					},
 				],
 				has_more: false,
@@ -159,10 +162,46 @@ it("admits through the real owner guard and blocks replacement/expiry during pre
 		resetModelCatalogForTest();
 	}
 });
+const codexCeilingCases = [
+	{ name: "catalog ceiling 20", ceiling: 20, malformed: false },
+	{ name: "catalog ceiling 19", ceiling: 19, malformed: false },
+	{ name: "missing ceiling", ceiling: undefined, malformed: false },
+	{ name: "explicit null ceiling", ceiling: null, malformed: false },
+	{ name: "zero ceiling", ceiling: 0, malformed: true },
+	{ name: "negative ceiling", ceiling: -1, malformed: true },
+	{ name: "fractional ceiling", ceiling: 1.5, malformed: true },
+	{ name: "numeric string ceiling", ceiling: "20", malformed: true },
+	{
+		name: "unsafe integer ceiling",
+		ceiling: Number.MAX_SAFE_INTEGER + 1,
+		malformed: true,
+	},
+	{ name: "object ceiling", ceiling: { tokens: 20 }, malformed: true },
+];
+
 it.each([
-	true,
-	false,
-])("admits synthetic Codex through the composite (grant=%s), never inferring a missing ceiling", async (withGrant) => {
+	...codexCeilingCases.flatMap(({ name, ceiling, malformed }) =>
+		[true, false].map((withGrant) => ({
+			name: `${name}, grant=${withGrant}`,
+			ceiling,
+			malformed,
+			withGrant,
+			rotation: false,
+		})),
+	),
+	{
+		name: "usage token A versus catalog/dispatch token B",
+		ceiling: 20,
+		malformed: false,
+		withGrant: false,
+		rotation: true,
+	},
+])("synthetic Codex composite: $name", async ({
+	ceiling,
+	malformed,
+	withGrant,
+	rotation,
+}) => {
 	const savedFetch = globalThis.fetch;
 	const account = {
 		...fixture().account,
@@ -173,7 +212,6 @@ it.each([
 		expires_at: Date.now() + 3600000,
 		custom_endpoint: null,
 	} as Account;
-	let outputCeiling: number | undefined = 20;
 	globalThis.fetch = Object.assign(
 		async (url: string | URL | Request) =>
 			String(url).includes("/usage")
@@ -193,10 +231,10 @@ it.each([
 						models: [
 							{
 								slug: "gpt-6-astra",
-								context_window: 10000,
-								max_context_window: 10000,
-								max_output_tokens: outputCeiling,
-								input_modalities: ["text"],
+								context_window: 272000,
+								max_context_window: 872000,
+								max_output_tokens: ceiling,
+								input_modalities: ["text", "image"],
 							},
 						],
 					}),
@@ -210,6 +248,7 @@ it.each([
 		const original = {
 			model: "gpt-6-astra",
 			messages: [{ role: "user", content: "hello" }],
+			tools: [{ name: "Read", input_schema: { type: "object" } }],
 			max_tokens: 20,
 		};
 		const transformed = await new CodexProvider().transformRequestBody(
@@ -220,6 +259,7 @@ it.each([
 			}),
 		);
 		const finalBody = await transformed.json();
+		expect(finalBody.max_output_tokens).toBeUndefined();
 		await new Promise<void>((resolve) =>
 			usageCache.startPolling(
 				account.id,
@@ -234,100 +274,75 @@ it.each([
 		);
 		const snapshot = usageCache.getSnapshot(account.id);
 		if (!snapshot) throw new Error("poll did not publish a snapshot");
-		let rotationInput: QualityRouteAdmissionInput | undefined;
-		for (const ceiling of [20, 19, undefined]) {
-			outputCeiling = ceiling;
-			await getCodexModels(account.id, ctx);
-			const catalog = getCodexAutoCatalogEvidence(account.id);
-			const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
-			if (!catalog || !target)
-				throw new Error("missing source-owned synthetic catalog");
-			const input: QualityRouteAdmissionInput = {
-				...fixture(),
-				account,
-				selectedCredentials: { account, accessToken: "synthetic-token" },
-				policy: {
-					accounts: [
-						{
-							accountId: account.id,
-							provider: "codex",
-							lines: ["gpt-astra"],
-							priority: 0,
-						},
-					],
-					assignments: [
-						{
-							line: "gpt-astra",
-							lane: "astra",
-							priority: 0,
-							upgrade: "same-line-supported",
-						},
-					],
-					spendGrants: withGrant
-						? [
-								{
-									accountId: account.id,
-									line: "gpt-astra",
-									authorization: "operator-approved",
-									scope: "outside-subscription",
-								},
-							]
-						: [],
-				},
-				usage: withGrant
-					? { ...fixture().usage, provider: "codex" }
-					: { ...snapshot, accountId: account.id, provider: "codex" },
-				request: {
-					catalog,
-					target,
-					requirements: captureAutoRequestRequirements(original),
-					finalBody,
-				},
-			};
-			expect(evaluateQualityRouteAdmission(input)).toMatchObject(
-				ceiling === 20
-					? { status: "admit", accounting: { requestedOutput: 20 } }
-					: {
-							status: ceiling === undefined ? "unknown" : "reject",
-							reason: "output-unsupported",
-						},
-			);
-			if (!withGrant && ceiling === 20) {
-				rotationInput = input;
-				expect(
-					evaluateQualityRouteAdmission({
-						...input,
-						selectedCredentials: { account, accessToken: "rotated" },
-					}).status,
-				).not.toBe("admit");
-				expect(
-					evaluateQualityRouteAdmission({
-						...input,
-						request: {
-							...input.request,
-							requirements: captureAutoRequestRequirements({
-								...original,
-								max_tokens: 21,
-							}),
-						},
-					}).status,
-				).not.toBe("admit");
-			}
-		}
-		if (!withGrant) {
-			if (!rotationInput) throw new Error("missing admitted rotation baseline");
+		await getCodexModels(account.id, ctx);
+		const catalog = getCodexAutoCatalogEvidence(account.id);
+		const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
+		if (!catalog || !target)
+			throw new Error("missing source-owned synthetic catalog");
+		const input: QualityRouteAdmissionInput = {
+			...fixture(),
+			account,
+			selectedCredentials: { account, accessToken: "synthetic-token" },
+			policy: {
+				accounts: [
+					{
+						accountId: account.id,
+						provider: "codex",
+						lines: ["gpt-astra"],
+						priority: 0,
+					},
+				],
+				assignments: [
+					{
+						line: "gpt-astra",
+						lane: "astra",
+						priority: 0,
+						upgrade: "same-line-supported",
+					},
+				],
+				spendGrants: withGrant
+					? [
+							{
+								accountId: account.id,
+								line: "gpt-astra",
+								authorization: "operator-approved",
+								scope: "outside-subscription",
+							},
+						]
+					: [],
+			},
+			usage: withGrant
+				? { ...fixture().usage, provider: "codex" }
+				: { ...snapshot, accountId: account.id, provider: "codex" },
+			request: {
+				catalog,
+				target,
+				requirements: captureAutoRequestRequirements(original),
+				finalBody,
+			},
+		};
+		if (rotation) {
+			// Keep this baseline independent of the new output-limit accounting.
+			expect(evaluateQualityRouteAdmission(input).status).toBe("admit");
 			// Catalog and dispatch own token B, while usage still owns token A.
-			// Catalog rejection must not mask lost forwarding of the dispatch token.
+			// A matching fresh catalog must not mask lost dispatch-token forwarding.
 			account.access_token = "rotated";
-			outputCeiling = 20;
 			await getCodexModels(account.id, ctx);
-			const catalog = getCodexAutoCatalogEvidence(account.id);
-			const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
-			if (!catalog || !target) throw new Error("missing rotated catalog");
+			const rotatedCatalog = getCodexAutoCatalogEvidence(account.id);
+			const rotatedTarget = resolveAutoModelTargets(
+				rotatedCatalog,
+				"gpt-astra",
+			).current;
+			if (!rotatedCatalog || !rotatedTarget)
+				throw new Error("missing rotated catalog");
 			const rotated: QualityRouteAdmissionInput = {
-				...rotationInput,
+				...input,
 				selectedCredentials: { account, accessToken: "rotated" },
-				request: { ...rotationInput.request, catalog, target },
+				request: {
+					...input.request,
+					catalog: rotatedCatalog,
+					target: rotatedTarget,
+				},
 			};
 			expect(evaluateQualityRouteAdmission(rotated).status).not.toBe("admit");
 			expect(await usageCache.refreshNow(account.id)).toBe(true);
@@ -338,7 +353,124 @@ it.each([
 					...rotated,
 					usage: { ...refreshed, accountId: account.id, provider: "codex" },
 				}),
-			).toMatchObject({ status: "admit", accounting: { requestedOutput: 20 } });
+			).toMatchObject({
+				status: "admit",
+				accounting: { requestedOutput: 20 },
+			});
+			return;
+		}
+		if (malformed) {
+			expect(evaluateQualityRouteAdmission(input)).toMatchObject({
+				status: "unknown",
+				reason: "output-unsupported",
+			});
+			return;
+		}
+		expect(evaluateQualityRouteAdmission(input)).toMatchObject(
+			ceiling === 19
+				? { status: "reject", reason: "output-unsupported" }
+				: {
+						status: "admit",
+						accounting: {
+							requestedOutput: 20,
+							outputLimit:
+								ceiling == null
+									? { kind: "provider-managed", tokens: null }
+									: { kind: "catalog", tokens: 20 },
+						},
+					},
+		);
+		if (ceiling == null) {
+			expect(target.capabilities?.maxOutputTokens).toBeNull();
+			for (const max_tokens of [
+				undefined,
+				null,
+				0,
+				-1,
+				1.5,
+				"20",
+				Number.MAX_SAFE_INTEGER + 1,
+			]) {
+				expect(
+					evaluateQualityRouteAdmission({
+						...input,
+						request: {
+							...input.request,
+							requirements: captureAutoRequestRequirements({
+								...original,
+								max_tokens,
+							}),
+						},
+					}),
+				).toMatchObject({ status: "unknown", reason: "output-unsupported" });
+			}
+			const bytes = new TextEncoder().encode(JSON.stringify(finalBody)).length;
+			const inputBudget = bytes + Math.ceil(bytes / 4) + 1024;
+			for (const excess of [0, 1]) {
+				const max_tokens = 272000 - inputBudget + excess;
+				expect(
+					evaluateQualityRouteAdmission({
+						...input,
+						request: {
+							...input.request,
+							requirements: captureAutoRequestRequirements({
+								...original,
+								max_tokens,
+							}),
+						},
+					}),
+				).toMatchObject({
+					status: excess === 0 ? "admit" : "reject",
+					...(excess === 1 ? { reason: "context-unsupported" } : {}),
+					accounting: {
+						requestedOutput: max_tokens,
+						outputLimit: { kind: "provider-managed", tokens: null },
+					},
+				});
+			}
+			for (const changed of [
+				{ ...finalBody, input: [] },
+				{ ...finalBody, tools: [] },
+			]) {
+				expect(
+					evaluateQualityRouteAdmission({
+						...input,
+						request: { ...input.request, finalBody: changed },
+					}),
+				).toMatchObject({
+					status: "unknown",
+					reason: "request-preservation-unknown",
+				});
+			}
+			expect(
+				evaluateQualityRouteAdmission({
+					...input,
+					request: {
+						...input.request,
+						finalBody: { ...finalBody, max_output_tokens: 19 },
+					},
+				}),
+			).toMatchObject({ status: "reject", reason: "output-unsupported" });
+		}
+		if (!withGrant && ceiling === 20) {
+			expect(
+				evaluateQualityRouteAdmission({
+					...input,
+					selectedCredentials: { account, accessToken: "rotated" },
+				}).status,
+			).not.toBe("admit");
+			expect(
+				evaluateQualityRouteAdmission({
+					...input,
+					request: {
+						...input.request,
+						requirements: captureAutoRequestRequirements({
+							...original,
+							max_tokens: 21,
+						}),
+					},
+				}).status,
+			).not.toBe("admit");
 		}
 	} finally {
 		usageCache.stopPolling(account.id);

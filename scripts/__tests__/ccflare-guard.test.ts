@@ -77,25 +77,11 @@ afterEach(async () => {
 	);
 });
 
-async function allocatePort() {
-	const probe = http.createServer();
-	await new Promise<void>((resolve, reject) => {
-		probe.once("error", reject);
-		probe.listen(0, "127.0.0.1", () => resolve());
-	});
-	const address = probe.address();
-	if (!address || typeof address === "string")
-		throw new Error("missing address");
-	await new Promise<void>((resolve) => probe.close(() => resolve()));
-	return address.port;
-}
-
 async function startProductionNodeGuard(
 	upstreamBase: string,
 	extraEnv: Record<string, string> = {},
 	runtimePrelude = "",
 ) {
-	const listenPort = await allocatePort();
 	const guardPath = fileURLToPath(
 		new URL("../ccflare-guard.mjs", import.meta.url),
 	);
@@ -112,7 +98,7 @@ async function startProductionNodeGuard(
 			...process.env,
 			CCFLARE_UPSTREAM: upstreamBase,
 			GUARD_HOST: "127.0.0.1",
-			GUARD_PORT: String(listenPort),
+			GUARD_PORT: "0",
 			GUARD_MAX_ACTIVE: "1",
 			GUARD_MAX_QUEUE: "10",
 			GUARD_MAX_WAIT_MS: "2000",
@@ -153,7 +139,15 @@ async function startProductionNodeGuard(
 		throw new Error(`timed out waiting for ${event}: ${stderr}`);
 	}
 
-	await waitForEvent("guard_started");
+	const { listenPort } = await waitForEvent("guard_started");
+	if (
+		typeof listenPort !== "number" ||
+		!Number.isInteger(listenPort) ||
+		listenPort < 1 ||
+		listenPort > 65535
+	) {
+		throw new Error(`invalid guard_started listenPort: ${listenPort}`);
+	}
 	return {
 		baseUrl: `http://127.0.0.1:${listenPort}`,
 		child,
@@ -324,6 +318,38 @@ async function waitForHealth(
 }
 
 describe("source-controlled guard", () => {
+	test("binds the production guard without reserving and releasing its port", async () => {
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				res.writeHead(200, { "content-type": "text/plain" });
+				res.end("mock upstream reached");
+			}),
+		);
+		const { baseUrl, waitForEvent } = await startProductionNodeGuard(
+			upstreamBase,
+			{},
+			`const http = await import("node:http");
+		const competitor = http.createServer((_req, res) => res.end("competing listener"));
+		await new Promise((resolve, reject) => {
+			competitor.once("error", reject);
+			competitor.listen(Number(process.env.GUARD_PORT), "127.0.0.1", resolve);
+		});
+		console.log(JSON.stringify({event: "competitor_started", listenPort: competitor.address().port}));`,
+		);
+		const competitor = await waitForEvent("competitor_started");
+		expect(Number(new URL(baseUrl).port)).not.toBe(competitor.listenPort);
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("mock upstream reached");
+		const competingResponse = await fetch(
+			`http://127.0.0.1:${competitor.listenPort}`,
+		);
+		expect(await competingResponse.text()).toBe("competing listener");
+	});
+
 	test("enforces the request-wide recovery silence hard maximum at the exact boundary", () => {
 		expect(MAX_GUARD_RECOVERY_SILENCE_MS).toBe(120_000);
 		expect(() =>

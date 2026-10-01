@@ -35,7 +35,23 @@ const decision = {
 	},
 } as const;
 
-test("quality explanation survives repository, late save, and authenticated history mapping", async () => {
+test.each([
+	decision,
+	{
+		...decision,
+		accounting: {
+			...decision.accounting,
+			outputLimit: { kind: "provider-managed", tokens: null },
+		},
+	},
+	{
+		...decision,
+		accounting: {
+			...decision.accounting,
+			outputLimit: { kind: "catalog", tokens: 32000 },
+		},
+	},
+] as const)("quality explanation survives repository, late save, and authenticated history mapping (%#)", async (decision) => {
 	const db = new Database(":memory:");
 	try {
 		runMigrations(db);
@@ -56,9 +72,15 @@ test("quality explanation survives repository, late save, and authenticated hist
 		const row = db
 			.query("SELECT * FROM requests WHERE id = ?")
 			.get(data.id) as RequestRow;
+		const sanitized = sanitizeQualityDecision(decision);
+		expect(sanitized).not.toBeNull();
+		expect(sanitized?.accounting).toEqual(decision.accounting);
 		expect(toRequestResponse(toRequest(row)).qualityDecision).toEqual(
-			sanitizeQualityDecision(decision),
+			sanitized,
 		);
+		expect(
+			toRequestResponse(toRequest(row)).qualityDecision?.accounting,
+		).toEqual(decision.accounting);
 		expect(row.route_repin_reason).toBeNull();
 		await repo.save({
 			...data,
@@ -126,6 +148,48 @@ test("quality explanation survives repository, late save, and authenticated hist
 		).toBe("gpt-astra-test");
 	} finally {
 		db.close();
+	}
+});
+
+test("output-limit disclosure is bounded, discriminated and rejects arbitrary nested data", () => {
+	for (const outputLimit of [
+		null,
+		[],
+		"provider-managed",
+		{},
+		{ kind: "provider-managed" },
+		{ kind: "provider-managed", tokens: 32000 },
+		{ kind: "catalog", tokens: null },
+		{ kind: "catalog", tokens: 0 },
+		{ kind: "catalog", tokens: -1 },
+		{ kind: "catalog", tokens: 1.5 },
+		{ kind: "catalog", tokens: "32000" },
+		{ kind: "catalog", tokens: Infinity },
+		{ kind: "catalog", tokens: Number.MAX_SAFE_INTEGER + 1 },
+		{ kind: "invented", tokens: null },
+		{ kind: ["catalog"], tokens: 32000 },
+		{ kind: "provider-managed", tokens: null, authorization: "secret" },
+		{ kind: "catalog", tokens: 32000, raw: { api_key: "secret" } },
+	]) {
+		expect(
+			sanitizeQualityDecision({
+				...decision,
+				accounting: { ...decision.accounting, outputLimit },
+			}),
+		).toBeNull();
+	}
+	const legacy = sanitizeQualityDecision(decision);
+	expect(legacy?.accounting).toEqual(decision.accounting);
+	for (const outputLimit of [
+		{ kind: "provider-managed", tokens: null },
+		{ kind: "catalog", tokens: 1 },
+		{ kind: "catalog", tokens: Number.MAX_SAFE_INTEGER },
+	]) {
+		const accounting = { ...decision.accounting, outputLimit };
+		expect(
+			sanitizeQualityDecision(JSON.stringify({ ...decision, accounting }))
+				?.accounting,
+		).toEqual(accounting);
 	}
 });
 

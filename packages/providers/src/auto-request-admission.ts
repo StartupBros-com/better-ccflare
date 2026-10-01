@@ -23,12 +23,17 @@ import type {
 
 /** Arithmetic only, NOT an evidence issuer or an admission override. The caller
  * supplies an accounted input budget (which may be an explicitly labelled estimate).
+ * requestedOutput is an accounting reserve, not a wire-enforced generation cap.
+ * A catalog outputLimit checks that reserve, but does not replace it in the budget.
+ * Estimated fit does not guarantee actual generation stays within the reserve.
  */
 export function decideAutoContextFit(input: {
 	inputUpperBound: unknown;
 	requestedOutput: unknown;
 	contextLimit: unknown;
 	outputLimit: unknown;
+	/** Explicitly delegates acceptance/length control for a null ceiling; keeps the full reserve. */
+	outputLimitMode?: "provider-managed";
 }): QualityAdmissionDecision {
 	const output = positiveSafeCapacity(input.requestedOutput);
 	const ceiling = positiveSafeCapacity(input.outputLimit);
@@ -39,7 +44,11 @@ export function decideAutoContextFit(input: {
 	if (
 		context === null ||
 		output === null ||
-		ceiling === null ||
+		(ceiling === null &&
+			!(
+				input.outputLimitMode === "provider-managed" &&
+				input.outputLimit === null
+			)) ||
 		typeof tokens !== "number" ||
 		!Number.isSafeInteger(tokens) ||
 		tokens < 0
@@ -494,6 +503,8 @@ function codexPreserves(
 /** Evaluate original requirements before final representation, so translation
  * cannot hide images, tools, or the requested output. Local accounting is an
  * explicitly labelled operational estimate, not an exact tokenizer guarantee.
+ * Codex subscription translation omits max_output_tokens: retaining the caller's
+ * reserve here does not enforce a generation cap, even with a known catalog ceiling.
  */
 export function evaluateAutoRequestAdmission(
 	input: AutoRequestAdmissionInput,
@@ -589,7 +600,9 @@ export function evaluateAutoRequestAdmission(
 	} else return { status: "unknown", reason: "request-preservation-unknown" };
 	if (!requestedModalities || !capabilities?.inputModalities)
 		return { status: "unknown", reason: "modality-unsupported" };
-	if (capabilities.maxOutputTokens === null)
+	const providerManagedOutput =
+		target.provider === "codex" && capabilities.providerManagedOutput === true;
+	if (capabilities.maxOutputTokens === null && !providerManagedOutput)
 		return { status: "unknown", reason: "output-unsupported" };
 	if (capabilities.maxContextWindow === null)
 		return { status: "unknown", reason: "context-unsupported" };
@@ -643,6 +656,9 @@ export function evaluateAutoRequestAdmission(
 			requestedOutput: output,
 			contextLimit,
 			outputLimit: capabilities.maxOutputTokens,
+			...(providerManagedOutput
+				? { outputLimitMode: "provider-managed" as const }
+				: {}),
 		}),
 		accounting: {
 			source: "local-envelope-v1",
@@ -651,6 +667,10 @@ export function evaluateAutoRequestAdmission(
 			inputEstimate,
 			headroom,
 			requestedOutput: output,
+			outputLimit:
+				capabilities.maxOutputTokens === null
+					? { kind: "provider-managed", tokens: null }
+					: { kind: "catalog", tokens: capabilities.maxOutputTokens },
 		},
 	};
 }
