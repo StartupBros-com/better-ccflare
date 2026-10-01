@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import http, { type Server } from "node:http";
 import net from "node:net";
+import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
@@ -40,6 +41,8 @@ import {
 	MAX_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
 	MIN_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
 	createGuard,
+	createGuardAbortOwner,
+	drainRequest,
 	planRecoveryAction,
 } from "../ccflare-guard.mjs";
 
@@ -548,7 +551,55 @@ describe("source-controlled guard", () => {
 		);
 		expect(timeoutEvent).toMatchObject({
 			requestDrainTimeoutMs: 1_000,
+			cleanupPhase: "body_too_large",
+			discardedBytes: 0,
+			discardedBytesCapped: false,
+			responseCommitted: true,
+			responseCompleted: true,
 		});
+		expect(guard.state.counters.aborted).toBe(0);
+	});
+
+	test("completed health response survives its blocked upload cleanup deadline", async () => {
+		// Native Node owns the production HTTP request-close semantics; Bun closes
+		// a health request body early after sending the response.
+		const { baseUrl, waitForEvent } = await startProductionNodeGuard(
+			"http://127.0.0.1:1",
+			{
+				GUARD_REQUEST_DRAIN_TIMEOUT_MS: "1000",
+			},
+		);
+		const socket = await openRawRequest(
+			baseUrl,
+			"GET /_guard/health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 20\r\n\r\nabc",
+		);
+		try {
+			const response = await readRawResponsesUntil(socket, '"status":"ok"');
+			expect(response).toContain("HTTP/1.1 200");
+			socket.write("def");
+			const cleanup = await waitForEvent("guard_request_drain_timeout", 2_500);
+			expect(cleanup).toMatchObject({
+				id: null,
+				cleanupPhase: "health_discard",
+				discardedBytes: 6,
+				discardedBytesCapped: false,
+				responseCommitted: true,
+				responseCompleted: true,
+			});
+			const health = await waitForHealth(
+				baseUrl,
+				(health) => health.counters.requestDrainTimeouts === 1,
+			);
+			expect(health.counters).toMatchObject({
+				total: 0,
+				success: 0,
+				finalError: 0,
+				aborted: 0,
+			});
+			expect(health.bodyReaders.current).toBe(0);
+		} finally {
+			socket.destroy();
+		}
 	});
 
 	test("does not let a slow body reader monopolize an upstream permit", async () => {
@@ -1827,6 +1878,9 @@ describe("source-controlled guard", () => {
 		const lastChunkAgeMs = timeout?.lastChunkAgeMs;
 		expect(timeout).toMatchObject({
 			attempt: 1,
+			abortOwner: "provider_failure",
+			abortEvent: "response_body_idle",
+			abortAgeMs: expect.any(Number),
 			rawResponseChunkCount: 1,
 			rawResponseBytes: Buffer.byteLength(partial),
 			firstBodyByteMs: expect.any(Number),
@@ -1834,6 +1888,289 @@ describe("source-controlled guard", () => {
 			lastChunkAgeMs: expect.any(Number),
 		});
 		expect(Number(lastChunkAgeMs)).toBeGreaterThanOrEqual(25);
+	});
+
+	test("unowned AbortError preserves the aggregate without inventing a client owner", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let signalWasAborted = true;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:1", {
+			fetchImpl: async (_url: URL, init: RequestInit) => {
+				signalWasAborted = init.signal!.aborted;
+				throw Object.assign(new Error("private abort detail"), {
+					name: "AbortError",
+				});
+			},
+			logger: (line: string) => events.push(JSON.parse(line)),
+		});
+		const socket = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+		);
+		try {
+			await waitFor(() => guard.state.counters.aborted === 1);
+			expect(signalWasAborted).toBe(false);
+			expect(guard.state.counters).toMatchObject({
+				aborted: 1,
+				clientAborted: 0,
+				unknownAborted: 1,
+			});
+			expect(events.some((event) => event.event === "client_aborted")).toBe(
+				false,
+			);
+			expect(
+				events.find((event) => event.event === "guard_abort_unknown"),
+			).toMatchObject({
+				abortOwner: "unknown",
+				abortEvent: "unowned_abort",
+				abortAgeMs: expect.any(Number),
+			});
+			expect(JSON.stringify(events)).not.toContain("private abort detail");
+			expect(guard.state.active).toBe(0);
+			expect(guard.state.bodyReaders.active).toBe(0);
+		} finally {
+			socket.destroy();
+		}
+	});
+
+	test.each([
+		"AbortError",
+		"Error",
+	])("production body-stage %s freezes truthful ownership before response teardown", async (errorName) => {
+		const upstreamBase = await listen(
+			http.createServer((req, res) => {
+				req.resume();
+				res.writeHead(200, { "content-type": "text/plain" });
+				res.write("body-prefix");
+			}),
+		);
+		const { baseUrl, waitForEvent } = await startProductionNodeGuard(
+			upstreamBase,
+			{},
+			`const streams = await import("node:stream");
+			const nativeFromWeb = streams.Readable.fromWeb;
+			streams.Readable.fromWeb = function(...args) {
+				const source = nativeFromWeb.apply(this, args);
+				source.once("data", () => setTimeout(() => source.destroy(Object.assign(
+					new Error("fixture source failure"), { name: ${JSON.stringify(errorName)} }
+				)), 20));
+				return source;
+			};`,
+		);
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(200);
+		await expect(response.text()).rejects.toThrow();
+		const unknown = errorName === "AbortError";
+		const terminal = await waitForEvent(
+			unknown ? "guard_abort_unknown" : "proxy_exception",
+		);
+		expect(terminal).toMatchObject({
+			abortOwner: unknown ? "unknown" : "provider_failure",
+			abortEvent: unknown ? "source_abort" : "upstream_failure",
+			abortAgeMs: expect.any(Number),
+		});
+		const health = await waitForHealth(
+			baseUrl,
+			(health) => health.active === 0,
+		);
+		expect(health.counters).toMatchObject({
+			aborted: unknown ? 1 : 0,
+			clientAborted: 0,
+			unknownAborted: unknown ? 1 : 0,
+			upstreamTransportErrors: unknown ? 0 : 1,
+			success: 0,
+			retried: 0,
+		});
+		expect(health.bodyReaders.current).toBe(0);
+		expect(health.bodyReaders.reservedBytes).toBe(0);
+	});
+
+	test("first observed client abort outranks a later deadline-shaped error", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let received = false;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:1", {
+			fetchImpl: async (_url: URL, init: RequestInit) =>
+				new Promise((_resolve, reject) => {
+					received = true;
+					init.signal!.addEventListener(
+						"abort",
+						() =>
+							reject(
+								Object.assign(new Error("derivative"), {
+									name: "AbortError",
+									code: "GUARD_ACCEPTED_DEADLINE",
+								}),
+							),
+						{ once: true },
+					);
+				}),
+			logger: (line: string) => events.push(JSON.parse(line)),
+		});
+		const socket = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+		);
+		await waitFor(() => received);
+		socket.destroy();
+		await waitFor(() => guard.state.active === 0);
+		expect(guard.state.counters).toMatchObject({
+			aborted: 1,
+			clientAborted: 1,
+			unknownAborted: 0,
+			acceptedDeadlineExceeded: 0,
+		});
+		expect(
+			events.find((event) => event.event === "client_aborted"),
+		).toMatchObject({ abortOwner: "client", abortAgeMs: expect.any(Number) });
+	});
+
+	test.each([
+		"GUARD_RECYCLE_UNAVAILABLE",
+		"GUARD_RESPONSE_IDLE_TIMEOUT",
+	])("first header deadline survives derivative %s rejection", async (derivativeCode) => {
+		const events: Array<Record<string, unknown>> = [];
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:1", {
+			totalDeadlineMs: 40,
+			fetchImpl: async (_url: URL, init: RequestInit) =>
+				new Promise((_resolve, reject) => {
+					init.signal!.addEventListener(
+						"abort",
+						() =>
+							reject(
+								Object.assign(new Error("derivative"), {
+									name: "AbortError",
+									code: derivativeCode,
+								}),
+							),
+						{ once: true },
+					);
+				}),
+			logger: (line: string) => events.push(JSON.parse(line)),
+		});
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(504);
+		expect((await response.json()).error.type).toBe("guard_deadline_exceeded");
+		expect(
+			events.find((event) => event.event === "guard_deadline_exceeded"),
+		).toMatchObject({
+			abortOwner: "deadline",
+			abortEvent: "header_deadline",
+			abortAgeMs: expect.any(Number),
+		});
+		expect(
+			events.some(
+				(event) => event.event === "guard_recycle_request_terminated",
+			),
+		).toBe(false);
+		expect(guard.state.counters).toMatchObject({
+			deadlineExceeded: 1,
+			responseBodyIdleTimeouts: 0,
+			aborted: 0,
+			clientAborted: 0,
+			unknownAborted: 0,
+		});
+		expect(guard.state.active).toBe(0);
+	});
+
+	test("normal completed response close never becomes an abort", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:1", {
+			fetchImpl: async () => new Response("done"),
+			logger: (line: string) => events.push(JSON.parse(line)),
+		});
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+			headers: { connection: "close" },
+		});
+		expect(await response.text()).toBe("done");
+		await waitFor(() => guard.state.active === 0);
+		expect(guard.state.counters).toMatchObject({
+			success: 1,
+			aborted: 0,
+			clientAborted: 0,
+			unknownAborted: 0,
+		});
+		expect(
+			events.some((event) =>
+				["client_aborted", "guard_abort_unknown"].includes(String(event.event)),
+			),
+		).toBe(false);
+	});
+
+	test("abort ownership freezes monotonic first cause across derivative races", () => {
+		let clock = 10_000_000n;
+		const unknown = createGuardAbortOwner(() => clock);
+		expect(unknown.record("toString", "private-event")).toBe(false);
+		expect(unknown.record("client", "arbitrary-event")).toBe(false);
+		expect(unknown.fields()).toEqual({
+			abortOwner: null,
+			abortEvent: null,
+			abortAgeMs: null,
+		});
+		expect(unknown.record("unknown", "unowned_abort")).toBe(true);
+		expect(unknown.record("client", "response_closed")).toBe(false);
+		expect(unknown.fields().abortOwner).toBe("unknown");
+		for (const [cause, event] of [
+			["deadline", "header_deadline"],
+			["accepted_deadline", "accepted_deadline"],
+			["maintenance", "recycle"],
+			["provider_failure", "upstream_failure"],
+		]) {
+			const owner = createGuardAbortOwner(() => clock);
+			expect(owner.record(cause, event)).toBe(true);
+			clock += 2_000_000n;
+			expect(owner.record("client", "socket_closed")).toBe(false);
+			expect(owner.fields()).toMatchObject({
+				abortOwner: cause,
+				abortEvent: event,
+				abortAgeMs: 2,
+			});
+		}
+	});
+
+	test("bounded upload discard releases listeners and keeps timeout secondary", async () => {
+		const req = Object.assign(new EventEmitter(), {
+			resume() {},
+			destroy() {},
+			socket: { destroy() {} },
+		});
+		let timeoutCount = 0;
+		let discarded: Record<string, unknown> | undefined;
+		drainRequest(req, 20, (details: Record<string, unknown>) => {
+			timeoutCount += 1;
+			discarded = details;
+		});
+		req.emit("data", Buffer.from("discard-only"));
+		await waitFor(() => timeoutCount === 1);
+		expect(discarded).toEqual({
+			discardedBytes: 12,
+			discardedBytesCapped: false,
+		});
+		for (const event of ["data", "error", "end", "close", "aborted"])
+			expect(req.listenerCount(event)).toBe(0);
+		req.emit("close");
+		await Bun.sleep(25);
+		expect(timeoutCount).toBe(1);
+		const ended = Object.assign(new EventEmitter(), {
+			resume() {},
+			destroy() {
+				throw new Error("must not destroy");
+			},
+		});
+		drainRequest(ended, 20, () => {
+			timeoutCount += 1;
+		});
+		ended.emit("end");
+		await Bun.sleep(25);
+		expect(timeoutCount).toBe(1);
+		for (const event of ["data", "error", "end", "close", "aborted"])
+			expect(ended.listenerCount(event)).toBe(0);
 	});
 
 	test("logs raw body telemetry on client abort without replaying the committed response", async () => {
@@ -1881,7 +2218,12 @@ describe("source-controlled guard", () => {
 			firstBodyByteMs: expect.any(Number),
 			maxInterChunkGapMs: 0,
 			lastChunkAgeMs: expect.any(Number),
+			abortOwner: "client",
+			abortAgeMs: expect.any(Number),
 		});
+		expect(["request_aborted", "response_closed", "socket_closed"]).toContain(
+			clientAbort.abortEvent,
+		);
 		expect(fetchCalls).toBe(1);
 	});
 
@@ -1971,6 +2313,7 @@ describe("source-controlled guard", () => {
 	// the body at all before authorizing retry (see the retry-focused tests
 	// below), so this scenario is only reachable with the header absent.
 	test("bounds a stalled partially inspected oversized response body (legacy body-only fallback)", async () => {
+		const events: Array<Record<string, unknown>> = [];
 		let fetchCalls = 0;
 		let cancelCalls = 0;
 		const stalledResponse: {
@@ -1982,6 +2325,7 @@ describe("source-controlled guard", () => {
 			totalDeadlineMs: 200,
 			responseIdleTimeoutMs: 30,
 			allowLegacyPoolBody: true,
+			logger: (line: string) => events.push(JSON.parse(line)),
 			fetchImpl: async () => {
 				fetchCalls += 1;
 				if (fetchCalls === 1) {
@@ -2030,6 +2374,14 @@ describe("source-controlled guard", () => {
 			expect(fetchCalls).toBe(2);
 			expect(cancelCalls).toBe(1);
 			expect(guard.state.counters.responseBodyIdleTimeouts).toBe(1);
+			expect(guard.state.counters.aborted).toBe(0);
+			expect(
+				events.find((event) => event.event === "response_body_idle_timeout"),
+			).toMatchObject({
+				abortOwner: "provider_failure",
+				abortEvent: "response_body_idle",
+				abortAgeMs: expect.any(Number),
+			});
 		} finally {
 			firstAbort.abort();
 			try {

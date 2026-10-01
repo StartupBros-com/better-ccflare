@@ -190,13 +190,14 @@ function writeOptionalTunnelFixture(dir: string): string {
 		tunnel,
 		[
 			"#!/usr/bin/env node",
-			'import { existsSync } from "node:fs";',
+			'import { existsSync, unlinkSync } from "node:fs";',
 			'import http from "node:http";',
 			"const exitFile = process.env.TUNNEL_EXIT_FILE;",
 			"const server = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });",
 			"server.listen(Number(process.env.AI_GATEWAY_LOCAL_PORT), '127.0.0.1');",
 			"const stop = () => { server.close(() => process.exit(0)); };",
-			"const timer = setInterval(() => { if (exitFile && existsSync(exitFile)) { clearInterval(timer); stop(); } }, 10);",
+			// A single injected outage must not kill every replacement tunnel.
+			"const timer = setInterval(() => { if (exitFile && existsSync(exitFile)) { unlinkSync(exitFile); clearInterval(timer); stop(); } }, 10);",
 			"process.on('SIGTERM', stop);",
 		].join("\n"),
 	);
@@ -1050,17 +1051,29 @@ describe("run-ccflare-stack supervisor lifecycle", () => {
 		await waitForOutput(runner, "restarting stack via supervisor");
 		const restartStartedAt = Date.now();
 		while (
-			(runner.getOutput().stdout.match(/starting ai-gateway tunnel/g) ?? [])
-				.length < 2 &&
+			(runner.getOutput().stdout.match(/ccflare stack ready/g) ?? []).length <
+				2 &&
 			Date.now() - restartStartedAt < 5_000
 		) {
 			await Bun.sleep(10);
 		}
+		// The restart announcement precedes spawning/readiness. Verify a stable
+		// recovered stack before testing intentional shutdown, rather than
+		// racing TERM against another fixture-induced tunnel death.
+		const recoveredOutput = runner.getOutput();
+		expect(
+			(recoveredOutput.stdout.match(/ccflare stack ready/g) ?? []).length,
+			JSON.stringify(recoveredOutput),
+		).toBe(2);
+		expect(
+			(recoveredOutput.stdout.match(/ai-gateway tunnel ready at/g) ?? []).length,
+			JSON.stringify(recoveredOutput),
+		).toBe(2);
 		expect(runner.child.kill("SIGTERM")).toBe(true);
 		const result = await waitForExit(runner.child, 5_000);
 		const output = runner.getOutput();
 
-		expect(result.code).toBe(143);
+		expect(result.code, JSON.stringify(output)).toBe(143);
 		expect(output.stdout).toContain("class=clean");
 		expect(
 			(output.stdout.match(/starting ai-gateway tunnel/g) ?? []).length,

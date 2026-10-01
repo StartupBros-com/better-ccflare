@@ -4,6 +4,7 @@ import {
 	type RoutingPhysicalAttempt,
 	type RoutingStreamEvidence,
 	sanitizeRequestRoutingAttemptSummary,
+	sanitizeRoutingDecision,
 	sanitizeRoutingStreamEvidence,
 	toRoutingAttemptCause,
 } from "@better-ccflare/types/request";
@@ -180,6 +181,16 @@ export function createPhysicalAttemptBudgetExceededResponse(
  * In-place transport retries do not call claim and therefore remain unaffected.
  */
 export class RoutingAttemptLedger {
+	private routingDecisionObservation: ReturnType<
+		typeof sanitizeRoutingDecision
+	> | null = null;
+	/** First local decision belongs to the terminal owner; sanitize before retaining. */
+	observeRoutingDecision(
+		decision: import("@better-ccflare/types/request").RoutingDecision,
+	): void {
+		this.routingDecisionObservation ??= sanitizeRoutingDecision(decision);
+	}
+
 	private readonly attempted = new Set<string>();
 	private readonly retried = new Set<string>();
 	private readonly blockedAccounts = new Set<string>();
@@ -300,7 +311,11 @@ export class RoutingAttemptLedger {
 				input.error === "downstream_cancelled") &&
 			last?.cause
 				? last.cause
-				: toRoutingAttemptCause(input.error);
+				: this.routingDecisionObservation !== null &&
+						this.physicalAttempts === 0 &&
+						toRoutingAttemptCause(input.error) === "unknown"
+					? "routing_rejected"
+					: toRoutingAttemptCause(input.error);
 		if (last?.outcome === "pending")
 			this.recordPhysicalOutcome(
 				input.success ? null : selectedCause,
@@ -312,6 +327,12 @@ export class RoutingAttemptLedger {
 			);
 		return sanitizeRequestRoutingAttemptSummary({
 			version: 1,
+			...(this.routingDecisionObservation
+				? {
+						decision: this.routingDecisionObservation.decision,
+						decisionGap: this.routingDecisionObservation.gap,
+					}
+				: {}),
 			physicalAttemptCount: this.physicalAttempts,
 			routeCount: this.attemptedCount,
 			attempts: this.observations,

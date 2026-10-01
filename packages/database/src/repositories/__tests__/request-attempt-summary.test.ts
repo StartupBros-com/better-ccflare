@@ -14,6 +14,26 @@ import { RequestRepository } from "../request.repository";
 
 const summary: RequestRoutingAttemptSummary = {
 	version: 1,
+	decision: {
+		version: 1,
+		requestedLogicalModel: "test-logical",
+		operation: "messages",
+		origin: "unknown",
+		reason: "route_unavailable",
+		evidence: "inferred",
+		inventory: "complete",
+		constraints: {
+			forcedRoute: false,
+			capabilityProfile: false,
+			routeProfile: false,
+			profileId: null,
+			provider: null,
+			physicalModel: null,
+		},
+		selection: null,
+		stages: [],
+	},
+	decisionGap: null,
 	physicalAttemptCount: 2,
 	routeCount: 1,
 	truncated: false,

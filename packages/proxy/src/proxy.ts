@@ -151,6 +151,13 @@ import {
 	forwardObservedRequest,
 } from "./handlers/request-observation";
 import {
+	completeRoutingSelectionStage,
+	freezeRoutingDecisionConstraints,
+	loadRoutingInventory,
+	observeRoutingSelectionCandidate,
+	routingDiagnosticCandidateKey,
+} from "./handlers/routing-selection-diagnostics";
+import {
 	createProtectedAnthropicOverloadResponse,
 	getAutomaticAccountCooldownUntil,
 } from "./handlers/routing-terminal";
@@ -946,6 +953,11 @@ async function handleProxyCoreImpl(
 	);
 	bindObservedRequestId(observation, requestMeta.id);
 	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
+	requestMeta.routingTrustedKeepalive = trustedInternalKeepalive;
+	requestMeta.routingRequestedLogicalModel =
+		typeof originalParsedBody?.model === "string"
+			? originalParsedBody.model
+			: null;
 	const routingAttemptLedger = new RoutingAttemptLedger();
 	getRequestLifecycleCoordinator(requestMeta).bindRoutingObservation(
 		routingAttemptLedger,
@@ -1174,7 +1186,14 @@ async function handleProxyCoreImpl(
 				),
 		});
 	} catch (error) {
-		if (!(error instanceof PreTransportPhaseTimeoutError)) throw error;
+		if (!(error instanceof PreTransportPhaseTimeoutError)) {
+			if (requestMeta.routingInventoryOutcome === "failed")
+				recordLocalRoutingTerminal(
+					new Response(null, { status: 500 }),
+					"inventory_failed",
+				);
+			throw error;
+		}
 		const originalModel = requestBodyContext.getModel();
 		agentInterception = {
 			modifiedBody: requestBodyContext.getBuffer(),
@@ -1301,6 +1320,7 @@ async function handleProxyCoreImpl(
 		requestMeta.routeProfilePhysicalModelPolicy =
 			profile.physicalModelPolicy ?? null;
 		requestMeta.routeExpectedProvider = profile.expectedProvider;
+		freezeRoutingDecisionConstraints(requestMeta);
 		const inheritedPickerModel =
 			source === "inherited" && configuredEffectivePicker;
 		const inheritedHelperModel = source === "inherited" && isServerToolHelper;
@@ -1373,6 +1393,10 @@ async function handleProxyCoreImpl(
 			excludedCandidateCount:
 				existing?.excludedCandidateCount ?? excludedCandidateCount,
 			selectedCandidateCount: existing?.selectedCandidateCount ?? 0,
+			reasonEvidence:
+				zeroAttemptReason === "selection_timeout"
+					? "exact"
+					: (existing?.reasonEvidence ?? "inferred"),
 			zeroAttemptReason:
 				zeroAttemptReason ??
 				existing?.zeroAttemptReason ??
@@ -1392,6 +1416,7 @@ async function handleProxyCoreImpl(
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 		const routingSelectionDiagnostics =
 			getRoutingSelectionDiagnostics("selection_timeout");
+		requestMeta.routingSelectionDiagnostics = routingSelectionDiagnostics;
 		logRoutingSelectionDiagnostics(routingSelectionDiagnostics);
 		const terminal = createRoutingTerminalResponse({
 			source: "selection",
@@ -1405,7 +1430,10 @@ async function handleProxyCoreImpl(
 		// A phase timeout is transient incomplete evidence, so keep the canonical
 		// route_unavailable body while explicitly inviting a bounded client retry.
 		terminal.response.headers.set("retry-after", "1");
-		return finishPacing(pacingSlot, terminal.response);
+		return finishPacing(
+			pacingSlot,
+			recordLocalRoutingTerminal(terminal.response, "selection_timeout"),
+		);
 	};
 	const getPredictiveThrottleUntil = (
 		account: Account,
@@ -1450,7 +1478,9 @@ async function handleProxyCoreImpl(
 				timeoutMs: preTransportDeadlines.accountSelectionTimeoutMs,
 				signal: routingSignal,
 				operation: async () => {
-					implicitRouteAccounts = await ctx.dbOps.getAllAccounts();
+					implicitRouteAccounts = await loadRoutingInventory(requestMeta, () =>
+						ctx.dbOps.getAllAccounts(),
+					);
 					return resolveImplicitCodexRoute(
 						finalRequestBodyContext.getParsedJson(),
 						implicitRouteAccounts,
@@ -1492,7 +1522,14 @@ async function handleProxyCoreImpl(
 				},
 			});
 		} catch (error) {
-			if (!(error instanceof PreTransportPhaseTimeoutError)) throw error;
+			if (!(error instanceof PreTransportPhaseTimeoutError)) {
+				if (requestMeta.routingInventoryOutcome === "failed")
+					recordLocalRoutingTerminal(
+						new Response(null, { status: 500 }),
+						"inventory_failed",
+					);
+				throw error;
+			}
 			return accountSelectionTimeoutResponse(null);
 		}
 		// The resolver can exhaust its own deadline before the outer timer fires.
@@ -1516,11 +1553,13 @@ async function handleProxyCoreImpl(
 		requestMeta.routeProfileExpectedPhysicalModel = id;
 		requestMeta.routeExpectedProvider = "codex";
 		requestMeta.forcedAccountId = null;
+		freezeRoutingDecisionConstraints(requestMeta);
 		finalRequestBodyContext.setModel(id);
 		finalBodyBuffer = finalRequestBodyContext.getBuffer();
 		appliedModel = id;
 		requestMeta.routeExpectedPhysicalModel = id;
 	}
+	freezeRoutingDecisionConstraints(requestMeta);
 	if (
 		url.pathname === "/v1/messages" &&
 		modelRouteResolution?.kind === "route" &&
@@ -1773,7 +1812,10 @@ async function handleProxyCoreImpl(
 				operation: () =>
 					primeCatalogRoleCandidates({
 						accountId: modelRouteResolution.profile.accountId ?? null,
-						loadAccounts: () => ctx.dbOps.getAllAccounts(),
+						loadAccounts: () =>
+							loadRoutingInventory(requestMeta, () =>
+								ctx.dbOps.getAllAccounts(),
+							),
 						ctx,
 						deadlineAt: primeDeadlineAt,
 						signal: routingSignal,
@@ -1892,7 +1934,10 @@ async function handleProxyCoreImpl(
 		if (error instanceof CountTokensUnsupportedError) {
 			return finishPacing(
 				pacingObservation?.slot ?? null,
-				createCountTokensUnsupportedResponse(error.providers),
+				recordLocalRoutingTerminal(
+					createCountTokensUnsupportedResponse(error.providers),
+					"count_tokens_unsupported",
+				),
 			);
 		}
 		if (error instanceof ServerToolRoutingError) {
@@ -1940,6 +1985,12 @@ async function handleProxyCoreImpl(
 	): boolean => {
 		const recoveryAt = getReactiveModelRecoveryAt(opts);
 		if (recoveryAt === null) return false;
+		observeRoutingSelectionCandidate(
+			requestMeta,
+			"usage_throttle",
+			routingDiagnosticCandidateKey(opts.accountId, opts.model),
+			"reactive_depletion",
+		);
 		reactiveModelRecoveryAt =
 			reactiveModelRecoveryAt === null
 				? recoveryAt
@@ -2010,6 +2061,16 @@ async function handleProxyCoreImpl(
 					syntheticProbe,
 					now,
 				});
+			observeRoutingSelectionCandidate(
+				requestMeta,
+				"usage_throttle",
+				routingDiagnosticCandidateKey(account.id, candidateModel),
+				reactivelyDepleted
+					? "reactive_depletion"
+					: throttleUntil && throttleUntil > now
+						? "predictive_throttle"
+						: null,
+			);
 			if (reactivelyDepleted) {
 				reactivelyDepletedAccounts.push(account);
 				continue;
@@ -2022,6 +2083,7 @@ async function handleProxyCoreImpl(
 			const alignedCandidate = alignedCandidates[index];
 			if (alignedCandidate) availableRoutingCandidates.push(alignedCandidate);
 		}
+		completeRoutingSelectionStage(requestMeta, "usage_throttle");
 		if (alignedCandidates.every((candidate) => candidate !== undefined)) {
 			requestMeta.routingCandidates = availableRoutingCandidates;
 		}
@@ -2161,7 +2223,10 @@ async function handleProxyCoreImpl(
 			if (error instanceof CountTokensUnsupportedError) {
 				return finishPacing(
 					pacingObservation?.slot ?? null,
-					createCountTokensUnsupportedResponse(error.providers),
+					recordLocalRoutingTerminal(
+						createCountTokensUnsupportedResponse(error.providers),
+						"count_tokens_unsupported",
+					),
 				);
 			}
 			if (error instanceof ServerToolRoutingError) {
@@ -2545,21 +2610,28 @@ async function handleProxyCoreImpl(
 		if (reactivelyDepletedAccounts.length > 0) {
 			return finishPacing(
 				pacingSlot,
-				createModelPoolExhaustedResponse({
-					capacityContext: getRoutingCapacityContext(requestMeta),
-					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
-					now: Date.now(),
-					modelRecoveryAt: reactiveModelRecoveryAt,
-					attemptedRoutes: 0,
-					routingSelectionDiagnostics: requestMeta.routingSelectionDiagnostics,
-				}),
+				recordLocalRoutingTerminal(
+					createModelPoolExhaustedResponse({
+						capacityContext: getRoutingCapacityContext(requestMeta),
+						rateLimitOutcomes: getRequestRateLimitOutcomes(req),
+						now: Date.now(),
+						modelRecoveryAt: reactiveModelRecoveryAt,
+						attemptedRoutes: 0,
+						routingSelectionDiagnostics:
+							requestMeta.routingSelectionDiagnostics,
+					}),
+					"model_pool_exhausted",
+				),
 			);
 		}
 
 		if (throttledAccounts.length > 0) {
 			return finishPacing(
 				pacingSlot,
-				createUsageThrottledResponse(throttledAccounts),
+				recordLocalRoutingTerminal(
+					createUsageThrottledResponse(throttledAccounts),
+					"predictive_throttle",
+				),
 			);
 		}
 
@@ -2573,7 +2645,10 @@ async function handleProxyCoreImpl(
 		) {
 			return finishPacing(
 				pacingSlot,
-				createForceAccountModelResponse(effectiveModel),
+				recordLocalRoutingTerminal(
+					createForceAccountModelResponse(effectiveModel),
+					"force_model_denied",
+				),
 			);
 		}
 
@@ -2643,7 +2718,9 @@ async function handleProxyCoreImpl(
 		let allAccounts: Account[] = [];
 		try {
 			allAccounts = filterRequestCompatibleAccounts(
-				await ctx.dbOps.getAllAccounts(),
+				await loadRoutingInventory(requestMeta, () =>
+					ctx.dbOps.getAllAccounts(),
+				),
 				req.headers,
 			);
 		} catch (error) {
@@ -2653,6 +2730,7 @@ async function handleProxyCoreImpl(
 			undefined,
 			allAccounts.length,
 		);
+		requestMeta.routingSelectionDiagnostics = routingSelectionDiagnostics;
 		const terminal = createRoutingTerminalResponse({
 			source: "selection",
 			accounts: allAccounts,
@@ -3379,6 +3457,14 @@ async function handleProxyCoreImpl(
 			trustedInternalAutoRefresh || trustedInternalKeepalive
 				? null
 				: getPredictiveThrottleUntil(route.account, route.model, now);
+		observeRoutingSelectionCandidate(
+			requestMeta,
+			"usage_throttle",
+			routingDiagnosticCandidateKey(route.account.id, route.model),
+			predictiveThrottleUntil !== null && predictiveThrottleUntil > now
+				? "predictive_throttle"
+				: null,
+		);
 		if (predictiveThrottleUntil !== null && predictiveThrottleUntil > now) {
 			consumePreferredRoute();
 			if (
@@ -3853,7 +3939,10 @@ async function handleProxyCoreImpl(
 				await routingAttemptLedger.discardTerminalResponse();
 				return finishPacing(
 					pacingSlot,
-					createCountTokensUnsupportedResponse(error.providers),
+					recordLocalRoutingTerminal(
+						createCountTokensUnsupportedResponse(error.providers),
+						"count_tokens_unsupported",
+					),
 				);
 			}
 			if (error instanceof ServerToolRoutingError) {
@@ -4193,17 +4282,20 @@ async function handleProxyCoreImpl(
 			if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 			return finishPacing(
 				pacingSlot,
-				createModelPoolExhaustedResponse({
-					capacityContext: getRoutingCapacityContext(requestMeta),
-					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
-					now: Date.now(),
-					modelRecoveryAt: reactiveModelRecoveryAt,
-					attemptedRoutes: upstreamAttempts === 0 ? 0 : undefined,
-					routingSelectionDiagnostics:
-						upstreamAttempts === 0
-							? requestMeta.routingSelectionDiagnostics
-							: undefined,
-				}),
+				recordLocalRoutingTerminal(
+					createModelPoolExhaustedResponse({
+						capacityContext: getRoutingCapacityContext(requestMeta),
+						rateLimitOutcomes: getRequestRateLimitOutcomes(req),
+						now: Date.now(),
+						modelRecoveryAt: reactiveModelRecoveryAt,
+						attemptedRoutes: upstreamAttempts === 0 ? 0 : undefined,
+						routingSelectionDiagnostics:
+							upstreamAttempts === 0
+								? requestMeta.routingSelectionDiagnostics
+								: undefined,
+					}),
+					"model_pool_exhausted",
+				),
 			);
 		} else if (
 			deferredModelRoutes.length === 0 &&
@@ -4215,7 +4307,10 @@ async function handleProxyCoreImpl(
 			if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 			return finishPacing(
 				pacingSlot,
-				createUsageThrottledResponse(throttledFallbackAccounts),
+				recordLocalRoutingTerminal(
+					createUsageThrottledResponse(throttledFallbackAccounts),
+					"predictive_throttle",
+				),
 			);
 		}
 	}
@@ -4344,6 +4439,14 @@ async function handleProxyCoreImpl(
 				trustedInternalAutoRefresh || trustedInternalKeepalive
 					? null
 					: getPredictiveThrottleUntil(route.account, route.model, now);
+			observeRoutingSelectionCandidate(
+				requestMeta,
+				"usage_throttle",
+				routingDiagnosticCandidateKey(route.account.id, route.model),
+				predictiveThrottleUntil !== null && predictiveThrottleUntil > now
+					? "predictive_throttle"
+					: null,
+			);
 			if (predictiveThrottleUntil !== null && predictiveThrottleUntil > now) {
 				return false;
 			}
@@ -4394,6 +4497,14 @@ async function handleProxyCoreImpl(
 				trustedInternalAutoRefresh || trustedInternalKeepalive
 					? null
 					: getPredictiveThrottleUntil(route.account, route.model, now);
+			observeRoutingSelectionCandidate(
+				requestMeta,
+				"usage_throttle",
+				routingDiagnosticCandidateKey(route.account.id, route.model),
+				predictiveThrottleUntil !== null && predictiveThrottleUntil > now
+					? "predictive_throttle"
+					: null,
+			);
 			if (predictiveThrottleUntil !== null && predictiveThrottleUntil > now) {
 				if (
 					!deferredPredictivelyThrottledAccounts.some(
@@ -4575,6 +4686,7 @@ async function handleProxyCoreImpl(
 		);
 	}
 
+	completeRoutingSelectionStage(requestMeta, "usage_throttle");
 	const exhaustedNativeTerminal = nativeQuotaTerminal("attempts");
 	if (exhaustedNativeTerminal) {
 		cacheBodyStore.discardStaged(requestMeta.id);
@@ -4590,17 +4702,20 @@ async function handleProxyCoreImpl(
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 		return finishPacing(
 			pacingSlot,
-			createModelPoolExhaustedResponse({
-				capacityContext: getRoutingCapacityContext(requestMeta),
-				rateLimitOutcomes: getRequestRateLimitOutcomes(req),
-				now: Date.now(),
-				modelRecoveryAt: reactiveModelRecoveryAt,
-				attemptedRoutes: upstreamAttempts === 0 ? 0 : undefined,
-				routingSelectionDiagnostics:
-					upstreamAttempts === 0
-						? requestMeta.routingSelectionDiagnostics
-						: undefined,
-			}),
+			recordLocalRoutingTerminal(
+				createModelPoolExhaustedResponse({
+					capacityContext: getRoutingCapacityContext(requestMeta),
+					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
+					now: Date.now(),
+					modelRecoveryAt: reactiveModelRecoveryAt,
+					attemptedRoutes: upstreamAttempts === 0 ? 0 : undefined,
+					routingSelectionDiagnostics:
+						upstreamAttempts === 0
+							? requestMeta.routingSelectionDiagnostics
+							: undefined,
+				}),
+				"model_pool_exhausted",
+			),
 		);
 	}
 	// If routing skipped every remaining candidate using direct, short-lived
@@ -4614,17 +4729,20 @@ async function handleProxyCoreImpl(
 		cacheBodyStore.discardStaged(requestMeta.id);
 		return finishPacing(
 			pacingSlot,
-			createModelPoolExhaustedResponse({
-				capacityContext: getRoutingCapacityContext(requestMeta),
-				rateLimitOutcomes: getRequestRateLimitOutcomes(req),
-				now: Date.now(),
-				modelRecoveryAt: reactiveModelRecoveryAt,
-				attemptedRoutes: upstreamAttempts === 0 ? 0 : undefined,
-				routingSelectionDiagnostics:
-					upstreamAttempts === 0
-						? requestMeta.routingSelectionDiagnostics
-						: undefined,
-			}),
+			recordLocalRoutingTerminal(
+				createModelPoolExhaustedResponse({
+					capacityContext: getRoutingCapacityContext(requestMeta),
+					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
+					now: Date.now(),
+					modelRecoveryAt: reactiveModelRecoveryAt,
+					attemptedRoutes: upstreamAttempts === 0 ? 0 : undefined,
+					routingSelectionDiagnostics:
+						upstreamAttempts === 0
+							? requestMeta.routingSelectionDiagnostics
+							: undefined,
+				}),
+				"model_pool_exhausted",
+			),
 		);
 	}
 	if (fallbackSelectionHadNoAvailable && throttledFallbackAccounts.length > 0) {
@@ -4632,7 +4750,10 @@ async function handleProxyCoreImpl(
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 		return finishPacing(
 			pacingSlot,
-			createUsageThrottledResponse(throttledFallbackAccounts),
+			recordLocalRoutingTerminal(
+				createUsageThrottledResponse(throttledFallbackAccounts),
+				"predictive_throttle",
+			),
 		);
 	}
 	if (deferredPredictivelyThrottledAccounts.length > 0) {
@@ -4640,7 +4761,10 @@ async function handleProxyCoreImpl(
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 		return finishPacing(
 			pacingSlot,
-			createUsageThrottledResponse(deferredPredictivelyThrottledAccounts),
+			recordLocalRoutingTerminal(
+				createUsageThrottledResponse(deferredPredictivelyThrottledAccounts),
+				"predictive_throttle",
+			),
 		);
 	}
 
@@ -4713,7 +4837,7 @@ async function handleProxyCoreImpl(
 	let terminalAccounts = allAttemptedAccounts;
 	try {
 		const refreshedTerminalAccounts = filterRequestCompatibleAccounts(
-			await ctx.dbOps.getAllAccounts(),
+			await loadRoutingInventory(requestMeta, () => ctx.dbOps.getAllAccounts()),
 			req.headers,
 		);
 		terminalAccounts = mergeTerminalAccountState(

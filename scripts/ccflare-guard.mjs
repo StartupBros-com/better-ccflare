@@ -266,6 +266,52 @@ function configuredBoolean(value, fallback) {
 	return fallback;
 }
 
+// First ownership is monotonic and immutable. Error names and derivative signal
+// cancellation are not positive evidence of a downstream client abort.
+const GUARD_ABORT_EVENTS = {
+	client: new Set(["request_aborted", "response_closed", "socket_closed"]),
+	deadline: new Set(["header_deadline", "typed_failure"]),
+	accepted_deadline: new Set(["accepted_deadline", "typed_failure"]),
+	maintenance: new Set(["recycle", "typed_failure"]),
+	provider_failure: new Set(["upstream_failure", "response_body_idle"]),
+	unknown: new Set(["unowned_abort", "source_abort"]),
+};
+
+export function createGuardAbortOwner(clock = () => process.hrtime.bigint()) {
+	let first = null;
+	return {
+		get cause() {
+			return first?.cause ?? null;
+		},
+		record(cause, event) {
+			if (
+				first !== null ||
+				!Object.hasOwn(GUARD_ABORT_EVENTS, cause) ||
+				!GUARD_ABORT_EVENTS[cause].has(event)
+			)
+				return false;
+			first = { cause, event, at: clock() };
+			return true;
+		},
+		fields() {
+			return {
+				abortOwner: first?.cause ?? null,
+				abortEvent: first?.event ?? null,
+				abortAgeMs:
+					first === null
+						? null
+						: Math.max(
+								0,
+								Math.min(
+									Number.MAX_SAFE_INTEGER,
+									Number((clock() - first.at) / 1_000_000n),
+								),
+							),
+			};
+		},
+	};
+}
+
 function abortError() {
 	const error = new Error("client aborted");
 	error.name = "AbortError";
@@ -443,17 +489,28 @@ function classifyRequestBody(req, maxRequestBodyBytes) {
 	};
 }
 
-function drainRequest(
+export function drainRequest(
 	req,
 	timeoutMs = DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
 	onTimeout,
 ) {
 	let drained = false;
 	let timer;
+	let discardedBytes = 0;
+	let discardedBytesCapped = false;
+	const onData = (chunk) => {
+		const bytes = Buffer.isBuffer(chunk)
+			? chunk.byteLength
+			: Buffer.byteLength(chunk);
+		if (bytes > Number.MAX_SAFE_INTEGER - discardedBytes)
+			discardedBytesCapped = true;
+		discardedBytes = Math.min(Number.MAX_SAFE_INTEGER, discardedBytes + bytes);
+	};
 	const cleanup = () => {
 		if (drained) return;
 		drained = true;
 		if (timer) clearTimeout(timer);
+		req.off("data", onData);
 		req.off("error", onError);
 		req.off("end", cleanup);
 		req.off("close", cleanup);
@@ -484,14 +541,18 @@ function drainRequest(
 				}
 			}
 			try {
-				onTimeout?.();
+				onTimeout?.({ discardedBytes, discardedBytesCapped });
 			} catch {
 				// Telemetry callbacks must never prevent the socket teardown.
+			} finally {
+				// Some injected/closed requests emit no further close event.
+				cleanup();
 			}
 		},
 		Math.max(1, timeoutMs),
 	);
 	timer.unref?.();
+	req.on("data", onData);
 	try {
 		req.resume();
 	} catch {
@@ -508,11 +569,15 @@ async function readBody(
 	declaredLength = parseDeclaredContentLength(req),
 ) {
 	if (signal?.aborted) {
-		drainRequest(req, drainTimeoutMs, onDrainTimeout);
+		drainRequest(req, drainTimeoutMs, (details) =>
+			onDrainTimeout?.("body_read_abort", details),
+		);
 		throw signal.reason || abortError();
 	}
 	if (declaredLength != null && declaredLength > BigInt(maxBytes)) {
-		drainRequest(req, drainTimeoutMs, onDrainTimeout);
+		drainRequest(req, drainTimeoutMs, (details) =>
+			onDrainTimeout?.("body_too_large", details),
+		);
 		throw requestBodyTooLargeError(maxBytes, {
 			declaredBytes: maxBytes + 1,
 		});
@@ -550,7 +615,9 @@ async function readBody(
 			if (buffer.byteLength > remainingBytes) {
 				totalBytes = maxBytes;
 				const error = requestBodyTooLargeError(maxBytes);
-				drainRequest(req, drainTimeoutMs, onDrainTimeout);
+				drainRequest(req, drainTimeoutMs, (details) =>
+					onDrainTimeout?.("body_too_large", details),
+				);
 				finish(() => reject(error));
 				return;
 			}
@@ -569,7 +636,9 @@ async function readBody(
 		const onAbort = () => {
 			// Keep the connection usable long enough to return a finite deadline
 			// response while discarding any remaining upload bytes.
-			drainRequest(req, drainTimeoutMs, onDrainTimeout);
+			drainRequest(req, drainTimeoutMs, (details) =>
+				onDrainTimeout?.("body_read_abort", details),
+			);
 			finish(() => reject(signal.reason || abortError()));
 		};
 
@@ -982,12 +1051,24 @@ async function pipelineResponseBody(
 	res,
 	responseIdleTimeoutMs,
 	onTimeout,
+	onSourceFailure,
 ) {
-	await pipeline(
-		source,
-		responseBodyIdleWatchdog(responseIdleTimeoutMs, onTimeout),
-		res,
-	);
+	const observeSourceFailure = (error) => onSourceFailure?.(error);
+	source.on("error", observeSourceFailure);
+	try {
+		await pipeline(
+			source,
+			responseBodyIdleWatchdog(responseIdleTimeoutMs, (error) => {
+				// Freeze the watchdog owner before cancelling readers/tearing down the
+				// downstream response, whose close event is derivative here.
+				onSourceFailure?.(error);
+				return onTimeout?.(error);
+			}),
+			res,
+		);
+	} finally {
+		source.off("error", observeSourceFailure);
+	}
 }
 
 async function sendFinalResponse(
@@ -995,6 +1076,7 @@ async function sendFinalResponse(
 	upstreamResponse,
 	beginResponse,
 	responseIdleTimeoutMs,
+	onSourceFailure,
 ) {
 	beginResponse();
 	res.writeHead(
@@ -1009,6 +1091,8 @@ async function sendFinalResponse(
 		Readable.fromWeb(upstreamResponse.body),
 		res,
 		responseIdleTimeoutMs,
+		undefined,
+		onSourceFailure,
 	);
 }
 
@@ -1178,6 +1262,7 @@ async function sendPartiallyReadResponse(
 	inspection,
 	beginResponse,
 	responseIdleTimeoutMs,
+	onSourceFailure,
 ) {
 	if (inspection.untouched) {
 		await sendFinalResponse(
@@ -1185,6 +1270,7 @@ async function sendPartiallyReadResponse(
 			upstreamResponse,
 			beginResponse,
 			responseIdleTimeoutMs,
+			onSourceFailure,
 		);
 		return;
 	}
@@ -1233,6 +1319,7 @@ async function sendPartiallyReadResponse(
 		res,
 		responseIdleTimeoutMs,
 		(error) => inspection.reader.cancel(error),
+		onSourceFailure,
 	);
 }
 
@@ -1687,7 +1774,13 @@ export function createGuard(options = {}) {
 		upstream429: 0,
 		upstreamTransportErrors: 0,
 		queueFull: 0,
+		// Compatibility aggregate: abort-shaped exceptions not attributed to the
+		// accepted/header deadlines or maintenance, using the first observed owner.
+		// clientAborted + unknownAborted partitions only this aggregate; historical
+		// client_aborted events also included unknown exceptions.
 		aborted: 0,
+		clientAborted: 0,
+		unknownAborted: 0,
 		deadlineExceeded: 0,
 		acceptedDeadlineExceeded: 0,
 		recoveryBeyondDeadline: 0,
@@ -2195,21 +2288,34 @@ export function createGuard(options = {}) {
 		);
 	}
 
-	function onRequestDrainTimeout(context) {
+	function onRequestDrainTimeout(context, res, cleanupPhase, details) {
 		counters.requestDrainTimeouts += 1;
 		log("guard_request_drain_timeout", {
 			id: context?.id ?? null,
 			requestDrainTimeoutMs,
 			elapsedMs: context ? now() - context.acceptedAt : null,
+			cleanupPhase,
+			discardedBytes: details.discardedBytes,
+			discardedBytesCapped: details.discardedBytesCapped,
+			responseCommitted: Boolean(res.headersSent),
+			responseCompleted: Boolean(res.writableFinished),
+			...(context?.abortFields() ?? {}),
 		});
 	}
 
-	function drainRequestForContext(req, context) {
+	function drainRequestForContext(
+		req,
+		res,
+		context,
+		cleanupPhase = "before_body_read",
+	) {
 		const timeoutMs = Math.min(
 			requestDrainTimeoutMs,
 			Math.max(1, context.remainingMs()),
 		);
-		drainRequest(req, timeoutMs, () => onRequestDrainTimeout(context));
+		drainRequest(req, timeoutMs, (details) =>
+			onRequestDrainTimeout(context, res, cleanupPhase, details),
+		);
 	}
 
 	function grantLease(queuedMs) {
@@ -2542,18 +2648,19 @@ export function createGuard(options = {}) {
 			clientController.signal,
 			recycleController.signal,
 		]);
-		let abortCause = null;
+		const abortOwner = createGuardAbortOwner(timingNow);
+		let abortHandled = false;
 		let responseBegun = false;
 		let disposed = false;
 
 		const expireDeadline = () => {
 			if (responseBegun || deadlineController.signal.aborted) return;
-			if (abortCause == null) abortCause = "deadline";
+			abortOwner.record("deadline", "header_deadline");
 			deadlineController.abort(deadlineError());
 		};
 		const expireAccepted = () => {
 			if (deadlineController.signal.aborted || disposed) return;
-			if (abortCause == null) abortCause = "accepted_deadline";
+			abortOwner.record("accepted_deadline", "accepted_deadline");
 			deadlineController.abort(
 				Object.assign(new Error("accepted request deadline exceeded"), {
 					name: "AbortError",
@@ -2568,22 +2675,23 @@ export function createGuard(options = {}) {
 				Number(BigInt(timing.workDeadlineMonoNs) - timingNow()) / 1_000_000,
 			),
 		);
-		const abortClient = () => {
+		const abortClient = (event) => {
 			if (clientController.signal.aborted) return;
-			if (abortCause == null) abortCause = "client";
+			abortOwner.record("client", event);
 			clientController.abort(abortError());
 		};
+		const onRequestAborted = () => abortClient("request_aborted");
 		const onResponseClose = () => {
-			if (!res.writableEnded) abortClient();
+			if (!res.writableEnded) abortClient("response_closed");
 		};
 		const onSocketClose = () => {
-			if (!res.writableEnded) abortClient();
+			if (!res.writableEnded) abortClient("socket_closed");
 		};
 		const deadlineTimer = setTimeout(
 			expireDeadline,
 			Math.max(0, totalDeadlineMs),
 		);
-		req.on("aborted", abortClient);
+		req.on("aborted", onRequestAborted);
 		res.on("close", onResponseClose);
 		req.socket.on("close", onSocketClose);
 
@@ -2591,6 +2699,7 @@ export function createGuard(options = {}) {
 			id: randomUUID(),
 			generation: null,
 			abortRecycle() {
+				abortOwner.record("maintenance", "recycle");
 				recycleController.abort(lifecycleError());
 			},
 			acceptedAt,
@@ -2598,7 +2707,37 @@ export function createGuard(options = {}) {
 			deadlineAt,
 			signal: combined.signal,
 			get abortCause() {
-				return abortCause;
+				return abortOwner.cause;
+			},
+			abortFields: () => abortOwner.fields(),
+			recordAbortOwner: (cause, event) => abortOwner.record(cause, event),
+			recordSourceFailure(error) {
+				// Freeze before pipeline cancellation generates downstream close events.
+				// A generic source AbortError identifies no owner, even in body phase.
+				if (error?.code === "GUARD_RESPONSE_IDLE_TIMEOUT") {
+					return abortOwner.record("provider_failure", "response_body_idle");
+				}
+				if (error?.code === "GUARD_ACCEPTED_DEADLINE") {
+					return abortOwner.record("accepted_deadline", "typed_failure");
+				}
+				if (error?.code === "GUARD_DEADLINE_EXCEEDED") {
+					return abortOwner.record("deadline", "typed_failure");
+				}
+				if (
+					["GUARD_RECYCLE_UNAVAILABLE", "GUARD_RECYCLE_QUEUE_FULL"].includes(
+						error?.code,
+					)
+				) {
+					return abortOwner.record("maintenance", "typed_failure");
+				}
+				return error?.name === "AbortError"
+					? abortOwner.record("unknown", "source_abort")
+					: abortOwner.record("provider_failure", "upstream_failure");
+			},
+			claimAbortHandling() {
+				if (abortHandled) return false;
+				abortHandled = true;
+				return true;
 			},
 			get responseBegun() {
 				return responseBegun;
@@ -2630,7 +2769,7 @@ export function createGuard(options = {}) {
 				disposed = true;
 				clearTimeout(deadlineTimer);
 				clearTimeout(acceptedTimer);
-				req.off("aborted", abortClient);
+				req.off("aborted", onRequestAborted);
 				res.off("close", onResponseClose);
 				req.socket.off("close", onSocketClose);
 				combined.dispose();
@@ -2660,10 +2799,34 @@ export function createGuard(options = {}) {
 
 	function handleAbort(error, res, context, attempt, responseTelemetry) {
 		const elapsedMs = now() - context.acceptedAt;
-		if (error?.code?.startsWith("GUARD_RECYCLE_")) {
+		if (context.abortCause == null) {
+			if (error?.code === "GUARD_ACCEPTED_DEADLINE")
+				context.recordAbortOwner("accepted_deadline", "typed_failure");
+			else if (error?.code === "GUARD_DEADLINE_EXCEEDED")
+				context.recordAbortOwner("deadline", "typed_failure");
+			else if (
+				["GUARD_RECYCLE_UNAVAILABLE", "GUARD_RECYCLE_QUEUE_FULL"].includes(
+					error?.code,
+				)
+			)
+				context.recordAbortOwner("maintenance", "typed_failure");
+			else if (error?.name === "AbortError" || context.signal.aborted)
+				context.recordAbortOwner("unknown", "unowned_abort");
+		}
+		if (context.abortCause == null || context.abortCause === "provider_failure")
+			return false;
+		if (!context.claimAbortHandling()) return true;
+		const ownerFields = context.abortFields();
+		if (context.abortCause === "maintenance") {
 			log("guard_recycle_request_terminated", {
 				id: context.id,
-				code: error.code,
+				code: [
+					"GUARD_RECYCLE_UNAVAILABLE",
+					"GUARD_RECYCLE_QUEUE_FULL",
+				].includes(error?.code)
+					? error.code
+					: "GUARD_RECYCLE_UNAVAILABLE",
+				...ownerFields,
 			});
 			if (res.headersSent) res.destroy(error);
 			else
@@ -2677,15 +2840,13 @@ export function createGuard(options = {}) {
 				);
 			return true;
 		}
-		if (
-			context.abortCause === "accepted_deadline" ||
-			error?.code === "GUARD_ACCEPTED_DEADLINE"
-		) {
+		if (context.abortCause === "accepted_deadline") {
 			counters.acceptedDeadlineExceeded += 1;
 			log("guard_accepted_deadline_exceeded", {
 				id: context.id,
 				attempt,
 				elapsedMs,
+				...ownerFields,
 			});
 			if (res.headersSent) res.destroy(error);
 			else
@@ -2698,15 +2859,13 @@ export function createGuard(options = {}) {
 				);
 			return true;
 		}
-		if (
-			context.abortCause === "deadline" ||
-			error?.code === "GUARD_DEADLINE_EXCEEDED"
-		) {
+		if (context.abortCause === "deadline") {
 			counters.deadlineExceeded += 1;
 			log("guard_deadline_exceeded", {
 				id: context.id,
 				attempt,
 				elapsedMs,
+				...ownerFields,
 			});
 			sendJsonError(
 				res,
@@ -2717,16 +2876,16 @@ export function createGuard(options = {}) {
 			);
 			return true;
 		}
-		if (
-			context.abortCause === "client" ||
-			error?.name === "AbortError" ||
-			context.signal.aborted
-		) {
+		if (context.abortCause === "client" || context.abortCause === "unknown") {
 			counters.aborted += 1;
-			log("client_aborted", {
+			const observedClient = context.abortCause === "client";
+			if (observedClient) counters.clientAborted += 1;
+			else counters.unknownAborted += 1;
+			log(observedClient ? "client_aborted" : "guard_abort_unknown", {
 				id: context.id,
 				attempt,
 				elapsedMs,
+				...ownerFields,
 				...rawResponseTelemetryFields(responseTelemetry),
 			});
 			return true;
@@ -2742,12 +2901,20 @@ export function createGuard(options = {}) {
 		responseTelemetry,
 	) {
 		if (error?.code !== "GUARD_RESPONSE_IDLE_TIMEOUT") return false;
+		if (
+			context.abortCause != null &&
+			context.abortCause !== "provider_failure"
+		) {
+			return handleAbort(error, res, context, attempt, responseTelemetry);
+		}
+		context.recordAbortOwner("provider_failure", "response_body_idle");
 		counters.responseBodyIdleTimeouts += 1;
 		log("response_body_idle_timeout", {
 			id: context.id,
 			attempt,
 			elapsedMs: now() - context.acceptedAt,
 			responseIdleTimeoutMs,
+			...context.abortFields(),
 			...rawResponseTelemetryFields(responseTelemetry),
 		});
 		if (!res.destroyed) res.destroy(error);
@@ -2813,6 +2980,7 @@ export function createGuard(options = {}) {
 				inspection,
 				context.beginResponse,
 				responseIdleTimeoutMs,
+				context.recordSourceFailure,
 			);
 		} else if (buffer === undefined) {
 			await sendFinalResponse(
@@ -2820,6 +2988,7 @@ export function createGuard(options = {}) {
 				upstreamResponse,
 				context.beginResponse,
 				responseIdleTimeoutMs,
+				context.recordSourceFailure,
 			);
 		} else {
 			await sendBufferedResponse(
@@ -2943,6 +3112,7 @@ export function createGuard(options = {}) {
 							upstreamResponse,
 							context.beginResponse,
 							responseIdleTimeoutMs,
+							context.recordSourceFailure,
 						);
 					} finally {
 						lease.release();
@@ -3228,6 +3398,7 @@ export function createGuard(options = {}) {
 								inspection,
 								context.beginResponse,
 								responseIdleTimeoutMs,
+								context.recordSourceFailure,
 							);
 						} finally {
 							lease.release();
@@ -3358,6 +3529,7 @@ export function createGuard(options = {}) {
 						upstreamResponse,
 						context.beginResponse,
 						responseIdleTimeoutMs,
+						context.recordSourceFailure,
 					);
 				} finally {
 					lease.release();
@@ -3380,12 +3552,14 @@ export function createGuard(options = {}) {
 				return;
 			}
 			if (handleAbort(error, res, context, attempt, responseTelemetry)) return;
+			context.recordAbortOwner("provider_failure", "upstream_failure");
 			counters.upstreamTransportErrors += 1;
 			log("proxy_exception", {
 				id,
 				attempt,
 				message: error.message,
 				...transportErrorFields(error),
+				...context.abortFields(),
 				...rawResponseTelemetryFields(responseTelemetry),
 			});
 			if (res.headersSent) {
@@ -3417,6 +3591,7 @@ export function createGuard(options = {}) {
 				upstreamResponse,
 				context.beginResponse,
 				responseIdleTimeoutMs,
+				context.recordSourceFailure,
 			);
 		} catch (error) {
 			if (
@@ -3425,12 +3600,14 @@ export function createGuard(options = {}) {
 				return;
 			}
 			if (handleAbort(error, res, context, 1, responseTelemetry)) return;
+			context.recordAbortOwner("provider_failure", "upstream_failure");
 			counters.upstreamTransportErrors += 1;
 			log("proxy_exception", {
 				id: context.id,
 				attempt: 1,
 				message: error.message,
 				...transportErrorFields(error),
+				...context.abortFields(),
 				...rawResponseTelemetryFields(responseTelemetry),
 			});
 			if (res.headersSent) {
@@ -3456,7 +3633,7 @@ export function createGuard(options = {}) {
 				const context = createRequestContext(req, res);
 				counters.drainingRejected += 1;
 				log("guard_draining", { id: context.id });
-				drainRequestForContext(req, context);
+				drainRequestForContext(req, res, context);
 				sendJsonError(
 					res,
 					context,
@@ -3475,8 +3652,8 @@ export function createGuard(options = {}) {
 			if (req.url === "/_guard/health") {
 				// Even a GET may carry a slow body. Health bypasses admission, so it
 				// must own its bounded discard after the immediate response.
-				drainRequest(req, requestDrainTimeoutMs, () =>
-					onRequestDrainTimeout(null),
+				drainRequest(req, requestDrainTimeoutMs, (details) =>
+					onRequestDrainTimeout(null, res, "health_discard", details),
 				);
 				res.writeHead(200, { "content-type": "application/json" });
 				res.end(
@@ -3576,7 +3753,7 @@ export function createGuard(options = {}) {
 
 			const context = createRequestContext(req, res);
 			if (req.url === "/health" && lifecycle !== "serving") {
-				drainRequestForContext(req, context);
+				drainRequestForContext(req, res, context);
 				sendJsonError(
 					res,
 					context,
@@ -3590,7 +3767,7 @@ export function createGuard(options = {}) {
 			}
 			const upstreamTarget = resolveUpstreamTarget(req.url, upstreamUrl);
 			if (!upstreamTarget) {
-				drainRequestForContext(req, context);
+				drainRequestForContext(req, res, context);
 				sendJsonError(
 					res,
 					context,
@@ -3605,7 +3782,7 @@ export function createGuard(options = {}) {
 			try {
 				await waitForServing(context);
 			} catch (error) {
-				drainRequestForContext(req, context);
+				drainRequestForContext(req, res, context);
 				handleAbort(error, res, context, 0, null);
 				context.dispose();
 				return;
@@ -3622,7 +3799,7 @@ export function createGuard(options = {}) {
 				} catch (error) {
 					// Queue rejection/expiry happens before body listeners are attached;
 					// drain the upload so keep-alive parsing remains synchronized.
-					drainRequestForContext(req, context);
+					drainRequestForContext(req, res, context);
 					if (error?.code === "GUARD_QUEUE_FULL") {
 						sendQueueFull(res, context);
 					} else if (!handleAbort(error, res, context, 0, null)) {
@@ -3648,7 +3825,7 @@ export function createGuard(options = {}) {
 			// admission decision above but never receives a body-reader reservation.
 			const bodyPlan = classifyRequestBody(req, maxRequestBodyBytes);
 			if (bodyPlan.oversized) {
-				drainRequestForContext(req, context);
+				drainRequestForContext(req, res, context, "body_too_large");
 				counters.oversizedRequestBodies += 1;
 				log("guard_request_body_too_large", {
 					id: context.id,
@@ -3682,7 +3859,8 @@ export function createGuard(options = {}) {
 					context.signal,
 					maxRequestBodyBytes,
 					Math.min(requestDrainTimeoutMs, Math.max(1, context.remainingMs())),
-					() => onRequestDrainTimeout(context),
+					(phase, details) =>
+						onRequestDrainTimeout(context, res, phase, details),
 					bodyPlan.declaredLength,
 				);
 			} catch (error) {
@@ -3690,7 +3868,7 @@ export function createGuard(options = {}) {
 				admissionLease = null;
 				bodyReaderLease?.release();
 				bodyReaderLease = null;
-				if (!bodyReadStarted) drainRequestForContext(req, context);
+				if (!bodyReadStarted) drainRequestForContext(req, res, context);
 				if (error?.code === "GUARD_BODY_READER_QUEUE_FULL") {
 					sendBodyReaderQueueFull(res, context);
 					context.dispose();
