@@ -68,6 +68,15 @@ test.each([
 		return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]!;
 	};
 	let runnerEnvironment: NodeJS.ProcessEnv;
+	const rssMode = mode === "rss_then_commit" || mode === "rss_prepared";
+	const procRoot = join(dir, "fixture-proc");
+	const headerRelease = join(dir, "release-headers");
+	const streamRelease = join(dir, "release-stream");
+	const armRss = (pid: number) => {
+		const status = join(procRoot, String(pid), "status");
+		writeFileSync(status + ".next", "Name:\tfixture\nVmRSS:\t1 kB\nVmSwap:\t0 kB\n");
+		renameSync(status + ".next", status);
+	};
 	try {
 		for (const [name, sha, delay] of [
 			["old", oldSource, 0],
@@ -77,10 +86,10 @@ test.each([
 				binary = join(dir, name);
 			writeFileSync(
 				source,
-				`import {Database} from "bun:sqlite";import {openSync,closeSync,unlinkSync,appendFileSync} from "node:fs";import {createManagedIngress} from ${JSON.stringify(join(root, "apps/server/src/managed-ingress.ts"))};
- ${name === "candidate" && mode === "early_exit" ? "process.exit(42);" : ""}const lock=process.env.FIXTURE_DB+".owner";const owner=openSync(lock,"wx");const db=new Database(process.env.FIXTURE_DB);db.exec("CREATE TABLE IF NOT EXISTS calls(generation INTEGER,path TEXT)");appendFileSync(process.env.FIXTURE_EVENTS,"open:"+process.pid+"\\n");
+				`import {Database} from "bun:sqlite";import {openSync,closeSync,unlinkSync,appendFileSync,existsSync,mkdirSync,readFileSync,writeFileSync} from "node:fs";import {createManagedIngress} from ${JSON.stringify(join(root, "apps/server/src/managed-ingress.ts"))};
+ ${name === "candidate" && mode === "early_exit" ? "process.exit(42);" : ""}const lock=process.env.FIXTURE_DB+".owner";const owner=openSync(lock,"wx");if(process.env.FIXTURE_PROC_ROOT){const proc=process.env.FIXTURE_PROC_ROOT+"/"+process.pid;mkdirSync(proc,{recursive:true});writeFileSync(proc+"/stat",readFileSync("/proc/"+process.pid+"/stat"));writeFileSync(proc+"/status",${JSON.stringify("Name:\tfixture\nVmRSS:\t0 kB\nVmSwap:\t0 kB\n")});}const db=new Database(process.env.FIXTURE_DB);db.exec("CREATE TABLE IF NOT EXISTS calls(generation INTEGER,path TEXT)");appendFileSync(process.env.FIXTURE_EVENTS,"open:"+process.pid+"\\n");
  await Bun.sleep(${delay});const ingress=createManagedIngress({enabled:true,secret:Buffer.from(process.env.CCFLARE_GUARD_CORRELATION_SECRET,"base64url"),generation:Number(process.env.CCFLARE_MANAGED_GENERATION),ingressNonce:process.env.CCFLARE_MANAGED_INGRESS_NONCE,candidateNonce:${JSON.stringify(name === "candidate" && mode === "bad_nonce" ? "e".repeat(32) : null)} ?? process.env.CCFLARE_MANAGED_CANDIDATE_NONCE,sourceSha:process.env.CCFLARE_SOURCE_SHA});
- const server=Bun.serve({hostname:"127.0.0.1",port:Number(process.env.PORT),fetch:r=>ingress(r,async req=>{const url=new URL(req.url);if(url.pathname==="/health")return Response.json({status:"ok",git_sha:${JSON.stringify(name === "candidate" && mode === "bad_source" ? oldSource : sha)}});db.query("INSERT INTO calls VALUES(?,?)").run(Number(process.env.CCFLARE_MANAGED_GENERATION),url.pathname);if(url.pathname==="/v1/slow")return new Response(new ReadableStream({start(c){c.enqueue(new TextEncoder().encode("first"));setTimeout(()=>{try{c.enqueue(new TextEncoder().encode("last"));c.close();}catch{}},350);}}));return new Response(${JSON.stringify(sha)});})});
+ const server=Bun.serve({hostname:"127.0.0.1",port:Number(process.env.PORT),fetch:r=>ingress(r,async req=>{const url=new URL(req.url);if(url.pathname==="/health")return Response.json({status:"ok",git_sha:${JSON.stringify(name === "candidate" && mode === "bad_source" ? oldSource : sha)}});db.query("INSERT INTO calls VALUES(?,?)").run(Number(process.env.CCFLARE_MANAGED_GENERATION),url.pathname);if(url.pathname==="/v1/slow"){const waitForFile=path=>new Promise(resolve=>{const timer=setInterval(()=>{if(existsSync(path)){clearInterval(timer);resolve();}},10);});if(process.env.FIXTURE_HEADER_RELEASE)await waitForFile(process.env.FIXTURE_HEADER_RELEASE);return new Response(new ReadableStream({start(c){c.enqueue(new TextEncoder().encode("first"));const finish=()=>{try{c.enqueue(new TextEncoder().encode("last"));c.close();}catch{}};if(process.env.FIXTURE_STREAM_RELEASE)waitForFile(process.env.FIXTURE_STREAM_RELEASE).then(finish);else setTimeout(finish,350);}}));}return new Response(${JSON.stringify(sha)});})});
  process.on("SIGTERM",()=>{server.stop(true);db.close();closeSync(owner);unlinkSync(lock);appendFileSync(process.env.FIXTURE_EVENTS,"close:"+process.pid+"\\n");process.exit(0);});`,
 			);
 			const result = spawnSync(
@@ -110,12 +119,15 @@ test.each([
 				CCFLARE_PIN_PATH: pin,
 				CCFLARE_TRANSACTION_DIR: control,
 				CCFLARE_MANAGED_TIMING: "1",
-				...(["rss_then_commit", "rss_prepared"].includes(mode)
+				...(rssMode
 					? {
 							RUNNER_RSS_THRESHOLD_BYTES: "1",
 							RUNNER_RSS_POLL_INTERVAL_MS: "20",
-							RUNNER_RSS_MIN_UPTIME_MS:
-								mode === "rss_prepared" ? "1000" : "150",
+							RUNNER_RSS_MIN_UPTIME_MS: "0",
+							RUNNER_PROC_ROOT: procRoot,
+							FIXTURE_PROC_ROOT: procRoot,
+							FIXTURE_HEADER_RELEASE: headerRelease,
+							FIXTURE_STREAM_RELEASE: streamRelease,
 							RUNNER_RSS_CONSECUTIVE_SAMPLES: "1",
 							RUNNER_RSS_RECYCLE_COOLDOWN_MS: "0",
 							RUNNER_RSS_MAX_RECYCLES: "1",
@@ -150,21 +162,50 @@ test.each([
 			return existsSync(join(control, "runtime.json")) && h;
 		});
 		const guardPid = health.runtime.process.guardPid;
-		const response = await fetch(base + "/v1/slow", {
-			method: "POST",
-			body: "{}",
-		});
-		const oldBody = response.text();
+		// Capture the original epoch before waiting for response headers. RSS is
+		// disarmed until this owner and its physical request admission are proven.
 		const initialRuntime = JSON.parse(
 			readFileSync(join(control, "runtime.json"), "utf8"),
 		);
+		expect(initialRuntime.generation).toBe(1);
+		const responsePending = fetch(base + "/v1/slow", {
+			method: "POST",
+			body: "{}",
+		});
+		if (rssMode) {
+			// Deterministically delay headers until the original owner has admitted
+			// the request, instead of betting on a 150ms watchdog/startup race.
+			const admission = new Database(join(dir, "fixture.db"), { readonly: true });
+			try {
+				const row = await until(() =>
+					admission.query("SELECT generation FROM calls WHERE path='/v1/slow'").get(),
+				);
+				expect(row).toEqual({ generation: initialRuntime.generation });
+			} finally {
+				admission.close();
+			}
+			const admitted = await (await fetch(base + "/_guard/health")).json();
+			expect(admitted.lifecycle.generation).toBe(initialRuntime.generation);
+			expect(admitted.lifecycle.dispatched).toBe(1);
+			expect(logs).not.toContain("RSS recycle trigger");
+			writeFileSync(headerRelease, "release\n");
+		}
+		const response = await responsePending;
+		const oldBody = response.text();
 		if (mode === "rss_then_commit") {
+			armRss(initialRuntime.oldPid);
+			await until(async () => {
+				const h = await (await fetch(base + "/_guard/health")).json();
+				return h.lifecycle.state === "draining" && h;
+			});
+			expect(existsSync(`/proc/${initialRuntime.oldPid}`)).toBe(true);
+			writeFileSync(streamRelease, "release\n");
 			expect(await oldBody).toBe("firstlast");
 			const recycled = await until(() => {
 				const r = JSON.parse(
 					readFileSync(join(control, "runtime.json"), "utf8"),
 				);
-				return r.generation === 2 && r;
+				return r.generation === initialRuntime.generation + 1 && r;
 			});
 			expect(existsSync(`/proc/${initialRuntime.oldPid}`)).toBe(false);
 			expect(existsSync(`/proc/${initialRuntime.deploymentPid}`)).toBe(false);
@@ -198,6 +239,7 @@ test.each([
 			// Model a durable preparation whose acknowledgement/daemon exit was lost.
 			// The actual RSS supervisor must retire the daemon and adopt that receipt.
 			prepareTransaction(control, manifest, runtime);
+			armRss(runtime.oldPid);
 		} else {
 			const client = spawnSync(
 				node,
@@ -227,6 +269,10 @@ test.each([
 			body: "{}",
 			signal: waitingAbort.signal,
 		});
+		if (mode === "rss_prepared") {
+			expect(existsSync(`/proc/${initialRuntime.oldPid}`)).toBe(true);
+			writeFileSync(streamRelease, "release\n");
+		}
 		expect(await oldBody).toBe("firstlast");
 		expect((await expired).status).toBe(504);
 		if (mode === "early_exit") {
