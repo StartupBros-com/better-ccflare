@@ -312,3 +312,30 @@ test("official inline Node bootstrap import does not execute CLI entrypoint", ()
 	expect(child.status).toBe(0);
 	expect(child.stdout.trim()).toBe("function");
 });
+
+test("malformed running owner receipt holds before any process absence lookup", () => {
+	const f = fixture();
+	try {
+		for (const owner of [
+			{ phase: "running" },
+			{ phase: "running", pid: 0, start: "2" },
+			{ phase: "running", pid: "999998", start: "2" },
+			{ phase: "running", pid: 999998, start: undefined },
+			{ phase: "running", pid: 999998, start: 2 },
+			{ phase: "running", pid: 999998, start: "../../self" },
+			{ phase: "running", pid: 999998, start: "0002" },
+		]) {
+			writeFileSync(join(f.dir, "owner.json"), JSON.stringify(owner));
+			let lookups = 0;
+			expect(
+				recoverTransaction(f.dir, () => {
+					lookups++;
+					return false;
+				}),
+			).toEqual({ action: "hold", reason: "unreaped_or_ambiguous_owner" });
+			expect(lookups).toBe(0);
+		}
+	} finally {
+		rmSync(f.dir, { recursive: true, force: true });
+	}
+});

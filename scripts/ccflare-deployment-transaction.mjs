@@ -225,7 +225,15 @@ export function recoverTransaction(dir, exists = processExists, configured) {
 	try {
 		if (existsSync(join(dir, "owner.json"))) {
 			const owner = JSON.parse(readFileSync(join(dir, "owner.json"), "utf8"));
-			if (owner.phase !== "running" || exists(owner.pid, owner.start))
+			if (
+				owner?.phase !== "running" ||
+				!Number.isSafeInteger(owner.pid) ||
+				owner.pid < 1 ||
+				typeof owner.start !== "string" ||
+				!/^(0|[1-9]\d{0,19})$/.test(owner.start) ||
+				BigInt(owner.start) > 18446744073709551615n ||
+				exists(owner.pid, owner.start)
+			)
 				return { action: "hold", reason: "unreaped_or_ambiguous_owner" };
 		}
 		const bootstrapPath = join(dir, "bootstrap.json");
