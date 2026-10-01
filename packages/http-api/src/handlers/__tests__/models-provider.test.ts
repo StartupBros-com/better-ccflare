@@ -105,6 +105,54 @@ async function ask(context: APIContext, query: string): Promise<Body> {
 }
 
 describe("GET /api/models", () => {
+	it("exposes only allowlisted capability facts and labels borrowed models shared", async () => {
+		const context = makeContext({});
+		if (!context.modelCatalog) throw new Error("missing test catalog");
+		context.modelCatalog.codexModels = async () => ({
+			source: "shared",
+			fetchedAt: 1000,
+			models: [
+				{
+					id: "gpt-6-astra",
+					displayName: "Astra",
+					description: null,
+					contextWindow: 10000,
+					maxContextWindow: 20000,
+					effectiveContextPercent: 95,
+					supersededBy: null,
+					capabilities: {
+						contextWindow: 10000,
+						maxContextWindow: 20000,
+						effectiveContextPercent: 95,
+						maxOutputTokens: 2000,
+						inputModalities: ["text", "image"],
+						toolEvidence: {
+							supports_search_tool: true,
+							secret: "do-not-serialize",
+						},
+						nativeCapabilities: { secret: "do-not-serialize" },
+						revision: "test",
+					},
+				},
+			],
+		});
+		const response = await createModelsHandler(context)(
+			new URL("http://local/api/models?provider=codex&accountId=a"),
+		);
+		const body = await response.json();
+		expect(body.source).toBe("shared");
+		expect(body.models[0].source).toBe("shared");
+		expect(body.models[0].capabilities).toEqual({
+			contextWindow: 10000,
+			maxContextWindow: 20000,
+			effectiveContextPercent: 95,
+			maxOutputTokens: 2000,
+			inputModalities: ["text", "image"],
+			toolEvidence: { supports_search_tool: true },
+		});
+		expect(JSON.stringify(body)).not.toContain("do-not-serialize");
+		expect(body.warning).toContain("another account");
+	});
 	it("preserves the legacy bundled fallback for the bare endpoint", async () => {
 		const context = makeContext({
 			anthropic: {

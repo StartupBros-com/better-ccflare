@@ -78,6 +78,7 @@ export function evaluateQualityRouteAdmission(
 		requestModel: target.physicalModel,
 		observedAt: usage.observedAt,
 		spendGrants: policy.spendGrants,
+		accessToken: input.selectedCredentials?.accessToken ?? null,
 	});
 	if (capacity.status !== "admit") return capacity;
 	const fit = evaluateAutoRequestAdmission(request);

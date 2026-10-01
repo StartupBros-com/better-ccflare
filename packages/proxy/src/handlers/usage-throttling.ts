@@ -4,7 +4,11 @@ import {
 	getModelFamily,
 	weeklyScopedWindowKey,
 } from "@better-ccflare/core";
-import type { AnyUsageData } from "@better-ccflare/providers";
+import {
+	type AnyUsageData,
+	type CodexSubscriptionFacts,
+	getCodexSubscriptionFacts,
+} from "@better-ccflare/providers";
 import type {
 	Account,
 	AccountBindingConstraint,
@@ -21,6 +25,8 @@ export interface AutoCapacityOptions {
 	readonly requestModel: string;
 	readonly observedAt: number;
 	readonly now?: number;
+	/** Actual resolved credential at physical dispatch; selection uses poll ownership. */
+	readonly accessToken?: string | null;
 	/** Trusted current policy only; never provider payload or request headers. */
 	readonly spendGrants: readonly QualitySpendGrant[];
 }
@@ -40,15 +46,73 @@ export function evaluateAutoCapacity(
 	) {
 		return { status: "unknown", reason: "capacity-evidence-unknown" };
 	}
+	const codex =
+		options.provider === "codex"
+			? getCodexSubscriptionFacts(
+					data,
+					options.accountId,
+					now,
+					DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS,
+					options.accessToken,
+				)
+			: null;
+	// Serializable projection may veto even with a grant, but cannot establish
+	// billing safety or omit a legacy row without private source ownership.
+	const codexCapacity =
+		codex ??
+		(options.provider === "codex"
+			? (data as { codex_subscription?: CodexSubscriptionFacts } | null)
+					?.codex_subscription
+			: null);
+	if (codexCapacity) {
+		if (codexCapacity.allowed === false || codexCapacity.limitReached === true)
+			return { status: "reject", reason: "provider-capacity-exhausted" };
+		if (
+			codexCapacity.allowed !== true ||
+			codexCapacity.limitReached !== false ||
+			codexCapacity.additionalLimitsUnknown !== false
+		)
+			return { status: "unknown", reason: "capacity-evidence-unknown" };
+		let live = false;
+		for (const window of [codexCapacity.primary, codexCapacity.secondary]) {
+			if (window?.presence === "null") continue;
+			if (
+				window?.presence !== "window" ||
+				typeof window.utilization !== "number" ||
+				!Number.isFinite(window.utilization) ||
+				window.utilization < 0 ||
+				typeof window.resetsAt !== "number" ||
+				!Number.isFinite(window.resetsAt) ||
+				window.resetsAt <= now
+			)
+				return { status: "unknown", reason: "capacity-evidence-unknown" };
+			if (window.utilization >= 100)
+				return { status: "reject", reason: "provider-capacity-exhausted" };
+			live = true;
+		}
+		if (!live)
+			return { status: "unknown", reason: "capacity-evidence-unknown" };
+	}
 	const family = getModelFamily(options.requestModel);
-	const rows = collectAutoCapacityEvidence(data, options.provider).filter(
-		(row) =>
-			row.scope === "account" ||
-			row.scope === "unknown" ||
-			(row.scope === "model"
-				? row.model === options.requestModel
-				: row.model === family),
-	);
+	const rows = collectAutoCapacityEvidence(data, options.provider)
+		.filter(
+			// Only source-proven synthesized empty mirrors may be omitted. Generic
+			// limits rows (including invalid/exhausted ones) always remain authoritative.
+			(row) =>
+				!(
+					codex &&
+					row.source === "flat" &&
+					codex.omittedLegacyWindows.includes(row.window)
+				),
+		)
+		.filter(
+			(row) =>
+				row.scope === "account" ||
+				row.scope === "unknown" ||
+				(row.scope === "model"
+					? row.model === options.requestModel
+					: row.model === family),
+		);
 	let unknown = false;
 	let accountEvidence = false;
 	let allowanceExhausted = false;
@@ -94,7 +158,11 @@ export function evaluateAutoCapacity(
 			? billingPayload?.spend !== undefined
 				? billingPayload.spend?.enabled
 				: billingPayload?.extra_usage?.is_enabled
-			: undefined;
+			: codex?.hasCredits === false &&
+					codex.unlimited === false &&
+					codex.balance === 0
+				? false
+				: undefined;
 	const billing =
 		enabled === false
 			? "unavailable"
@@ -127,8 +195,8 @@ export function evaluateAutoCapacity(
 	}
 	if (unknown || !accountEvidence)
 		return { status: "unknown", reason: "capacity-evidence-unknown" };
-	// Codex has no established subscription-only billing signal in this adapter.
-	// Billing enablement is not assurance that this request stays within allowance.
+	// Only owned no-credit Codex facts or confirmed-disabled native billing
+	// establish subscription-only safety; quota or plan labels alone cannot.
 	if (!grant && billing !== "unavailable")
 		return { status: "unknown", reason: "spend-not-authorized" };
 	return { status: "admit" };
