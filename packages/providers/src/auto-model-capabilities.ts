@@ -18,6 +18,8 @@ export interface AutoModelCapabilities {
 	readonly maxContextWindow: number | null;
 	readonly effectiveContextPercent: number | null;
 	readonly maxOutputTokens: number | null;
+	/** Only Codex's absent/null catalog field delegates acceptance, not malformed data. */
+	readonly providerManagedOutput: boolean;
 	readonly inputModalities: readonly string[] | null;
 	/** Provider-specific evidence, not a generic tool support grant. */
 	readonly toolEvidence: Readonly<Record<string, EvidenceValue>>;
@@ -237,6 +239,55 @@ export function normalizeAutoModelCapabilities(
 ): AutoModelCapabilities {
 	const percent = raw.effective_context_window_percent;
 	const modalities = raw.input_modalities;
+	const inputModalities = new Set<string>(
+		Array.isArray(modalities) &&
+			modalities.every(
+				(item) =>
+					typeof item === "string" &&
+					["text", "image", "audio", "video", "pdf"].includes(item),
+			)
+			? modalities
+			: [],
+	);
+	const nativeCapabilities =
+		provider === "anthropic" ? evidenceValue(raw.capabilities) : null;
+	if (provider === "anthropic") {
+		// Reviewed exact IDs share the documented text baseline; never infer by prefix.
+		// https://platform.claude.com/docs/en/about-claude/models/overview.md
+		if (
+			Object.values(SUPPORTED_IDENTITIES).some(
+				(support) =>
+					support.provider === provider &&
+					typeof raw.id === "string" &&
+					support.models.includes(raw.id),
+			)
+		)
+			inputModalities.add("text");
+		if (
+			nativeCapabilities &&
+			typeof nativeCapabilities === "object" &&
+			!Array.isArray(nativeCapabilities)
+		) {
+			for (const [key, modality] of [
+				["image_input", "image"],
+				["pdf_input", "pdf"],
+			] as const) {
+				const capability = (
+					nativeCapabilities as Record<string, EvidenceValue>
+				)[key];
+				if (
+					!capability ||
+					typeof capability !== "object" ||
+					Array.isArray(capability)
+				)
+					continue;
+				const supported = (capability as Record<string, EvidenceValue>)
+					.supported;
+				if (supported === true) inputModalities.add(modality);
+				else if (supported === false) inputModalities.delete(modality);
+			}
+		}
+	}
 	const toolEvidence: Record<string, EvidenceValue> = {};
 	for (const key of [
 		"tool_mode",
@@ -265,19 +316,15 @@ export function normalizeAutoModelCapabilities(
 		maxOutputTokens: positiveSafeCapacity(
 			provider === "codex" ? raw.max_output_tokens : raw.max_tokens,
 		),
-		inputModalities:
-			Array.isArray(modalities) &&
-			modalities.length > 0 &&
-			modalities.every(
-				(item) =>
-					typeof item === "string" &&
-					["text", "image", "audio", "video", "pdf"].includes(item),
-			)
-				? Object.freeze([...new Set(modalities as string[])])
-				: null,
+		providerManagedOutput:
+			provider === "codex" &&
+			(!Object.hasOwn(raw, "max_output_tokens") ||
+				raw.max_output_tokens === null),
+		inputModalities: inputModalities.size
+			? Object.freeze([...inputModalities])
+			: null,
 		toolEvidence: Object.freeze(toolEvidence),
-		nativeCapabilities:
-			provider === "anthropic" ? evidenceValue(raw.capabilities) : null,
+		nativeCapabilities,
 	};
 	if (
 		facts.contextWindow !== null &&

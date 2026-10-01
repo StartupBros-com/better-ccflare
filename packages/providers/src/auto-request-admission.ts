@@ -29,6 +29,8 @@ export function decideAutoContextFit(input: {
 	requestedOutput: unknown;
 	contextLimit: unknown;
 	outputLimit: unknown;
+	/** Explicit opt-in for an unpublished provider ceiling; context still reserves output. */
+	outputLimitMode?: "provider-managed";
 }): QualityAdmissionDecision {
 	const output = positiveSafeCapacity(input.requestedOutput);
 	const ceiling = positiveSafeCapacity(input.outputLimit);
@@ -39,7 +41,11 @@ export function decideAutoContextFit(input: {
 	if (
 		context === null ||
 		output === null ||
-		ceiling === null ||
+		(ceiling === null &&
+			!(
+				input.outputLimitMode === "provider-managed" &&
+				input.outputLimit === null
+			)) ||
 		typeof tokens !== "number" ||
 		!Number.isSafeInteger(tokens) ||
 		tokens < 0
@@ -589,7 +595,9 @@ export function evaluateAutoRequestAdmission(
 	} else return { status: "unknown", reason: "request-preservation-unknown" };
 	if (!requestedModalities || !capabilities?.inputModalities)
 		return { status: "unknown", reason: "modality-unsupported" };
-	if (capabilities.maxOutputTokens === null)
+	const providerManagedOutput =
+		target.provider === "codex" && capabilities.providerManagedOutput === true;
+	if (capabilities.maxOutputTokens === null && !providerManagedOutput)
 		return { status: "unknown", reason: "output-unsupported" };
 	if (capabilities.maxContextWindow === null)
 		return { status: "unknown", reason: "context-unsupported" };
@@ -643,6 +651,9 @@ export function evaluateAutoRequestAdmission(
 			requestedOutput: output,
 			contextLimit,
 			outputLimit: capabilities.maxOutputTokens,
+			...(providerManagedOutput
+				? { outputLimitMode: "provider-managed" as const }
+				: {}),
 		}),
 		accounting: {
 			source: "local-envelope-v1",
@@ -651,6 +662,10 @@ export function evaluateAutoRequestAdmission(
 			inputEstimate,
 			headroom,
 			requestedOutput: output,
+			outputLimit:
+				capabilities.maxOutputTokens === null
+					? { kind: "provider-managed", tokens: null }
+					: { kind: "catalog", tokens: capabilities.maxOutputTokens },
 		},
 	};
 }

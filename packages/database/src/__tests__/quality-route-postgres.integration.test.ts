@@ -327,7 +327,28 @@ describe.skipIf(!postgresUrl)(
 			expect(after.decision).toBeNull();
 		});
 
-		it("quality explanations survive fresh/upgrade, late saves and cross-connection readback", async () => {
+		it.each([
+			{ name: "legacy omission", disclosure: {} },
+			{
+				name: "provider-managed output",
+				disclosure: { outputLimit: { kind: "provider-managed", tokens: null } },
+			},
+			{
+				name: "catalog output",
+				disclosure: { outputLimit: { kind: "catalog", tokens: 32000 } },
+			},
+		] as const)("quality explanations survive fresh/upgrade, late saves and cross-connection readback: $name", async ({
+			disclosure,
+		}) => {
+			const accounting = {
+				source: "local-envelope-v1",
+				kind: "estimate",
+				envelopeBytes: 256,
+				inputEstimate: 64,
+				requestedOutput: 32,
+				headroom: 128,
+				...disclosure,
+			} as const;
 			const repo = new RequestRepository(adapters[0]);
 			const data = {
 				id: "quality-history",
@@ -348,8 +369,11 @@ describe.skipIf(!postgresUrl)(
 				skippedLanes: [
 					{ lane: "fable", reasons: { "subscription-exhausted": 1 } },
 				],
+				accounting,
 			});
 			expect(decision).not.toBeNull();
+			if (!decision) throw new Error("Invalid quality decision fixture");
+			expect(decision.accounting).toEqual(accounting);
 			await repo.save({ ...data, qualityDecision: decision });
 			await repo.save(data);
 			const row = await adapters[1].get<RequestRow>(
@@ -358,6 +382,7 @@ describe.skipIf(!postgresUrl)(
 			);
 			if (!row) throw new Error("Missing request fixture row");
 			expect(toRequest(row).qualityDecision).toEqual(decision);
+			expect(toRequest(row).qualityDecision?.accounting).toEqual(accounting);
 			await adapters[0].unsafe(
 				"ALTER TABLE requests DROP COLUMN quality_decision",
 			);
@@ -380,6 +405,9 @@ describe.skipIf(!postgresUrl)(
 			);
 			if (!upgraded) throw new Error("Missing request fixture row");
 			expect(toRequest(upgraded).qualityDecision).toEqual(decision);
+			expect(toRequest(upgraded).qualityDecision?.accounting).toEqual(
+				accounting,
+			);
 			expect(upgraded?.model).toBe(target.physicalModel);
 		});
 

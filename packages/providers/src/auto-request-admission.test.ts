@@ -40,7 +40,255 @@ const body = {
 	max_tokens: 20,
 };
 
+describe("documented native Models capabilities reach request admission", () => {
+	function native(
+		raw: Record<string, unknown>,
+		line = "claude-fable" as Parameters<typeof resolveAutoModelTargets>[1],
+	) {
+		const capabilities = normalizeAutoModelCapabilities("anthropic", raw);
+		const catalog = createAutoCatalogEvidence({
+			accountId: "native-fixture",
+			provider: "anthropic",
+			source: "live",
+			fetchedAt: Date.now(),
+			expiresAt: Date.now() + 60000,
+			models: [{ id: String(raw.id), capabilities }],
+		});
+		const target = resolveAutoModelTargets(catalog, line).current;
+		return { catalog, target, capabilities };
+	}
+	const raw = {
+		id: "claude-fable-5-1",
+		max_input_tokens: 10000,
+		max_tokens: 20,
+	};
+	it.each([
+		["claude-fable-5-1", "claude-fable"],
+		["claude-opus-5-5", "claude-opus"],
+		["claude-sonnet-5-5", "claude-sonnet"],
+		["claude-haiku-4-5", "claude-haiku"],
+		["claude-haiku-4-5-20251001", "claude-haiku"],
+	] as const)("admits baseline text for reviewed exact identity %s", (id, line) => {
+		for (const capabilities of [
+			undefined,
+			{},
+			{ image_input: { supported: false }, pdf_input: { supported: false } },
+		]) {
+			const evidence = native({ ...raw, id, capabilities }, line);
+			if (!evidence.target) throw new Error("missing approved target");
+			expect(evidence.capabilities.inputModalities).toEqual(["text"]);
+			expect(
+				evaluateAutoRequestAdmission({
+					...evidence,
+					target: evidence.target,
+					requirements: captureAutoRequestRequirements(body),
+					finalBody: { ...body, model: id },
+				}),
+			).toMatchObject({
+				status: "admit",
+				accounting: { outputLimit: { kind: "catalog", tokens: 20 } },
+			});
+		}
+	});
+	it("never grants baseline text or an approved target from a prefix or capacities", () => {
+		for (const id of [
+			"claude-fable-99",
+			"claude-fable-5-1-unreviewed",
+			"unknown",
+			"",
+		]) {
+			const evidence = native({ ...raw, id });
+			expect(evidence.capabilities.inputModalities ?? []).not.toContain("text");
+			expect(evidence.target).toBeNull();
+		}
+	});
+	it.each([
+		[
+			"image",
+			"image_input",
+			{
+				type: "image",
+				source: { type: "url", url: "https://example.invalid/image" },
+			},
+		],
+		[
+			"pdf",
+			"pdf_input",
+			{
+				type: "document",
+				source: {
+					type: "base64",
+					media_type: "application/pdf",
+					data: "synthetic",
+				},
+			},
+		],
+	] as const)("only boolean native support grants %s, without inventing media accounting", (modality, key, block) => {
+		for (const supported of [true, false, "true", 1, null, undefined]) {
+			const evidence = native({
+				...raw,
+				capabilities: { [key]: { supported } },
+			});
+			if (!evidence.target) throw new Error("missing native target");
+			expect(evidence.capabilities.inputModalities?.includes(modality)).toBe(
+				supported === true,
+			);
+			const original = {
+				...body,
+				messages: [{ role: "user", content: [block] }],
+			};
+			expect(
+				evaluateAutoRequestAdmission({
+					...evidence,
+					target: evidence.target,
+					requirements: captureAutoRequestRequirements(original),
+					finalBody: { ...original, model: raw.id },
+				}),
+			).toMatchObject(
+				supported === true
+					? { status: "unknown", reason: "input-accounting-unknown" }
+					: { status: "reject", reason: "modality-unsupported" },
+			);
+		}
+		for (const capabilities of [undefined, { [key]: { supported: false } }]) {
+			const evidence = native({
+				...raw,
+				input_modalities: ["text", modality],
+				capabilities,
+			});
+			if (!evidence.target) throw new Error("missing native target");
+			const original = {
+				...body,
+				messages: [{ role: "user", content: [block] }],
+			};
+			expect(
+				evaluateAutoRequestAdmission({
+					...evidence,
+					target: evidence.target,
+					requirements: captureAutoRequestRequirements(original),
+					finalBody: { ...original, model: raw.id },
+				}),
+			).toMatchObject(
+				capabilities === undefined
+					? { status: "unknown", reason: "input-accounting-unknown" }
+					: { status: "reject", reason: "modality-unsupported" },
+			);
+		}
+	});
+	it("keeps unknown native output and context unavailable", () => {
+		for (const [field, reason] of [
+			["max_tokens", "output-unsupported"],
+			["max_input_tokens", "context-unsupported"],
+		] as const) {
+			const evidence = native({
+				...raw,
+				[field]: undefined,
+				input_modalities: ["text"],
+			});
+			if (!evidence.target) throw new Error("missing native target");
+			expect(
+				evaluateAutoRequestAdmission({
+					...evidence,
+					target: evidence.target,
+					requirements: captureAutoRequestRequirements(body),
+					finalBody: { ...body, model: raw.id },
+				}),
+			).toMatchObject({ status: "unknown", reason });
+		}
+	});
+});
+
 describe("Auto request suitability (fixtures are not activation proof)", () => {
+	it.each([
+		undefined,
+		null,
+	])("delegates an unpublished Codex output ceiling (%s) without losing the reserve", async (ceiling) => {
+		const original = { ...body, model: "gpt-6-astra" };
+		const transformed = await new CodexProvider().transformRequestBody(
+			new Request("https://chatgpt.com/backend-api/codex/responses", {
+				method: "POST",
+				body: JSON.stringify(original),
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const finalBody = await transformed.json();
+		const catalog = createAutoCatalogEvidence({
+			accountId: "codex-fixture",
+			provider: "codex",
+			source: "live",
+			fetchedAt: Date.now(),
+			expiresAt: Date.now() + 60000,
+			models: [
+				{
+					id: original.model,
+					capabilities: normalizeAutoModelCapabilities("codex", {
+						context_window: 10000,
+						max_context_window: 10000,
+						input_modalities: ["text"],
+						...(ceiling === undefined ? {} : { max_output_tokens: ceiling }),
+					}),
+				},
+			],
+		});
+		const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
+		if (!catalog || !target) throw new Error("missing Codex target");
+		expect(
+			evaluateAutoRequestAdmission({
+				catalog,
+				target,
+				finalBody,
+				requirements: captureAutoRequestRequirements(original),
+			}),
+		).toMatchObject({
+			status: "admit",
+			accounting: {
+				requestedOutput: 20,
+				outputLimit: { kind: "provider-managed", tokens: null },
+			},
+		});
+		for (const invalid of [
+			0,
+			-1,
+			1.5,
+			"20",
+			Number.MAX_SAFE_INTEGER + 1,
+			{},
+			undefined,
+		]) {
+			const malformed = createAutoCatalogEvidence({
+				...catalog,
+				source: "live",
+				models: [
+					{
+						id: original.model,
+						capabilities: normalizeAutoModelCapabilities("codex", {
+							context_window: 10000,
+							max_context_window: 10000,
+							input_modalities: ["text"],
+							max_output_tokens: invalid,
+						}),
+					},
+				],
+			});
+			const malformedTarget = resolveAutoModelTargets(
+				malformed,
+				"gpt-astra",
+			).current;
+			if (!malformed || !malformedTarget)
+				throw new Error("missing malformed target");
+			expect(malformedTarget.capabilityRevision).not.toBe(
+				target.capabilityRevision,
+			);
+			expect(
+				evaluateAutoRequestAdmission({
+					catalog: malformed,
+					target: malformedTarget,
+					finalBody,
+					requirements: captureAutoRequestRequirements(original),
+				}),
+			).toMatchObject({ status: "unknown", reason: "output-unsupported" });
+		}
+	});
 	it("admits native client tools with semantic JSON equality and harmless streaming changes", () => {
 		const original = {
 			...body,
