@@ -185,6 +185,7 @@ export const MAX_ROUTING_ATTEMPT_SNAPSHOTS = 16;
 export const MAX_ROUTING_ATTEMPT_IDENTITY_CHARS = 128;
 export const MAX_ROUTING_ATTEMPT_SUMMARY_CHARS = 16384;
 export type RoutingAttemptCause =
+	| "accepted_request_deadline"
 	| "meaningful_progress_timeout"
 	| "semantic_timeout"
 	| "buffer_limit"
@@ -385,6 +386,7 @@ export interface RequestRoutingAttemptSummary {
 		| null;
 }
 const ROUTING_CAUSES = new Set<RoutingAttemptCause>([
+	"accepted_request_deadline",
 	"meaningful_progress_timeout",
 	"semantic_timeout",
 	"buffer_limit",

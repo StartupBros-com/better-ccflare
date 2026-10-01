@@ -72,6 +72,7 @@ import {
 	RECOVERY_STATUS_EXHAUSTED,
 	RECOVERY_STATUS_HEADER,
 } from "@better-ccflare/types/routing-recovery";
+import { assertManagedWorkAvailable } from "../../../../scripts/ccflare-managed-timing.mjs";
 import { isNativeAnthropicOAuthDegradedModeEligible } from "../anthropic-degraded-eligibility";
 import {
 	type AnthropicDegradedAdmissionDecision,
@@ -2508,8 +2509,9 @@ export async function proxyUnauthenticated(
 				nativeResponses: isResponsesAdapterRequest(req.headers, ctx),
 				signal: dispatchSignal,
 			},
-			() =>
-				makeProxyRequest(
+			() => {
+				assertManagedWorkAvailable(req);
+				return makeProxyRequest(
 					targetUrl,
 					req.method,
 					headers,
@@ -2522,7 +2524,8 @@ export async function proxyUnauthenticated(
 					// drain controller must be present when fetch is created so
 					// terminal recovery can later tear down a stuck response body.
 					dispatchSignal,
-				),
+				);
+			},
 		);
 
 		if (
@@ -2803,6 +2806,7 @@ export async function proxyWithAccount(
 						// No await after the final authoritative gates. Observation is
 						// fail-open and cannot make an expired attempt dispatchable.
 						onHttpDispatch?.();
+						assertManagedWorkAvailable(req);
 						markDispatched();
 						const pendingHttp = makeProxyRequest(
 							request,
@@ -3352,18 +3356,17 @@ export async function proxyWithAccount(
 				capabilityProofKey: capability?.proofKey ?? null,
 				inputReplayMode: capability?.inputReplayMode ?? [],
 				outputReplayMode: capability?.outputReplayMode ?? [],
-				beforePhysicalTransport: routingAttemptLedger
-					? () => {
-							routingAttemptLedger.recordPhysicalAttempt({
-								provider: provider.name,
-								logicalModel: clientRequestedModel,
-								physicalModel,
-								accountId: account.id,
-								candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
-								laneKey: requestMeta.affinityLaneKey ?? null,
-							});
-						}
-					: undefined,
+				beforePhysicalTransport: () => {
+					assertManagedWorkAvailable(req);
+					routingAttemptLedger?.recordPhysicalAttempt({
+						provider: provider.name,
+						logicalModel: clientRequestedModel,
+						physicalModel,
+						accountId: account.id,
+						candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
+						laneKey: requestMeta.affinityLaneKey ?? null,
+					});
+				},
 				serverToolHistoryProjector:
 					capability?.replay.serverToolHistoryProjector,
 				serverToolReplayIssuer: capability?.replay.serverToolReplayIssuer,
@@ -3553,7 +3556,10 @@ export async function proxyWithAccount(
 					timeoutMs:
 						getPreTransportDeadlineConfig().credentialResolutionTimeoutMs,
 					signal: routingSignal,
-					operation: () => getValidAccessToken(account, ctx),
+					operation: () => {
+						assertManagedWorkAvailable(req);
+						return getValidAccessToken(account, ctx);
+					},
 				});
 			} catch (error) {
 				if (error instanceof PreTransportPhaseTimeoutError) {
@@ -4376,6 +4382,7 @@ export async function proxyWithAccount(
 					claimCurrentHostedDispatch();
 				};
 				const claimHostedAndRecordHttpDispatch = (): void => {
+					assertManagedWorkAvailable(req);
 					ensureNativeQuotaDispatch();
 					routingAttemptLedger?.assertPhysicalAttemptAvailable(
 						physicalAttemptVetoContext(),
@@ -4409,21 +4416,19 @@ export async function proxyWithAccount(
 										conversationIdentity: webSocketConversationIdentity,
 										request: transportRequest,
 										signal,
-										onBeforeFrameSend: () =>
+										onBeforeFrameSend: () => {
+											assertManagedWorkAvailable(req);
 											routingAttemptLedger?.assertPhysicalAttemptAvailable(
 												physicalAttemptVetoContext(),
-											),
-										onBeforeFrameWrite: hostedAttempt
-											? () => {
-													// Order matters: the budget assertion inside this claim
-													// can still veto, and a vetoed attempt never wrote a
-													// frame. Only once the hosted claim succeeds has the
-													// attempt passed the point where annulling it would
-													// discard a send that may have reached upstream.
-													claimHostedDispatchAfterBudgetAssertion();
-													markDispatched();
-												}
-											: undefined,
+											);
+										},
+										onBeforeFrameWrite: () => {
+											assertManagedWorkAvailable(req);
+											if (hostedAttempt) {
+												claimHostedDispatchAfterBudgetAssertion();
+												markDispatched();
+											}
+										},
 										onFrameWritten: (receipt) => {
 											markObservedDispatch("websocket");
 											markDispatched();
@@ -4446,7 +4451,10 @@ export async function proxyWithAccount(
 						: undefined,
 					hostedAttempt
 						? claimHostedAndRecordHttpDispatch
-						: recordPhysicalDispatch,
+						: () => {
+								assertManagedWorkAvailable(req);
+								recordPhysicalDispatch();
+							},
 					() => {
 						dispatchStarted = true;
 						// The irreversible boundary: only now is this attempt's route
@@ -4720,7 +4728,10 @@ export async function proxyWithAccount(
 						timeoutMs:
 							getPreTransportDeadlineConfig().credentialResolutionTimeoutMs,
 						signal: routingSignal,
-						operation: () => refreshAccessTokenSafe(account, ctx),
+						operation: () => {
+							assertManagedWorkAvailable(req);
+							return refreshAccessTokenSafe(account, ctx);
+						},
 					});
 				} catch (error) {
 					const capturedRefreshToken = getRefreshTokenUsedForFailure(error);

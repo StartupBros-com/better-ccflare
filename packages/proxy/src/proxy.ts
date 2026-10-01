@@ -34,6 +34,7 @@ import type {
 	RoutingSelectionDiagnostics,
 	RoutingSelectionZeroAttemptReason,
 } from "@better-ccflare/types";
+import { registerManagedTerminal } from "../../../scripts/ccflare-managed-timing.mjs";
 import {
 	type AnthropicDegradedCohortFacts,
 	type AnthropicDegradedRouteInspection,
@@ -975,6 +976,16 @@ async function handleProxyCoreImpl(
 		});
 		return response;
 	};
+	registerManagedTerminal(req, (cause) => {
+		routingAttemptLedger.recordPhysicalOutcome(cause);
+		recordLocalRoutingTerminal(
+			Response.json(
+				{ error: { type: "api_error", code: cause } },
+				{ status: 504 },
+			),
+			cause,
+		);
+	});
 	const createRecordedForceRouteResponse = (
 		error: ForceRouteUnavailableError,
 	): Response => {

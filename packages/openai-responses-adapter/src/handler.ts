@@ -14,6 +14,7 @@ import {
 	RECOVERY_STATUS_HEADER,
 	recoveryScopeForCode,
 } from "@better-ccflare/types/routing-recovery";
+import { inheritManagedRequest } from "../../../scripts/ccflare-managed-timing.mjs";
 import {
 	MAX_RESPONSES_CONTENT_PARTS,
 	MAX_RESPONSES_INPUT_ITEMS,
@@ -570,6 +571,9 @@ export async function handleResponsesRequest(
 		// is built from a URL, which does not inherit the signal.
 		signal: req.signal,
 	});
+
+	// Keep the original accepted budget and terminal arbiter across adaptation.
+	inheritManagedRequest(req, syntheticReq);
 
 	// 6. Forward to proxy
 	log.info(`Forwarding responses request to ${messagesUrl.pathname}`);

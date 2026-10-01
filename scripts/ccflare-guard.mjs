@@ -41,6 +41,17 @@ import {
 	recoveryHeaderStatus,
 } from "./ccflare-guard-policy.mjs";
 
+import {
+	CLIENT_TIMEOUT_HEADER,
+	DEFAULT_ACCEPTED_CAP_MS,
+	MANAGED_TIMING_HEADER,
+	MANAGED_TIMING_VERSION,
+	bootIdentity,
+	createAcceptedTiming,
+	monotonicNowNs,
+	signManagedTiming,
+} from "./ccflare-managed-timing.mjs";
+
 export const DEFAULT_GUARD_SOURCE_ID = "better-ccflare-source-guard-v1";
 export const DEFAULT_GUARD_MAX_ATTEMPTS = 3;
 export const DEFAULT_GUARD_TOTAL_DEADLINE_MS = 600_000;
@@ -196,6 +207,22 @@ export function inspectRuntimeIdentity(options = {}) {
 			runner: parentRunnerIdentity(runnerPid, procRoot),
 			guard: fileIdentity(options.guardPath || GUARD_MODULE_PATH),
 			policy: fileIdentity(options.policyPath || POLICY_MODULE_PATH),
+			timing: fileIdentity(
+				fileURLToPath(new URL("./ccflare-managed-timing.mjs", import.meta.url)),
+			),
+			transaction: (() => {
+				const runner = parentRunnerIdentity(runnerPid, procRoot);
+				return runner
+					? fileIdentity(
+							fileURLToPath(
+								new URL(
+									"./ccflare-deployment-transaction.mjs",
+									`file://${runner.path}`,
+								),
+							),
+						)
+					: null;
+			})(),
 		},
 	};
 }
@@ -309,6 +336,8 @@ function requestHeaders(req, bodyLength, guardCorrelationEnvelope) {
 	// value is always discarded, including when stack credentials are missing.
 	headers.delete(GUARD_REQUEST_ID_HEADER);
 	headers.delete(GUARD_CORRELATION_SECRET_HEADER);
+	headers.delete(MANAGED_TIMING_HEADER);
+	headers.delete(CLIENT_TIMEOUT_HEADER);
 	if (guardCorrelationEnvelope) {
 		headers.set(GUARD_REQUEST_ID_HEADER, guardCorrelationEnvelope);
 	}
@@ -324,6 +353,8 @@ function responseHeaders(fetchHeaders, bodyLength = null) {
 		if (
 			lower === GUARD_REQUEST_ID_HEADER ||
 			lower === GUARD_CORRELATION_SECRET_HEADER ||
+			lower === MANAGED_TIMING_HEADER ||
+			lower === CLIENT_TIMEOUT_HEADER ||
 			lower === PROXY_REQUEST_ID_HEADER
 		) {
 			return;
@@ -438,25 +469,25 @@ function drainRequest(
 	req.once("aborted", cleanup);
 	timer = setTimeout(
 		() => {
-		if (drained) return;
-		timer = undefined;
-		// A rejected upload has no useful continuation. Destroying the request
-		// socket after the bounded drain window prevents a peer that never sends
-		// the remaining bytes from pinning a keep-alive connection forever.
-		try {
-			req.destroy();
-		} catch {
+			if (drained) return;
+			timer = undefined;
+			// A rejected upload has no useful continuation. Destroying the request
+			// socket after the bounded drain window prevents a peer that never sends
+			// the remaining bytes from pinning a keep-alive connection forever.
 			try {
-				req.socket?.destroy();
+				req.destroy();
 			} catch {
-				// Best effort; the server may already have closed the socket.
+				try {
+					req.socket?.destroy();
+				} catch {
+					// Best effort; the server may already have closed the socket.
+				}
 			}
-		}
-		try {
-			onTimeout?.();
-		} catch {
-			// Telemetry callbacks must never prevent the socket teardown.
-		}
+			try {
+				onTimeout?.();
+			} catch {
+				// Telemetry callbacks must never prevent the socket teardown.
+			}
 		},
 		Math.max(1, timeoutMs),
 	);
@@ -1658,6 +1689,7 @@ export function createGuard(options = {}) {
 		queueFull: 0,
 		aborted: 0,
 		deadlineExceeded: 0,
+		acceptedDeadlineExceeded: 0,
 		recoveryBeyondDeadline: 0,
 		recoverySleepCapExceeded: 0,
 		recoverySilenceBudgetExceeded: 0,
@@ -1703,6 +1735,35 @@ export function createGuard(options = {}) {
 	if (controlSocketPath && !decodeGuardCorrelationSecret(controlSecret)) {
 		throw new Error("private guard control requires a 32-byte credential");
 	}
+	const acceptedCapMs = configuredBoundedInteger(
+		options.acceptedCapMs ?? env.GUARD_ACCEPTED_CAP_MS,
+		DEFAULT_ACCEPTED_CAP_MS,
+		{ name: "GUARD_ACCEPTED_CAP_MS", min: 1, max: DEFAULT_ACCEPTED_CAP_MS },
+	);
+	const managedTimingEnabled = env.CCFLARE_MANAGED_TIMING === "1";
+	if (managedTimingEnabled) bootIdentity(); // Linux-only contract fails before listen.
+	const timingNow = managedTimingEnabled
+		? monotonicNowNs
+		: () => process.hrtime.bigint();
+	const ingressNonce =
+		env.CCFLARE_MANAGED_INGRESS_NONCE ||
+		(managedTimingEnabled ? "" : randomUUID().replaceAll("-", ""));
+	let candidateNonce = env.CCFLARE_MANAGED_CANDIDATE_NONCE || "";
+	let backendSourceSha = env.CCFLARE_SOURCE_SHA || sourceId;
+	let timingSecret = decodeGuardCorrelationSecret(
+		options.guardCorrelationSecret ?? env.CCFLARE_GUARD_CORRELATION_SECRET,
+	);
+	if (
+		managedTimingEnabled &&
+		(!timingSecret ||
+			!/^[0-9a-f]{32}$/.test(ingressNonce) ||
+			!/^[0-9a-f]{32}$/.test(candidateNonce) ||
+			!/^[0-9a-f]{40}$/.test(backendSourceSha))
+	)
+		throw new Error(
+			"managed guard requires valid clock, source, nonces and credential",
+		);
+	if (managedTimingEnabled) monotonicNowNs();
 	let lifecycle = "serving";
 	let shutdownAllowsAdmission = false;
 	let generation = 1;
@@ -1712,6 +1773,7 @@ export function createGuard(options = {}) {
 	let recycleTimer = null;
 	let attaching = false;
 	let replacementIdentity = null;
+	let preparedTransaction = null;
 	let lastRecycleOutcome = null;
 	const controlSockets = new Set();
 	const lifecycleSnapshot = () => ({
@@ -1789,7 +1851,10 @@ export function createGuard(options = {}) {
 				return Promise.resolve();
 			return Promise.reject(lifecycleError());
 		}
-		if (lifecycle === "serving" || (lifecycle === "shutdown" && shutdownAllowsAdmission))
+		if (
+			lifecycle === "serving" ||
+			(lifecycle === "shutdown" && shutdownAllowsAdmission)
+		)
 			return Promise.resolve();
 		if (lifecycle === "shutdown") return Promise.reject(lifecycleError());
 		if (lifecycleWaiters.size >= maxQueue) {
@@ -1814,7 +1879,11 @@ export function createGuard(options = {}) {
 	}
 	function procStartTime(pid) {
 		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-		return stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[19];
+		const marker = stat.lastIndexOf(") ");
+		const identity = stat.slice(marker + 2).split(" ")[19];
+		if (marker < 0 || !/^\d+$/.test(identity))
+			throw new Error("ambiguous process identity");
+		return identity;
 	}
 	const initialUpstreamPid = Number(env.GUARD_UPSTREAM_PID);
 	let oldIdentity =
@@ -1835,8 +1904,8 @@ export function createGuard(options = {}) {
 			let oldStart;
 			try {
 				oldStart = procStartTime(oldIdentity.pid);
-			} catch {
-				/* reaped */
+			} catch (error) {
+				if (error.code !== "ENOENT") throw error;
 			}
 			if (oldStart === oldIdentity.startTime)
 				throw new Error("previous upstream still exists");
@@ -1868,7 +1937,13 @@ export function createGuard(options = {}) {
 		if (
 			procStartTime(candidate.pid) !== candidate.startTime ||
 			!artifact?.sha256 ||
-			artifact.sha256 !== runtimeIdentity.artifacts.binary?.sha256
+			artifact.sha256 !==
+				(preparedTransaction
+					? candidate.rollback
+						? preparedTransaction.previousHash
+						: preparedTransaction.candidateHash
+					: replacementIdentity?.sha256 ||
+						runtimeIdentity.artifacts.binary?.sha256)
 		)
 			throw new Error("replacement executable identity mismatch");
 		const controller = new AbortController();
@@ -1896,7 +1971,21 @@ export function createGuard(options = {}) {
 			const health = JSON.parse(Buffer.concat(chunks).toString());
 			if (
 				!health.git_sha ||
-				!matchesPinnedSourceId(health.git_sha, sourceId) ||
+				!matchesPinnedSourceId(
+					health.git_sha,
+					preparedTransaction
+						? candidate.rollback
+							? preparedTransaction.previousSourceSha
+							: preparedTransaction.candidateSourceSha
+						: backendSourceSha,
+				) ||
+				(managedTimingEnabled &&
+					(health.managedIngress?.generation !== candidate.generation ||
+						health.managedIngress?.candidateNonce !==
+							candidate.candidateNonce ||
+						health.managedIngress?.timingContract !== MANAGED_TIMING_VERSION ||
+						health.managedIngress?.schemaDigest !==
+							env.CCFLARE_SCHEMA_DIGEST)) ||
 				procStartTime(candidate.pid) !== candidate.startTime
 			)
 				throw new Error("replacement health identity mismatch");
@@ -1909,6 +1998,43 @@ export function createGuard(options = {}) {
 			clearTimeout(timer);
 		}
 	}
+	function prepareReplacement(manifest) {
+		if (
+			!lifecycleEnabled ||
+			lifecycle !== "serving" ||
+			preparedTransaction ||
+			manifest?.expectedGeneration !== generation ||
+			!/^[0-9a-f]{64}$/.test(manifest.candidateHash || "") ||
+			!/^[0-9a-f]{40}$/.test(manifest.candidateSourceSha || "") ||
+			!/^[0-9a-f]{32}$/.test(manifest.candidateNonce || "") ||
+			manifest.schemaDigest !== env.CCFLARE_SCHEMA_DIGEST ||
+			!manifest.intentPath ||
+			!manifest.pinPath
+		)
+			return { ok: false, reason: "invalid_transaction" };
+		try {
+			const journal = JSON.parse(readFileSync(manifest.intentPath, "utf8"));
+			if (
+				journal.phase !== "prepared" ||
+				journal.manifest.transactionId !== manifest.transactionId ||
+				journal.manifest.candidateHash !== manifest.candidateHash ||
+				fileIdentity(manifest.pinPath)?.sha256 !== manifest.previousPinHash ||
+				fileIdentity(manifest.candidateBinary)?.sha256 !==
+					manifest.candidateHash
+			)
+				throw new Error("identity mismatch");
+			preparedTransaction = {
+				...manifest,
+				previousSourceSha: backendSourceSha,
+				previousHash:
+					replacementIdentity?.sha256 ||
+					runtimeIdentity.artifacts.binary?.sha256,
+			};
+			return { ok: true, generation };
+		} catch {
+			return { ok: false, reason: "verification_failed" };
+		}
+	}
 	async function attachReplacement(candidate) {
 		if (
 			!lifecycleEnabled ||
@@ -1918,6 +2044,27 @@ export function createGuard(options = {}) {
 			!decodeGuardCorrelationSecret(candidate.correlationSecret)
 		)
 			return { ok: false, reason: "invalid_generation_or_state" };
+		if (preparedTransaction) {
+			try {
+				const journal = JSON.parse(
+					readFileSync(preparedTransaction.intentPath, "utf8"),
+				);
+				if (
+					candidate.transactionId !== preparedTransaction.transactionId ||
+					candidate.candidateNonce !== preparedTransaction.candidateNonce ||
+					journal.manifest.transactionId !== candidate.transactionId ||
+					journal.phase !==
+						(candidate.rollback ? "rolled_back" : "committed") ||
+					fileIdentity(preparedTransaction.pinPath)?.sha256 !==
+						(candidate.rollback
+							? preparedTransaction.previousPinHash
+							: preparedTransaction.candidatePinHash)
+				)
+					return { ok: false, reason: "pin_or_transaction_not_committed" };
+			} catch {
+				return { ok: false, reason: "transaction_unavailable" };
+			}
+		}
 		attaching = true;
 		try {
 			const identity = await (options.verifyReplacement || verifyReplacement)(
@@ -1928,6 +2075,14 @@ export function createGuard(options = {}) {
 			replacementIdentity = identity;
 			oldIdentity = identity;
 			generation = candidate.generation;
+			backendSourceSha = preparedTransaction
+				? candidate.rollback
+					? preparedTransaction.previousSourceSha
+					: preparedTransaction.candidateSourceSha
+				: backendSourceSha;
+			preparedTransaction = null;
+			candidateNonce = candidate.candidateNonce || candidateNonce;
+			timingSecret = decodeGuardCorrelationSecret(candidate.correlationSecret);
 			signGuardCorrelation = createGuardCorrelationSigner(
 				candidate.correlationSecret,
 			);
@@ -1979,8 +2134,14 @@ export function createGuard(options = {}) {
 						socket.end(JSON.stringify({ ok: false }));
 						return;
 					}
-					if (!command || typeof command !== "object" || Array.isArray(command)) {
-						socket.end(JSON.stringify({ ok: false, reason: "invalid_command" }));
+					if (
+						!command ||
+						typeof command !== "object" ||
+						Array.isArray(command)
+					) {
+						socket.end(
+							JSON.stringify({ ok: false, reason: "invalid_command" }),
+						);
 						return;
 					}
 					const token = Buffer.from(String(command.secret || ""));
@@ -1993,13 +2154,25 @@ export function createGuard(options = {}) {
 						return;
 					}
 					clearTimeout(controlTimer);
-					controlTimer = setTimeout(() => socket.destroy(), shutdownGraceMs + 5000);
+					controlTimer = setTimeout(
+						() => socket.destroy(),
+						shutdownGraceMs + 5000,
+					);
 					const result =
-						command.command === "begin"
-							? await beginRecycle(command.generation)
-							: command.command === "attach"
-								? await attachReplacement(command)
-								: { ok: false, reason: "unknown_command" };
+						command.command === "prepare"
+							? prepareReplacement(command.manifest)
+							: command.command === "begin"
+								? await beginRecycle(command.generation)
+								: command.command === "verify"
+									? await verifyReplacement(command)
+											.then((identity) => ({ ok: true, identity }))
+											.catch(() => ({
+												ok: false,
+												reason: "verification_failed",
+											}))
+									: command.command === "attach"
+										? await attachReplacement(command)
+										: { ok: false, reason: "unknown_command" };
 					socket.end(JSON.stringify(result));
 				});
 			})
@@ -2096,7 +2269,8 @@ export function createGuard(options = {}) {
 
 	function canAcquireBodyReader(reservationBytes) {
 		return (
-			(lifecycle === "serving" || (lifecycle === "shutdown" && shutdownAllowsAdmission)) &&
+			(lifecycle === "serving" ||
+				(lifecycle === "shutdown" && shutdownAllowsAdmission)) &&
 			bodyReadersActive < maxBodyReaders &&
 			reservationBytes <= maxBufferedRequestBodyBytes - reservedBodyReaderBytes
 		);
@@ -2298,7 +2472,10 @@ export function createGuard(options = {}) {
 			await waitForServing(context);
 		} while (
 			context.generation == null &&
-			!(lifecycle === "serving" || (lifecycle === "shutdown" && shutdownAllowsAdmission))
+			!(
+				lifecycle === "serving" ||
+				(lifecycle === "shutdown" && shutdownAllowsAdmission)
+			)
 		);
 		context.ensureBudget();
 		context.generation ??= generation;
@@ -2314,6 +2491,26 @@ export function createGuard(options = {}) {
 			redirect: "manual",
 			signal,
 		};
+		if (managedTimingEnabled) {
+			init.headers.set(
+				MANAGED_TIMING_HEADER,
+				signManagedTiming(
+					context.timing,
+					{
+						bootId: bootIdentity(),
+						ingressNonce,
+						candidateNonce,
+						generation: context.generation,
+						backendSourceSha,
+						requestId: guardRequestId,
+						attemptOrdinal: guardAttemptOrdinal,
+						method: req.method,
+						path: `${upstreamTarget.pathname}${upstreamTarget.search}`,
+					},
+					timingSecret,
+				),
+			);
+		}
 		if (!["GET", "HEAD"].includes(req.method || "GET")) init.body = body;
 		return fetchImpl(upstreamTarget, init);
 	}
@@ -2325,7 +2522,18 @@ export function createGuard(options = {}) {
 
 	function createRequestContext(req, res) {
 		const acceptedAt = now();
-		const deadlineAt = acceptedAt + totalDeadlineMs;
+		const timing = createAcceptedTiming(
+			timingNow(),
+			String(req.headers[CLIENT_TIMEOUT_HEADER] || ""),
+			acceptedCapMs,
+			Math.min(totalDeadlineMs, 600_000),
+		);
+		const deadlineAt =
+			acceptedAt +
+			Math.min(
+				totalDeadlineMs,
+				timing.effectiveCapMs - timing.cleanupReserveMs,
+			);
 		const deadlineController = new AbortController();
 		const clientController = new AbortController();
 		const recycleController = new AbortController();
@@ -2343,6 +2551,23 @@ export function createGuard(options = {}) {
 			if (abortCause == null) abortCause = "deadline";
 			deadlineController.abort(deadlineError());
 		};
+		const expireAccepted = () => {
+			if (deadlineController.signal.aborted || disposed) return;
+			if (abortCause == null) abortCause = "accepted_deadline";
+			deadlineController.abort(
+				Object.assign(new Error("accepted request deadline exceeded"), {
+					name: "AbortError",
+					code: "GUARD_ACCEPTED_DEADLINE",
+				}),
+			);
+		};
+		const acceptedTimer = setTimeout(
+			expireAccepted,
+			Math.max(
+				0,
+				Number(BigInt(timing.workDeadlineMonoNs) - timingNow()) / 1_000_000,
+			),
+		);
 		const abortClient = () => {
 			if (clientController.signal.aborted) return;
 			if (abortCause == null) abortCause = "client";
@@ -2369,6 +2594,7 @@ export function createGuard(options = {}) {
 				recycleController.abort(lifecycleError());
 			},
 			acceptedAt,
+			timing,
 			deadlineAt,
 			signal: combined.signal,
 			get abortCause() {
@@ -2387,7 +2613,11 @@ export function createGuard(options = {}) {
 				if (combined.signal.aborted) {
 					throw combined.signal.reason || abortError();
 				}
-				if (now() >= deadlineAt) {
+				if (timingNow() >= BigInt(timing.workDeadlineMonoNs)) {
+					expireAccepted();
+					throw combined.signal.reason;
+				}
+				if (!responseBegun && now() >= deadlineAt) {
 					expireDeadline();
 					throw combined.signal.reason || deadlineError();
 				}
@@ -2399,6 +2629,7 @@ export function createGuard(options = {}) {
 				if (disposed) return;
 				disposed = true;
 				clearTimeout(deadlineTimer);
+				clearTimeout(acceptedTimer);
 				req.off("aborted", abortClient);
 				res.off("close", onResponseClose);
 				req.socket.off("close", onSocketClose);
@@ -2443,6 +2674,27 @@ export function createGuard(options = {}) {
 					"guard_upstream_unavailable",
 					"upstream replacement in progress",
 					{ "retry-after": "1" },
+				);
+			return true;
+		}
+		if (
+			context.abortCause === "accepted_deadline" ||
+			error?.code === "GUARD_ACCEPTED_DEADLINE"
+		) {
+			counters.acceptedDeadlineExceeded += 1;
+			log("guard_accepted_deadline_exceeded", {
+				id: context.id,
+				attempt,
+				elapsedMs,
+			});
+			if (res.headersSent) res.destroy(error);
+			else
+				sendJsonError(
+					res,
+					context,
+					504,
+					"accepted_request_deadline",
+					"accepted request deadline exceeded",
 				);
 			return true;
 		}
@@ -3193,288 +3445,184 @@ export function createGuard(options = {}) {
 	// independent 300s whole-upload timeout otherwise preempts a legitimate
 	// maintenance waiter whose body is intentionally not being consumed.
 	// Preserve finite native protection before a complete header is available.
-	const server = http.createServer({ requestTimeout: 0, headersTimeout: 60_000 }, async (req, res) => {
-		// server.close() stops accepting new TCP connections, but a connection
-		// with an in-flight request can still present another keep-alive request.
-		// Gate admission before reading its body or acquiring a concurrency lease
-		// so shutdown cannot be prolonged by work accepted after the signal.
-		if (draining) {
-			const context = createRequestContext(req, res);
-			counters.drainingRejected += 1;
-			log("guard_draining", { id: context.id });
-			drainRequestForContext(req, context);
-			sendJsonError(
-				res,
-				context,
-				503,
-				"guard_draining",
-				"local guard is draining",
-				{
-					"retry-after": "1",
-					connection: "close",
-				},
-			);
-			context.dispose();
-			return;
-		}
-
-		if (req.url === "/_guard/health") {
-			// Even a GET may carry a slow body. Health bypasses admission, so it
-			// must own its bounded discard after the immediate response.
-			drainRequest(req, requestDrainTimeoutMs, () => onRequestDrainTimeout(null));
-			res.writeHead(200, { "content-type": "application/json" });
-			res.end(
-				JSON.stringify({
-					status: "ok",
-					sourceId,
-					policyId,
-					source: sourceId,
-					policy: policyId,
-					listenHost,
-					listenPort,
-					upstreamBase,
-					maxActive,
-					maxBodyReaders,
-					maxRecoveryWaits,
-					maxAttempts,
-					totalDeadlineMs,
-					retryAttemptHeadroomMs,
-					maxRecoverySleepMs,
-					recoverySilenceBudgetMs: maxRecoverySleepMs,
-					jitterMs,
-					maxInspectionBytes,
-					maxRequestBodyBytes,
-					maxBufferedRequestBodyBytes,
-					requestDrainTimeoutMs,
-					responseIdleTimeoutMs,
-					delayInspectionTimeoutMs,
-					allowLegacyPoolBody,
-					shutdownGraceMs,
-					draining,
-					lifecycle: lifecycleSnapshot(),
-					runtime: {
-						...runtimeIdentity,
-						...(replacementIdentity
-							? {
-									process: {
-										...runtimeIdentity.process,
-										upstreamPid: replacementIdentity.pid,
-										upstreamStartTime: replacementIdentity.startTime,
-									},
-									artifacts: {
-										...runtimeIdentity.artifacts,
-										binary: {
-											path: replacementIdentity.path,
-											sha256: replacementIdentity.sha256,
-										},
-									},
-								}
-							: {}),
-						limits: {
-							totalDeadlineMs,
-							retryAttemptHeadroomMs,
-							maxRecoverySleepMs,
-							recoverySilenceBudgetMs: maxRecoverySleepMs,
-							maxAttempts,
-							jitterMs,
-							maxInspectionBytes,
-							maxRequestBodyBytes,
-							maxBufferedRequestBodyBytes,
-							requestDrainTimeoutMs,
-							responseIdleTimeoutMs,
-							delayInspectionTimeoutMs,
-							allowLegacyPoolBody,
-							shutdownGraceMs,
-							maxActive,
-							maxQueue,
-							maxBodyReaders,
-							maxBodyReaderQueue: maxQueue,
-							maxRecoveryWaits,
-						},
-					},
-					active,
-					queued: queue.length,
-					bodyReaders: {
-						configured: maxBodyReaders,
-						queueLimit: maxQueue,
-						reservationLimitBytes: maxBufferedRequestBodyBytes,
-						reservedBytes: reservedBodyReaderBytes,
-						reservedBytesPeak: peakReservedBodyReaderBytes,
-						current: bodyReadersActive,
-						queued: bodyReaderQueue.length,
-						peak: peakBodyReaders,
-					},
-					recoveryWaits: {
-						configured: maxRecoveryWaits,
-						current: activeRecoveryWaits,
-						peak: peakRecoveryWaits,
-					},
-					counters,
-				}),
-			);
-			return;
-		}
-
-		const context = createRequestContext(req, res);
-		if (req.url === "/health" && lifecycle !== "serving") {
-			drainRequestForContext(req, context);
-			sendJsonError(
-				res,
-				context,
-				503,
-				"guard_upstream_unavailable",
-				"upstream replacement in progress",
-				{ "retry-after": "1" },
-			);
-			context.dispose();
-			return;
-		}
-		const upstreamTarget = resolveUpstreamTarget(req.url, upstreamUrl);
-		if (!upstreamTarget) {
-			drainRequestForContext(req, context);
-			sendJsonError(
-				res,
-				context,
-				400,
-				"guard_invalid_request_target",
-				"request target must be a valid origin-form path",
-			);
-			context.dispose();
-			return;
-		}
-
-		try {
-			await waitForServing(context);
-		} catch (error) {
-			drainRequestForContext(req, context);
-			handleAbort(error, res, context, 0, null);
-			context.dispose();
-			return;
-		}
-		const limited = isLimitedPath(req);
-		let admissionLease = null;
-		let bodyReaderLease = null;
-		if (limited) {
-			try {
-				// Admission owns the concurrency slot before any request-body bytes
-				// are read. A queued request therefore consumes only the stream
-				// parser's bounded socket buffer, never an aggregate body buffer.
-				admissionLease = await acquire(context.id, context.signal);
-			} catch (error) {
-				// Queue rejection/expiry happens before body listeners are attached;
-				// drain the upload so keep-alive parsing remains synchronized.
+	const server = http.createServer(
+		{ requestTimeout: 0, headersTimeout: 60_000 },
+		async (req, res) => {
+			// server.close() stops accepting new TCP connections, but a connection
+			// with an in-flight request can still present another keep-alive request.
+			// Gate admission before reading its body or acquiring a concurrency lease
+			// so shutdown cannot be prolonged by work accepted after the signal.
+			if (draining) {
+				const context = createRequestContext(req, res);
+				counters.drainingRejected += 1;
+				log("guard_draining", { id: context.id });
 				drainRequestForContext(req, context);
-				if (error?.code === "GUARD_QUEUE_FULL") {
-					sendQueueFull(res, context);
-				} else if (!handleAbort(error, res, context, 0, null)) {
-					sendJsonError(
-						res,
-						context,
-						502,
-						"guard_admission_error",
-						error?.message || "guard admission failed",
-					);
-				}
-				context.dispose();
-				return;
-			}
-			// This first lease is an admission reservation used to preserve the
-			// existing upstream queue ordering. Release the physical upstream
-			// permit before reading bytes; body readers have their own bounded pool.
-			admissionLease.release();
-			admissionLease = null;
-		}
-
-		// Classify before attaching body listeners. Declared oversize retains the
-		// admission decision above but never receives a body-reader reservation.
-		const bodyPlan = classifyRequestBody(req, maxRequestBodyBytes);
-		if (bodyPlan.oversized) {
-			drainRequestForContext(req, context);
-			counters.oversizedRequestBodies += 1;
-			log("guard_request_body_too_large", {
-				id: context.id,
-				maxRequestBodyBytes,
-				declaredBytes: bodyPlan.declaredBytes,
-				receivedBytes: maxRequestBodyBytes + 1,
-				elapsedMs: now() - context.acceptedAt,
-			});
-			sendJsonError(
-				res,
-				context,
-				413,
-				"guard_request_body_too_large",
-				"request body exceeds the local guard limit",
-			);
-			context.dispose();
-			return;
-		}
-
-		let body;
-		let bodyReadStarted = false;
-		try {
-			bodyReaderLease = await acquireBodyReader(
-				context.id,
-				context.signal,
-				bodyPlan.reservationBytes,
-			);
-			bodyReadStarted = true;
-			body = await readBody(
-				req,
-				context.signal,
-				maxRequestBodyBytes,
-				Math.min(requestDrainTimeoutMs, Math.max(1, context.remainingMs())),
-				() => onRequestDrainTimeout(context),
-				bodyPlan.declaredLength,
-			);
-		} catch (error) {
-			admissionLease?.release();
-			admissionLease = null;
-			bodyReaderLease?.release();
-			bodyReaderLease = null;
-			if (!bodyReadStarted) drainRequestForContext(req, context);
-			if (error?.code === "GUARD_BODY_READER_QUEUE_FULL") {
-				sendBodyReaderQueueFull(res, context);
-				context.dispose();
-				return;
-			}
-			if (handleAbort(error, res, context, 0, null)) {
-				context.dispose();
-				return;
-			}
-			if (error?.code === "GUARD_REQUEST_BODY_TOO_LARGE") {
-				counters.oversizedRequestBodies += 1;
-				log("guard_request_body_too_large", {
-					id: context.id,
-					maxRequestBodyBytes,
-					declaredBytes: error.declaredBytes ?? null,
-					receivedBytes: error.receivedBytes ?? maxRequestBodyBytes + 1,
-					elapsedMs: now() - context.acceptedAt,
-				});
 				sendJsonError(
 					res,
 					context,
-					413,
-					"guard_request_body_too_large",
-					"request body exceeds the local guard limit",
+					503,
+					"guard_draining",
+					"local guard is draining",
+					{
+						"retry-after": "1",
+						connection: "close",
+					},
 				);
-			} else {
-				sendJsonError(res, context, 400, "guard_bad_request", error.message);
+				context.dispose();
+				return;
 			}
-			context.dispose();
-			return;
-		}
 
-		try {
+			if (req.url === "/_guard/health") {
+				// Even a GET may carry a slow body. Health bypasses admission, so it
+				// must own its bounded discard after the immediate response.
+				drainRequest(req, requestDrainTimeoutMs, () =>
+					onRequestDrainTimeout(null),
+				);
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(
+					JSON.stringify({
+						status: "ok",
+						sourceId,
+						policyId,
+						source: sourceId,
+						policy: policyId,
+						listenHost,
+						listenPort,
+						upstreamBase,
+						maxActive,
+						maxBodyReaders,
+						maxRecoveryWaits,
+						maxAttempts,
+						totalDeadlineMs,
+						acceptedCapMs,
+						timingContract: MANAGED_TIMING_VERSION,
+						backendSourceSha,
+						retryAttemptHeadroomMs,
+						maxRecoverySleepMs,
+						recoverySilenceBudgetMs: maxRecoverySleepMs,
+						jitterMs,
+						maxInspectionBytes,
+						maxRequestBodyBytes,
+						maxBufferedRequestBodyBytes,
+						requestDrainTimeoutMs,
+						responseIdleTimeoutMs,
+						delayInspectionTimeoutMs,
+						allowLegacyPoolBody,
+						shutdownGraceMs,
+						draining,
+						lifecycle: lifecycleSnapshot(),
+						runtime: {
+							...runtimeIdentity,
+							...(replacementIdentity
+								? {
+										process: {
+											...runtimeIdentity.process,
+											upstreamPid: replacementIdentity.pid,
+											upstreamStartTime: replacementIdentity.startTime,
+										},
+										artifacts: {
+											...runtimeIdentity.artifacts,
+											binary: {
+												path: replacementIdentity.path,
+												sha256: replacementIdentity.sha256,
+											},
+										},
+									}
+								: {}),
+							limits: {
+								totalDeadlineMs,
+								retryAttemptHeadroomMs,
+								maxRecoverySleepMs,
+								recoverySilenceBudgetMs: maxRecoverySleepMs,
+								maxAttempts,
+								jitterMs,
+								maxInspectionBytes,
+								maxRequestBodyBytes,
+								maxBufferedRequestBodyBytes,
+								requestDrainTimeoutMs,
+								responseIdleTimeoutMs,
+								delayInspectionTimeoutMs,
+								allowLegacyPoolBody,
+								shutdownGraceMs,
+								maxActive,
+								maxQueue,
+								maxBodyReaders,
+								maxBodyReaderQueue: maxQueue,
+								maxRecoveryWaits,
+							},
+						},
+						active,
+						queued: queue.length,
+						bodyReaders: {
+							configured: maxBodyReaders,
+							queueLimit: maxQueue,
+							reservationLimitBytes: maxBufferedRequestBodyBytes,
+							reservedBytes: reservedBodyReaderBytes,
+							reservedBytesPeak: peakReservedBodyReaderBytes,
+							current: bodyReadersActive,
+							queued: bodyReaderQueue.length,
+							peak: peakBodyReaders,
+						},
+						recoveryWaits: {
+							configured: maxRecoveryWaits,
+							current: activeRecoveryWaits,
+							peak: peakRecoveryWaits,
+						},
+						counters,
+					}),
+				);
+				return;
+			}
+
+			const context = createRequestContext(req, res);
+			if (req.url === "/health" && lifecycle !== "serving") {
+				drainRequestForContext(req, context);
+				sendJsonError(
+					res,
+					context,
+					503,
+					"guard_upstream_unavailable",
+					"upstream replacement in progress",
+					{ "retry-after": "1" },
+				);
+				context.dispose();
+				return;
+			}
+			const upstreamTarget = resolveUpstreamTarget(req.url, upstreamUrl);
+			if (!upstreamTarget) {
+				drainRequestForContext(req, context);
+				sendJsonError(
+					res,
+					context,
+					400,
+					"guard_invalid_request_target",
+					"request target must be a valid origin-form path",
+				);
+				context.dispose();
+				return;
+			}
+
+			try {
+				await waitForServing(context);
+			} catch (error) {
+				drainRequestForContext(req, context);
+				handleAbort(error, res, context, 0, null);
+				context.dispose();
+				return;
+			}
+			const limited = isLimitedPath(req);
+			let admissionLease = null;
+			let bodyReaderLease = null;
 			if (limited) {
-				// Retain the weighted reservation through every upstream attempt and
-				// final response delivery. The body remains reachable for retry and
-				// forwarding until the selected handler returns; the outer finally
-				// releases it exactly once after that lifecycle ends.
 				try {
+					// Admission owns the concurrency slot before any request-body bytes
+					// are read. A queued request therefore consumes only the stream
+					// parser's bounded socket buffer, never an aggregate body buffer.
 					admissionLease = await acquire(context.id, context.signal);
 				} catch (error) {
-					bodyReaderLease?.release();
-					bodyReaderLease = null;
+					// Queue rejection/expiry happens before body listeners are attached;
+					// drain the upload so keep-alive parsing remains synchronized.
+					drainRequestForContext(req, context);
 					if (error?.code === "GUARD_QUEUE_FULL") {
 						sendQueueFull(res, context);
 					} else if (!handleAbort(error, res, context, 0, null)) {
@@ -3486,20 +3634,132 @@ export function createGuard(options = {}) {
 							error?.message || "guard admission failed",
 						);
 					}
+					context.dispose();
 					return;
 				}
-				const lease = admissionLease;
+				// This first lease is an admission reservation used to preserve the
+				// existing upstream queue ordering. Release the physical upstream
+				// permit before reading bytes; body readers have their own bounded pool.
+				admissionLease.release();
 				admissionLease = null;
-				await handleLimited(req, res, body, context, upstreamTarget, lease);
-			} else {
-				await handlePassthrough(req, res, body, context, upstreamTarget);
 			}
-		} finally {
-			admissionLease?.release();
-			bodyReaderLease?.release();
-			context.dispose();
-		}
-	});
+
+			// Classify before attaching body listeners. Declared oversize retains the
+			// admission decision above but never receives a body-reader reservation.
+			const bodyPlan = classifyRequestBody(req, maxRequestBodyBytes);
+			if (bodyPlan.oversized) {
+				drainRequestForContext(req, context);
+				counters.oversizedRequestBodies += 1;
+				log("guard_request_body_too_large", {
+					id: context.id,
+					maxRequestBodyBytes,
+					declaredBytes: bodyPlan.declaredBytes,
+					receivedBytes: maxRequestBodyBytes + 1,
+					elapsedMs: now() - context.acceptedAt,
+				});
+				sendJsonError(
+					res,
+					context,
+					413,
+					"guard_request_body_too_large",
+					"request body exceeds the local guard limit",
+				);
+				context.dispose();
+				return;
+			}
+
+			let body;
+			let bodyReadStarted = false;
+			try {
+				bodyReaderLease = await acquireBodyReader(
+					context.id,
+					context.signal,
+					bodyPlan.reservationBytes,
+				);
+				bodyReadStarted = true;
+				body = await readBody(
+					req,
+					context.signal,
+					maxRequestBodyBytes,
+					Math.min(requestDrainTimeoutMs, Math.max(1, context.remainingMs())),
+					() => onRequestDrainTimeout(context),
+					bodyPlan.declaredLength,
+				);
+			} catch (error) {
+				admissionLease?.release();
+				admissionLease = null;
+				bodyReaderLease?.release();
+				bodyReaderLease = null;
+				if (!bodyReadStarted) drainRequestForContext(req, context);
+				if (error?.code === "GUARD_BODY_READER_QUEUE_FULL") {
+					sendBodyReaderQueueFull(res, context);
+					context.dispose();
+					return;
+				}
+				if (handleAbort(error, res, context, 0, null)) {
+					context.dispose();
+					return;
+				}
+				if (error?.code === "GUARD_REQUEST_BODY_TOO_LARGE") {
+					counters.oversizedRequestBodies += 1;
+					log("guard_request_body_too_large", {
+						id: context.id,
+						maxRequestBodyBytes,
+						declaredBytes: error.declaredBytes ?? null,
+						receivedBytes: error.receivedBytes ?? maxRequestBodyBytes + 1,
+						elapsedMs: now() - context.acceptedAt,
+					});
+					sendJsonError(
+						res,
+						context,
+						413,
+						"guard_request_body_too_large",
+						"request body exceeds the local guard limit",
+					);
+				} else {
+					sendJsonError(res, context, 400, "guard_bad_request", error.message);
+				}
+				context.dispose();
+				return;
+			}
+
+			try {
+				if (limited) {
+					// Retain the weighted reservation through every upstream attempt and
+					// final response delivery. The body remains reachable for retry and
+					// forwarding until the selected handler returns; the outer finally
+					// releases it exactly once after that lifecycle ends.
+					try {
+						admissionLease = await acquire(context.id, context.signal);
+					} catch (error) {
+						bodyReaderLease?.release();
+						bodyReaderLease = null;
+						if (error?.code === "GUARD_QUEUE_FULL") {
+							sendQueueFull(res, context);
+						} else if (!handleAbort(error, res, context, 0, null)) {
+							sendJsonError(
+								res,
+								context,
+								502,
+								"guard_admission_error",
+								error?.message || "guard admission failed",
+							);
+						}
+						return;
+					}
+					const lease = admissionLease;
+					admissionLease = null;
+					await handleLimited(req, res, body, context, upstreamTarget, lease);
+				} else {
+					await handlePassthrough(req, res, body, context, upstreamTarget);
+				}
+			} finally {
+				admissionLease?.release();
+				bodyReaderLease?.release();
+				context.dispose();
+			}
+		},
+	);
 
 	server.on("close", () => upstreamTransport?.close());
 
@@ -3588,18 +3848,18 @@ export function createGuard(options = {}) {
 				if (exitProcess) process.exit(exitStatus);
 			};
 			server.close(() => finish("natural", 0));
-		server.closeIdleConnections?.();
+			server.closeIdleConnections?.();
 			timer = setTimeout(() => {
-			log("guard_force_close", {
-				signal,
-				openSockets: sockets.size,
-				shutdownGraceMs,
-			});
-			server.closeAllConnections?.();
-			for (const socket of sockets) socket.destroy();
+				log("guard_force_close", {
+					signal,
+					openSockets: sockets.size,
+					shutdownGraceMs,
+				});
+				server.closeAllConnections?.();
+				for (const socket of sockets) socket.destroy();
 				finish("forced", GUARD_FORCED_DRAIN_EXIT_STATUS);
-		}, shutdownGraceMs);
-		timer.unref();
+			}, shutdownGraceMs);
+			timer.unref();
 		});
 		return shutdownPromise;
 	}

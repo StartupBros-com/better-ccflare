@@ -17,6 +17,12 @@ import type {
 	ProviderAttemptPlanContext,
 } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
+import {
+	bindManagedRequest,
+	createAcceptedTiming,
+	monotonicNowNs,
+	registerManagedTerminal,
+} from "../../../../../scripts/ccflare-managed-timing.mjs";
 import { ANTHROPIC_DRAIN_DEADLINE_MS } from "../../anthropic-terminal-recovery";
 import { CACHE_REPLAY_MODEL_HEADER } from "../../cache-transport-staging";
 import {
@@ -1076,6 +1082,59 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		]);
 	});
 
+	it.each([
+		"websocket",
+		"http",
+	])("absolute accepted clock vetoes the real %s boundary before any frame or HTTP replay", async (lane) => {
+		installUsageCollector();
+		const body = makeRequestBody(),
+			controller = new AbortController();
+		const req = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			body,
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			signal: controller.signal,
+		});
+		bindManagedRequest(
+			req,
+			createAcceptedTiming(monotonicNowNs(), "2000"),
+			(error) => controller.abort(error),
+		);
+		const fetchMock = mock(async () => new Response("unexpected HTTP send"));
+		globalThis.fetch = fetchMock as unknown as typeof fetch;
+		let frameWrites = 0;
+		const causes: string[] = [];
+		spyOn(codexWebSocketTransport, "tryRequest").mockImplementation(
+			async (input) => {
+				// The absolute contract expires after preparation without an idle/header
+				// timer firing. The transport callback itself must fence this write.
+				bindManagedRequest(req, createAcceptedTiming(0n), (error) =>
+					controller.abort(error),
+				);
+				registerManagedTerminal(req, (cause) => causes.push(cause));
+				if (lane === "http") return null;
+				input.onBeforeFrameSend?.();
+				input.onBeforeFrameWrite?.();
+				frameWrites++;
+				throw new Error("expired frame reached wire");
+			},
+		);
+		await runProxy(
+			req,
+			body,
+			makePolicy(1000),
+			"managed-expired-frame",
+			undefined,
+			{ originalModel: "claude-sonnet-4-5" },
+		).catch(() => null);
+		expect(frameWrites).toBe(0);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(causes).toEqual(["accepted_request_deadline"]);
+		expect(controller.signal.aborted).toBe(true);
+	});
 	it("counts a non-hosted WebSocket frame at its pre-write transport boundary", async () => {
 		installUsageCollector();
 		const ledger = new RoutingAttemptLedger();

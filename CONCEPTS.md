@@ -300,3 +300,11 @@ The dispatch fence durably distinguishes a possibly sent inference from work tha
   automatic family.
 - *Utilization* is always a 0–100 percentage once past normalization, never a 0–1 fraction,
   even though several providers report it as a fraction natively.
+
+## Retained ingress and cold backend handoff
+
+**Terminal full-service shutdown** stops admission by closing the public listener, then drains and retires all service children. **Retained-ingress replacement** keeps the public guard/listener alive while fencing physical dispatch, draining old streams and replacing exactly one backend database/routing authority. It has a dispatch pause, bounded unread queues and original accepted deadlines; it is not a zero-pause blue/green deployment.
+
+A **committed backend generation** has verified executable/source, PID/start, listener, nonce, timing/compatibility identity and a durable exact pin before it receives new work. **Admission continuity** measures listener acceptance separately from dispatch availability, stream completion and forced retirement. Ingress source identity may differ from backend source identity after a compatible handoff.
+
+The **accepted request deadline** is the trusted first-header work limit shared across managed ingress and backend. It differs from response-start, stream-idle and meaningful-progress limits. Its **cleanup reserve** bounds settlement after the primary terminal; cleanup failure is secondary evidence and cannot renew work or change the first terminal cause.
