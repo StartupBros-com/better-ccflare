@@ -2,7 +2,8 @@
 
 Status: implementation-ready for Units 1 and 2; conditional investigations require new evidence.
 Source: fresh `origin/main` at `085adb508ee977f8472c7fadedf27b3ba725a5e8`.
-Evidence cutoff: 2026-10-01 06:36:58 UTC; live identity verified at 06:53:40 UTC.
+Historical audit cutoff: 2026-10-01 06:36:58 UTC; live identity verified at 06:53:40 UTC.
+Separate closeout observation: 07:04:22–07:16:10 UTC, including the new recurrence below.
 Backend `085adb50` was served by guard/runner `fce5fa55`, generation 3; 07:04:22 UTC remained serving with unchanged final-error count and zero transport/deadline errors.
 This investigation changed no production process, provider traffic, quota, routing or client setting.
 
@@ -22,6 +23,18 @@ Implement the two remaining diagnostic gaps below rather than repeat those shipp
 - **Historical, unresolved:** 18 Sol semantic-stall roots comprised 16 failures and two later successes.
   Valid protocol frames do not establish productive output. All preceded the corrected guard epoch.
   Current code already saves both attempts, the specific timeout cause and native/wire status distinction.
+- **Current recurrence:** at 07:05:56.605 UTC, Sol again reached `meaningful_progress_timeout`;
+  guard duration 840.121 seconds; upstream HTTP 200, local terminal 503, outer HTTP 200 plus clean SSE error.
+  Both attempts kept account/model: initial 83 protocol frames, 27 encrypted-reasoning-done events,
+  708,230 raw bytes; rescue 3 frames and 527,546 bytes. Recorded native text/visible-summary/tool-argument
+  deltas and pending/peak tool/reasoning buffers were zero. Raw-event ages were 23.328/17.071 seconds:
+  fresh protocol activity, not silent connectivity loss. Semantic cause froze before provider cancellation.
+  Native `other` counts 35/1 mean the bounded known-category classifier cannot exclude novel productive events.
+  This supports opaque/upstream-workload activity with no recorded usable output, not complete causal proof.
+  Stable backend `085adb50`/guard `fce5fa55`, generation 3 establish timeline attribution; attempts lack build SHA.
+  A later natural success in the stored cohort matched recorded full-input/instructions/tools HMAC, item count,
+  effort, account/model and canonical-conversation controls. This counters deterministic bad-input/retry-failure
+  claims; recorded equality proves neither exact agent identity nor complete final-wire equivalence.
 - **Unqualified:** three historical memory recycles do not prove a leak; 14 large Astra zero reads,
   including 13 with earlier same-cohort hits, do not prove identical serialized prefixes or a cache defect.
 - The 49 zero-dispatch refusals were all `POST /v1/messages`, ending at 05:07:52.957 UTC.
@@ -126,9 +139,11 @@ once-only terminal/counters, retained primary outcome, bounded bytes and zero le
 
 ## Conditional investigations — no causal repair before proof
 
-**Sol progress:** consume the deployed per-attempt ledger at the next natural recurrence.
-Join accepted request/generation/attempt chronology, native event categories and productive counts,
-translated meaningful output, selected terminal owner and cleanup. Add only absent bounded ages/buffer facts.
+**Sol progress:** consume the closeout recurrence and future natural joins through the deployed ledger.
+Join accepted request/generation/attempt chronology, native categories, translated meaningful progress,
+selected owner and cleanup. Raw event ages and buffer counters already exist in traces; use them.
+Add only genuinely absent canonical facts or a fixed bounded native-`other` breakdown if needed.
+The matched later success leaves a repeated-failure TTL tracker conditional, not implementation-ready.
 Native productive output with zero translated progress is a translation/gating candidate requiring a local mock;
 structural/opaque native events with no productive delta indicate a different upstream/workload hypothesis.
 Reuse `packages/proxy/src/__tests__/semantic-stall-evidence.test.ts`,
