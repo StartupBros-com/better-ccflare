@@ -2753,6 +2753,7 @@ export async function proxyWithAccount(
 		optionalOutboundTransport?: (
 			signal: AbortSignal,
 			markDispatched: () => void,
+			markObservedDispatch: (transport: "http" | "websocket") => void,
 		) => Promise<Response | null>,
 		onHttpDispatch?: () => void,
 		onDispatchStarted?: () => void,
@@ -2779,26 +2780,6 @@ export async function proxyWithAccount(
 					signal,
 					drainAbortController.signal,
 				]);
-				const optionalResponse = await optionalOutboundTransport?.(
-					attemptSignal,
-					markDispatched,
-				);
-				if (optionalResponse) return optionalResponse;
-				// This hook is the last thing that can refuse the send: it asserts the
-				// request-local physical budget and claims a hosted dispatch, and it
-				// throws instead of returning when either fails. Mark only after it
-				// returns, when nothing remains between here and the fetch below.
-				onHttpDispatch?.();
-				markDispatched();
-				// KTD8 final-wire observation: purely diagnostic (see
-				// forwardObservedUpstream). `request` here is the fully-transformed
-				// wire request for this physical attempt -- after model forcing,
-				// provider body transforms, and header preparation. `sourceBody`
-				// is this attempt's replay body (reflecting model forcing and any
-				// retry-loop delta), passed in by the caller for diagnostic
-				// correlation only, never re-sent. Skipped entirely for the
-				// websocket/optional-transport path above, which never reaches
-				// this line.
 				return await forwardObservedUpstream(
 					provider,
 					request,
@@ -2810,10 +2791,20 @@ export async function proxyWithAccount(
 						nativeResponses: isResponsesAdapterRequest(req.headers, ctx),
 						signal: attemptSignal,
 					},
-					async () => {
+					async (markObservedDispatch) => {
+						const optionalResponse = await optionalOutboundTransport?.(
+							attemptSignal,
+							markDispatched,
+							markObservedDispatch,
+						);
+						if (optionalResponse) return optionalResponse;
 						if (qualityPrepare) await qualityPrepare();
 						modelFallbackPolicy?.qualityAttempt?.assertDispatch();
-						return makeProxyRequest(
+						// No await after the final authoritative gates. Observation is
+						// fail-open and cannot make an expired attempt dispatchable.
+						onHttpDispatch?.();
+						markDispatched();
+						const pendingHttp = makeProxyRequest(
 							request,
 							undefined,
 							undefined,
@@ -2821,6 +2812,8 @@ export async function proxyWithAccount(
 							undefined,
 							attemptSignal,
 						);
+						markObservedDispatch("http");
+						return pendingHttp;
 					},
 				);
 			};
@@ -4400,7 +4393,7 @@ export async function proxyWithAccount(
 					attemptPlan.providerName === "codex" &&
 						!hasCodexTurnStateReplay &&
 						!modelFallbackPolicy?.qualityAttempt
-						? async (signal, markDispatched) => {
+						? async (signal, markDispatched, markObservedDispatch) => {
 								currentCodexWebSocketReceipt = null;
 								// Capture the concrete stamped attempt before any later retry mutates the
 								// surrounding attempt variable. These are the same join keys written to
@@ -4432,6 +4425,7 @@ export async function proxyWithAccount(
 												}
 											: undefined,
 										onFrameWritten: (receipt) => {
+											markObservedDispatch("websocket");
 											markDispatched();
 											recordPhysicalDispatch();
 											currentCodexWebSocketReceipt = receipt;

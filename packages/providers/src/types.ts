@@ -71,6 +71,8 @@ export interface UpstreamObservationContext {
  * client (see `forwardObservedUpstream`, the sole caller).
  */
 export interface UpstreamObservation {
+	/** Observation only; called at the authorized physical-send seam. */
+	dispatched?(transport: "http" | "websocket"): void;
 	response(response: Response): Response;
 	error(error: unknown): void;
 }

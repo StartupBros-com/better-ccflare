@@ -3,6 +3,7 @@ import { getCodexReasoningRetention } from "@better-ccflare/config";
 import {
 	BUFFER_SIZES,
 	getExactOAuthErrorCode,
+	getGitSha,
 	getModelFamily,
 	getOAuthErrorCode,
 	isForceAccountModelEnabled,
@@ -2915,6 +2916,11 @@ export class CodexProvider extends BaseProvider {
 			context,
 			(source) =>
 				this.extractSessionId(source as unknown as AnthropicRequest) ?? null,
+			{
+				buildEpoch: getGitSha(),
+				capabilityRevision: "codex-responses-observation-v1",
+				keyEpoch: "codex-wire-key-v1",
+			},
 		);
 	}
 

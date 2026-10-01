@@ -79,6 +79,37 @@ describe("durable cache metadata journal", () => {
 		}
 	});
 
+	test("preserves only fixed qualification and physical transport vocabulary", () => {
+		expect(
+			sanitizeCacheFacts({
+				physical_transport: "websocket",
+				response_mode: "sse",
+				cache_cohort_qualification: "unknown",
+				cache_cohort_reason: "physical_parameters_unobserved",
+				upstream_cache_residency: "unknown",
+				usage_input_semantics: "physical_inclusive",
+				digest_epoch_digest: cacheDigest("epoch"),
+				prepare_to_dispatch_ms: 9,
+				cache_write_tokens: null,
+			}),
+		).toMatchObject({
+			physical_transport: "websocket",
+			response_mode: "sse",
+			cache_cohort_qualification: "unknown",
+			cache_cohort_reason: "physical_parameters_unobserved",
+			cache_write_tokens: null,
+		});
+		expect(
+			sanitizeCacheFacts({
+				physical_transport: "PRIVATE-TRANSPORT",
+				response_mode: "PRIVATE-MODE",
+				cache_cohort_reason: "PRIVATE-REASON",
+				upstream_cache_residency: "resident",
+				client_build_digest: "PRIVATE-CLIENT",
+			}),
+		).toEqual({});
+	});
+
 	test("rejects payload-shaped values and never follows the journal symlink", () => {
 		expect(
 			sanitizeCacheFacts({
