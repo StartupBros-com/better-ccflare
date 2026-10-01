@@ -302,3 +302,93 @@ describe("readBoundedRequestBody", () => {
 		expect(body.locked).toBe(false);
 	});
 });
+
+describe("request body cleanup failure preserves its primary result", () => {
+	function cleanupFailure(body: ReadableStream<Uint8Array<ArrayBuffer>>) {
+		const reader = body.getReader();
+		const release = reader.releaseLock.bind(reader);
+		let releases = 0;
+		reader.releaseLock = () => {
+			releases++;
+			throw new TypeError("undefined is not a function");
+		};
+		const request = requestFromStream(body);
+		Object.defineProperty(body, "getReader", { value: () => reader });
+		return { request, releases: () => releases, dispose: release };
+	}
+	it("returns complete binary bytes when EOF lock release throws", async () => {
+		const payload = new Uint8Array([0, 255, ...encoder.encode("é")]);
+		const f = cleanupFailure(streamFromChunks([payload]));
+		try {
+			const buffer = await readBoundedRequestBody(f.request, 8);
+			expect([...new Uint8Array(buffer as ArrayBuffer)]).toEqual([...payload]);
+			expect(f.releases()).toBe(1);
+		} finally {
+			f.dispose();
+		}
+	});
+	it("preserves the exact primary reader error when lock release throws", async () => {
+		const primary = new Error("body read failed");
+		const f = cleanupFailure(
+			new ReadableStream({
+				start(c) {
+					c.error(primary);
+				},
+			}),
+		);
+		try {
+			await expect(readBoundedRequestBody(f.request, 8)).rejects.toBe(primary);
+			expect(f.releases()).toBe(1);
+		} finally {
+			f.dispose();
+		}
+	});
+	it("preserves request abort and cancellation when lock release throws", async () => {
+		const controller = new AbortController();
+		const primary = new DOMException("downstream closed", "AbortError");
+		let cancelled = 0;
+		const f = cleanupFailure(
+			new ReadableStream({
+				cancel() {
+					cancelled++;
+				},
+			}),
+		);
+		try {
+			const result = readBoundedRequestBody(
+				{ ...f.request, signal: controller.signal },
+				8,
+			);
+			controller.abort(primary);
+			await expect(result).rejects.toBe(primary);
+			expect(cancelled).toBe(1);
+			expect(f.releases()).toBe(1);
+		} finally {
+			f.dispose();
+		}
+	});
+	it("preserves streamed overflow without returning a prefix when lock release throws", async () => {
+		let cancelled = 0;
+		const f = cleanupFailure(
+			new ReadableStream({
+				start(c) {
+					c.enqueue(encoder.encode("123456789"));
+				},
+				cancel() {
+					cancelled++;
+				},
+			}),
+		);
+		try {
+			await expect(readBoundedRequestBody(f.request, 8)).rejects.toMatchObject({
+				name: "RequestBodyTooLargeError",
+				source: "streamed",
+				limit: 8,
+			});
+			expect(cancelled).toBe(1);
+			expect(f.releases()).toBe(1);
+		} finally {
+			f.dispose();
+		}
+	});
+});
