@@ -66,8 +66,8 @@ describe("CLI Qwen account re-authentication", () => {
 		dbOps = DatabaseFactory.getInstance();
 	});
 
-	afterEach(() => {
-		DatabaseFactory.reset();
+	afterEach(async () => {
+		await DatabaseFactory.reset();
 		for (const path of [dbPath, `${dbPath}-shm`, `${dbPath}-wal`]) {
 			if (existsSync(path)) {
 				rmSync(path, { recursive: true, force: true });

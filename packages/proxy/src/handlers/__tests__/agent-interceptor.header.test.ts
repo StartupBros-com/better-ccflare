@@ -70,8 +70,8 @@ describe("Agent Interceptor - X-Anthropic-Agent-Id Header", () => {
 		dbOps = DatabaseFactory.getInstance();
 	});
 
-	afterAll(() => {
-		DatabaseFactory.reset();
+	afterAll(async () => {
+		await DatabaseFactory.reset();
 		try {
 			if (existsSync(TEST_DB_PATH)) unlinkSync(TEST_DB_PATH);
 		} catch (error) {

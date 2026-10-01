@@ -48,6 +48,10 @@ import {
 } from "./adapters/bun-sql-adapter";
 import { EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE } from "./inline-incremental-vacuum-worker";
 import { EMBEDDED_VACUUM_WORKER_CODE } from "./inline-vacuum-worker";
+import {
+	type MaintenanceWorkerOptions,
+	MaintenanceWorkerOwner,
+} from "./maintenance-worker-owner";
 import { ensureSchema, runMigrations } from "./migrations";
 import { ensureSchemaPg, runMigrationsPg } from "./migrations-pg";
 import {
@@ -407,11 +411,32 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 	private usageWindows: UsageWindowsRepository;
 	private cacheFlightRecorder: CacheFlightRecorderRepository;
 
+	private maintenanceOwner: MaintenanceWorkerOwner;
+	private compactionOwner: MaintenanceWorkerOwner;
+	private closePromise?: Promise<void>;
+	private closing = false;
+
 	constructor(
 		dbPath?: string,
 		dbConfig?: DatabaseConfig,
 		retryConfig?: DatabaseRetryConfig,
+		maintenanceOptions?: MaintenanceWorkerOptions,
 	) {
+		this.maintenanceOwner = new MaintenanceWorkerOwner(
+			new URL("./incremental-vacuum-worker.ts", import.meta.url).href,
+			{
+				embeddedCode: EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE,
+				...maintenanceOptions,
+			},
+		);
+		this.compactionOwner = new MaintenanceWorkerOwner(
+			new URL("./vacuum-worker.ts", import.meta.url).href,
+			{
+				embeddedCode: EMBEDDED_VACUUM_WORKER_CODE,
+				jobTimeoutMs: 30 * 60_000,
+				maxPendingJobs: 0,
+			},
+		);
 		// Default database configuration optimized for distributed filesystems.
 		// cacheSize kept in sync with the runtime-config default in
 		// packages/config/src/index.ts (256 MiB, negative = KiB): a big enough
@@ -1885,17 +1910,27 @@ OAuth tokens will need to be re-authenticated.
 		await this.agentPreferences.setBulkPreferences(agentIds, model);
 	}
 
-	async close(): Promise<void> {
-		// Stop the multi-instance heartbeat loop and remove this instance's
-		// row before closing the adapter. Best-effort — errors here are
-		// logged inside the stopper, not rethrown.
-		if (this.heartbeatStop) {
-			try {
-				await this.heartbeatStop();
-			} finally {
-				this.heartbeatStop = null;
-			}
-		}
+	close(): Promise<void> {
+		if (this.closePromise) return this.closePromise;
+		this.closing = true;
+		this.closePromise = this.closeOwnedResources();
+		return this.closePromise;
+	}
+
+	private async closeOwnedResources(): Promise<void> {
+		// Close-time writes/checkpoint are best-effort: an unrelated writer must
+		// not park the main event loop in the serving connection's busy handler.
+		this.sqliteDb?.exec("PRAGMA busy_timeout = 0");
+		const stopHeartbeat = this.heartbeatStop;
+		this.heartbeatStop = null;
+		// Stop every trigger synchronously before awaiting retirement. Each
+		// pending owner must positively settle; ambiguity holds adapter close
+		// until the supervisor reaps the process instead of allowing replacement.
+		await Promise.all([
+			this.maintenanceOwner.close(),
+			this.compactionOwner.close(),
+			stopHeartbeat?.(),
+		]);
 		await this.adapter.close();
 	}
 
@@ -1936,37 +1971,14 @@ OAuth tokens will need to be re-authenticated.
 			return { ok: true, skipped: true, durationMs: 0 };
 		}
 		const start = Date.now();
-		const worker = this.spawnIncrementalVacuumWorker();
-		try {
-			const result = await new Promise<
-				| { ok: true; skipped: boolean }
-				| { ok: true; mode: number }
-				| { ok: false; error: string }
-			>((resolve, reject) => {
-				worker.onmessage = (event: MessageEvent) => resolve(event.data);
-				worker.onerror = (event: ErrorEvent) =>
-					reject(new Error(event.message ?? "optimize worker error"));
-				worker.postMessage({ dbPath: this.resolvedDbPath, kind: "optimize" });
-			});
-			const durationMs = Date.now() - start;
-			if (!result.ok) {
-				return { ok: false, skipped: false, durationMs, error: result.error };
-			}
-			return {
-				ok: true,
-				skipped: "skipped" in result ? result.skipped : false,
-				durationMs,
-			};
-		} catch (err) {
-			return {
-				ok: false,
-				skipped: false,
-				durationMs: Date.now() - start,
-				error: err instanceof Error ? err.message : String(err),
-			};
-		} finally {
-			worker.terminate();
-		}
+		const result = await this.maintenanceOwner.run({
+			dbPath: this.resolvedDbPath,
+			kind: "optimize",
+		});
+		const durationMs = Date.now() - start;
+		return result.ok
+			? { ok: true, skipped: result.skipped ?? false, durationMs }
+			: { ok: false, skipped: false, durationMs, error: result.error };
 	}
 
 	/**
@@ -2110,41 +2122,21 @@ OAuth tokens will need to be re-authenticated.
 			};
 		}
 
-		// Run the WAL checkpoint + VACUUM + TRUNCATE sequence in a Worker thread
-		// so the main Bun event loop stays free to serve health checks and other
-		// requests during what can be a minutes-long exclusive DB operation.
-		const dbPath = this.resolvedDbPath;
-		let worker: Worker;
-		if (EMBEDDED_VACUUM_WORKER_CODE) {
-			const workerCode = Buffer.from(
-				EMBEDDED_VACUUM_WORKER_CODE,
-				"base64",
-			).toString("utf8");
-			const blob = new Blob([workerCode], { type: "text/javascript" });
-			worker = new Worker(URL.createObjectURL(blob), { smol: true });
-		} else {
-			worker = new Worker(new URL("./vacuum-worker.ts", import.meta.url).href);
-		}
+		if (this.closing)
+			return {
+				walBusy: 0,
+				walLog: 0,
+				walCheckpointed: 0,
+				vacuumed: false,
+				error: "Database closing",
+			};
 		this.compacting = true;
-
 		try {
-			const result = await new Promise<{
-				ok: boolean;
-				walBusy?: number;
-				walLog?: number;
-				walCheckpointed?: number;
-				walTruncateBusy?: number;
-				error?: string;
-			}>((resolve, reject) => {
-				worker.onmessage = (event: MessageEvent) => resolve(event.data);
-				worker.onerror = (event: ErrorEvent) =>
-					reject(new Error(event.message));
-				worker.postMessage({
-					dbPath,
-					busyTimeoutMs: this.dbConfig.busyTimeoutMs ?? 10000,
-				});
+			const result = await this.compactionOwner.run({
+				kind: "compact",
+				dbPath: this.resolvedDbPath,
+				busyTimeoutMs: this.dbConfig.busyTimeoutMs ?? 10000,
 			});
-
 			if (!result.ok) {
 				const msg = result.error ?? "Unknown error in vacuum worker";
 				console.error(`[compact] Database compaction failed: ${msg}`);
@@ -2167,29 +2159,14 @@ OAuth tokens will need to be re-authenticated.
 			};
 		} finally {
 			this.compacting = false;
-			worker.terminate();
 		}
 	}
 
-	/**
-	 * Spawn the incremental-vacuum worker (shared by `incrementalVacuum()`
-	 * (kind "vacuum") and `optimizeAsync()` (kind "optimize"). Uses the
-	 * embedded base64 bundle when available (production build), falling back
-	 * to the on-disk worker source (tests / fresh worktrees where the inline
-	 * file is an empty placeholder).
-	 */
-	private spawnIncrementalVacuumWorker(): Worker {
-		if (EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE) {
-			const workerCode = Buffer.from(
-				EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE,
-				"base64",
-			).toString("utf8");
-			const blob = new Blob([workerCode], { type: "text/javascript" });
-			return new Worker(URL.createObjectURL(blob), { smol: true });
-		}
-		return new Worker(
-			new URL("./incremental-vacuum-worker.ts", import.meta.url).href,
-		);
+	getMaintenanceStatus() {
+		return {
+			periodic: this.maintenanceOwner.getStatus(),
+			compaction: this.compactionOwner.getStatus(),
+		};
 	}
 
 	/**
@@ -2212,6 +2189,7 @@ OAuth tokens will need to be re-authenticated.
 	 * than throwing, so a transient failure doesn't crash the hourly tick.
 	 */
 	async incrementalVacuum(pages = 8000): Promise<void> {
+		if (this.closing) return;
 		if (!this.sqliteDb || !this.resolvedDbPath) return;
 
 		// Resolve the effective auto_vacuum mode. The captured `originalMode`
@@ -2247,42 +2225,32 @@ OAuth tokens will need to be re-authenticated.
 			return;
 		}
 
-		const dbPath = this.resolvedDbPath;
-		const worker = this.spawnIncrementalVacuumWorker();
-
-		try {
-			const result = await new Promise<
-				{ ok: true; mode: number } | { ok: false; error: string }
-			>((resolve, reject) => {
-				worker.onmessage = (event: MessageEvent) => resolve(event.data);
-				worker.onerror = (event: ErrorEvent) =>
-					reject(new Error(event.message ?? "incremental-vacuum worker error"));
-				worker.postMessage({ dbPath, pages, kind: "vacuum" });
-			});
-			if (result.ok) {
-				this.incVacuumConsecutiveSkips = 0;
+		const result = await this.maintenanceOwner.run({
+			dbPath: this.resolvedDbPath,
+			pages,
+			kind: "vacuum",
+		});
+		if (result.ok) {
+			this.incVacuumConsecutiveSkips = 0;
+		} else {
+			this.incVacuumConsecutiveSkips += 1;
+			// Single-tick failures are common and noise — sustained skips
+			// across several hourly ticks mean the DB isn't getting any
+			// reclamation, which can let free pages accumulate without
+			// bound. Escalate after 3 consecutive skips (= 3 hours of
+			// missed reclamation). (Greptile #230)
+			if (this.incVacuumConsecutiveSkips >= INC_VAC_SKIP_ESCALATE_AT) {
+				console.warn(
+					`[incrementalVacuum] worker error (${this.incVacuumConsecutiveSkips} consecutive ` +
+						`skips, ≈${this.incVacuumConsecutiveSkips}h of missed reclamation): ` +
+						`${result.error}. ` +
+						`Sustained SQLITE_BUSY suggests writer-slot contention — investigate ` +
+						`whether long-running writers (large DELETEs, manual maintenance) are ` +
+						`overlapping the hourly tick.`,
+				);
 			} else {
-				this.incVacuumConsecutiveSkips += 1;
-				// Single-tick failures are common and noise — sustained skips
-				// across several hourly ticks mean the DB isn't getting any
-				// reclamation, which can let free pages accumulate without
-				// bound. Escalate after 3 consecutive skips (= 3 hours of
-				// missed reclamation). (Greptile #230)
-				if (this.incVacuumConsecutiveSkips >= INC_VAC_SKIP_ESCALATE_AT) {
-					console.warn(
-						`[incrementalVacuum] worker error (${this.incVacuumConsecutiveSkips} consecutive ` +
-							`skips, ≈${this.incVacuumConsecutiveSkips}h of missed reclamation): ` +
-							`${result.error}. ` +
-							`Sustained SQLITE_BUSY suggests writer-slot contention — investigate ` +
-							`whether long-running writers (large DELETEs, manual maintenance) are ` +
-							`overlapping the hourly tick.`,
-					);
-				} else {
-					console.warn(`[incrementalVacuum] worker error: ${result.error}`);
-				}
+				console.warn(`[incrementalVacuum] worker error: ${result.error}`);
 			}
-		} finally {
-			worker.terminate();
 		}
 	}
 

@@ -1914,18 +1914,17 @@ export default async function startServer(options?: {
 	// vacuum worker held the write lock, freezing the event loop.
 	const unregisterWalCheckpoint = registerCleanup({
 		id: "wal-checkpoint",
-		callback: () => {
-			dbOps
-				.optimizeAsync()
-				.then(async (result) => {
-					const walBytes = result.ok ? await dbOps.getWalSizeBytes() : 0;
-					const { level, message } = formatWalCheckpointLog(result, walBytes);
-					log[level](message);
-				})
-				.catch((err) => {
-					log.error(`WAL checkpoint error: ${err}`);
-				});
+		callback: async () => {
+			try {
+				const result = await dbOps.optimizeAsync();
+				const walBytes = result.ok ? await dbOps.getWalSizeBytes() : 0;
+				const { level, message } = formatWalCheckpointLog(result, walBytes);
+				log[level](message);
+			} catch (err) {
+				log.error(`WAL checkpoint error: ${err}`);
+			}
 		},
+		maxConcurrent: 1,
 		minutes: 1,
 		description: "WAL checkpoint to prevent unbounded WAL file growth",
 	});

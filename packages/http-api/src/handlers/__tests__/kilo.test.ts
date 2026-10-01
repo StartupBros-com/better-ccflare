@@ -29,7 +29,8 @@ describe("Kilo Gateway Handler", () => {
 		handler = createKiloAccountAddHandler(dbOps);
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await DatabaseFactory.reset();
 		// Clean up test database
 		try {
 			if (existsSync(TEST_DB_PATH)) {
@@ -38,7 +39,6 @@ describe("Kilo Gateway Handler", () => {
 		} catch (error) {
 			console.warn("Failed to clean up test database:", error);
 		}
-		DatabaseFactory.reset();
 	});
 
 	describe("Kilo Gateway Account Creation", () => {

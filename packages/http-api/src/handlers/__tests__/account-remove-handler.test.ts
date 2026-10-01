@@ -31,11 +31,11 @@ describe("createAccountRemoveHandler — id-scoped delete", () => {
 		handler = createAccountRemoveHandler(dbOps);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		// Close BEFORE unlinking: deleting the file under an open connection
 		// makes close()'s `PRAGMA wal_checkpoint(TRUNCATE)` fail with
 		// SQLITE_IOERR_VNODE, surfacing as an unhandled error between tests.
-		DatabaseFactory.reset();
+		await DatabaseFactory.reset();
 		cleanupDbFiles();
 	});
 

@@ -412,20 +412,30 @@ export function startHeartbeatLoop(
 	options: {
 		intervalMs?: number;
 		now?: () => number;
+		settlementTimeoutMs?: number;
 	} = {},
 ): () => Promise<void> {
 	const intervalMs = options.intervalMs ?? HEARTBEAT_INTERVAL_MS;
 	const now = options.now ?? Date.now;
 
+	const settlementTimeoutMs =
+		typeof options.settlementTimeoutMs === "number" &&
+		Number.isFinite(options.settlementTimeoutMs)
+			? Math.max(1, Math.min(1000, Math.trunc(options.settlementTimeoutMs)))
+			: 1000;
 	let stopped = false;
+	let inFlight: Promise<void> | null = null;
+	let stopPromise: Promise<void> | null = null;
 	const timer = setInterval(() => {
-		if (stopped) return;
-		// Fire-and-forget: write errors are logged inside writeHeartbeat
-		// callers, but here we surface them as warnings so a transient DB
-		// hiccup does not kill the process.
-		writeHeartbeat(adapter, now()).catch((err) => {
-			log.warn(`heartbeat tick failed: ${(err as Error).message}`);
-		});
+		if (stopped || inFlight) return;
+		// Keep one tracked mutation. A slow retry must not multiply timer jobs.
+		inFlight = writeHeartbeat(adapter, now())
+			.catch((err) => {
+				log.warn(`heartbeat tick failed: ${(err as Error).message}`);
+			})
+			.finally(() => {
+				inFlight = null;
+			});
 	}, intervalMs);
 	// Don't keep the event loop alive just for the heartbeat. Bun's
 	// setInterval return type is `number` under `lib: ["DOM"]` and
@@ -433,14 +443,42 @@ export function startHeartbeatLoop(
 	const maybeTimer = timer as { unref?: () => void };
 	if (typeof maybeTimer.unref === "function") maybeTimer.unref();
 
-	return async () => {
-		if (stopped) return;
+	return () => {
+		if (stopPromise) return stopPromise;
 		stopped = true;
 		clearInterval(timer);
-		try {
-			await clearHeartbeat(adapter);
-		} catch (err) {
-			log.warn(`heartbeat cleanup failed: ${(err as Error).message}`);
-		}
+		const settle = async (job: Promise<void>) => {
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await Promise.race([
+					job,
+					new Promise<never>((_, reject) => {
+						timeout = setTimeout(
+							() =>
+								reject(
+									new Error(
+										"heartbeat retirement unconfirmed; database ownership held",
+									),
+								),
+							settlementTimeoutMs,
+						);
+					}),
+				]);
+			} finally {
+				if (timeout) clearTimeout(timeout);
+			}
+		};
+		stopPromise = (async () => {
+			if (inFlight) await settle(inFlight);
+			// The row cannot be resurrected by a still-owned heartbeat after deletion.
+			// A pending cleanup also holds adapter close; an ordinary settled failure
+			// is best-effort and the stale row expires naturally.
+			await settle(
+				clearHeartbeat(adapter).catch((err) => {
+					log.warn(`heartbeat cleanup failed: ${(err as Error).message}`);
+				}),
+			);
+		})();
+		return stopPromise;
 	};
 }

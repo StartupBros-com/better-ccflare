@@ -29,7 +29,8 @@ describe("NanoGPT Handler", () => {
 		handler = createNanoGPTAccountAddHandler(dbOps);
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await DatabaseFactory.reset();
 		// Clean up test database
 		try {
 			if (existsSync(TEST_DB_PATH)) {
@@ -38,7 +39,6 @@ describe("NanoGPT Handler", () => {
 		} catch (error) {
 			console.warn("Failed to clean up test database:", error);
 		}
-		DatabaseFactory.reset();
 	});
 
 	describe("NanoGPT Account Creation", () => {

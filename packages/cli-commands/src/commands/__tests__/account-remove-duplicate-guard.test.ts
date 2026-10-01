@@ -57,12 +57,12 @@ describe("removeAccountById / removeAccount duplicate-name safety", () => {
 		dbOps = DatabaseFactory.getInstance();
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		// Close BEFORE unlinking. Deleting the file out from under an open
 		// connection makes close() fail its `PRAGMA wal_checkpoint(TRUNCATE)`
 		// with SQLITE_IOERR_VNODE, which surfaces as an unhandled error between
 		// tests and takes unrelated cases down with it.
-		DatabaseFactory.reset();
+		await DatabaseFactory.reset();
 		for (const suffix of ["", "-wal", "-shm"]) {
 			try {
 				const p = `${TEST_DB_PATH}${suffix}`;

@@ -157,13 +157,14 @@ describe("interceptAndModifyRequest - rewrite guard integration", () => {
 		fs.mkdirSync(agentsDir, { recursive: true });
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await DatabaseFactory.reset();
 		try {
 			if (existsSync(TEST_DB_PATH)) unlinkSync(TEST_DB_PATH);
 		} catch (error) {
 			console.warn("Failed to clean up test database:", error);
 		}
-		DatabaseFactory.reset();
+
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 		agentRegistry.clearWorkspaces();
 	});
@@ -411,8 +412,8 @@ describe("interceptAndModifyRequest - forced tool_choice guard", () => {
 		fs.mkdirSync(agentsDir, { recursive: true });
 	});
 
-	afterAll(() => {
-		DatabaseFactory.reset();
+	afterAll(async () => {
+		await DatabaseFactory.reset();
 		for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
 			fs.rmSync(file, { force: true });
 		}

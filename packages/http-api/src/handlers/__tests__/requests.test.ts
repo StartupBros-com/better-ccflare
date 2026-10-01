@@ -58,7 +58,8 @@ describe("createRequestsSummaryHandler — attribution source mapping", () => {
 		);
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await DatabaseFactory.reset();
 		try {
 			if (existsSync(TEST_DB_PATH)) {
 				unlinkSync(TEST_DB_PATH);
@@ -66,7 +67,6 @@ describe("createRequestsSummaryHandler — attribution source mapping", () => {
 		} catch (error) {
 			console.warn("Failed to clean up test database:", error);
 		}
-		DatabaseFactory.reset();
 	});
 
 	it("maps project_attribution_source and agent_attribution_source onto the response", async () => {

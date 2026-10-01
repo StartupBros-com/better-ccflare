@@ -77,7 +77,8 @@ describe("createRequestsSummaryHandler — stream terminal state mapping", () =>
 		await saveWithTerminalState(dbOps, "req-no-state", null);
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await DatabaseFactory.reset();
 		try {
 			if (existsSync(TEST_DB_PATH)) {
 				unlinkSync(TEST_DB_PATH);
@@ -85,7 +86,6 @@ describe("createRequestsSummaryHandler — stream terminal state mapping", () =>
 		} catch (error) {
 			console.warn("Failed to clean up test database:", error);
 		}
-		DatabaseFactory.reset();
 	});
 
 	async function fetchRows(): Promise<RequestResponse[]> {

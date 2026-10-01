@@ -8,6 +8,7 @@ import {
 import { migrateFromCcflare } from "./migrate-from-ccflare";
 
 let instance: DatabaseOperations | null = null;
+let closing: Promise<void> | null = null;
 let dbPath: string | undefined;
 let runtimeConfig: RuntimeConfig | undefined;
 let migrationChecked = false;
@@ -24,11 +25,19 @@ export function initialize(
 	runtimeConfigParam?: RuntimeConfig,
 	_fastMode = false,
 ): void {
+	if (closing)
+		throw new Error(
+			"Database owner retiring; await closeAll() before initializing",
+		);
 	dbPath = dbPathParam;
 	runtimeConfig = runtimeConfigParam;
 }
 
 export function getInstance(_fastMode?: boolean): DatabaseOperations {
+	if (closing)
+		throw new Error(
+			"Database owner retiring; await closeAll() before replacement",
+		);
 	if (!instance) {
 		// Perform one-time migration check from legacy ccflare
 		if (!migrationChecked) {
@@ -85,17 +94,23 @@ export async function getInstanceAsync(
 	return db;
 }
 
-export function closeAll(): void {
-	if (instance) {
-		unregisterDisposable(instance);
-		// Fire-and-forget close (sync-compatible)
-		void instance.close();
+/** Keep the singleton registered until every database owner has retired. */
+export function closeAll(): Promise<void> {
+	if (closing) return closing;
+	if (!instance) return Promise.resolve();
+	const retiringInstance = instance;
+	closing = retiringInstance.close().then(() => {
+		unregisterDisposable(retiringInstance);
 		instance = null;
-	}
+		closing = null;
+	});
+	// On ambiguous retirement, keep the failed promise and owner fenced until
+	// process reap rather than opening another connection over a live worker.
+	return closing;
 }
 
-export function reset(): void {
-	closeAll();
+export function reset(): Promise<void> {
+	return closeAll();
 }
 
 export const DatabaseFactory = {

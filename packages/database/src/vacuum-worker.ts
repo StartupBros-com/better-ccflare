@@ -1,9 +1,9 @@
 import { Database } from "bun:sqlite";
 
-type VacuumRequest = {
-	dbPath: string;
-	busyTimeoutMs: number;
-};
+type VacuumRequest = (
+	| { kind?: "compact"; dbPath: string; busyTimeoutMs: number }
+	| { kind: "retire" }
+) & { generation?: number; jobId?: number };
 
 type VacuumResult =
 	| {
@@ -22,8 +22,24 @@ type VacuumResult =
 			walTruncateBusy?: number;
 	  };
 
+let retirementSafe = true;
+let retired = false;
 self.onmessage = (event: MessageEvent<VacuumRequest>) => {
-	const { dbPath, busyTimeoutMs } = event.data;
+	const request = event.data;
+	if (request.kind === "retire") {
+		retired = true;
+		if (retirementSafe) {
+			self.postMessage({
+				kind: "retired",
+				generation: request.generation,
+				closed: true,
+			});
+			self.close();
+		}
+		return;
+	}
+	if (retired || !retirementSafe) return;
+	const { dbPath, busyTimeoutMs } = request;
 	let walBusy = 0;
 	let walLog = 0;
 	let walCheckpointed = 0;
@@ -89,25 +105,48 @@ self.onmessage = (event: MessageEvent<VacuumRequest>) => {
 			}
 		}
 
-		db.close();
+		try {
+			db.close();
+		} catch (error) {
+			retirementSafe = false;
+			throw error;
+		}
 		db = undefined;
 
 		self.postMessage({
+			generation: request.generation,
+			jobId: request.jobId,
+			closed: true,
 			ok: true,
 			walBusy,
 			walLog,
 			walCheckpointed,
 			walTruncateBusy,
-		} satisfies VacuumResult);
+		} satisfies VacuumResult & {
+			generation?: number;
+			jobId?: number;
+			closed: boolean;
+		});
 	} catch (err) {
-		db?.close();
+		try {
+			db?.close();
+		} catch {
+			retirementSafe = false;
+		}
 		self.postMessage({
+			generation: request.generation,
+			jobId: request.jobId,
+			closed: retirementSafe,
 			ok: false,
 			error: err instanceof Error ? err.message : String(err),
 			walBusy,
 			walLog,
 			walCheckpointed,
 			walTruncateBusy,
-		} satisfies VacuumResult);
+		} satisfies VacuumResult & {
+			generation?: number;
+			jobId?: number;
+			closed: boolean;
+		});
 	}
 };
