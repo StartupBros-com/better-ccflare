@@ -2805,8 +2805,8 @@ export async function proxyWithAccount(
 						modelFallbackPolicy?.qualityAttempt?.assertDispatch();
 						// No await after the final authoritative gates. Observation is
 						// fail-open and cannot make an expired attempt dispatchable.
-						onHttpDispatch?.();
 						assertManagedWorkAvailable(req);
+						onHttpDispatch?.();
 						markDispatched();
 						const pendingHttp = makeProxyRequest(
 							request,
