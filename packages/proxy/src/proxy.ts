@@ -942,6 +942,11 @@ async function handleProxyCoreImpl(
 	bindObservedRequestId(observation, requestMeta.id);
 	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
 	const routingAttemptLedger = new RoutingAttemptLedger();
+	getRequestLifecycleCoordinator(requestMeta).bindRoutingObservation(
+		routingAttemptLedger,
+		(nativeStatus) =>
+			activeAnthropicPreCommitRescue?.isRescueCommitted() ? 200 : nativeStatus,
+	);
 	const recordLocalRoutingTerminal = (
 		response: Response,
 		terminalKind: string,

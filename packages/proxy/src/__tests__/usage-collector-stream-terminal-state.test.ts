@@ -117,6 +117,78 @@ describe("UsageCollector - stream terminal state in the live summary", () => {
 		return summary;
 	}
 
+	test("native parser clears a provisional winner when its actual stream is incomplete", async () => {
+		const requestId = "terminal-native-attempt";
+		collector.handleStart({
+			...makeStart(requestId),
+			path: "/v1/responses",
+			providerName: "codex",
+			responseHeaders: {
+				"x-better-ccflare-codex-response-format": "responses-api",
+			},
+		});
+		collector.handleChunk(
+			requestId,
+			new TextEncoder().encode(
+				'event: response.incomplete\ndata: {"type":"response.incomplete","response":{"model":"test-model","status":"incomplete","usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+			),
+		);
+		await collector.handleEnd({
+			type: "end",
+			requestId,
+			success: true,
+			routingAttemptSummary: {
+				version: 1,
+				physicalAttemptCount: 1,
+				routeCount: 1,
+				truncated: false,
+				completeness: "complete",
+				outputOriginOrdinal: 1,
+				winnerOrdinal: 1,
+				nativeStatus: 200,
+				wireStatus: 200,
+				terminalCause: null,
+				cancellationOrigin: null,
+				attempts: [
+					{
+						ordinal: 1,
+						accountId: "test-account",
+						provider: "codex",
+						logicalModel: "test-logical",
+						physicalModel: "test-model",
+						outcome: "succeeded",
+						cause: null,
+						startedAt: null,
+						outcomeObservedAt: null,
+						nativeStatus: 200,
+						protocolFrames: null,
+						meaningfulProgress: "unknown",
+						terminalEvidenceSeen: null,
+					},
+				],
+			},
+		});
+		const summary = summaries.get(requestId);
+		if (!summary) throw new Error("Expected native final summary");
+		expect(summary.success).toBe(false);
+		expect(summary.streamTerminalState).toBe("truncated");
+		expect(summary.routingAttemptSummary).toMatchObject({
+			outputOriginOrdinal: 1,
+			winnerOrdinal: null,
+			terminalCause: "unknown",
+			attempts: [{ outcome: "failed", cause: "unknown" }],
+		});
+		await collector.drain();
+		const row = await dbOps
+			.getAdapter()
+			.get<{ routing_attempt_summary: string }>(
+				"SELECT routing_attempt_summary FROM requests WHERE id=?",
+				[requestId],
+			);
+		if (!row) throw new Error("Expected native final row");
+		expect(JSON.parse(row.routing_attempt_summary).winnerOrdinal).toBeNull();
+	});
+
 	test("a client-cancelled stream reaches the live summary", async () => {
 		const summary = await runRequestAndGetSummary(
 			"terminal-state-cancelled",

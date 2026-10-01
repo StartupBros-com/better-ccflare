@@ -1513,6 +1513,7 @@ OAuth tokens will need to be re-authenticated.
 		routeProvenance?: RouteProvenance | null,
 		accounting?: RequestData["accounting"],
 		qualityDecision?: RequestData["qualityDecision"],
+		routingAttemptSummary?: RequestData["routingAttemptSummary"],
 	): Promise<void> {
 		await withDatabaseRetry(
 			() =>
@@ -1542,6 +1543,7 @@ OAuth tokens will need to be re-authenticated.
 					routeProvenance,
 					accounting,
 					qualityDecision,
+					routingAttemptSummary,
 				}),
 			this.retryConfig,
 			"saveRequest",

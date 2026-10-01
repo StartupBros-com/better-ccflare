@@ -2453,6 +2453,10 @@ export async function proxyUnauthenticated(
 		}
 
 		routingAttemptLedger?.recordPhysicalAttempt({
+			provider: ctx.provider.name,
+			logicalModel:
+				requestMeta.originalModel ?? requestMeta.requestedLogicalModel ?? null,
+			physicalModel: null,
 			laneKey: requestMeta.affinityLaneKey ?? null,
 		});
 		const dispatchSignal = AbortSignal.any([
@@ -3299,6 +3303,10 @@ export async function proxyWithAccount(
 				beforePhysicalTransport: routingAttemptLedger
 					? () => {
 							routingAttemptLedger.recordPhysicalAttempt({
+								provider: provider.name,
+								logicalModel:
+									requestMeta.originalModel ?? clientRequestedModel ?? null,
+								physicalModel,
 								accountId: account.id,
 								candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
 								laneKey: requestMeta.affinityLaneKey ?? null,
@@ -4277,6 +4285,10 @@ export async function proxyWithAccount(
 				const recordPhysicalDispatch = (): void => {
 					ensureNativeQuotaDispatch();
 					routingAttemptLedger?.recordPhysicalAttempt({
+						provider: attemptPlan.providerName,
+						logicalModel:
+							requestMeta.originalModel ?? clientRequestedModel ?? null,
+						physicalModel: resolvedModel ?? null,
 						accountId: account.id,
 						candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
 						laneKey: requestMeta.affinityLaneKey ?? null,
@@ -4885,6 +4897,7 @@ export async function proxyWithAccount(
 				readAttemptBoundJson,
 			);
 			if (!classification) return false;
+			routingAttemptLedger?.recordPhysicalOutcome("context_length_exceeded");
 			const authoritative = classification === "authoritative";
 			const retainedLegacyContextOverflow = hasRetainedLegacyContextOverflow();
 			const canReplayAuthoritativeOverflow =
@@ -6141,6 +6154,7 @@ export async function proxyWithAccount(
 			failureResponse: Response,
 			attemptedModel = currentTransportModel || effectiveBodyContext.getModel(),
 		): Promise<RawAttemptFailureClassification> => {
+			routingAttemptLedger?.observePhysicalResponse(failureResponse.status);
 			const classification =
 				(await handleExtraUsageExhausted400(failureResponse, attemptedModel)) ??
 				(await handleOrgPermissionDenied403(failureResponse, attemptedModel)) ??
@@ -6155,6 +6169,7 @@ export async function proxyWithAccount(
 					stopAccountAttempt: false,
 				};
 			}
+			routingAttemptLedger?.recordPhysicalOutcome("upstream_error");
 			await finalizeCurrentCodexTransport(failureResponse);
 			if (!classification.retainedTerminalResponse) {
 				await discardUpstreamBody(failureResponse);
@@ -7429,6 +7444,13 @@ export async function proxyWithAccount(
 				}
 				break;
 			} catch (error) {
+				if (error instanceof AnthropicPreCommitStallError) {
+					routingAttemptLedger?.recordPhysicalOutcome(
+						error.reason,
+						"failed",
+						error,
+					);
+				}
 				const websocketReceipt = getCurrentCodexWebSocketReceipt();
 				if (websocketReceipt?.frameWritten) {
 					activeAttemptCommitment?.abortIfDeadlineElapsed();
@@ -8187,6 +8209,15 @@ export async function proxyWithAccount(
 			},
 		} satisfies PreparedProxyAccountResponse;
 	} catch (err) {
+		if (err instanceof AnthropicPreCommitStallError)
+			routingAttemptLedger?.recordPhysicalOutcome(err.reason, "failed", err);
+		else if (req.signal.aborted)
+			routingAttemptLedger?.recordPhysicalOutcome(
+				"client_cancelled",
+				"cancelled",
+			);
+		else if (!(err instanceof NativeQuotaAdmissionDenied))
+			routingAttemptLedger?.recordPhysicalOutcome("transport_error");
 		if (err instanceof QualityAttemptRejected) throw err;
 		const committedLifecycle = anthropicDegradedState?.lifecycle;
 		if (req.signal.aborted) {

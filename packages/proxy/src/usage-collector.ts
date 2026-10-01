@@ -21,6 +21,7 @@ import {
 // the REST handler uses, so both write surfaces narrow identically.
 import {
 	sanitizeQualityDecision,
+	sanitizeRequestRoutingAttemptSummary,
 	toStreamTerminalState,
 } from "@better-ccflare/types/request";
 import { formatCost } from "@better-ccflare/ui-common";
@@ -1221,6 +1222,41 @@ export class UsageCollector {
 			};
 		}
 
+		// This final parser owns native completion evidence. A header-based success
+		// can become a failed/truncated stream here before the first durable final.
+		const observedSummary = sanitizeRequestRoutingAttemptSummary(
+			msg.routingAttemptSummary,
+		);
+		msg = { ...msg, routingAttemptSummary: observedSummary };
+		if (
+			observedSummary &&
+			(!msg.success ||
+				msg.streamTerminalState === "client_cancelled" ||
+				msg.streamTerminalState === "error" ||
+				msg.streamTerminalState === "truncated")
+		) {
+			const cancelled = msg.streamTerminalState === "client_cancelled";
+			const cause = cancelled
+				? "client_cancelled"
+				: (observedSummary.terminalCause ?? "unknown");
+			msg = {
+				...msg,
+				routingAttemptSummary: {
+					...observedSummary,
+					winnerOrdinal: null,
+					terminalCause: cause,
+					cancellationOrigin: cancelled
+						? "client"
+						: observedSummary.cancellationOrigin,
+					attempts: observedSummary.attempts.map((a) =>
+						a.ordinal === observedSummary.winnerOrdinal
+							? { ...a, outcome: cancelled ? "cancelled" : "failed", cause }
+							: a,
+					),
+				},
+			};
+		}
+
 		// The streaming message_start names the REQUESTED model; a fallback content
 		// block or a fallback_message iteration names the model that actually served.
 		// A non-stream body's top-level model is already the serving model, so it wins.
@@ -1814,6 +1850,7 @@ export class UsageCollector {
 					startMessage.routeProvenance ?? null,
 					startMessage.accounting,
 					sanitizeQualityDecision(startMessage.qualityDecision),
+					msg.routingAttemptSummary,
 				);
 			} catch (error) {
 				log.error(
@@ -1986,6 +2023,7 @@ export class UsageCollector {
 			// producer only emits known states: both surfaces feed one field, and
 			// hardening one of them is how the two drift apart.
 			streamTerminalState: toStreamTerminalState(msg.streamTerminalState),
+			routingAttemptSummary: msg.routingAttemptSummary,
 		};
 
 		// Notify cacheBodyStore and emit summary for real-time updates

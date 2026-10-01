@@ -179,7 +179,204 @@ export function toStreamTerminalState(
 }
 
 // Database row type
+/** Fixed, observational attribution. It never grants routing or replay authority. */
+export const MAX_ROUTING_ATTEMPT_SNAPSHOTS = 16;
+// Four ASCII identity fields per snapshot fit the same compact write/read envelope.
+export const MAX_ROUTING_ATTEMPT_IDENTITY_CHARS = 128;
+export const MAX_ROUTING_ATTEMPT_SUMMARY_CHARS = 16384;
+export type RoutingAttemptCause =
+	| "meaningful_progress_timeout"
+	| "semantic_timeout"
+	| "context_length_exceeded"
+	| "upstream_error"
+	| "transport_error"
+	| "client_cancelled"
+	| "routing_rejected"
+	| "unknown";
+export interface RoutingPhysicalAttempt {
+	readonly ordinal: number;
+	readonly accountId: string | null;
+	readonly provider: string | null;
+	readonly logicalModel: string | null;
+	readonly physicalModel: string | null;
+	readonly outcome: "pending" | "failed" | "succeeded" | "cancelled";
+	readonly startedAt: number | null;
+	readonly outcomeObservedAt: number | null;
+	readonly nativeStatus: number | null;
+	readonly protocolFrames: number | null;
+	readonly meaningfulProgress: "absent" | "observed" | "unknown";
+	readonly terminalEvidenceSeen: boolean | null;
+	readonly cause: RoutingAttemptCause | null;
+}
+export interface RequestRoutingAttemptSummary {
+	readonly version: 1;
+	readonly physicalAttemptCount: number;
+	readonly routeCount: number;
+	readonly attempts: readonly RoutingPhysicalAttempt[];
+	readonly truncated: boolean;
+	readonly completeness: "complete" | "partial";
+	readonly outputOriginOrdinal: number | null;
+	readonly winnerOrdinal: number | null;
+	readonly nativeStatus: number | null;
+	readonly wireStatus: number | null;
+	readonly terminalCause: RoutingAttemptCause | null;
+	readonly cancellationOrigin: "client" | "unknown" | null;
+}
+const ROUTING_CAUSES = new Set<RoutingAttemptCause>([
+	"meaningful_progress_timeout",
+	"semantic_timeout",
+	"context_length_exceeded",
+	"upstream_error",
+	"transport_error",
+	"client_cancelled",
+	"routing_rejected",
+	"unknown",
+]);
+export function toRoutingAttemptCause(value: unknown): RoutingAttemptCause {
+	return typeof value === "string" &&
+		ROUTING_CAUSES.has(value as RoutingAttemptCause)
+		? (value as RoutingAttemptCause)
+		: "unknown";
+}
+function routingIdentity(value: unknown): string | null {
+	return typeof value === "string" &&
+		value.length <= MAX_ROUTING_ATTEMPT_IDENTITY_CHARS &&
+		/^[a-zA-Z0-9_.:/[\]@+-]+$/.test(value)
+		? value
+		: null;
+}
+function routingCounter(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value)
+		? Math.max(0, Math.min(32, Math.floor(value)))
+		: 0;
+}
+function routingOrdinal(value: unknown, count: number): number | null {
+	return typeof value === "number" &&
+		Number.isInteger(value) &&
+		value > 0 &&
+		value <= count
+		? value
+		: null;
+}
+function routingTimestamp(value: unknown): number | null {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+		? value
+		: null;
+}
+function routingStatus(value: unknown): number | null {
+	return typeof value === "number" &&
+		Number.isInteger(value) &&
+		value >= 100 &&
+		value <= 599
+		? value
+		: null;
+}
+/** Reject arbitrary fields/events/content at both persistence and read boundaries. */
+export function sanitizeRequestRoutingAttemptSummary(
+	value: unknown,
+): RequestRoutingAttemptSummary | null {
+	if (typeof value === "string") {
+		if (value.length > MAX_ROUTING_ATTEMPT_SUMMARY_CHARS) return null;
+		try {
+			value = JSON.parse(value);
+		} catch {
+			return null;
+		}
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const source = value as Record<string, unknown>;
+	if (source.version !== 1 || !Array.isArray(source.attempts)) return null;
+	const physicalAttemptCount = routingCounter(source.physicalAttemptCount);
+	let identityDropped = false;
+	const ordinals = new Set<number>();
+	const attempts = source.attempts
+		.slice(0, MAX_ROUTING_ATTEMPT_SNAPSHOTS)
+		.flatMap((item) => {
+			if (!item || typeof item !== "object") return [];
+			const a = item as Record<string, unknown>;
+			const ordinal = routingOrdinal(a.ordinal, physicalAttemptCount);
+			if (ordinal === null || ordinals.has(ordinal)) return [];
+			ordinals.add(ordinal);
+			for (const identity of [
+				a.accountId,
+				a.provider,
+				a.logicalModel,
+				a.physicalModel,
+			]) {
+				if (identity != null && routingIdentity(identity) === null)
+					identityDropped = true;
+			}
+			return [
+				{
+					ordinal,
+					accountId: routingIdentity(a.accountId),
+					provider: routingIdentity(a.provider),
+					logicalModel: routingIdentity(a.logicalModel),
+					physicalModel: routingIdentity(a.physicalModel),
+					outcome:
+						a.outcome === "failed" ||
+						a.outcome === "succeeded" ||
+						a.outcome === "cancelled"
+							? a.outcome
+							: "pending",
+					cause: a.cause === null ? null : toRoutingAttemptCause(a.cause),
+					startedAt: routingTimestamp(a.startedAt),
+					outcomeObservedAt: routingTimestamp(a.outcomeObservedAt),
+					nativeStatus: routingStatus(a.nativeStatus),
+					protocolFrames:
+						typeof a.protocolFrames === "number" &&
+						Number.isFinite(a.protocolFrames)
+							? Math.max(0, Math.min(65535, Math.floor(a.protocolFrames)))
+							: null,
+					meaningfulProgress:
+						a.meaningfulProgress === "observed" ||
+						a.meaningfulProgress === "absent"
+							? a.meaningfulProgress
+							: "unknown",
+					terminalEvidenceSeen:
+						typeof a.terminalEvidenceSeen === "boolean"
+							? a.terminalEvidenceSeen
+							: null,
+				} satisfies RoutingPhysicalAttempt,
+			];
+		});
+	return {
+		version: 1,
+		physicalAttemptCount,
+		routeCount: routingCounter(source.routeCount),
+		attempts,
+		truncated:
+			source.truncated === true || physicalAttemptCount > attempts.length,
+		completeness:
+			source.completeness === "complete" &&
+			!identityDropped &&
+			source.truncated !== true &&
+			physicalAttemptCount === attempts.length &&
+			attempts.every((a) => a.outcome !== "pending")
+				? "complete"
+				: "partial",
+		outputOriginOrdinal: routingOrdinal(
+			source.outputOriginOrdinal,
+			physicalAttemptCount,
+		),
+		winnerOrdinal: routingOrdinal(source.winnerOrdinal, physicalAttemptCount),
+		nativeStatus: routingStatus(source.nativeStatus),
+		wireStatus: routingStatus(source.wireStatus),
+		terminalCause:
+			source.terminalCause === null
+				? null
+				: toRoutingAttemptCause(source.terminalCause),
+		cancellationOrigin:
+			source.cancellationOrigin === "client"
+				? "client"
+				: source.cancellationOrigin === "unknown"
+					? "unknown"
+					: null,
+	};
+}
+
 export interface RequestRow {
+	routing_attempt_summary?: string | null;
 	quality_decision?: string | null;
 	id: string;
 	timestamp: number;
@@ -225,6 +422,7 @@ export interface RequestRow {
 
 // Domain model
 export interface Request {
+	routingAttemptSummary?: RequestRoutingAttemptSummary | null;
 	id: string;
 	timestamp: number;
 	method: string;
@@ -263,6 +461,7 @@ export interface Request {
 
 // API response type
 export interface RequestResponse {
+	routingAttemptSummary?: RequestRoutingAttemptSummary | null;
 	id: string;
 	timestamp: string;
 	method: string;
@@ -459,6 +658,9 @@ export function toRequest(row: RequestRow): Request {
 		clientSessionId: row.client_session_id || undefined,
 		streamTerminalState: toStreamTerminalState(row.stream_terminal_state),
 		qualityDecision: sanitizeQualityDecision(row.quality_decision),
+		routingAttemptSummary: sanitizeRequestRoutingAttemptSummary(
+			row.routing_attempt_summary,
+		),
 		routeProvenance: toRouteProvenance(row),
 	};
 }
@@ -498,6 +700,7 @@ export function toRequestResponse(request: Request): RequestResponse {
 		agentAttributionSource: request.agentAttributionSource,
 		clientSessionId: request.clientSessionId,
 		streamTerminalState: request.streamTerminalState,
+		routingAttemptSummary: request.routingAttemptSummary,
 		qualityDecision: sanitizeQualityDecision(request.qualityDecision),
 		routeProvenance: request.routeProvenance,
 	};

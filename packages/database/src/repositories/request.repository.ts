@@ -8,7 +8,9 @@ import type {
 } from "@better-ccflare/types";
 import {
 	type QualityDecisionRecord,
+	type RequestRoutingAttemptSummary,
 	sanitizeQualityDecision,
+	sanitizeRequestRoutingAttemptSummary,
 } from "@better-ccflare/types/request";
 import { getCleanupBatchSize } from "../adapters/bun-sql-adapter";
 import { decryptPayload, encryptPayload } from "../payload-encryption";
@@ -96,6 +98,7 @@ async function decryptForList(id: string, json: string): Promise<string> {
 }
 
 export interface RequestData {
+	routingAttemptSummary?: RequestRoutingAttemptSummary | null;
 	qualityDecision?: QualityDecisionRecord | null;
 	accounting?: RequestAccountingContext;
 	id: string;
@@ -161,6 +164,9 @@ export class RequestRepository extends BaseRepository<RequestData> {
 	async save(data: RequestData): Promise<void> {
 		const { usage } = data;
 		const decision = sanitizeQualityDecision(data.qualityDecision);
+		const attemptSummary = sanitizeRequestRoutingAttemptSummary(
+			data.routingAttemptSummary,
+		);
 		const projectRankIncoming = projectRank(
 			"EXCLUDED.project_attribution_source",
 		);
@@ -191,19 +197,19 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				stream_terminal_state, client_session_id,
 				route_profile_id, requested_route_model, routed_provider, routed_model,
 				route_fallback_rung, route_home_action, route_repin_reason, route_candidate_id,
-				account_generation, cache_health_native, internal_origin, quality_decision
+				account_generation, cache_health_native, internal_origin, quality_decision, routing_attempt_summary
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (id) DO UPDATE SET
 				timestamp = EXCLUDED.timestamp,
 				method = EXCLUDED.method,
 				path = EXCLUDED.path,
-				account_used = EXCLUDED.account_used,
-				status_code = EXCLUDED.status_code,
-				success = EXCLUDED.success,
-				error_message = EXCLUDED.error_message,
+				account_used = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.account_used ELSE EXCLUDED.account_used END,
+				status_code = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.status_code ELSE EXCLUDED.status_code END,
+				success = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.success ELSE EXCLUDED.success END,
+				error_message = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.error_message ELSE EXCLUDED.error_message END,
 				response_time_ms = EXCLUDED.response_time_ms,
-				failover_attempts = EXCLUDED.failover_attempts,
+				failover_attempts = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.failover_attempts ELSE EXCLUDED.failover_attempts END,
 				model = EXCLUDED.model,
 				prompt_tokens = EXCLUDED.prompt_tokens,
 				completion_tokens = EXCLUDED.completion_tokens,
@@ -232,29 +238,29 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				project_attribution_source = CASE WHEN ${projectWinsIncoming} THEN EXCLUDED.project_attribution_source ELSE requests.project_attribution_source END,
 				agent_used = CASE WHEN ${agentWinsIncoming} THEN EXCLUDED.agent_used ELSE requests.agent_used END,
 				agent_attribution_source = CASE WHEN ${agentWinsIncoming} THEN EXCLUDED.agent_attribution_source ELSE requests.agent_attribution_source END,
-				-- stream_terminal_state uses preserve-first (COALESCE) — a later
-				-- re-finalization (e.g. updateUsage after handleEnd) shouldn't
-				-- blank out the real SSE termination state the handleEnd path
-				-- recorded. A null incoming value means "I have nothing new",
-				-- not "the stream was clean".
-				stream_terminal_state = COALESCE(EXCLUDED.stream_terminal_state, requests.stream_terminal_state),
+				-- Attempt-summary rows retain the first terminal state, including
+				-- an unknown/null state; late usage or a conflicting complete save
+				-- cannot rewrite a failed stream. Legacy rows keep their existing
+				-- nullable enrichment behavior.
+				stream_terminal_state = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.stream_terminal_state ELSE COALESCE(EXCLUDED.stream_terminal_state, requests.stream_terminal_state) END,
 				-- The client session id is fixed for a given request id, and the
 				-- error paths that re-save a row do not carry it. Preserve-first,
 				-- so a later save without it cannot blank out what the main path
 				-- recorded.
 				client_session_id = COALESCE(EXCLUDED.client_session_id, requests.client_session_id),
-				route_profile_id = COALESCE(EXCLUDED.route_profile_id, requests.route_profile_id),
-				requested_route_model = COALESCE(EXCLUDED.requested_route_model, requests.requested_route_model),
-				routed_provider = COALESCE(EXCLUDED.routed_provider, requests.routed_provider),
-				routed_model = COALESCE(EXCLUDED.routed_model, requests.routed_model),
-				route_fallback_rung = COALESCE(EXCLUDED.route_fallback_rung, requests.route_fallback_rung),
-				route_home_action = COALESCE(EXCLUDED.route_home_action, requests.route_home_action),
-				route_repin_reason = COALESCE(EXCLUDED.route_repin_reason, requests.route_repin_reason),
-				route_candidate_id = COALESCE(EXCLUDED.route_candidate_id, requests.route_candidate_id),
+				route_profile_id = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.route_profile_id ELSE COALESCE(EXCLUDED.route_profile_id, requests.route_profile_id) END,
+				requested_route_model = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.requested_route_model ELSE COALESCE(EXCLUDED.requested_route_model, requests.requested_route_model) END,
+				routed_provider = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.routed_provider ELSE COALESCE(EXCLUDED.routed_provider, requests.routed_provider) END,
+				routed_model = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.routed_model ELSE COALESCE(EXCLUDED.routed_model, requests.routed_model) END,
+				route_fallback_rung = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.route_fallback_rung ELSE COALESCE(EXCLUDED.route_fallback_rung, requests.route_fallback_rung) END,
+				route_home_action = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.route_home_action ELSE COALESCE(EXCLUDED.route_home_action, requests.route_home_action) END,
+				route_repin_reason = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.route_repin_reason ELSE COALESCE(EXCLUDED.route_repin_reason, requests.route_repin_reason) END,
+				route_candidate_id = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.route_candidate_id ELSE COALESCE(EXCLUDED.route_candidate_id, requests.route_candidate_id) END,
 				account_generation = COALESCE(requests.account_generation, EXCLUDED.account_generation),
 				cache_health_native = COALESCE(requests.cache_health_native, EXCLUDED.cache_health_native),
 				internal_origin = COALESCE(requests.internal_origin, EXCLUDED.internal_origin),
- quality_decision = COALESCE(requests.quality_decision, EXCLUDED.quality_decision)
+ quality_decision = COALESCE(requests.quality_decision, EXCLUDED.quality_decision),
+ routing_attempt_summary = COALESCE(requests.routing_attempt_summary, EXCLUDED.routing_attempt_summary)
 		`,
 			[
 				data.id,
@@ -303,6 +309,7 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				data.accounting ? (data.accounting.nativeCache ? 1 : 0) : null,
 				data.accounting ? (data.accounting.internal ? 1 : 0) : null,
 				decision ? JSON.stringify(decision) : null,
+				attemptSummary ? JSON.stringify(attemptSummary) : null,
 			],
 		);
 	}
