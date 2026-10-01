@@ -149,9 +149,11 @@ async function main(): Promise<void> {
 	process.once("SIGTERM", stop);
 	process.once("SIGINT", stop);
 
+	const port = server.port;
+	if (!port) throw new Error("fixture did not bind a port");
 	const ready: RequestBodyUpstreamReadyMessage = {
 		type: REQUEST_BODY_UPSTREAM_READY_TYPE,
-		port: server.port,
+		port,
 	};
 	process.stdout.write(`${JSON.stringify(ready)}\n`);
 }

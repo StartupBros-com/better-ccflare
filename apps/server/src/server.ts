@@ -1,3 +1,4 @@
+import { heapSize, memoryUsage as jscMemoryUsage } from "bun:jsc";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
@@ -1473,7 +1474,9 @@ export default async function startServer(options?: {
 		queueLimit: config.getMaxBodyAdmissionQueue(),
 	});
 	activeBodyAdmission = bodyAdmission;
-	const memoryMonitor = new MemoryMonitor();
+	const memoryMonitor = new MemoryMonitor({
+		readJscMemoryUsage: () => ({ heapSize: heapSize(), ...jscMemoryUsage() }),
+	});
 	// Route profiles are strict operator intent. Validate before database startup,
 	// background jobs, or the HTTP listener can make this process look healthy.
 	const modelRouteProfiles = parseModelRouteProfiles();
@@ -1834,6 +1837,8 @@ export default async function startServer(options?: {
 						reservedBytes: admission.reservedBytes,
 						queuedRequests: admission.queuedRequests,
 					},
+					maintenance: dbOps.getMaintenanceStatus(),
+					writer: asyncWriter.getHealth(),
 					trackedStreams: inflightStreams.size,
 					pendingRequests: serverInstance?.pendingRequests ?? 0,
 				});
