@@ -2873,6 +2873,9 @@ export async function proxyWithAccount(
 		// Apply model override from combo slot (per D-04, REQ-12)
 		const baseBodyContext =
 			requestBodyContext ?? new RequestBodyContext(requestBodyBuffer);
+		// Capture logical provenance before overrides, admission, or helper sends.
+		const clientRequestedModel =
+			requestMeta.originalModel ?? baseBodyContext.getModel();
 		let effectiveBodyContext = baseBodyContext;
 		let effectiveBodyBuffer = baseBodyContext.getBuffer();
 		// True only once the override is actually patched into the outgoing body —
@@ -3360,8 +3363,7 @@ export async function proxyWithAccount(
 					? () => {
 							routingAttemptLedger.recordPhysicalAttempt({
 								provider: provider.name,
-								logicalModel:
-									requestMeta.originalModel ?? clientRequestedModel ?? null,
+								logicalModel: clientRequestedModel,
 								physicalModel,
 								accountId: account.id,
 								candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
@@ -4342,8 +4344,7 @@ export async function proxyWithAccount(
 					ensureNativeQuotaDispatch();
 					routingAttemptLedger?.recordPhysicalAttempt({
 						provider: attemptPlan.providerName,
-						logicalModel:
-							requestMeta.originalModel ?? clientRequestedModel ?? null,
+						logicalModel: clientRequestedModel,
 						physicalModel: resolvedModel ?? null,
 						accountId: account.id,
 						candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
@@ -8152,8 +8153,6 @@ export async function proxyWithAccount(
 			requestMeta.originalModel,
 			attemptAppliedModel,
 		);
-		const clientRequestedModel =
-			requestMeta.originalModel ?? baseBodyContext.getModel();
 		const hasTransportModelProvenance =
 			response.ok &&
 			!hasLogicalModelRewrite &&
