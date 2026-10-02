@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	BoundedJsonTooLargeError,
+	RequestBodyTooLargeError,
 	readBoundedRequestBody,
 	serializeBoundedJson,
 } from "../bounded-request-body";
@@ -391,4 +392,13 @@ describe("request body cleanup failure preserves its primary result", () => {
 			f.dispose();
 		}
 	});
+});
+
+it("retains the bounded-body decoder cause without changing limit metadata", () => {
+	const cause = new Error("decoder exceeded maxOutputLength");
+	const error = new RequestBodyTooLargeError("streamed", 1024, { cause });
+	expect(error.cause).toBe(cause);
+	expect(error.limit).toBe(1024);
+	expect(error.source).toBe("streamed");
+	expect(new RequestBodyTooLargeError("streamed", 1024).cause).toBeUndefined();
 });

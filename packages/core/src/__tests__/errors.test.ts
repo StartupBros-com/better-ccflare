@@ -7,7 +7,16 @@ import {
 	isStructuredInvalidGrant,
 	OAuthRefreshTokenError,
 	PAUSE_REASON_NEEDS_REAUTH,
+	ProviderError,
+	ValidationError,
 } from "../errors";
+
+import {
+	safeJsonParse,
+	validateArray,
+	validateEndpointUrl,
+	validateObject,
+} from "../validation";
 
 describe("formatOAuthErrorMessage", () => {
 	it("extracts machine codes from nested provider error objects", () => {
@@ -157,5 +166,69 @@ describe("OAuthRefreshTokenError", () => {
 describe("PAUSE_REASON_NEEDS_REAUTH", () => {
 	it("is the stable oauth_invalid_grant string", () => {
 		expect(PAUSE_REASON_NEEDS_REAUTH).toBe("oauth_invalid_grant");
+	});
+});
+
+describe("error cause preservation", () => {
+	it("preserves a cause without changing AppError JSON or context", () => {
+		const cause = new Error("private diagnostic");
+		const validation = new ValidationError("invalid", "field", 42, { cause });
+		const provider = new ProviderError(
+			"upstream failed",
+			"provider",
+			502,
+			{ attempt: 1 },
+			{ cause },
+		);
+		for (const error of [validation, provider]) {
+			expect(error.cause).toBe(cause);
+			expect(Object.getOwnPropertyDescriptor(error, "cause")?.enumerable).toBe(
+				false,
+			);
+			expect(error.toJSON()).not.toHaveProperty("cause");
+			expect(JSON.stringify(error)).not.toContain("private diagnostic");
+		}
+		expect(validation.context).toEqual({ field: "field", value: 42 });
+		expect(provider.context).toEqual({ provider: "provider", attempt: 1 });
+		expect(new ValidationError("legacy").cause).toBeUndefined();
+	});
+
+	it("retains the exact child validation error when adding array or object context", () => {
+		const cause = new ValidationError("bad child");
+		const rejectChild = () => {
+			throw cause;
+		};
+		for (const run of [
+			() => validateArray([1], "items", { itemValidator: rejectChild }),
+			() =>
+				validateObject({ item: 1 }, "record", {
+					schema: { item: rejectChild },
+				}),
+		]) {
+			let caught: unknown;
+			try {
+				run();
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBeInstanceOf(ValidationError);
+			expect((caught as Error).cause).toBe(cause);
+		}
+	});
+
+	it("retains actual JSON and URL parser failures", () => {
+		for (const [run, type] of [
+			[() => safeJsonParse("{"), SyntaxError],
+			[() => validateEndpointUrl("http://[invalid"), TypeError],
+		] as const) {
+			let caught: unknown;
+			try {
+				run();
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBeInstanceOf(ValidationError);
+			expect((caught as Error).cause).toBeInstanceOf(type);
+		}
 	});
 });

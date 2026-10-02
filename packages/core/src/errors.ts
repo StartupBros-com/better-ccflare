@@ -16,8 +16,9 @@ export abstract class AppError extends Error {
 		public readonly code: string,
 		public readonly statusCode: number,
 		context?: Record<string, unknown>,
+		options?: ErrorOptions,
 	) {
-		super(message);
+		super(message, options);
 		this.name = this.constructor.name;
 		this.timestamp = new Date();
 		this.context = context;
@@ -298,8 +299,9 @@ export class ValidationError extends AppError {
 		message: string,
 		public readonly field?: string,
 		public readonly value?: unknown,
+		options?: ErrorOptions,
 	) {
-		super(message, "VALIDATION_ERROR", 400, { field, value });
+		super(message, "VALIDATION_ERROR", 400, { field, value }, options);
 	}
 }
 
@@ -312,8 +314,15 @@ export class ProviderError extends AppError {
 		public readonly provider: string,
 		statusCode = 502,
 		context?: Record<string, unknown>,
+		options?: ErrorOptions,
 	) {
-		super(message, "PROVIDER_ERROR", statusCode, { provider, ...context });
+		super(
+			message,
+			"PROVIDER_ERROR",
+			statusCode,
+			{ provider, ...context },
+			options,
+		);
 	}
 }
 

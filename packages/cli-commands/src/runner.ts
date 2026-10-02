@@ -64,8 +64,8 @@ export type ManagedRoutingCliCommand =
 	  });
 
 export class ManagedRoutingCliUsageError extends Error {
-	constructor(message: string) {
-		super(message);
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
 		this.name = "ManagedRoutingCliUsageError";
 	}
 }
@@ -280,6 +280,7 @@ export async function executeManagedRoutingCliCommand(
 				error instanceof Error
 					? error.message
 					: "Managed-routing API configuration is invalid.",
+				{ cause: error },
 			);
 		}
 	}

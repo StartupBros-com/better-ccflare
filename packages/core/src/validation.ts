@@ -265,10 +265,12 @@ export function validateArray<T>(
 				return options.itemValidator?.(item, index);
 			} catch (error) {
 				if (error instanceof ValidationError) {
+					// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
 					throw new ValidationError(
 						`${field}[${index}]: ${error.message}`,
 						`${field}[${index}]`,
 						item,
+						{ cause: error },
 					);
 				}
 				throw error;
@@ -315,10 +317,12 @@ export function validateObject<T extends Record<string, unknown>>(
 				result[key as keyof T] = validator(obj[key]);
 			} catch (error) {
 				if (error instanceof ValidationError) {
+					// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
 					throw new ValidationError(
 						`${field}.${key}: ${error.message}`,
 						`${field}.${key}`,
 						obj[key],
+						{ cause: error },
 					);
 				}
 				throw error;
@@ -410,10 +414,12 @@ export function validateEndpointUrl(url: unknown, field = "endpoint"): string {
 		if (error instanceof ValidationError) {
 			throw error;
 		}
+		// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
 		throw new ValidationError(
 			`${field} has invalid URL format: ${error instanceof Error ? error.message : String(error)}`,
 			field,
 			url,
+			{ cause: error },
 		);
 	}
 }
@@ -451,10 +457,12 @@ export function safeJsonParse<T = unknown>(json: unknown, field = "json"): T {
 	try {
 		return JSON.parse(trimmed) as T;
 	} catch (error) {
+		// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
 		throw new ValidationError(
 			`${field} contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
 			field,
 			json,
+			{ cause: error },
 		);
 	}
 }

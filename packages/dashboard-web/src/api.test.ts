@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { HttpError } from "@better-ccflare/errors";
 import type { RequestOptions } from "@better-ccflare/http-common";
 import { api } from "./api";
 
@@ -379,5 +380,36 @@ describe("dashboard API log redaction", () => {
 		]) {
 			expect(serialized).not.toContain(sentinel);
 		}
+	});
+});
+
+describe("dashboard error cause preservation", () => {
+	it.each([
+		() =>
+			api.addDeepseekAccount({
+				name: "fixture",
+				apiKey: "synthetic",
+				priority: 0,
+			}),
+		() => api.forceResetRateLimit("fixture"),
+		() => api.setStrategy("round-robin"),
+		() => api.getCodexAuthStatus("fixture"),
+	])("retains the exact HttpError and its status through API rethrows", async (request) => {
+		const cause = new HttpError(503, "Synthetic service unavailable", {
+			retry: true,
+		});
+		api.request = mock(async () => {
+			throw cause;
+		}) as typeof api.request;
+		let caught: unknown;
+		try {
+			await request();
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		expect(caught).not.toBe(cause);
+		expect((caught as Error).message).toBe(cause.message);
+		expect((caught as Error).cause).toBe(cause);
 	});
 });

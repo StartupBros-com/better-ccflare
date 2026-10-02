@@ -26,8 +26,9 @@ export class HttpError extends Error {
 		public status: number,
 		message: string,
 		public details?: unknown,
+		options?: ErrorOptions,
 	) {
-		super(message);
+		super(message, options);
 		this.name = "HttpError";
 	}
 }

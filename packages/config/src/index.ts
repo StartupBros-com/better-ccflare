@@ -2454,6 +2454,7 @@ export class Config extends EventEmitter {
 			try {
 				parsed = new URL(value);
 			} catch (_error) {
+				// biome-ignore lint/nursery/useErrorCause: URL parse errors retain input that may include webhook credentials.
 				throw new ValidationError(
 					"Invalid alert webhook URL",
 					"alert_webhook_url",

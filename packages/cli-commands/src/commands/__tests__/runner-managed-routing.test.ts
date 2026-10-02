@@ -311,3 +311,23 @@ describe("shared managed-routing CLI executor", () => {
 		]);
 	});
 });
+
+it("chains the sanitized configuration error, not the raw invalid URL", async () => {
+	let caught: unknown;
+	try {
+		await executeManagedRoutingCliCommand({
+			action: "list",
+			json: false,
+			apiUrl: "http://[private-input",
+		});
+	} catch (error) {
+		caught = error;
+	}
+	expect(caught).toBeInstanceOf(ManagedRoutingCliUsageError);
+	const cause = (caught as Error).cause;
+	expect(cause).toBeInstanceOf(Error);
+	expect((cause as Error).message).toBe(
+		"Managed-routing API URL must be a valid loopback URL.",
+	);
+	expect(cause).not.toHaveProperty("cause");
+});

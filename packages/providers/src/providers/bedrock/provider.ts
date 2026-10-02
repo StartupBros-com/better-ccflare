@@ -606,6 +606,7 @@ export class BedrockProvider extends BaseProvider implements Provider {
 
 		// Validate credentials exist by creating credential chain
 		// This fails early if profile is misconfigured
+		let credentialFailure: string | undefined;
 		try {
 			const credentialProvider = createBedrockCredentialChain(account);
 			// Attempt to resolve credentials to validate they exist
@@ -615,10 +616,12 @@ export class BedrockProvider extends BaseProvider implements Provider {
 			);
 		} catch (error) {
 			const { message: errorMsg } = await translateBedrockError(error);
-			throw new Error(
-				`Bedrock credential validation failed for ${account.name}: ${errorMsg}`,
-				{ cause: error },
-			);
+			credentialFailure = `Bedrock credential validation failed for ${account.name}: ${errorMsg}`;
+		}
+		if (credentialFailure !== undefined) {
+			// Only the translated message crosses this boundary. SDK causes can carry
+			// credential paths/tokens into the dashboard's recursively serialized logs.
+			throw new Error(credentialFailure);
 		}
 
 		// Return dummy token (Bedrock doesn't use tokens, credentials are resolved per-request)
@@ -928,6 +931,10 @@ export class BedrockProvider extends BaseProvider implements Provider {
 			credentials,
 		});
 
+		// SDK errors are projected to messages before throwing; never attach raw
+		// credential/transport causes to these caller-visible translated errors.
+		let failureMessage: string;
+
 		// Step 8: Call Bedrock API with appropriate command. The request-private
 		// gate sits outside the error translation block so its control error remains
 		// intact and can stop every outer routing loop without mutating account state.
@@ -979,9 +986,9 @@ export class BedrockProvider extends BaseProvider implements Provider {
 					});
 				}
 
-				const { message: translatedError } = await translateBedrockError(error);
-				throw new Error(translatedError, { cause: error });
+				({ message: failureMessage } = await translateBedrockError(error));
 			}
+			throw new Error(failureMessage);
 		}
 
 		const command = new ConverseCommand({
@@ -996,9 +1003,9 @@ export class BedrockProvider extends BaseProvider implements Provider {
 				model: generateClientModelName(transformedModelId),
 			});
 		} catch (error) {
-			const { message: translatedError } = await translateBedrockError(error);
-			throw new Error(translatedError, { cause: error });
+			({ message: failureMessage } = await translateBedrockError(error));
 		}
+		throw new Error(failureMessage);
 	}
 
 	/**

@@ -34,30 +34,6 @@
 			}
 		}
 	},
-	"overrides": [
-		{
-			"includes": [
-				"packages/cli-commands/src/runner.ts",
-				"packages/config/src/index.ts",
-				"packages/core/src/validation.ts",
-				"packages/database/src/repositories/combo.repository.ts",
-				"packages/http-api/src/handlers/accounts.ts",
-				"packages/http-api/src/services/device-setup-jobs.ts",
-				"packages/http-common/src/client.ts",
-				"packages/openai-responses-adapter/src/handler.ts",
-				"packages/proxy/src/handlers/account-selector.ts",
-				"packages/proxy/src/handlers/proxy-operations.ts",
-				"packages/proxy/src/openai-compatible-model-catalog.ts"
-			],
-			"linter": {
-				"rules": {
-					"nursery": {
-						"useErrorCause": "off"
-					}
-				}
-			}
-		}
-	],
 	"javascript": {
 		"formatter": {
 			"quoteStyle": "double"

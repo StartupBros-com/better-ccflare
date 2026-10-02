@@ -3243,6 +3243,7 @@ async function selectAccountsForRequestInternal(
 			console.error("  bun run cli --repair-db\n");
 			console.error("The explicit route will fail closed.");
 			console.error(`${"═".repeat(50)}\n`);
+			// biome-ignore lint/nursery/useErrorCause: Routing failures expose a fixed reason, not raw database errors or query details.
 			throw new ForceRouteUnavailableError(forcedAccountId, "lookup_failed");
 		}
 	}
@@ -3264,6 +3265,7 @@ async function selectAccountsForRequestInternal(
 				"Failed to get accounts from database for capability route lookup:",
 				error,
 			);
+			// biome-ignore lint/nursery/useErrorCause: Routing failures expose a fixed reason, not raw database errors or query details.
 			throw new ForceRouteUnavailableError(
 				meta.routeProfileId?.trim() || "capability-route",
 				"lookup_failed",

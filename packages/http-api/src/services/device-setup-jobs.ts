@@ -242,8 +242,8 @@ export class DeviceSetupValidationError extends Error {
 export class DeviceSetupIdempotencyConflictError extends Error {
 	readonly code = "idempotency_conflict";
 
-	constructor() {
-		super("Idempotency key was already used for a different request");
+	constructor(options?: ErrorOptions) {
+		super("Idempotency key was already used for a different request", options);
 		this.name = "DeviceSetupIdempotencyConflictError";
 	}
 }
@@ -686,7 +686,8 @@ class DurableDeviceSetupCoordinator implements DeviceSetupCoordinator {
 			});
 		} catch (error) {
 			if (isRepositoryIdempotencyConflict(error)) {
-				throw new DeviceSetupIdempotencyConflictError();
+				// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
+				throw new DeviceSetupIdempotencyConflictError({ cause: error });
 			}
 			throw error;
 		}
@@ -743,6 +744,7 @@ class DurableDeviceSetupCoordinator implements DeviceSetupCoordinator {
 				authorizationErrorCode(error),
 				leaseToken,
 			);
+			// biome-ignore lint/nursery/useErrorCause: Provider failures may contain OAuth tokens; expose only the authorization error code recorded above.
 			throw new DeviceSetupAuthorizationUnavailableError();
 		}
 		if (this.disposed || active.leaseLost) {

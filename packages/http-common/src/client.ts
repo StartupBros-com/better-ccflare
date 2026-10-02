@@ -95,7 +95,10 @@ export class HttpClient {
 
 				// Don't retry on abort
 				if (error instanceof Error && error.name === "AbortError") {
-					throw new HttpError(408, "Request timeout");
+					// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
+					throw new HttpError(408, "Request timeout", undefined, {
+						cause: error,
+					});
 				}
 
 				// Retry if we have attempts left

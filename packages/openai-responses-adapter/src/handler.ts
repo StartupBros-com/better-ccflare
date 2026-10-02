@@ -265,7 +265,8 @@ function decompressZstdBounded(
 		return copy.buffer;
 	} catch (error) {
 		if (isZstdTooLargeError(error)) {
-			throw new RequestBodyTooLargeError("streamed", limit);
+			// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
+			throw new RequestBodyTooLargeError("streamed", limit, { cause: error });
 		}
 		throw error;
 	}
