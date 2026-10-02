@@ -25,45 +25,29 @@
 		"rules": {
 			"recommended": true,
 			"nursery": {
-				"useErrorCause": "error"
+				"useErrorCause": {
+					"level": "error",
+					"options": {
+						"requireCatchParameter": false
+					}
+				}
 			}
 		}
 	},
 	"overrides": [
 		{
 			"includes": [
-				"apps/cli/src/main.ts",
-				"apps/cli/src/quality-route-control.ts",
-				"packages/cli-commands/src/commands/managed-routing-client.ts",
 				"packages/cli-commands/src/runner.ts",
 				"packages/config/src/index.ts",
 				"packages/core/src/validation.ts",
 				"packages/database/src/repositories/combo.repository.ts",
-				"packages/database/src/repositories/device-setup-job.repository.ts",
-				"packages/database/src/repositories/usage-windows.repository.ts",
 				"packages/http-api/src/handlers/accounts.ts",
-				"packages/http-api/src/handlers/codex-model-migration.ts",
-				"packages/http-api/src/handlers/combos.ts",
-				"packages/http-api/src/handlers/oauth.ts",
-				"packages/http-api/src/handlers/quality-routes.ts",
 				"packages/http-api/src/services/device-setup-jobs.ts",
 				"packages/http-common/src/client.ts",
 				"packages/openai-responses-adapter/src/handler.ts",
-				"packages/providers/src/provider-attempt-plan.ts",
-				"packages/providers/src/providers/anthropic/provider.ts",
-				"packages/providers/src/providers/codex/provider.ts",
-				"packages/providers/src/providers/codex/server-tool-attempt-plan.ts",
-				"packages/providers/src/providers/codex/server-tool-response.ts",
-				"packages/providers/src/providers/codex/server-tools.ts",
-				"packages/providers/src/providers/xai/provider.ts",
-				"packages/providers/src/server-tool-capabilities.ts",
-				"packages/providers/src/server-tools/anthropic-server-tool-encoder.ts",
-				"packages/providers/src/server-tools/history-projection.ts",
-				"packages/providers/src/server-tools/replay-envelope.ts",
 				"packages/proxy/src/handlers/account-selector.ts",
 				"packages/proxy/src/handlers/proxy-operations.ts",
-				"packages/proxy/src/openai-compatible-model-catalog.ts",
-				"packages/proxy/src/server-tool-replay-runtime.ts"
+				"packages/proxy/src/openai-compatible-model-catalog.ts"
 			],
 			"linter": {
 				"rules": {
