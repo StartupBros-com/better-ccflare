@@ -323,7 +323,9 @@ function configureSqlite(db: Database, config: DatabaseConfig): void {
 		db.run("PRAGMA wal_autocheckpoint = 0");
 	} catch (error) {
 		console.error("Database configuration failed:", error);
-		throw new Error(`Failed to configure SQLite database: ${error}`);
+		throw new Error(`Failed to configure SQLite database: ${error}`, {
+			cause: error,
+		});
 	}
 }
 

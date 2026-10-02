@@ -430,7 +430,7 @@ test.each([
 			`close:${runtime.oldPid}`,
 		);
 	} catch (error) {
-		throw new Error(`${error}\n${logs.slice(-6000)}`);
+		throw new Error(`${error}\n${logs.slice(-6000)}`, { cause: error });
 	} finally {
 		if (runner && !runner.killed) {
 			runner.kill("SIGTERM");

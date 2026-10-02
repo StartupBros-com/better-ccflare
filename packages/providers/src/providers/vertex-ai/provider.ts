@@ -86,6 +86,7 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 		} catch (error) {
 			throw new Error(
 				`Failed to parse Vertex AI configuration for account ${account.name}: ${error}`,
+				{ cause: error },
 			);
 		}
 	}
@@ -124,6 +125,7 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 			throw new Error(
 				`Failed to authenticate with Google Cloud: ${error}. ` +
 					"Ensure you've run 'gcloud auth application-default login' or set GOOGLE_APPLICATION_CREDENTIALS.",
+				{ cause: error },
 			);
 		}
 	}
