@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	describeModelRouteProfileFlow,
 	MODEL_ROUTE_PROFILE_MODEL_PREFIX,
 	ModelRouteSessionRegistry,
 	parseModelRouteProfiles,
@@ -17,6 +18,13 @@ const PROFILE_JSON = JSON.stringify([
 		expectedPhysicalModel: "gpt-5.6-sol",
 	},
 ]);
+
+const EXACT_FLOW =
+	"One pinned account, no fallback · subagents use the same account";
+const BOUNDED_FLOW =
+	"One pinned account, size-capped requests, no fallback · subagents use the same account";
+const POOL_FLOW =
+	"Pool of matching accounts, load-balancer order, then error · subagents fall back to normal routing";
 
 function profile() {
 	const [configured] = parseModelRouteProfiles(PROFILE_JSON);
@@ -713,18 +721,22 @@ describe("parseModelRouteProfiles physicalModelPolicy", () => {
 			{
 				id: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}pro-primary-sol`,
 				display_name: "GPT-5.6 Sol · pro-primary",
+				description: EXACT_FLOW,
 			},
 			{
 				id: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}codex-opus`,
 				display_name: "Codex · opus",
+				description: EXACT_FLOW,
 			},
 			{
 				id: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}codex-sonnet`,
 				display_name: "Codex · sonnet",
+				description: EXACT_FLOW,
 			},
 			{
 				id: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}codex-haiku[1m]`,
 				display_name: "Codex · haiku",
+				description: POOL_FLOW,
 			},
 		]);
 		for (const id of ["codex-opus", "codex-sonnet", "codex-haiku"]) {
@@ -796,6 +808,7 @@ describe("ModelRouteSessionRegistry", () => {
 			{
 				id: configured.discoveryModelId,
 				display_name: configured.displayName,
+				description: EXACT_FLOW,
 			},
 		]);
 	});
@@ -1697,5 +1710,76 @@ describe("ModelRouteSessionRegistry", () => {
 		expect(
 			registry.isExactProfileRouteForAccount("unknown-route", "mac-studio"),
 		).toBe(false);
+	});
+});
+
+describe("describeModelRouteProfileFlow", () => {
+	const base = {
+		displayName: "Route",
+		logicalModel: "claude-opus-5",
+		expectedProvider: "codex",
+		description: "operator-secret-note",
+	};
+	const kinds: Array<[string, Record<string, unknown>, string]> = [
+		["exact", { id: "a", accountId: "acct-secret" }, EXACT_FLOW],
+		[
+			"bounded exact",
+			{
+				id: "b",
+				accountId: "acct-secret",
+				contextWindow: 272_000,
+				maxOutputTokens: 32_000,
+			},
+			BOUNDED_FLOW,
+		],
+		[
+			"capability pool",
+			{ id: "c", selection: "capability", expectedPhysicalModel: "gpt-x" },
+			POOL_FLOW,
+		],
+		[
+			"catalog-role pool",
+			{
+				id: "d",
+				selection: "capability",
+				physicalModelPolicy: "catalog-role",
+			},
+			POOL_FLOW,
+		],
+		[
+			"catalog-role exact",
+			{
+				id: "e",
+				accountId: "acct-secret",
+				physicalModelPolicy: "catalog-role",
+			},
+			EXACT_FLOW,
+		],
+	];
+
+	it.each(
+		kinds,
+	)("describes a %s profile from its kind only", (_kind, extra, expected) => {
+		const [parsed] = parseModelRouteProfiles(
+			JSON.stringify([{ ...base, ...extra }]),
+		);
+		if (!parsed) throw new Error("Expected the profile to parse");
+		expect(describeModelRouteProfileFlow(parsed)).toBe(expected);
+		const [discovered] = new ModelRouteSessionRegistry([
+			parsed,
+		]).getDiscoveryModels();
+		expect(discovered?.description).toBe(expected);
+		const text = discovered?.description ?? "";
+		expect(text.length).toBeLessThanOrEqual(100);
+		expect(text).not.toMatch(/[\r\n<]/);
+		for (const secret of [
+			"operator-secret-note",
+			"acct-secret",
+			"claude-opus-5",
+			"gpt-x",
+			"catalog-role",
+		]) {
+			expect(JSON.stringify(discovered)).not.toContain(secret);
+		}
 	});
 });

@@ -7,6 +7,7 @@ import type {
 	QualityPermittedFallback,
 	QualityPolicyRevision,
 	QualityProvider,
+	QualityRootPreference,
 	QualityRouteChoice,
 	QualityRoutingPolicy,
 	QualitySpendGrant,
@@ -31,6 +32,43 @@ const LANES: readonly QualityLane[] = [
 	"standard",
 	"lightweight",
 ];
+
+const LINE_LABELS: Readonly<Record<QualityApprovedLine, string>> = {
+	"claude-fable": "Fable",
+	"gpt-astra": "Astra",
+	"claude-opus": "Opus",
+	"gpt-sol": "Sol",
+	"claude-sonnet": "Sonnet",
+	"claude-haiku": "Haiku",
+};
+const MAIN_LADDERS: Readonly<
+	Record<QualityRootPreference, readonly QualityLane[]>
+> = {
+	auto: ["fable", "astra", "opus"],
+	fable: ["fable", "astra", "opus"],
+	astra: ["astra", "opus"],
+	opus: ["opus"],
+};
+
+/**
+ * One-line picker description of a main choice's flow, built from the compiled
+ * policy only (never account ids). Claude Code cuts descriptions at 100 chars;
+ * the worst case (four steps plus the spend note) is 96.
+ */
+function describeMainLadder(
+	policy: Pick<QualityRoutingPolicy, "lanes" | "accounts" | "spendGrants">,
+	preference: QualityRootPreference,
+): string {
+	const enrolled = new Set(policy.accounts.flatMap((account) => account.lines));
+	const steps = MAIN_LADDERS[preference]
+		.flatMap((laneName) => policy.lanes[laneName])
+		.filter((approved) => enrolled.has(approved));
+	if (steps.length === 0)
+		return "No enrolled account on this ladder · requests fail";
+	const paid = policy.spendGrants.some((grant) => steps.includes(grant.line));
+	const spend = paid ? "paid use only where approved" : "subscription only";
+	return `${steps.map((step) => LINE_LABELS[step]).join(" → ")}, then error · keeps last working model · ${spend}`;
+}
 
 function invalid(path: string, message: string): never {
 	throw new Error(
@@ -296,39 +334,6 @@ export function compileQualityRoutingPolicy(
 		spendGrants,
 	};
 	const revision: QualityPolicyRevision = `quality-policy-v1:${createHash("sha256").update(JSON.stringify(effective)).digest("hex")}`;
-	const choices: QualityRouteChoice[] =
-		accounts.length === 0
-			? []
-			: [
-					{
-						preference: "auto",
-						publicModelId: "claude-bccf-quality-auto",
-						displayName: "Auto",
-						description:
-							"Native Fable, then approved Astra, then latest approved Opus-level models.",
-					},
-					{
-						preference: "fable",
-						publicModelId: "claude-bccf-quality-fable",
-						displayName: "Fable-preferred",
-						description:
-							"Start at native Fable; bounded fallback to Astra, then Opus-level models.",
-					},
-					{
-						preference: "astra",
-						publicModelId: "claude-bccf-quality-astra",
-						displayName: "Astra-preferred",
-						description:
-							"Start at approved Astra; bounded fallback to Opus-level models.",
-					},
-					{
-						preference: "opus",
-						publicModelId: "claude-bccf-quality-opus",
-						displayName: "Opus-latest",
-						description:
-							"Latest approved native Opus or GPT Sol; no earlier or lower lane.",
-					},
-				];
 	const lanes: Record<QualityLane, QualityApprovedLine[]> = {
 		fable: [],
 		astra: [],
@@ -340,17 +345,43 @@ export function compileQualityRoutingPolicy(
 		(a, b) => a.priority - b.priority || compare(a.line, b.line),
 	))
 		lanes[assignment.lane].push(assignment.line);
+	const flow = (preference: QualityRootPreference) =>
+		describeMainLadder({ lanes, accounts, spendGrants }, preference);
+	const choices: QualityRouteChoice[] =
+		accounts.length === 0
+			? []
+			: [
+					{
+						preference: "auto",
+						publicModelId: "claude-bccf-quality-auto",
+						displayName: "Auto",
+						description: flow("auto"),
+					},
+					{
+						preference: "fable",
+						publicModelId: "claude-bccf-quality-fable",
+						displayName: "Fable-preferred",
+						description: flow("fable"),
+					},
+					{
+						preference: "astra",
+						publicModelId: "claude-bccf-quality-astra",
+						displayName: "Astra-preferred",
+						description: flow("astra"),
+					},
+					{
+						preference: "opus",
+						publicModelId: "claude-bccf-quality-opus",
+						displayName: "Opus-latest",
+						description: flow("opus"),
+					},
+				];
 	return freeze({
 		...effective,
 		revision,
 		choices,
 		lanes,
-		mainLadders: {
-			auto: ["fable", "astra", "opus"],
-			fable: ["fable", "astra", "opus"],
-			astra: ["astra", "opus"],
-			opus: ["opus"],
-		},
+		mainLadders: MAIN_LADDERS,
 		workerLanes: {
 			standard: ["standard"],
 			lightweight: ["lightweight"],
