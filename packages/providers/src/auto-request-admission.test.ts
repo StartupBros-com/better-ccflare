@@ -383,10 +383,7 @@ describe("documented native Models capabilities reach request admission", () => 
 					requirements: captureAutoRequestRequirements(body),
 					finalBody: { ...body, model: id },
 				}),
-			).toMatchObject({
-				status: "admit",
-				accounting: { outputLimit: { kind: "catalog", tokens: 20 } },
-			});
+			).toEqual({ status: "admit" });
 		}
 	});
 	it("never grants baseline text or an approved target from a prefix or capacities", () => {
@@ -422,7 +419,7 @@ describe("documented native Models capabilities reach request admission", () => 
 				},
 			},
 		],
-	] as const)("only boolean native support grants %s, without inventing media accounting", (modality, key, block) => {
+	] as const)("native %s capability flags never gate admission (stock does not check modality)", (modality, key, block) => {
 		for (const supported of [true, false, "true", 1, null, undefined]) {
 			const evidence = native({
 				...raw,
@@ -443,11 +440,7 @@ describe("documented native Models capabilities reach request admission", () => 
 					requirements: captureAutoRequestRequirements(original),
 					finalBody: { ...original, model: raw.id },
 				}),
-			).toMatchObject(
-				supported === true
-					? { status: "unknown", reason: "input-accounting-unknown" }
-					: { status: "reject", reason: "modality-unsupported" },
-			);
+			).toEqual({ status: "admit" });
 		}
 		for (const capabilities of [undefined, { [key]: { supported: false } }]) {
 			const evidence = native({
@@ -467,18 +460,11 @@ describe("documented native Models capabilities reach request admission", () => 
 					requirements: captureAutoRequestRequirements(original),
 					finalBody: { ...original, model: raw.id },
 				}),
-			).toMatchObject(
-				capabilities === undefined
-					? { status: "unknown", reason: "input-accounting-unknown" }
-					: { status: "reject", reason: "modality-unsupported" },
-			);
+			).toEqual({ status: "admit" });
 		}
 	});
-	it("keeps unknown native output and context unavailable", () => {
-		for (const [field, reason] of [
-			["max_tokens", "output-unsupported"],
-			["max_input_tokens", "context-unsupported"],
-		] as const) {
+	it("admits when native output or context capacity is unknown", () => {
+		for (const field of ["max_tokens", "max_input_tokens"] as const) {
 			const evidence = native({
 				...raw,
 				[field]: undefined,
@@ -492,7 +478,7 @@ describe("documented native Models capabilities reach request admission", () => 
 					requirements: captureAutoRequestRequirements(body),
 					finalBody: { ...body, model: raw.id },
 				}),
-			).toMatchObject({ status: "unknown", reason });
+			).toEqual({ status: "admit" });
 		}
 	});
 });
@@ -807,45 +793,17 @@ describe("Auto request suitability (fixtures are not activation proof)", () => {
 			}),
 		).toMatchObject({ status: "reject", reason: "context-unsupported" });
 	});
-	it("admits ordinary native text with explicitly estimated envelope headroom", () => {
+	it("admits ordinary native text without claiming local token accounting", () => {
 		const decision = evaluateAutoRequestAdmission({
 			...fixture(10000),
 			requirements: captureAutoRequestRequirements(body),
 			finalBody: { ...body, model: "claude-fable-5-1" },
 		});
-		expect(decision).toMatchObject({
-			status: "admit",
-			accounting: {
-				source: "local-envelope-v1",
-				kind: "estimate",
-				requestedOutput: 20,
-			},
-		});
+		expect(decision).toEqual({ status: "admit" });
 	});
-	it("uses the full 91-byte envelope, 1047 headroom, and original 20 output at the margin", () => {
-		// Worked policy example: 91 + ceil(91 / 4) + 1024 + 20 = 1158.
-		const request = {
-			requirements: captureAutoRequestRequirements(body),
-			finalBody: { ...body, model: "claude-fable-5-1" },
-		};
-		expect(
-			evaluateAutoRequestAdmission({ ...fixture(1158), ...request }),
-		).toMatchObject({
-			status: "admit",
-			accounting: {
-				envelopeBytes: 91,
-				inputEstimate: 91,
-				headroom: 1047,
-				requestedOutput: 20,
-			},
-		});
-		expect(
-			evaluateAutoRequestAdmission({ ...fixture(1157), ...request }),
-		).toMatchObject({ status: "reject", reason: "context-unsupported" });
-	});
-	it("keeps unsupported local tool forms and unaccountable media unavailable", () => {
+	it("admits native tool schema variants the local contract used to refuse", () => {
 		for (const tools of [
-			[{ type: "custom", name: "Read" }],
+			[{ name: "Read", strict: true, input_schema: { type: "object" } }],
 			[
 				{
 					name: "Read",
@@ -862,10 +820,10 @@ describe("Auto request suitability (fixtures are not activation proof)", () => {
 					requirements: captureAutoRequestRequirements(original),
 					finalBody: { ...original, model: "claude-fable-5-1" },
 				}).status,
-			).not.toBe("admit");
+			).toBe("admit");
 		}
 	});
-	it("does not admit unrecognized or malformed content as ordinary local-tool text", () => {
+	it("admits unrecognized or malformed native content (upstream validates it, as for stock)", () => {
 		for (const block of [
 			{ type: "tool_use", id: "call", name: "Read", input: "not-an-object" },
 			{ type: "tool_result", content: "missing call identity" },
@@ -881,7 +839,7 @@ describe("Auto request suitability (fixtures are not activation proof)", () => {
 					requirements: captureAutoRequestRequirements(original),
 					finalBody: { ...original, model: "claude-fable-5-1" },
 				}).status,
-			).not.toBe("admit");
+			).toBe("admit");
 		}
 	});
 	it("preserves requested output at an exact arithmetic bound without clamping", () => {
@@ -919,7 +877,7 @@ describe("Auto request suitability (fixtures are not activation proof)", () => {
 			}),
 		).toMatchObject({ status: "reject", reason: "output-unsupported" });
 	});
-	it("never treats request token estimates or a current catalog as accounting proof", () => {
+	it("does not refuse native requests carrying extra request token claims", () => {
 		const input = { ...body, input_tokens: 1 };
 		expect(
 			evaluateAutoRequestAdmission({
@@ -927,7 +885,7 @@ describe("Auto request suitability (fixtures are not activation proof)", () => {
 				requirements: captureAutoRequestRequirements(input),
 				finalBody: { ...input, model: "claude-fable-5-1" },
 			}),
-		).toMatchObject({ status: "unknown", reason: "input-accounting-unknown" });
+		).toEqual({ status: "admit" });
 	});
 	it("keeps native forced-tool vetoes even when translation removes tool choice", () => {
 		const original = { ...body, tool_choice: { type: "any" } };
@@ -939,7 +897,7 @@ describe("Auto request suitability (fixtures are not activation proof)", () => {
 			}),
 		).toMatchObject({ status: "reject", reason: "tools-unsupported" });
 	});
-	it("does not hide unsupported original modalities behind translation", () => {
+	it("does not gate native admission on modality (stock sends images to the account)", () => {
 		const original = {
 			...body,
 			messages: [
@@ -960,7 +918,7 @@ describe("Auto request suitability (fixtures are not activation proof)", () => {
 				requirements: captureAutoRequestRequirements(original),
 				finalBody: { ...body, model: "claude-fable-5-1" },
 			}),
-		).toMatchObject({ status: "reject", reason: "modality-unsupported" });
+		).toEqual({ status: "admit" });
 	});
 	it("rejects a lowered final output reserve and retains the original after caller mutation", () => {
 		const original = structuredClone(body);
@@ -997,5 +955,337 @@ describe("Auto request suitability (fixtures are not activation proof)", () => {
 				finalBody: { ...body, model: target.physicalModel },
 			}),
 		).toMatchObject({ status: "unknown", reason: "catalog-evidence-stale" });
+	});
+});
+
+const CODEX_A = { status: "admit" };
+const CODEX_B = { status: "unknown", reason: "request-preservation-unknown" };
+const CODEX_C = CODEX_B;
+const CODEX_D = CODEX_B;
+const CODEX_E = { status: "reject", reason: "modality-unsupported" };
+const CODEX_F = CODEX_B;
+const CODEX_G = { status: "unknown", reason: "tools-unsupported" };
+const CODEX_H = { status: "unknown", reason: "context-unsupported" };
+const CODEX_I = { status: "reject", reason: "context-unsupported" };
+describe("native Anthropic admission never refuses what stock routing would send", () => {
+	const nativeRaw = {
+		id: "claude-fable-5-1",
+		max_input_tokens: 10000,
+		max_tokens: 20000,
+	};
+	function nativeEvidence(raw: Record<string, unknown> = nativeRaw) {
+		const catalog = createAutoCatalogEvidence({
+			accountId: "native-parity",
+			provider: "anthropic",
+			source: "live",
+			fetchedAt: Date.now(),
+			expiresAt: Date.now() + 60000,
+			models: [
+				{
+					id: String(raw.id),
+					capabilities: normalizeAutoModelCapabilities("anthropic", raw),
+				},
+			],
+		});
+		const target = resolveAutoModelTargets(catalog, "claude-fable").current;
+		if (!catalog || !target) throw new Error("missing native target");
+		return { catalog, target };
+	}
+	async function codexEvidence(original: Record<string, unknown>) {
+		const catalog = createAutoCatalogEvidence({
+			accountId: "codex-parity",
+			provider: "codex",
+			source: "live",
+			fetchedAt: Date.now(),
+			expiresAt: Date.now() + 60000,
+			models: [
+				{
+					id: "gpt-6-astra",
+					capabilities: normalizeAutoModelCapabilities("codex", {
+						context_window: 10000,
+						max_context_window: 10000,
+						max_output_tokens: 20000,
+						input_modalities: ["text"],
+					}),
+				},
+			],
+		});
+		const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
+		if (!catalog || !target) throw new Error("missing codex target");
+		const transformed = await new CodexProvider().transformRequestBody(
+			new Request("https://chatgpt.com/backend-api/codex/responses", {
+				method: "POST",
+				body: JSON.stringify({ ...original, model: "gpt-6-astra" }),
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		return { catalog, target, finalBody: await transformed.json() };
+	}
+	const base = {
+		model: "auto",
+		messages: [{ role: "user", content: "hello" }],
+		max_tokens: 20,
+	};
+	const imageMessages = [
+		{
+			role: "user",
+			content: [
+				{
+					type: "image",
+					source: { type: "url", url: "https://example.invalid/i.png" },
+				},
+			],
+		},
+		{
+			role: "assistant",
+			content: [{ type: "tool_use", id: "c1", name: "Read", input: {} }],
+		},
+		{
+			role: "user",
+			content: [
+				{
+					type: "tool_result",
+					tool_use_id: "c1",
+					content: [
+						{
+							type: "document",
+							source: {
+								type: "base64",
+								media_type: "application/pdf",
+								data: "synthetic",
+							},
+						},
+					],
+				},
+			],
+		},
+	];
+	// [name, original body, native final body (stock transform applied), codex expectation]
+	const cases: [
+		string,
+		Record<string, unknown>,
+		Record<string, unknown>,
+		Record<string, unknown>,
+	][] = [
+		[
+			"system cache_control gains ttl 1h after the snapshot",
+			{
+				...base,
+				system: [
+					{ type: "text", text: "s", cache_control: { type: "ephemeral" } },
+				],
+			},
+			{
+				...base,
+				system: [
+					{
+						type: "text",
+						text: "s",
+						cache_control: { type: "ephemeral", ttl: "1h" },
+					},
+				],
+			},
+			CODEX_A,
+		],
+		[
+			"clear_thinking edit stripped by stock when thinking is disabled",
+			{
+				...base,
+				thinking: { type: "disabled" },
+				context_management: {
+					edits: [
+						{ type: "clear_tool_uses_20250919" },
+						{ type: "clear_thinking_20251015" },
+					],
+				},
+			},
+			{
+				...base,
+				thinking: { type: "disabled" },
+				context_management: { edits: [{ type: "clear_tool_uses_20250919" }] },
+			},
+			CODEX_B,
+		],
+		[
+			"output_config effort xhigh",
+			{ ...base, output_config: { effort: "xhigh" } },
+			{ ...base, output_config: { effort: "xhigh" } },
+			CODEX_C,
+		],
+		[
+			"thinking budget_tokens",
+			{ ...base, thinking: { type: "enabled", budget_tokens: 8000 } },
+			{ ...base, thinking: { type: "enabled", budget_tokens: 8000 } },
+			CODEX_D,
+		],
+		[
+			"image block and PDF inside tool_result",
+			{ ...base, messages: imageMessages },
+			{ ...base, messages: imageMessages },
+			CODEX_E,
+		],
+		[
+			"unknown top-level key",
+			{ ...base, service_tier: "auto" },
+			{ ...base, service_tier: "auto" },
+			CODEX_F,
+		],
+		[
+			"client tool with extra schema keys",
+			{
+				...base,
+				tools: [
+					{
+						name: "Read",
+						strict: true,
+						cache_control: { type: "ephemeral" },
+						input_schema: { type: "object" },
+					},
+				],
+			},
+			{
+				...base,
+				tools: [
+					{
+						name: "Read",
+						strict: true,
+						cache_control: { type: "ephemeral" },
+						input_schema: { type: "object" },
+					},
+				],
+			},
+			CODEX_G,
+		],
+	];
+	for (const [name, original, nativeFinal, codexExpected] of cases) {
+		it(`admits on anthropic, codex unchanged: ${name}`, async () => {
+			expect(
+				evaluateAutoRequestAdmission({
+					...nativeEvidence(),
+					requirements: captureAutoRequestRequirements(original),
+					finalBody: { ...nativeFinal, model: "claude-fable-5-1" },
+				}),
+			).toEqual({ status: "admit" });
+			const codex = await codexEvidence(original);
+			expect(
+				evaluateAutoRequestAdmission({
+					...codex,
+					requirements: captureAutoRequestRequirements({
+						...original,
+						model: "gpt-6-astra",
+					}),
+				}),
+			).toMatchObject(codexExpected);
+		});
+	}
+	it("admits on anthropic when catalog window and output ceiling are unknown, codex unchanged", async () => {
+		const original = base;
+		expect(
+			evaluateAutoRequestAdmission({
+				...nativeEvidence({ id: "claude-fable-5-1" }),
+				requirements: captureAutoRequestRequirements(original),
+				finalBody: { ...original, model: "claude-fable-5-1" },
+			}),
+		).toEqual({ status: "admit" });
+		const codex = await codexEvidence(original);
+		const catalog = createAutoCatalogEvidence({
+			...codex.catalog,
+			source: "live",
+			models: [
+				{
+					id: "gpt-6-astra",
+					capabilities: normalizeAutoModelCapabilities("codex", {
+						input_modalities: ["text"],
+					}),
+				},
+			],
+		});
+		const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
+		if (!target) throw new Error("missing codex target");
+		expect(
+			evaluateAutoRequestAdmission({
+				catalog,
+				target,
+				finalBody: codex.finalBody,
+				requirements: captureAutoRequestRequirements(original),
+			}),
+		).toMatchObject(CODEX_H);
+	});
+	it("admits a multi-megabyte body on anthropic; codex keeps its context rejection", async () => {
+		const original = {
+			...base,
+			messages: [{ role: "user", content: "x".repeat(4_000_000) }],
+		};
+		expect(
+			evaluateAutoRequestAdmission({
+				...nativeEvidence(),
+				requirements: captureAutoRequestRequirements(original),
+				finalBody: { ...original, model: "claude-fable-5-1" },
+			}),
+		).toEqual({ status: "admit" });
+		const codex = await codexEvidence(original);
+		expect(
+			evaluateAutoRequestAdmission({
+				...codex,
+				requirements: captureAutoRequestRequirements({
+					...original,
+					model: "gpt-6-astra",
+				}),
+			}),
+		).toMatchObject(CODEX_I);
+	});
+	it("admits when max_tokens is missing or invalid (no proven skip)", () => {
+		for (const max_tokens of [undefined, 0, -1, 1.5, "20", null]) {
+			const original = { ...base, max_tokens };
+			expect(
+				evaluateAutoRequestAdmission({
+					...nativeEvidence(),
+					requirements: captureAutoRequestRequirements(original),
+					finalBody: { ...original, model: "claude-fable-5-1" },
+				}),
+			).toEqual({ status: "admit" });
+		}
+	});
+	it("still rejects proven anthropic failures", () => {
+		const evidence = nativeEvidence();
+		const requirements = captureAutoRequestRequirements({
+			...base,
+			max_tokens: 20001,
+		});
+		expect(
+			evaluateAutoRequestAdmission({
+				...evidence,
+				requirements,
+				finalBody: { ...base, max_tokens: 20001, model: "claude-fable-5-1" },
+			}),
+		).toMatchObject({ status: "reject", reason: "output-unsupported" });
+		expect(
+			evaluateAutoRequestAdmission({
+				...evidence,
+				requirements: captureAutoRequestRequirements(base),
+				finalBody: { ...base, max_tokens: 19, model: "claude-fable-5-1" },
+			}),
+		).toMatchObject({ status: "reject", reason: "output-unsupported" });
+		expect(
+			evaluateAutoRequestAdmission({
+				...evidence,
+				requirements: captureAutoRequestRequirements(base),
+				finalBody: { ...base, model: "claude-opus-5-5" },
+			}),
+		).toMatchObject({ status: "reject", reason: "model-unsupported" });
+		expect(
+			evaluateAutoRequestAdmission({
+				...evidence,
+				requirements: captureAutoRequestRequirements({
+					...base,
+					tools: [{ type: "web_search_20250305", name: "web_search" }],
+				}),
+				finalBody: {
+					...base,
+					tools: [{ type: "web_search_20250305", name: "web_search" }],
+					model: "claude-fable-5-1",
+				},
+			}),
+		).toMatchObject({ status: "unknown", reason: "tools-unsupported" });
 	});
 });

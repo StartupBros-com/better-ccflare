@@ -126,10 +126,7 @@ export function revalidateAutoTarget(
 	return current?.evidenceRef === target.evidenceRef ? current : null;
 }
 
-function modalities(
-	body: Record<string, unknown>,
-	native: boolean,
-): Set<string> | null {
+function modalities(body: Record<string, unknown>): Set<string> | null {
 	const found = new Set<string>();
 	const visit = (value: unknown): boolean => {
 		if (typeof value === "string") {
@@ -145,15 +142,6 @@ function modalities(
 				return (
 					typeof block.text === "string" &&
 					onlyKeys(block, ["type", "text", "cache_control"])
-				);
-			case "thinking":
-				found.add("text");
-				return (
-					native &&
-					typeof block.thinking === "string" &&
-					typeof block.signature === "string" &&
-					block.signature.length > 0 &&
-					onlyKeys(block, ["type", "thinking", "signature"])
 				);
 			case "image":
 				found.add("image");
@@ -214,11 +202,11 @@ function onlyKeys(
 	return Object.keys(value).every((key) => keys.includes(key));
 }
 
-/** Client function tools are supported by the native protocol and Codex's
- * existing function adapter. This does NOT infer hosted-tool support from a flag.
- * Unknown tool variants/schemas are deliberately outside this contract.
+/** Client function tools supported by Codex's existing function adapter. This
+ * does NOT infer hosted-tool support from a flag. Unknown tool variants/schemas
+ * are deliberately outside this contract.
  */
-function clientTools(body: Record<string, unknown>, native: boolean): boolean {
+function clientTools(body: Record<string, unknown>): boolean {
 	return (
 		body.tools === undefined ||
 		(Array.isArray(body.tools) &&
@@ -231,10 +219,7 @@ function clientTools(body: Record<string, unknown>, native: boolean): boolean {
 						"description",
 						"input_schema",
 						"cache_control",
-						...(native ? ["defer_loading"] : []),
 					]) &&
-					(tool.defer_loading === undefined ||
-						typeof tool.defer_loading === "boolean") &&
 					typeof tool.name === "string" &&
 					tool.name.length > 0 &&
 					(tool.description === undefined ||
@@ -243,47 +228,6 @@ function clientTools(body: Record<string, unknown>, native: boolean): boolean {
 				);
 			}))
 	);
-}
-
-/** Native protocol shapes whose entire JSON representation can be conservatively
- * counted. This is not permission to rewrite an unsupported combination to fit.
- */
-function nativeTextConfiguration(body: Record<string, unknown>): boolean {
-	if (body.thinking !== undefined) {
-		const thinking = record(body.thinking);
-		if (
-			!thinking ||
-			!onlyKeys(thinking, ["type"]) ||
-			!["adaptive", "disabled"].includes(String(thinking.type))
-		)
-			return false;
-	}
-	if (body.output_config !== undefined) {
-		const output = record(body.output_config);
-		if (
-			!output ||
-			!onlyKeys(output, ["effort"]) ||
-			!["low", "medium", "high", "max"].includes(String(output.effort))
-		)
-			return false;
-	}
-	if (body.context_management !== undefined) {
-		const context = record(body.context_management);
-		if (
-			!context ||
-			!onlyKeys(context, ["edits"]) ||
-			!Array.isArray(context.edits)
-		)
-			return false;
-		for (const value of context.edits) {
-			const edit = record(value);
-			if (!edit || !onlyKeys(edit, ["type"])) return false;
-			if (edit.type === "clear_thinking_20251015") {
-				if (record(body.thinking)?.type !== "adaptive") return false;
-			} else if (edit.type !== "clear_tool_uses_20250919") return false;
-		}
-	}
-	return true;
 }
 
 function textBlocks(value: unknown, separator: string): string | null {
@@ -519,6 +463,85 @@ function codexPreserves(
 	);
 }
 
+/** Hosted server tools are proven per target by the provider materializer, the
+ * same decision stock routing makes per candidate in account-selector.
+ */
+function hostedToolsDecision(
+	input: AutoRequestAdmissionInput,
+	target: AutoModelTargetEvidence,
+	hosted: NonNullable<ReturnType<typeof deriveServerToolRequirement>>,
+): QualityAdmissionDecision | null {
+	const source = input.hostedTools;
+	if (
+		!source ||
+		source.context.account.id !== target.accountId ||
+		source.context.account.provider !== target.provider
+	)
+		return { status: "unknown", reason: "tools-unsupported" };
+	try {
+		const tuple = materializeProviderServerToolCapabilityTuple(
+			source.provider,
+			{
+				...source.context,
+				requirements: hosted,
+				physicalModel: target.physicalModel,
+			},
+		);
+		if (!tuple) return { status: "unknown", reason: "tools-unsupported" };
+		const decision = materializeProviderServerToolCapabilityDecision(
+			source.provider,
+			hosted,
+			tuple,
+		);
+		if (decision.decision !== "proven")
+			return {
+				status: decision.decision === "unsupported" ? "reject" : "unknown",
+				reason: "tools-unsupported",
+			};
+	} catch {
+		return { status: "unknown", reason: "tools-unsupported" };
+	}
+	return null;
+}
+
+/** Native Anthropic pass-through. Stock routing applies no request-shape,
+ * modality, or context admission for the same account and model, so Auto must
+ * not refuse what stock would send: only proven rejections skip a lane. The
+ * request body is deliberately not compared with the original (stock legitimately
+ * rewrites it: system cache TTL, clear_thinking strip), and no local token
+ * accounting is claimed; upstream returns its own "prompt is too long" exactly
+ * as it does for stock.
+ */
+function evaluateNativeAnthropicAdmission(
+	input: AutoRequestAdmissionInput,
+	target: AutoModelTargetEvidence,
+	original: Record<string, unknown>,
+	final: Record<string, unknown> | null,
+): QualityAdmissionDecision {
+	if (!final || final.model !== target.physicalModel)
+		return { status: "reject", reason: "model-unsupported" };
+	if (
+		(hasForcedToolChoice(original) || hasForcedToolChoice(final)) &&
+		!supportsForcedToolChoice(target.physicalModel)
+	)
+		return { status: "reject", reason: "tools-unsupported" };
+	const output = positiveSafeCapacity(original.max_tokens);
+	if (output !== null) {
+		const ceiling = target.capabilities?.maxOutputTokens;
+		if (ceiling != null && output > ceiling)
+			return { status: "reject", reason: "output-unsupported" };
+		const finalOutput = positiveSafeCapacity(final.max_tokens);
+		if (finalOutput !== null && finalOutput < output)
+			return { status: "reject", reason: "output-unsupported" };
+	}
+	const hosted = deriveServerToolRequirement(original);
+	if (hosted) {
+		const decision = hostedToolsDecision(input, target, hosted);
+		if (decision) return decision;
+	}
+	return { status: "admit" };
+}
+
 /** Evaluate original requirements before final representation, so translation
  * cannot hide images, tools, or the requested output. Local accounting is an
  * explicitly labelled operational estimate, not an exact tokenizer guarantee.
@@ -535,14 +558,10 @@ export function evaluateAutoRequestAdmission(
 		return { status: "unknown", reason: "request-preservation-unknown" };
 	const original = JSON.parse(serialized) as Record<string, unknown>;
 	const final = record(input.finalBody);
+	if (target.provider === "anthropic")
+		return evaluateNativeAnthropicAdmission(input, target, original, final);
 	if (!final || final.model !== target.physicalModel)
 		return { status: "reject", reason: "model-unsupported" };
-	if (
-		target.provider === "anthropic" &&
-		(hasForcedToolChoice(original) || hasForcedToolChoice(final)) &&
-		!supportsForcedToolChoice(target.physicalModel)
-	)
-		return { status: "reject", reason: "tools-unsupported" };
 	const capabilities = target.capabilities;
 	const output = positiveSafeCapacity(original.max_tokens);
 	if (output === null)
@@ -552,10 +571,7 @@ export function evaluateAutoRequestAdmission(
 		output > capabilities.maxOutputTokens
 	)
 		return { status: "reject", reason: "output-unsupported" };
-	const requestedModalities = modalities(
-		original,
-		target.provider === "anthropic",
-	);
+	const requestedModalities = modalities(original);
 	if (
 		requestedModalities &&
 		capabilities?.inputModalities &&
@@ -566,49 +582,12 @@ export function evaluateAutoRequestAdmission(
 		return { status: "reject", reason: "modality-unsupported" };
 	const hosted = deriveServerToolRequirement(original);
 	if (hosted) {
-		const source = input.hostedTools;
-		if (
-			!source ||
-			source.context.account.id !== target.accountId ||
-			source.context.account.provider !== target.provider
-		)
-			return { status: "unknown", reason: "tools-unsupported" };
-		try {
-			const tuple = materializeProviderServerToolCapabilityTuple(
-				source.provider,
-				{
-					...source.context,
-					requirements: hosted,
-					physicalModel: target.physicalModel,
-				},
-			);
-			if (!tuple) return { status: "unknown", reason: "tools-unsupported" };
-			const decision = materializeProviderServerToolCapabilityDecision(
-				source.provider,
-				hosted,
-				tuple,
-			);
-			if (decision.decision !== "proven")
-				return {
-					status: decision.decision === "unsupported" ? "reject" : "unknown",
-					reason: "tools-unsupported",
-				};
-		} catch {
-			return { status: "unknown", reason: "tools-unsupported" };
-		}
+		const decision = hostedToolsDecision(input, target, hosted);
+		if (decision) return decision;
 	}
-	if (!hosted && !clientTools(original, target.provider === "anthropic"))
+	if (!hosted && !clientTools(original))
 		return { status: "unknown", reason: "tools-unsupported" };
-	if (target.provider === "anthropic") {
-		const finalOutput = positiveSafeCapacity(final.max_tokens);
-		if (finalOutput !== null && finalOutput < output)
-			return { status: "reject", reason: "output-unsupported" };
-		// JSON key order and the streaming transport flag are not prompt semantics.
-		const { model: _originalModel, stream: _originalStream, ...a } = original;
-		const { model: _physicalModel, stream: _physicalStream, ...b } = final;
-		if (!isDeepStrictEqual(a, b))
-			return { status: "unknown", reason: "request-preservation-unknown" };
-	} else if (target.provider === "codex") {
+	if (target.provider === "codex") {
 		if (
 			final.max_output_tokens !== undefined &&
 			positiveSafeCapacity(final.max_output_tokens) !== output
@@ -633,7 +612,6 @@ export function evaluateAutoRequestAdmission(
 	// owner exists here yet, so do not accept a caller-supplied count or valid=true.
 	if (
 		hosted ||
-		(target.provider === "anthropic" && !nativeTextConfiguration(original)) ||
 		[...requestedModalities].some((value) => value !== "text") ||
 		Object.keys(original).some(
 			(key) =>
@@ -650,9 +628,7 @@ export function evaluateAutoRequestAdmission(
 					"top_p",
 					"top_k",
 					"stop_sequences",
-					...(target.provider === "anthropic"
-						? ["thinking", "output_config", "context_management"]
-						: ["output_config"]),
+					"output_config",
 				].includes(key),
 		)
 	)

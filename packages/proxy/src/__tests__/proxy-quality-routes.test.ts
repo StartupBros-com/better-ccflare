@@ -796,8 +796,9 @@ describe("prewarmed native catalogs", () => {
 					accountId: "a",
 					physicalModel: "claude-fable-5-1",
 				},
-				accounting: { kind: "estimate", source: "local-envelope-v1" },
 			});
+			// Native Anthropic admission claims no local token accounting.
+			expect(history[0].qualityDecision.accounting).toBeUndefined();
 			expect(history[0].qualityDecision.selected.evidenceRef).toBeUndefined();
 			expect(
 				history[0].qualityDecision.selected.catalogRevision,
@@ -1269,7 +1270,7 @@ describe("prewarmed native catalogs", () => {
 	it.each([
 		false,
 		true,
-	])("counts all deferred schema bytes even with defer_loading=%s", async (defer_loading) => {
+	])("does not refuse a large deferred schema locally, defer_loading=%s (upstream is the arbiter, as for stock)", async (defer_loading) => {
 		const tool = {
 			name: "lookup",
 			defer_loading,
@@ -1285,9 +1286,10 @@ describe("prewarmed native catalogs", () => {
 				},
 			),
 		);
-		expect(response.status).toBe(503);
-		expect(sends).toHaveLength(0);
-		expect(await home()).toBeUndefined();
+		expect(response.status).toBe(200);
+		await response.text();
+		await flush();
+		expect(sends).toHaveLength(1);
 	});
 
 	it.each([
@@ -1299,11 +1301,6 @@ describe("prewarmed native catalogs", () => {
 			context_management: { edits: [{ type: "clear_thinking_20251015" }] },
 		},
 		{ context_management: { edits: [{ type: "future_edit" }] } },
-		{
-			tools: [
-				{ type: "custom", name: "lookup", input_schema: { type: "object" } },
-			],
-		},
 		{
 			tools: [
 				{
@@ -1329,8 +1326,30 @@ describe("prewarmed native catalogs", () => {
 				},
 			],
 		},
-	])("does not broaden native admission to unknown or incompatible shapes: %j", async (body) => {
+	])("admits unusual native shapes exactly as stock would send them: %j", async (body) => {
 		const response = await send(request(undefined, {}, body));
+		expect(response.status).toBe(200);
+		await response.text();
+		await flush();
+		expect(sends).toHaveLength(1);
+	});
+
+	it("still defers a hosted-looking tool type to the shared materializer decision", async () => {
+		const response = await send(
+			request(
+				undefined,
+				{},
+				{
+					tools: [
+						{
+							type: "custom",
+							name: "lookup",
+							input_schema: { type: "object" },
+						},
+					],
+				},
+			),
+		);
 		expect(response.status).toBe(503);
 		expect(sends).toHaveLength(0);
 		expect(await home()).toBeUndefined();
