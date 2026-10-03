@@ -1,3 +1,5 @@
+import { loadCliDotenv } from "./startup-env";
+
 // This entrypoint MUST be compiled with --no-compile-autoload-dotenv. Controls
 // must reach application code with only the environment supplied by the caller.
 // Ordinary commands retain Bun's native dotenv semantics before app imports.
@@ -32,7 +34,10 @@ if (!process.argv.slice(2).some((arg) => arg.startsWith("--quality-routing"))) {
 	}
 }
 
-// main retains its legacy fallback .env locations, source entrypoint and flags.
+// argv[1] names Bun's virtual bundled entrypoint, not the deployed executable.
+// Load fallbacks once, using the physical path, before app modules snapshot env.
+loadCliDotenv(process.execPath);
+
 // The dynamic import is important: app modules may snapshot env at import time.
 const { startCli } = await import("./main");
 startCli();

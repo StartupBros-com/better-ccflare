@@ -1,34 +1,9 @@
 #!/usr/bin/env bun
-// Load .env file to ensure environment variables are available
-import { config } from "dotenv";
+import { loadCliDotenv } from "./startup-env";
 
-// Load .env with robust path resolution for different deployment scenarios:
-// 1. Current directory (when binary is in project root)
-// 2. Project root (when running from source with bun run)
-// 3. Executable directory (when binary is deployed elsewhere)
-const possibleEnvPaths = [
-	".env", // Current directory
-	"../../.env", // Project root from apps/cli/src
-];
-
-// For deployed binaries, also check the executable's directory
-if (process.argv[1]) {
-	const execPath = require("node:path").dirname(
-		require("node:path").resolve(process.argv[1]),
-	);
-	possibleEnvPaths.push(require("node:path").join(execPath, ".env"));
-}
-
-// Quality controls accept only an explicitly named, already-present variable;
-// never search dotenv files for a credential (all other commands stay unchanged).
-if (!process.argv.slice(2).some((arg) => arg.startsWith("--quality-routing"))) {
-	for (const envPath of possibleEnvPaths) {
-		const result = config({ path: envPath, quiet: true });
-		if (result.parsed && Object.keys(result.parsed).length > 0) {
-			break; // Stop after finding the first .env with variables
-		}
-	}
-}
+// Source runs retain the script-directory fallback. Compiled startup has already
+// loaded the same fallbacks using its physical executable, before app imports.
+loadCliDotenv(process.argv[1]);
 
 import type { CreatedAccountIdentity } from "@better-ccflare/cli-commands";
 import { getManagedRoutingHelpText } from "@better-ccflare/cli-commands/help";

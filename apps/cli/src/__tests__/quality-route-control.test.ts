@@ -1,11 +1,14 @@
 import { expect, it } from "bun:test";
 import {
+	copyFileSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import {
@@ -312,6 +315,76 @@ it.skipIf(!process.env.BETTER_CCFLARE_TEST_COMPILED_CLI)(
 	},
 );
 
+it("ordinary CLI finds dotenv beside its physical executable or source entrypoint, but controls never do", async () => {
+	const directory = mkdtempSync(join(tmpdir(), "quality-cli-exec-fallback-"));
+	try {
+		const app = join(directory, "app");
+		const cwd = join(directory, "work", "cwd");
+		mkdirSync(app);
+		mkdirSync(cwd, { recursive: true });
+		const binary = process.env.BETTER_CCFLARE_TEST_COMPILED_CLI;
+		let entrypoint: string[];
+		if (binary) {
+			const executable = join(app, "arbitrary-cli-name");
+			copyFileSync(binary, executable);
+			entrypoint = [executable];
+		} else {
+			const script = join(app, "source-entry.ts");
+			writeFileSync(
+				script,
+				`const { startCli } = await import(${JSON.stringify(new URL("../main.ts", import.meta.url).pathname)}); startCli();`,
+			);
+			entrypoint = [process.execPath, "--no-env-file", script];
+		}
+		const database = join(directory, "physical-directory.db");
+		writeFileSync(
+			join(app, ".env"),
+			`BETTER_CCFLARE_DB_PATH=${database}\nSYNTHETIC_INFERENCE_KEY=synthetic-file-secret\n`,
+		);
+		const env = {
+			HOME: directory,
+			XDG_CONFIG_HOME: directory,
+			TMPDIR: directory,
+			PATH: process.env.PATH ?? "",
+		};
+		for (const action of ["status", "retry-preferred"]) {
+			const control = Bun.spawn(
+				[
+					...entrypoint,
+					`--quality-routing-${action}`,
+					"synthetic-session",
+					"--origin",
+					"http://127.0.0.1:1",
+					"--credential-env",
+					"SYNTHETIC_INFERENCE_KEY",
+				],
+				{ cwd, env, stdout: "pipe", stderr: "pipe" },
+			);
+			const stdout = await new Response(control.stdout).text();
+			const stderr = await new Response(control.stderr).text();
+			expect(await control.exited).toBe(1);
+			expect(stdout.trim()).toBe('{"status":"missing-credential"}');
+			expect(stdout + stderr).not.toContain("synthetic-file-secret");
+			expect(existsSync(database)).toBe(false);
+		}
+		const ordinary = Bun.spawn([...entrypoint, "--list"], {
+			cwd,
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdout = await new Response(ordinary.stdout).text();
+		const stderr = await new Response(ordinary.stderr).text();
+		expect({ exit: await ordinary.exited, stdout, stderr }).toMatchObject({
+			exit: 0,
+		});
+		expect(stdout).toContain("No accounts configured");
+		expect(existsSync(database)).toBe(true);
+	} finally {
+		rmSync(directory, { recursive: true });
+	}
+}, 30000);
+
 const args = [
 	"--quality-routing-retry-preferred",
 	"session-a",
@@ -396,6 +469,128 @@ it("reads only the named credential and redelivers the identical retry after los
 	});
 	expect(JSON.stringify(result)).not.toContain("synthetic-secret");
 });
+it("actual CLI redelivers the same retry after the API commits but loses its response, mutating once", async () => {
+	const directory = mkdtempSync(join(tmpdir(), "quality-cli-redelivery-"));
+	const calls: {
+		method: string | undefined;
+		url: string | undefined;
+		authorization: string | undefined;
+	}[] = [];
+	const bodies: string[] = [];
+	const receipts = new Map<string, { body: string; revision: number }>();
+	let revision = 4;
+	let mutations = 0;
+	const server = createServer(async (req, res) => {
+		calls.push({
+			method: req.method,
+			url: req.url,
+			authorization: req.headers.authorization,
+		});
+		res.setHeader("content-type", "application/json");
+		if (req.method === "GET") {
+			res.end(
+				JSON.stringify({
+					status: "known",
+					incarnation: "incarnation-a",
+					intentRevision: revision,
+				}),
+			);
+			return;
+		}
+		let body = "";
+		for await (const chunk of req) body += chunk.toString();
+		bodies.push(body);
+		const intent = JSON.parse(body);
+		const receipt = receipts.get(intent.idempotencyToken);
+		if (receipt) {
+			res.statusCode = receipt.body === body ? 200 : 409;
+			res.end(
+				JSON.stringify({
+					status: receipt.body === body ? "ready" : "conflict",
+					intentRevision: receipt.revision,
+				}),
+			);
+			return;
+		}
+		if (
+			intent.incarnation !== "incarnation-a" ||
+			intent.expectedIntentRevision !== revision ||
+			typeof intent.idempotencyToken !== "string" ||
+			!intent.idempotencyToken
+		) {
+			res.statusCode = 409;
+			res.end(JSON.stringify({ status: "stale" }));
+			return;
+		}
+		mutations++;
+		revision++;
+		receipts.set(intent.idempotencyToken, { body, revision });
+		// Commit first, then lose the response on the real loopback transport.
+		res.destroy();
+	});
+	try {
+		await new Promise<void>((resolve) =>
+			server.listen(0, "127.0.0.1", resolve),
+		);
+		const { port } = server.address() as AddressInfo;
+		const child = Bun.spawn(
+			[
+				...cliEntrypoint(),
+				"--quality-routing-retry-preferred",
+				"session-a",
+				"--origin",
+				`http://127.0.0.1:${port}`,
+				"--credential-env",
+				"SYNTHETIC_INFERENCE_KEY",
+			],
+			{
+				cwd: directory,
+				env: {
+					HOME: directory,
+					XDG_CONFIG_HOME: directory,
+					TMPDIR: directory,
+					PATH: process.env.PATH ?? "",
+					SYNTHETIC_INFERENCE_KEY: "synthetic-runtime-key",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		const stdout = await new Response(child.stdout).text();
+		const stderr = await new Response(child.stderr).text();
+		expect({ exit: await child.exited, stderr }).toMatchObject({ exit: 0 });
+		expect(JSON.parse(stdout)).toEqual({ status: "ready", intentRevision: 5 });
+		expect(calls).toEqual([
+			{
+				method: "GET",
+				url: "/v1/quality-routing/sessions/session-a",
+				authorization: "Bearer synthetic-runtime-key",
+			},
+			...Array.from({ length: 2 }, () => ({
+				method: "POST",
+				url: "/v1/quality-routing/sessions/session-a/retry-preferred",
+				authorization: "Bearer synthetic-runtime-key",
+			})),
+		]);
+		expect(bodies).toHaveLength(2);
+		expect(bodies[0]).toBe(bodies[1]);
+		expect(JSON.parse(bodies[0] ?? "null")).toEqual({
+			incarnation: "incarnation-a",
+			expectedIntentRevision: 4,
+			idempotencyToken: expect.any(String),
+		});
+		expect(mutations).toBe(1);
+		expect(revision).toBe(5);
+		expect(receipts.size).toBe(1);
+		expect(stdout + stderr).not.toContain("synthetic-runtime-key");
+	} finally {
+		await new Promise<void>((resolve, reject) =>
+			server.close((error) => (error ? reject(error) : resolve())),
+		);
+		rmSync(directory, { recursive: true });
+	}
+}, 30000);
+
 it("rejects non-loopback, userinfo, alternate protocol and hostname confusion before credential access", () => {
 	for (const origin of [
 		"https://example.com",
