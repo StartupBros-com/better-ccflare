@@ -53,6 +53,7 @@ import { RoutingAttemptLedger } from "./handlers/routing-attempt-ledger";
 import { evaluateAutoCapacity } from "./handlers/usage-throttling";
 import { getNativeAutoCatalogEvidence } from "./model-catalog";
 import { opaqueRuntimeId } from "./opaque-runtime-id";
+import { prepareNativeQualityCatalogs } from "./quality-route-catalog-preparation";
 import type { RequestBodyContext } from "./request-body-context";
 import { recordRoutingTerminalRequest } from "./routing-terminal-recorder";
 import { bindRequestPrivateServerToolReplay } from "./server-tool-replay-runtime";
@@ -377,7 +378,8 @@ function replacementFor(
 		: null;
 }
 /** Returns null only for untouched ordinary routing. Local policy/state failures never
- * fall back to the legacy selector. No network stack exists in this controller. */
+ * fall back to the legacy selector. Native discovery is bounded request preparation;
+ * inference still uses the existing provider-attempt machinery. */
 export async function routeQualityRequest(input: {
 	req: Request;
 	url: URL;
@@ -498,7 +500,21 @@ export async function routeQualityRequest(input: {
 		}
 		const requirements =
 			input.requirements ?? captureAutoRequestRequirements(input.originalBody);
-		const accounts = await ctx.dbOps.getAllAccounts();
+		let accounts = await ctx.dbOps.getAllAccounts();
+		// Only an authenticated, accepted Auto request reaches this permission
+		// boundary. Discovery/control/manual routes never authorize OAuth lookups.
+		if (process.env.BETTER_CCFLARE_MODELS_OFFLINE !== "1") {
+			await prepareNativeQualityCatalogs(ctx, policy, intent, accounts, {
+				signal: req.signal,
+				allowOAuth: true,
+			});
+			accounts = await ctx.dbOps.getAllAccounts();
+		}
+		if (req.signal.aborted) return unavailable("request-aborted");
+		if (ctx.config.getQualityRoutingPolicy?.()?.revision !== policy.revision)
+			return unavailable("changed-admission");
+		// Lease acquisition and the final dispatch guard still fence accepted
+		// intent, account incarnation, credentials and policy after these awaits.
 		const compilation = compileQualityCandidates(
 			policy,
 			intent,
