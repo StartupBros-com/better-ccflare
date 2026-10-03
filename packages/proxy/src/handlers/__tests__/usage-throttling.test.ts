@@ -241,6 +241,106 @@ describe("mandatory Auto capacity and spend", () => {
 			).status,
 		).toBe("unknown");
 	});
+	describe("live Anthropic payload shape with seven_day_breakdown", () => {
+		const iso = (ms: number) => new Date(ms).toISOString();
+		const base = Date.now();
+		const liveOpts = { ...opts, observedAt: base, now: base };
+		const session = iso(base + 3 * 3600_000);
+		const week = iso(base + 4 * 86400_000);
+		const livePayload = () => ({
+			limits: [
+				{
+					kind: "session",
+					percent: 6,
+					resets_at: session,
+					scope: null,
+					is_active: true,
+				},
+				{
+					kind: "weekly_all",
+					percent: 2,
+					resets_at: week,
+					scope: null,
+					is_active: true,
+				},
+				{
+					kind: "weekly_scoped",
+					percent: 0,
+					resets_at: week,
+					scope: { model: { id: null, display_name: "Fable" }, surface: null },
+					is_active: false,
+				},
+			],
+			five_hour: { utilization: 6, resets_at: session },
+			seven_day: { utilization: 2, resets_at: week },
+			seven_day_oauth_apps: null,
+			seven_day_opus: null,
+			seven_day_sonnet: null,
+			seven_day_cowork: null,
+			seven_day_omelette: null,
+			tangelo: null,
+			iguana_necktie: {
+				utilization: null,
+				resets_at: null,
+				limit_dollars: 0,
+				used_dollars: 0,
+				remaining_dollars: 0,
+				locked_reason: null,
+			},
+			seven_day_breakdown: {
+				as_of: iso(base),
+				window_started_at: iso(base - 3 * 86400_000),
+				rows: [
+					{ key: "fable", display_name: "Fable", percent: 0 },
+					{ key: "other", display_name: "Other", percent: 2 },
+				],
+			},
+			extra_usage: {
+				is_enabled: false,
+				monthly_limit: null,
+				used_credits: null,
+				utilization: null,
+			},
+			spend: { enabled: false },
+			member_dashboard_available: false,
+		});
+		it("admits Fable and Opus without grants", () => {
+			expect(
+				evaluateAutoCapacity(livePayload(), {
+					...liveOpts,
+					line: "claude-fable" as const,
+					requestModel: "claude-fable-5-1",
+				}),
+			).toEqual({ status: "admit" });
+			expect(
+				evaluateAutoCapacity(livePayload(), {
+					...liveOpts,
+					line: "claude-opus" as const,
+					requestModel: "claude-opus-5-5",
+				}),
+			).toEqual({ status: "admit" });
+		});
+		it("still fails closed on a window-shaped unrecognized seven_day_ key", () => {
+			const data = {
+				...livePayload(),
+				seven_day_oauth_apps: { utilization: null, resets_at: null },
+			};
+			expect(evaluateAutoCapacity(data, liveOpts)).toMatchObject({
+				status: "unknown",
+				reason: "capacity-evidence-unknown",
+			});
+		});
+		it("still fails closed on an unrecognized seven_day_ key with renamed window fields", () => {
+			const data = {
+				...livePayload(),
+				seven_day_newwindow: { percent: 100 },
+			};
+			expect(evaluateAutoCapacity(data, liveOpts)).toMatchObject({
+				status: "unknown",
+				reason: "capacity-evidence-unknown",
+			});
+		});
+	});
 });
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
