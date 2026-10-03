@@ -193,13 +193,14 @@ function nativeEntry(
 	};
 }
 
+/** Returns false when a newer lookup/deletion superseded this generation. */
 function publishNativeEvidence(
 	selected: AutoResolvedCredentials,
 	models: ModelCatalogEntry[],
 	generation: number,
-): void {
+): boolean {
 	const accountId = selected.account.id;
-	if (nativeEvidenceGeneration.get(accountId) !== generation) return;
+	if (nativeEvidenceGeneration.get(accountId) !== generation) return false;
 	const fetchedAt = Date.now();
 	// One refresh interval, capped at the native default, without scheduler jitter
 	// or retry grace. Disabling refresh does not grant unbounded validity.
@@ -224,6 +225,7 @@ function publishNativeEvidence(
 		});
 		nativeOwnEvidence.set(accountId, evidence);
 	}
+	return true;
 }
 
 const MAX_PAGES = 5;
@@ -389,6 +391,10 @@ export class NativeCatalogAccountIneligibleError extends Error {
  * an active account's credentials. Paginates via `after_id` up to
  * `MAX_PAGES` pages defensively. One ten-second deadline covers the entire
  * lookup, including response bodies and pagination; callers may cancel early.
+ * A targeted lookup (`accountId`) exists only to publish owned evidence, so if
+ * a newer lookup or deletion supersedes it before publication it throws
+ * `NativeCatalogObsoleteGenerationError` rather than resolving; untargeted
+ * lookups still resolve with the fetched models.
  */
 export async function fetchLiveModels(
 	ctx: ProxyContext,
@@ -447,7 +453,20 @@ async function fetchLiveModelsUntilAborted(
 		settle = resolve;
 	});
 	const registered = new Set<string>();
+	// Idempotent: runs on abort (the worker may be stuck in an uncancellable
+	// await) and again on settle, so waiters are never left on a dead entry.
+	const release = () => {
+		for (const id of registered) {
+			if (pendingNativeAcquisitions.get(id)?.generation === generation)
+				pendingNativeAcquisitions.delete(id);
+		}
+		registered.clear();
+		settle();
+	};
+	signal.addEventListener("abort", release, { once: true });
 	const register = (accountId: string) => {
+		// An aborted call must not publish a wait signal nothing would release.
+		if (signal.aborted) return;
 		// Never replace a newer lookup's entry: waiters must keep seeing it.
 		if (
 			(pendingNativeAcquisitions.get(accountId)?.generation ?? 0) > generation
@@ -460,11 +479,8 @@ async function fetchLiveModelsUntilAborted(
 	try {
 		return await acquireNativeCatalog(ctx, options, generation, register);
 	} finally {
-		for (const id of registered) {
-			if (pendingNativeAcquisitions.get(id)?.generation === generation)
-				pendingNativeAcquisitions.delete(id);
-		}
-		settle();
+		signal.removeEventListener("abort", release);
+		release();
 	}
 }
 
@@ -558,7 +574,13 @@ async function acquireNativeCatalog(
 		}
 
 		if (!body.has_more) {
-			publishNativeEvidence(selected, models, generation);
+			// Check and publish are synchronous, so they stay atomic. A targeted
+			// lookup exists only to publish owned evidence: superseded means retry.
+			if (
+				!publishNativeEvidence(selected, models, generation) &&
+				options.accountId
+			)
+				throw new NativeCatalogObsoleteGenerationError();
 			break;
 		}
 		if (!body.last_id) break;

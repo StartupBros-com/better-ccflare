@@ -663,6 +663,97 @@ describe("model-catalog", () => {
 			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
 		});
 
+		it("releases the pending acquisition when the caller aborts an uncancellable account lookup", async () => {
+			const account = makeAccount();
+			const ctx = makeCtx([account]);
+			// Never settles and ignores AbortSignal, like a wedged DB read.
+			ctx.dbOps.getAccount = () => new Promise<Account | null>(() => {});
+			global.fetch = mock(async () =>
+				Response.json({ data: [] }),
+			) as unknown as typeof fetch;
+			const controller = new AbortController();
+			const pending = fetchLiveModels(ctx, {
+				accountId: account.id,
+				signal: controller.signal,
+			});
+			const signal = getPendingNativeCatalogAcquisition(account.id);
+			expect(signal).toBeInstanceOf(Promise);
+			controller.abort(new Error("caller gone"));
+			await expect(pending).rejects.toThrow("caller gone");
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+			// A later waiter must not hang on the abandoned worker.
+			let settled = false;
+			void signal?.then(() => {
+				settled = true;
+			});
+			// Bounded by a few microtask turns, not a timer.
+			for (let turn = 0; turn < 5; turn++) await Promise.resolve();
+			expect(settled).toBe(true);
+		});
+
+		it("does not register a pending acquisition after the signal aborts", async () => {
+			const account = makeAccount();
+			const ctx = makeCtx([account]);
+			const controller = new AbortController();
+			controller.abort(new Error("already gone"));
+			await expect(
+				fetchLiveModels(ctx, {
+					accountId: account.id,
+					signal: controller.signal,
+				}),
+			).rejects.toThrow("already gone");
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+		});
+
+		it("rejects a targeted lookup superseded while its models page is in flight, publishing nothing", async () => {
+			const account = makeAccount();
+			const started = deferred<void>();
+			const gate = deferred<void>();
+			global.fetch = mock(async () => {
+				started.resolve();
+				await gate.promise;
+				return Response.json({
+					data: [{ id: "claude-opus-5-5" }],
+					has_more: false,
+				});
+			}) as unknown as typeof fetch;
+			const pending = fetchLiveModels(makeCtx([account]), {
+				accountId: account.id,
+			});
+			const outcome = pending.then(
+				() => null,
+				(error) => error,
+			);
+			await started.promise;
+			clearNativeAutoCatalogEvidence(account.id);
+			gate.resolve();
+			expect(await outcome).toBeInstanceOf(
+				NativeCatalogObsoleteGenerationError,
+			);
+			expect(getNativeAutoCatalogEvidence(account.id)).toBeNull();
+		});
+
+		it("still resolves an untargeted lookup superseded at publication without publishing owned evidence", async () => {
+			const account = makeAccount();
+			const started = deferred<void>();
+			const gate = deferred<void>();
+			global.fetch = mock(async () => {
+				started.resolve();
+				await gate.promise;
+				return Response.json({
+					data: [{ id: "claude-opus-5-5" }],
+					has_more: false,
+				});
+			}) as unknown as typeof fetch;
+			const pending = fetchLiveModels(makeCtx([account]));
+			await started.promise;
+			clearNativeAutoCatalogEvidence(account.id);
+			gate.resolve();
+			const models = await pending;
+			expect(models.map((entry) => entry.id)).toEqual(["claude-opus-5-5"]);
+			expect(getNativeAutoCatalogEvidence(account.id)).toBeNull();
+		});
+
 		it("untargeted lookups register once the account is selected and clear on settle", async () => {
 			const account = makeAccount();
 			const lookup = deferred<Account[]>();

@@ -29,7 +29,11 @@ import {
 	getCodexModels,
 } from "../codex-model-catalog";
 import type { ProxyContext } from "../handlers/proxy-types";
-import { fetchLiveModels, resetModelCatalogForTest } from "../model-catalog";
+import {
+	clearNativeAutoCatalogEvidence,
+	fetchLiveModels,
+	resetModelCatalogForTest,
+} from "../model-catalog";
 import { ModelRouteSessionRegistry } from "../model-route-profiles";
 import { handleProxy } from "../proxy";
 import { compileQualityCandidates } from "../quality-route-candidates";
@@ -359,6 +363,47 @@ describe("cold native catalog acquisition", () => {
 			{ model: "claude-fable-5-1", authorization: "synthetic-a" },
 		]);
 		expect(catalogs.toSorted()).toEqual(["synthetic-a", "synthetic-b"]);
+	});
+
+	it("cold Auto waits for and rechecks a catalog lookup superseded mid-flight instead of refusing", async () => {
+		const transport = globalThis.fetch;
+		let held!: () => void;
+		const heldPromise = new Promise<void>((resolve) => {
+			held = resolve;
+		});
+		let release!: () => void;
+		const releasePromise = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let heldOnce = false;
+		globalThis.fetch = Object.assign(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const req = input instanceof Request ? input : new Request(input, init);
+				if (
+					req.method === "GET" &&
+					req.headers.get("x-api-key") === "synthetic-a" &&
+					!heldOnce
+				) {
+					heldOnce = true;
+					held();
+					await releasePromise;
+				}
+				return transport(input, init);
+			},
+			{ preconnect: () => {} },
+		) as typeof fetch;
+		const pending = send();
+		await heldPromise;
+		// A deletion/newer lookup supersedes the request's in-flight account read.
+		clearNativeAutoCatalogEvidence("a");
+		release();
+		const response = await pending;
+		expect(response.status).toBe(200);
+		await response.text();
+		await flush();
+		expect(sends).toEqual([
+			{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+		]);
 	});
 
 	it.each([
