@@ -1945,3 +1945,264 @@ describe("count helper capability before ranking", () => {
 		);
 	});
 });
+
+describe("advisor native passthrough request gate", () => {
+	const ADVISOR_TOOL = {
+		type: "advisor_20260301",
+		name: "advisor",
+		model: "claude-opus-5",
+	};
+	const ADVISOR_HISTORY = [
+		{
+			role: "assistant",
+			content: [
+				{
+					type: "server_tool_use",
+					id: "srvtoolu_1",
+					name: "advisor",
+					input: {},
+				},
+			],
+		},
+		{ role: "user", content: "continue" },
+	];
+
+	function makeFirstPartyAccount(): Account {
+		return makeAccount({
+			id: "first-party",
+			name: "first-party",
+			provider: "anthropic",
+			access_token: "test-token",
+			expires_at: Date.now() + 60 * 60_000,
+			custom_endpoint: null,
+			model_mappings: null,
+		});
+	}
+
+	function makeAdvisorRequest(
+		options: {
+			tools?: Array<Record<string, unknown>>;
+			messages?: unknown[];
+			path?: string;
+			replayIdentity?: "valid" | "missing";
+		} = {},
+	): Request {
+		const headers = new Headers({
+			"content-type": "application/json",
+			"anthropic-version": "2023-06-01",
+		});
+		if (options.replayIdentity !== "missing") {
+			headers.set("authorization", "Bearer server-tool-test-client");
+			headers.set("x-claude-code-session-id", "server-tool-test-session");
+		}
+		return new Request(`https://proxy.local${options.path ?? "/v1/messages"}`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				model: MODEL,
+				max_tokens: 16,
+				messages: options.messages ?? [{ role: "user", content: "hello" }],
+				tools: options.tools ?? [ADVISOR_TOOL],
+			}),
+		});
+	}
+
+	async function refusal(request: Request, accounts: Account[]) {
+		const { ctx, refreshCalls, mutations } = makeContext(accounts);
+		globalThis.fetch = mock(
+			async () => new Response("{}", { status: 500 }),
+		) as unknown as typeof fetch;
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = (await response.json()) as {
+			error: { code: string; reason: string; message: string };
+		};
+		return { ctx, refreshCalls, mutations, response, body };
+	}
+
+	it("admits an advisor-only request and reaches upstream in exactly one fetch", async () => {
+		const { ctx } = makeContext(makeFirstPartyAccount());
+		let forwarded: Record<string, unknown> | undefined;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const outbound = input instanceof Request ? input : new Request(input);
+			forwarded = (await outbound.clone().json()) as Record<string, unknown>;
+			return new Response(JSON.stringify({ type: "message", content: [] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		const request = makeAdvisorRequest();
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(forwarded?.tools).toEqual([ADVISOR_TOOL]);
+	});
+
+	it("refuses advisor plus a hosted web_search declaration before replay binding", async () => {
+		// A missing replay identity would yield replay_unavailable if binding ran.
+		const request = makeAdvisorRequest({
+			tools: [
+				ADVISOR_TOOL,
+				{ type: "web_search_20250305", name: "web_search" },
+			],
+			replayIdentity: "missing",
+		});
+		const { ctx, refreshCalls, mutations, response, body } = await refusal(
+			request,
+			[makeFirstPartyAccount()],
+		);
+
+		expect(response.status).toBe(400);
+		expect(body.error.reason).toBe("advisor_declaration_unavailable");
+		expect(body.error.message).toContain("the advisor tool is not available");
+		expect(body.error.message).not.toContain(
+			"not available for this organization",
+		);
+		expect(body.error.message).not.toContain("Input tag");
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+		expect(mutations.updateAccountUsage).toHaveBeenCalledTimes(0);
+		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+		expect(response.headers.has("x-better-ccflare-pool-status")).toBeFalse();
+		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBeFalse();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(usageHandleEnd.mock.calls[0]?.[0]).toMatchObject({
+			success: false,
+			error: "server_tool_advisor_declaration_unavailable",
+		});
+	});
+
+	it("refuses advisor history beside web-search replay history with the history phrase", async () => {
+		const request = makeAdvisorRequest({
+			tools: [],
+			replayIdentity: "missing",
+			messages: [
+				...ADVISOR_HISTORY,
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "web_search_tool_result",
+							tool_use_id: "srvtoolu_2",
+							content: [
+								{
+									type: "web_search_result",
+									encrypted_content: "bccf1.A256GCM.proxy-envelope",
+								},
+							],
+						},
+					],
+				},
+			],
+		});
+		const { ctx, response, body } = await refusal(request, [
+			makeFirstPartyAccount(),
+		]);
+
+		expect(response.status).toBe(400);
+		expect(body.error.reason).toBe("advisor_history_unavailable");
+		expect(body.error.message).toContain(
+			"Advisor tool result content could not be processed",
+		);
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+	});
+
+	it("refuses a declared unknown advisor type with the declaration phrase", async () => {
+		const request = makeAdvisorRequest({
+			tools: [{ type: "advisor_20270101", name: "advisor" }],
+		});
+		const { response, body } = await refusal(request, [
+			makeFirstPartyAccount(),
+		]);
+
+		expect(response.status).toBe(400);
+		expect(body.error.reason).toBe("advisor_declaration_unavailable");
+		expect(body.error.code).not.toBe("server_tool_unsupported_requirement");
+		expect(body.error.message).toContain("the advisor tool is not available");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+	});
+
+	it("keeps an unrelated typed tool on server_tool_unsupported_requirement", async () => {
+		const request = makeAdvisorRequest({
+			tools: [{ type: "code_execution_20250825", name: "code_execution" }],
+		});
+		const { response, body } = await refusal(request, [
+			makeFirstPartyAccount(),
+		]);
+
+		expect(response.status).toBe(400);
+		expect(body.error.code).toBe("server_tool_unsupported_requirement");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+	});
+
+	it("keeps an advisor-only main-chain request a root while a web_search request stays a helper", async () => {
+		async function selectedLineage(request: Request, account: Account) {
+			const { ctx } = makeContext(account, (provider) => {
+				provider.resolveServerToolCapability = (_requirements, tuple) => ({
+					decision: "proven",
+					proof: makeProof(tuple, `lineage:${tuple.candidateId}`),
+				});
+			});
+			const lineages: Array<RequestMeta["routeLineage"]> = [];
+			ctx.strategy.select = mock(
+				async (accounts: Account[], meta: RequestMeta) => {
+					lineages.push(meta.routeLineage);
+					return accounts;
+				},
+			);
+			globalThis.fetch = mock(
+				async () =>
+					new Response(JSON.stringify({ type: "message", content: [] }), {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					}),
+			) as unknown as typeof fetch;
+			await handleProxy(request, new URL(request.url), ctx);
+			return lineages;
+		}
+
+		const advisor = await selectedLineage(
+			makeAdvisorRequest(),
+			makeFirstPartyAccount(),
+		);
+		const hosted = await selectedLineage(
+			makeServerToolRequest(),
+			makeAccount(),
+		);
+
+		expect(advisor.length).toBeGreaterThan(0);
+		expect(advisor.every((lineage) => lineage?.kind === "root")).toBe(true);
+		expect(hosted.length).toBeGreaterThan(0);
+		expect(hosted.every((lineage) => lineage?.kind === "helper")).toBe(true);
+	});
+
+	it("neither filters nor refuses count_tokens that declares advisor", async () => {
+		const { ctx } = makeContext(makeFirstPartyAccount());
+		let seenMeta: RequestMeta | undefined;
+		ctx.strategy.select = mock(
+			async (accounts: Account[], meta: RequestMeta) => {
+				seenMeta = meta;
+				return accounts;
+			},
+		);
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ input_tokens: 3 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		) as unknown as typeof fetch;
+		const request = makeAdvisorRequest({ path: "/v1/messages/count_tokens" });
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(seenMeta?.nativeAnthropicToolRequirement).toBeNull();
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+	});
+});

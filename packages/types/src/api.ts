@@ -1,5 +1,6 @@
 import type { AllowedModel } from "./agent";
 import type {
+	NativeAnthropicToolRequirement,
 	ServerToolCapabilityDecision,
 	ServerToolReplayAtom,
 	ServerToolRequirements,
@@ -252,6 +253,12 @@ export interface RequestMeta {
 	trustedInternalAutoRefresh?: boolean;
 	/** Frozen content-minimal server-tool constraints derived from the final request body. */
 	serverToolRequirements?: ServerToolRequirements;
+	/**
+	 * Advisor content the request carries, which only first-party Anthropic
+	 * accounts can serve. Required so no construction site silently defaults to
+	 * "no constraint"; null where no body context exists (count helpers, probes).
+	 */
+	nativeAnthropicToolRequirement: NativeAnthropicToolRequirement | null;
 	/**
 	 * Whether the endpoint carries a semantically significant server-tool query.
 	 * Raw query text is never copied into routing metadata; the exact Claude SDK

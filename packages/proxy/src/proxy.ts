@@ -185,6 +185,7 @@ import {
 } from "./routing-terminal-recorder";
 import { bindRequestPrivateServerToolReplay } from "./server-tool-replay-runtime";
 import {
+	createNativeAnthropicToolRoutingError,
 	createServerToolRoutingErrorResponse,
 	ServerToolCandidateCapabilityError,
 	ServerToolRoutingError,
@@ -1030,6 +1031,7 @@ async function handleProxyCoreImpl(
 							reason: error.reason,
 							accountId: clientVisibleAccountId,
 							capabilitySummary: error.capabilitySummary,
+							requestedToolTypes: error.requestedToolTypes,
 						}),
 			),
 			`server_tool_${error.reason}`,
@@ -1646,6 +1648,28 @@ async function handleProxyCoreImpl(
 	const serverToolRequirements = isCountHelper
 		? undefined
 		: derivedServerToolRequirements;
+	// Advisor is native-only: it never joins the hosted server-tool layer, and
+	// count_tokens declarations are neither filtered nor refused.
+	const nativeAnthropicToolRequirement = isCountHelper
+		? undefined
+		: finalRequestBodyContext.finalizeNativeAnthropicToolRequirement();
+	requestMeta.nativeAnthropicToolRequirement =
+		nativeAnthropicToolRequirement ?? null;
+	// Advisor beside a proxy-hosted tool, or an advisor_* type this proxy does not
+	// know, cannot be served by any single route. Refuse before replay binding.
+	// A request that is already invalid or unsupported keeps that error: dropping
+	// advisor would not make it routable.
+	if (
+		nativeAnthropicToolRequirement &&
+		!serverToolRequirements?.invalid?.length &&
+		!serverToolRequirements?.unsupported?.length &&
+		(serverToolRequirements !== undefined ||
+			nativeAnthropicToolRequirement.unknownDeclaredTypes.length > 0)
+	) {
+		return createUnservedServerToolRoutingErrorResponse(
+			createNativeAnthropicToolRoutingError(nativeAnthropicToolRequirement),
+		);
+	}
 	if (serverToolRequirements) {
 		requestMeta.serverToolRequirements = serverToolRequirements;
 		// Selection needs only the semantic presence bit. Keep the raw query out of

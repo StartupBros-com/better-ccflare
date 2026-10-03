@@ -1,10 +1,14 @@
 import { describe, expect, mock, test } from "bun:test";
 
-import { deriveServerToolRequirement } from "../../providers/src/server-tool-capabilities";
+import {
+	deriveNativeAnthropicToolRequirement,
+	deriveServerToolRequirement,
+} from "../../providers/src/server-tool-capabilities";
 
 // RequestBodyContext imports the providers facade, whose production side effects
 // are outside this lifecycle unit test. Keep only the pure classifier seam here.
 mock.module("@better-ccflare/providers", () => ({
+	deriveNativeAnthropicToolRequirement,
 	deriveServerToolRequirement,
 }));
 
@@ -318,5 +322,59 @@ describe("RequestBodyContext server-tool finalization", () => {
 		]);
 		expect(parent.getParsedJson()?.tools).toBe(parentBody.tools);
 		expect(parent.finalizeServerToolRequirements()).toBe(parentRequirements);
+	});
+});
+
+describe("RequestBodyContext native Anthropic tool finalization", () => {
+	const advisorBody = {
+		model: "original-model",
+		tools: [{ type: "advisor_20260301", name: "advisor", model: "x" }],
+		messages: [{ role: "user", content: "hi" }],
+	};
+
+	test("records the advisor requirement from the post-rewrite body", () => {
+		const context = new RequestBodyContext(
+			encodeBody({ model: "original-model", messages: [] }),
+		);
+		context.mutateParsedJson((body) => {
+			body.tools = advisorBody.tools;
+		});
+		context.setModel("rewritten-model");
+
+		const requirement = context.finalizeNativeAnthropicToolRequirement();
+
+		expect(requirement).toEqual({
+			declaredToolTypes: ["advisor_20260301"],
+			unknownDeclaredTypes: [],
+			hasHistory: false,
+		});
+		expect(context.finalizeNativeAnthropicToolRequirement()).toBe(requirement);
+	});
+
+	test("returns undefined without advisor content", () => {
+		const context = new RequestBodyContext(
+			encodeBody({ model: "m", messages: [] }),
+		);
+		expect(context.finalizeNativeAnthropicToolRequirement()).toBeUndefined();
+	});
+
+	test("rejects mutation after the native requirement is finalized", () => {
+		const context = new RequestBodyContext(encodeBody(advisorBody));
+		context.finalizeNativeAnthropicToolRequirement();
+		expect(() => context.setModel("late")).toThrow(/finalized/);
+		expect(() => context.mutateParsedJson(() => undefined)).toThrow(
+			/finalized/,
+		);
+	});
+
+	test("keeps advisor out of the helper preview", () => {
+		const context = new RequestBodyContext(encodeBody(advisorBody));
+		expect(context.previewServerToolRequirements()).toBeUndefined();
+		const hosted = new RequestBodyContext(
+			encodeBody({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+		);
+		expect(hosted.previewServerToolRequirements()).toBeDefined();
 	});
 });

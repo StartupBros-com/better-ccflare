@@ -1,5 +1,11 @@
-import { deriveServerToolRequirement } from "@better-ccflare/providers/server-tool-capabilities";
-import type { ServerToolRequirements } from "@better-ccflare/types";
+import {
+	deriveNativeAnthropicToolRequirement,
+	deriveServerToolRequirement,
+} from "@better-ccflare/providers/server-tool-capabilities";
+import type {
+	NativeAnthropicToolRequirement,
+	ServerToolRequirements,
+} from "@better-ccflare/types";
 
 export type RequestJsonBody = Record<string, unknown>;
 
@@ -25,6 +31,10 @@ export class RequestBodyContext {
 	private dirty = false;
 	private serverToolRequirementsFinalized = false;
 	private serverToolRequirements: ServerToolRequirements | undefined;
+	private nativeAnthropicToolRequirementDerived = false;
+	private nativeAnthropicToolRequirement:
+		| NativeAnthropicToolRequirement
+		| undefined;
 
 	private assertServerToolRequirementsMutable(): void {
 		if (this.serverToolRequirementsFinalized) {
@@ -124,6 +134,26 @@ export class RequestBodyContext {
 		});
 		this.serverToolRequirementsFinalized = true;
 		return this.serverToolRequirements;
+	}
+
+	/**
+	 * Derive the native-Anthropic passthrough requirement (advisor) from the final
+	 * parsed body. Shares the server-tool finalization latch, so the body cannot
+	 * change between this derivation and the hosted-tool one.
+	 */
+	finalizeNativeAnthropicToolRequirement():
+		| NativeAnthropicToolRequirement
+		| undefined {
+		// Finalizing first freezes the inspected layers, so this read-only pass
+		// sees exactly the body that ships. Kept separate from the hosted
+		// derivation so that one stays a single traversal.
+		this.finalizeServerToolRequirements();
+		if (!this.nativeAnthropicToolRequirementDerived) {
+			this.nativeAnthropicToolRequirement =
+				deriveNativeAnthropicToolRequirement(this.getParsedJson());
+			this.nativeAnthropicToolRequirementDerived = true;
+		}
+		return this.nativeAnthropicToolRequirement;
 	}
 
 	setModel(model: string): boolean {
