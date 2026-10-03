@@ -84,7 +84,7 @@ let nextNativeEvidenceGeneration = 0;
  */
 const pendingNativeAcquisitions = new Map<
 	string,
-	{ generation: number; settled: Promise<void> }
+	{ generation: number; settled: Promise<void>; wake: () => void }
 >();
 
 /** Thrown when a newer lookup for the same account superseded this one. */
@@ -176,6 +176,12 @@ export function clearNativeAutoCatalogEvidence(accountId: string): void {
 	nativeOwnerEpoch.set(accountId, (nativeOwnerEpoch.get(accountId) ?? 0) + 1);
 	nativeCredentialFingerprint.delete(accountId);
 	nativeEvidenceGeneration.set(accountId, ++nextNativeEvidenceGeneration);
+	// The fenced lookup can never publish for the new incarnation, so release
+	// its waiters now instead of letting them spend their budget on it. The old
+	// worker's generation fence is unchanged; its later release() is a no-op.
+	const pending = pendingNativeAcquisitions.get(accountId);
+	pendingNativeAcquisitions.delete(accountId);
+	pending?.wake();
 }
 
 function nativeEntry(
@@ -472,7 +478,11 @@ async function fetchLiveModelsUntilAborted(
 			(pendingNativeAcquisitions.get(accountId)?.generation ?? 0) > generation
 		)
 			return;
-		pendingNativeAcquisitions.set(accountId, { generation, settled });
+		pendingNativeAcquisitions.set(accountId, {
+			generation,
+			settled,
+			wake: settle,
+		});
 		registered.add(accountId);
 	};
 	if (options.accountId) register(options.accountId);

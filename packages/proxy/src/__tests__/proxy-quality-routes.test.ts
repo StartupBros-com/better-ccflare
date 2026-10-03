@@ -406,6 +406,55 @@ describe("cold native catalog acquisition", () => {
 		]);
 	});
 
+	it("cold Auto after an account replacement does not wait out the fenced lookup stuck in an uncancellable await", async () => {
+		const getAccount = ctx.dbOps.getAccount;
+		let holdFirst = true;
+		let release!: () => void;
+		const releasePromise = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		ctx.dbOps.getAccount = async (id: string) => {
+			if (id === "a" && holdFirst) {
+				holdFirst = false;
+				await releasePromise;
+			}
+			return getAccount(id);
+		};
+		const catalogs: string[] = [];
+		const transport = globalThis.fetch;
+		globalThis.fetch = Object.assign(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const req = input instanceof Request ? input : new Request(input, init);
+				if (req.method === "GET")
+					catalogs.push(req.headers.get("x-api-key") ?? "");
+				return transport(input, init);
+			},
+			{ preconnect: () => {} },
+		) as typeof fetch;
+		// The old incarnation's lookup wedges in getAccount, before any fetch.
+		const old = fetchLiveModels(ctx, { accountId: "a" });
+		const oldOutcome = old.then(
+			() => null,
+			(error) => error,
+		);
+		expect(holdFirst).toBe(false);
+		// Account "a" is replaced while the old lookup is still stuck.
+		clearNativeAutoCatalogEvidence("a");
+		const startedAt = performance.now();
+		const response = await send();
+		expect(response.status).toBe(200);
+		await response.text();
+		await flush();
+		// Prompt: far below the lookup's own deadline, with the old await still held.
+		expect(performance.now() - startedAt).toBeLessThan(3_000);
+		expect(catalogs).toContain("synthetic-a");
+		expect(sends).toEqual([
+			{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+		]);
+		release();
+		await oldOutcome;
+	});
+
 	it.each([
 		"credential rotation",
 		"account replacement",

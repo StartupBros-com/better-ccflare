@@ -691,6 +691,40 @@ describe("model-catalog", () => {
 			expect(settled).toBe(true);
 		});
 
+		it("clearing an account releases waiters on its fenced in-flight lookup", async () => {
+			const account = makeAccount();
+			const lookup = deferred<Account | null>();
+			const ctx = makeCtx([account]);
+			// Uncancellable await, like a wedged DB read.
+			ctx.dbOps.getAccount = () => lookup.promise;
+			global.fetch = mock(async () =>
+				Response.json({ data: [{ id: "claude-opus-5-5" }], has_more: false }),
+			) as unknown as typeof fetch;
+			const pending = fetchLiveModels(ctx, { accountId: account.id });
+			const outcome = pending.then(
+				() => null,
+				(error) => error,
+			);
+			const signal = getPendingNativeCatalogAcquisition(account.id);
+			expect(signal).toBeInstanceOf(Promise);
+			let settled = false;
+			void signal?.then(() => {
+				settled = true;
+			});
+			clearNativeAutoCatalogEvidence(account.id);
+			// Bounded by a few microtask turns, not a timer.
+			for (let turn = 0; turn < 5; turn++) await Promise.resolve();
+			expect(settled).toBe(true);
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+			// The fenced worker still publishes nothing and leaves no entry.
+			lookup.resolve(account);
+			expect(await outcome).toBeInstanceOf(
+				NativeCatalogObsoleteGenerationError,
+			);
+			expect(getNativeAutoCatalogEvidence(account.id)).toBeNull();
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+		});
+
 		it("does not register a pending acquisition after the signal aborts", async () => {
 			const account = makeAccount();
 			const ctx = makeCtx([account]);
