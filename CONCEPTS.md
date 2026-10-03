@@ -150,6 +150,21 @@ are refused once a plan window reads full even while the provider still reports 
 allowed: the provider's allowed flag can lag its usage percentage, and the request that
 crosses the line is billed to credits.
 
+### First-party Anthropic account
+
+An account with provider `anthropic` whose endpoint is the default or exactly
+`https://api.anthropic.com`. Gateways that speak the Anthropic wire format, such as
+`anthropic-compatible` accounts or `anthropic` accounts with a custom endpoint, are not
+first-party, even when they relay to Anthropic.
+
+### Native passthrough tool
+
+A typed Anthropic server tool, currently only Claude Code's advisor, that the proxy neither
+executes nor proves. Its declaration and history are forwarded unchanged to a first-party
+Anthropic account. Where no such account would serve, the request is refused with text the
+client recognizes as "drop this tool and retry", never stripped silently. It is distinct from a
+hosted server tool such as WebSearch, which a provider route serves under an exact reviewed proof.
+
 ## Usage measurement
 
 ### Cache parity
