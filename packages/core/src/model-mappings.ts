@@ -522,6 +522,28 @@ export function getEndpointUrl(account: Account): string | null {
 }
 
 /**
+ * True only for an Anthropic account whose resolved endpoint is the
+ * first-party API (https://api.anthropic.com, no port or credentials).
+ * OAuth and API-key accounts both qualify. Fails closed on unparsable URLs.
+ */
+export function isFirstPartyAnthropicAccount(account: Account): boolean {
+	if (account.provider !== "anthropic") return false;
+	const endpoint = getEndpointUrl(account) ?? "https://api.anthropic.com";
+	try {
+		const url = new URL(endpoint);
+		return (
+			url.protocol === "https:" &&
+			url.hostname === "api.anthropic.com" &&
+			!url.port &&
+			!url.username &&
+			!url.password
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
  * A typed result for compatible-endpoint resolution.
  * Either the endpoint is available, or the account is unavailable with a reason.
  */

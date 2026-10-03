@@ -14,6 +14,7 @@ import {
 	getStrictClaudeModelFamily,
 	hasForcedToolChoice,
 	isFamilyAliasModel,
+	isFirstPartyAnthropicAccount,
 	isValidClaudeModel,
 	isWellFormedConcreteClaudeModelId,
 	LATEST_FABLE_MODEL,
@@ -1093,5 +1094,90 @@ describe("Vercel AI Gateway catch-all recipe (U4)", () => {
 		expect(getEndpointUrl(vercelAccount)).toBe(
 			"https://ai-gateway.vercel.sh/v1",
 		);
+	});
+});
+
+describe("isFirstPartyAnthropicAccount", () => {
+	const base = {
+		id: "t",
+		name: "t",
+		provider: "anthropic",
+		refresh_token: "",
+		access_token: null,
+		expires_at: null,
+		api_key: null,
+		custom_endpoint: null,
+	} as unknown as Account;
+	const make = (over: Partial<Account>): Account =>
+		({ ...base, ...over }) as Account;
+
+	test("anthropic OAuth with no endpoint", () => {
+		expect(isFirstPartyAnthropicAccount(make({}))).toBe(true);
+	});
+	test("anthropic API key with no endpoint", () => {
+		expect(isFirstPartyAnthropicAccount(make({ api_key: "sk-x" }))).toBe(true);
+	});
+	test("custom endpoint https://api.anthropic.com", () => {
+		expect(
+			isFirstPartyAnthropicAccount(
+				make({ custom_endpoint: "https://api.anthropic.com" }),
+			),
+		).toBe(true);
+		expect(
+			isFirstPartyAnthropicAccount(
+				make({ custom_endpoint: "https://api.anthropic.com/v1" }),
+			),
+		).toBe(true);
+	});
+	test("legacy JSON endpoint form", () => {
+		expect(
+			isFirstPartyAnthropicAccount(
+				make({
+					custom_endpoint: JSON.stringify({
+						endpoint: "https://api.anthropic.com",
+					}),
+				}),
+			),
+		).toBe(true);
+		expect(
+			isFirstPartyAnthropicAccount(
+				make({
+					custom_endpoint: JSON.stringify({
+						endpoint: "https://gateway.example.com",
+					}),
+				}),
+			),
+		).toBe(false);
+	});
+	test("non-native endpoints", () => {
+		for (const ep of [
+			"https://gateway.example.com",
+			"http://api.anthropic.com",
+			"https://api.anthropic.com:8443",
+			"https://user:pw@api.anthropic.com",
+			"https://api.anthropic.com.evil.test",
+			"https://user@api.anthropic.com",
+			"http://192.168.1.50:8080",
+			"not a url",
+		]) {
+			expect(isFirstPartyAnthropicAccount(make({ custom_endpoint: ep }))).toBe(
+				false,
+			);
+		}
+	});
+	test("other providers", () => {
+		for (const provider of [
+			"anthropic-compatible",
+			"codex",
+			"xai",
+			"openai-compatible",
+		]) {
+			expect(isFirstPartyAnthropicAccount(make({ provider }))).toBe(false);
+			expect(
+				isFirstPartyAnthropicAccount(
+					make({ provider, custom_endpoint: "https://api.anthropic.com" }),
+				),
+			).toBe(false);
+		}
 	});
 });

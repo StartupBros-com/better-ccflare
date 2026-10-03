@@ -59,6 +59,21 @@ export interface ServerToolRequirements {
 	readonly replay: ServerToolReplayRequirement;
 }
 
+/**
+ * Routing requirement for tools that only a first-party Anthropic account can
+ * serve natively (for example the advisor tool). Unlike ServerToolRequirements
+ * the proxy never executes these tools; it only needs to route the request to
+ * an account that can pass them through.
+ */
+export interface NativeAnthropicToolRequirement {
+	/** Declared tool types the proxy knows how to route (advisor_20260301). */
+	readonly declaredToolTypes: readonly string[];
+	/** Declared `advisor_*` types the proxy does not recognise (refused, R9). */
+	readonly unknownDeclaredTypes: readonly string[];
+	/** Advisor blocks appear in message history; fails closed when truncated. */
+	readonly hasHistory: boolean;
+}
+
 /** Exact candidate and transport contract to which one proof applies. */
 export interface ServerToolCapabilityTuple {
 	readonly candidateId: string;
