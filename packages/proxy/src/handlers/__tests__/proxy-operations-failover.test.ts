@@ -8,6 +8,7 @@ import {
 	spyOn,
 } from "bun:test";
 import type { CacheFlightCohortSealReceipt } from "@better-ccflare/core";
+import { Logger } from "@better-ccflare/logger";
 import type {
 	Provider,
 	ProviderAttemptPlan,
@@ -1285,6 +1286,68 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 		expect(transformCalls).toBe(0);
 		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
 		expect(ctx.asyncWriter.enqueue).toHaveBeenCalledTimes(0);
+	});
+
+	it("rejects a non-first-party account for an advisor request before refresh, transform or fetch", async () => {
+		const account = makeAccount({
+			id: "codex-acc",
+			name: "codex-acc",
+			provider: "codex",
+			custom_endpoint: null,
+			model_mappings: null,
+			access_token: "codex-token",
+			expires_at: Date.now() + 60 * 60_000,
+		});
+		const meta = makeRequestMeta({
+			nativeAnthropicToolRequirement: {
+				declaredToolTypes: ["advisor_20260301"],
+				unknownDeclaredTypes: [],
+				hasHistory: false,
+			},
+		});
+		const bodyBuffer = makeRequestBody("claude-sonnet-4-5");
+		const ctx = makeProxyContext();
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ unexpected: true }, 200),
+		);
+		const errors = spyOn(Logger.prototype, "error").mockImplementation(
+			() => {},
+		);
+
+		let caught: unknown;
+		try {
+			await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				meta,
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				undefined,
+				{ routeCandidateId: "account:codex-acc" },
+			);
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(caught).toBeInstanceOf(ServerToolCandidateCapabilityError);
+		expect((caught as ServerToolCandidateCapabilityError).reason).toBe(
+			"provider_unavailable",
+		);
+		expect((caught as ServerToolCandidateCapabilityError).accountId).toBe(
+			"codex-acc",
+		);
+		expect(errors).toHaveBeenCalled();
+		errors.mockRestore();
 	});
 
 	it("terminates a hosted request before any physical-model fallback can plan or send", async () => {
