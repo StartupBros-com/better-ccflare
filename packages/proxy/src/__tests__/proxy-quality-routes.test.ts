@@ -1803,6 +1803,25 @@ it("explicit native frontier child is not downgraded to standard", async () => {
 			?.home?.target.physicalModel,
 	).toBe("claude-fable-5-1");
 });
+it("child sending an unknown quality id is rejected before worker routing", async () => {
+	await (await send()).text();
+	await flush();
+	const response = await send(
+		request("claude-bccf-quality-unknown", {
+			"x-claude-code-agent-id": "unknown-picker-child",
+		}),
+	);
+	expect(response.status).toBe(400);
+	expect(await response.json()).toMatchObject({
+		error: { reason: "unknown-or-disabled-quality-id" },
+	});
+	expect(sends).toHaveLength(1);
+	expect(
+		(await service.status(scope))?.conversations.filter(
+			(c) => c.key !== "$root",
+		),
+	).toEqual([]);
+});
 it.each([
 	["larger than analytics", 300 * 1024, "", true],
 	["exact analytics boundary", 256 * 1024, "", true],
