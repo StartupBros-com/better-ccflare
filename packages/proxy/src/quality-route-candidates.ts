@@ -53,6 +53,7 @@ import { RoutingAttemptLedger } from "./handlers/routing-attempt-ledger";
 import { evaluateAutoCapacity } from "./handlers/usage-throttling";
 import { getNativeAutoCatalogEvidence } from "./model-catalog";
 import { opaqueRuntimeId } from "./opaque-runtime-id";
+import { prepareNativeQualityCatalogs } from "./quality-route-catalog-preparation";
 import type { RequestBodyContext } from "./request-body-context";
 import { recordRoutingTerminalRequest } from "./routing-terminal-recorder";
 import { bindRequestPrivateServerToolReplay } from "./server-tool-replay-runtime";
@@ -300,11 +301,9 @@ function workerRole(
 	policy: QualityRoutingPolicy,
 ): QualityWorkerRole | null {
 	if (!model) return null;
-	if (model === `${QUALITY_MODEL_PREFIX}astra`) return "astra";
-	if (model.startsWith(QUALITY_MODEL_PREFIX))
-		return ["fable", "opus"].includes(model.slice(QUALITY_MODEL_PREFIX.length))
-			? (model.slice(QUALITY_MODEL_PREFIX.length) as QualityWorkerRole)
-			: null;
+	// A picker id on a worker is the copied main-agent preference, not a role
+	// request: workers stay standard instead of inheriting the parent's tier.
+	if (model.startsWith(QUALITY_MODEL_PREFIX)) return "standard";
 	for (const assignment of policy.assignments) {
 		if (
 			policy.accounts.some(
@@ -377,7 +376,8 @@ function replacementFor(
 		: null;
 }
 /** Returns null only for untouched ordinary routing. Local policy/state failures never
- * fall back to the legacy selector. No network stack exists in this controller. */
+ * fall back to the legacy selector. Native discovery is bounded request preparation;
+ * inference still uses the existing provider-attempt machinery. */
 export async function routeQualityRequest(input: {
 	req: Request;
 	url: URL;
@@ -498,7 +498,22 @@ export async function routeQualityRequest(input: {
 		}
 		const requirements =
 			input.requirements ?? captureAutoRequestRequirements(input.originalBody);
-		const accounts = await ctx.dbOps.getAllAccounts();
+		let accounts = await ctx.dbOps.getAllAccounts();
+		// Only an authenticated, accepted Auto request reaches this permission
+		// boundary. Discovery/control/manual routes never authorize OAuth lookups.
+		if (process.env.BETTER_CCFLARE_MODELS_OFFLINE !== "1") {
+			await prepareNativeQualityCatalogs(ctx, policy, intent, accounts, {
+				signal: req.signal,
+				allowOAuth: true,
+				conversation,
+			});
+			accounts = await ctx.dbOps.getAllAccounts();
+		}
+		if (req.signal.aborted) return unavailable("request-aborted");
+		if (ctx.config.getQualityRoutingPolicy?.()?.revision !== policy.revision)
+			return unavailable("changed-admission");
+		// Lease acquisition and the final dispatch guard still fence accepted
+		// intent, account incarnation, credentials and policy after these awaits.
 		const compilation = compileQualityCandidates(
 			policy,
 			intent,
