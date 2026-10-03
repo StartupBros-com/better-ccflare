@@ -18,6 +18,7 @@ import {
 	createAccountAutoPauseOnOverageHandler,
 	createAccountAutoRefreshHandler,
 	createAccountBillingTypeHandler,
+	createAccountCodexCreditDrainHandler,
 	createAccountCustomEndpointUpdateHandler,
 	createAccountForceResetRateLimitHandler,
 	createAccountModelFallbacksUpdateHandler,
@@ -833,6 +834,16 @@ export class APIRouter {
 					createAccountAutoPauseOnOverageHandler(this.context.dbOps);
 				return await this.wrapHandler((req) =>
 					autoPauseOnOverageHandler(req, accountId),
+				)(req, url);
+			}
+
+			// Account Codex credit-drain toggle (Codex accounts only)
+			if (path.endsWith("/codex-credit-drain") && method === "POST") {
+				const codexCreditDrainHandler = createAccountCodexCreditDrainHandler(
+					this.context.dbOps,
+				);
+				return await this.wrapHandler((req) =>
+					codexCreditDrainHandler(req, accountId),
 				)(req, url);
 			}
 

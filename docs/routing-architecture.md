@@ -331,6 +331,47 @@ flowchart TD
 
 *Source: this fork implements the filter inline rather than in upstream's standalone `model-capacity.ts` module — see `packages/proxy/src/handlers/account-selector.ts` (`getReactiveModelCapacityBlocker`, the hard-capacity exclusion path), `packages/proxy/src/handlers/usage-throttling.ts` (`evaluateHardCapacity`), `packages/proxy/src/handlers/routing-terminal.ts` (the `model_pool_exhausted` terminal outcome), and `packages/proxy/src/handlers/proxy-operations.ts` (the `out_of_credits` 429 handler that feeds the reactive cache — distinct from the unrelated `all_models_exhausted_429` per-account cooldown reason used when an account's own configured model-fallback list is exhausted`).*
 
+## Per-account Codex credit drain
+
+`codex_credit_drain_enabled` (default off, "keep") lets an operator mark a Codex
+account to keep serving after its `five_hour` / `seven_day` subscription window
+reaches 100%, so OpenAI bills the overflow to purchased credits. It is opt-in per
+account because it spends money.
+
+**What it relaxes.** When `isCodexCreditDrainActive` is true, `evaluateHardCapacity`
+stops excluding the account for spent `session` and `weekly_all` windows
+(`creditDrainActive`, honored only for provider `codex`). It is resolved in the
+ordinary, capability/route-profile, forced-account and combo candidate paths
+(`evaluateCandidateCapacity`) and in the managed-routing preview
+(`isLogicalModelExhausted`), so previews match runtime. Predictive pacing
+(`getAccountUsageThrottleUntil`, which resolves drain itself) skips windows at
+>= 100% but still paces windows with headroom.
+
+**Evidence.** Drain is active only with fresh, poll-verified credit evidence:
+`hasCredits === true || unlimited === true` from the source-owned usage poll.
+`balance` is display-only and never counts; `rate_limit.allowed` /
+`limit_reached` are never consulted. The evidence lives in a side map in
+`UsageCache`, written only when a real poll binds an owned observation, so
+passive response-header writes, `usageCache.set` and manual refresh can neither
+create nor clear it. It expires after the capacity snapshot freshness window
+(3 minutes), and is dropped on `delete`, `stopPolling` and `clear`. Missing or
+stale evidence means the account is treated exactly like a "keep" account.
+Drain therefore needs owned usage polls at most 3 minutes apart. The default
+90-second poll interval (`USAGE_POLL_INTERVAL_MS` / `usage_poll_interval_ms`)
+qualifies. A longer interval makes drain intermittent. Selection stays
+consistent, because the hard-capacity snapshot goes stale on the same clock and
+fails open. Pacing has no freshness bound, so it resumes pacing spent windows
+once the evidence expires. Both cases fail closed: no credits are spent without
+fresh evidence.
+
+**What it does not change.** Auto/quality routes (`evaluateAutoCapacity`) still
+reject spent subscription windows, `weekly_scoped` family exclusions are
+unchanged, and internal probes never ride drain: `evaluateCandidateCapacity`
+skips the relaxation for keepalive (`syntheticProbe`) and authenticated
+auto-refresh requests, so a probe to a spent opted-in account still fails closed
+with `account_capacity_exhausted` instead of spending credits. When credits run out, the next upstream 429 benches the account through
+the normal reactive rate-limit path.
+
 ## Durable Auto quality routing
 
 This opt-in path is separate from legacy strategy selection and the fail-open manual model-capacity filter above. No policy means no Auto enrollment or discovery entries. Enabled semantic choices are `claude-bccf-quality-auto`, `claude-bccf-quality-fable`, `claude-bccf-quality-astra`, and `claude-bccf-quality-opus`; they are intent IDs, never physical upstream model names. Main Auto starts on Fable → Astra → Opus. An explicit main preference starts on that suffix. Standard and lightweight children use their own approved lanes and independent homes, including while a root response streams. A child that sends a quality intent ID (normally because it inherited the main session's picker choice) is routed as a standard worker, so a main preference never upgrades workers; a child gets a higher-tier or lightweight role by naming that model (for example `claude-opus-5-5` or `claude-haiku-4-5`), or the physical model ID of an enrolled line such as Astra. A trusted request-only child without a stable conversation key does not acquire a guessed durable home. Each discovery entry carries a generated one-line `description` of its flow: the ladder's enrolled lines in assignment-priority order (for example `Fable → Astra → Opus → Sol`), then error, the sticky last working home, and whether spend grants allow paid use or only the subscription. It describes enrollment, not live availability: a listed step is still skipped on a request when its account is missing or unavailable, lacks current catalog evidence, or fails capacity admission. Auto and Fable-preferred read identically because they behave identically.

@@ -269,6 +269,9 @@ function classifyQuotaExhaustion(
 	account: AccountResponse,
 ): { reason: ExcludedReason; resetMs: number | null } | null {
 	if (!account.usageData) return null;
+	// A Codex account that is actively draining purchased credits keeps
+	// serving past 100% of its plan windows, so it is not exhausted.
+	if (account.codexCreditDrainActive) return null;
 
 	const fiveHour = extractFiveHour(account.usageData);
 	if (fiveHour?.pct != null && fiveHour.pct >= 100) {

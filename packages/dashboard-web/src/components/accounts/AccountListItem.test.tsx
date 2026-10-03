@@ -15,7 +15,7 @@ import type { FullUsageData } from "@better-ccflare/types";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Account } from "../../api";
 import { AccountList } from "./AccountList";
-import { AccountListItem } from "./AccountListItem";
+import { AccountListItem, CodexCreditDrainControl } from "./AccountListItem";
 import { mergeAccountModelMappings } from "./AccountModelMappingsDialog";
 import type { AccountFamilyRoutingState } from "./account-routing";
 
@@ -577,3 +577,108 @@ describe("AccountListItem (binding constraint display)", () => {
 		expect(html).toContain("100%");
 	});
 });
+
+describe("AccountListItem Codex credit drain toggle", () => {
+	function render(
+		account: Account,
+		onCodexCreditDrainToggle?: (a: Account) => void,
+	) {
+		return renderToStaticMarkup(
+			<AccountListItem
+				account={account}
+				{...requiredHandlers}
+				onCodexCreditDrainToggle={onCodexCreditDrainToggle}
+			/>,
+		);
+	}
+
+	it("renders the Drain credits switch for codex rows with the spend warning", () => {
+		const html = render(makeAccount({ provider: "codex" }), noop);
+		expect(html).toContain("Drain credits:");
+		expect(html).toContain("spends purchased credits");
+	});
+
+	it("does not render for non-codex rows or without a handler", () => {
+		expect(render(makeAccount({ provider: "anthropic" }), noop)).not.toContain(
+			"Drain credits:",
+		);
+		expect(render(makeAccount({ provider: "codex" }))).not.toContain(
+			"Drain credits:",
+		);
+	});
+
+	it("reflects codexCreditDrainEnabled", () => {
+		const on = render(
+			makeAccount({ provider: "codex", codexCreditDrainEnabled: true }),
+			noop,
+		);
+		const off = render(makeAccount({ provider: "codex" }), noop);
+		const drainSwitch = (html: string) =>
+			html.slice(html.indexOf("Drain credits:"));
+		expect(drainSwitch(on)).toContain('aria-checked="true"');
+		expect(drainSwitch(off)).not.toContain('aria-checked="true"');
+	});
+
+	it("calls the handler with the account when toggled", () => {
+		const account = makeAccount({ provider: "codex" });
+		const calls: Account[] = [];
+		const el = CodexCreditDrainControl({
+			account,
+			onToggle: (a: Account) => calls.push(a),
+		});
+		const found = findSwitch(el);
+		expect(found).not.toBeNull();
+		found?.onCheckedChange?.(true);
+		expect(calls).toEqual([account]);
+	});
+
+	it("shows the on-credits indicator only when drain is serving from credits", () => {
+		const serving = render(
+			makeAccount({
+				provider: "codex",
+				codexCreditDrainEnabled: true,
+				codexCreditDrainActive: true,
+				codexCreditDrainServing: true,
+			}),
+			noop,
+		);
+		const armedOnly = render(
+			makeAccount({
+				provider: "codex",
+				codexCreditDrainEnabled: true,
+				codexCreditDrainActive: true,
+				codexCreditDrainServing: false,
+			}),
+			noop,
+		);
+		const inactive = render(
+			makeAccount({ provider: "codex", codexCreditDrainEnabled: true }),
+			noop,
+		);
+		expect(serving).toContain("on credits");
+		expect(armedOnly).not.toContain("on credits");
+		expect(inactive).not.toContain("on credits");
+	});
+});
+
+type SwitchProps = { onCheckedChange?: (v: boolean) => void };
+function findSwitch(node: unknown): SwitchProps | null {
+	if (!node || typeof node !== "object") return null;
+	if (Array.isArray(node)) {
+		for (const n of node) {
+			const r = findSwitch(n);
+			if (r) return r;
+		}
+		return null;
+	}
+	const props = (node as { props?: Record<string, unknown> }).props;
+	if (!props) return null;
+	if (
+		typeof props.title === "string" &&
+		props.title.includes("purchased credits") &&
+		typeof props.onCheckedChange === "function"
+	) {
+		return props as SwitchProps;
+	}
+	return findSwitch(props.children);
+}

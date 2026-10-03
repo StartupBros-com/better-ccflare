@@ -1591,3 +1591,42 @@ describe("scoped exhaustion requires a FUTURE reset (backend parity)", () => {
 		]);
 	});
 });
+
+describe("computePoolUsage with Codex credit drain", () => {
+	const spent = {
+		five_hour: { utilization: 100, resets_at: null },
+		seven_day: { utilization: 100, resets_at: null },
+	} as never;
+
+	it("does not count a draining account as exhausted", () => {
+		const accounts = [
+			mkAccount({
+				name: "codex-drain",
+				provider: "codex",
+				usageData: spent,
+				codexCreditDrainEnabled: true,
+				codexCreditDrainActive: true,
+			}),
+		];
+		for (const window of ["five_hour", "seven_day"] as const) {
+			const result = computePoolUsage(accounts, window, NOW);
+			expect(result.exhausted).toEqual([]);
+		}
+	});
+
+	it("still counts the same account as exhausted when drain is not active", () => {
+		const accounts = [
+			mkAccount({
+				name: "codex-drain",
+				provider: "codex",
+				usageData: spent,
+				codexCreditDrainEnabled: true,
+				codexCreditDrainActive: false,
+			}),
+		];
+		const five = computePoolUsage(accounts, "five_hour", NOW);
+		expect(five.exhausted).toHaveLength(1);
+		const seven = computePoolUsage(accounts, "seven_day", NOW);
+		expect(seven.exhausted).toHaveLength(1);
+	});
+});

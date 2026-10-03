@@ -104,12 +104,44 @@ interface AccountListItemProps {
 	onAutoRefreshToggle: (account: Account) => void;
 	onBillingTypeToggle: (account: Account) => void;
 	onAutoPauseOnOverageToggle?: (account: Account) => void;
+	onCodexCreditDrainToggle?: (account: Account) => void;
 	onPeakHoursPauseToggle?: (account: Account) => void;
 	onCustomEndpointChange?: (account: Account) => void;
 	onModelMappingsChange?: (account: Account) => void;
 	onReauth?: (account: Account) => void;
 	onAnthropicReauth?: (account: Account) => void;
 	onCodexReauth?: (account: Account) => void;
+}
+
+/**
+ * Per-account Codex credit drain switch. Hook-free so tests can call it
+ * directly and inspect the Switch props.
+ */
+export function CodexCreditDrainControl({
+	account,
+	onToggle,
+}: {
+	account: Account;
+	onToggle: (account: Account) => void;
+}) {
+	return (
+		<div className="flex items-center gap-2">
+			<span className="text-xs text-muted-foreground">Drain credits:</span>
+			<Switch
+				checked={account.codexCreditDrainEnabled ?? false}
+				onCheckedChange={() => onToggle(account)}
+				title="Lets ccflare keep routing to this account after its plan window is spent, which spends purchased credits. Applies only while fresh usage data confirms credits are available."
+			/>
+			{account.codexCreditDrainServing && (
+				<span
+					className="text-xs font-medium text-amber-600"
+					title="Plan window is spent; requests are being served from purchased credits"
+				>
+					on credits
+				</span>
+			)}
+		</div>
+	);
 }
 
 export function AccountListItem({
@@ -126,6 +158,7 @@ export function AccountListItem({
 	onAutoRefreshToggle,
 	onBillingTypeToggle,
 	onAutoPauseOnOverageToggle,
+	onCodexCreditDrainToggle,
 	onPeakHoursPauseToggle,
 	onCustomEndpointChange,
 	onModelMappingsChange,
@@ -273,6 +306,12 @@ export function AccountListItem({
 										/>
 									</div>
 								)}
+							{account.provider === "codex" && onCodexCreditDrainToggle && (
+								<CodexCreditDrainControl
+									account={account}
+									onToggle={onCodexCreditDrainToggle}
+								/>
+							)}
 							{account.provider === "zai" && onPeakHoursPauseToggle && (
 								<div className="flex items-center gap-2">
 									<span className="text-xs text-muted-foreground">

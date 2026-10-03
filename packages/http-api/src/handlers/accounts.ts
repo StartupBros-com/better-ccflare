@@ -51,6 +51,7 @@ import {
 	refreshCodexUsageForAccount,
 	restartUsagePollingForAccount,
 } from "@better-ccflare/proxy";
+import { isCodexCreditDrainActive } from "@better-ccflare/proxy/usage-throttling";
 import type {
 	Account,
 	AnthropicUsageData,
@@ -64,6 +65,7 @@ import { accountCreatedResponse } from "../utils/account-created-response";
 import {
 	computeRateLimitStatusDisplay,
 	getRepresentativeUsageResetMs,
+	isUsageExhausted,
 } from "./rate-limit-status";
 
 const log = new Logger("AccountsHandler");
@@ -337,6 +339,7 @@ export function createAccountsListHandler(
 			auto_refresh_enabled: 0 | 1;
 			auto_pause_on_overage_enabled: 0 | 1;
 			peak_hours_pause_enabled: 0 | 1;
+			codex_credit_drain_enabled: 0 | 1;
 			custom_endpoint: string | null;
 			model_mappings: string | null;
 			cross_region_mode: string | null;
@@ -371,6 +374,7 @@ export function createAccountsListHandler(
 					custom_endpoint,
 					COALESCE(auto_pause_on_overage_enabled, 0) as auto_pause_on_overage_enabled,
 					COALESCE(peak_hours_pause_enabled, 0) as peak_hours_pause_enabled,
+					COALESCE(codex_credit_drain_enabled, 0) as codex_credit_drain_enabled,
 
 					model_mappings,
 					cross_region_mode,
@@ -610,6 +614,17 @@ export function createAccountsListHandler(
 					}
 				}
 
+				// Resolved once per row and reused by the throttle display and the
+				// status label so both agree with routing.
+				const creditDrainActive = isCodexCreditDrainActive(
+					{
+						id: account.id,
+						provider: account.provider ?? "",
+						codex_credit_drain_enabled:
+							account.codex_credit_drain_enabled === 1,
+					},
+					now,
+				);
 				const usageThrottleSettings = {
 					fiveHourEnabled: config.getUsageThrottlingFiveHourEnabled(),
 					weeklyEnabled: config.getUsageThrottlingWeeklyEnabled(),
@@ -625,7 +640,7 @@ export function createAccountsListHandler(
 						now,
 						// Display path: surface ALL per-model caps (m3 amber highlight);
 						// routing-side model matching happens in proxy.ts only.
-						{ scopedMode: "all" },
+						{ scopedMode: "all", creditDrainActive },
 					);
 					usageThrottledUntil = usageThrottleStatus.throttleUntil;
 					usageThrottledWindows = usageThrottleStatus.throttledWindows;
@@ -634,6 +649,24 @@ export function createAccountsListHandler(
 				// Computed after usage resolution so an exhausted usage window can
 				// outrank stale header snapshots and the bare "OK" default
 				// (incident 2026-07-09: 100% weekly utilization displayed as "OK").
+				const representativeUtilization =
+					getRepresentativeUtilizationForProvider(
+						// FullUsageData is the http-api display shape (nullable
+						// utilization); the provider helpers read the same fields.
+						fullUsageData as AnyUsageData | null,
+						account.provider ?? "anthropic",
+					) ?? usageUtilization;
+				const representativeResetMs = getRepresentativeUsageResetMs(
+					fullUsageData,
+					account.provider ?? "anthropic",
+				);
+				const creditDrainServing =
+					creditDrainActive &&
+					isUsageExhausted(
+						representativeUtilization,
+						representativeResetMs,
+						now,
+					);
 				const rateLimitStatus = computeRateLimitStatusDisplay(
 					{
 						rate_limit_status: account.rate_limit_status ?? null,
@@ -649,21 +682,13 @@ export function createAccountsListHandler(
 						// overage pool is spent would be labelled usage_exhausted
 						// while it happily serves traffic. usageUtilization /
 						// usageWindow below still report the pool for display.
-						usageUtilization:
-							getRepresentativeUtilizationForProvider(
-								// FullUsageData is the http-api display shape (nullable
-								// utilization); the provider helpers read the same fields.
-								fullUsageData as AnyUsageData | null,
-								account.provider ?? "anthropic",
-							) ?? usageUtilization,
+						usageUtilization: representativeUtilization,
 						// Shared provider-aware derivation (same as /health) — a plain
 						// extractUsageResetMs(fullUsageData, usageWindow) silently loses
 						// the zai reset because usageWindow is the display label
 						// ("five_hour"), not the payload key ("tokens_limit").
-						usageResetMs: getRepresentativeUsageResetMs(
-							fullUsageData,
-							account.provider ?? "anthropic",
-						),
+						usageResetMs: representativeResetMs,
+						creditDrainActive,
 					},
 					now,
 				);
@@ -747,6 +772,9 @@ export function createAccountsListHandler(
 					autoPauseOnOverageEnabled:
 						account.auto_pause_on_overage_enabled === 1,
 					peakHoursPauseEnabled: account.peak_hours_pause_enabled === 1,
+					codexCreditDrainEnabled: account.codex_credit_drain_enabled === 1,
+					codexCreditDrainActive: creditDrainActive,
+					codexCreditDrainServing: creditDrainServing,
 					customEndpoint: account.custom_endpoint,
 					modelMappings,
 					usageUtilization,
@@ -2964,6 +2992,65 @@ export function createAccountAutoFallbackHandler(dbOps: DatabaseOperations) {
 				error instanceof Error
 					? error
 					: new Error("Failed to toggle auto-fallback"),
+			);
+		}
+	};
+}
+
+/**
+ * Create a Codex credit-drain toggle handler (Codex accounts only).
+ *
+ * Enabling lets ccflare keep routing to the account after its subscription
+ * window is spent, so OpenAI serves it from purchased credits. Routing only
+ * honors the flag while fresh poll-verified credit evidence exists.
+ */
+export function createAccountCodexCreditDrainHandler(
+	dbOps: DatabaseOperations,
+) {
+	return async (req: Request, accountId: string): Promise<Response> => {
+		try {
+			const body = await req.json();
+
+			const enabled = validateNumber(body.enabled, "enabled", {
+				required: true,
+				allowedValues: [0, 1] as const,
+			});
+
+			if (enabled === undefined) {
+				return errorResponse(BadRequest("Enabled field is required (0 or 1)"));
+			}
+
+			const db = dbOps.getAdapter();
+			const account = await db.get<{ name: string; provider: string }>(
+				"SELECT name, provider FROM accounts WHERE id = ?",
+				[accountId],
+			);
+
+			if (!account) {
+				return errorResponse(NotFound("Account not found"));
+			}
+
+			if (account.provider !== "codex") {
+				return errorResponse(
+					BadRequest("Credit drain is only available for Codex accounts"),
+				);
+			}
+
+			await dbOps.setCodexCreditDrainEnabled(accountId, enabled === 1);
+
+			const action = enabled === 1 ? "enabled" : "disabled";
+
+			return jsonResponse({
+				success: true,
+				message: `Credit drain ${action} for account '${account.name}'`,
+				codexCreditDrainEnabled: enabled === 1,
+			});
+		} catch (error) {
+			log.error("Account codex-credit-drain toggle error:", error);
+			return errorResponse(
+				error instanceof Error
+					? error
+					: new Error("Failed to toggle codex credit drain"),
 			);
 		}
 	};

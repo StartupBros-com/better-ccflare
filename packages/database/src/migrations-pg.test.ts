@@ -266,6 +266,27 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 		expect(pgInventory.tables.get("accounts")?.size ?? 0).toBeGreaterThan(10);
 	});
 
+	it("ports codex_credit_drain_enabled to CREATE TABLE, columnsToAdd, and the dedup MAX", () => {
+		const createBlock = pgSource.slice(
+			pgSource.indexOf("CREATE TABLE IF NOT EXISTS accounts"),
+		);
+		expect(createBlock.slice(0, 4000)).toContain(
+			"codex_credit_drain_enabled INTEGER NOT NULL DEFAULT 0",
+		);
+		expect(pgSource).toContain(
+			"ALTER TABLE accounts ADD COLUMN codex_credit_drain_enabled INTEGER NOT NULL DEFAULT 0",
+		);
+		expect(pgSource).toContain(
+			"codex_credit_drain_enabled = (SELECT MAX(COALESCE(codex_credit_drain_enabled, 0)) FROM accounts",
+		);
+		expect(
+			sqliteInventory.tables.get("accounts")?.has("codex_credit_drain_enabled"),
+		).toBe(true);
+		expect(
+			pgInventory.tables.get("accounts")?.has("codex_credit_drain_enabled"),
+		).toBe(true);
+	});
+
 	it("includes the executed shared cache-health DDL and its real column names", () => {
 		const db = new Database(":memory:");
 		try {

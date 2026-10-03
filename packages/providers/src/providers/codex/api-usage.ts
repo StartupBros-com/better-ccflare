@@ -181,6 +181,28 @@ export function bindCodexUsageObservation(
 	return owned;
 }
 
+/**
+ * Credit evidence carried by an owned observation, read without the currency
+ * check so the cache can capture it at bind time (before the entry is
+ * installed). Returns null for anything that is not a source-owned observation
+ * for this account. Credits are available iff has_credits or unlimited is
+ * exactly true; balance is display-only and never counts.
+ */
+export function readCodexCreditEvidence(
+	owned: unknown,
+	accountId: string,
+): { available: boolean; acquiredAt: number } | null {
+	if (!owned || typeof owned !== "object") return null;
+	const observation = ownedObservations.get(owned);
+	if (!observation || observation.accountId !== accountId) return null;
+	return {
+		available:
+			observation.facts.hasCredits === true ||
+			observation.facts.unlimited === true,
+		acquiredAt: observation.acquiredAt,
+	};
+}
+
 /** Validate private source ownership; the optional token is mandatory at dispatch. */
 export function getCodexSubscriptionFacts(
 	data: unknown,

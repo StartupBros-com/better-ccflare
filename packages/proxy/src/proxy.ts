@@ -26,7 +26,6 @@ import {
 	isOfficialXaiEndpoint,
 	isXaiCacheNativeEnabled,
 	type RequestObservation,
-	usageCache,
 } from "@better-ccflare/providers";
 import type {
 	Account,
@@ -93,9 +92,9 @@ import {
 	ForceRouteUnavailableError,
 	filterRequestCompatibleAccounts,
 	formatRoutingAttemptMessage,
+	getAccountUsageThrottleUntil,
 	getComboSlotInfo,
 	getRoutingCapacityContext,
-	getUsageThrottleUntil,
 	interceptAndModifyRequest,
 	isComboFallbackDisabled,
 	isInternalProbe,
@@ -1486,18 +1485,16 @@ async function handleProxyCoreImpl(
 		account: Account,
 		model: string | null,
 		now: number,
-	): number | null => {
-		const settings = {
-			fiveHourEnabled: ctx.config.getUsageThrottlingFiveHourEnabled(),
-			weeklyEnabled: ctx.config.getUsageThrottlingWeeklyEnabled(),
-		};
-		return settings.fiveHourEnabled || settings.weeklyEnabled
-			? getUsageThrottleUntil(usageCache.get(account.id), settings, now, {
-					requestModel: model,
-					scopedMode: "match",
-				})
-			: null;
-	};
+	): number | null =>
+		getAccountUsageThrottleUntil(
+			account,
+			{
+				fiveHourEnabled: ctx.config.getUsageThrottlingFiveHourEnabled(),
+				weeklyEnabled: ctx.config.getUsageThrottlingWeeklyEnabled(),
+			},
+			now,
+			model,
+		);
 	let implicitAccountSelectionBudgetMs: number | undefined;
 	let implicitRouteAccounts: Account[] | undefined;
 	const codexPhysicalModel = getCodexPassthroughPhysicalModel(

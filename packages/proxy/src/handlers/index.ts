@@ -118,7 +118,9 @@ export {
 export {
 	type BindingConstraint,
 	createUsageThrottledResponse,
+	getAccountUsageThrottleUntil,
 	getBindingConstraint,
 	getUsageThrottleStatus,
 	getUsageThrottleUntil,
+	isCodexCreditDrainActive,
 } from "./usage-throttling";

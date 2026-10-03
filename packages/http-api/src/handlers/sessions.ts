@@ -17,6 +17,7 @@ import {
 	getUsageThrottleStatus,
 	MODEL_ROUTE_PROFILE_MODEL_PREFIX,
 } from "@better-ccflare/proxy";
+import { isCodexCreditDrainActive } from "@better-ccflare/proxy/usage-throttling";
 import {
 	computeRateLimitStatusDisplay,
 	getRepresentativeUsageResetMs,
@@ -255,8 +256,10 @@ export function createSessionAccountHandler(
 		// Computed after usage resolution so an exhausted usage window can outrank
 		// stale header snapshots and the bare "OK" default (same precedence as the
 		// accounts list handler; incident 2026-07-09).
+		const creditDrainActive = isCodexCreditDrainActive(account, now);
 		const rateLimitStatus = computeRateLimitStatusDisplay(
 			{
+				creditDrainActive,
 				rate_limit_status: account.rate_limit_status ?? null,
 				rate_limit_reset: account.rate_limit_reset ?? null,
 				rate_limited_until: account.rate_limited_until ?? null,
@@ -282,7 +285,7 @@ export function createSessionAccountHandler(
 				usageData as AnyUsageData,
 				throttleSettings,
 				now,
-				{ scopedMode: "all" },
+				{ scopedMode: "all", creditDrainActive },
 			);
 			usageThrottledUntil = throttle.throttleUntil;
 			usageThrottledWindows = throttle.throttledWindows;

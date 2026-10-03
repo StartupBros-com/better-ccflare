@@ -91,6 +91,32 @@ describe("computeRateLimitStatusDisplay — usage exhaustion (incident fix)", ()
 	});
 });
 
+describe("computeRateLimitStatusDisplay — Codex credit drain", () => {
+	const spent = {
+		...base,
+		usageUtilization: 100,
+		usageResetMs: NOW + 60 * 60000,
+	};
+
+	it("does not report usage_exhausted when credit drain is active", () => {
+		expect(
+			computeRateLimitStatusDisplay({ ...spent, creditDrainActive: true }, NOW),
+		).toBe("OK");
+	});
+
+	it("reports usage_exhausted when credit drain is off or unset", () => {
+		expect(computeRateLimitStatusDisplay(spent, NOW)).toBe(
+			"usage_exhausted (60m)",
+		);
+		expect(
+			computeRateLimitStatusDisplay(
+				{ ...spent, creditDrainActive: false },
+				NOW,
+			),
+		).toBe("usage_exhausted (60m)");
+	});
+});
+
 describe("isUsageExhausted — shared staleness guard", () => {
 	it("is exhausted at 100% with unknown reset", () => {
 		expect(isUsageExhausted(100, null, NOW)).toBe(true);

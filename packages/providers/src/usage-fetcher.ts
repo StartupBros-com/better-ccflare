@@ -35,6 +35,7 @@ import {
 import {
 	bindCodexUsageObservation,
 	fetchCodexUsageData,
+	readCodexCreditEvidence,
 } from "./providers/codex/api-usage";
 import {
 	fetchXaiUsageData,
@@ -897,6 +898,19 @@ class UsageCache {
 	 */
 	private registrations = new Map<string, PollRegistration>();
 	private nextEpoch = 0;
+	/**
+	 * Poll-verified Codex credit evidence, written only from a freshly bound
+	 * owned observation. Passive header writes (set/setAuthoritative) replace the
+	 * owned cache entry but must neither create nor clear this.
+	 */
+	private codexCreditEvidence = new Map<
+		string,
+		{
+			registration: PollRegistration;
+			available: boolean;
+			acquiredAt: number;
+		}
+	>();
 	private usageRateLimitedUntil = new Map<string, number>(); // Tracks when usage API 429 clears
 	private modelScopedDepletions = new Map<
 		string,
@@ -987,6 +1001,16 @@ class UsageCache {
 				) ?? data;
 			this.invalidateCodexAcquisition(registration.accountId);
 			this.cache.set(registration.accountId, entry);
+			const evidence = readCodexCreditEvidence(
+				entry.data,
+				registration.accountId,
+			);
+			if (evidence) {
+				this.codexCreditEvidence.set(registration.accountId, {
+					registration,
+					...evidence,
+				});
+			}
 			return;
 		}
 		this.setAuthoritative(registration.accountId, data);
@@ -1170,6 +1194,7 @@ class UsageCache {
 		registration.abortController.abort();
 		// Clean up cache entry when polling stops to prevent memory leaks
 		this.deleteCacheEntry(accountId);
+		this.codexCreditEvidence.delete(accountId);
 		this.usageRateLimitedUntil.delete(accountId);
 		this.modelScopedDepletions.delete(accountId);
 		this.familyScopedDepletions.delete(accountId);
@@ -1826,10 +1851,34 @@ class UsageCache {
 	}
 
 	/**
+	 * Poll-verified Codex credit evidence: true = fresh owned evidence of
+	 * credits, false = fresh owned evidence of none, null = no fresh owned
+	 * evidence (missing, registration replaced, future-dated, or stale).
+	 */
+	getCodexCreditEvidence(
+		accountId: string,
+		now: number,
+		maxAgeMs: number,
+	): boolean | null {
+		const evidence = this.codexCreditEvidence.get(accountId);
+		if (!evidence || !this.isCurrent(evidence.registration)) return null;
+		if (
+			!Number.isFinite(now) ||
+			!Number.isFinite(evidence.acquiredAt) ||
+			evidence.acquiredAt < 0 ||
+			evidence.acquiredAt > now ||
+			now - evidence.acquiredAt >= maxAgeMs
+		)
+			return null;
+		return evidence.available;
+	}
+
+	/**
 	 * Clear cached data for a specific account
 	 */
 	delete(accountId: string): void {
 		this.deleteCacheEntry(accountId);
+		this.codexCreditEvidence.delete(accountId);
 		this.modelScopedDepletions.delete(accountId);
 		this.familyScopedDepletions.delete(accountId);
 		log.debug(`Cleared usage cache for account ${accountId}`);
@@ -1843,6 +1892,7 @@ class UsageCache {
 			this.stopPolling(accountId);
 		}
 		this.cache.clear();
+		this.codexCreditEvidence.clear();
 		this.usageRateLimitedUntil.clear();
 		this.modelScopedDepletions.clear();
 		this.familyScopedDepletions.clear();

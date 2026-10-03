@@ -1022,3 +1022,142 @@ describe("createUsageThrottledResponse", () => {
 		expect(body.error.message).toContain("Codex B");
 	});
 });
+
+describe("Codex credit drain relaxation", () => {
+	const NOW = Date.UTC(2026, 6, 17, 12, 0, 0);
+	const OBSERVED_AT = NOW - 30_000;
+	const reset = new Date(NOW + 60 * 60 * 1000).toISOString();
+	const base = { requestModel: "gpt-6", observedAt: OBSERVED_AT, now: NOW };
+
+	for (const window of ["seven_day", "five_hour"] as const) {
+		const data = {
+			five_hour: { utilization: 10, resets_at: reset },
+			seven_day: { utilization: 10, resets_at: reset },
+			[window]: { utilization: 100, resets_at: reset },
+		} as never;
+		it(`excludes a codex ${window} window at 100% by default`, () => {
+			const result = evaluateHardCapacity(data, {
+				...base,
+				provider: "codex",
+			});
+			expect(result.eligible).toBe(false);
+			expect(result.exclusions[0]?.scope).toBe("account");
+		});
+		it(`keeps a codex ${window} window at 100% eligible when creditDrainActive`, () => {
+			const result = evaluateHardCapacity(data, {
+				...base,
+				provider: "codex",
+				creditDrainActive: true,
+			});
+			expect(result.eligible).toBe(true);
+			expect(result.exclusions).toEqual([]);
+		});
+		it(`ignores creditDrainActive for non-codex providers (${window})`, () => {
+			for (const provider of ["anthropic", "xai", null]) {
+				const result = evaluateHardCapacity(data, {
+					...base,
+					provider,
+					creditDrainActive: true,
+				});
+				expect(result.eligible).toBe(false);
+			}
+		});
+	}
+
+	it("still excludes a spent weekly_scoped family under creditDrainActive", () => {
+		const data = {
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: reset,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+		} as never;
+		const result = evaluateHardCapacity(data, {
+			requestModel: "claude-fable-5",
+			observedAt: OBSERVED_AT,
+			now: NOW,
+			provider: "codex",
+			creditDrainActive: true,
+		});
+		expect(result.exclusions.map((e) => e.scope)).toEqual(["family"]);
+	});
+
+	it("getUsageThrottleStatus keeps a spent weekly_scoped window throttled under creditDrainActive", () => {
+		const now = Date.UTC(2026, 3, 28, 12, 0, 0);
+		const weekReset = new Date(
+			now + 7 * 24 * 60 * 60 * 1000 - 60 * 60 * 1000,
+		).toISOString();
+		const data = {
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: weekReset,
+					scope: {
+						model: { id: null, display_name: "Fable" },
+						surface: null,
+					},
+				},
+			],
+		} as never;
+		const settings = { fiveHourEnabled: true, weeklyEnabled: true };
+		const all = getUsageThrottleStatus(data, settings, now, {
+			scopedMode: "all",
+			creditDrainActive: true,
+		});
+		expect(all.throttleUntil).not.toBeNull();
+		expect(all.throttledWindows).toContain("seven_day_fable");
+		const match = getUsageThrottleStatus(data, settings, now, {
+			scopedMode: "match",
+			requestModel: "claude-fable-5",
+			creditDrainActive: true,
+		});
+		expect(match.throttleUntil).not.toBeNull();
+		expect(match.throttledWindows).toContain("seven_day_fable");
+	});
+
+	it("getUsageThrottleStatus skips spent account-wide five_hour/seven_day windows under creditDrainActive", () => {
+		const now = Date.UTC(2026, 3, 28, 12, 0, 0);
+		const fiveHourReset = new Date(now + 2 * 60 * 60 * 1000).toISOString();
+		const weekReset = new Date(now + 3 * 24 * 60 * 60 * 1000).toISOString();
+		const data = {
+			five_hour: { utilization: 100, resets_at: fiveHourReset },
+			seven_day: { utilization: 100, resets_at: weekReset },
+		} as never;
+		const settings = { fiveHourEnabled: true, weeklyEnabled: true };
+		const status = getUsageThrottleStatus(data, settings, now, {
+			creditDrainActive: true,
+		});
+		expect(status.throttledWindows).toEqual([]);
+		expect(status.throttleUntil).toBeNull();
+	});
+
+	it("getUsageThrottleStatus skips only spent windows when creditDrainActive", () => {
+		const now = Date.UTC(2026, 3, 28, 12, 0, 0);
+		const fiveHourReset = new Date(now + 2 * 60 * 60 * 1000).toISOString();
+		const weekReset = new Date(now + 3 * 24 * 60 * 60 * 1000).toISOString();
+		const data = {
+			five_hour: { utilization: 100, resets_at: fiveHourReset },
+			seven_day: { utilization: 90, resets_at: weekReset },
+		} as never;
+		const settings = { fiveHourEnabled: true, weeklyEnabled: true };
+		expect(
+			getUsageThrottleStatus(data, settings, now).throttledWindows,
+		).toEqual(expect.arrayContaining(["five_hour", "seven_day"]));
+		expect(
+			getUsageThrottleStatus(data, settings, now, { creditDrainActive: true })
+				.throttledWindows,
+		).toEqual(["seven_day"]);
+		expect(
+			getUsageThrottleUntil(
+				{ five_hour: { utilization: 100, resets_at: fiveHourReset } } as never,
+				settings,
+				now,
+				{ creditDrainActive: true },
+			),
+		).toBeNull();
+	});
+});

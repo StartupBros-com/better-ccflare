@@ -1177,6 +1177,7 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 		   auto_refresh_enabled = ${agg("MAX", "auto_refresh_enabled")},
 		   auto_pause_on_overage_enabled = ${agg("MAX", "auto_pause_on_overage_enabled")},
 		   peak_hours_pause_enabled = ${agg("MAX", "peak_hours_pause_enabled")},
+		   codex_credit_drain_enabled = ${agg("MAX", "codex_credit_drain_enabled")},
 		   rate_limit_remaining = (SELECT MIN(rate_limit_remaining) FROM accounts
 		                           ${groupScope} AND rate_limit_remaining IS NOT NULL),
 		   rate_limit_status = COALESCE(rate_limit_status, ${freshest("rate_limit_status")}),
@@ -2139,6 +2140,16 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			log.info("Added peak_hours_pause_enabled column to accounts table");
 		}
 
+		// Add codex_credit_drain_enabled column: per-account opt-in to keep
+		// routing a Codex account after its plan window is spent, so OpenAI
+		// serves it from purchased credits (issue #419). Default 0 = keep.
+		if (!initialAccountsColumnNames.includes("codex_credit_drain_enabled")) {
+			db.prepare(
+				"ALTER TABLE accounts ADD COLUMN codex_credit_drain_enabled INTEGER NOT NULL DEFAULT 0",
+			).run();
+			log.info("Added codex_credit_drain_enabled column to accounts table");
+		}
+
 		// Add pause_reason column to track why an account is paused (issue #139)
 		// Possible values: null (not paused), 'manual' (user paused via CLI/API),
 		// 'failure_threshold' (auto-refresh failures), 'overage' (billing overage)
@@ -2220,7 +2231,8 @@ export function runMigrations(db: Database, dbPath?: string): void {
 					model_fallbacks TEXT,
 					auto_pause_on_overage_enabled INTEGER DEFAULT 0,
 					pause_reason TEXT,
-					requires_reauth INTEGER DEFAULT 0
+					requires_reauth INTEGER DEFAULT 0,
+					codex_credit_drain_enabled INTEGER NOT NULL DEFAULT 0
 				)
 			`).run();
 
@@ -2236,7 +2248,8 @@ export function runMigrations(db: Database, dbPath?: string): void {
 					paused, rate_limit_reset, rate_limit_reset_at, rate_limit_status, rate_limit_remaining,
 					auto_fallback_enabled, custom_endpoint, auto_refresh_enabled,
 					model_mappings, cross_region_mode, model_fallbacks,
-					auto_pause_on_overage_enabled, pause_reason, requires_reauth
+					auto_pause_on_overage_enabled, pause_reason, requires_reauth,
+					codex_credit_drain_enabled
 				FROM accounts
 			`).run();
 
@@ -2560,7 +2573,10 @@ export function runMigrations(db: Database, dbPath?: string): void {
 
 		// Remove tier columns if they exist (cleanup migration)
 		// Use the column names we already defined above
-		// Drop account_tier column from accounts table if it exists
+		// Drop account_tier column from accounts table if it exists.
+		// Columns ADDed earlier in this same pass must be listed in the SELECT:
+		// their ADD COLUMN guards read the pre-migration column names, so a
+		// column dropped here stays missing until the next boot.
 		if (finalAccountsColumnNames.includes("account_tier")) {
 			// SQLite doesn't support DROP COLUMN directly, so we need to recreate the table
 			db.prepare(`
@@ -2571,7 +2587,7 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			       rate_limit_reset, rate_limit_reset_at, rate_limit_status, rate_limit_remaining,
 			       auto_fallback_enabled, custom_endpoint, auto_refresh_enabled, model_mappings,
 			       cross_region_mode, model_fallbacks, billing_type, auto_pause_on_overage_enabled,
-			       pause_reason, requires_reauth
+			       pause_reason, requires_reauth, codex_credit_drain_enabled
 			FROM accounts
 		`).run();
 

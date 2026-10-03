@@ -12,6 +12,7 @@ import {
 	getRepresentativeUtilizationForProvider,
 	usageCache,
 } from "@better-ccflare/providers";
+import { isCodexCreditDrainActive } from "@better-ccflare/proxy/usage-throttling";
 import type {
 	Account,
 	AnthropicDegradedRuntimeHealth,
@@ -96,6 +97,11 @@ export function computePoolStatus(
 	now: number,
 	getUsageInfo: AccountUsageInfoFn = () => null,
 ): PoolStatus {
+	// A Codex account that is draining credits is routable despite a spent
+	// subscription window (isCodexCreditDrainActive, same predicate routing
+	// uses), so its window must not count as exhaustion here.
+	const usageInfoFor: AccountUsageInfoFn = (a) =>
+		isCodexCreditDrainActive(a, now) ? null : getUsageInfo(a);
 	const configured = accounts.length;
 	const paused = accounts.filter((a) => a.paused).length;
 	const rateLimitedAccounts = accounts.filter(
@@ -113,7 +119,7 @@ export function computePoolStatus(
 	// between `routable` and `usage_exhausted` changed because `routable` now
 	// honors usage telemetry — see commit message for details.
 	const routable = accounts.filter((a) =>
-		isAccountAvailable(a, now, getUsageInfo(a) ?? undefined),
+		isAccountAvailable(a, now, usageInfoFor(a) ?? undefined),
 	).length;
 	// `usage_exhausted` is the diagnostic overlay: accounts whose cached
 	// telemetry shows 100% utilization with a future reset, AND that have no
@@ -123,7 +129,7 @@ export function computePoolStatus(
 	// rate_limited accounts).
 	const usage_exhausted = accounts.filter((a) => {
 		if (!isAccountAvailable(a, now)) return false;
-		const usage = getUsageInfo(a);
+		const usage = usageInfoFor(a);
 		return (
 			usage !== null && isUsageExhausted(usage.utilization, usage.resetMs, now)
 		);

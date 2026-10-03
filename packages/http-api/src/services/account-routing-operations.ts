@@ -22,7 +22,10 @@ import {
 	resolveAccountLogicalModelCapability,
 } from "@better-ccflare/providers/request-capabilities";
 import { usageCache } from "@better-ccflare/providers/usage-cache";
-import { evaluateHardCapacity } from "@better-ccflare/proxy/usage-throttling";
+import {
+	evaluateHardCapacity,
+	isCodexCreditDrainActive,
+} from "@better-ccflare/proxy/usage-throttling";
 import type {
 	Account,
 	AccountRoutingEffectiveView,
@@ -82,6 +85,7 @@ function isLogicalModelExhausted(
 		observedAt: snapshot.observedAt,
 		provider: account.provider,
 		now,
+		creditDrainActive: isCodexCreditDrainActive(account, now),
 	}).eligible;
 }
 

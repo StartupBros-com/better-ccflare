@@ -41,6 +41,12 @@ export interface RateLimitStatusInput {
 	usageUtilization: number | null;
 	/** Reset time (ms epoch) of the representative usage window, if known. */
 	usageResetMs?: number | null;
+	/**
+	 * Codex credit drain is in effect (see isCodexCreditDrainActive): the spent
+	 * subscription window does not block routing, so it must not be reported as
+	 * usage exhaustion. Defaults to off.
+	 */
+	creditDrainActive?: boolean;
 }
 
 function minutesLeft(untilMs: number, now: number): number {
@@ -53,7 +59,10 @@ export function computeRateLimitStatusDisplay(
 ): string {
 	const { usageUtilization, usageResetMs } = input;
 
-	if (isUsageExhausted(usageUtilization, usageResetMs, now)) {
+	if (
+		!input.creditDrainActive &&
+		isUsageExhausted(usageUtilization, usageResetMs, now)
+	) {
 		if (usageResetMs != null && usageResetMs > now) {
 			return `usage_exhausted (${minutesLeft(usageResetMs, now)}m)`;
 		}
