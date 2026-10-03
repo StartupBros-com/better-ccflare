@@ -699,3 +699,48 @@ The native Anthropic lane may be observed only through a real interactive Claude
 - Required lint, typecheck, formatting, isolated suites and PG tests pass; all skipped or unavailable validation remains visible.
 - Independent review cites the exact revision, abandoned-attempt code is removed, and no generated workers, credentials or unrelated config changes enter the diff.
 - The build is ready for an operator-authorized deployment and activation decision; a merge alone neither deploys nor enables Auto.
+
+
+---
+
+## Status and approved amendments — 2026-10-03 UTC
+
+**IMPLEMENTATION DEPLOYED / AUTO ENABLED / LIVE ACCEPTANCE OPEN**
+
+U1–U7 are implemented and shipped. This status records implementation checks, not completed live acceptance. U8 remains incomplete. [Issue #398](https://github.com/StartupBros-com/better-ccflare/issues/398) remains open and is the living remaining-acceptance list.
+
+### Merged implementation and deployment
+
+- [PR #402](https://github.com/StartupBros-com/better-ccflare/pull/402): foundation.
+- [PR #404](https://github.com/StartupBros-com/better-ccflare/pull/404): subscription-only admission.
+- [PR #407](https://github.com/StartupBros-com/better-ccflare/pull/407): provider-managed output and native capability fix.
+- [PR #413](https://github.com/StartupBros-com/better-ccflare/pull/413): exact official effort preservation.
+
+- [PR #416](https://github.com/StartupBros-com/better-ccflare/pull/416): physical executable-directory dotenv fallback and compiled retry-redelivery verification.
+
+Earlier on 2026-10-03, revision `0666336ef681c827108c004cda837f5d26e4326e`, version `3.5.78`, was deployed through `scripts/deploy-ccflare.sh` using a backend-only handoff. Runtime identity and health were independently verified; Auto status then returned HTTP `404` with `{"status":"disabled"}`. This remains historical deployment evidence.
+
+The current installed revision is `312ff63dee3d31cd4c8711337d749d9c49dbb512` (v3.5.78), deployed through the unmodified script. Independent verification matched binary SHA-256 `856a539caec2715aa743fa7620ed01cdcb5b1c5a2e9734c1880b18a0d234db96`, the running executable and isolated `--git-sha` output. Both production health ports returned `ok` / `312ff63d`; the guard backend reported the full revision and the service was active/running with `NRestarts=0`.
+
+Separate later approval authorized Auto activation at **2026-10-03 04:42:21Z**, with six line assignments, eight accounts, two fallback edges and **zero paid-spend grants**. Authenticated discovery returned six preserved manual choices plus four quality choices. An unused session returned HTTP `404` with exactly `{"status":"unknown"}`, not disabled. Background-merge policy remained enabled. The integrating session verified unchanged before/after checksums for the app config and both profile files; the independent verifier corroborated the app config and route-profile drop-in but could not read the protected profile environment file. Activation and discovery are not live-provider acceptance.
+
+### Approved post-plan amendments
+
+1. **Conservative accounting.** The implemented full-final-JSON byte estimate plus headroom preserves the full input, required tools and original requested output reserve. It remains an estimate, not a guaranteed context fit.
+2. **Explicit Codex output exception.** `allow-unbounded-output` accepts provider-managed output where the Codex catalog ceiling is missing or null. It explicitly accepts the absence of a wire-enforced caller output cap and of a guaranteed context fit. Finite known caps remain enforced. This narrowly supersedes the historical blanket unknown-output prohibition in the 2026-09-30 amendment, KTD6, the activation gates and Definition of Done only for this approved Codex case. Unknown context, unsupported tools/modalities and other missing evidence are not waived. No paid-spend grant or activation is implied.
+3. **Exact official effort.** An official `output_config` containing exactly `effort` is allowed only with current-account-owned exact-target support and literal equality with the final reasoning effort. Unknown or malformed values, extra keys and clamps (including `max` to `xhigh`) are rejected. Legacy-original, dual-original and structured-output support were not added; the ordinary resolver is unchanged.
+
+### Remaining U8 acceptance
+
+- [ ] Selected-account eligibility and applicable subscription/capability evidence.
+- [ ] Real interactive main-agent and tool-rich routing acceptance. Scripted Anthropic-backed traffic remains prohibited.
+- [ ] Actual affected-client GPT-5.6 picker provenance and any justified targeted correction.
+- [x] Installed compiled CLI credential/transport isolation and dotenv fallback verified at `312ff63d`: **17/17 tests (149 assertions)** and **22/22 historical checks**, using `env -i`, `bwrap --unshare-all`, absolute Bun 1.4.2 and synthetic loopback services. Physical `/app/.env`, project fallback, precedence/expansion, credential refusal, proxy denial and redirect refusal passed; the historical suite made zero proxy-port contacts.
+- [x] Actual compiled CLI lost-response retry-redelivery smoke: GET → POST → POST, identical idempotency-bearing bodies and one synthetic mutation. This is synthetic receipt-server evidence, not live-handler persistence or live-provider routing.
+- [ ] Real interactive main/home/worker/fallback behavior and authenticated retry acceptance remain unverified; no real interactive Auto turn has been supplied for this check.
+
+**Historical smoke — 2026-10-03, `0666336e`, before #416:** **21/22, exit 1**, including 13/13 credential controls and 8/9 ordinary-startup checks. Physical executable-directory dotenv fallback failed because the legacy fallback used Bun's virtual `argv[1]` path. The virtual-directory contrast was diagnostic, not a passing replacement assertion; no pre-change binary was tested, so regression attribution remains unverified. The installed `312ff63d` results above retire the fallback and CLI-redelivery gaps, while preserving [the original diagnosis](../troubleshooting.md#auto-quality-routing).
+
+The historical product requirements, design decisions and verification obligations above are preserved byte-for-byte. Read their historical future-tense and blanket output-limit language with this dated amendment. Neither shipped code nor fixture checks close the outstanding live-acceptance gates.
+
+Reviewed plan, updated in place: https://claude.ai/artifact/MhARSo63DsqhdzD1BJAa2b
