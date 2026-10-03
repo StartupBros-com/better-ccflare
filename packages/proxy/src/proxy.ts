@@ -1,4 +1,5 @@
 import {
+	extractClaudeVersion,
 	formatXaiCacheCanary,
 	getModelFamily,
 	isAccountAvailable,
@@ -64,6 +65,10 @@ import {
 } from "./cache-pacing";
 import { warnOnLookbackRisk } from "./cache-telemetry";
 import { CACHE_REPLAY_MODEL_HEADER } from "./cache-transport-staging";
+import {
+	applyClaudeCodeBackgroundMergePolicy,
+	backgroundMergePolicyIncompatibilityResponse,
+} from "./claude-code-background-merge-policy";
 import { adaptAnthropicSsePingsForClaudeCode } from "./claude-code-ping-compat";
 import {
 	deriveClaudeCodeRouteLineage,
@@ -934,7 +939,7 @@ async function handleProxyCoreImpl(
 	}
 	const requestBodyContext = new RequestBodyContext(requestBodyBuffer);
 	const originalParsedBody = requestBodyContext.getParsedJson();
-	const qualityRequirements = ctx.qualityRouteService
+	let qualityRequirements = ctx.qualityRouteService
 		? captureAutoRequestRequirements(originalParsedBody)
 		: undefined;
 	// Scheduler auth has already been consumed above. Only an explicitly
@@ -1154,6 +1159,33 @@ async function handleProxyCoreImpl(
 		} else {
 			// If we can't parse the body, let it through and let the provider handle it
 			log.debug("Could not parse request body for validation");
+		}
+	}
+
+	// Server policy applies only to native Claude Code system instructions. The
+	// adapter exclusion requires the existing process-local proof, not a caller's
+	// claimed protocol/header or metadata.user_id. No-op paths retain raw bytes.
+	if (
+		req.method === "POST" &&
+		url.pathname === "/v1/messages" &&
+		ctx.config.getClaudeCodeBackgroundMergePolicyEnabled?.() === true &&
+		!isResponsesAdapterRequest(req.headers, ctx) &&
+		extractClaudeVersion(req.headers.get("user-agent")) !== null
+	) {
+		const policyResult =
+			applyClaudeCodeBackgroundMergePolicy(requestBodyContext);
+		if (policyResult === "incompatible") {
+			return backgroundMergePolicyIncompatibilityResponse();
+		}
+		if (policyResult === "replaced" && ctx.qualityRouteService) {
+			// Establish only the authorized edit as the preservation baseline. Use
+			// the original buffer so earlier cache-TTL changes do not acquire a new
+			// exemption from admission. Provider/model/tool checks remain unchanged.
+			const policyBaseline = new RequestBodyContext(requestBodyBuffer);
+			applyClaudeCodeBackgroundMergePolicy(policyBaseline);
+			qualityRequirements = captureAutoRequestRequirements(
+				policyBaseline.getParsedJson(),
+			);
 		}
 	}
 

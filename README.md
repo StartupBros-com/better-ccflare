@@ -198,6 +198,50 @@ STORE_PAYLOADS=false                   # Disable storing request/response bodies
 - Never commit `.env` files containing sensitive values to version control
 - Use environment-specific configuration for production deployments
 
+#### Claude Code background merge policy
+
+This server-owned policy is **off by default**. An operator can enable it with
+`CCFLARE_CLAUDE_CODE_BACKGROUND_MERGE_POLICY=true` (or `1`), or the boolean
+`"claude_code_background_merge_policy_enabled": true` in the existing server
+configuration file. A present environment value takes precedence; every value
+other than exactly `true` or `1` disables it. Request headers, message content,
+and `metadata.user_id` cannot enable the setting.
+
+For native Claude Code `POST /v1/messages` requests, the gateway recognizes one
+exact `# Background Session` section and its known worktree Git paragraph in
+top-level `system` instructions. Only its sentence `Never push to main/master,
+force-push, or merge.` is replaced with:
+
+> Never push directly to main/master or force-push. You may merge an operator-authorized pull request only after its required checks and review requirements are satisfied. A review-governor stop requires an explicit operator decision; never set operator-only override flags. Any separate session-specific or loop-authority prohibition on merging still applies.
+
+This runs before agent interception and provider dispatch, so native Anthropic,
+Codex/Responses, and OpenAI conversion receive the same policy on every attempt.
+It preserves the rest of the prompt, text-block metadata, messages, roles, and
+tool content. The policy itself leaves disabled and nonmatching requests' raw
+bytes intact; ordinary provider conversion still applies. Trusted synthetic
+Responses ingress is excluded using the existing internal adapter proof.
+Foreground/non-Claude requests and isolated occurrences of the sentence are
+unchanged. Quoted examples, fenced code, and XML-wrapped content are not edited.
+
+Recognizable background-template drift, duplicate sections/paragraphs, and
+templates split across blocks fail before provider dispatch with HTTP **409**,
+`error.type: "invalid_request_error"`, and
+`error.code: "claude_code_background_merge_policy_incompatible"`. This also applies
+to streaming ingress; the rejection is JSON. The error contains no prompt text
+or credentials, and the policy adds no prompt logging. An operator must review
+the changed host template and update the recognized fixture before re-enabling
+compatibility; the gateway does not strip instructions or silently fall back to
+the conflicting directive.
+
+Enable this only for a gateway whose clients' top-level system instructions you
+trust. The Claude Code user-agent identifies the client format, not authenticated
+host provenance. There is no independent background-session marker: if a future
+host removes every recognizable section/paragraph marker, the gateway cannot
+distinguish it from foreground instructions. This policy neither grants merge
+authorization nor changes repository hooks, review gates, or session authority.
+Offline payload tests establish delivery and preservation, not model compliance;
+live behavioral evaluation has not been run.
+
 #### Server-tool admission and replay key file (Linux operators)
 
 Hosted web-search requests are always classified and admitted through exact typed capability proofs; there is no activation flag or permissive passthrough mode. Invalid requirements, incapable providers, and unavailable request-private replay fail locally before provider I/O. Requests without server tools retain the ordinary routing path and do not access replay storage. `CCFLARE_SERVER_TOOL_REPLAY_KEYS_FILE` prepares the replay codec required by capable server-tool candidates; it does **not** broaden provider capability. On Linux, set it to a normalized absolute path whose components are not symlinks. The loader pins each path component by descriptor, while the target must be a regular, single-link file owned by the service process UID with mode `0400` or `0600`; group/world-readable files fail closed. Ancestor ownership is not used as an authorization signal, so use an administrator-controlled directory even though the final-inode checks remain the enforcement boundary. Put only the path in the environment, never key material.

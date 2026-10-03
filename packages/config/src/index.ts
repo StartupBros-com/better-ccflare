@@ -939,6 +939,7 @@ export interface ConfigData {
 	implicit_fallback_allowed_classes?: string;
 	implicit_fallback_denied_classes?: string;
 	skill_elision_blocked_skills?: string;
+	claude_code_background_merge_policy_enabled?: boolean;
 	health_detail_enabled?: boolean;
 	anthropic_degraded_mode?: AnthropicDegradedMode;
 	anthropic_degraded_large_request_tokens?: number;
@@ -1863,6 +1864,19 @@ export class Config extends EventEmitter {
 		return parseSkillElisionBlockedSkills(
 			this.data.skill_elision_blocked_skills,
 		);
+	}
+
+	/**
+	 * Server-owned opt-in for the recognized Claude Code background Git
+	 * directive. A present env value always wins, including malformed values
+	 * (disabled). No request-facing setter is exposed for this policy.
+	 */
+	getClaudeCodeBackgroundMergePolicyEnabled(): boolean {
+		const fromEnv = parseEnabledEnvFlag(
+			process.env.CCFLARE_CLAUDE_CODE_BACKGROUND_MERGE_POLICY,
+		);
+		if (fromEnv !== undefined) return fromEnv;
+		return this.data.claude_code_background_merge_policy_enabled === true;
 	}
 
 	setUsageThrottlingFiveHourEnabled(value: boolean): void {
