@@ -77,6 +77,30 @@ const nativeOwnEvidence = new Map<string, AutoCatalogEvidence>();
 const nativeEvidenceGeneration = new Map<string, number>();
 const nativeCredentialFingerprint = new Map<string, string>();
 let nextNativeEvidenceGeneration = 0;
+/**
+ * Wait signal only: the newest in-flight native acquisition per account. It never
+ * carries results, credentials or ownership; callers must still validate owned
+ * evidence themselves. The promise resolves (never rejects) when it settles.
+ */
+const pendingNativeAcquisitions = new Map<
+	string,
+	{ generation: number; settled: Promise<void> }
+>();
+
+/** Thrown when a newer lookup for the same account superseded this one. */
+export class NativeCatalogObsoleteGenerationError extends Error {
+	constructor() {
+		super("obsolete native catalog generation");
+		this.name = "NativeCatalogObsoleteGenerationError";
+	}
+}
+
+/** Resolves when the newest in-flight native acquisition for the account settles. */
+export function getPendingNativeCatalogAcquisition(
+	accountId: string,
+): Promise<void> | undefined {
+	return pendingNativeAcquisitions.get(accountId)?.settled;
+}
 const nativeOwnerEpoch = new Map<string, number>();
 const nativeOwners = new WeakMap<
 	AutoCatalogEvidence,
@@ -418,6 +442,44 @@ async function fetchLiveModelsUntilAborted(
 	signal.throwIfAborted();
 	// Reserve before the first await: deletion or a newer lookup must fence us.
 	const generation = ++nextNativeEvidenceGeneration;
+	let settle!: () => void;
+	const settled = new Promise<void>((resolve) => {
+		settle = resolve;
+	});
+	const registered = new Set<string>();
+	const register = (accountId: string) => {
+		// Never replace a newer lookup's entry: waiters must keep seeing it.
+		if (
+			(pendingNativeAcquisitions.get(accountId)?.generation ?? 0) > generation
+		)
+			return;
+		pendingNativeAcquisitions.set(accountId, { generation, settled });
+		registered.add(accountId);
+	};
+	if (options.accountId) register(options.accountId);
+	try {
+		return await acquireNativeCatalog(ctx, options, generation, register);
+	} finally {
+		for (const id of registered) {
+			if (pendingNativeAcquisitions.get(id)?.generation === generation)
+				pendingNativeAcquisitions.delete(id);
+		}
+		settle();
+	}
+}
+
+async function acquireNativeCatalog(
+	ctx: ProxyContext,
+	options: {
+		allowOAuth?: boolean;
+		accountId?: string;
+		signal: AbortSignal;
+		accountEligible?: NativeCatalogAccountEligible;
+	},
+	generation: number,
+	register: (accountId: string) => void,
+): Promise<ModelCatalogEntry[]> {
+	const { signal } = options;
 	const allowOAuth = options?.allowOAuth ?? false;
 	let accounts: Account[];
 	if (options?.accountId) {
@@ -446,13 +508,14 @@ async function fetchLiveModelsUntilAborted(
 	}
 
 	if ((nativeEvidenceGeneration.get(account.id) ?? 0) > generation)
-		throw new Error("obsolete native catalog generation");
+		throw new NativeCatalogObsoleteGenerationError();
 	nativeEvidenceGeneration.set(account.id, generation);
+	if (!options.accountId) register(account.id);
 	const provider = getProvider(account.provider) || ctx.provider;
 	const accessToken = await getValidAccessToken(account, ctx);
 	signal.throwIfAborted();
 	if (nativeEvidenceGeneration.get(account.id) !== generation)
-		throw new Error("obsolete native catalog generation");
+		throw new NativeCatalogObsoleteGenerationError();
 	const selected = { account: { ...account }, accessToken };
 	const fingerprint = nativeFingerprint(selected);
 	if (nativeCredentialFingerprint.get(account.id) !== fingerprint)
@@ -810,6 +873,7 @@ export function initModelCatalogRefresh(
 export function resetModelCatalogForTest(): void {
 	nativeOwnEvidence.clear();
 	nativeEvidenceGeneration.clear();
+	pendingNativeAcquisitions.clear();
 	nativeCredentialFingerprint.clear();
 	memoryCatalog = null;
 	diskLoadAttempted = false;

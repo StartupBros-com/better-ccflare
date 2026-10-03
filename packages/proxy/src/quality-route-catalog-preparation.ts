@@ -9,6 +9,8 @@ import { getValidAccessToken } from "./handlers/token-manager";
 import {
 	fetchLiveModels,
 	getNativeAutoCatalogEvidence,
+	getPendingNativeCatalogAcquisition,
+	NativeCatalogObsoleteGenerationError,
 	validateNativeAutoCatalogCredentials,
 } from "./model-catalog";
 
@@ -105,7 +107,14 @@ export async function prepareNativeQualityCatalogs(
 				}
 			}
 		}
-		const prepare = async (accountId: string) => {
+		// A pending acquisition is a wait signal only: another request's evidence is
+		// never our authority; we recheck ownership against OUR resolved credential.
+		const prepareOnce = async (accountId: string) => {
+			const pending = getPendingNativeCatalogAcquisition(accountId);
+			if (pending) {
+				await pending;
+				if (stopped()) return;
+			}
 			const evidence = getNativeAutoCatalogEvidence(accountId);
 			if (evidence) {
 				// Freshness alone says nothing about credential/incarnation ownership.
@@ -137,6 +146,18 @@ export async function prepareNativeQualityCatalogs(
 				signal: controller.signal,
 				accountEligible: isQualityCatalogRequestEligible,
 			});
+		};
+		// A newer lookup for the same account superseded ours: wait for it and
+		// recheck ownership instead of giving up. Bounded; other errors are final.
+		const prepare = async (accountId: string) => {
+			for (let attempt = 0; attempt < 3 && !stopped(); attempt++) {
+				try {
+					await prepareOnce(accountId);
+					return;
+				} catch (error) {
+					if (!(error instanceof NativeCatalogObsoleteGenerationError)) return;
+				}
+			}
 		};
 		let next = 0;
 		const worker = async () => {

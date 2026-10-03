@@ -324,6 +324,43 @@ describe("cold native catalog acquisition", () => {
 		]);
 	});
 
+	it("two concurrent cold Auto requests share one native acquisition per account and both route", async () => {
+		const transport = globalThis.fetch;
+		const catalogs: string[] = [];
+		globalThis.fetch = Object.assign(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const req = input instanceof Request ? input : new Request(input, init);
+				if (req.method === "GET") {
+					catalogs.push(req.headers.get("x-api-key") ?? "");
+					// Hold the response so the second request overlaps the first.
+					await new Promise((resolve) => setTimeout(resolve, 20));
+				}
+				return transport(input, init);
+			},
+			{ preconnect: () => {} },
+		) as typeof fetch;
+		const responses = await Promise.all([
+			send(
+				request("claude-bccf-quality-auto", {
+					"x-claude-code-session-id": "s1",
+				}),
+			),
+			send(
+				request("claude-bccf-quality-auto", {
+					"x-claude-code-session-id": "s2",
+				}),
+			),
+		]);
+		expect(responses.map((r) => r.status)).toEqual([200, 200]);
+		await Promise.all(responses.map((r) => r.text()));
+		await flush();
+		expect(sends).toEqual([
+			{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+			{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+		]);
+		expect(catalogs.toSorted()).toEqual(["synthetic-a", "synthetic-b"]);
+	});
+
 	it.each([
 		"credential rotation",
 		"account replacement",

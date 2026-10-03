@@ -11,6 +11,7 @@ const calls: {
 	accountEligible?: (account: Account) => boolean;
 }[] = [];
 let discover: (signal: AbortSignal) => Promise<void>;
+const pendingFor = new Map<string, Promise<void>>();
 // Scoped spies, not mock.module: a module mock has no per-file isolation, so a
 // synthetic model-catalog would leak into later files in the same process.
 // Every replaced export is restored in afterAll; unrelated exports stay real.
@@ -31,6 +32,9 @@ const spies = [
 			evidence.apiKey === selected.account.api_key &&
 			evidence.createdAt === selected.account.created_at &&
 			selected.accessToken === "") as never,
+	),
+	spyOn(modelCatalog, "getPendingNativeCatalogAcquisition").mockImplementation(
+		((id: string) => pendingFor.get(id)) as never,
 	),
 	spyOn(modelCatalog, "fetchLiveModels").mockImplementation((async (
 		_ctx: unknown,
@@ -113,6 +117,7 @@ const options = () => ({ signal: new AbortController().signal });
 beforeEach(() => {
 	fresh.clear();
 	calls.length = 0;
+	pendingFor.clear();
 	discover = async () => {};
 });
 
@@ -410,5 +415,116 @@ describe("native quality catalog preparation (metadata mocks only)", () => {
 		} finally {
 			globalThis.setTimeout = originalSetTimeout;
 		}
+	});
+	describe("obsolete native catalog generation", () => {
+		const obsolete = () =>
+			new modelCatalog.NativeCatalogObsoleteGenerationError();
+		test("waits for the newer acquisition and rechecks owned evidence instead of returning", async () => {
+			const p = policy(["a"]);
+			let release!: () => void;
+			discover = async () => {
+				pendingFor.set(
+					"a",
+					new Promise<void>((resolve) => {
+						release = () => {
+							pendingFor.delete("a");
+							resolve();
+						};
+					}),
+				);
+				throw obsolete();
+			};
+			let done = false;
+			const run = prepareNativeQualityCatalogs(
+				context(p),
+				p,
+				intent,
+				[account("a")],
+				{ ...options(), allowOAuth: true },
+			).then(() => {
+				done = true;
+			});
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			expect(done).toBe(false);
+			expect(calls).toHaveLength(1);
+			fresh.set("a", { apiKey: "synthetic-a", createdAt: 1 });
+			release();
+			await run;
+			expect(calls).toHaveLength(1);
+		});
+		test("a newer acquisition that settles without evidence leads the waiter to fetch itself", async () => {
+			const p = policy(["a"]);
+			let first = true;
+			discover = async () => {
+				if (!first) return;
+				first = false;
+				pendingFor.set("a", Promise.resolve());
+				throw obsolete();
+			};
+			await prepareNativeQualityCatalogs(
+				context(p),
+				p,
+				intent,
+				[account("a")],
+				{
+					...options(),
+					allowOAuth: true,
+				},
+			);
+			expect(calls).toHaveLength(2);
+		});
+		test("the attempt cap bounds repeated obsolescence", async () => {
+			const p = policy(["a"]);
+			discover = async () => {
+				throw obsolete();
+			};
+			await prepareNativeQualityCatalogs(
+				context(p),
+				p,
+				intent,
+				[account("a")],
+				{
+					...options(),
+					allowOAuth: true,
+				},
+			);
+			expect(calls).toHaveLength(3);
+		});
+		test("caller cancellation bounds a wait on a pending acquisition that never settles", async () => {
+			const p = policy(["a"]);
+			const controller = new AbortController();
+			discover = async () => {
+				pendingFor.set("a", new Promise<void>(() => {}));
+				throw obsolete();
+			};
+			const run = prepareNativeQualityCatalogs(
+				context(p),
+				p,
+				intent,
+				[account("a")],
+				{ signal: controller.signal, allowOAuth: true },
+			);
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			controller.abort();
+			await run;
+			expect(calls).toHaveLength(1);
+		});
+		test("non-obsolete errors return immediately without retrying", async () => {
+			const p = policy(["a"]);
+			discover = async () => {
+				throw new Error("unavailable");
+			};
+			await prepareNativeQualityCatalogs(
+				context(p),
+				p,
+				intent,
+				[account("a")],
+				{
+					...options(),
+					allowOAuth: true,
+				},
+			);
+			expect(calls).toHaveLength(1);
+		});
 	});
 });
