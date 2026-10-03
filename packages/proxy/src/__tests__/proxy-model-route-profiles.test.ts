@@ -807,6 +807,8 @@ describe("Claude Code gateway model route profiles", () => {
 				{
 					id: PROFILE_MODEL_1M,
 					display_name: "GPT-5.6 Sol · pro-primary",
+					description:
+						"One pinned account, no fallback · subagents use the same account",
 				},
 			],
 			has_more: false,
@@ -3609,8 +3611,18 @@ describe("catalog-role Codex route profiles", () => {
 		const raw = await response.text();
 		expect(JSON.parse(raw)).toEqual({
 			data: [
-				{ id: ROLE_PICKER, display_name: "Codex · opus" },
-				{ id: ROLE_POOL_PICKER, display_name: "Codex pool · opus" },
+				{
+					id: ROLE_PICKER,
+					display_name: "Codex · opus",
+					description:
+						"One pinned account, no fallback · subagents use the same account",
+				},
+				{
+					id: ROLE_POOL_PICKER,
+					display_name: "Codex pool · opus",
+					description:
+						"Pool of matching accounts, load-balancer order, then error · subagents use the same pool",
+				},
 			],
 			has_more: false,
 		});

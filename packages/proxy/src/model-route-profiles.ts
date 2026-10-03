@@ -95,6 +95,22 @@ export function isBoundedModelRouteProfile(
 	);
 }
 
+/**
+ * One-line picker description of a profile's routing flow, generated from its
+ * kind only. Discovery must never expose the operator description, account id,
+ * logical or physical model, or the catalog-role policy, so none feed this.
+ * Pool order is the global load-balancer strategy's, not account priority.
+ */
+export function describeModelRouteProfileFlow(
+	profile: ModelRouteProfile,
+): string {
+	if (profile.selection === "capability")
+		return "Pool of matching accounts, load-balancer order, then error · subagents use the same pool";
+	if (isBoundedModelRouteProfile(profile))
+		return "One pinned account, size-capped requests, no fallback · subagents use the same account";
+	return "One pinned account, no fallback · subagents use the same account";
+}
+
 function configError(message: string): Error {
 	return new Error(`${MODEL_ROUTE_PROFILES_ENV}: ${message}`);
 }
@@ -603,10 +619,12 @@ export class ModelRouteSessionRegistry {
 	getDiscoveryModels(): ReadonlyArray<{
 		readonly id: string;
 		readonly display_name: string;
+		readonly description: string;
 	}> {
 		return Array.from(this.profilesById.values(), (profile) => ({
 			id: profile.discoveryModelId,
 			display_name: profile.displayName,
+			description: describeModelRouteProfileFlow(profile),
 		}));
 	}
 

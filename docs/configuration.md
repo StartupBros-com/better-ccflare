@@ -502,7 +502,7 @@ routing, error reasons, and saved picker IDs are unchanged.
 |---|---:|---|
 | `id` | yes | Unique lowercase kebab-case slug, up to 48 characters. better-ccflare generates the reserved public model ID `claude-bccf-route-<id>`; clients cannot configure a different public ID |
 | `displayName` | yes | Picker label, 1–120 characters |
-| `description` | no | Operator-facing description, up to 500 characters |
+| `description` | no | Operator-facing description, up to 500 characters. It is never returned by discovery; the picker description is generated from the profile kind instead |
 | `selection` | no | Set to `capability` for a live matching-account pool. When omitted, the profile retains legacy exact-account selection |
 | `accountId` | conditional | Required for legacy profiles; omit it for `selection: "capability"`. It is never returned by the discovery endpoint |
 | `logicalModel` | yes | Claude request model written on an explicit root selection before the account's normal model mapping is applied |
@@ -554,7 +554,7 @@ Point Claude Code's Anthropic base URL and authentication at better-ccflare as u
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 ```
 
-When at least one route profile is configured, authenticated `GET /v1/models` requests are answered locally with one preferred public model ID and display name for each profile. Discovery metadata is not enforcement: it does not select an account, impose profile bounds, or contact an upstream provider. Claude Code labels these entries as gateway models in `/model`.
+When at least one route profile is configured, authenticated `GET /v1/models` requests are answered locally with one preferred public model ID and display name for each profile. Each entry carries the ID, the display name and a generated one-line `description` of its priority flow. Profile descriptions are generated from the profile kind only, never from the operator `description`, account ID or model names: an exact profile reads `One pinned account, no fallback · subagents use the same account`; a bounded exact profile reads `One pinned account, size-capped requests, no fallback · subagents use the same account`; a `capability` pool reads `Pool of matching accounts, load-balancer order, then error · subagents use the same pool`. Claude Code shows the description under the label, collapses whitespace, cuts it at 100 characters, and shows "From gateway" when it is absent (observed in Claude Code 2.1.288). Discovery metadata is not enforcement: it does not select an account, impose profile bounds, or contact an upstream provider. Claude Code labels these entries as gateway models in `/model`.
 
 Every profile keeps the stable legacy ID `claude-bccf-route-<id>`. For a profile with `clientContextWindowHint: "1m"`, discovery instead emits the preferred ID `claude-bccf-route-<id>[1m]`; better-ccflare accepts both exact spellings for that profile, but emits only the preferred row. Claude Code strips `[1m]` before API transport, while better-ccflare also accepts the suffixed spelling verbatim for protocol robustness. This opt-in is a Claude Code client context-classification hint, not a provider-capacity claim or admission enforcement.
 
