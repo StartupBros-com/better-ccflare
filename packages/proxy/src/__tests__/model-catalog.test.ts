@@ -10,7 +10,11 @@ import {
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BUNDLED_MODELS_AS_OF, CLAUDE_MODEL_IDS } from "@better-ccflare/core";
+import {
+	BUNDLED_MODELS_AS_OF,
+	CLAUDE_MODEL_IDS,
+	isAccountAvailable,
+} from "@better-ccflare/core";
 import { getProvider } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers/proxy-types";
@@ -19,9 +23,11 @@ import {
 	fetchLiveModels,
 	getModelCatalog,
 	getNativeAutoCatalogEvidence,
+	getPendingNativeCatalogAcquisition,
 	ingestModelsListing,
 	initModelCatalogRefresh,
 	type ModelCatalog,
+	NativeCatalogObsoleteGenerationError,
 	refreshModelCatalog,
 	resetModelCatalogForTest,
 	validateNativeAutoCatalogCredentials,
@@ -294,6 +300,174 @@ describe("model-catalog", () => {
 
 	describe("fetchLiveModels", () => {
 		it.each([
+			false,
+			true,
+		])("cancels a pending body promptly without late publication or pagination (has_more=%s)", async (hasMore) => {
+			const controller = new AbortController();
+			const reading = deferred<void>();
+			const body = deferred<unknown>();
+			const fetchMock = mock(async () => {
+				const response = Response.json({});
+				response.json = async () => {
+					reading.resolve();
+					return body.promise;
+				};
+				return response;
+			});
+			global.fetch = Object.assign(fetchMock, { preconnect: () => {} });
+			const pending = fetchLiveModels(makeCtx([makeAccount()]), {
+				signal: controller.signal,
+			});
+			const outcome = pending.then(
+				() => "resolved",
+				() => "cancelled",
+			);
+			await reading.promise;
+			controller.abort(new Error("caller cancelled"));
+			try {
+				expect(
+					await Promise.race([
+						outcome,
+						new Promise((resolve) =>
+							setTimeout(() => resolve("still pending"), 25),
+						),
+					]),
+				).toBe("cancelled");
+			} finally {
+				body.resolve({
+					data: [{ id: "claude-late" }],
+					has_more: hasMore,
+					last_id: "claude-late",
+				});
+				await outcome;
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(getNativeAutoCatalogEvidence("acc-1")).toBeNull();
+		});
+
+		it("shares one ten-second deadline across pagination and body reading, rejecting late success", async () => {
+			const reading = deferred<void>();
+			const body = deferred<unknown>();
+			const fetchSignals: (AbortSignal | null | undefined)[] = [];
+			global.fetch = Object.assign(
+				async (_url: unknown, init?: RequestInit) => {
+					fetchSignals.push(init?.signal);
+					if (fetchSignals.length === 1) {
+						await new Promise((resolve) => setTimeout(resolve, 1_500));
+						return Response.json({
+							data: [{ id: "first-page" }],
+							has_more: true,
+							last_id: "first-page",
+						});
+					}
+					const response = Response.json({});
+					response.json = async () => {
+						reading.resolve();
+						return body.promise;
+					};
+					return response;
+				},
+				{ preconnect: () => {} },
+			);
+			const pending = fetchLiveModels(makeCtx([makeAccount()]));
+			const outcome = pending.then(
+				() => "resolved",
+				() => "timed out",
+			);
+			await reading.promise;
+			try {
+				expect(
+					await Promise.race([
+						outcome,
+						new Promise((resolve) =>
+							setTimeout(() => resolve("still pending"), 9_000),
+						),
+					]),
+				).toBe("timed out");
+				expect(fetchSignals).toHaveLength(2);
+				expect(fetchSignals[0]?.aborted).toBe(true);
+				expect(fetchSignals[1]?.aborted).toBe(true);
+			} finally {
+				body.resolve({ data: [{ id: "claude-late" }], has_more: false });
+				await outcome;
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			expect(getNativeAutoCatalogEvidence("acc-1")).toBeNull();
+		}, 15_000);
+		it.each([
+			"lookup",
+			"headers",
+		])("cancels pending %s without late body reads or new traffic", async (phase) => {
+			const controller = new AbortController();
+			const entered = deferred<void>();
+			const resume = deferred<void>();
+			const account = makeAccount();
+			const ctx = makeCtx([account]);
+			if (phase === "lookup") {
+				ctx.dbOps.getAccount = async () => {
+					entered.resolve();
+					await resume.promise;
+					return account;
+				};
+			}
+			const readBody = mock(async () => ({
+				data: [{ id: "claude-late" }],
+				has_more: false,
+			}));
+			const fetchMock = mock(async () => {
+				entered.resolve();
+				await resume.promise;
+				const response = Response.json({});
+				response.json = readBody;
+				return response;
+			});
+			global.fetch = Object.assign(fetchMock, { preconnect: () => {} });
+			const pending = fetchLiveModels(ctx, {
+				accountId: account.id,
+				signal: controller.signal,
+			});
+			const outcome = pending.then(
+				() => "resolved",
+				() => "cancelled",
+			);
+			await entered.promise;
+			controller.abort();
+			try {
+				expect(
+					await Promise.race([
+						outcome,
+						new Promise((resolve) =>
+							setTimeout(() => resolve("still pending"), 25),
+						),
+					]),
+				).toBe("cancelled");
+			} finally {
+				resume.resolve();
+				await outcome;
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			expect(fetchMock).toHaveBeenCalledTimes(phase === "lookup" ? 0 : 1);
+			expect(readBody).not.toHaveBeenCalled();
+			expect(getNativeAutoCatalogEvidence(account.id)).toBeNull();
+		});
+
+		it("rejects an already-cancelled lookup without upstream traffic", async () => {
+			const controller = new AbortController();
+			controller.abort(new Error("caller cancelled"));
+			const fetchMock = mock(async () =>
+				Response.json({ data: [], has_more: false }),
+			);
+			global.fetch = Object.assign(fetchMock, { preconnect: () => {} });
+			await expect(
+				fetchLiveModels(makeCtx([makeAccount()]), {
+					signal: controller.signal,
+				}),
+			).rejects.toThrow("caller cancelled");
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(getNativeAutoCatalogEvidence("acc-1")).toBeNull();
+		});
+		it.each([
 			["missing", null],
 			["paused", { paused: true }],
 			["wrong provider", { provider: "zai" }],
@@ -344,6 +518,45 @@ describe("model-catalog", () => {
 			expect(lookup).not.toHaveBeenCalled();
 		});
 
+		it.each([
+			["rate-limited", { rate_limited_until: Date.now() + 60_000 }],
+			["requires reauth", { pause_reason: "oauth_invalid_grant" }],
+		] as const)("request-eligibility predicate rejects a freshly reloaded %s target before any fetch or publication", async (_label, overrides) => {
+			const target = makeAccount({ id: "target", ...overrides });
+			const ctx = makeCtx([target]);
+			const fetchMock = mock(async () => Response.json({ data: [] }));
+			global.fetch = fetchMock as unknown as typeof fetch;
+			const seen: string[] = [];
+			await expect(
+				fetchLiveModels(ctx, {
+					accountId: "target",
+					accountEligible: (a) => {
+						seen.push(a.id);
+						return isAccountAvailable(a) && !a.requires_reauth;
+					},
+				}),
+			).rejects.toThrow("not eligible for this request");
+			expect(seen).toEqual(["target"]);
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(getNativeAutoCatalogEvidence("target")).toBeNull();
+		});
+
+		it("without a request-eligibility predicate a rate-limited target is still fetched (unchanged default)", async () => {
+			const target = makeAccount({
+				id: "target",
+				rate_limited_until: Date.now() + 60_000,
+			});
+			const fetchMock = mock(async () =>
+				Response.json({ data: [{ id: "claude-opus-5-5" }], has_more: false }),
+			);
+			global.fetch = fetchMock as unknown as typeof fetch;
+			const models = await fetchLiveModels(makeCtx([target]), {
+				accountId: "target",
+			});
+			expect(models).toHaveLength(1);
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+		});
+
 		it("fences deletion while targeted lookup is pending", async () => {
 			const account = makeAccount();
 			const lookup = deferred<Account | null>();
@@ -380,6 +593,257 @@ describe("model-catalog", () => {
 			);
 			expect(fetchMock).toHaveBeenCalledTimes(1);
 			expect(getNativeAutoCatalogEvidence(account.id)).toBe(evidence);
+		});
+
+		it("throws a typed obsolete error for the superseded caller, which never publishes", async () => {
+			const account = makeAccount();
+			const lookup = deferred<Account | null>();
+			const ctx = makeCtx([account]);
+			ctx.dbOps.getAccount = () => lookup.promise;
+			const fetchMock = mock(async () => Response.json({ data: [] }));
+			global.fetch = fetchMock as unknown as typeof fetch;
+			const pending = fetchLiveModels(ctx, { accountId: account.id });
+			clearNativeAutoCatalogEvidence(account.id);
+			lookup.resolve(account);
+			const error = await pending.catch((e) => e);
+			expect(error).toBeInstanceOf(NativeCatalogObsoleteGenerationError);
+			expect(error.message).toBe("obsolete native catalog generation");
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(getNativeAutoCatalogEvidence(account.id)).toBeNull();
+		});
+
+		it("exposes the newest pending acquisition; only the owning generation clears it", async () => {
+			const account = makeAccount();
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+			const oldLookup = deferred<Account | null>();
+			const oldCtx = makeCtx([account]);
+			oldCtx.dbOps.getAccount = () => oldLookup.promise;
+			global.fetch = mock(async () =>
+				Response.json({ data: [{ id: "claude-opus-5-5" }], has_more: false }),
+			) as unknown as typeof fetch;
+			const older = fetchLiveModels(oldCtx, { accountId: account.id });
+			const olderSignal = getPendingNativeCatalogAcquisition(account.id);
+			expect(olderSignal).toBeInstanceOf(Promise);
+			const newLookup = deferred<Account | null>();
+			const newCtx = makeCtx([account]);
+			newCtx.dbOps.getAccount = () => newLookup.promise;
+			const newer = fetchLiveModels(newCtx, { accountId: account.id });
+			const newerSignal = getPendingNativeCatalogAcquisition(account.id);
+			expect(newerSignal).not.toBe(olderSignal);
+			// Older settles (obsolete) while the newer one is still pending.
+			oldLookup.resolve(account);
+			newLookup.resolve(account);
+			// Make the older one obsolete: it reaches the token await after the newer set its generation.
+			await older.catch(() => undefined);
+			await olderSignal;
+			await newer.catch(() => undefined);
+			await newerSignal;
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+		});
+
+		it("an older settling acquisition does not delete the newer pending entry", async () => {
+			const account = makeAccount();
+			const oldLookup = deferred<Account | null>();
+			const oldCtx = makeCtx([account]);
+			oldCtx.dbOps.getAccount = () => oldLookup.promise;
+			global.fetch = mock(async () =>
+				Response.json({ data: [{ id: "claude-opus-5-5" }], has_more: false }),
+			) as unknown as typeof fetch;
+			const older = fetchLiveModels(oldCtx, { accountId: account.id });
+			const newLookup = deferred<Account | null>();
+			const newCtx = makeCtx([account]);
+			newCtx.dbOps.getAccount = () => newLookup.promise;
+			const newer = fetchLiveModels(newCtx, { accountId: account.id });
+			const newerSignal = getPendingNativeCatalogAcquisition(account.id);
+			oldLookup.resolve(account);
+			await older.catch(() => undefined);
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBe(newerSignal);
+			newLookup.resolve(account);
+			await newer;
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+		});
+
+		it("releases the pending acquisition when the caller aborts an uncancellable account lookup", async () => {
+			const account = makeAccount();
+			const ctx = makeCtx([account]);
+			// Never settles and ignores AbortSignal, like a wedged DB read.
+			ctx.dbOps.getAccount = () => new Promise<Account | null>(() => {});
+			global.fetch = mock(async () =>
+				Response.json({ data: [] }),
+			) as unknown as typeof fetch;
+			const controller = new AbortController();
+			const pending = fetchLiveModels(ctx, {
+				accountId: account.id,
+				signal: controller.signal,
+			});
+			const signal = getPendingNativeCatalogAcquisition(account.id);
+			expect(signal).toBeInstanceOf(Promise);
+			controller.abort(new Error("caller gone"));
+			await expect(pending).rejects.toThrow("caller gone");
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+			// A later waiter must not hang on the abandoned worker.
+			let settled = false;
+			void signal?.then(() => {
+				settled = true;
+			});
+			// Bounded by a few microtask turns, not a timer.
+			for (let turn = 0; turn < 5; turn++) await Promise.resolve();
+			expect(settled).toBe(true);
+		});
+
+		it("clearing an account releases waiters on its fenced in-flight lookup", async () => {
+			const account = makeAccount();
+			const lookup = deferred<Account | null>();
+			const ctx = makeCtx([account]);
+			// Uncancellable await, like a wedged DB read.
+			ctx.dbOps.getAccount = () => lookup.promise;
+			global.fetch = mock(async () =>
+				Response.json({ data: [{ id: "claude-opus-5-5" }], has_more: false }),
+			) as unknown as typeof fetch;
+			const pending = fetchLiveModels(ctx, { accountId: account.id });
+			const outcome = pending.then(
+				() => null,
+				(error) => error,
+			);
+			const signal = getPendingNativeCatalogAcquisition(account.id);
+			expect(signal).toBeInstanceOf(Promise);
+			let settled = false;
+			void signal?.then(() => {
+				settled = true;
+			});
+			clearNativeAutoCatalogEvidence(account.id);
+			// Bounded by a few microtask turns, not a timer.
+			for (let turn = 0; turn < 5; turn++) await Promise.resolve();
+			expect(settled).toBe(true);
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+			// The fenced worker still publishes nothing and leaves no entry.
+			lookup.resolve(account);
+			expect(await outcome).toBeInstanceOf(
+				NativeCatalogObsoleteGenerationError,
+			);
+			expect(getNativeAutoCatalogEvidence(account.id)).toBeNull();
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+		});
+
+		it("does not register a pending acquisition after the signal aborts", async () => {
+			const account = makeAccount();
+			const ctx = makeCtx([account]);
+			const controller = new AbortController();
+			controller.abort(new Error("already gone"));
+			await expect(
+				fetchLiveModels(ctx, {
+					accountId: account.id,
+					signal: controller.signal,
+				}),
+			).rejects.toThrow("already gone");
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+		});
+
+		it("rejects a targeted lookup superseded while its models page is in flight, publishing nothing", async () => {
+			const account = makeAccount();
+			const started = deferred<void>();
+			const gate = deferred<void>();
+			global.fetch = mock(async () => {
+				started.resolve();
+				await gate.promise;
+				return Response.json({
+					data: [{ id: "claude-opus-5-5" }],
+					has_more: false,
+				});
+			}) as unknown as typeof fetch;
+			const pending = fetchLiveModels(makeCtx([account]), {
+				accountId: account.id,
+			});
+			const outcome = pending.then(
+				() => null,
+				(error) => error,
+			);
+			await started.promise;
+			clearNativeAutoCatalogEvidence(account.id);
+			gate.resolve();
+			expect(await outcome).toBeInstanceOf(
+				NativeCatalogObsoleteGenerationError,
+			);
+			expect(getNativeAutoCatalogEvidence(account.id)).toBeNull();
+		});
+
+		it("still resolves an untargeted lookup superseded at publication without publishing owned evidence", async () => {
+			const account = makeAccount();
+			const started = deferred<void>();
+			const gate = deferred<void>();
+			global.fetch = mock(async () => {
+				started.resolve();
+				await gate.promise;
+				return Response.json({
+					data: [{ id: "claude-opus-5-5" }],
+					has_more: false,
+				});
+			}) as unknown as typeof fetch;
+			const pending = fetchLiveModels(makeCtx([account]));
+			await started.promise;
+			clearNativeAutoCatalogEvidence(account.id);
+			gate.resolve();
+			const models = await pending;
+			expect(models.map((entry) => entry.id)).toEqual(["claude-opus-5-5"]);
+			expect(getNativeAutoCatalogEvidence(account.id)).toBeNull();
+		});
+
+		it("untargeted lookups register once the account is selected and clear on settle", async () => {
+			const account = makeAccount();
+			const lookup = deferred<Account[]>();
+			const ctx = makeCtx([account]);
+			ctx.dbOps.getAllAccounts = () => lookup.promise;
+			global.fetch = mock(async () =>
+				Response.json({ data: [{ id: "claude-opus-5-5" }], has_more: false }),
+			) as unknown as typeof fetch;
+			const pending = fetchLiveModels(ctx);
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+			lookup.resolve([account]);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			await pending;
+			expect(getNativeAutoCatalogEvidence(account.id)).not.toBeNull();
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
+		});
+
+		it("an older untargeted lookup registering late never replaces a newer targeted entry", async () => {
+			const account = makeAccount();
+			const allAccounts = deferred<Account[]>();
+			const untargetedCtx = makeCtx([account]);
+			untargetedCtx.dbOps.getAllAccounts = () => allAccounts.promise;
+			const targetLookup = deferred<Account | null>();
+			const targetedCtx = makeCtx([account]);
+			targetedCtx.dbOps.getAccount = () => targetLookup.promise;
+			const fetchStarted = deferred<void>();
+			const gate = deferred<void>();
+			global.fetch = mock(async () => {
+				fetchStarted.resolve();
+				await gate.promise;
+				return Response.json({
+					data: [{ id: "claude-opus-5-5" }],
+					has_more: false,
+				});
+			}) as unknown as typeof fetch;
+			// Older generation (untargeted) starts first, newer (targeted) second.
+			const older = fetchLiveModels(untargetedCtx);
+			const newer = fetchLiveModels(targetedCtx, { accountId: account.id });
+			const newerSignal = getPendingNativeCatalogAcquisition(account.id);
+			expect(newerSignal).toBeInstanceOf(Promise);
+			let newerSettled = false;
+			void newerSignal?.then(() => {
+				newerSettled = true;
+			});
+			// The older lookup selects the account and reaches its fetch while the
+			// newer one is still waiting on its own account lookup.
+			allAccounts.resolve([account]);
+			await fetchStarted.promise;
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBe(newerSignal);
+			expect(newerSettled).toBe(false);
+			targetLookup.resolve(account);
+			gate.resolve();
+			await older.catch(() => undefined);
+			await newer.catch(() => undefined);
+			await newerSignal;
+			expect(getPendingNativeCatalogAcquisition(account.id)).toBeUndefined();
 		});
 
 		it("fences deletion while account lookup is pending", async () => {
