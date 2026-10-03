@@ -10,7 +10,11 @@ import {
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BUNDLED_MODELS_AS_OF, CLAUDE_MODEL_IDS } from "@better-ccflare/core";
+import {
+	BUNDLED_MODELS_AS_OF,
+	CLAUDE_MODEL_IDS,
+	isAccountAvailable,
+} from "@better-ccflare/core";
 import { getProvider } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers/proxy-types";
@@ -510,6 +514,45 @@ describe("model-catalog", () => {
 			expect(seen).toEqual(["Bearer preferred-key"]);
 			expect(enumerate).toHaveBeenCalledTimes(1);
 			expect(lookup).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			["rate-limited", { rate_limited_until: Date.now() + 60_000 }],
+			["requires reauth", { pause_reason: "oauth_invalid_grant" }],
+		] as const)("request-eligibility predicate rejects a freshly reloaded %s target before any fetch or publication", async (_label, overrides) => {
+			const target = makeAccount({ id: "target", ...overrides });
+			const ctx = makeCtx([target]);
+			const fetchMock = mock(async () => Response.json({ data: [] }));
+			global.fetch = fetchMock as unknown as typeof fetch;
+			const seen: string[] = [];
+			await expect(
+				fetchLiveModels(ctx, {
+					accountId: "target",
+					accountEligible: (a) => {
+						seen.push(a.id);
+						return isAccountAvailable(a) && !a.requires_reauth;
+					},
+				}),
+			).rejects.toThrow("not eligible for this request");
+			expect(seen).toEqual(["target"]);
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(getNativeAutoCatalogEvidence("target")).toBeNull();
+		});
+
+		it("without a request-eligibility predicate a rate-limited target is still fetched (unchanged default)", async () => {
+			const target = makeAccount({
+				id: "target",
+				rate_limited_until: Date.now() + 60_000,
+			});
+			const fetchMock = mock(async () =>
+				Response.json({ data: [{ id: "claude-opus-5-5" }], has_more: false }),
+			);
+			global.fetch = fetchMock as unknown as typeof fetch;
+			const models = await fetchLiveModels(makeCtx([target]), {
+				accountId: "target",
+			});
+			expect(models).toHaveLength(1);
+			expect(fetchMock).toHaveBeenCalledTimes(1);
 		});
 
 		it("fences deletion while targeted lookup is pending", async () => {

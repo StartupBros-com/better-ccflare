@@ -350,6 +350,16 @@ function selectEligibleAccount(
 	});
 }
 
+/** Optional request-scoped gate applied to freshly loaded accounts. */
+export type NativeCatalogAccountEligible = (account: Account) => boolean;
+
+export class NativeCatalogAccountIneligibleError extends Error {
+	constructor() {
+		super("Native catalog account is not eligible for this request");
+		this.name = "NativeCatalogAccountIneligibleError";
+	}
+}
+
 /**
  * Fetch the live list of models from Anthropic's `/v1/models` endpoint using
  * an active account's credentials. Paginates via `after_id` up to
@@ -358,7 +368,12 @@ function selectEligibleAccount(
  */
 export async function fetchLiveModels(
 	ctx: ProxyContext,
-	options?: { allowOAuth?: boolean; accountId?: string; signal?: AbortSignal },
+	options?: {
+		allowOAuth?: boolean;
+		accountId?: string;
+		signal?: AbortSignal;
+		accountEligible?: NativeCatalogAccountEligible;
+	},
 ): Promise<ModelCatalogEntry[]> {
 	options?.signal?.throwIfAborted();
 	const controller = new AbortController();
@@ -392,7 +407,12 @@ export async function fetchLiveModels(
 
 async function fetchLiveModelsUntilAborted(
 	ctx: ProxyContext,
-	options: { allowOAuth?: boolean; accountId?: string; signal: AbortSignal },
+	options: {
+		allowOAuth?: boolean;
+		accountId?: string;
+		signal: AbortSignal;
+		accountEligible?: NativeCatalogAccountEligible;
+	},
 ): Promise<ModelCatalogEntry[]> {
 	const { signal } = options;
 	signal.throwIfAborted();
@@ -407,6 +427,15 @@ async function fetchLiveModelsUntilAborted(
 		accounts = await ctx.dbOps.getAllAccounts();
 	}
 	signal.throwIfAborted();
+	// Request-scoped eligibility is judged on the freshly loaded rows, before any
+	// generation reservation, token preparation or request for that account.
+	if (options.accountEligible) {
+		const eligible = accounts.filter((a) => options.accountEligible?.(a));
+		if (accounts.length > 0 && eligible.length === 0) {
+			throw new NativeCatalogAccountIneligibleError();
+		}
+		accounts = eligible;
+	}
 	const account = selectEligibleAccount(accounts, { allowOAuth });
 	if (!account) {
 		throw new Error(

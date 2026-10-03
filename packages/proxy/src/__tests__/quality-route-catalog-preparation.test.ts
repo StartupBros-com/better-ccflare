@@ -1,34 +1,51 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { Account, QualityRoutingPolicy } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers/proxy-types";
+import * as modelCatalog from "../model-catalog";
 
 const fresh = new Map<string, { apiKey: string; createdAt: number }>();
 const calls: {
 	accountId?: string;
 	allowOAuth?: boolean;
 	signal?: AbortSignal;
+	accountEligible?: (account: Account) => boolean;
 }[] = [];
 let discover: (signal: AbortSignal) => Promise<void>;
-mock.module("../model-catalog", () => ({
-	getNativeAutoCatalogEvidence: (id: string) => fresh.get(id) ?? null,
-	validateNativeAutoCatalogCredentials: (
-		evidence: { apiKey: string; createdAt: number } | null,
-		selected: { account: Account; accessToken: string },
-	) =>
-		evidence !== null &&
-		fresh.get(selected.account.id) === evidence &&
-		evidence.apiKey === selected.account.api_key &&
-		evidence.createdAt === selected.account.created_at &&
-		selected.accessToken === "",
-	fetchLiveModels: async (_ctx: unknown, options: (typeof calls)[number]) => {
+// Scoped spies, not mock.module: a module mock has no per-file isolation, so a
+// synthetic model-catalog would leak into later files in the same process.
+// Every replaced export is restored in afterAll; unrelated exports stay real.
+const spies = [
+	spyOn(modelCatalog, "getNativeAutoCatalogEvidence").mockImplementation(
+		((id: string) => fresh.get(id) ?? null) as never,
+	),
+	spyOn(
+		modelCatalog,
+		"validateNativeAutoCatalogCredentials",
+	).mockImplementation(
+		((
+			evidence: { apiKey: string; createdAt: number } | null,
+			selected: { account: Account; accessToken: string },
+		) =>
+			evidence !== null &&
+			fresh.get(selected.account.id) === evidence &&
+			evidence.apiKey === selected.account.api_key &&
+			evidence.createdAt === selected.account.created_at &&
+			selected.accessToken === "") as never,
+	),
+	spyOn(modelCatalog, "fetchLiveModels").mockImplementation((async (
+		_ctx: unknown,
+		options: (typeof calls)[number],
+	) => {
 		calls.push(options);
 		await discover(options.signal as AbortSignal);
 		return [];
-	},
-}));
-const { prepareNativeQualityCatalogs } = await import(
-	"../quality-route-catalog-preparation"
-);
+	}) as never),
+];
+afterAll(() => {
+	for (const spy of spies) spy.mockRestore();
+});
+
+import { prepareNativeQualityCatalogs } from "../quality-route-catalog-preparation";
 
 function account(id: string, extra: Partial<Account> = {}): Account {
 	return {
@@ -100,6 +117,55 @@ beforeEach(() => {
 });
 
 describe("native quality catalog preparation (metadata mocks only)", () => {
+	test("every preparation fetch carries the one shared request-eligibility predicate", async () => {
+		const p = policy(["cold", "stale", "mismatch"]);
+		fresh.set("mismatch", { apiKey: "old-key", createdAt: 0 });
+		await prepareNativeQualityCatalogs(
+			context(p),
+			p,
+			intent,
+			[account("cold"), account("stale"), account("mismatch")],
+			{ ...options(), allowOAuth: true },
+		);
+		expect(calls.map((c) => c.accountId).toSorted()).toEqual([
+			"cold",
+			"mismatch",
+			"stale",
+		]);
+		const predicate = calls[0].accountEligible;
+		expect(typeof predicate).toBe("function");
+		expect(calls.every((c) => c.accountEligible === predicate)).toBe(true);
+		const check = predicate as (a: Account) => boolean;
+		expect(check(account("ok"))).toBe(true);
+		expect(check(account("paused", { paused: true }))).toBe(false);
+		expect(
+			check(account("limited", { rate_limited_until: Date.now() + 60_000 })),
+		).toBe(false);
+		expect(
+			check(account("reauth", { pause_reason: "oauth_invalid_grant" })),
+		).toBe(false);
+		expect(check(account("flag", { requires_reauth: true }))).toBe(false);
+		expect(
+			check(account("custom", { custom_endpoint: "https://invalid.example" })),
+		).toBe(false);
+		expect(check(account("foreign", { provider: "codex" }))).toBe(false);
+	});
+	test.each([
+		["rate-limited", { rate_limited_until: Date.now() + 60_000 }],
+		["requires reauth", { requires_reauth: true }],
+		["custom endpoint", { custom_endpoint: "https://invalid.example" }],
+		["foreign", { provider: "codex" }],
+	] as const)("the ownership shortcut uses the same predicate: a %s reload neither resolves tokens nor fetches", async (_label, extra) => {
+		const p = policy(["a"]);
+		fresh.set("a", { apiKey: "old-key", createdAt: 0 });
+		const ctx = context(p);
+		ctx.dbOps.getAccount = async () => account("a", extra as Partial<Account>);
+		await prepareNativeQualityCatalogs(ctx, p, intent, [account("a")], {
+			...options(),
+			allowOAuth: true,
+		});
+		expect(calls).toHaveLength(0);
+	});
 	test("selects enrolled available native accounts once in stable priority order; OAuth denied by default", async () => {
 		const p = policy([
 			"b",

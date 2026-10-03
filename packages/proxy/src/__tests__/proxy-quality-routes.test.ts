@@ -471,6 +471,31 @@ describe("cold native catalog acquisition", () => {
 		expect(await service.status(scope)).toBeNull();
 	});
 
+	it("an enrolled cold account that becomes rate-limited while queued receives no catalog GET and Auto still routes", async () => {
+		const live = accounts;
+		const limited = { ...live[1], rate_limited_until: Date.now() + 60_000 };
+		// The startup snapshot still shows b available; the fresh reload does not.
+		ctx.dbOps.getAccount = async (id: string) =>
+			id === "b" ? limited : (live.find((a) => a.id === id) ?? null);
+		const transport = globalThis.fetch;
+		const catalogs: string[] = [];
+		globalThis.fetch = Object.assign(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const req = input instanceof Request ? input : new Request(input, init);
+				if (req.method === "GET")
+					catalogs.push(req.headers.get("x-api-key") ?? "");
+				return transport(input, init);
+			},
+			{ preconnect: () => {} },
+		) as typeof fetch;
+		const response = await send();
+		expect(response.status).toBe(200);
+		await response.text();
+		await flush();
+		expect(catalogs).toEqual(["synthetic-a"]);
+		expect(sends.map((s) => s.authorization)).toEqual(["synthetic-a"]);
+	});
+
 	it("abort during cold catalog preparation never sends inference even if the catalog completes", async () => {
 		const abort = new AbortController();
 		const transport = globalThis.fetch;

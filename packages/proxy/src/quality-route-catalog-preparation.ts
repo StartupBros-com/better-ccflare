@@ -13,6 +13,20 @@ import {
 } from "./model-catalog";
 
 /**
+ * The single request-eligibility rule for Auto catalog preparation: the queue
+ * snapshot filter, the ownership shortcut and every discovery fetch share it, so
+ * an account that stops being eligible while queued receives no metadata traffic.
+ */
+export function isQualityCatalogRequestEligible(account: Account): boolean {
+	return (
+		account.provider === "anthropic" &&
+		isAccountAvailable(account) &&
+		!account.requires_reauth &&
+		!account.custom_endpoint
+	);
+}
+
+/**
  * Best-effort preparation, not permission or dispatch authority. The caller owns
  * permission to invoke discovery and must recheck abort and policy after awaiting
  * this helper, before compiling/admitting a request. OAuth remains denied unless
@@ -73,10 +87,7 @@ export async function prepareNativeQualityCatalogs(
 								a.id === enrollment.accountId &&
 								a.provider === enrollment.provider,
 						);
-						return account &&
-							isAccountAvailable(account) &&
-							!account.requires_reauth &&
-							!account.custom_endpoint
+						return account && isQualityCatalogRequestEligible(account)
 							? [{ account, enrollment }]
 							: [];
 					})
@@ -105,10 +116,7 @@ export async function prepareNativeQualityCatalogs(
 					stopped() ||
 					!account ||
 					account.id !== accountId ||
-					account.provider !== "anthropic" ||
-					!isAccountAvailable(account) ||
-					account.requires_reauth ||
-					account.custom_endpoint
+					!isQualityCatalogRequestEligible(account)
 				)
 					return;
 				const accessToken = await getValidAccessToken(account, ctx);
@@ -127,6 +135,7 @@ export async function prepareNativeQualityCatalogs(
 				accountId,
 				allowOAuth: options.allowOAuth ?? false,
 				signal: controller.signal,
+				accountEligible: isQualityCatalogRequestEligible,
 			});
 		};
 		let next = 0;
