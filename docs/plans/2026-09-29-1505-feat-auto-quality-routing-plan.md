@@ -699,3 +699,38 @@ The native Anthropic lane may be observed only through a real interactive Claude
 - Required lint, typecheck, formatting, isolated suites and PG tests pass; all skipped or unavailable validation remains visible.
 - Independent review cites the exact revision, abandoned-attempt code is removed, and no generated workers, credentials or unrelated config changes enter the diff.
 - The build is ready for an operator-authorized deployment and activation decision; a merge alone neither deploys nor enables Auto.
+
+
+---
+
+## Status and approved amendments — 2026-10-03 UTC
+
+**IMPLEMENTATION DEPLOYED / LIVE ACCEPTANCE OPEN**
+
+U1–U7 are implemented and shipped. This status records implementation checks, not completed live acceptance. U8 remains incomplete. [Issue #398](https://github.com/StartupBros-com/better-ccflare/issues/398) remains open and is the living remaining-acceptance list.
+
+### Merged implementation and deployment
+
+- [PR #402](https://github.com/StartupBros-com/better-ccflare/pull/402): foundation.
+- [PR #404](https://github.com/StartupBros-com/better-ccflare/pull/404): subscription-only admission.
+- [PR #407](https://github.com/StartupBros-com/better-ccflare/pull/407): provider-managed output and native capability fix.
+- [PR #413](https://github.com/StartupBros-com/better-ccflare/pull/413): exact official effort preservation.
+
+Revision `0666336ef681c827108c004cda837f5d26e4326e`, version `3.5.78`, was deployed through `scripts/deploy-ccflare.sh` using a backend-only handoff. Runtime health SHA, binary digest, service health and guard health were independently verified in the closeout. Auto local status returned HTTP `404` with `{"status":"disabled"}`. Deployment does not mean Auto is activated.
+
+### Approved post-plan amendments
+
+1. **Conservative accounting.** The implemented full-final-JSON byte estimate plus headroom preserves the full input, required tools and original requested output reserve. It remains an estimate, not a guaranteed context fit.
+2. **Explicit Codex output exception.** `allow-unbounded-output` accepts provider-managed output where the Codex catalog ceiling is missing or null. It explicitly accepts the absence of a wire-enforced caller output cap and of a guaranteed context fit. Finite known caps remain enforced. This narrowly supersedes the historical blanket unknown-output prohibition in the 2026-09-30 amendment, KTD6, the activation gates and Definition of Done only for this approved Codex case. Unknown context, unsupported tools/modalities and other missing evidence are not waived. No paid-spend grant or activation is implied.
+3. **Exact official effort.** An official `output_config` containing exactly `effort` is allowed only with current-account-owned exact-target support and literal equality with the final reasoning effort. Unknown or malformed values, extra keys and clamps (including `max` to `xhigh`) are rejected. Legacy-original, dual-original and structured-output support were not added; the ordinary resolver is unchanged.
+
+### Remaining U8 acceptance
+
+- [ ] Selected-account eligibility and applicable subscription/capability evidence.
+- [ ] Real interactive main-agent and tool-rich routing acceptance. Scripted Anthropic-backed traffic remains prohibited.
+- [ ] Actual affected-client GPT-5.6 picker provenance and any justified targeted correction.
+- [x] Compiled CLI credential isolation verified on the hash-verified production executable `0666336e`: **13/13 controls passed** in a hermetic `env -i` / `bwrap --unshare-all` sandbox with a dummy loopback API, no real homes and no provider calls. Dotenv-only credentials refused with zero HTTP; production/development/test variants and parent dotenv were ignored; explicit process credentials worked; proxy denial held despite `NO_PROXY`; redirects and non-loopback targets were denied. Only this exact-build credential gap is retired. The original smoke remains **21/22, exit 1**, with **8/9 ordinary-startup checks**: physical executable-directory dotenv fallback failed because the legacy fallback uses Bun's virtual `argv[1]` path. The virtual-directory contrast is diagnostic, not a passing replacement assertion; no pre-change binary was tested, so regression status is unverified. Ordinary-startup compatibility and unexercised lost-response redelivery remain distinct open items; see [the bounded diagnosis](../troubleshooting.md#auto-quality-routing).
+
+The historical product requirements, design decisions and verification obligations above are preserved byte-for-byte. Read their historical future-tense and blanket output-limit language with this dated amendment. Neither shipped code nor fixture checks close the outstanding live-acceptance gates.
+
+Reviewed plan, updated in place: https://claude.ai/artifact/MhARSo63DsqhdzD1BJAa2b
