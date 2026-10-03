@@ -301,11 +301,9 @@ function workerRole(
 	policy: QualityRoutingPolicy,
 ): QualityWorkerRole | null {
 	if (!model) return null;
-	if (model === `${QUALITY_MODEL_PREFIX}astra`) return "astra";
-	if (model.startsWith(QUALITY_MODEL_PREFIX))
-		return ["fable", "opus"].includes(model.slice(QUALITY_MODEL_PREFIX.length))
-			? (model.slice(QUALITY_MODEL_PREFIX.length) as QualityWorkerRole)
-			: null;
+	// A picker id on a worker is the copied main-agent preference, not a role
+	// request: workers stay standard instead of inheriting the parent's tier.
+	if (model.startsWith(QUALITY_MODEL_PREFIX)) return "standard";
 	for (const assignment of policy.assignments) {
 		if (
 			policy.accounts.some(
