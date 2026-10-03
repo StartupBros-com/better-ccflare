@@ -705,7 +705,7 @@ The native Anthropic lane may be observed only through a real interactive Claude
 
 ## Status and approved amendments — 2026-10-03 UTC
 
-**IMPLEMENTATION DEPLOYED / LIVE ACCEPTANCE OPEN**
+**IMPLEMENTATION DEPLOYED / AUTO ENABLED / LIVE ACCEPTANCE OPEN**
 
 U1–U7 are implemented and shipped. This status records implementation checks, not completed live acceptance. U8 remains incomplete. [Issue #398](https://github.com/StartupBros-com/better-ccflare/issues/398) remains open and is the living remaining-acceptance list.
 
@@ -716,7 +716,13 @@ U1–U7 are implemented and shipped. This status records implementation checks, 
 - [PR #407](https://github.com/StartupBros-com/better-ccflare/pull/407): provider-managed output and native capability fix.
 - [PR #413](https://github.com/StartupBros-com/better-ccflare/pull/413): exact official effort preservation.
 
-Revision `0666336ef681c827108c004cda837f5d26e4326e`, version `3.5.78`, was deployed through `scripts/deploy-ccflare.sh` using a backend-only handoff. Runtime health SHA, binary digest, service health and guard health were independently verified in the closeout. Auto local status returned HTTP `404` with `{"status":"disabled"}`. Deployment does not mean Auto is activated.
+- [PR #416](https://github.com/StartupBros-com/better-ccflare/pull/416): physical executable-directory dotenv fallback and compiled retry-redelivery verification.
+
+Earlier on 2026-10-03, revision `0666336ef681c827108c004cda837f5d26e4326e`, version `3.5.78`, was deployed through `scripts/deploy-ccflare.sh` using a backend-only handoff. Runtime identity and health were independently verified; Auto status then returned HTTP `404` with `{"status":"disabled"}`. This remains historical deployment evidence.
+
+The current installed revision is `312ff63dee3d31cd4c8711337d749d9c49dbb512` (v3.5.78), deployed through the unmodified script. Independent verification matched binary SHA-256 `856a539caec2715aa743fa7620ed01cdcb5b1c5a2e9734c1880b18a0d234db96`, the running executable and isolated `--git-sha` output. Both production health ports returned `ok` / `312ff63d`; the guard backend reported the full revision and the service was active/running with `NRestarts=0`.
+
+Separate later approval authorized Auto activation at **2026-10-03 04:42:21Z**, with six line assignments, eight accounts, two fallback edges and **zero paid-spend grants**. Authenticated discovery returned six preserved manual choices plus four quality choices. An unused session returned HTTP `404` with exactly `{"status":"unknown"}`, not disabled. Background-merge policy remained enabled. The integrating session verified unchanged before/after checksums for the app config and both profile files; the independent verifier corroborated the app config and route-profile drop-in but could not read the protected profile environment file. Activation and discovery are not live-provider acceptance.
 
 ### Approved post-plan amendments
 
@@ -729,7 +735,11 @@ Revision `0666336ef681c827108c004cda837f5d26e4326e`, version `3.5.78`, was deplo
 - [ ] Selected-account eligibility and applicable subscription/capability evidence.
 - [ ] Real interactive main-agent and tool-rich routing acceptance. Scripted Anthropic-backed traffic remains prohibited.
 - [ ] Actual affected-client GPT-5.6 picker provenance and any justified targeted correction.
-- [x] Compiled CLI credential isolation verified on the hash-verified production executable `0666336e`: **13/13 controls passed** in a hermetic `env -i` / `bwrap --unshare-all` sandbox with a dummy loopback API, no real homes and no provider calls. Dotenv-only credentials refused with zero HTTP; production/development/test variants and parent dotenv were ignored; explicit process credentials worked; proxy denial held despite `NO_PROXY`; redirects and non-loopback targets were denied. Only this exact-build credential gap is retired. The original smoke remains **21/22, exit 1**, with **8/9 ordinary-startup checks**: physical executable-directory dotenv fallback failed because the legacy fallback uses Bun's virtual `argv[1]` path. The virtual-directory contrast is diagnostic, not a passing replacement assertion; no pre-change binary was tested, so regression status is unverified. Ordinary-startup compatibility and unexercised lost-response redelivery remain distinct open items; see [the bounded diagnosis](../troubleshooting.md#auto-quality-routing).
+- [x] Installed compiled CLI credential/transport isolation and dotenv fallback verified at `312ff63d`: **17/17 tests (149 assertions)** and **22/22 historical checks**, using `env -i`, `bwrap --unshare-all`, absolute Bun 1.4.2 and synthetic loopback services. Physical `/app/.env`, project fallback, precedence/expansion, credential refusal, proxy denial and redirect refusal passed; the historical suite made zero proxy-port contacts.
+- [x] Actual compiled CLI lost-response retry-redelivery smoke: GET → POST → POST, identical idempotency-bearing bodies and one synthetic mutation. This is synthetic receipt-server evidence, not live-handler persistence or live-provider routing.
+- [ ] Real interactive main/home/worker/fallback behavior and authenticated retry acceptance remain unverified; no real interactive Auto turn has been supplied for this check.
+
+**Historical smoke — 2026-10-03, `0666336e`, before #416:** **21/22, exit 1**, including 13/13 credential controls and 8/9 ordinary-startup checks. Physical executable-directory dotenv fallback failed because the legacy fallback used Bun's virtual `argv[1]` path. The virtual-directory contrast was diagnostic, not a passing replacement assertion; no pre-change binary was tested, so regression attribution remains unverified. The installed `312ff63d` results above retire the fallback and CLI-redelivery gaps, while preserving [the original diagnosis](../troubleshooting.md#auto-quality-routing).
 
 The historical product requirements, design decisions and verification obligations above are preserved byte-for-byte. Read their historical future-tense and blanket output-limit language with this dated amendment. Neither shipped code nor fixture checks close the outstanding live-acceptance gates.
 
