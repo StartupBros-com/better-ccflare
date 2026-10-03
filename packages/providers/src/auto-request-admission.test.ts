@@ -999,3 +999,94 @@ describe("Auto request suitability (fixtures are not activation proof)", () => {
 		).toMatchObject({ status: "unknown", reason: "catalog-evidence-stale" });
 	});
 });
+
+describe("Auto advisor admission is decided by first-party status", () => {
+	const advisorTool = {
+		type: "advisor_20260301",
+		name: "advisor",
+		model: "claude-opus-5-5",
+	};
+	const clientTool = {
+		name: "Read",
+		input_schema: { type: "object", properties: {} },
+	};
+	const advisorHistory = [
+		{ role: "user", content: "hello" },
+		{
+			role: "assistant",
+			content: [
+				{
+					type: "server_tool_use",
+					id: "srvtoolu_1",
+					name: "advisor",
+					input: {},
+				},
+				{
+					type: "advisor_tool_result",
+					tool_use_id: "srvtoolu_1",
+					content: { type: "advisor_result", text: "use a map" },
+				},
+				{ type: "text", text: "done" },
+			],
+		},
+		{ role: "user", content: "continue" },
+	];
+	const decide = (original: Record<string, unknown>, firstParty?: boolean) =>
+		evaluateAutoRequestAdmission({
+			...fixture(10000),
+			requirements: captureAutoRequestRequirements(original),
+			finalBody: { ...original, model: "claude-fable-5-1" },
+			...(firstParty === undefined ? {} : { firstPartyAnthropic: firstParty }),
+		});
+
+	it("admits the advisor declaration beside client tools on a first-party candidate", () => {
+		expect(
+			decide({ ...body, tools: [clientTool, advisorTool] }, true).status,
+		).toBe("admit");
+	});
+	it("admits advisor-only history on a first-party candidate", () => {
+		expect(decide({ ...body, messages: advisorHistory }, true).status).toBe(
+			"admit",
+		);
+	});
+	it("does not admit the advisor declaration on a native candidate that is not first-party", () => {
+		for (const firstParty of [false, undefined])
+			expect(decide({ ...body, tools: [advisorTool] }, firstParty)).toEqual({
+				status: "reject",
+				reason: "tools-unsupported",
+			});
+	});
+	it("does not admit advisor history on a native candidate that is not first-party", () => {
+		expect(decide({ ...body, messages: advisorHistory }, false)).toEqual({
+			status: "reject",
+			reason: "tools-unsupported",
+		});
+	});
+	it("still rejects an unknown advisor type and keeps other typed tools unadmitted", () => {
+		expect(
+			decide(
+				{ ...body, tools: [{ type: "advisor_20990101", name: "advisor" }] },
+				true,
+			).status,
+		).not.toBe("admit");
+		expect(
+			decide(
+				{ ...body, tools: [{ type: "code_execution_20250825", name: "x" }] },
+				true,
+			).status,
+		).not.toBe("admit");
+	});
+	it("leaves non-advisor admission unchanged by the first-party flag", () => {
+		for (const original of [
+			body,
+			{ ...body, tools: [clientTool] },
+			{ ...body, tools: [{ type: "weird_tool", name: "w" }] },
+		]) {
+			const outcomes = [true, false, undefined].map((flag) =>
+				decide(original, flag),
+			);
+			expect(outcomes[1]).toEqual(outcomes[0]);
+			expect(outcomes[2]).toEqual(outcomes[0]);
+		}
+	});
+});

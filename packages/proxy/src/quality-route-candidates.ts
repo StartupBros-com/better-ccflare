@@ -1,4 +1,8 @@
-import { getModelFamily, isAccountAvailable } from "@better-ccflare/core";
+import {
+	getModelFamily,
+	isAccountAvailable,
+	isFirstPartyAnthropicAccount,
+} from "@better-ccflare/core";
 import type {
 	QualityConversation,
 	QualityIngressTicket,
@@ -57,6 +61,12 @@ import { prepareNativeQualityCatalogs } from "./quality-route-catalog-preparatio
 import type { RequestBodyContext } from "./request-body-context";
 import { recordRoutingTerminalRequest } from "./routing-terminal-recorder";
 import { bindRequestPrivateServerToolReplay } from "./server-tool-replay-runtime";
+import {
+	createNativeAnthropicToolRoutingError,
+	createServerToolRoutingErrorResponse,
+	ServerToolCandidateCapabilityError,
+	type ServerToolRoutingError,
+} from "./server-tool-routing-errors";
 import { tryGetUsageCollector } from "./usage-collector";
 
 export const QUALITY_MODEL_PREFIX = "claude-bccf-quality-";
@@ -620,6 +630,54 @@ export async function routeQualityRequest(input: {
 
 		const ledger = new RoutingAttemptLedger();
 		const serverTools = body.finalizeServerToolRequirements();
+		// Advisor is native-only, so Auto admits it per candidate (first-party
+		// accounts) and refuses recoverably when only other candidates remain.
+		const nativeRequirement = body.finalizeNativeAnthropicToolRequirement();
+		meta.nativeAnthropicToolRequirement = nativeRequirement ?? null;
+		const persistRejection = async () => {
+			if (!conversation) return;
+			try {
+				await service.recordRejectedDecision(
+					session,
+					incarnation,
+					conversation.key,
+					conversation.revision,
+					meta.id,
+					meta.qualityDecision,
+				);
+			} catch {
+				/* Explanation failure never triggers inference or changes routing. */
+			}
+		};
+		const refuseServerTool = async (error: ServerToolRoutingError) => {
+			await persistRejection();
+			const response = createServerToolRoutingErrorResponse(error);
+			void recordRoutingTerminalRequest({
+				collector: tryGetUsageCollector(),
+				requestMeta: meta,
+				requestHeaders: req.headers,
+				response,
+				providerName: ctx.provider.name,
+				terminalKind: `server_tool_${error.reason}`,
+				upstreamAttempts: ledger.attemptedCount,
+				apiKeyId,
+				apiKeyName,
+			});
+			return response;
+		};
+		// Advisor beside a proxy-hosted tool, or an advisor_* type this proxy does
+		// not know, cannot be served by any route. A request already invalid or
+		// unsupported keeps its existing terminal below.
+		if (
+			nativeRequirement &&
+			!serverTools?.invalid?.length &&
+			!serverTools?.unsupported?.length &&
+			(serverTools !== undefined ||
+				nativeRequirement.unknownDeclaredTypes.length > 0)
+		)
+			return await refuseServerTool(
+				createNativeAnthropicToolRoutingError(nativeRequirement),
+			);
 		if (serverTools) {
 			if (serverTools.invalid?.length || serverTools.unsupported?.length)
 				return unavailable("tools-unsupported");
@@ -635,6 +693,7 @@ export async function routeQualityRequest(input: {
 			)
 				return unavailable("tool-replay-unavailable");
 		}
+		let advisorSkipped = false;
 		const degraded = ctx.anthropicDegradedMode?.createRequestAdmission({
 			cohortKey: null,
 			risk: classifyAnthropicReplayRisk({
@@ -674,6 +733,13 @@ export async function routeQualityRequest(input: {
 				: { status: "unknown", reason: "capacity-evidence-unknown" };
 			if (capacityDecision.status !== "admit") {
 				recordSkip(candidate.target.lane, capacityDecision.reason);
+				continue;
+			}
+			// A candidate that passed availability and capacity but cannot run advisor
+			// is skipped before any wire is built, so nothing reaches its upstream.
+			if (nativeRequirement && !isFirstPartyAnthropicAccount(account)) {
+				advisorSkipped = true;
+				recordSkip(candidate.target.lane, "tools-unsupported");
 				continue;
 			}
 			let lease: QualityLease | null = null;
@@ -974,6 +1040,17 @@ export async function routeQualityRequest(input: {
 					await settle({ kind: "failed" });
 					return unavailable("pre-dispatch-state-changed");
 				}
+				// The dispatch backstop rejects a non-first-party account before any
+				// wire exists. That is a skip, never a whole-request failure.
+				if (
+					error instanceof ServerToolCandidateCapabilityError &&
+					error.reason === "provider_unavailable" &&
+					nativeRequirement
+				) {
+					advisorSkipped = true;
+					recordSkip(candidate.target.lane, "tools-unsupported");
+					continue;
+				}
 				if (!(error instanceof QualityAttemptRejected))
 					return unavailable("attempt-unavailable");
 			} finally {
@@ -986,20 +1063,11 @@ export async function routeQualityRequest(input: {
 					)?.release();
 			}
 		}
-		if (conversation) {
-			try {
-				await service.recordRejectedDecision(
-					session,
-					incarnation,
-					conversation.key,
-					conversation.revision,
-					meta.id,
-					meta.qualityDecision,
-				);
-			} catch {
-				/* Explanation failure never triggers inference or changes routing. */
-			}
-		}
+		if (nativeRequirement && advisorSkipped)
+			return await refuseServerTool(
+				createNativeAnthropicToolRoutingError(nativeRequirement),
+			);
+		await persistRejection();
 		const response = unavailable(lastAdmissionReason);
 		void recordRoutingTerminalRequest({
 			collector: tryGetUsageCollector(),

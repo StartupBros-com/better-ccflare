@@ -1,3 +1,4 @@
+import { isFirstPartyAnthropicAccount } from "@better-ccflare/core";
 import {
 	type AutoRequestAdmissionInput,
 	evaluateAutoRequestAdmission,
@@ -18,14 +19,15 @@ import { evaluateAutoCapacity } from "./usage-throttling";
 export interface QualityRouteAdmissionInput {
 	readonly account: Pick<
 		Account,
-		"id" | "provider" | "paused" | "rate_limited_until"
+		"id" | "provider" | "paused" | "rate_limited_until" | "custom_endpoint"
 	>;
 	/** Re-read trusted compiled policy after credential preparation. */
 	readonly policy: Pick<
 		QualityRoutingPolicy,
 		"accounts" | "assignments" | "spendGrants"
 	>;
-	readonly request: AutoRequestAdmissionInput;
+	/** The candidate's first-party status is derived here from `account`. */
+	readonly request: Omit<AutoRequestAdmissionInput, "firstPartyAnthropic">;
 	/** Actual transport credentials, resolved by the server after all preparation.
 	 * Never populate from request headers/body. Missing credentials fail closed.
 	 */
@@ -81,7 +83,10 @@ export function evaluateQualityRouteAdmission(
 		accessToken: input.selectedCredentials?.accessToken ?? null,
 	});
 	if (capacity.status !== "admit") return capacity;
-	const fit = evaluateAutoRequestAdmission(request);
+	const fit = evaluateAutoRequestAdmission({
+		...request,
+		firstPartyAnthropic: isFirstPartyAnthropicAccount(account as Account),
+	});
 	if (fit.status === "reject") return fit;
 	const selected = input.selectedCredentials;
 	if (

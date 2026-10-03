@@ -13,9 +13,12 @@ import {
 	resolveAutoModelTargets,
 } from "./auto-model-capabilities";
 import {
+	ADVISOR_SERVER_TOOL_NAME,
+	deriveNativeAnthropicToolRequirement,
 	deriveServerToolRequirement,
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
+	NATIVE_ANTHROPIC_PASSTHROUGH_TOOL_TYPES,
 } from "./server-tool-capabilities";
 import type {
 	Provider,
@@ -93,6 +96,9 @@ export interface AutoRequestAdmissionInput {
 	readonly catalog: AutoCatalogEvidence | null;
 	/** Exact parsed physical request, after provider transformation. */
 	readonly finalBody: unknown;
+	/** Whether the candidate account is first-party Anthropic (KTD2). Only such a
+	 * candidate may carry advisor content; an absent value counts as false. */
+	readonly firstPartyAnthropic?: boolean;
 	/** Trusted provider implementation and selected account; not request-supplied proof. */
 	readonly hostedTools?: {
 		readonly provider: Provider;
@@ -129,6 +135,7 @@ export function revalidateAutoTarget(
 function modalities(
 	body: Record<string, unknown>,
 	native: boolean,
+	advisor: boolean,
 ): Set<string> | null {
 	const found = new Set<string>();
 	const visit = (value: unknown): boolean => {
@@ -194,6 +201,22 @@ function modalities(
 					record(block.input) !== null &&
 					onlyKeys(block, ["type", "id", "name", "input", "cache_control"])
 				);
+			case "server_tool_use":
+				if (!advisor || block.name !== ADVISOR_SERVER_TOOL_NAME) return false;
+				found.add("text");
+				return (
+					typeof block.id === "string" &&
+					record(block.input) !== null &&
+					onlyKeys(block, ["type", "id", "name", "input"])
+				);
+			case "advisor_tool_result":
+				if (!advisor) return false;
+				found.add("text");
+				return (
+					typeof block.tool_use_id === "string" &&
+					record(block.content) !== null &&
+					onlyKeys(block, ["type", "tool_use_id", "content"])
+				);
 			default:
 				return false;
 		}
@@ -218,12 +241,37 @@ function onlyKeys(
  * existing function adapter. This does NOT infer hosted-tool support from a flag.
  * Unknown tool variants/schemas are deliberately outside this contract.
  */
-function clientTools(body: Record<string, unknown>, native: boolean): boolean {
+function clientTools(
+	body: Record<string, unknown>,
+	native: boolean,
+	advisor: boolean,
+): boolean {
 	return (
 		body.tools === undefined ||
 		(Array.isArray(body.tools) &&
 			body.tools.every((value) => {
 				const tool = record(value);
+				// The advisor declaration is a typed passthrough tool, not a client
+				// function: the first-party upstream executes it and the preservation
+				// check below keeps it byte-equal.
+				if (
+					advisor &&
+					tool &&
+					typeof tool.type === "string" &&
+					NATIVE_ANTHROPIC_PASSTHROUGH_TOOL_TYPES.includes(tool.type)
+				)
+					return (
+						tool.name === ADVISOR_SERVER_TOOL_NAME &&
+						typeof tool.model === "string" &&
+						onlyKeys(tool, [
+							"type",
+							"name",
+							"model",
+							"max_uses",
+							"caching",
+							"cache_control",
+						])
+					);
 				return (
 					tool &&
 					onlyKeys(tool, [
@@ -543,6 +591,15 @@ export function evaluateAutoRequestAdmission(
 		!supportsForcedToolChoice(target.physicalModel)
 	)
 		return { status: "reject", reason: "tools-unsupported" };
+	// Advisor runs only where api.anthropic.com executes it (KTD8). Any other
+	// candidate, including an anthropic one on a custom endpoint, is unsuitable.
+	const advisorRequired =
+		deriveNativeAnthropicToolRequirement(original) !== undefined;
+	if (
+		advisorRequired &&
+		(input.firstPartyAnthropic !== true || target.provider !== "anthropic")
+	)
+		return { status: "reject", reason: "tools-unsupported" };
 	const capabilities = target.capabilities;
 	const output = positiveSafeCapacity(original.max_tokens);
 	if (output === null)
@@ -555,6 +612,7 @@ export function evaluateAutoRequestAdmission(
 	const requestedModalities = modalities(
 		original,
 		target.provider === "anthropic",
+		advisorRequired,
 	);
 	if (
 		requestedModalities &&
@@ -597,7 +655,10 @@ export function evaluateAutoRequestAdmission(
 			return { status: "unknown", reason: "tools-unsupported" };
 		}
 	}
-	if (!hosted && !clientTools(original, target.provider === "anthropic"))
+	if (
+		!hosted &&
+		!clientTools(original, target.provider === "anthropic", advisorRequired)
+	)
 		return { status: "unknown", reason: "tools-unsupported" };
 	if (target.provider === "anthropic") {
 		const finalOutput = positiveSafeCapacity(final.max_tokens);
