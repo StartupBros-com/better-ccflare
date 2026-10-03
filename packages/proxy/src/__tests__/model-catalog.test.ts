@@ -294,6 +294,174 @@ describe("model-catalog", () => {
 
 	describe("fetchLiveModels", () => {
 		it.each([
+			false,
+			true,
+		])("cancels a pending body promptly without late publication or pagination (has_more=%s)", async (hasMore) => {
+			const controller = new AbortController();
+			const reading = deferred<void>();
+			const body = deferred<unknown>();
+			const fetchMock = mock(async () => {
+				const response = Response.json({});
+				response.json = async () => {
+					reading.resolve();
+					return body.promise;
+				};
+				return response;
+			});
+			global.fetch = Object.assign(fetchMock, { preconnect: () => {} });
+			const pending = fetchLiveModels(makeCtx([makeAccount()]), {
+				signal: controller.signal,
+			});
+			const outcome = pending.then(
+				() => "resolved",
+				() => "cancelled",
+			);
+			await reading.promise;
+			controller.abort(new Error("caller cancelled"));
+			try {
+				expect(
+					await Promise.race([
+						outcome,
+						new Promise((resolve) =>
+							setTimeout(() => resolve("still pending"), 25),
+						),
+					]),
+				).toBe("cancelled");
+			} finally {
+				body.resolve({
+					data: [{ id: "claude-late" }],
+					has_more: hasMore,
+					last_id: "claude-late",
+				});
+				await outcome;
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(getNativeAutoCatalogEvidence("acc-1")).toBeNull();
+		});
+
+		it("shares one ten-second deadline across pagination and body reading, rejecting late success", async () => {
+			const reading = deferred<void>();
+			const body = deferred<unknown>();
+			const fetchSignals: (AbortSignal | null | undefined)[] = [];
+			global.fetch = Object.assign(
+				async (_url: unknown, init?: RequestInit) => {
+					fetchSignals.push(init?.signal);
+					if (fetchSignals.length === 1) {
+						await new Promise((resolve) => setTimeout(resolve, 1_500));
+						return Response.json({
+							data: [{ id: "first-page" }],
+							has_more: true,
+							last_id: "first-page",
+						});
+					}
+					const response = Response.json({});
+					response.json = async () => {
+						reading.resolve();
+						return body.promise;
+					};
+					return response;
+				},
+				{ preconnect: () => {} },
+			);
+			const pending = fetchLiveModels(makeCtx([makeAccount()]));
+			const outcome = pending.then(
+				() => "resolved",
+				() => "timed out",
+			);
+			await reading.promise;
+			try {
+				expect(
+					await Promise.race([
+						outcome,
+						new Promise((resolve) =>
+							setTimeout(() => resolve("still pending"), 9_000),
+						),
+					]),
+				).toBe("timed out");
+				expect(fetchSignals).toHaveLength(2);
+				expect(fetchSignals[0]?.aborted).toBe(true);
+				expect(fetchSignals[1]?.aborted).toBe(true);
+			} finally {
+				body.resolve({ data: [{ id: "claude-late" }], has_more: false });
+				await outcome;
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			expect(getNativeAutoCatalogEvidence("acc-1")).toBeNull();
+		}, 15_000);
+		it.each([
+			"lookup",
+			"headers",
+		])("cancels pending %s without late body reads or new traffic", async (phase) => {
+			const controller = new AbortController();
+			const entered = deferred<void>();
+			const resume = deferred<void>();
+			const account = makeAccount();
+			const ctx = makeCtx([account]);
+			if (phase === "lookup") {
+				ctx.dbOps.getAccount = async () => {
+					entered.resolve();
+					await resume.promise;
+					return account;
+				};
+			}
+			const readBody = mock(async () => ({
+				data: [{ id: "claude-late" }],
+				has_more: false,
+			}));
+			const fetchMock = mock(async () => {
+				entered.resolve();
+				await resume.promise;
+				const response = Response.json({});
+				response.json = readBody;
+				return response;
+			});
+			global.fetch = Object.assign(fetchMock, { preconnect: () => {} });
+			const pending = fetchLiveModels(ctx, {
+				accountId: account.id,
+				signal: controller.signal,
+			});
+			const outcome = pending.then(
+				() => "resolved",
+				() => "cancelled",
+			);
+			await entered.promise;
+			controller.abort();
+			try {
+				expect(
+					await Promise.race([
+						outcome,
+						new Promise((resolve) =>
+							setTimeout(() => resolve("still pending"), 25),
+						),
+					]),
+				).toBe("cancelled");
+			} finally {
+				resume.resolve();
+				await outcome;
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			expect(fetchMock).toHaveBeenCalledTimes(phase === "lookup" ? 0 : 1);
+			expect(readBody).not.toHaveBeenCalled();
+			expect(getNativeAutoCatalogEvidence(account.id)).toBeNull();
+		});
+
+		it("rejects an already-cancelled lookup without upstream traffic", async () => {
+			const controller = new AbortController();
+			controller.abort(new Error("caller cancelled"));
+			const fetchMock = mock(async () =>
+				Response.json({ data: [], has_more: false }),
+			);
+			global.fetch = Object.assign(fetchMock, { preconnect: () => {} });
+			await expect(
+				fetchLiveModels(makeCtx([makeAccount()]), {
+					signal: controller.signal,
+				}),
+			).rejects.toThrow("caller cancelled");
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(getNativeAutoCatalogEvidence("acc-1")).toBeNull();
+		});
+		it.each([
 			["missing", null],
 			["paused", { paused: true }],
 			["wrong provider", { provider: "zai" }],

@@ -353,12 +353,49 @@ function selectEligibleAccount(
 /**
  * Fetch the live list of models from Anthropic's `/v1/models` endpoint using
  * an active account's credentials. Paginates via `after_id` up to
- * `MAX_PAGES` pages defensively.
+ * `MAX_PAGES` pages defensively. One ten-second deadline covers the entire
+ * lookup, including response bodies and pagination; callers may cancel early.
  */
 export async function fetchLiveModels(
 	ctx: ProxyContext,
-	options?: { allowOAuth?: boolean; accountId?: string },
+	options?: { allowOAuth?: boolean; accountId?: string; signal?: AbortSignal },
 ): Promise<ModelCatalogEntry[]> {
+	options?.signal?.throwIfAborted();
+	const controller = new AbortController();
+	const signal = options?.signal
+		? AbortSignal.any([options.signal, controller.signal])
+		: controller.signal;
+	const timeoutId = setTimeout(
+		() =>
+			controller.abort(
+				new DOMException("Model catalog fetch timed out", "TimeoutError"),
+			),
+		FETCH_TIMEOUT_MS,
+	);
+	let onAbort!: () => void;
+	const cancelled = new Promise<never>((_resolve, reject) => {
+		onAbort = () => reject(signal.reason);
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+	try {
+		// Also bound awaits that do not honor AbortSignal (e.g. account lookup).
+		// The worker checks the signal after each await before any further effects.
+		return await Promise.race([
+			fetchLiveModelsUntilAborted(ctx, { ...options, signal }),
+			cancelled,
+		]);
+	} finally {
+		clearTimeout(timeoutId);
+		signal.removeEventListener("abort", onAbort);
+	}
+}
+
+async function fetchLiveModelsUntilAborted(
+	ctx: ProxyContext,
+	options: { allowOAuth?: boolean; accountId?: string; signal: AbortSignal },
+): Promise<ModelCatalogEntry[]> {
+	const { signal } = options;
+	signal.throwIfAborted();
 	// Reserve before the first await: deletion or a newer lookup must fence us.
 	const generation = ++nextNativeEvidenceGeneration;
 	const allowOAuth = options?.allowOAuth ?? false;
@@ -369,6 +406,7 @@ export async function fetchLiveModels(
 	} else {
 		accounts = await ctx.dbOps.getAllAccounts();
 	}
+	signal.throwIfAborted();
 	const account = selectEligibleAccount(accounts, { allowOAuth });
 	if (!account) {
 		throw new Error(
@@ -383,6 +421,7 @@ export async function fetchLiveModels(
 	nativeEvidenceGeneration.set(account.id, generation);
 	const provider = getProvider(account.provider) || ctx.provider;
 	const accessToken = await getValidAccessToken(account, ctx);
+	signal.throwIfAborted();
 	if (nativeEvidenceGeneration.get(account.id) !== generation)
 		throw new Error("obsolete native catalog generation");
 	const selected = { account: { ...account }, accessToken };
@@ -406,18 +445,13 @@ export async function fetchLiveModels(
 		const query = afterId ? `?after_id=${encodeURIComponent(afterId)}` : "";
 		const url = provider.buildUrl("/v1/models", query, account);
 
-		const controller = new AbortController();
-		const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-		let response: Response;
-		try {
-			response = await fetch(url, {
-				method: "GET",
-				headers,
-				signal: controller.signal,
-			});
-		} finally {
-			clearTimeout(timeoutId);
-		}
+		signal.throwIfAborted();
+		const response = await fetch(url, {
+			method: "GET",
+			headers,
+			signal,
+		});
+		signal.throwIfAborted();
 
 		if (!response.ok) {
 			throw new Error(
@@ -426,6 +460,7 @@ export async function fetchLiveModels(
 		}
 
 		const body = (await response.json()) as AnthropicModelsPageResponse;
+		signal.throwIfAborted();
 		for (const m of body.data ?? []) {
 			models.push(nativeEntry(m));
 		}
