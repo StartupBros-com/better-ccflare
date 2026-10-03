@@ -18,10 +18,13 @@ interface Line {
  * Carry quoting state across text blocks; splitting a wrapper cannot promote it.
  * This is deliberately not a general Markdown parser or an authority evaluator.
  */
-function instructionLines(texts: { text: string; block: number }[]): Line[] {
+function instructionLines(
+	texts: { text: string; block: number }[],
+): Line[] | null {
 	const lines: Line[] = [];
 	let fence: { marker: string; length: number } | undefined;
-	const tags: string[] = [];
+	let wrapper: string | undefined;
+	let ambiguousClose = false;
 	let comment = false;
 	for (const { text, block } of texts) {
 		let offset = 0;
@@ -29,6 +32,7 @@ function instructionLines(texts: { text: string; block: number }[]): Line[] {
 			const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
 			const current = { text: line, block, offset };
 			offset += raw.length + 1;
+			if (wrapper && line.includes(`</${wrapper}>`)) ambiguousClose = true;
 			const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
 			if (fence) {
 				if (
@@ -39,7 +43,7 @@ function instructionLines(texts: { text: string; block: number }[]): Line[] {
 					fence = undefined;
 				continue;
 			}
-			const wasWrapped = tags.length > 0;
+			const wasWrapped = wrapper !== undefined;
 			let hasTag = false;
 			let cursor = 0;
 			// Consume markup in source order: a comment excludes only its own
@@ -55,19 +59,18 @@ function instructionLines(texts: { text: string; block: number }[]): Line[] {
 				const remaining = line.slice(cursor);
 				if (/^(?: {4}|\t|\s*>)/.test(remaining)) break;
 				const openingFence = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(remaining);
-				if (openingFence && tags.length === 0 && !hasTag) {
+				if (openingFence && !hasTag) {
 					fence = {
 						marker: openingFence[1][0],
 						length: openingFence[1].length,
 					};
 					break;
 				}
-				// Only block-leading markup can open an exclusion. Inline mentions
-				// in prose or inline code must not hide later instructions.
-				const match =
-					tags.length === 0 && !hasTag && !/^ {0,3}</.test(remaining)
-						? null
-						: /<!--|<(\/?)([A-Za-z][\w:.-]*)\b[^>]*>/.exec(remaining);
+				// Only block-leading markup can change an exclusion. Inline mentions
+				// in prose or inline code cannot open or close a host wrapper.
+				const match = /^ {0,3}(?:<!--|<(\/?)([A-Za-z][\w:.-]*)\b[^>]*>)/.exec(
+					remaining,
+				);
 				if (!match) {
 					if (!wasWrapped && !hasTag)
 						lines.push({
@@ -78,20 +81,35 @@ function instructionLines(texts: { text: string; block: number }[]): Line[] {
 					break;
 				}
 				cursor += match.index + match[0].length;
-				if (match[0] === "<!--") {
+				if (match[0].trimStart() === "<!--") {
+					if (wrapper) {
+						// Only skip comments on this boundary line. An unmatched
+						// literal in the opaque body must not hide the real close.
+						const end = line.indexOf("-->", cursor);
+						if (end === -1) break;
+						cursor = end + 3;
+						continue;
+					}
 					comment = true;
 					continue;
 				}
 				hasTag = true;
 				if (match[1]) {
-					if (tags.at(-1) === match[2]) tags.pop();
-				} else if (!match[0].endsWith("/>")) {
-					tags.push(match[2]);
+					if (wrapper === match[2]) {
+						wrapper = undefined;
+						ambiguousClose = false;
+					}
+				} else if (!wrapper && !match[0].endsWith("/>")) {
+					// The outer wrapper owns the exclusion. Interior generic tags,
+					// including unmatched tags and HTML void elements, are opaque.
+					wrapper = match[2];
 				}
 			}
 		}
 	}
-	return lines;
+	// A quoted/fenced close cannot establish host authority. If no real close
+	// follows it, reject the ambiguity instead of silently forwarding the ban.
+	return wrapper && ambiguousClose ? null : lines;
 }
 
 export type BackgroundMergePolicyResult =
@@ -114,6 +132,7 @@ export function applyClaudeCodeBackgroundMergePolicy(
 		}
 	}
 	const lines = instructionLines(texts);
+	if (lines === null) return "incompatible";
 	const headings = lines.filter((line) =>
 		/^\s*(?:#{1,6}\s*background[\s_-]+session\b.*|background[\s_-]+session\s*)$/i.test(
 			line.text,

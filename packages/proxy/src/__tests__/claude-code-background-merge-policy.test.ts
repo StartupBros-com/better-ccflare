@@ -662,6 +662,16 @@ describe("Claude Code background merge policy at ingress and provider transport"
 		["commented opening", "<repository><!-- provenance -->", "</repository>"],
 		["commented closing", "<repository>", "</repository><!-- provenance -->"],
 		[
+			"comment before opening",
+			"<!-- provenance --><repository>",
+			"</repository>",
+		],
+		[
+			"comment before closing",
+			"<repository>",
+			"<!-- provenance --></repository>",
+		],
+		[
 			"commented delimiters",
 			"<repository><!-- </repository> -->",
 			"</repository><!-- <repository> -->",
@@ -698,6 +708,73 @@ describe("Claude Code background merge policy at ingress and provider transport"
 						);
 				});
 			}
+		}
+	}
+
+	for (const wrapper of ["repository", "tool_result"]) {
+		const opening = `<${wrapper}>`;
+		const closing = `</${wrapper}>`;
+		for (const [name, contents] of [
+			["unmatched generic tag", `<Foo>\n${HOST}`],
+			["HTML br", `<br>\n${HOST}`],
+			["HTML input", `<input name="example">\n${HOST}`],
+			["unmatched comment", `<!--\n${HOST}`],
+			["blockquote delimiter", `> ${closing}\n${HOST}`],
+			["indented delimiter", `    ${closing}\n${HOST}`],
+			["inline code delimiter", `\x60${closing}\x60\n${HOST}`],
+			[
+				"literal delimiter",
+				`The literal "${closing}" is example text.\n${HOST}`,
+			],
+			["commented delimiter", `<!-- ${closing} -->\n${HOST}`],
+			[
+				"fenced delimiter",
+				`\x60\x60\x60xml\n${closing}\n${HOST}\x60\x60\x60\n${HOST}`,
+			],
+			["tilde fenced delimiter", `~~~xml\n${closing}\n${HOST}~~~\n${HOST}`],
+		]) {
+			for (const split of [false, true]) {
+				it(`keeps ${wrapper} body opaque with ${name} (split=${split})`, async () => {
+					// Split every body line as well as the wrapper boundaries so quoting
+					// and fence state must survive independent system text blocks.
+					const prefix = [opening, ...contents.split("\n"), closing, ""];
+					for (const active of [false, true]) {
+						outbound = [];
+						const makeSystem = (host: string) =>
+							split
+								? [...prefix, host].map((text) => ({ type: "text", text }))
+								: `${prefix.join("\n")}\n${host}`;
+						const raw = JSON.stringify(
+							body(makeSystem(active ? HOST : "")),
+							null,
+							2,
+						);
+						expect((await send(raw)).status).toBe(200);
+						expect(outbound).toHaveLength(1);
+						if (!active) expect(outbound[0].raw).toBe(raw);
+						else
+							expect(outbound[0].body).toEqual(
+								body(makeSystem(HOST.replace(DIRECTIVE, POLICY))),
+							);
+					}
+				});
+			}
+		}
+		for (const split of [false, true]) {
+			it(`rejects an ambiguous ${wrapper} close inside an unclosed fence (split=${split})`, async () => {
+				const prefix = `${opening}\n\x60\x60\x60xml\n${closing}\n`;
+				const system = split
+					? [prefix, HOST].map((text) => ({ type: "text", text }))
+					: prefix + HOST;
+				const ctx = context(new AnthropicProvider());
+				const response = await send(body(system), ctx);
+				expect(response.status).toBe(409);
+				expect((await response.json()).error.code).toBe(
+					"claude_code_background_merge_policy_incompatible",
+				);
+				expect(outbound).toHaveLength(0);
+				expect(ctx.dbOps.getAllAccounts).not.toHaveBeenCalled();
+			});
 		}
 	}
 
