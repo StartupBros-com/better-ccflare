@@ -1552,6 +1552,25 @@ class API extends HttpClient {
 		}
 	}
 
+	async updateAccountCodexCreditDrain(
+		accountId: string,
+		enabled: boolean,
+	): Promise<void> {
+		const url = `/api/accounts/${accountId}/codex-credit-drain`;
+		this.logger.debug(`→ POST ${url}`, { enabled });
+		try {
+			await this.post(url, { enabled: enabled ? 1 : 0 });
+		} catch (error) {
+			this.logger.error(`✗ POST ${url} - ERROR`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			if (error instanceof HttpError) {
+				throw new Error(error.message, { cause: error });
+			}
+			throw error;
+		}
+	}
+
 	async updateAccountCustomEndpoint(
 		accountId: string,
 		customEndpoint: string | null,

@@ -641,6 +641,18 @@ export function AccountsTab() {
 		}
 	};
 
+	const handleCodexCreditDrainToggle = async (account: Account) => {
+		try {
+			await api.updateAccountCodexCreditDrain(
+				account.id,
+				!account.codexCreditDrainEnabled,
+			);
+			await loadAccounts();
+		} catch (err) {
+			setActionError(formatError(err));
+		}
+	};
+
 	const handleCustomEndpointChange = (account: Account) => {
 		setCustomEndpointDialog({ isOpen: true, account });
 	};
@@ -796,6 +808,7 @@ export function AccountsTab() {
 						onAutoRefreshToggle={handleAutoRefreshToggle}
 						onBillingTypeToggle={handleBillingTypeToggle}
 						onAutoPauseOnOverageToggle={handleAutoPauseOnOverageToggle}
+						onCodexCreditDrainToggle={handleCodexCreditDrainToggle}
 						onPeakHoursPauseToggle={handlePeakHoursPauseToggle}
 						onCustomEndpointChange={handleCustomEndpointChange}
 						onModelMappingsChange={handleModelMappingsChange}
