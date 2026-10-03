@@ -507,6 +507,7 @@ export async function routeQualityRequest(input: {
 			await prepareNativeQualityCatalogs(ctx, policy, intent, accounts, {
 				signal: req.signal,
 				allowOAuth: true,
+				conversation,
 			});
 			accounts = await ctx.dbOps.getAllAccounts();
 		}

@@ -416,6 +416,255 @@ describe("native quality catalog preparation (metadata mocks only)", () => {
 			globalThis.setTimeout = originalSetTimeout;
 		}
 	});
+	describe("owned evidence is authoritative over unrelated pending acquisitions", () => {
+		// Bounded by wall time, never the 10s preparation deadline.
+		const settlesWithin = async (run: Promise<void>, ms: number) =>
+			Promise.race([
+				run.then(() => true),
+				new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms)),
+			]);
+		test("fresh credential-owned evidence returns promptly while an unrelated lookup is stuck", async () => {
+			const p = policy(["a"]);
+			const evidence = { apiKey: "synthetic-a", createdAt: 1 };
+			fresh.set("a", evidence);
+			// Stands in for an untargeted refresh stuck after selecting this account.
+			pendingFor.set("a", new Promise<void>(() => {}));
+			const controller = new AbortController();
+			const run = prepareNativeQualityCatalogs(
+				context(p),
+				p,
+				intent,
+				[account("a")],
+				{ signal: controller.signal, allowOAuth: true },
+			);
+			try {
+				expect(await settlesWithin(run, 300)).toBe(true);
+				expect(calls).toHaveLength(0);
+				expect(modelCatalog.getNativeAutoCatalogEvidence("a")).toBe(evidence);
+			} finally {
+				controller.abort();
+				await run;
+			}
+		});
+		test("without OAuth permission existing evidence also returns without waiting", async () => {
+			const p = policy(["a"]);
+			fresh.set("a", { apiKey: "synthetic-a", createdAt: 1 });
+			pendingFor.set("a", new Promise<void>(() => {}));
+			const controller = new AbortController();
+			const run = prepareNativeQualityCatalogs(
+				context(p),
+				p,
+				intent,
+				[account("a")],
+				{ signal: controller.signal },
+			);
+			try {
+				expect(await settlesWithin(run, 300)).toBe(true);
+				expect(calls).toHaveLength(0);
+			} finally {
+				controller.abort();
+				await run;
+			}
+		});
+		test("unowned evidence still waits for the pending acquisition, rechecks, and does not duplicate the fetch", async () => {
+			const p = policy(["a"]);
+			fresh.set("a", { apiKey: "old-key", createdAt: 0 });
+			let release!: () => void;
+			pendingFor.set(
+				"a",
+				new Promise<void>((resolve) => {
+					release = () => {
+						pendingFor.delete("a");
+						resolve();
+					};
+				}),
+			);
+			let done = false;
+			const run = prepareNativeQualityCatalogs(
+				context(p),
+				p,
+				intent,
+				[account("a")],
+				{ ...options(), allowOAuth: true },
+			).then(() => {
+				done = true;
+			});
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(done).toBe(false);
+			expect(calls).toHaveLength(0);
+			fresh.set("a", { apiKey: "synthetic-a", createdAt: 1 });
+			release();
+			await run;
+			expect(calls).toHaveLength(0);
+		});
+		test("missing evidence waits for the pending acquisition and fetches itself when it publishes nothing", async () => {
+			const p = policy(["a"]);
+			let release!: () => void;
+			pendingFor.set(
+				"a",
+				new Promise<void>((resolve) => {
+					release = () => {
+						pendingFor.delete("a");
+						resolve();
+					};
+				}),
+			);
+			const run = prepareNativeQualityCatalogs(
+				context(p),
+				p,
+				intent,
+				[account("a")],
+				{ ...options(), allowOAuth: true },
+			);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(calls).toHaveLength(0);
+			release();
+			await run;
+			expect(calls.map((c) => c.accountId)).toEqual(["a"]);
+		});
+	});
+	describe("persisted conversation home is acquired first", () => {
+		type Home = {
+			accountId?: string;
+			provider?: string;
+			line?: string;
+			lane?: string;
+			intentRevision?: string;
+		};
+		const conversation = (home: Home = {}) =>
+			({
+				revision: "r1",
+				home: {
+					intentRevision: home.intentRevision ?? "r1",
+					target: {
+						accountId: home.accountId ?? "h",
+						provider: home.provider ?? "anthropic",
+						line: home.line ?? "claude-opus",
+						lane: home.lane ?? "opus",
+						physicalModel: "synthetic-model",
+					},
+				},
+			}) as never;
+		const ranked = () => [
+			account("a", { priority: 0 }),
+			account("b", { priority: 1 }),
+			account("h", { priority: 2 }),
+		];
+		// a and b stall until aborted; h publishes owned evidence at once.
+		const stallAllButHome = () => {
+			discover = (signal) => {
+				const id = calls[calls.length - 1].accountId as string;
+				if (id === "h") {
+					fresh.set("h", { apiKey: "synthetic-h", createdAt: 1 });
+					return Promise.resolve();
+				}
+				return new Promise((resolve) =>
+					signal.addEventListener("abort", () => resolve(), { once: true }),
+				);
+			};
+		};
+		const run = async (
+			p: QualityRoutingPolicy,
+			accounts: Account[],
+			conv: unknown,
+			prepIntent: Parameters<typeof prepareNativeQualityCatalogs>[2] = intent,
+		) => {
+			const controller = new AbortController();
+			const pending = prepareNativeQualityCatalogs(
+				context(p),
+				p,
+				prepIntent,
+				accounts,
+				{
+					signal: controller.signal,
+					allowOAuth: true,
+					conversation: conv,
+				} as never,
+			);
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			controller.abort();
+			await pending;
+		};
+		test("a valid home last in priority order is started first and gets owned evidence while higher-priority lookups stall", async () => {
+			const p = policy(["a", "b", "h"]);
+			stallAllButHome();
+			await run(p, ranked(), conversation());
+			expect(calls[0].accountId).toBe("h");
+			expect(fresh.has("h")).toBe(true);
+			expect(calls.map((c) => c.accountId).toSorted()).toEqual(["a", "b", "h"]);
+		});
+		test("a worker intent's descendant home gets the same treatment", async () => {
+			const p = policy(["a", "b", "h"]);
+			stallAllButHome();
+			await run(
+				p,
+				ranked(),
+				conversation({ line: "claude-sonnet", lane: "standard" }),
+				{ kind: "worker", role: "standard" },
+			);
+			expect(calls[0].accountId).toBe("h");
+			expect(fresh.has("h")).toBe(true);
+		});
+		test.each([
+			["null conversation", () => null, () => ranked(), undefined],
+			[
+				"revision mismatch",
+				() => conversation({ intentRevision: "r0" }),
+				() => ranked(),
+				undefined,
+			],
+			[
+				"provider mismatch",
+				() => conversation({ provider: "codex" }),
+				() => ranked(),
+				undefined,
+			],
+			[
+				"out-of-lane home",
+				() => conversation({ line: "claude-sonnet", lane: "standard" }),
+				() => ranked(),
+				{ kind: "main", preference: "opus" },
+			],
+			[
+				"line not enrolled for the home account",
+				() => conversation(),
+				() => ranked(),
+				"enroll-sonnet-only",
+			],
+			[
+				"ineligible (paused) home account",
+				() => conversation(),
+				() => [
+					account("a", { priority: 0 }),
+					account("b", { priority: 1 }),
+					account("h", { priority: 2, paused: true }),
+				],
+				undefined,
+			],
+		] as const)("%s is not promoted: normal order applies", async (_label, conv, accts, variant) => {
+			let p = policy(["a", "b", "h"]);
+			if (variant === "enroll-sonnet-only")
+				p = {
+					...p,
+					accounts: p.accounts.map((e) =>
+						e.accountId === "h" ? { ...e, lines: ["claude-sonnet"] } : e,
+					),
+				};
+			stallAllButHome();
+			await run(
+				p,
+				accts() as Account[],
+				conv(),
+				variant && typeof variant === "object"
+					? (variant as typeof intent)
+					: intent,
+			);
+			expect(calls.slice(0, 2).map((c) => c.accountId)).toEqual(["a", "b"]);
+			expect(
+				calls.map((c) => c.accountId).filter((id) => id === "h").length,
+			).toBeLessThanOrEqual(1);
+		});
+	});
 	describe("obsolete native catalog generation", () => {
 		const obsolete = () =>
 			new modelCatalog.NativeCatalogObsoleteGenerationError();

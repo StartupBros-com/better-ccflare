@@ -1,4 +1,5 @@
 import { isAccountAvailable } from "@better-ccflare/core";
+import type { QualityConversation } from "@better-ccflare/database";
 import type {
 	Account,
 	QualityRequestIntent,
@@ -45,7 +46,11 @@ export async function prepareNativeQualityCatalogs(
 	policy: QualityRoutingPolicy,
 	intent: QualityRequestIntent,
 	accounts: readonly Account[],
-	options: { signal: AbortSignal; allowOAuth?: boolean },
+	options: {
+		signal: AbortSignal;
+		allowOAuth?: boolean;
+		conversation?: QualityConversation | null;
+	},
 ): Promise<void> {
 	const policyCurrent = () =>
 		ctx.config.getQualityRoutingPolicy?.()?.revision === policy.revision;
@@ -73,6 +78,31 @@ export async function prepareNativeQualityCatalogs(
 				: policy.workerLanes[intent.role];
 		const seen = new Set<string>();
 		const queue: string[] = [];
+		// A valid persisted home is compiled first, so reacquire it first: owned
+		// evidence is process-local and two stalled higher-priority lookups must not
+		// starve it. Mirrors the home conditions in compileQualityCandidates.
+		const home = options.conversation?.home;
+		if (home && home.intentRevision === options.conversation?.revision) {
+			const homeAccount = accounts.find(
+				(a) =>
+					a.id === home.target.accountId && a.provider === home.target.provider,
+			);
+			if (
+				homeAccount &&
+				isQualityCatalogRequestEligible(homeAccount) &&
+				lanes.includes(home.target.lane) &&
+				policy.lanes[home.target.lane].includes(home.target.line) &&
+				policy.accounts.some(
+					(a) =>
+						a.accountId === homeAccount.id &&
+						a.provider === homeAccount.provider &&
+						a.lines.includes(home.target.line),
+				)
+			) {
+				seen.add(homeAccount.id);
+				queue.push(homeAccount.id);
+			}
+		}
 		// Match compiler ordering: lane, line, enrollment/account priority, ID.
 		for (const lane of lanes) {
 			for (const line of policy.lanes[lane]) {
@@ -107,36 +137,38 @@ export async function prepareNativeQualityCatalogs(
 				}
 			}
 		}
+		// Existing evidence is checked against OUR resolved credential before any
+		// wait: freshness alone says nothing about ownership, and an unrelated stuck
+		// lookup must not delay an account whose evidence we already own.
+		const ownsEvidence = async (accountId: string): Promise<boolean> => {
+			const evidence = getNativeAutoCatalogEvidence(accountId);
+			if (!evidence) return false;
+			// Do not resolve (potentially refresh) OAuth tokens without permission.
+			if (!options.allowOAuth) return true;
+			const account = await ctx.dbOps.getAccount(accountId);
+			if (
+				stopped() ||
+				!account ||
+				account.id !== accountId ||
+				!isQualityCatalogRequestEligible(account)
+			)
+				return true;
+			const accessToken = await getValidAccessToken(account, ctx);
+			if (stopped()) return true;
+			return validateNativeAutoCatalogCredentials(evidence, {
+				account,
+				accessToken,
+			});
+		};
 		// A pending acquisition is a wait signal only: another request's evidence is
 		// never our authority; we recheck ownership against OUR resolved credential.
 		const prepareOnce = async (accountId: string) => {
+			if (await ownsEvidence(accountId)) return;
 			const pending = getPendingNativeCatalogAcquisition(accountId);
 			if (pending) {
 				await pending;
 				if (stopped()) return;
-			}
-			const evidence = getNativeAutoCatalogEvidence(accountId);
-			if (evidence) {
-				// Freshness alone says nothing about credential/incarnation ownership.
-				// Do not resolve (potentially refresh) OAuth tokens without permission.
-				if (!options.allowOAuth) return;
-				const account = await ctx.dbOps.getAccount(accountId);
-				if (
-					stopped() ||
-					!account ||
-					account.id !== accountId ||
-					!isQualityCatalogRequestEligible(account)
-				)
-					return;
-				const accessToken = await getValidAccessToken(account, ctx);
-				if (stopped()) return;
-				if (
-					validateNativeAutoCatalogCredentials(evidence, {
-						account,
-						accessToken,
-					})
-				)
-					return;
+				if (await ownsEvidence(accountId)) return;
 			}
 			if (stopped()) return;
 			// Discovery reloads the account and retains its generation/ownership fences.
