@@ -2206,3 +2206,212 @@ describe("advisor native passthrough request gate", () => {
 		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 	});
 });
+
+describe("advisor native-only selection through handleProxy", () => {
+	const ADVISOR_TOOL = {
+		type: "advisor_20260301",
+		name: "advisor",
+		model: "claude-opus-5",
+	};
+	const ADVISOR_BETA = "advisor-tool-2026-03-01";
+	const DECLARATION_PHRASE = "the advisor tool is not available";
+	const HISTORY_PHRASE = "Advisor tool result content could not be processed";
+
+	function firstParty(): Account {
+		return makeAccount({
+			id: "advisor-first-party",
+			name: "advisor-first-party",
+			provider: "anthropic",
+			access_token: "test-token",
+			expires_at: Date.now() + 60 * 60_000,
+			custom_endpoint: null,
+			model_mappings: null,
+			priority: 5,
+		});
+	}
+
+	// The default fixture provider is not first-party; it sorts ahead of the
+	// first-party account, so only the native constraint keeps it off the request.
+	function gateway(overrides: Partial<Account> = {}): Account {
+		return makeAccount({
+			id: "advisor-gateway",
+			name: "advisor-gateway",
+			priority: 0,
+			api_key: "gateway-key",
+			refresh_token: "",
+			...overrides,
+		});
+	}
+
+	function advisorRequest(
+		options: {
+			model?: string;
+			headers?: Record<string, string>;
+			tools?: Array<Record<string, unknown>>;
+			messages?: unknown[];
+		} = {},
+	): Request {
+		return new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: new Headers({
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+				"anthropic-beta": ADVISOR_BETA,
+				authorization: "Bearer server-tool-test-client",
+				"x-claude-code-session-id": "server-tool-test-session",
+				...options.headers,
+			}),
+			body: JSON.stringify({
+				model: options.model ?? MODEL,
+				max_tokens: 16,
+				messages: options.messages ?? [{ role: "user", content: "hello" }],
+				tools: options.tools ?? [ADVISOR_TOOL],
+			}),
+		});
+	}
+
+	async function refused(request: Request, accounts: Account[]) {
+		const { ctx, refreshCalls, mutations } = makeContext(accounts);
+		globalThis.fetch = mock(
+			async () => new Response("{}", { status: 500 }),
+		) as unknown as typeof fetch;
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = (await response.json()) as {
+			error: Record<string, unknown> & { message: string };
+		};
+		return { ctx, refreshCalls, mutations, response, body };
+	}
+
+	it("sends the request, tool object and beta header only to the first-party account in a mixed pool (AE1)", async () => {
+		const { ctx } = makeContext([gateway(), firstParty()]);
+		const fetched: Array<{
+			url: string;
+			beta: string | null;
+			body: Record<string, unknown>;
+		}> = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const outbound = input instanceof Request ? input : new Request(input);
+			fetched.push({
+				url: outbound.url,
+				beta: outbound.headers.get("anthropic-beta"),
+				body: (await outbound.clone().json()) as Record<string, unknown>,
+			});
+			return new Response(JSON.stringify({ type: "message", content: [] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		const request = advisorRequest();
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(fetched).toHaveLength(1);
+		expect(new URL(fetched[0].url).host).toBe("api.anthropic.com");
+		expect(fetched[0].beta).toContain(ADVISOR_BETA);
+		expect(fetched[0].body.tools).toEqual([ADVISOR_TOOL]);
+		const offered = (ctx.strategy.select as ReturnType<typeof mock>).mock.calls
+			.flatMap((call) => call[0] as Account[])
+			.map((account) => account.id);
+		expect(offered).not.toContain("advisor-gateway");
+	});
+
+	it("refuses a route profile pinned to a non-first-party account with no account id and zero fetches (AE2)", async () => {
+		const pinned = gateway({ id: "advisor-pinned-gateway" });
+		const { ctx, refreshCalls, mutations } = makeContext([
+			pinned,
+			firstParty(),
+		]);
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "advisor-pinned-profile",
+						displayName: "Advisor pinned profile",
+						accountId: pinned.id,
+						logicalModel: MODEL,
+						expectedProvider: pinned.provider,
+					},
+				]),
+			),
+		);
+		globalThis.fetch = mock(
+			async () => new Response("{}", { status: 500 }),
+		) as unknown as typeof fetch;
+		const request = advisorRequest({
+			model: "claude-bccf-route-advisor-pinned-profile",
+		});
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = (await response.json()) as {
+			error: { message: string; reason: string };
+		};
+
+		expect(response.status).toBe(400);
+		expect(body.error.reason).toBe("advisor_declaration_unavailable");
+		expect(body.error.message).toContain(DECLARATION_PHRASE);
+		expect(body.error).not.toHaveProperty("account_id");
+		expect(JSON.stringify(body)).not.toContain(pinned.id);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+		expect(mutations.updateAccountUsage).toHaveBeenCalledTimes(0);
+	});
+
+	it("refuses a header force to a non-first-party account with zero fetches", async () => {
+		const request = advisorRequest({
+			headers: { "x-better-ccflare-account-id": "advisor-gateway" },
+		});
+		const { response, body } = await refused(request, [
+			gateway(),
+			firstParty(),
+		]);
+
+		expect(response.status).toBe(400);
+		expect(body.error.message).toContain(DECLARATION_PHRASE);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+	});
+
+	it("refuses a history-only request when only a non-first-party account is available (AE3)", async () => {
+		const request = advisorRequest({
+			tools: [],
+			messages: [
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "server_tool_use",
+							id: "srvtoolu_1",
+							name: "advisor",
+							input: {},
+						},
+					],
+				},
+				{ role: "user", content: "continue" },
+			],
+		});
+		const { ctx, refreshCalls, mutations, response, body } = await refused(
+			request,
+			[gateway()],
+		);
+
+		expect(response.status).toBe(400);
+		expect(body.error.reason).toBe("advisor_history_unavailable");
+		expect(body.error.message).toContain(HISTORY_PHRASE);
+		expect(body.error.message).not.toContain(
+			"not available for this organization",
+		);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+		expect(mutations.updateAccountUsage).toHaveBeenCalledTimes(0);
+		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+		expect(
+			(ctx.strategy.select as ReturnType<typeof mock>).mock.calls.flatMap(
+				(call) => call[0] as Account[],
+			),
+		).toEqual([]);
+	});
+});

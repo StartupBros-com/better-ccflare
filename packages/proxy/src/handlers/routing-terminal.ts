@@ -1,3 +1,4 @@
+import { isFirstPartyAnthropicAccount } from "@better-ccflare/core";
 import type {
 	Account,
 	RateLimitReason,
@@ -959,10 +960,16 @@ export function mergeTerminalAccountState(
 	});
 }
 
-/** Mirror selector request exclusions while retaining dynamic cross-provider routing. */
+/**
+ * Mirror selector request exclusions while retaining dynamic cross-provider
+ * routing. `nativeAnthropicOnly` mirrors the advisor constraint: terminal
+ * bodies and the `pool_exhausted` classification must ignore accounts that
+ * could never have served the request.
+ */
 export function filterRequestCompatibleAccounts(
 	accounts: readonly Account[],
 	headers: Headers,
+	nativeAnthropicOnly = false,
 ): Account[] {
 	const excluded =
 		headers
@@ -970,8 +977,11 @@ export function filterRequestCompatibleAccounts(
 			?.split(",")
 			.map((provider) => provider.trim())
 			.filter(Boolean) ?? [];
-	if (excluded.length === 0) return [...accounts];
-	return accounts.filter((account) =>
+	const candidates = nativeAnthropicOnly
+		? accounts.filter((account) => isFirstPartyAnthropicAccount(account))
+		: accounts;
+	if (excluded.length === 0) return [...candidates];
+	return candidates.filter((account) =>
 		excluded.every((provider) => {
 			if (provider === "anthropic-oauth") {
 				return !(
