@@ -1882,6 +1882,50 @@ describe("UsageCollector request lifecycle", () => {
 				});
 			});
 
+			it("marks billing incomplete and keeps the executor cost when advisor pricing misses the deadline", async () => {
+				useDeterministicModelPricing();
+				process.env.CF_PRICING_TIMEOUT_MS = "20";
+				const deterministicPricing = pricingImplementation;
+				pricingImplementation = (model, tokens) =>
+					model === HAIKU_MODEL
+						? new Promise<number>(() => {})
+						: deterministicPricing(model, tokens);
+				const { collector, savedUsages } = harness();
+				const requestId = "stream-advisor-pricing-deadline";
+				const advisorLogs = captureAdvisorLogs();
+				try {
+					collector.handleStart(makeStartMessage(requestId));
+					collector.handleChunk(
+						requestId,
+						advisorStream(FABLE_MODEL, { input_tokens: 10, output_tokens: 7 }, [
+							executorIteration,
+							advisorIteration,
+						]),
+					);
+					await collector.handleEnd({ type: "end", requestId, success: true });
+					await collector.drain();
+				} finally {
+					advisorLogs.stop();
+				}
+
+				// The advisor sum never finished, so no advisor spend is added.
+				expect(savedUsages.get(requestId)).toMatchObject({
+					costUsd: EXECUTOR_COST,
+				});
+				expect(advisorLogs.events).toHaveLength(1);
+				expect(advisorLogs.events[0]?.data).toMatchObject({
+					requestId,
+					billableAdvisorIterations: 1,
+					billingIncomplete: true,
+				});
+				expect(advisorLogs.events[0]?.data).not.toHaveProperty(
+					"advisorCostUsd",
+				);
+				expect(advisorLogs.events[0]?.data).not.toHaveProperty(
+					"unpricedAdvisorModels",
+				);
+			});
+
 			it("costs an advisor tool-result error with zero advisor tokens the same as the executor alone", async () => {
 				useDeterministicModelPricing();
 				const { collector, savedUsages } = harness();

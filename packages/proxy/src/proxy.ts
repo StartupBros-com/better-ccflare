@@ -29,6 +29,7 @@ import {
 } from "@better-ccflare/providers";
 import type {
 	Account,
+	NativeAnthropicToolRequirement,
 	RequestMeta,
 	RoutingCandidateMetadata,
 	RoutingSelectionDiagnostics,
@@ -1043,6 +1044,14 @@ async function handleProxyCoreImpl(
 	// non-first-party account was removed only by the native constraint: that
 	// is an unserved advisor requirement (refuse, R5). With nothing removed the
 	// caller's existing terminal stands (R7).
+	const nativeConstraintRefusal = (
+		requirement: NativeAnthropicToolRequirement,
+	): Response => {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		return createUnservedServerToolRoutingErrorResponse(
+			createNativeAnthropicToolRoutingError(requirement),
+		);
+	};
 	const nativeConstraintEmptyPoolRefusal = (): Response | null => {
 		const requirement = requestMeta.nativeAnthropicToolRequirement;
 		if (
@@ -1051,10 +1060,7 @@ async function handleProxyCoreImpl(
 		) {
 			return null;
 		}
-		cacheBodyStore.discardStaged(requestMeta.id);
-		return createUnservedServerToolRoutingErrorResponse(
-			createNativeAnthropicToolRoutingError(requirement),
-		);
+		return nativeConstraintRefusal(requirement);
 	};
 	activeAnthropicPreCommitRescue?.registerRequestLifecycle(
 		getRequestLifecycleCoordinator(requestMeta),
@@ -2684,10 +2690,8 @@ async function handleProxyCoreImpl(
 		// throw below can leave a stale mapping (KTD-5).
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 
-		const nativeConstraintRefusal = nativeConstraintEmptyPoolRefusal();
-		if (nativeConstraintRefusal) {
-			return finishPacing(pacingSlot, nativeConstraintRefusal);
-		}
+		const emptyPoolRefusal = nativeConstraintEmptyPoolRefusal();
+		if (emptyPoolRefusal) return finishPacing(pacingSlot, emptyPoolRefusal);
 
 		const nativeTerminal = nativeQuotaTerminal("selection");
 		if (nativeTerminal) return finishPacing(pacingSlot, nativeTerminal);
@@ -4374,9 +4378,10 @@ async function handleProxyCoreImpl(
 			requestMeta.nativeAnthropicToolRequirement != null &&
 			getNativeConstraintRemovedAccountIds(requestMeta).size > 0
 		) {
-			const refusal = nativeConstraintEmptyPoolRefusal();
-			if (!refusal) throw new Error("native constraint refusal expected");
-			return finishPacing(pacingSlot, refusal);
+			return finishPacing(
+				pacingSlot,
+				nativeConstraintRefusal(requestMeta.nativeAnthropicToolRequirement),
+			);
 		} else if (
 			deferredModelRoutes.length === 0 &&
 			!hasExhaustedLocalServerToolCapabilityFailures() &&

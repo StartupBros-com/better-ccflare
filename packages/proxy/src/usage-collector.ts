@@ -1703,11 +1703,7 @@ export class UsageCollector {
 			advisorStale ||
 			advisorOverflow ||
 			unpricedAdvisorModels.size > 0 ||
-			(advisorSeen &&
-				billableAdvisorIterations > 0 &&
-				!advisorPriced &&
-				!advisorStale &&
-				state.usage.costUsd !== undefined);
+			(billableAdvisorIterations > 0 && !advisorPriced);
 		const iterationCount = state.usage.iterations?.length ?? 0;
 		if (hasFallbackSignal) {
 			let fallbackFromModel = state.fallbackFromModel;
