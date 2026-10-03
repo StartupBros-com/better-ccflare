@@ -36,7 +36,11 @@ import {
 } from "../model-catalog";
 import { ModelRouteSessionRegistry } from "../model-route-profiles";
 import { handleProxy } from "../proxy";
-import { compileQualityCandidates } from "../quality-route-candidates";
+import {
+	compileQualityCandidates,
+	QUALITY_REASON_RANK,
+	surfaceQualityReason,
+} from "../quality-route-candidates";
 import { QualityRouteService } from "../quality-route-service";
 import * as collectors from "../usage-collector";
 
@@ -1142,11 +1146,6 @@ describe("prewarmed native catalogs", () => {
 			{
 				id: "claude-bccf-quality-auto",
 				display_name: "Auto",
-				description: `Fable → Opus${flowTail}`,
-			},
-			{
-				id: "claude-bccf-quality-fable",
-				display_name: "Fable-preferred",
 				description: `Fable → Opus${flowTail}`,
 			},
 			{
@@ -3140,5 +3139,174 @@ describe("prewarmed native catalogs", () => {
 			});
 			expect(sends).toHaveLength(1);
 		});
+	});
+
+	it("terminal 503 names the surfaced reason and bounded lanes without changing status or code", async () => {
+		for (const a of accounts)
+			usageCache.set(a.id, {
+				limits: [
+					{ kind: "weekly_all", percent: 100, resets_at: Date.now() + 60000 },
+				],
+				spend: { enabled: false },
+			} as never);
+		const response = await send();
+		expect(response.status).toBe(503);
+		const body = (await response.json()) as {
+			type: string;
+			error: {
+				type: string;
+				code: string;
+				reason: string;
+				message: string;
+				lanes: unknown;
+			};
+		};
+		expect(body.type).toBe("error");
+		expect(body.error.type).toBe("service_unavailable");
+		expect(body.error.code).toBe("quality_route_unavailable");
+		expect(body.error.reason).toBe("provider-capacity-exhausted");
+		expect(body.error.message).toBe(
+			"Auto could not serve this request: provider-capacity-exhausted (see error.lanes)",
+		);
+		expect(body.error.lanes).toEqual([
+			{ lane: "fable", reasons: { "provider-capacity-exhausted": 2 } },
+			{ lane: "opus", reasons: { "provider-capacity-exhausted": 2 } },
+		]);
+	});
+
+	it("non-terminal quality errors keep their original body shape", async () => {
+		const response = await send(request("claude-bccf-quality-nope"));
+		expect(response.status).toBe(400);
+		const body = (await response.json()) as { error: Record<string, unknown> };
+		expect(body.error.message).toBeUndefined();
+		expect(body.error.lanes).toBeUndefined();
+	});
+
+	describe("surfaced 503 reason ranking", () => {
+		const expand = (multiset: Record<string, number>) =>
+			Object.entries(multiset).flatMap(([reason, n]) =>
+				Array.from({ length: n }, () => reason as never),
+			);
+		it("production Incident B multiset surfaces request-preservation-unknown", () => {
+			const fable = {
+				"evidence-missing": 1,
+				"subscription-exhausted": 1,
+				"request-preservation-unknown": 2,
+				"provider-capacity-exhausted": 1,
+			};
+			const astra = {
+				"capacity-evidence-unknown": 1,
+				"provider-capacity-exhausted": 2,
+			};
+			const opus = {
+				"evidence-missing": 1,
+				"request-preservation-unknown": 3,
+				"provider-capacity-exhausted": 3,
+				"capacity-evidence-unknown": 1,
+			};
+			// The last recorded reason in production was provider-capacity-exhausted.
+			expect(
+				surfaceQualityReason([
+					...expand(fable),
+					...expand(astra),
+					...expand(opus),
+				]),
+			).toBe("request-preservation-unknown");
+		});
+		it("is independent of recording order and prefers the better tier", () => {
+			expect(
+				surfaceQualityReason([
+					"provider-capacity-exhausted",
+					"evidence-missing",
+				]),
+			).toBe("evidence-missing");
+			expect(
+				surfaceQualityReason([
+					"evidence-missing",
+					"provider-capacity-exhausted",
+				]),
+			).toBe("evidence-missing");
+			expect(
+				surfaceQualityReason(["account-unavailable", "subscription-exhausted"]),
+			).toBe("subscription-exhausted");
+			expect(
+				surfaceQualityReason(["tools-unsupported", "tools-unsupported"]),
+			).toBe("tools-unsupported");
+		});
+		it("empty record falls back to lane-unavailable", () => {
+			expect(surfaceQualityReason([])).toBe("lane-unavailable");
+		});
+		it("ranks every QualityAdmissionReason exactly once", () => {
+			const all = [
+				"account-not-enrolled",
+				"line-not-approved",
+				"account-unavailable",
+				"model-unsupported",
+				"evidence-missing",
+				"context-unsupported",
+				"subscription-exhausted",
+				"spend-not-authorized",
+				"lane-unavailable",
+				"provider-capacity-exhausted",
+				"capacity-evidence-unknown",
+				"billing-evidence-unknown",
+				"catalog-evidence-stale",
+				"credential-evidence-unknown",
+				"input-accounting-unknown",
+				"output-unsupported",
+				"modality-unsupported",
+				"tools-unsupported",
+				"request-preservation-unknown",
+			];
+			expect([...QUALITY_REASON_RANK].sort()).toEqual([...all].sort());
+			expect(new Set(QUALITY_REASON_RANK).size).toBe(
+				QUALITY_REASON_RANK.length,
+			);
+		});
+	});
+
+	it("labels cooled-down and paused accounts without evidence account-unavailable", async () => {
+		const policy = ctx.config.getQualityRoutingPolicy();
+		if (!policy) throw new Error("missing policy fixture");
+		resetModelCatalogForTest();
+		failCatalogAcquisition();
+		const cooled = { ...accounts[0], rate_limited_until: Date.now() + 60_000 };
+		const paused = { ...accounts[1], paused: true };
+		const compiledUnavailable = compileQualityCandidates(
+			policy,
+			{ kind: "main", preference: "auto" },
+			[cooled, paused],
+		);
+		expect(compiledUnavailable.candidates).toEqual([]);
+		expect(compiledUnavailable.skippedLanes).toEqual([
+			{ lane: "fable", reasons: { "account-unavailable": 2 } },
+			{ lane: "opus", reasons: { "account-unavailable": 2 } },
+		]);
+		const compiledAvailable = compileQualityCandidates(
+			policy,
+			{ kind: "main", preference: "auto" },
+			accounts,
+		);
+		expect(compiledAvailable.skippedLanes).toEqual([
+			{ lane: "fable", reasons: { "evidence-missing": 2 } },
+			{ lane: "opus", reasons: { "evidence-missing": 2 } },
+		]);
+	});
+
+	it("keeps the Fable-preferred id routable though discovery hides it", async () => {
+		const policy = ctx.config.getQualityRoutingPolicy();
+		expect(
+			policy?.choices.map((choice) => [choice.preference, choice.listed]),
+		).toEqual([
+			["auto", true],
+			["fable", false],
+			["astra", true],
+			["opus", true],
+		]);
+		const response = await send(request("claude-bccf-quality-fable"));
+		expect(response.status).toBe(200);
+		await response.text();
+		await flush();
+		expect((await service.status(scope))?.preference).toBe("fable");
 	});
 });

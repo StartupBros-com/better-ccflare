@@ -356,24 +356,28 @@ export function compileQualityRoutingPolicy(
 						publicModelId: "claude-bccf-quality-auto",
 						displayName: "Auto",
 						description: flow("auto"),
+						listed: true,
 					},
 					{
 						preference: "fable",
 						publicModelId: "claude-bccf-quality-fable",
 						displayName: "Fable-preferred",
 						description: flow("fable"),
+						listed: false,
 					},
 					{
 						preference: "astra",
 						publicModelId: "claude-bccf-quality-astra",
 						displayName: "Astra-preferred",
 						description: flow("astra"),
+						listed: true,
 					},
 					{
 						preference: "opus",
 						publicModelId: "claude-bccf-quality-opus",
 						displayName: "Opus-latest",
 						description: flow("opus"),
+						listed: true,
 					},
 				];
 	return freeze({
