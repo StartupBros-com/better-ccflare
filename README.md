@@ -208,9 +208,15 @@ other than exactly `true` or `1` disables it. Request headers, message content,
 and `metadata.user_id` cannot enable the setting.
 
 For native Claude Code `POST /v1/messages` requests, the gateway recognizes one
-exact `# Background Session` section and its known worktree Git paragraph in
-top-level `system` instructions. Only its sentence `Never push to main/master,
-force-push, or merge.` is replaced with:
+complete captured `# Background Session` section in top-level `system`
+instructions, including the introduction, scratch-directory guidance, worktree
+isolation, Git policy and closing report guidance. Only the absolute POSIX
+scratch-path slot ending in `.claude/jobs/<job-id>/tmp` may vary, with plain
+ASCII path components and no whitespace, control characters or traversal.
+Other host templates require an explicit compatibility update. The section
+ends at the next genuine top-level heading or EOF, not a nested or quoted
+heading. Only its sentence `Never push to main/master, force-push, or merge.`
+is replaced with:
 
 > Never push directly to main/master or force-push. You may merge an operator-authorized pull request only after its required checks and review requirements are satisfied. A review-governor stop requires an explicit operator decision; never set operator-only override flags. Any separate session-specific or loop-authority prohibition on merging still applies.
 
@@ -220,6 +226,10 @@ It preserves the rest of the prompt, text-block metadata, messages, roles, and
 tool content. The policy itself leaves disabled and nonmatching requests' raw
 bytes intact; ordinary provider conversion still applies. Trusted synthetic
 Responses ingress is excluded using the existing internal adapter proof.
+Authenticated internal keepalives retain their already-normalized instructions;
+a public keepalive header alone cannot grant that exemption. Context admission
+recounts the expanded prompt before deciding capacity, without relaxing its
+existing activation or estimate-confidence rules.
 Foreground/non-Claude requests and isolated occurrences of the sentence are
 unchanged. Quoted examples, fenced code, and XML-wrapped content are not edited.
 

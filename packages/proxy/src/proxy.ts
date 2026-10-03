@@ -1067,7 +1067,7 @@ async function handleProxyCoreImpl(
 	activeAnthropicPreCommitRescue?.activate();
 	const routingSignal = activeAnthropicPreCommitRescue?.signal ?? req.signal;
 	const preTransportDeadlines = getPreTransportDeadlineConfig();
-	const contextAdmissionTracker =
+	let contextAdmissionTracker =
 		process.env.CCFLARE_CONTEXT_ADMISSION === "1" &&
 		url.pathname === "/v1/messages" &&
 		originalParsedBody &&
@@ -1178,6 +1178,18 @@ async function handleProxyCoreImpl(
 			applyClaudeCodeBackgroundMergePolicy(requestBodyContext);
 		if (policyResult === "incompatible") {
 			return backgroundMergePolicyIncompatibilityResponse();
+		}
+		if (policyResult === "replaced" && contextAdmissionTracker) {
+			// The replacement is longer than the original instruction. Capacity admission
+			// must account for the actual request, independently of preservation checks.
+			const normalizedBody = requestBodyContext.getParsedJson();
+			if (normalizedBody) {
+				contextAdmissionTracker = createContextAdmissionTracker(
+					estimateAnthropicAdmissionTokens(normalizedBody),
+					normalizedBody.max_tokens,
+					requestMeta.id,
+				);
+			}
 		}
 		if (policyResult === "replaced" && ctx.qualityRouteService) {
 			// Establish only the authorized edit as the preservation baseline. Use

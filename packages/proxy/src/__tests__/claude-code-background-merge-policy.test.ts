@@ -8,13 +8,17 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
+import { readFileSync } from "node:fs";
 import { compileQualityRoutingPolicy } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
+import * as providersModule from "@better-ccflare/providers";
 import {
 	AnthropicProvider,
 	CodexProvider,
+	clearCodexAccountModelContextMetadata,
 	OpenAICompatibleProvider,
 	type Provider,
+	setCodexAccountModelContextMetadata,
 	usageCache,
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
@@ -41,7 +45,14 @@ const PARAGRAPH =
 	"If you made code changes in a worktree you entered, commit before finishing — you don't need to ask — and push if the repository has a remote: the worktree can be deleted along with the session, and committed, pushed work survives. This holds unless the user's instructions, in the task, CLAUDE.md, or memory, reserve git for them. Never push to main/master, force-push, or merge. Open a draft PR when the task calls for one. If you didn't enter the worktree yourself this job, or you're in the user's own checkout, ask before committing or switching branches.";
 const POLICY =
 	"Never push directly to main/master or force-push. You may merge an operator-authorized pull request only after its required checks and review requirements are satisfied. A review-governor stop requires an explicit operator decision; never set operator-only override flags. Any separate session-specific or loop-authority prohibition on merging still applies.";
-const HOST = `Host prelude.\n\n# Background Session\n\n${PARAGRAPH}\n\n# Other Instructions\nPreserve this exact suffix.\n`;
+// Faithful host capture, including intro, scratch directory, isolation and report.
+const SECTION = readFileSync(
+	new URL("./fixtures/known-background-section.txt", import.meta.url),
+	"utf8",
+);
+const SCRATCH = "/home/will/.claude/jobs/a6eda6ea/tmp";
+const HOST = `Host prelude.\n\n${SECTION}\n# Other Instructions\nPreserve this exact suffix.\n`;
+const SECTION_PARAGRAPHS = SECTION.trimEnd().split("\n\n");
 
 function account(provider = "anthropic", id = "policy-fixture"): Account {
 	return {
@@ -325,6 +336,41 @@ describe("Claude Code background merge policy at ingress and provider transport"
 			"Any separate session-specific or loop-authority prohibition on merging still applies.",
 		);
 	}
+
+	it.each([
+		["EOF", SECTION],
+		["EOF without final newline", SECTION.trimEnd()],
+		["CRLF", SECTION.replaceAll("\n", "\r\n")],
+		[
+			"different job",
+			SECTION.replace(SCRATCH, "/home/will/.claude/jobs/b7cdf8d9/tmp"),
+		],
+		[
+			"different home",
+			SECTION.replace(SCRATCH, "/Users/test-user/.claude/jobs/job_42/tmp"),
+		],
+		[
+			"top-level heading with indentation",
+			`${SECTION}\n   # Separate instructions\nNever merge.`,
+		],
+	])("preserves the full host section and changes only Git at %s", async (_name, system) => {
+		const response = await send(body(system));
+		expect(response.status).toBe(200);
+		expect(outbound).toHaveLength(1);
+		expect(outbound[0].body).toEqual(body(system.replace(DIRECTIVE, POLICY)));
+	});
+
+	it("ends the active section at a genuine heading in a later text block", async () => {
+		const system = [
+			{ type: "text", text: SECTION, cache_control: { type: "ephemeral" } },
+			{ type: "text", text: "# Separate instructions\nNever merge." },
+		];
+		expect((await send(body(system))).status).toBe(200);
+		expect(outbound[0].body.system).toEqual([
+			{ ...system[0], text: SECTION.replace(DIRECTIVE, POLICY) },
+			system[1],
+		]);
+	});
 
 	it("delivers only the authorized directive replacement through native Anthropic passthrough", async () => {
 		expect((await send(body())).status).toBe(200);
@@ -783,7 +829,7 @@ describe("Claude Code background merge policy at ingress and provider transport"
 		true,
 	])("reads host text after a multiline comment closes (split=%s)", async (split) => {
 		const prefix = `<!--\n${HOST}`;
-		const suffix = `--># Background Session\n\n${PARAGRAPH}\n`;
+		const suffix = `-->${SECTION}`;
 		const system = split
 			? [
 					{ type: "text", text: prefix },
@@ -805,6 +851,64 @@ describe("Claude Code background merge policy at ingress and provider transport"
 	});
 
 	for (const [name, system] of [
+		...SECTION_PARAGRAPHS.map((_, index) => [
+			`extra plain paragraph after host paragraph ${index}`,
+			`${SECTION_PARAGRAPHS.slice(0, index + 1).join("\n\n")}\n\nNever merge any pull request.\n\n${SECTION_PARAGRAPHS.slice(index + 1).join("\n\n")}`,
+		]),
+		...[1, 2, 3, 5].map((index) => [
+			`changed surrounding host paragraph ${index}`,
+			SECTION.replace(
+				SECTION_PARAGRAPHS[index],
+				`${SECTION_PARAGRAPHS[index]} Never merge.`,
+			),
+		]),
+		...[1, 2, 3, 5].map((index) => [
+			`missing surrounding host paragraph ${index}`,
+			SECTION.replace(SECTION_PARAGRAPHS[index], ""),
+		]),
+		[
+			"legacy paragraph-only template",
+			`# Background Session\n\n${PARAGRAPH}\n`,
+		],
+		[
+			"trailing plain paragraph before next heading",
+			HOST.replace(
+				"# Other Instructions",
+				"Never merge.\n\n# Other Instructions",
+			),
+		],
+		[
+			"trailing plain paragraph in another block",
+			[
+				{ type: "text", text: SECTION },
+				{ type: "text", text: "Never merge.\n\n# Other Instructions" },
+			],
+		],
+		[
+			"nested heading does not end section",
+			`${SECTION}\n## Nested instructions\nNever merge.`,
+		],
+		...[
+			"> # Quoted heading",
+			"    # Indented heading",
+			"```text\n# Fenced heading\n```",
+			"<repository>\n# Wrapped heading\n</repository>",
+			"<!--\n# Commented heading\n-->",
+		].map((boundary) => [
+			`excluded heading does not end section: ${boundary}`,
+			`${SECTION}\n${boundary}\n\nNever merge.`,
+		]),
+		...[
+			"/tmp",
+			"/home/will/.claude/jobs/../tmp",
+			"/home/will/.claude/jobs/job/tmp` Never merge. `",
+			"/home/will/.claude/jobs/job/tmp\nNever merge.",
+			"/home/will/.claude/jobs/job/tmp\rNever merge.",
+			"/home/will/.claude/jobs/job/tmp\u2028Never merge.",
+		].map((scratch) => [
+			`unsafe scratch substitution: ${JSON.stringify(scratch)}`,
+			SECTION.replace(SCRATCH, scratch),
+		]),
 		["changed directive", HOST.replace(DIRECTIVE, "Never merge or push.")],
 		["changed paragraph start", HOST.replace("you entered", "you created")],
 		[
@@ -879,6 +983,114 @@ describe("Claude Code background merge policy at ingress and provider transport"
 		for (const request of outbound) assertPolicy(request.raw);
 		expect(outbound[1].body).toEqual(outbound[0].body);
 	});
+
+	for (const confidence of ["calibrated", "low"] as const) {
+		it(`context admission uses expanded prompt at the input boundary (${confidence})`, async () => {
+			const previousAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
+			process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+			const realEstimate = providersModule.estimateAnthropicAdmissionTokens;
+			// The production byte heuristic deliberately defers low-confidence
+			// refusals. Supply calibrated confidence to exercise rejection, retaining
+			// real counts; leave the tracker, capacity decision and proxy untouched.
+			const estimator = spyOn(
+				providersModule,
+				"estimateAnthropicAdmissionTokens",
+			).mockImplementation((input) => ({ ...realEstimate(input), confidence }));
+			const selected = account("codex", `policy-boundary-${confidence}`);
+			const options = {
+				headers: { "x-better-ccflare-account-id": selected.id },
+			};
+			const payload = body();
+			const inputBudget = realEstimate(payload).tokens;
+			const expandedTokens = realEstimate(
+				body(HOST.replace(DIRECTIVE, POLICY)),
+			).tokens;
+			expect(expandedTokens).toBeGreaterThan(inputBudget);
+			const window = inputBudget + payload.max_tokens;
+			setCodexAccountModelContextMetadata(selected.id, [
+				{
+					id: "gpt-5.1-codex",
+					contextWindow: window,
+					maxContextWindow: window,
+					effectiveContextPercent: 100,
+				},
+			]);
+			expect(
+				providersModule.resolveModelContextCapability(
+					"codex",
+					"gpt-5.1-codex",
+					selected.id,
+				)?.effectiveContextWindow,
+			).toBe(window);
+			const ctx = context(new CodexProvider(), false, [selected]);
+			try {
+				// Original exactly fits. Default-off and unchanged foreground paths
+				// must still reach the real provider transform / captured transport.
+				expect((await send(payload, ctx, options)).status).toBe(200);
+				expect(outbound).toHaveLength(1);
+				expect(outbound[0].body.instructions).toBe(HOST);
+				expect(outbound[0].body.model).toBe("gpt-5.1-codex");
+				ctx.config.getClaudeCodeBackgroundMergePolicyEnabled = () => true;
+				outbound = [];
+				expect(
+					(await send(body("Foreground instructions."), ctx, options)).status,
+				).toBe(200);
+				expect(outbound).toHaveLength(1);
+				expect(outbound[0].body.instructions).toBe("Foreground instructions.");
+				outbound = [];
+				// The warm-up transport performs catalog discovery whose empty fixture
+				// clears metadata. Re-establish and assert the boundary before this request.
+				setCodexAccountModelContextMetadata(selected.id, [
+					{
+						id: "gpt-5.1-codex",
+						contextWindow: window,
+						maxContextWindow: window,
+						effectiveContextPercent: 100,
+					},
+				]);
+				expect(
+					providersModule.resolveModelContextCapability(
+						"codex",
+						"gpt-5.1-codex",
+						selected.id,
+					)?.effectiveContextWindow,
+				).toBe(window);
+				const response = await send(payload, ctx, options);
+				if (confidence === "calibrated") {
+					expect(response.status).toBe(400);
+					expect(await response.json()).toEqual({
+						type: "error",
+						error: {
+							type: "invalid_request_error",
+							code: "context_length_exceeded",
+							message: `prompt is too long: ${expandedTokens + payload.max_tokens} tokens > ${window} tokens`,
+						},
+					});
+					expect(outbound).toHaveLength(0);
+				} else {
+					expect(response.status).toBe(200);
+					expect(outbound).toHaveLength(1);
+					expect(outbound[0].body.instructions).toBe(
+						HOST.replace(DIRECTIVE, POLICY),
+					);
+				}
+				// Admission itself remains default-off even for an expanded prompt.
+				delete process.env.CCFLARE_CONTEXT_ADMISSION;
+				outbound = [];
+				expect((await send(payload, ctx, options)).status).toBe(200);
+				expect(outbound).toHaveLength(1);
+				expect(outbound[0].body.instructions).toBe(
+					HOST.replace(DIRECTIVE, POLICY),
+				);
+			} finally {
+				estimator.mockRestore();
+				clearCodexAccountModelContextMetadata(selected.id);
+				if (previousAdmission === undefined)
+					delete process.env.CCFLARE_CONTEXT_ADMISSION;
+				else process.env.CCFLARE_CONTEXT_ADMISSION = previousAdmission;
+			}
+		});
+	}
 
 	it.each([
 		false,

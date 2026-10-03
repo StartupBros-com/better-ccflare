@@ -6,6 +6,38 @@ const PARAGRAPH =
 const REPLACEMENT =
 	"Never push directly to main/master or force-push. You may merge an operator-authorized pull request only after its required checks and review requirements are satisfied. A review-governor stop requires an explicit operator decision; never set operator-only override flags. Any separate session-specific or loop-authority prohibition on merging still applies.";
 
+const INTRO =
+	'This session runs as a background job. The user may be chatting with you live or may have stepped away to check results later — respond naturally either way, and don\'t refer to yourself as "a background agent."';
+const SCRATCH_PREFIX = "Use `$CLAUDE_JOB_DIR/tmp` (`";
+const SCRATCH_SUFFIX =
+	"`) for any temporary files (scripts, query files, intermediate outputs) instead of `/tmp` — parallel bg jobs share `/tmp` and clobber each other's files. This directory already exists and is cleaned up when the job is deleted, so anything the user should keep belongs somewhere durable instead.";
+const ISOLATION =
+	"Before making any code changes, use the EnterWorktree tool to isolate your work from other parallel jobs and the user's working copy — unless your cwd is already under `.claude/worktrees/`, in which case you're already isolated. This is enforced: file edits in the shared checkout are rejected until you isolate, so call EnterWorktree before your first edit rather than after a rejected attempt. If you're only reading, searching, or answering questions, skip this and work in place. If EnterWorktree fails, continue in place.";
+const REPORT =
+	"End the job with a report the user can act on: what you did, where it lives — path, branch, PR, or the answer itself — and the next command if one is needed. If you're running as a subagent, the git guidance above and this report don't apply: return your work to your caller.";
+
+/** All section text is fixed except the host-rendered, backtick-delimited scratch path. */
+function isKnownSection(section: string): boolean {
+	const parts = section.replace(/\r\n/g, "\n").trimEnd().split("\n\n");
+	if (
+		parts.length !== 6 ||
+		parts[0] !== "# Background Session" ||
+		parts[1] !== INTRO ||
+		parts[3] !== ISOLATION ||
+		parts[4] !== PARAGRAPH ||
+		parts[5] !== REPORT
+	)
+		return false;
+	const scratch = parts[2];
+	if (!scratch.startsWith(SCRATCH_PREFIX) || !scratch.endsWith(SCRATCH_SUFFIX))
+		return false;
+	const path = scratch.slice(SCRATCH_PREFIX.length, -SCRATCH_SUFFIX.length);
+	// Delimiters and control characters cannot become instructions through this variable slot.
+	return /^\/(?:[A-Za-z0-9_-][A-Za-z0-9._-]*\/)+\.claude\/jobs\/[A-Za-z0-9_-]+\/tmp$/.test(
+		path,
+	);
+}
+
 interface Line {
 	text: string;
 	block: number;
@@ -152,20 +184,29 @@ export function applyClaudeCodeBackgroundMergePolicy(
 		heading.offset >= paragraph.offset
 	)
 		return "incompatible";
-	// The paragraph must belong to this section, not a subsequent section or
-	// nested example. Require a separate paragraph rather than a substring match.
+	// Validate the whole active section. A quoted/nested heading cannot hide drift
+	// by ending it early, and a later block without a genuine heading is still its content.
 	const text = texts.find((entry) => entry.block === paragraph.block)?.text;
 	if (text === undefined) return "incompatible";
-	const between = text.slice(
-		heading.offset + heading.text.length,
-		paragraph.offset,
+	const nextHeading = lines.find(
+		(line) =>
+			(line.block > heading.block ||
+				(line.block === heading.block && line.offset > heading.offset)) &&
+			/^ {0,3}#(?:\s|$)/.test(line.text),
 	);
-	if (/^\s*#{1,6}\s/m.test(between) || !/\n\r?\n$/.test(between)) {
+	const sectionEnd =
+		nextHeading?.block === heading.block ? nextHeading.offset : text.length;
+	if (!isKnownSection(text.slice(heading.offset, sectionEnd)))
 		return "incompatible";
-	}
-	const after = text.slice(paragraph.offset + PARAGRAPH.length);
-	if (after !== "" && !/^(?:\r?\n){2}/.test(after) && !/^\r?\n$/.test(after)) {
-		return "incompatible";
+	for (const entry of texts) {
+		if (entry.block <= heading.block) continue;
+		if (nextHeading !== undefined && entry.block > nextHeading.block) break;
+		const end =
+			nextHeading?.block === entry.block
+				? nextHeading.offset
+				: entry.text.length;
+		if (entry.text.slice(0, end).trim() !== "") return "incompatible";
+		if (nextHeading?.block === entry.block) break;
 	}
 	const start = paragraph.offset + PARAGRAPH.indexOf(DIRECTIVE);
 	const edited =
