@@ -1591,6 +1591,352 @@ describe("UsageCollector request lifecycle", () => {
 			});
 		});
 
+		describe("advisor iteration pricing", () => {
+			const UNPRICED_ADVISOR_MODEL = "advisor-unpriced-test";
+
+			function captureAdvisorLogs(): {
+				events: LogEvent[];
+				stop: () => void;
+			} {
+				const events: LogEvent[] = [];
+				const onLog = (event: LogEvent) => {
+					if (event.msg === "anthropic_advisor_iterations") events.push(event);
+				};
+				logBus.on("log", onLog);
+				return { events, stop: () => logBus.off("log", onLog) };
+			}
+
+			function advisorStream(
+				model: string,
+				topLevel: { input_tokens: number; output_tokens: number },
+				iterations: unknown[] | undefined,
+			): Uint8Array {
+				return new TextEncoder().encode(
+					`event: message_start\ndata: ${JSON.stringify({
+						type: "message_start",
+						message: {
+							model,
+							usage: { input_tokens: topLevel.input_tokens, output_tokens: 0 },
+						},
+					})}\n\nevent: message_delta\ndata: ${JSON.stringify({
+						type: "message_delta",
+						usage: {
+							...topLevel,
+							...(iterations ? { iterations } : {}),
+						},
+					})}\n\n`,
+				);
+			}
+
+			const executorIteration = {
+				type: "message",
+				model: FABLE_MODEL,
+				input_tokens: 10,
+				output_tokens: 7,
+			};
+			const advisorIteration = {
+				type: "advisor_message",
+				model: HAIKU_MODEL,
+				input_tokens: 11,
+				output_tokens: 13,
+			};
+			// FABLE factor 1: 10 + 7*10 = 80. HAIKU factor 3: 3 * (11 + 13*10) = 423.
+			const EXECUTOR_COST = 80;
+			const ADVISOR_COST = 423;
+
+			it("prices a streamed advisor iteration on top of the executor and keeps token columns executor-only", async () => {
+				useDeterministicModelPricing();
+				const { collector, savedUsages } = harness();
+				const requestId = "stream-advisor-priced";
+				const advisorLogs = captureAdvisorLogs();
+				try {
+					collector.handleStart(makeStartMessage(requestId));
+					collector.handleChunk(
+						requestId,
+						advisorStream(FABLE_MODEL, { input_tokens: 10, output_tokens: 7 }, [
+							executorIteration,
+							advisorIteration,
+						]),
+					);
+					await collector.handleEnd({ type: "end", requestId, success: true });
+					await collector.drain();
+				} finally {
+					advisorLogs.stop();
+				}
+
+				expect(savedUsages.get(requestId)).toMatchObject({
+					model: FABLE_MODEL,
+					costUsd: EXECUTOR_COST + ADVISOR_COST,
+					inputTokens: 10,
+					outputTokens: 7,
+					totalTokens: 17,
+				});
+				expect(advisorLogs.events).toHaveLength(1);
+				expect(advisorLogs.events[0]?.data).toMatchObject({
+					requestId,
+					advisorIterations: 1,
+				});
+				expect(advisorLogs.events[0]?.data).not.toHaveProperty(
+					"billingIncomplete",
+				);
+			});
+
+			it("prices the equivalent non-streaming JSON response identically", async () => {
+				useDeterministicModelPricing();
+				const { collector, savedUsages } = harness();
+				const requestId = "json-advisor-priced";
+				const responseBody = Buffer.from(
+					JSON.stringify({
+						model: FABLE_MODEL,
+						usage: {
+							input_tokens: 10,
+							output_tokens: 7,
+							iterations: [executorIteration, advisorIteration],
+						},
+					}),
+				).toString("base64");
+				collector.handleStart(
+					makeStartMessage(requestId, {
+						isStream: false,
+						responseHeaders: { "content-type": "application/json" },
+					}),
+				);
+				await collector.handleEnd({
+					type: "end",
+					requestId,
+					success: true,
+					responseBody,
+				});
+				await collector.drain();
+
+				expect(savedUsages.get(requestId)).toMatchObject({
+					model: FABLE_MODEL,
+					costUsd: EXECUTOR_COST + ADVISOR_COST,
+					inputTokens: 10,
+					outputTokens: 7,
+				});
+			});
+
+			it("counts an advisor iteration once when a fallback billing split also applies", async () => {
+				useDeterministicModelPricing();
+				const { collector, savedUsages } = harness();
+				const requestId = "stream-advisor-with-fallback";
+				const fallbackLogs = captureFallbackUsageLogs();
+				try {
+					collector.handleStart(makeStartMessage(requestId));
+					collector.handleChunk(
+						requestId,
+						advisorStream(FABLE_MODEL, { input_tokens: 10, output_tokens: 7 }, [
+							executorIteration,
+							advisorIteration,
+							{
+								type: "fallback_message",
+								model: OPUS_MODEL,
+								input_tokens: 23,
+								output_tokens: 29,
+							},
+						]),
+					);
+					await collector.handleEnd({ type: "end", requestId, success: true });
+					await collector.drain();
+				} finally {
+					fallbackLogs.stop();
+				}
+
+				// FABLE 80 + OPUS 2 * (23 + 290) = 626 + advisor 423 once.
+				expect(savedUsages.get(requestId)).toMatchObject({
+					model: OPUS_MODEL,
+					costUsd: 80 + 626 + ADVISOR_COST,
+				});
+				const advisorCalls = estimateCostUSD.mock.calls.filter(
+					([model]) => model === HAIKU_MODEL,
+				);
+				expect(advisorCalls).toHaveLength(1);
+				expect(fallbackLogs.events[0]?.data).toMatchObject({
+					priced: "iterations",
+					iterationCount: 2,
+				});
+			});
+
+			it("keeps the executor cost and marks billing incomplete when the advisor model is unpriced", async () => {
+				useDeterministicModelPricing();
+				modelPricedImplementation = async (model) =>
+					model !== UNPRICED_ADVISOR_MODEL;
+				const { collector, savedUsages } = harness();
+				const requestId = "stream-advisor-unpriced";
+				const advisorLogs = captureAdvisorLogs();
+				try {
+					collector.handleStart(makeStartMessage(requestId));
+					collector.handleChunk(
+						requestId,
+						advisorStream(FABLE_MODEL, { input_tokens: 10, output_tokens: 7 }, [
+							executorIteration,
+							{ ...advisorIteration, model: UNPRICED_ADVISOR_MODEL },
+						]),
+					);
+					await collector.handleEnd({ type: "end", requestId, success: true });
+					await collector.drain();
+				} finally {
+					advisorLogs.stop();
+				}
+
+				expect(savedUsages.get(requestId)).toMatchObject({
+					costUsd: EXECUTOR_COST,
+				});
+				expect(
+					estimateCostUSD.mock.calls.some(
+						([model]) => model === UNPRICED_ADVISOR_MODEL,
+					),
+				).toBe(false);
+				expect(advisorLogs.events).toHaveLength(1);
+				expect(advisorLogs.events[0]?.data).toMatchObject({
+					requestId,
+					billingIncomplete: true,
+					unpricedAdvisorModels: [UNPRICED_ADVISOR_MODEL],
+				});
+			});
+
+			it("marks billing incomplete and adds no advisor cost when the iteration snapshot is stale", async () => {
+				useDeterministicModelPricing();
+				const { collector, savedUsages } = harness();
+				const requestId = "stream-advisor-stale-snapshot";
+				const advisorLogs = captureAdvisorLogs();
+				try {
+					collector.handleStart(makeStartMessage(requestId));
+					collector.handleChunk(
+						requestId,
+						advisorStream(FABLE_MODEL, { input_tokens: 10, output_tokens: 7 }, [
+							executorIteration,
+							advisorIteration,
+						]),
+					);
+					// A later usage payload carries no iterations array, so the
+					// retained snapshot predates the final counters.
+					collector.handleChunk(
+						requestId,
+						new TextEncoder().encode(
+							`event: message_delta\ndata: ${JSON.stringify({
+								type: "message_delta",
+								usage: { input_tokens: 10, output_tokens: 7 },
+							})}\n\n`,
+						),
+					);
+					await collector.handleEnd({ type: "end", requestId, success: true });
+					await collector.drain();
+				} finally {
+					advisorLogs.stop();
+				}
+
+				expect(savedUsages.get(requestId)).toMatchObject({
+					costUsd: EXECUTOR_COST,
+				});
+				expect(advisorLogs.events).toHaveLength(1);
+				expect(advisorLogs.events[0]?.data).toMatchObject({
+					requestId,
+					billingIncomplete: true,
+					iterationsStale: true,
+				});
+			});
+
+			it("marks billing incomplete when advisor entries overflow the retained limit", async () => {
+				useDeterministicModelPricing();
+				const { collector, savedUsages } = harness();
+				const requestId = "stream-advisor-overflow";
+				const advisorLogs = captureAdvisorLogs();
+				const advisorEntries = Array.from({ length: 66 }, () => ({
+					type: "advisor_message",
+					model: HAIKU_MODEL,
+					input_tokens: 1,
+					output_tokens: 1,
+				}));
+				try {
+					collector.handleStart(makeStartMessage(requestId));
+					collector.handleChunk(
+						requestId,
+						advisorStream(FABLE_MODEL, { input_tokens: 10, output_tokens: 7 }, [
+							executorIteration,
+							...advisorEntries,
+						]),
+					);
+					await collector.handleEnd({ type: "end", requestId, success: true });
+					await collector.drain();
+				} finally {
+					advisorLogs.stop();
+				}
+
+				// 64 retained entries at HAIKU factor 3 * (1 + 10) = 33 each.
+				expect(savedUsages.get(requestId)).toMatchObject({
+					costUsd: EXECUTOR_COST + 64 * 33,
+				});
+				expect(advisorLogs.events[0]?.data).toMatchObject({
+					billingIncomplete: true,
+					iterationsTruncated: true,
+				});
+			});
+
+			it("costs an advisor tool-result error with zero advisor tokens the same as the executor alone", async () => {
+				useDeterministicModelPricing();
+				const { collector, savedUsages } = harness();
+				const requestId = "stream-advisor-zero-tokens";
+				const advisorLogs = captureAdvisorLogs();
+				try {
+					collector.handleStart(makeStartMessage(requestId));
+					collector.handleChunk(
+						requestId,
+						advisorStream(FABLE_MODEL, { input_tokens: 10, output_tokens: 7 }, [
+							executorIteration,
+							{
+								type: "advisor_message",
+								model: HAIKU_MODEL,
+								input_tokens: 0,
+								output_tokens: 0,
+							},
+						]),
+					);
+					await collector.handleEnd({ type: "end", requestId, success: true });
+					await collector.drain();
+				} finally {
+					advisorLogs.stop();
+				}
+
+				expect(savedUsages.get(requestId)).toMatchObject({
+					costUsd: EXECUTOR_COST,
+				});
+				expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+				for (const event of advisorLogs.events) {
+					expect(event.data).not.toHaveProperty("billingIncomplete");
+				}
+			});
+
+			it("prices a response without iterations exactly as the executor top level", async () => {
+				useDeterministicModelPricing();
+				const { collector, savedUsages } = harness();
+				const requestId = "stream-no-iterations";
+				const advisorLogs = captureAdvisorLogs();
+				try {
+					collector.handleStart(makeStartMessage(requestId));
+					collector.handleChunk(
+						requestId,
+						advisorStream(
+							FABLE_MODEL,
+							{ input_tokens: 10, output_tokens: 7 },
+							undefined,
+						),
+					);
+					await collector.handleEnd({ type: "end", requestId, success: true });
+					await collector.drain();
+				} finally {
+					advisorLogs.stop();
+				}
+
+				expect(savedUsages.get(requestId)).toMatchObject({
+					costUsd: EXECUTOR_COST,
+				});
+				expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+				expect(advisorLogs.events).toHaveLength(0);
+			});
+		});
+
 		it("prices a truncated fallback snapshot from the aggregate, capturing dropped advisor spend", async () => {
 			useDeterministicModelPricing();
 			const { collector, savedUsages } = harness();
@@ -1652,31 +1998,39 @@ describe("UsageCollector request lifecycle", () => {
 				model: OPUS_MODEL,
 				costUsd: 1_745,
 			});
-			expect(estimateCostUSD).toHaveBeenCalledTimes(3);
+			// The aggregate prices only the executor and fallback entries; each
+			// advisor_message is then priced on its own, once, at its own model.
+			expect(estimateCostUSD).toHaveBeenCalledTimes(4);
 			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, FABLE_MODEL, {
 				inputTokens: 5,
 				outputTokens: 7,
 				cacheReadInputTokens: 0,
 				cacheCreationInputTokens: 0,
 			});
-			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, HAIKU_MODEL, {
-				inputTokens: 28,
-				outputTokens: 32,
-				cacheReadInputTokens: 0,
-				cacheCreationInputTokens: 0,
-			});
-			expect(estimateCostUSD).toHaveBeenNthCalledWith(3, OPUS_MODEL, {
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, OPUS_MODEL, {
 				inputTokens: 23,
 				outputTokens: 29,
 				cacheReadInputTokens: 0,
 				cacheCreationInputTokens: 0,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(3, HAIKU_MODEL, {
+				inputTokens: 11,
+				outputTokens: 13,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(4, HAIKU_MODEL, {
+				inputTokens: 17,
+				outputTokens: 19,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
 			});
 			expect(fallbackLogs.events).toHaveLength(1);
 			expect(fallbackLogs.events[0]?.data).toEqual({
 				requestId,
 				from: FABLE_MODEL,
 				to: OPUS_MODEL,
-				iterationCount: 64,
+				iterationCount: 63,
 				priced: "aggregate",
 				iterationsTruncated: true,
 			});
@@ -1745,15 +2099,15 @@ describe("UsageCollector request lifecycle", () => {
 			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, HAIKU_MODEL, {
 				inputTokens: 8,
 				outputTokens: 6,
-				cacheReadInputTokens: 0,
-				cacheCreationInputTokens: 0,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
 			});
 			expect(fallbackLogs.events).toHaveLength(1);
 			expect(fallbackLogs.events[0]?.data).toEqual({
 				requestId,
 				from: FABLE_MODEL,
 				to: OPUS_MODEL,
-				iterationCount: 64,
+				iterationCount: 63,
 				priced: "aggregate",
 				iterationsTruncated: true,
 			});

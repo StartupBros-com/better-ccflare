@@ -79,6 +79,16 @@ interface RequestState {
 		tokensPerSecond?: number;
 		iterations?: UsageIteration[];
 		iterationsSeq?: number;
+		// advisor_message entries are kept apart from `iterations`: they are
+		// priced as an explicit per-iteration sum at finalize (KTD9) and must
+		// never enter the fallback split or the per-model aggregate, or a
+		// response carrying both signals would count the advisor twice.
+		// Complete-snapshot state: replaced wholesale by a later snapshot
+		// exactly like `iterations` (staleness follows iterationsSeq), cleared
+		// in freeRequestState. Bounded by MAX_USAGE_ITERATIONS; overflow sets
+		// advisorIterationsOverflow so the row reads as billing-incomplete.
+		advisorIterations?: UsageIteration[];
+		advisorIterationsOverflow?: boolean;
 		fallbackIterationSeen?: boolean;
 		fallbackIterationModel?: string;
 		iterationsTruncated?: boolean;
@@ -287,6 +297,8 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	}
 
 	const iterations: UsageIteration[] = [];
+	const advisorIterations: UsageIteration[] = [];
+	let advisorIterationsOverflow = false;
 	let fallbackIterationSeen = false;
 	let fallbackIterationModel: string | undefined;
 	// Per-model billing aggregate, built over the FULL raw array (not just
@@ -330,6 +342,25 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 			continue;
 		}
 		const raw = rawIteration as Record<string, unknown>;
+		if (raw.type === "advisor_message") {
+			if (advisorIterations.length >= MAX_USAGE_ITERATIONS) {
+				advisorIterationsOverflow = true;
+			} else {
+				advisorIterations.push({
+					type: "advisor_message",
+					model: normalizeNonEmptyString(raw.model),
+					input_tokens: normalizeTokenCount(raw.input_tokens),
+					output_tokens: normalizeTokenCount(raw.output_tokens),
+					cache_read_input_tokens: normalizeTokenCount(
+						raw.cache_read_input_tokens,
+					),
+					cache_creation_input_tokens: normalizeTokenCount(
+						raw.cache_creation_input_tokens,
+					),
+				});
+			}
+			continue;
+		}
 		if (raw.type === "fallback_message") {
 			fallbackIterationSeen = true;
 			const model = normalizeNonEmptyString(raw.model);
@@ -391,6 +422,8 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	// Each provider payload is a complete snapshot. A later array supersedes
 	// the earlier one, including when every later entry is invalid.
 	state.usage.iterations = iterations;
+	state.usage.advisorIterations = advisorIterations;
+	state.usage.advisorIterationsOverflow = advisorIterationsOverflow;
 	state.usage.iterationsSeq = state.usagePayloadSeq;
 	state.usage.fallbackIterationSeen = fallbackIterationSeen;
 	state.usage.fallbackIterationModel = fallbackIterationModel;
@@ -850,6 +883,8 @@ function freeRequestState(state: RequestState): void {
 	state.discardingUsageLine = false;
 	state.nativeResponses = undefined;
 	state.usage.iterations = undefined;
+	state.usage.advisorIterations = undefined;
+	state.usage.advisorIterationsOverflow = undefined;
 	state.usage.iterationsSeq = undefined;
 	state.usage.fallbackIterationSeen = undefined;
 	state.usage.fallbackIterationModel = undefined;
@@ -1398,6 +1433,21 @@ export class UsageCollector {
 				iterations.length > 0) ||
 			seamRealContentUnaccounted ||
 			iterationAttributionAmbiguous;
+		// advisor_message iterations (KTD9): priced per iteration at their own
+		// model and added to the executor cost below. A snapshot that predates
+		// the final usage payload cannot be trusted to describe this response,
+		// so a stale one is never priced and only flags the row.
+		const advisorEntries = state.usage.advisorIterations ?? [];
+		const advisorSeen = advisorEntries.length > 0;
+		const advisorStale = advisorSeen && iterationsStale;
+		const advisorOverflow =
+			advisorSeen &&
+			!iterationsStale &&
+			state.usage.advisorIterationsOverflow === true;
+		const unpricedAdvisorModels = new Set<string>();
+		let advisorCostUsd: number | undefined;
+		let advisorPriced = false;
+		let billableAdvisorIterations = 0;
 		// Capturing a JSON model without usage must not manufacture zero counts
 		// or a price. Existing streaming/provider compatibility defaults stay intact.
 		const modelOnlyJson =
@@ -1521,6 +1571,46 @@ export class UsageCollector {
 				);
 			}
 
+			if (advisorSeen && !advisorStale && state.usage.costUsd !== undefined) {
+				// Same predicate as the fallback split: an iteration with no
+				// output (including an advisor tool-result error with zero
+				// tokens) was never billed.
+				const billableAdvisor = advisorEntries.filter(
+					(iteration) => (iteration.output_tokens ?? 0) > 0,
+				);
+				billableAdvisorIterations = billableAdvisor.length;
+				let advisorSum = 0;
+				let sumComputed = false;
+				const executorCost = state.usage.costUsd;
+				const total = await this.estimateCostWithDeadline(
+					startMessage.requestId,
+					model,
+					async () => {
+						for (const iteration of billableAdvisor) {
+							// Unlike the executor, an advisor model the catalogue
+							// cannot price is an unknown cost, not a confident $0.
+							if (!iteration.model || !(await isModelPriced(iteration.model))) {
+								unpricedAdvisorModels.add(iteration.model ?? "(unspecified)");
+								continue;
+							}
+							advisorSum += await estimateCostUSD(iteration.model, {
+								inputTokens: iteration.input_tokens,
+								outputTokens: iteration.output_tokens,
+								cacheReadInputTokens: iteration.cache_read_input_tokens,
+								cacheCreationInputTokens: iteration.cache_creation_input_tokens,
+							});
+						}
+						sumComputed = true;
+						return executorCost + advisorSum;
+					},
+				);
+				if (sumComputed) {
+					advisorPriced = true;
+					advisorCostUsd = advisorSum;
+					state.usage.costUsd = total;
+				}
+			}
+
 			// Calculate tokens per second - zai specific vs other providers
 			if (finalOutputTokens > 0) {
 				const totalDurationSec = responseTime / 1000;
@@ -1606,6 +1696,18 @@ export class UsageCollector {
 			}
 		}
 
+		// An advisor row is billing-incomplete whenever any advisor spend could
+		// not be priced: stale/overflowed snapshot, unpriced model, or a pricing
+		// deadline that fired before the advisor sum finished.
+		const advisorBillingIncomplete =
+			advisorStale ||
+			advisorOverflow ||
+			unpricedAdvisorModels.size > 0 ||
+			(advisorSeen &&
+				billableAdvisorIterations > 0 &&
+				!advisorPriced &&
+				!advisorStale &&
+				state.usage.costUsd !== undefined);
 		const iterationCount = state.usage.iterations?.length ?? 0;
 		if (hasFallbackSignal) {
 			let fallbackFromModel = state.fallbackFromModel;
@@ -1639,8 +1741,24 @@ export class UsageCollector {
 				...(iterations.length > 0 && iterationsStale
 					? { iterationsStale: true }
 					: {}),
-				...(billingIncomplete ? { billingIncomplete: true } : {}),
+				...(billingIncomplete || advisorBillingIncomplete
+					? { billingIncomplete: true }
+					: {}),
 				...(iterationAttributionAmbiguous ? { unresolvedIterationModels } : {}),
+			});
+		}
+		if (advisorSeen) {
+			log.info("anthropic_advisor_iterations", {
+				requestId: startMessage.requestId,
+				advisorIterations: advisorEntries.length,
+				billableAdvisorIterations,
+				...(advisorCostUsd !== undefined ? { advisorCostUsd } : {}),
+				...(advisorBillingIncomplete ? { billingIncomplete: true } : {}),
+				...(advisorStale ? { iterationsStale: true } : {}),
+				...(advisorOverflow ? { iterationsTruncated: true } : {}),
+				...(unpricedAdvisorModels.size > 0
+					? { unpricedAdvisorModels: [...unpricedAdvisorModels] }
+					: {}),
 			});
 		}
 
