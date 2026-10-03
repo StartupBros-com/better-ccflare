@@ -330,6 +330,16 @@ describe("mandatory Auto capacity and spend", () => {
 				reason: "capacity-evidence-unknown",
 			});
 		});
+		it("still fails closed on an unrecognized seven_day_ key with renamed window fields", () => {
+			const data = {
+				...livePayload(),
+				seven_day_newwindow: { percent: 100 },
+			};
+			expect(evaluateAutoCapacity(data, liveOpts)).toMatchObject({
+				status: "unknown",
+				reason: "capacity-evidence-unknown",
+			});
+		});
 	});
 });
 

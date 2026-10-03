@@ -71,6 +71,21 @@ describe("Auto capacity source precedence", () => {
 		);
 	});
 
+	it("keeps an unrecognized seven_day_ key with renamed window fields as an unknown row", () => {
+		const rows = collectAutoCapacityEvidence(
+			{
+				...healthyWindows,
+				seven_day_newwindow: { percent: 100 },
+			},
+			"anthropic",
+		);
+		expect(rows.find((r) => r.window === "seven_day_newwindow")).toMatchObject({
+			window: "seven_day_newwindow",
+			scope: "unknown",
+			utilization: null,
+		});
+	});
+
 	it("keeps known windows as rows even when their shape drifts", () => {
 		const rows = collectAutoCapacityEvidence(
 			{ seven_day: {}, seven_day_fable: { foo: 1 } },
