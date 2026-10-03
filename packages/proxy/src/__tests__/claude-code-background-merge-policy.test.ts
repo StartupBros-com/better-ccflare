@@ -22,7 +22,14 @@ import { BunSqlAdapter } from "../../../database/src/adapters/bun-sql-adapter";
 import { ensureSchema } from "../../../database/src/migrations";
 import { QualityRouteRepository } from "../../../database/src/repositories/quality-route.repository";
 import type { ProxyContext } from "../handlers";
-import { RESPONSES_ADAPTER_SECRET_HEADER } from "../handlers/proxy-types";
+import {
+	INTERNAL_PROBE_SECRET_HEADER,
+	RESPONSES_ADAPTER_SECRET_HEADER,
+} from "../handlers/proxy-types";
+import {
+	INTERNAL_AUTO_REFRESH_HEADER,
+	stampInternalAutoRefreshAuth,
+} from "../internal-probe-auth";
 import { fetchLiveModels, resetModelCatalogForTest } from "../model-catalog";
 import { handleProxy } from "../proxy";
 import { QualityRouteService } from "../quality-route-service";
@@ -129,7 +136,12 @@ function body(system: unknown = HOST, stream = false) {
 
 describe("Claude Code background merge policy at ingress and provider transport", () => {
 	const originalFetch = globalThis.fetch;
-	let outbound: { url: string; raw: string; body: Record<string, unknown> }[];
+	let outbound: {
+		url: string;
+		raw: string;
+		body: Record<string, unknown>;
+		headers: Headers;
+	}[];
 	let collector: ReturnType<typeof spyOn>;
 	let optionalCollector: ReturnType<typeof spyOn>;
 	let starts: Record<string, unknown>[];
@@ -200,7 +212,12 @@ describe("Claude Code background merge policy at ingress and provider transport"
 				});
 			const raw = await request.text();
 			const finalBody = JSON.parse(raw);
-			outbound.push({ url: request.url, raw, body: finalBody });
+			outbound.push({
+				url: request.url,
+				raw,
+				body: finalBody,
+				headers: new Headers(request.headers),
+			});
 			if (failures-- > 0)
 				return Response.json(
 					{ error: { type: "rate_limit_error", message: "fixture retry" } },
@@ -314,6 +331,58 @@ describe("Claude Code background merge policy at ingress and provider transport"
 		expect(outbound).toHaveLength(1);
 		expect(outbound[0].body).toEqual(body(HOST.replace(DIRECTIVE, POLICY)));
 		expect(starts[0].accountId).toBe("policy-fixture");
+	});
+
+	it.each([
+		"scheduler credential",
+		"process-local proof",
+	])("replays the captured normalized request unchanged with trusted keepalive %s", async (proof) => {
+		const ctx = context(new AnthropicProvider());
+		expect((await send(body(), ctx)).status).toBe(200);
+		expect(outbound).toHaveLength(1);
+		const captured = outbound[0];
+		assertPolicy(captured.raw);
+		const userAgent = captured.headers.get("user-agent") ?? "";
+		expect(userAgent).toStartWith("claude-cli/");
+		const headers = new Headers({ "x-better-ccflare-keepalive": "true" });
+		if (proof === "scheduler credential") stampInternalAutoRefreshAuth(headers);
+		else
+			headers.set(INTERNAL_PROBE_SECRET_HEADER, "fixture-process-local-proof");
+		expect(
+			(
+				await send(captured.raw, ctx, {
+					userAgent,
+					headers: Object.fromEntries(headers),
+				})
+			).status,
+		).toBe(200);
+		expect(outbound).toHaveLength(2);
+		expect(outbound[1].raw).toBe(captured.raw);
+	});
+
+	it.each([
+		false,
+		true,
+	])("forged keepalive headers cannot bypass template checks (forged proof=%s)", async (forgedProof) => {
+		const ctx = context(new AnthropicProvider());
+		const headers = {
+			"x-better-ccflare-keepalive": "true",
+			...(forgedProof
+				? {
+						[INTERNAL_PROBE_SECRET_HEADER]: "forged",
+						[INTERNAL_AUTO_REFRESH_HEADER]: "forged",
+					}
+				: {}),
+		};
+		expect((await send(body(), ctx, { headers })).status).toBe(200);
+		expect(outbound).toHaveLength(1);
+		assertPolicy(outbound[0].raw);
+		const denied = await send(outbound[0].raw, ctx, { headers });
+		expect(denied.status).toBe(409);
+		expect((await denied.json()).error.code).toBe(
+			"claude_code_background_merge_policy_incompatible",
+		);
+		expect(outbound).toHaveLength(1);
 	});
 
 	for (const [family, makeProvider] of [
@@ -589,6 +658,75 @@ describe("Claude Code background merge policy at ingress and provider transport"
 		});
 	}
 
+	for (const [name, opening, closing] of [
+		["commented opening", "<repository><!-- provenance -->", "</repository>"],
+		["commented closing", "<repository>", "</repository><!-- provenance -->"],
+		[
+			"commented delimiters",
+			"<repository><!-- </repository> -->",
+			"</repository><!-- <repository> -->",
+		],
+	] as const) {
+		for (const active of [false, true]) {
+			for (const split of [false, true]) {
+				it(`preserves quoted HOST with ${name} (active=${active}, split=${split})`, async () => {
+					const quoted = `${opening}\n${HOST}${closing}\n\n`;
+					const suffix = active ? HOST : "";
+					const system = split
+						? [
+								{ type: "text", text: opening },
+								{ type: "text", text: HOST },
+								{ type: "text", text: closing },
+								{ type: "text", text: suffix },
+							]
+						: quoted + suffix;
+					const raw = JSON.stringify(body(system), null, 2);
+					expect((await send(raw)).status).toBe(200);
+					expect(outbound).toHaveLength(1);
+					if (!active) expect(outbound[0].raw).toBe(raw);
+					else
+						expect(outbound[0].body).toEqual(
+							body(
+								typeof system === "string"
+									? quoted + HOST.replace(DIRECTIVE, POLICY)
+									: system.map((block, index) =>
+											index === 3
+												? { ...block, text: HOST.replace(DIRECTIVE, POLICY) }
+												: block,
+										),
+							),
+						);
+				});
+			}
+		}
+	}
+
+	it.each([
+		false,
+		true,
+	])("reads host text after a multiline comment closes (split=%s)", async (split) => {
+		const prefix = `<!--\n${HOST}`;
+		const suffix = `--># Background Session\n\n${PARAGRAPH}\n`;
+		const system = split
+			? [
+					{ type: "text", text: prefix },
+					{ type: "text", text: suffix },
+				]
+			: prefix + suffix;
+		expect((await send(body(system))).status).toBe(200);
+		expect(outbound).toHaveLength(1);
+		expect(outbound[0].body).toEqual(
+			body(
+				split
+					? [
+							{ type: "text", text: prefix },
+							{ type: "text", text: suffix.replace(DIRECTIVE, POLICY) },
+						]
+					: prefix + suffix.replace(DIRECTIVE, POLICY),
+			),
+		);
+	});
+
 	for (const [name, system] of [
 		["changed directive", HOST.replace(DIRECTIVE, "Never merge or push.")],
 		["changed paragraph start", HOST.replace("you entered", "you created")],
@@ -665,7 +803,10 @@ describe("Claude Code background merge policy at ingress and provider transport"
 		expect(outbound[1].body).toEqual(outbound[0].body);
 	});
 
-	it("establishes the authorized prompt for real quality admission without waiving output limits", async () => {
+	it.each([
+		false,
+		true,
+	])("quality admission exempts only the policy edit (additional cache TTL mutation=%s)", async (mutateTtl) => {
 		qualityFixture = true;
 		const db = new Database(":memory:");
 		ensureSchema(db);
@@ -701,6 +842,7 @@ describe("Claude Code background merge policy at ingress and provider transport"
 		ctx.config = {
 			...ctx.config,
 			getQualityRoutingPolicy: () => policy,
+			getSystemPromptCacheTtl1h: () => mutateTtl,
 		} as ProxyContext["config"];
 		ctx.qualityRouteService = service;
 		try {
@@ -716,10 +858,21 @@ describe("Claude Code background merge policy at ingress and provider transport"
 				principal: "fixture-principal",
 				headers: { "x-claude-code-session-id": "fixture-quality-session" },
 			};
-			const payload = { ...body(), model: "claude-bccf-quality-auto" };
-			expect((await send(payload, ctx, options)).status).toBe(200);
+			const system = [
+				{ type: "text", text: HOST, cache_control: { type: "ephemeral" } },
+			];
+			const payload = { ...body(system), model: "claude-bccf-quality-auto" };
+			const response = await send(payload, ctx, options);
+			if (mutateTtl) {
+				expect(response.status).toBe(503);
+				expect(outbound).toHaveLength(0);
+				return;
+			}
+			expect(response.status).toBe(200);
 			expect(outbound).toHaveLength(1);
-			expect(outbound[0].body.system).toBe(HOST.replace(DIRECTIVE, POLICY));
+			expect(outbound[0].body.system).toEqual([
+				{ ...system[0], text: HOST.replace(DIRECTIVE, POLICY) },
+			]);
 			assertPolicy(outbound[0].raw);
 			const denied = await send({ ...payload, max_tokens: 1001 }, ctx, options);
 			expect(denied.status).not.toBe(200);

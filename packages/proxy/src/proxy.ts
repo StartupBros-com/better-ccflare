@@ -1164,11 +1164,13 @@ async function handleProxyCoreImpl(
 
 	// Server policy applies only to native Claude Code system instructions. The
 	// adapter exclusion requires the existing process-local proof, not a caller's
-	// claimed protocol/header or metadata.user_id. No-op paths retain raw bytes.
+	// claimed protocol/header or metadata.user_id. Authenticated keepalives replay
+	// already-normalized instructions. No-op paths retain raw bytes.
 	if (
 		req.method === "POST" &&
 		url.pathname === "/v1/messages" &&
 		ctx.config.getClaudeCodeBackgroundMergePolicyEnabled?.() === true &&
+		!trustedInternalKeepalive &&
 		!isResponsesAdapterRequest(req.headers, ctx) &&
 		extractClaudeVersion(req.headers.get("user-agent")) !== null
 	) {

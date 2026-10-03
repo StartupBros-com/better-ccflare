@@ -39,28 +39,49 @@ function instructionLines(texts: { text: string; block: number }[]): Line[] {
 					fence = undefined;
 				continue;
 			}
-			if (comment) {
-				if (line.includes("-->")) comment = false;
-				continue;
-			}
-			if (/^(?: {4}|\t|\s*>)/.test(line)) continue;
-			if (delimiter && tags.length === 0) {
-				fence = { marker: delimiter[1][0], length: delimiter[1].length };
-				continue;
-			}
-			// Only block-leading markup can open an exclusion. Inline tag/comment
-			// mentions in prose or inline code must not hide later instructions.
-			if (tags.length === 0 && !/^ {0,3}</.test(line)) {
-				lines.push(current);
-				continue;
-			}
-			if (line.includes("<!--")) {
-				comment = !line.includes("-->", line.indexOf("<!--") + 4);
-				continue;
-			}
 			const wasWrapped = tags.length > 0;
 			let hasTag = false;
-			for (const match of line.matchAll(/<(\/?)([A-Za-z][\w:.-]*)\b[^>]*>/g)) {
+			let cursor = 0;
+			// Consume markup in source order: a comment excludes only its own
+			// contents, not an adjacent wrapper transition or the following text.
+			while (cursor < line.length) {
+				if (comment) {
+					const end = line.indexOf("-->", cursor);
+					if (end === -1) break;
+					comment = false;
+					cursor = end + 3;
+					continue;
+				}
+				const remaining = line.slice(cursor);
+				if (/^(?: {4}|\t|\s*>)/.test(remaining)) break;
+				const openingFence = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(remaining);
+				if (openingFence && tags.length === 0 && !hasTag) {
+					fence = {
+						marker: openingFence[1][0],
+						length: openingFence[1].length,
+					};
+					break;
+				}
+				// Only block-leading markup can open an exclusion. Inline mentions
+				// in prose or inline code must not hide later instructions.
+				const match =
+					tags.length === 0 && !hasTag && !/^ {0,3}</.test(remaining)
+						? null
+						: /<!--|<(\/?)([A-Za-z][\w:.-]*)\b[^>]*>/.exec(remaining);
+				if (!match) {
+					if (!wasWrapped && !hasTag)
+						lines.push({
+							text: remaining,
+							block,
+							offset: current.offset + cursor,
+						});
+					break;
+				}
+				cursor += match.index + match[0].length;
+				if (match[0] === "<!--") {
+					comment = true;
+					continue;
+				}
 				hasTag = true;
 				if (match[1]) {
 					if (tags.at(-1) === match[2]) tags.pop();
@@ -68,7 +89,6 @@ function instructionLines(texts: { text: string; block: number }[]): Line[] {
 					tags.push(match[2]);
 				}
 			}
-			if (!wasWrapped && !hasTag && tags.length === 0) lines.push(current);
 		}
 	}
 	return lines;
