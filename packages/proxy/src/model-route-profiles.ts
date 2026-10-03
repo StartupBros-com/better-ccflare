@@ -105,7 +105,7 @@ export function describeModelRouteProfileFlow(
 	profile: ModelRouteProfile,
 ): string {
 	if (profile.selection === "capability")
-		return "Pool of matching accounts, load-balancer order, then error · subagents use the same pool";
+		return "Pool of matching accounts, load-balancer order, then error · subagents fall back to normal routing";
 	if (isBoundedModelRouteProfile(profile))
 		return "One pinned account, size-capped requests, no fallback · subagents use the same account";
 	return "One pinned account, no fallback · subagents use the same account";

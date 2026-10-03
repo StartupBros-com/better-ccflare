@@ -24,7 +24,7 @@ const EXACT_FLOW =
 const BOUNDED_FLOW =
 	"One pinned account, size-capped requests, no fallback · subagents use the same account";
 const POOL_FLOW =
-	"Pool of matching accounts, load-balancer order, then error · subagents use the same pool";
+	"Pool of matching accounts, load-balancer order, then error · subagents fall back to normal routing";
 
 function profile() {
 	const [configured] = parseModelRouteProfiles(PROFILE_JSON);

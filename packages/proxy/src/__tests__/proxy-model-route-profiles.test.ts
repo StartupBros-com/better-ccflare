@@ -3621,7 +3621,7 @@ describe("catalog-role Codex route profiles", () => {
 					id: ROLE_POOL_PICKER,
 					display_name: "Codex pool · opus",
 					description:
-						"Pool of matching accounts, load-balancer order, then error · subagents use the same pool",
+						"Pool of matching accounts, load-balancer order, then error · subagents fall back to normal routing",
 				},
 			],
 			has_more: false,
