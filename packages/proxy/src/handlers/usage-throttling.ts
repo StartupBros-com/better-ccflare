@@ -8,6 +8,7 @@ import {
 	type AnyUsageData,
 	type CodexSubscriptionFacts,
 	getCodexSubscriptionFacts,
+	usageCache,
 } from "@better-ccflare/providers";
 import type {
 	Account,
@@ -205,6 +206,30 @@ export function evaluateAutoCapacity(
 const RETRY_AFTER_SECONDS = 60;
 /** Two default 90-second usage polls; independent from the cache's 10m maximum. */
 export const DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS = 3 * 60 * 1000;
+
+/**
+ * True when this Codex account opted in to draining purchased credits AND
+ * fresh poll-verified evidence says credits are available. Passive header
+ * writes and usageCache.set can never produce that evidence.
+ */
+export function isCodexCreditDrainActive(
+	account: {
+		id: string;
+		provider: string;
+		codex_credit_drain_enabled?: boolean | null;
+	},
+	now: number,
+): boolean {
+	return (
+		account.provider === "codex" &&
+		account.codex_credit_drain_enabled === true &&
+		usageCache.getCodexCreditEvidence(
+			account.id,
+			now,
+			DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS,
+		) === true
+	);
+}
 
 type CapacityWindowKind = "session" | "weekly_all" | "weekly_scoped" | "other";
 
@@ -599,6 +624,12 @@ export interface HardCapacityOptions {
 	readonly provider?: string | null;
 	readonly now?: number;
 	readonly snapshotFreshnessMs?: number;
+	/**
+	 * Resolved by the caller via isCodexCreditDrainActive. Honored only for
+	 * provider "codex": spent session/weekly_all windows stop excluding the
+	 * account so OpenAI can serve it from purchased credits.
+	 */
+	readonly creditDrainActive?: boolean;
 }
 
 export type CapacityOverageStatus = "available" | "unavailable" | "unknown";
@@ -730,6 +761,8 @@ export function evaluateHardCapacity(
 		(options.provider !== "anthropic" ||
 			resolveCapacityOverageStatus(data) === "unavailable");
 
+	const creditDrain =
+		options.creditDrainActive === true && options.provider === "codex";
 	const exclusions: HardCapacityExclusion[] = [];
 	for (const window of windows) {
 		if (
@@ -739,6 +772,7 @@ export function evaluateHardCapacity(
 		) {
 			continue;
 		}
+		if (creditDrain && window.kind !== "weekly_scoped") continue;
 		if (window.utilization < 100) continue;
 		if (window.resetAtMs !== null && window.resetAtMs <= now) continue;
 
@@ -950,7 +984,12 @@ export function getUsageThrottleStatus(
 	data: AnyUsageData | null,
 	settings: UsageThrottleSettings,
 	now = Date.now(),
-	opts?: { requestModel?: string | null; scopedMode?: "match" | "all" },
+	opts?: {
+		requestModel?: string | null;
+		scopedMode?: "match" | "all";
+		/** Skip spent (>=100%) windows; windows with headroom are still paced. */
+		creditDrainActive?: boolean;
+	},
 ): UsageThrottleStatus {
 	// scopedMode "all" (default, display path) surfaces every per-model cap;
 	// "match" (routing path) only counts a scoped cap when the request's model
@@ -975,6 +1014,7 @@ export function getUsageThrottleStatus(
 			continue;
 		}
 		if (!isWindowThrottlingEnabled(window.window, settings)) continue;
+		if (opts?.creditDrainActive && window.utilization >= 100) continue;
 		if (window.resetAtMs === null) continue;
 		if (window.resetAtMs <= now) continue;
 		const startMs = computeWindowStartMs(window.resetAtMs, window.window);
@@ -1008,7 +1048,12 @@ export function getUsageThrottleUntil(
 	data: AnyUsageData | null,
 	settings: UsageThrottleSettings,
 	now = Date.now(),
-	opts?: { requestModel?: string | null; scopedMode?: "match" | "all" },
+	opts?: {
+		requestModel?: string | null;
+		scopedMode?: "match" | "all";
+		/** Skip spent (>=100%) windows; windows with headroom are still paced. */
+		creditDrainActive?: boolean;
+	},
 ): number | null {
 	return getUsageThrottleStatus(data, settings, now, opts).throttleUntil;
 }

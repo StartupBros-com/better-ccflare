@@ -121,4 +121,5 @@ export {
 	getBindingConstraint,
 	getUsageThrottleStatus,
 	getUsageThrottleUntil,
+	isCodexCreditDrainActive,
 } from "./usage-throttling";

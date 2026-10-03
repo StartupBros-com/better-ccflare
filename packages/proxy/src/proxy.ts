@@ -97,6 +97,7 @@ import {
 	getRoutingCapacityContext,
 	getUsageThrottleUntil,
 	interceptAndModifyRequest,
+	isCodexCreditDrainActive,
 	isComboFallbackDisabled,
 	isInternalProbe,
 	isPreparedProxyAccountResponse,
@@ -1494,6 +1495,7 @@ async function handleProxyCoreImpl(
 			? getUsageThrottleUntil(usageCache.get(account.id), settings, now, {
 					requestModel: model,
 					scopedMode: "match",
+					creditDrainActive: isCodexCreditDrainActive(account, now),
 				})
 			: null;
 	};

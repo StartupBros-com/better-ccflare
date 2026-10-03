@@ -82,6 +82,7 @@ import {
 	evaluateHardCapacity,
 	getWeeklyQuotaPressure,
 	type HardCapacityExclusion,
+	isCodexCreditDrainActive,
 } from "./usage-throttling";
 
 const log = new Logger("AccountSelector");
@@ -1338,6 +1339,7 @@ function evaluateCandidateCapacity(
 			observedAt: snapshot.observedAt,
 			provider: account.provider,
 			now,
+			creditDrainActive: isCodexCreditDrainActive(account, now),
 		});
 		blockers.push(
 			...hardCapacity.exclusions

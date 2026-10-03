@@ -384,4 +384,24 @@ describe("Codex subscription-only source evidence (fake metadata transport)", ()
 				.status,
 		).not.toBe("admit");
 	});
+	it("never admits a credit-drain account with spent windows on quality routes", async () => {
+		const body = payload();
+		Object.assign(body.rate_limit, {
+			primary_window: {
+				used_percent: 100,
+				reset_at: Math.floor(now / 1000) + 3600,
+			},
+			secondary_window: {
+				used_percent: 100,
+				reset_at: Math.floor(now / 1000) + 3600,
+			},
+		});
+		body.credits = { has_credits: true, unlimited: false, balance: "25" };
+		const snapshot = await poll(body);
+		// The drain evidence exists, yet Auto/quality admission ignores it.
+		expect(
+			usageCache.getCodexCreditEvidence(accountId, Date.now(), 180_000),
+		).toBe(true);
+		expect(decision(snapshot).status).not.toBe("admit");
+	});
 });
