@@ -135,6 +135,21 @@ validate through the same private authority as the parent request even when it c
 subagent marker. Helper classification grants no capability by itself: the chosen provider
 route must still hold an exact reviewed proof.
 
+### Credit drain
+
+A per-account opt-in that lets a subscription account holding purchased provider credits keep
+serving client traffic after its plan windows are spent, so the provider bills those credits
+instead of the account being refused.
+
+It holds only while fresh evidence from the account's own usage poll says credits are
+available; without that evidence the account falls back to the normal spent-window refusal, so
+the drain fails closed. It lifts only the account-wide short and multi-day windows (per-model
+caps still bind) and never covers the proxy's own probe traffic or Auto quality routing, which
+spends credits only under a separate, explicit operator grant. Accounts without the opt-in are
+refused once a plan window reads full even while the provider still reports them as allowed:
+the provider's allowed flag can lag its usage percentage, and the request that crosses the line
+is billed to credits.
+
 ## Usage measurement
 
 ### Cache parity
@@ -300,6 +315,9 @@ The dispatch fence durably distinguishes a possibly sent inference from work tha
   automatic family.
 - *Utilization* is always a 0–100 percentage once past normalization, never a 0–1 fraction,
   even though several providers report it as a fraction natively.
+- *Drain* names two unrelated things: *Guard-first drain* lets in-flight requests settle before
+  a process stops, while *Credit drain* spends an account's purchased credits once its plan
+  windows are spent.
 
 ## Retained ingress and cold backend handoff
 
