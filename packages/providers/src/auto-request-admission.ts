@@ -6,6 +6,7 @@ import {
 import type { QualityAdmissionDecision } from "@better-ccflare/types";
 import {
 	type AutoCatalogEvidence,
+	type AutoModelCapabilities,
 	type AutoModelTargetEvidence,
 	isAutoCatalogEvidenceCurrent,
 	positiveSafeCapacity,
@@ -311,7 +312,24 @@ function textBlocks(value: unknown, separator: string): string | null {
 function codexPreserves(
 	original: Record<string, unknown>,
 	final: Record<string, unknown>,
+	capabilities: AutoModelCapabilities | null,
 ): boolean {
+	if (Object.hasOwn(original, "output_config")) {
+		const output = record(original.output_config);
+		const reasoning = record(final.reasoning);
+		if (
+			!output ||
+			!onlyKeys(output, ["effort"]) ||
+			typeof output.effort !== "string" ||
+			!capabilities?.supportedReasoningEfforts?.some(
+				(effort) => effort === output.effort,
+			) ||
+			!reasoning ||
+			!onlyKeys(reasoning, ["effort"]) ||
+			reasoning.effort !== output.effort
+		)
+			return false;
+	}
 	if (
 		!onlyKeys(original, [
 			"model",
@@ -322,6 +340,7 @@ function codexPreserves(
 			"max_tokens",
 			"stream",
 			"metadata",
+			"output_config",
 		]) ||
 		!onlyKeys(final, [
 			"model",
@@ -595,7 +614,7 @@ export function evaluateAutoRequestAdmission(
 			positiveSafeCapacity(final.max_output_tokens) !== output
 		)
 			return { status: "reject", reason: "output-unsupported" };
-		if (!codexPreserves(original, final))
+		if (!codexPreserves(original, final, capabilities))
 			return { status: "unknown", reason: "request-preservation-unknown" };
 	} else return { status: "unknown", reason: "request-preservation-unknown" };
 	if (!requestedModalities || !capabilities?.inputModalities)
@@ -633,7 +652,7 @@ export function evaluateAutoRequestAdmission(
 					"stop_sequences",
 					...(target.provider === "anthropic"
 						? ["thinking", "output_config", "context_management"]
-						: []),
+						: ["output_config"]),
 				].includes(key),
 		)
 	)

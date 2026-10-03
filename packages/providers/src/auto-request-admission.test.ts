@@ -10,6 +10,305 @@ import {
 	evaluateAutoRequestAdmission,
 } from "./auto-request-admission";
 import { CodexProvider } from "./providers/codex/provider";
+import {
+	captureCodexModelReasoningSnapshot,
+	clearCodexAccountModelContextMetadata,
+	setCodexAccountModelContextMetadata,
+} from "./request-capabilities";
+
+function effortCatalog(
+	levels: unknown = [{ effort: "high" }],
+	accountId = "effort-owner",
+) {
+	const catalog = createAutoCatalogEvidence({
+		accountId,
+		provider: "codex",
+		source: "live",
+		fetchedAt: Date.now(),
+		expiresAt: Date.now() + 60000,
+		models: [
+			{
+				id: "gpt-6-astra",
+				capabilities: normalizeAutoModelCapabilities("codex", {
+					context_window: 10000,
+					max_context_window: 10000,
+					input_modalities: ["text"],
+					supported_reasoning_levels: levels,
+				}),
+			},
+		],
+	});
+	const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
+	if (!catalog || !target) throw new Error("missing effort target");
+	return { catalog, target };
+}
+async function translateEffort(
+	original: Record<string, unknown>,
+	supported = ["minimal", "low", "medium", "high", "xhigh", "max"],
+	refreshed?: string[],
+) {
+	setCodexAccountModelContextMetadata("effort-owner", [
+		{
+			id: "gpt-6-astra",
+			contextWindow: 10000,
+			maxContextWindow: 10000,
+			effectiveContextPercent: 100,
+			supportedReasoningEfforts: supported,
+		},
+	]);
+	const reasoningSnapshot = captureCodexModelReasoningSnapshot("effort-owner");
+	if (refreshed) {
+		setCodexAccountModelContextMetadata("effort-owner", [
+			{
+				id: "gpt-6-astra",
+				contextWindow: 10000,
+				maxContextWindow: 10000,
+				effectiveContextPercent: 100,
+				supportedReasoningEfforts: refreshed,
+			},
+		]);
+		expect(
+			captureCodexModelReasoningSnapshot("effort-owner")?.get("gpt-6-astra")
+				?.supportedEfforts,
+		).toEqual(refreshed);
+		expect(reasoningSnapshot?.get("gpt-6-astra")?.supportedEfforts).toEqual(
+			supported,
+		);
+	}
+	clearCodexAccountModelContextMetadata("effort-owner");
+	const transformed = await new CodexProvider().transformRequestBody(
+		new Request("https://example.invalid/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(original),
+		}),
+		undefined,
+		undefined,
+		{ reasoningSnapshot },
+	);
+	return transformed.json();
+}
+const effortBody = {
+	model: "gpt-6-astra",
+	system: "Keep all input.",
+	messages: [{ role: "user", content: "Read a file." }],
+	max_tokens: 20,
+	tools: [
+		{
+			name: "Read",
+			description: "Read a file",
+			input_schema: {
+				type: "object",
+				properties: { path: { type: "string" } },
+			},
+		},
+	],
+};
+describe("Codex Auto official effort preservation", () => {
+	it("rejects malformed official configurations even with a valid translated effort", async () => {
+		const finalBody = await translateEffort({
+			...effortBody,
+			output_config: { effort: "high" },
+		});
+		for (const output_config of [
+			null,
+			[],
+			"high",
+			1,
+			{},
+			{ effort: null },
+			{ effort: [] },
+			{ effort: 1 },
+			{ effort: "" },
+			{ effort: "unknown" },
+			{ effort: "HIGH" },
+			{ effort: " high " },
+			{ effort: "high", format: {} },
+			{ format: {} },
+		]) {
+			expect(
+				evaluateAutoRequestAdmission({
+					...effortCatalog(),
+					finalBody,
+					requirements: captureAutoRequestRequirements({
+						...effortBody,
+						output_config,
+					}),
+				}),
+			).toMatchObject({
+				status: "unknown",
+				reason: "request-preservation-unknown",
+			});
+		}
+	});
+	it("rejects missing, malformed, changed or extra final reasoning", async () => {
+		const original = { ...effortBody, output_config: { effort: "high" } };
+		const finalBody = await translateEffort(original);
+		for (const reasoning of [
+			undefined,
+			null,
+			[],
+			"high",
+			{},
+			{ effort: "low" },
+			{ effort: 1 },
+			{ effort: "high", summary: "auto" },
+		]) {
+			expect(
+				evaluateAutoRequestAdmission({
+					...effortCatalog(),
+					requirements: captureAutoRequestRequirements(original),
+					finalBody: { ...finalBody, reasoning },
+				}).status,
+			).not.toBe("admit");
+		}
+	});
+	it("never admits original legacy reasoning, alone or alongside official effort", async () => {
+		for (const original of [
+			{ ...effortBody, reasoning: { effort: "high" } },
+			{
+				...effortBody,
+				output_config: { effort: "high" },
+				reasoning: { effort: "high" },
+			},
+		]) {
+			const finalBody = await translateEffort(original);
+			expect(
+				evaluateAutoRequestAdmission({
+					...effortCatalog(),
+					finalBody,
+					requirements: captureAutoRequestRequirements(original),
+				}).status,
+			).not.toBe("admit");
+		}
+	});
+	it("unchanged wire effort cannot replace missing, malformed or unsupported catalog support", async () => {
+		const original = { ...effortBody, output_config: { effort: "high" } };
+		const finalBody = await translateEffort(original);
+		for (const levels of [
+			null,
+			[],
+			"high",
+			[{ effort: "low" }],
+			[{ effort: "high" }, { effort: "unknown" }],
+			[{}],
+			[null],
+			["high"],
+			[{ effort: "HIGH" }],
+		]) {
+			expect(
+				evaluateAutoRequestAdmission({
+					...effortCatalog(levels),
+					finalBody,
+					requirements: captureAutoRequestRequirements(original),
+				}).status,
+			).not.toBe("admit");
+		}
+		const missing = effortCatalog();
+		const missingCapabilities = normalizeAutoModelCapabilities("codex", {
+			context_window: 10000,
+			max_context_window: 10000,
+			input_modalities: ["text"],
+		});
+		const catalog = createAutoCatalogEvidence({
+			...missing.catalog,
+			source: "live",
+			models: [{ id: "gpt-6-astra", capabilities: missingCapabilities }],
+		});
+		const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
+		if (!target) throw new Error("missing target");
+		expect(
+			evaluateAutoRequestAdmission({
+				catalog,
+				target,
+				finalBody,
+				requirements: captureAutoRequestRequirements(original),
+			}).status,
+		).not.toBe("admit");
+	});
+	it.each([
+		["xhigh", "high"],
+		["minimal", "low"],
+		["max", "xhigh"],
+	])("rejects actual adapter clamp %s to %s despite current support", async (effort, clamped) => {
+		const original = { ...effortBody, output_config: { effort } };
+		// The retained adapter generation differs from the newly published owned catalog.
+		const finalBody = await translateEffort(original, [clamped], [effort]);
+		expect(finalBody.reasoning).toEqual({ effort: clamped });
+		expect(
+			evaluateAutoRequestAdmission({
+				...effortCatalog([{ effort }]),
+				finalBody,
+				requirements: captureAutoRequestRequirements(original),
+			}).status,
+		).not.toBe("admit");
+	});
+	it("rechecks account, exact target, support revision and expiry", async () => {
+		const original = { ...effortBody, output_config: { effort: "high" } };
+		const finalBody = await translateEffort(original);
+		const evidence = effortCatalog();
+		const input = {
+			...evidence,
+			finalBody,
+			requirements: captureAutoRequestRequirements(original),
+		};
+		for (const catalog of [
+			effortCatalog([{ effort: "high" }], "other-owner").catalog,
+			effortCatalog([{ effort: "high" }, { effort: "max" }]).catalog,
+			{ ...evidence.catalog, expiresAt: Date.now() },
+		])
+			expect(evaluateAutoRequestAdmission({ ...input, catalog })).toMatchObject(
+				{ status: "unknown", reason: "catalog-evidence-stale" },
+			);
+		expect(
+			evaluateAutoRequestAdmission({
+				...input,
+				finalBody: { ...finalBody, model: "gpt-6.1-sol" },
+			}).status,
+		).not.toBe("admit");
+		expect(
+			evaluateAutoRequestAdmission({
+				...input,
+				finalBody: { ...finalBody, instructions: "changed" },
+			}).status,
+		).not.toBe("admit");
+		expect(
+			evaluateAutoRequestAdmission({
+				...input,
+				finalBody: { ...finalBody, input: [] },
+			}).status,
+		).not.toBe("admit");
+	});
+	it.each([
+		"minimal",
+		"low",
+		"medium",
+		"high",
+		"xhigh",
+		"max",
+	])("admits exactly advertised %s through the real adapter", async (effort) => {
+		const original = { ...effortBody, output_config: { effort } };
+		const finalBody = await translateEffort(original);
+		expect(finalBody.reasoning).toEqual({ effort });
+		expect(finalBody.instructions).toBe(original.system);
+		expect(finalBody.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "Read a file." }] },
+		]);
+		expect(
+			evaluateAutoRequestAdmission({
+				...effortCatalog([{ effort }]),
+				requirements: captureAutoRequestRequirements(original),
+				finalBody,
+			}),
+		).toMatchObject({
+			status: "admit",
+			accounting: {
+				requestedOutput: 20,
+				outputLimit: { kind: "provider-managed" },
+			},
+		});
+	});
+});
 
 function fixture(contextLimit = 100) {
 	const now = Date.now();

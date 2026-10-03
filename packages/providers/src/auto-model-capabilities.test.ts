@@ -185,6 +185,49 @@ describe("Auto evidence freshness", () => {
 });
 
 describe("exact-model capability normalization", () => {
+	it.each(
+		[
+			undefined,
+			null,
+			[],
+			"high",
+			["high"],
+			[null],
+			[[]],
+			[{}],
+			[{ effort: null }],
+			[{ effort: 1 }],
+			[{ effort: "" }],
+			[{ effort: "HIGH" }],
+			[{ effort: " high " }],
+			[{ effort: "high" }, { effort: "unknown" }],
+			Array(7).fill({ effort: "high" }),
+			Object.assign(Array(2), { 0: { effort: "high" } }),
+		].map((levels) => ({ levels })),
+	)("keeps invalid reasoning support unknown ($levels)", ({ levels }) => {
+		expect(
+			normalizeAutoModelCapabilities("codex", {
+				supported_reasoning_levels: levels,
+			}).supportedReasoningEfforts,
+		).toBeNull();
+	});
+	it("captures immutable exact reasoning support and revisions support changes", () => {
+		const levels = [{ effort: "high", description: "High" }, { effort: "max" }];
+		const raw = { supported_reasoning_levels: levels };
+		const first = normalizeAutoModelCapabilities("codex", raw);
+		expect(first.supportedReasoningEfforts).toEqual(["high", "max"]);
+		expect(Object.isFrozen(first.supportedReasoningEfforts)).toBe(true);
+		levels[0].effort = "low";
+		levels.push({ effort: "medium" });
+		expect(first.supportedReasoningEfforts).toEqual(["high", "max"]);
+		expect(normalizeAutoModelCapabilities("codex", raw).revision).not.toBe(
+			first.revision,
+		);
+		expect(
+			normalizeAutoModelCapabilities("anthropic", raw)
+				.supportedReasoningEfforts,
+		).toBeNull();
+	});
 	it("does not accept contradictory capacity fields", () => {
 		const result = normalizeAutoModelCapabilities("codex", {
 			context_window: 872000,
