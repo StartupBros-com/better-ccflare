@@ -1767,6 +1767,43 @@ it.each([
 	}
 });
 it.each([
+	"claude-bccf-quality-auto",
+	"claude-bccf-quality-fable",
+	"claude-bccf-quality-astra",
+	"claude-bccf-quality-opus",
+])("child inheriting picker id %s routes as a standard worker", async (pickerId) => {
+	await (await send()).text();
+	await flush();
+	const response = await send(
+		request(pickerId, { "x-claude-code-agent-id": "inherited-picker-child" }),
+	);
+	expect(response.status).toBe(200);
+	await response.text();
+	await flush();
+	expect(sends[1]?.model).toBe("claude-sonnet-5-5");
+	expect((await service.status(scope))?.preference).toBe("auto");
+	expect((await home())?.physicalModel).toBe("claude-fable-5-1");
+	expect(
+		(await service.status(scope))?.conversations.find((c) => c.key !== "$root")
+			?.home?.target.physicalModel,
+	).toBe("claude-sonnet-5-5");
+});
+it("explicit native frontier child is not downgraded to standard", async () => {
+	await (await send()).text();
+	await flush();
+	const response = await send(
+		request("claude-fable-5-1", { "x-claude-code-agent-id": "fable-child" }),
+	);
+	expect(response.status).toBe(200);
+	await response.text();
+	await flush();
+	expect(sends[1]?.model).toBe("claude-fable-5-1");
+	expect(
+		(await service.status(scope))?.conversations.find((c) => c.key !== "$root")
+			?.home?.target.physicalModel,
+	).toBe("claude-fable-5-1");
+});
+it.each([
 	["larger than analytics", 300 * 1024, "", true],
 	["exact analytics boundary", 256 * 1024, "", true],
 	["invalid tail past analytics", 256 * 1024, "invalid", false],
