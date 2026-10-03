@@ -46,6 +46,7 @@ describe("AccountRepository — compare-and-set token/requires_reauth writes (ro
 				auto_refresh_enabled INTEGER DEFAULT 0,
 				auto_pause_on_overage_enabled INTEGER DEFAULT 0,
 				peak_hours_pause_enabled INTEGER DEFAULT 0,
+				codex_credit_drain_enabled INTEGER NOT NULL DEFAULT 0,
 				custom_endpoint TEXT,
 				model_mappings TEXT,
 				cross_region_mode TEXT,

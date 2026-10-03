@@ -1578,6 +1578,7 @@ describe.skipIf(!livePgAvailable)(
 					await dbOps.setAutoFallbackEnabled("acct-1", true);
 					await dbOps.setAutoPauseOnOverageEnabled("acct-1", true);
 					await dbOps.setPeakHoursPauseEnabled("acct-1", true);
+					await dbOps.setCodexCreditDrainEnabled("acct-1", true);
 					await dbOps.setAccountBillingType("acct-1", "plan");
 					await dbOps.updateAccountRequestCount("acct-1", 7);
 					await dbOps.resetAccountSession("acct-1", now);

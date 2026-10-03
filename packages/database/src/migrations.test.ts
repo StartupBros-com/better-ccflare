@@ -569,6 +569,45 @@ describe("Cache flight cohort seal migrations", () => {
 	});
 });
 
+describe("Database Migrations - codex_credit_drain_enabled", () => {
+	it("adds the column with default 0 on an existing DB and is idempotent", () => {
+		const db = new Database(":memory:");
+		try {
+			ensureSchema(db);
+			const cols = () =>
+				(
+					db.prepare("PRAGMA table_info(accounts)").all() as Array<{
+						name: string;
+						notnull: number;
+						dflt_value: string | null;
+					}>
+				).find((c) => c.name === "codex_credit_drain_enabled");
+			expect(cols()).toBeUndefined();
+
+			runMigrations(db);
+			const col = cols();
+			expect(col).toBeDefined();
+			expect(col?.notnull).toBe(1);
+			expect(col?.dflt_value).toBe("0");
+
+			db.prepare(
+				"INSERT INTO accounts (id, name, provider, created_at) VALUES ('c1','c1','codex',1)",
+			).run();
+			const row = db
+				.prepare(
+					"SELECT codex_credit_drain_enabled AS v FROM accounts WHERE id='c1'",
+				)
+				.get() as { v: number };
+			expect(row.v).toBe(0);
+
+			expect(() => runMigrations(db)).not.toThrow();
+			expect(cols()).toBeDefined();
+		} finally {
+			db.close();
+		}
+	});
+});
+
 describe("Database Migrations - Tier Column Removal", () => {
 	let db: Database;
 

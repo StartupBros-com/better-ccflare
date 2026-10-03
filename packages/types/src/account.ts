@@ -227,6 +227,7 @@ export interface AccountRow {
 	auto_refresh_enabled?: boolean | number | null;
 	auto_pause_on_overage_enabled?: boolean | number | null;
 	peak_hours_pause_enabled?: boolean | number | null;
+	codex_credit_drain_enabled?: boolean | number | null;
 	custom_endpoint?: string | null;
 	model_mappings?: string | null; // JSON string for OpenAI-compatible providers
 	cross_region_mode?: string | null; // Bedrock cross-region inference mode
@@ -265,6 +266,11 @@ export interface Account {
 	auto_refresh_enabled: boolean;
 	auto_pause_on_overage_enabled: boolean;
 	peak_hours_pause_enabled: boolean;
+	/**
+	 * Optional on purpose: absent = off = "keep" (default behavior), so existing
+	 * Account fixtures need no edit. toAccount always sets it.
+	 */
+	codex_credit_drain_enabled?: boolean;
 	custom_endpoint: string | null;
 	model_mappings: string | null; // JSON string for OpenAI-compatible providers
 	cross_region_mode: string | null; // Bedrock cross-region inference mode
@@ -338,6 +344,9 @@ export interface AccountResponse {
 	autoFallbackEnabled: boolean;
 	autoRefreshEnabled: boolean;
 	autoPauseOnOverageEnabled?: boolean;
+	codexCreditDrainEnabled?: boolean;
+	/** Enabled AND drain currently in effect (fresh credit evidence). */
+	codexCreditDrainActive?: boolean;
 	peakHoursPauseEnabled?: boolean;
 	customEndpoint: string | null;
 	modelMappings: { [key: string]: string | string[] } | null; // Parsed model mappings (arrays = cycling models)
@@ -491,6 +500,7 @@ export function toAccount(row: AccountRow): Account {
 		auto_refresh_enabled: !!row.auto_refresh_enabled,
 		auto_pause_on_overage_enabled: !!row.auto_pause_on_overage_enabled,
 		peak_hours_pause_enabled: !!row.peak_hours_pause_enabled,
+		codex_credit_drain_enabled: !!row.codex_credit_drain_enabled,
 		custom_endpoint: row.custom_endpoint || null,
 		model_mappings: row.model_mappings || null,
 		cross_region_mode: row.cross_region_mode || null,
@@ -583,6 +593,7 @@ export function toAccountResponse(account: Account): AccountResponse {
 		autoRefreshEnabled: account.auto_refresh_enabled,
 		autoPauseOnOverageEnabled: account.auto_pause_on_overage_enabled,
 		peakHoursPauseEnabled: account.peak_hours_pause_enabled,
+		codexCreditDrainEnabled: !!account.codex_credit_drain_enabled,
 		customEndpoint: account.custom_endpoint,
 		modelMappings,
 		usageUtilization: null, // Will be filled in by API handler from cache

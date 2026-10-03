@@ -1479,6 +1479,13 @@ OAuth tokens will need to be re-authenticated.
 		await this.accounts.setAutoPauseOnOverageEnabled(accountId, enabled);
 	}
 
+	async setCodexCreditDrainEnabled(
+		accountId: string,
+		enabled: boolean,
+	): Promise<void> {
+		await this.accounts.setCodexCreditDrainEnabled(accountId, enabled);
+	}
+
 	async setPeakHoursPauseEnabled(
 		accountId: string,
 		enabled: boolean,

@@ -562,6 +562,21 @@ function readAccountBoolean(account: Account, field: keyof Account): boolean {
 	return value;
 }
 
+/**
+ * For fields that are optional on Account (absent = off). An absent own
+ * property reads as false; a present one must still be a plain boolean data
+ * property, so accessors/getters keep being rejected.
+ */
+function readOptionalAccountBoolean(
+	account: Account,
+	field: keyof Account,
+): boolean {
+	if (Object.getOwnPropertyDescriptor(account, field) === undefined) {
+		return false;
+	}
+	return readAccountBoolean(account, field);
+}
+
 function createScalarAccountView(account: Account): Account {
 	const accountView: Account = {
 		id: readAccountString(account, "id"),
@@ -604,6 +619,10 @@ function createScalarAccountView(account: Account): Account {
 		peak_hours_pause_enabled: readAccountBoolean(
 			account,
 			"peak_hours_pause_enabled",
+		),
+		codex_credit_drain_enabled: readOptionalAccountBoolean(
+			account,
+			"codex_credit_drain_enabled",
 		),
 		custom_endpoint: readAccountNullableString(account, "custom_endpoint"),
 		model_mappings: readAccountNullableString(account, "model_mappings"),

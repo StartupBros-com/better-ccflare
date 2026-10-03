@@ -1085,6 +1085,40 @@ describe("Database Migrations — non-destructive account dedup", () => {
 		}
 	});
 
+	it("keeps codex_credit_drain_enabled=1 when any duplicate has it", () => {
+		setupFullSchemaForDedupTest(db);
+
+		const now = Date.now();
+		db.prepare(
+			`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint, codex_credit_drain_enabled)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+		).run("cdr-1", "cdr", "codex", "r1", "a1", now - 5000, now, now, null);
+		db.prepare(
+			`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint, codex_credit_drain_enabled)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+		).run(
+			"cdr-2",
+			"cdr",
+			"codex",
+			"r2",
+			"a2",
+			now - 9000,
+			now - 90000,
+			now - 9000,
+			null,
+		);
+
+		runMigrations(db);
+
+		const survivors = db
+			.prepare(
+				`SELECT codex_credit_drain_enabled AS v FROM accounts WHERE name = 'cdr'`,
+			)
+			.all() as Array<{ v: number | null }>;
+		expect(survivors).toHaveLength(1);
+		expect(survivors[0].v).toBe(1);
+	});
+
 	// Regression tests for the code-review finding "dedup silently
 	// CASCADE-deletes combo_membership_exclusions" (and the companion
 	// device_setup_jobs gap). All tests above run with SQLite's default
