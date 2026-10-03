@@ -103,6 +103,20 @@ describe("UsageCache Codex credit evidence", () => {
 		).toBeNull();
 	});
 
+	it("is null once a replacement registration has not yet produced evidence", async () => {
+		await poll(body({ has_credits: true }));
+		expect(
+			usageCache.getCodexCreditEvidence(accountId, Date.now(), MAX_AGE),
+		).toBe(true);
+		// A second startPolling without stopPolling replaces the registration.
+		// Its fetch never settles, so it cannot bind new evidence.
+		globalThis.fetch = (() => new Promise<Response>(() => {})) as typeof fetch;
+		usageCache.startPolling(accountId, "fake-token", "codex", 60_000);
+		expect(
+			usageCache.getCodexCreditEvidence(accountId, Date.now(), MAX_AGE),
+		).toBeNull();
+	});
+
 	it("goes stale after maxAgeMs and rejects future-dated evidence", async () => {
 		await poll(body({ has_credits: true }));
 		const now = Date.now();

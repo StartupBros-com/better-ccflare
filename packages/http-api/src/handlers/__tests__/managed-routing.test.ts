@@ -1,4 +1,4 @@
-import { describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock } from "bun:test";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import { usageCache } from "@better-ccflare/providers/usage-cache";
 import type {
@@ -739,6 +739,83 @@ describe("managed routing HTTP control plane", () => {
 		} finally {
 			usageCache.clearFamilyScopedExhaustion("a", "claude-opus-4-8");
 		}
+	});
+
+	describe("Codex credit drain in the effective routing preview", () => {
+		const originalFetch = globalThis.fetch;
+		const drainId = "a";
+
+		afterEach(() => {
+			usageCache.stopPolling(drainId);
+			usageCache.delete(drainId);
+			globalThis.fetch = originalFetch;
+		});
+
+		async function ownedCodexPoll(credits: Record<string, unknown>) {
+			const reset_at = Math.floor(Date.now() / 1000) + 3600;
+			globalThis.fetch = (async () =>
+				Response.json({
+					rate_limit: {
+						allowed: false,
+						limit_reached: true,
+						primary_window: { used_percent: 100, reset_at },
+						secondary_window: { used_percent: 100, reset_at },
+					},
+					credits,
+				})) as typeof fetch;
+			await new Promise<void>((resolve) => {
+				usageCache.startPolling(
+					drainId,
+					"fake-token",
+					"codex",
+					60_000,
+					undefined,
+					undefined,
+					undefined,
+					() => resolve(),
+				);
+			});
+		}
+
+		async function firstMemberReason(drainEnabled: boolean) {
+			const state = statefulDb();
+			state.mutateAccount(drainId, {
+				provider: "codex",
+				api_key: "secret-codex",
+				refresh_token: null,
+				access_token: null,
+				custom_endpoint: null,
+				model_mappings: null,
+				codex_credit_drain_enabled: drainEnabled,
+			});
+			const response = await createEffectiveRoutingHandler(
+				state.dbOps,
+				dependencies,
+			)("opus");
+			const members = (await response.json()).data.resolution.members;
+			return members[0].availability.reason as string;
+		}
+
+		const CREDITS = { has_credits: true, unlimited: false, balance: "10" };
+
+		it("treats a drain-active Codex account with spent windows as available", async () => {
+			await ownedCodexPoll(CREDITS);
+			expect(await firstMemberReason(true)).toBe("available");
+		});
+
+		it("still reports model_exhausted for spent windows when drain is off", async () => {
+			await ownedCodexPoll(CREDITS);
+			expect(await firstMemberReason(false)).toBe("model_exhausted");
+		});
+
+		it("still reports model_exhausted for spent windows without credits", async () => {
+			await ownedCodexPoll({
+				has_credits: false,
+				unlimited: false,
+				balance: "0",
+			});
+			expect(await firstMemberReason(true)).toBe("model_exhausted");
+		});
 	});
 
 	it("previews from a non-secret draft auth shape and emits reviewed identifiers", async () => {
