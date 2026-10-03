@@ -223,28 +223,45 @@ describe("selectAccountsForRequest — Codex credit drain", () => {
 		expect(result).toEqual([]);
 	});
 
-	it("excludes when the owned evidence has gone stale", async () => {
-		const account = makeAccount({
-			id: "drain-stale",
-			codex_credit_drain_enabled: true,
-		});
+	/**
+	 * Polls stopped succeeding but traffic keeps going: response headers keep
+	 * the usage snapshot fresh at 100% while the owned credit evidence ages.
+	 */
+	async function selectAfterPassiveWrite(id: string, elapsedMs: number) {
+		const account = makeAccount({ id, codex_credit_drain_enabled: true });
 		await ownedPoll(account.id, CREDITS);
 		const realNow = Date.now;
-		Date.now = () => realNow() + 10 * 60_000;
+		Date.now = () => realNow() + elapsedMs;
 		try {
+			const resets_at = new Date(Date.now() + 3_600_000).toISOString();
+			usageCache.set(account.id, {
+				five_hour: { utilization: 100, resets_at },
+				seven_day: { utilization: 100, resets_at },
+			} as never);
 			const result = await selectAccountsForRequest(
 				makeMeta(),
 				makeCtx([account]),
 				MODEL,
 			);
-			// Stale snapshot also fails open on hard capacity; assert the
-			// evidence getter itself, which is what gates the relaxation.
-			expect(
-				usageCache.getCodexCreditEvidence(account.id, Date.now(), 180_000),
-			).toBeNull();
-			expect(Array.isArray(result)).toBe(true);
+			return { account, result };
 		} finally {
 			Date.now = realNow;
 		}
+	}
+
+	it("keeps selecting when a passive header write lands within the evidence window", async () => {
+		const { account, result } = await selectAfterPassiveWrite(
+			"drain-passive-fresh",
+			60_000,
+		);
+		expect(result).toEqual([account]);
+	});
+
+	it("excludes once the owned evidence is stale even though headers keep the snapshot fresh", async () => {
+		const { result } = await selectAfterPassiveWrite(
+			"drain-passive-stale",
+			10 * 60_000,
+		);
+		expect(result).toEqual([]);
 	});
 });
