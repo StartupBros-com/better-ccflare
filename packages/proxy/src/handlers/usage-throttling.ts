@@ -1058,6 +1058,28 @@ export function getUsageThrottleUntil(
 	return getUsageThrottleStatus(data, settings, now, opts).throttleUntil;
 }
 
+/**
+ * Request-path pacing for one account. Reads the account's cached usage and
+ * resolves Codex credit drain here, so no caller can drop the drain argument.
+ */
+export function getAccountUsageThrottleUntil(
+	account: {
+		id: string;
+		provider: string;
+		codex_credit_drain_enabled?: boolean | null;
+	},
+	settings: UsageThrottleSettings,
+	now: number,
+	requestModel: string | null,
+): number | null {
+	if (!settings.fiveHourEnabled && !settings.weeklyEnabled) return null;
+	return getUsageThrottleUntil(usageCache.get(account.id), settings, now, {
+		requestModel,
+		scopedMode: "match",
+		creditDrainActive: isCodexCreditDrainActive(account, now),
+	});
+}
+
 export function createUsageThrottledResponse(accounts: Account[]): Response {
 	const names = accounts.map((account) => account.name).join(", ");
 	return new Response(

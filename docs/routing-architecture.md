@@ -343,8 +343,9 @@ stops excluding the account for spent `session` and `weekly_all` windows
 (`creditDrainActive`, honored only for provider `codex`). It is resolved in the
 ordinary, capability/route-profile, forced-account and combo candidate paths
 (`evaluateCandidateCapacity`) and in the managed-routing preview
-(`isLogicalModelExhausted`), so previews match runtime. Predictive pacing skips
-windows at >= 100% but still paces windows with headroom.
+(`isLogicalModelExhausted`), so previews match runtime. Predictive pacing
+(`getAccountUsageThrottleUntil`, which resolves drain itself) skips windows at
+>= 100% but still paces windows with headroom.
 
 **Evidence.** Drain is active only with fresh, poll-verified credit evidence:
 `hasCredits === true || unlimited === true` from the source-owned usage poll.
@@ -358,8 +359,10 @@ stale evidence means the account is treated exactly like a "keep" account.
 
 **What it does not change.** Auto/quality routes (`evaluateAutoCapacity`) still
 reject spent subscription windows, `weekly_scoped` family exclusions are
-unchanged, and the auto-refresh scheduler is unchanged so probes never spend
-credits. When credits run out, the next upstream 429 benches the account through
+unchanged, and internal probes never ride drain: `evaluateCandidateCapacity`
+skips the relaxation for keepalive (`syntheticProbe`) and authenticated
+auto-refresh requests, so a probe to a spent opted-in account still fails closed
+with `account_capacity_exhausted` instead of spending credits. When credits run out, the next upstream 429 benches the account through
 the normal reactive rate-limit path.
 
 ## Durable Auto quality routing
