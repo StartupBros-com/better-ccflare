@@ -622,8 +622,7 @@ export async function routeQualityRequest(input: {
 			QualityLane,
 			Partial<Record<QualityAdmissionReason, number>>
 		>();
-		let surfacedReason: QualityAdmissionReason = "lane-unavailable";
-		let anySkip = false;
+		const recordedReasons: QualityAdmissionReason[] = [];
 		const attemptedLanes = new Set<QualityLane>();
 		const summaries = (through?: QualityLane): QualitySkippedLanes =>
 			lanes
@@ -644,9 +643,7 @@ export async function routeQualityRequest(input: {
 			compilationOnly = false,
 		) => {
 			if (!compilationOnly) attemptedLanes.add(lane);
-			if (!anySkip || reasonRank(reason) < reasonRank(surfacedReason))
-				surfacedReason = reason;
-			anySkip = true;
+			recordedReasons.push(reason);
 			const reasons = skipped.get(lane) ?? {};
 			reasons[reason] = Math.min(1_000_000, (reasons[reason] ?? 0) + count);
 			skipped.set(lane, reasons);
@@ -1052,6 +1049,7 @@ export async function routeQualityRequest(input: {
 				/* Explanation failure never triggers inference or changes routing. */
 			}
 		}
+		const surfacedReason = surfaceQualityReason(recordedReasons);
 		const response = unavailable(surfacedReason, 503, {
 			message: `Auto could not serve this request: ${surfacedReason} (see error.lanes)`,
 			lanes: summaries(),

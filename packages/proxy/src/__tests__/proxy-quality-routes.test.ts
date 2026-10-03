@@ -3174,6 +3174,53 @@ describe("prewarmed native catalogs", () => {
 		]);
 	});
 
+	it("terminal 503 surfaces an earlier request-shape reason over later capacity skips", async () => {
+		// Incident B shape: the last recorded skip is a capacity reason, but the
+		// surfaced reason must be the better-ranked request-shape one.
+		const transport = globalThis.fetch;
+		globalThis.fetch = Object.assign(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const req = input instanceof Request ? input : new Request(input, init);
+				if (req.method !== "GET") return transport(input, init);
+				const catalog = (await (await transport(input, init)).json()) as {
+					data: { id: string; max_tokens: number }[];
+				};
+				for (const model of catalog.data)
+					if (/^claude-(fable|opus)/.test(model.id)) model.max_tokens = 10;
+				return Response.json(catalog);
+			},
+			{ preconnect: () => {} },
+		) as typeof fetch;
+		resetModelCatalogForTest();
+		for (const a of accounts)
+			await fetchLiveModels(ctx, { allowOAuth: true, accountId: a.id });
+		// Account "a" is tried first and refused for request shape; account "b"
+		// is tried later and refused for capacity.
+		accounts[0].priority = 0;
+		accounts[1].priority = 1;
+		usageCache.set("b", {
+			limits: [
+				{ kind: "weekly_all", percent: 100, resets_at: Date.now() + 60000 },
+			],
+			spend: { enabled: false },
+		} as never);
+		const response = await send();
+		expect(response.status).toBe(503);
+		const body = (await response.json()) as {
+			error: {
+				reason: string;
+				lanes: { lane: string; reasons: Record<string, number> }[];
+			};
+		};
+		expect(sends).toHaveLength(0);
+		const laneReasons = Object.fromEntries(
+			body.error.lanes.map((l) => [l.lane, Object.keys(l.reasons)]),
+		);
+		expect(laneReasons.fable).toContain("output-unsupported");
+		expect(laneReasons.opus).toContain("provider-capacity-exhausted");
+		expect(body.error.reason).toBe("output-unsupported");
+	});
+
 	it("non-terminal quality errors keep their original body shape", async () => {
 		const response = await send(request("claude-bccf-quality-nope"));
 		expect(response.status).toBe(400);
