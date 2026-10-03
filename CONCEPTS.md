@@ -142,13 +142,13 @@ serving client traffic after its plan windows are spent, so the provider bills t
 instead of the account being refused.
 
 It holds only while fresh evidence from the account's own usage poll says credits are
-available; without that evidence the account falls back to the normal spent-window refusal, so
-the drain fails closed. It lifts only the account-wide short and multi-day windows (per-model
-caps still bind) and never covers the proxy's own probe traffic or Auto quality routing, which
-spends credits only under a separate, explicit operator grant. Accounts without the opt-in are
-refused once a plan window reads full even while the provider still reports them as allowed:
-the provider's allowed flag can lag its usage percentage, and the request that crosses the line
-is billed to credits.
+available. Without that evidence the account gets the normal spent-window refusal, and that
+refusal itself needs a fresh usage reading. It lifts only the account-wide short and
+multi-day windows (per-model caps are not lifted) and never covers the proxy's own probe traffic
+or Auto quality routing, which has its own, stricter spend rules. Accounts without the opt-in
+are refused once a plan window reads full even while the provider still reports them as
+allowed: the provider's allowed flag can lag its usage percentage, and the request that
+crosses the line is billed to credits.
 
 ## Usage measurement
 
