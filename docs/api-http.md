@@ -488,6 +488,29 @@ curl -X POST http://localhost:8080/api/accounts/uuid-here/auto-fallback \
 - **Performance Management**: Automatically use higher-performance accounts when they're ready
 - **Tiered Access**: Ensure priority accounts get used first when available
 
+#### POST /api/accounts/:accountId/codex-credit-drain
+
+Enable or disable credit drain for a Codex account. When enabled, ccflare keeps routing to the account after its five-hour or weekly subscription window reaches 100%, so OpenAI serves the requests from purchased credits. **This spends real credits.** The default is off.
+
+Routing honors the flag only while fresh, poll-verified credit evidence exists (the usage poll reports `has_credits` or `unlimited`; a bare balance does not count). With no fresh evidence the account behaves as if the flag were off. Codex accounts only; other providers get `400`, unknown accounts `404`.
+
+**Request Body:**
+```json
+{ "enabled": 1 }
+```
+`enabled` must be `0` or `1`.
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Credit drain enabled for account 'name'",
+  "codexCreditDrainEnabled": true
+}
+```
+
+`GET /api/accounts` returns `codexCreditDrainEnabled` (the setting) and `codexCreditDrainActive` (the setting AND fresh credit evidence, i.e. currently in effect). While active, a spent window is not reported as `usage_exhausted` or throttled, and `/health` counts the account as routable.
+
 #### POST /api/accounts/:accountId/pause
 
 Pause an account temporarily.
