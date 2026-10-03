@@ -95,6 +95,7 @@ export interface AutoCapacityEvidence {
 /** Auto-only projection. History and manual throttling retain their contracts.
  * Keep duplicate and invalid rows: omission must not manufacture capacity.
  * Generic presence, not validity, suppresses a legacy mirror.
+ * Unrecognized seven_day_* metadata objects with no window fields are not windows.
  */
 export function collectAutoCapacityEvidence(
 	usage: unknown,
@@ -198,6 +199,13 @@ export function collectAutoCapacityEvidence(
 		const row = asRecord(value);
 		if (!row) continue;
 		const identity = scopeForKey(key);
+		// Unrecognized metadata (e.g. seven_day_breakdown) carries no window fields.
+		if (
+			identity.scope === "other" &&
+			!Object.hasOwn(row, "utilization") &&
+			!Object.hasOwn(row, "resets_at")
+		)
+			continue;
 		add(
 			"flat",
 			key,

@@ -35,6 +35,56 @@ describe("Auto capacity source precedence", () => {
 			utilization: null,
 		});
 	});
+
+	const healthyWindows = {
+		five_hour: { utilization: 6, resets_at: "2026-10-03T12:00:00.000Z" },
+		seven_day: { utilization: 2, resets_at: "2026-10-07T12:00:00.000Z" },
+	};
+
+	it("does not treat a seven_day_breakdown metadata object as a window", () => {
+		const rows = collectAutoCapacityEvidence(
+			{
+				...healthyWindows,
+				seven_day_breakdown: {
+					as_of: "2026-10-03T09:00:00.000Z",
+					window_started_at: "2026-09-30T09:00:00.000Z",
+					rows: [{ key: "fable", display_name: "Fable", percent: 0 }],
+				},
+			},
+			"anthropic",
+		);
+		expect(rows.map((r) => r.window)).toEqual(["five_hour", "seven_day"]);
+		expect(rows.some((r) => r.window === "seven_day_breakdown")).toBe(false);
+		expect(rows.some((r) => r.scope === "unknown")).toBe(false);
+	});
+
+	it("keeps a window-shaped unrecognized seven_day_ key as an unknown row", () => {
+		const rows = collectAutoCapacityEvidence(
+			{
+				...healthyWindows,
+				seven_day_oauth_apps: { utilization: null, resets_at: null },
+			},
+			"anthropic",
+		);
+		expect(rows.find((r) => r.window === "seven_day_oauth_apps")).toMatchObject(
+			{ scope: "unknown", utilization: null },
+		);
+	});
+
+	it("keeps known windows as rows even when their shape drifts", () => {
+		const rows = collectAutoCapacityEvidence(
+			{ seven_day: {}, seven_day_fable: { foo: 1 } },
+			"anthropic",
+		);
+		expect(rows.find((r) => r.window === "seven_day_fable")).toMatchObject({
+			scope: "family",
+			utilization: null,
+		});
+		expect(rows.find((r) => r.window === "seven_day")).toMatchObject({
+			scope: "account",
+			utilization: null,
+		});
+	});
 });
 
 describe("normalizeProviderUsageWindows", () => {
