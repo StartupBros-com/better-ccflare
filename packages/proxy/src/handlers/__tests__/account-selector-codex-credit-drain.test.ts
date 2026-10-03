@@ -160,6 +160,61 @@ describe("selectAccountsForRequest — Codex credit drain", () => {
 		).rejects.toMatchObject({ accountId: account.id });
 	});
 
+	it("keeps an auto-refresh probe off the drain override", async () => {
+		const account = makeAccount({
+			id: "drain-auto-refresh",
+			codex_credit_drain_enabled: true,
+		});
+		await ownedPoll(account.id, CREDITS);
+		const meta = makeMeta({ "x-better-ccflare-account-id": account.id });
+		meta.trustedInternalAutoRefresh = true;
+		await expect(
+			selectAccountsForRequest(meta, makeCtx([account]), MODEL),
+		).rejects.toMatchObject({
+			accountId: account.id,
+			reason: "account_capacity_exhausted",
+		});
+	});
+
+	it("keeps a keepalive probe off the drain override", async () => {
+		const account = makeAccount({
+			id: "drain-keepalive",
+			codex_credit_drain_enabled: true,
+		});
+		await ownedPoll(account.id, CREDITS);
+		await expect(
+			selectAccountsForRequest(
+				makeMeta({ "x-better-ccflare-account-id": account.id }),
+				makeCtx([account]),
+				MODEL,
+				{ syntheticProbe: true },
+			),
+		).rejects.toMatchObject({
+			accountId: account.id,
+			reason: "account_capacity_exhausted",
+		});
+	});
+
+	it("excludes again once a later poll reports the credits gone", async () => {
+		const account = makeAccount({
+			id: "drain-credits-spent",
+			codex_credit_drain_enabled: true,
+		});
+		await ownedPoll(account.id, CREDITS);
+		expect(
+			await selectAccountsForRequest(makeMeta(), makeCtx([account]), MODEL),
+		).toEqual([account]);
+		usageCache.stopPolling(account.id);
+		await ownedPoll(account.id, {
+			has_credits: false,
+			unlimited: false,
+			balance: "0",
+		});
+		expect(
+			await selectAccountsForRequest(makeMeta(), makeCtx([account]), MODEL),
+		).toEqual([]);
+	});
+
 	it("excludes when drain is on but the poll says no credits", async () => {
 		const account = makeAccount({
 			id: "drain-no-credits",

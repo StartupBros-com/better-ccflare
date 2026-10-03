@@ -1334,12 +1334,18 @@ function evaluateCandidateCapacity(
 	const enforceModelScopedCapacity = enforcesModelScopedCapacity(options);
 
 	if (snapshot) {
+		// Credit drain serves client traffic only: internal probes (auto-refresh,
+		// keepalive) keep the spent-window gate rather than spend credits.
+		const internalProbe =
+			options.syntheticProbe ||
+			options.observationMeta?.trustedInternalAutoRefresh === true;
 		const hardCapacity = evaluateHardCapacity(snapshot.data, {
 			requestModel: model,
 			observedAt: snapshot.observedAt,
 			provider: account.provider,
 			now,
-			creditDrainActive: isCodexCreditDrainActive(account, now),
+			creditDrainActive:
+				!internalProbe && isCodexCreditDrainActive(account, now),
 		});
 		blockers.push(
 			...hardCapacity.exclusions
