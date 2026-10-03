@@ -121,6 +121,7 @@ import {
 	evaluateNativeQuotaRequest,
 	getCapacityDeferredModelRoutes,
 	getClientVisibleServerToolAccountId,
+	getNativeConstraintRemovedAccountIds,
 	getNativeQuotaCandidateModelUnavailableUntil,
 	getNativeQuotaContext,
 	getReactiveModelCapacityBlocker,
@@ -1035,6 +1036,24 @@ async function handleProxyCoreImpl(
 						}),
 			),
 			`server_tool_${error.reason}`,
+		);
+	};
+	// An advisor request whose first-party candidates are all throttled or
+	// depleted must not fall into the pool's own terminal while an available
+	// non-first-party account was removed only by the native constraint: that
+	// is an unserved advisor requirement (refuse, R5). With nothing removed the
+	// caller's existing terminal stands (R7).
+	const nativeConstraintEmptyPoolRefusal = (): Response | null => {
+		const requirement = requestMeta.nativeAnthropicToolRequirement;
+		if (
+			requirement == null ||
+			getNativeConstraintRemovedAccountIds(requestMeta).size === 0
+		) {
+			return null;
+		}
+		cacheBodyStore.discardStaged(requestMeta.id);
+		return createUnservedServerToolRoutingErrorResponse(
+			createNativeAnthropicToolRoutingError(requirement),
 		);
 	};
 	activeAnthropicPreCommitRescue?.registerRequestLifecycle(
@@ -2665,6 +2684,11 @@ async function handleProxyCoreImpl(
 		// throw below can leave a stale mapping (KTD-5).
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 
+		const nativeConstraintRefusal = nativeConstraintEmptyPoolRefusal();
+		if (nativeConstraintRefusal) {
+			return finishPacing(pacingSlot, nativeConstraintRefusal);
+		}
+
 		const nativeTerminal = nativeQuotaTerminal("selection");
 		if (nativeTerminal) return finishPacing(pacingSlot, nativeTerminal);
 
@@ -2790,6 +2814,7 @@ async function handleProxyCoreImpl(
 					ctx.dbOps.getAllAccounts(),
 				),
 				req.headers,
+				requestMeta.nativeAnthropicToolRequirement != null,
 			);
 		} catch (error) {
 			log.error("Failed to load terminal account state", error);
@@ -4344,6 +4369,17 @@ async function handleProxyCoreImpl(
 		} else if (
 			deferredModelRoutes.length === 0 &&
 			!hasExhaustedLocalServerToolCapabilityFailures() &&
+			(reactivelyDepletedFallbackAccounts.length > 0 ||
+				throttledFallbackAccounts.length > 0) &&
+			requestMeta.nativeAnthropicToolRequirement != null &&
+			getNativeConstraintRemovedAccountIds(requestMeta).size > 0
+		) {
+			const refusal = nativeConstraintEmptyPoolRefusal();
+			if (!refusal) throw new Error("native constraint refusal expected");
+			return finishPacing(pacingSlot, refusal);
+		} else if (
+			deferredModelRoutes.length === 0 &&
+			!hasExhaustedLocalServerToolCapabilityFailures() &&
 			reactivelyDepletedFallbackAccounts.length > 0
 		) {
 			cacheBodyStore.discardStaged(requestMeta.id);
@@ -4755,6 +4791,13 @@ async function handleProxyCoreImpl(
 	}
 
 	completeRoutingSelectionStage(requestMeta, "usage_throttle");
+	// Nothing reached an upstream, so an available non-first-party account that
+	// only the native constraint removed is what the throttle terminals below
+	// would have been standing in for.
+	if (routingAttemptLedger.attemptedCount === 0) {
+		const refusal = nativeConstraintEmptyPoolRefusal();
+		if (refusal) return finishPacing(pacingSlot, refusal);
+	}
 	const exhaustedNativeTerminal = nativeQuotaTerminal("attempts");
 	if (exhaustedNativeTerminal) {
 		cacheBodyStore.discardStaged(requestMeta.id);
@@ -4907,6 +4950,7 @@ async function handleProxyCoreImpl(
 		const refreshedTerminalAccounts = filterRequestCompatibleAccounts(
 			await loadRoutingInventory(requestMeta, () => ctx.dbOps.getAllAccounts()),
 			req.headers,
+			requestMeta.nativeAnthropicToolRequirement != null,
 		);
 		terminalAccounts = mergeTerminalAccountState(
 			refreshedTerminalAccounts,

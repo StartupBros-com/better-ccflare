@@ -2373,6 +2373,129 @@ describe("advisor native-only selection through handleProxy", () => {
 		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
 	});
 
+	describe("when throttling empties the native-filtered pool", () => {
+		const throttleFirstParty = (ctx: ProxyContext, account: Account) => {
+			ctx.config.getUsageThrottlingFiveHourEnabled = () => true;
+			usageCache.set(account.id, {
+				five_hour: {
+					utilization: 80,
+					resets_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+				},
+				seven_day: { utilization: 10, resets_at: null },
+			});
+		};
+		const depleteFirstParty = (account: Account) => {
+			usageCache.markModelScopedExhausted(
+				account.id,
+				MODEL,
+				ADVISOR_BETA,
+				Date.now() + 60_000,
+			);
+		};
+		const fetchSpy = () => {
+			globalThis.fetch = mock(
+				async () => new Response("{}", { status: 500 }),
+			) as unknown as typeof fetch;
+		};
+		const cleanup = (account: Account) => {
+			usageCache.delete(account.id);
+		};
+
+		it("refuses instead of the 529 when the first-party account is predictively throttled and a gateway is available", async () => {
+			const first = firstParty();
+			const { ctx, mutations } = makeContext([gateway(), first]);
+			throttleFirstParty(ctx, first);
+			fetchSpy();
+			try {
+				const request = advisorRequest();
+				const response = await handleProxy(request, new URL(request.url), ctx);
+				const body = (await response.json()) as {
+					error: { message: string; reason: string };
+				};
+
+				expect(response.status).toBe(400);
+				expect(body.error.reason).toBe("advisor_declaration_unavailable");
+				expect(body.error.message).toContain(DECLARATION_PHRASE);
+				expect(response.headers.has("retry-after")).toBeFalse();
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+				expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+			} finally {
+				cleanup(first);
+			}
+		});
+
+		it("keeps the 529 when the first-party account is predictively throttled and no other account is available", async () => {
+			const first = firstParty();
+			const { ctx } = makeContext([first]);
+			throttleFirstParty(ctx, first);
+			fetchSpy();
+			try {
+				const request = advisorRequest();
+				const response = await handleProxy(request, new URL(request.url), ctx);
+
+				expect(response.status).toBe(529);
+				expect(response.headers.has("retry-after")).toBeTrue();
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				cleanup(first);
+			}
+		});
+
+		it("refuses instead of the model-pool 503 when the first-party account is reactively model-depleted and a gateway is available", async () => {
+			const first = firstParty();
+			const { ctx } = makeContext([gateway(), first]);
+			depleteFirstParty(first);
+			fetchSpy();
+			try {
+				const request = advisorRequest();
+				const response = await handleProxy(request, new URL(request.url), ctx);
+				const body = (await response.json()) as {
+					error: { message: string; reason: string };
+				};
+
+				expect(response.status).toBe(400);
+				expect(body.error.reason).toBe("advisor_declaration_unavailable");
+				expect(body.error.message).toContain(DECLARATION_PHRASE);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				cleanup(first);
+			}
+		});
+
+		it("keeps the model-pool 503 when the first-party account is reactively model-depleted and no other account is available", async () => {
+			const first = firstParty();
+			const { ctx } = makeContext([first]);
+			depleteFirstParty(first);
+			fetchSpy();
+			try {
+				const request = advisorRequest();
+				const response = await handleProxy(request, new URL(request.url), ctx);
+
+				expect(response.status).toBe(503);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				cleanup(first);
+			}
+		});
+
+		it("refuses with zero fetches under CCFLARE_PASSTHROUGH_ON_EMPTY_POOL=1 rather than passing through to Anthropic", async () => {
+			process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+			const first = firstParty();
+			const { ctx } = makeContext([gateway(), first]);
+			throttleFirstParty(ctx, first);
+			fetchSpy();
+			try {
+				const request = advisorRequest();
+				const response = await handleProxy(request, new URL(request.url), ctx);
+
+				expect(response.status).toBe(400);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				cleanup(first);
+			}
+		});
+	});
+
 	it("refuses a history-only request when only a non-first-party account is available (AE3)", async () => {
 		const request = advisorRequest({
 			tools: [],
