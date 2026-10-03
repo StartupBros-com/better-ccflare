@@ -353,7 +353,9 @@ export class OAuthFlow {
 			// http-api handlers use so the dashboard renders a uniform
 			// error.
 			if (isUniqueConstraintError(insertErr)) {
-				throw new Error(`Account name '${name}' is already taken`);
+				throw new Error(`Account name '${name}' is already taken`, {
+					cause: insertErr,
+				});
 			}
 			throw insertErr;
 		}
@@ -413,7 +415,9 @@ export class OAuthFlow {
 			// only translates the error into the same wording the
 			// http-api handlers emit.
 			if (isUniqueConstraintError(insertErr)) {
-				throw new Error(`Account name '${name}' is already taken`);
+				throw new Error(`Account name '${name}' is already taken`, {
+					cause: insertErr,
+				});
 			}
 			throw insertErr;
 		}

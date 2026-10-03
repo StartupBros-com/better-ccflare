@@ -8,8 +8,12 @@ export class RequestBodyTooLargeError extends Error {
 	readonly source: RequestBodyTooLargeSource;
 	readonly limit: number;
 
-	constructor(source: RequestBodyTooLargeSource, limit: number) {
-		super(`Request body exceeds the ${limit}-byte limit.`);
+	constructor(
+		source: RequestBodyTooLargeSource,
+		limit: number,
+		options?: ErrorOptions,
+	) {
+		super(`Request body exceeds the ${limit}-byte limit.`, options);
 		this.name = "RequestBodyTooLargeError";
 		this.source = source;
 		this.limit = limit;

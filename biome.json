@@ -23,7 +23,15 @@
 	"linter": {
 		"enabled": true,
 		"rules": {
-			"recommended": true
+			"recommended": true,
+			"nursery": {
+				"useErrorCause": {
+					"level": "error",
+					"options": {
+						"requireCatchParameter": false
+					}
+				}
+			}
 		}
 	},
 	"javascript": {

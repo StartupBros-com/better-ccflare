@@ -44,3 +44,18 @@ describe("getErrorType message classification", () => {
 		);
 	});
 });
+
+describe("HttpError cause compatibility", () => {
+	it("keeps details separate from the non-enumerable diagnostic cause", () => {
+		const cause = new Error("transport failure");
+		const details = { field: "request" };
+		const error = new HttpError(408, "Request timeout", details, { cause });
+		expect(error.cause).toBe(cause);
+		expect(error.details).toBe(details);
+		expect(error.status).toBe(408);
+		expect(Object.getOwnPropertyDescriptor(error, "cause")?.enumerable).toBe(
+			false,
+		);
+		expect(new HttpError(400, "legacy", details).cause).toBeUndefined();
+	});
+});

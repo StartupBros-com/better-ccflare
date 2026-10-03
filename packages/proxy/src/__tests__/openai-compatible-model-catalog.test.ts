@@ -525,6 +525,7 @@ describe("fetchOpenAICompatibleModelsPreview", () => {
 			const message = error instanceof Error ? error.message : String(error);
 			expect(message).toContain("401");
 			expect(message).not.toContain(secret);
+			expect(error).not.toHaveProperty("cause");
 			expect(message).not.toContain("upstream leaked");
 		}
 	});

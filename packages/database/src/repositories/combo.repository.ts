@@ -48,8 +48,8 @@ import { BaseRepository } from "./base.repository";
 export class RoutingPolicyRevisionConflictError extends Error {
 	readonly code = "stale_routing_preview";
 
-	constructor() {
-		super("Routing policy revision changed before apply");
+	constructor(options?: ErrorOptions) {
+		super("Routing policy revision changed before apply", options);
 		this.name = "RoutingPolicyRevisionConflictError";
 	}
 }
@@ -66,11 +66,13 @@ export class ModelMappingsWriteConflictError extends Error {
 	constructor(
 		readonly reason: "revision" | "row",
 		readonly accountId: string | null = null,
+		options?: ErrorOptions,
 	) {
 		super(
 			reason === "revision"
 				? "Routing policy revision changed before the model_mappings write"
 				: `model_mappings changed for account ${accountId} before the write`,
+			options,
 		);
 		this.name = "ModelMappingsWriteConflictError";
 	}
@@ -887,7 +889,8 @@ export class ComboRepository extends BaseRepository<Combo> {
 				error instanceof BatchExpectedChangesError &&
 				error.statementIndex === 0
 			) {
-				throw new RoutingPolicyRevisionConflictError();
+				// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
+				throw new RoutingPolicyRevisionConflictError({ cause: error });
 			}
 			throw error;
 		}
@@ -964,11 +967,17 @@ export class ComboRepository extends BaseRepository<Combo> {
 		} catch (error) {
 			if (error instanceof BatchExpectedChangesError) {
 				if (error.statementIndex === 0) {
-					throw new ModelMappingsWriteConflictError("revision");
+					// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
+					throw new ModelMappingsWriteConflictError("revision", null, {
+						cause: error,
+					});
 				}
 				const write = input.writes[error.statementIndex - 1];
 				if (write) {
-					throw new ModelMappingsWriteConflictError("row", write.account_id);
+					// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
+					throw new ModelMappingsWriteConflictError("row", write.account_id, {
+						cause: error,
+					});
 				}
 			}
 			throw error;
@@ -1094,7 +1103,8 @@ export class ComboRepository extends BaseRepository<Combo> {
 				error instanceof BatchExpectedChangesError &&
 				error.statementIndex === 0
 			) {
-				throw new RoutingPolicyRevisionConflictError();
+				// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
+				throw new RoutingPolicyRevisionConflictError({ cause: error });
 			}
 			throw error;
 		}

@@ -97,6 +97,7 @@ function sleepSync(ms: number): void {
 			throw new Error(
 				`Synchronous sleep not supported in this environment. ` +
 					`Bun.sleepSync is not available and Node.js child_process failed: ${error instanceof Error ? error.message : String(error)}`,
+				{ cause: error },
 			);
 		}
 	}

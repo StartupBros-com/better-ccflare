@@ -1416,6 +1416,7 @@ export default async function startServer(options?: {
 			console.error("SSL file path validation failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});
+			// biome-ignore lint/nursery/useErrorCause: deliberate redaction; the caught error carries the rejected filesystem path, which must stay out of the thrown error. It is logged above.
 			throw new Error(
 				"SSL file path validation failed. Check server logs for details.",
 			);

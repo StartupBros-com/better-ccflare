@@ -95,6 +95,12 @@ describe("ComboRepository guarded model_mappings writes", () => {
 		).rejects.toMatchObject({
 			code: "stale_model_mappings_write",
 			reason: "revision",
+			cause: {
+				name: "BatchExpectedChangesError",
+				statementIndex: 0,
+				expectedChanges: 1,
+				actualChanges: 0,
+			},
 		});
 		expect(mappings("codex-alpha")).toBe(ALPHA_OLD);
 		expect(await repo.getRoutingPolicyRevision()).toBe(revision + 1);
@@ -130,6 +136,11 @@ describe("ComboRepository guarded model_mappings writes", () => {
 		).rejects.toMatchObject({
 			code: "stale_model_mappings_write",
 			reason: "row",
+			cause: {
+				name: "BatchExpectedChangesError",
+				expectedChanges: 1,
+				actualChanges: 0,
+			},
 			accountId: "codex-beta",
 		});
 		expect(mappings("codex-alpha")).toBe(ALPHA_OLD);

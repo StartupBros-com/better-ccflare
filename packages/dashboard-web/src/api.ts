@@ -444,7 +444,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -474,7 +474,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -504,7 +504,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -534,7 +534,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -562,7 +562,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -589,7 +589,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -616,7 +616,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -643,7 +643,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -671,7 +671,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -700,7 +700,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -729,7 +729,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -784,7 +784,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -814,7 +814,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -844,7 +844,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -873,7 +873,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -902,7 +902,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -931,7 +931,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1295,7 +1295,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1318,7 +1318,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1350,7 +1350,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1410,7 +1410,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1436,7 +1436,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1464,7 +1464,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1492,7 +1492,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1518,7 +1518,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1546,7 +1546,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1577,7 +1577,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1608,7 +1608,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1636,7 +1636,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1707,7 +1707,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1798,7 +1798,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1826,7 +1826,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1856,7 +1856,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1900,7 +1900,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1956,7 +1956,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -1980,7 +1980,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -2010,7 +2010,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -2294,7 +2294,7 @@ class API extends HttpClient {
 				stack: error instanceof Error ? error.stack : undefined,
 			});
 			if (error instanceof HttpError) {
-				throw new Error(error.message);
+				throw new Error(error.message, { cause: error });
 			}
 			throw error;
 		}
@@ -2563,7 +2563,8 @@ class API extends HttpClient {
 			return response;
 		} catch (error) {
 			this.logger.error(`✗ POST ${url} - ERROR`, { error });
-			if (error instanceof HttpError) throw new Error(error.message);
+			if (error instanceof HttpError)
+				throw new Error(error.message, { cause: error });
 			throw error;
 		}
 	}
@@ -2588,7 +2589,8 @@ class API extends HttpClient {
 			this.logger.error(`✗ GET ${logUrl} - ERROR`, {
 				error: error instanceof Error ? error.message : String(error),
 			});
-			if (error instanceof HttpError) throw new Error(error.message);
+			if (error instanceof HttpError)
+				throw new Error(error.message, { cause: error });
 			throw error;
 		}
 	}
@@ -2607,7 +2609,8 @@ class API extends HttpClient {
 			return response;
 		} catch (error) {
 			this.logger.error(`✗ POST ${url} - ERROR`, { error });
-			if (error instanceof HttpError) throw new Error(error.message);
+			if (error instanceof HttpError)
+				throw new Error(error.message, { cause: error });
 			throw error;
 		}
 	}
@@ -2624,7 +2627,8 @@ class API extends HttpClient {
 			this.logger.error(`✗ GET ${logUrl} - ERROR`, {
 				error: error instanceof Error ? error.message : "Request failed",
 			});
-			if (error instanceof HttpError) throw new Error(error.message);
+			if (error instanceof HttpError)
+				throw new Error(error.message, { cause: error });
 			throw error;
 		}
 	}
@@ -2641,7 +2645,8 @@ class API extends HttpClient {
 			this.logger.error(`✗ GET ${logUrl} - ERROR`, {
 				error: error instanceof Error ? error.message : "Request failed",
 			});
-			if (error instanceof HttpError) throw new Error(error.message);
+			if (error instanceof HttpError)
+				throw new Error(error.message, { cause: error });
 			throw error;
 		}
 	}
@@ -2661,7 +2666,8 @@ class API extends HttpClient {
 			return response;
 		} catch (error) {
 			this.logger.error(`✗ POST ${url} - ERROR`, { error });
-			if (error instanceof HttpError) throw new Error(error.message);
+			if (error instanceof HttpError)
+				throw new Error(error.message, { cause: error });
 			throw error;
 		}
 	}
@@ -2683,7 +2689,8 @@ class API extends HttpClient {
 			return response;
 		} catch (error) {
 			this.logger.error(`✗ POST ${url} - ERROR`, { error });
-			if (error instanceof HttpError) throw new Error(error.message);
+			if (error instanceof HttpError)
+				throw new Error(error.message, { cause: error });
 			throw error;
 		}
 	}
@@ -2702,7 +2709,8 @@ class API extends HttpClient {
 			return response;
 		} catch (error) {
 			this.logger.error(`✗ POST ${url} - ERROR`, { error });
-			if (error instanceof HttpError) throw new Error(error.message);
+			if (error instanceof HttpError)
+				throw new Error(error.message, { cause: error });
 			throw error;
 		}
 	}
@@ -2722,7 +2730,8 @@ class API extends HttpClient {
 			return response;
 		} catch (error) {
 			this.logger.error(`✗ POST ${url} - ERROR`, { error });
-			if (error instanceof HttpError) throw new Error(error.message);
+			if (error instanceof HttpError)
+				throw new Error(error.message, { cause: error });
 			throw error;
 		}
 	}
@@ -2756,7 +2765,8 @@ class API extends HttpClient {
 			this.logger.error(`✗ GET ${logUrl} - ERROR`, {
 				error: error instanceof Error ? error.message : String(error),
 			});
-			if (error instanceof HttpError) throw new Error(error.message);
+			if (error instanceof HttpError)
+				throw new Error(error.message, { cause: error });
 			throw error;
 		}
 	}

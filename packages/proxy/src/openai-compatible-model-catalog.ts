@@ -268,12 +268,14 @@ async function fetchModelsFromEndpoint(
 		return models;
 	} catch (error) {
 		if (timedOut) {
+			// biome-ignore lint/nursery/useErrorCause: Discovery errors are credential-free by contract; a transport cause may retain the credential-bearing URL.
 			throw new OpenAICompatibleModelDiscoveryError(
 				"timeout",
 				"OpenAI-compatible model discovery timed out",
 			);
 		}
 		if (error instanceof OpenAICompatibleModelDiscoveryError) throw error;
+		// biome-ignore lint/nursery/useErrorCause: Discovery errors are credential-free by contract; raw transport errors must not escape.
 		throw new OpenAICompatibleModelDiscoveryError(
 			"upstream",
 			"OpenAI-compatible model discovery failed",

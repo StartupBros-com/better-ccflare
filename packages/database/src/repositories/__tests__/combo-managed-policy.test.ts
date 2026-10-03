@@ -267,7 +267,14 @@ describe("ComboRepository managed policy", () => {
 					},
 				],
 			}),
-		).rejects.toThrow("Routing policy revision changed");
+		).rejects.toMatchObject({
+			code: "stale_routing_preview",
+			cause: {
+				name: "BatchExpectedChangesError",
+				expectedChanges: 1,
+				actualChanges: 0,
+			},
+		});
 
 		const snapshot = await repo.getRoutingPolicySnapshot("opus");
 		expect(snapshot.assignment.membership_mode).toBe("manual");
@@ -290,7 +297,14 @@ describe("ComboRepository managed policy", () => {
 					},
 				],
 			}),
-		).rejects.toThrow("Routing policy revision changed");
+		).rejects.toMatchObject({
+			code: "stale_routing_preview",
+			cause: {
+				name: "BatchExpectedChangesError",
+				expectedChanges: 1,
+				actualChanges: 0,
+			},
+		});
 		expect((await repo.getRoutingPolicySnapshot("opus")).rules).toEqual([]);
 	});
 

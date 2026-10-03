@@ -32,8 +32,8 @@ export async function parseRequestBody<T>(req: Request): Promise<T> {
 	try {
 		const body = await req.json();
 		return body as T;
-	} catch (_error) {
-		throw new Error("Invalid JSON in request body");
+	} catch (error) {
+		throw new Error("Invalid JSON in request body", { cause: error });
 	}
 }
 

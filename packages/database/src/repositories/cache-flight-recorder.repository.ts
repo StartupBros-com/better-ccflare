@@ -297,13 +297,16 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 			) {
 				throw new Error(
 					"immutable cache flight service epoch evidence conflict",
+					{ cause: error },
 				);
 			}
 			if (
 				error instanceof BatchExpectedChangesError &&
 				error.statementIndex === partitionVerificationIndex
 			) {
-				throw new Error("immutable cache flight partition evidence conflict");
+				throw new Error("immutable cache flight partition evidence conflict", {
+					cause: error,
+				});
 			}
 			throw error;
 		}

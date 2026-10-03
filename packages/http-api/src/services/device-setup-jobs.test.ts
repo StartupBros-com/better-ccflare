@@ -864,3 +864,14 @@ const _statusCoverage = [
 	"authorization_error",
 	"expired",
 ] satisfies DeviceSetupJobStatus[];
+
+it("preserves an idempotency conflict's diagnostic cause without changing its public contract", () => {
+	const cause = new Error("repository conflict");
+	const error = new DeviceSetupIdempotencyConflictError({ cause });
+	expect(error.cause).toBe(cause);
+	expect(error.code).toBe("idempotency_conflict");
+	expect(error.message).toBe(
+		"Idempotency key was already used for a different request",
+	);
+	expect(new DeviceSetupIdempotencyConflictError().cause).toBeUndefined();
+});

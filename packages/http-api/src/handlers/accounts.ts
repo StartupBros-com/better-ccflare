@@ -2125,6 +2125,7 @@ export function createNanoGPTAccountAddHandler(dbOps: DatabaseOperations) {
 					if (error instanceof ValidationError) {
 						throw error;
 					}
+					// biome-ignore lint/nursery/useErrorCause: Unknown input/parser exceptions are deliberately replaced with a fixed validation error; retain no unvetted payload.
 					throw new ValidationError("Invalid model mappings format");
 				}
 			}
@@ -4253,6 +4254,7 @@ export function createOpenRouterAccountAddHandler(dbOps: DatabaseOperations) {
 					if (error instanceof ValidationError) {
 						throw error;
 					}
+					// biome-ignore lint/nursery/useErrorCause: Unknown input/parser exceptions are deliberately replaced with a fixed validation error; retain no unvetted payload.
 					throw new ValidationError("Invalid model mappings format");
 				}
 			}

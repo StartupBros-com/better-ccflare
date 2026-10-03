@@ -2590,6 +2590,7 @@ export async function proxyUnauthenticated(
 			throw error;
 		}
 		logError(error, log);
+		// biome-ignore lint/nursery/useErrorCause: This custom constructor forwards the explicit cause option below; Biome only recognizes the built-in Error argument position.
 		throw new ProviderError(
 			ERROR_MESSAGES.UNAUTHENTICATED_FAILED,
 			ctx.provider.name,
@@ -2597,6 +2598,7 @@ export async function proxyUnauthenticated(
 			{
 				originalError: error instanceof Error ? error.message : String(error),
 			},
+			{ cause: error },
 		);
 	} finally {
 		attemptCommitment?.dispose();
@@ -7857,6 +7859,7 @@ export async function proxyWithAccount(
 								latestPhysicalAnthropicCohortKey,
 							);
 							if (!suppression || suppression.action !== "suppress") {
+								// biome-ignore lint/nursery/useErrorCause: This is a separate admission-state invariant failure, not a wrapper for the caught stream error.
 								throw new Error(
 									"Committed Anthropic semantic overload was not terminally suppressed",
 								);
@@ -7896,6 +7899,7 @@ export async function proxyWithAccount(
 							"protected_precommit_backup_overloaded",
 						);
 					}
+					// biome-ignore lint/nursery/useErrorCause: Only the sanitized admission decision may escape; the raw provider stream error must not accompany it.
 					throw new AnthropicDegradedSendDeniedError(protectedSemanticDenial);
 				}
 				if (protectedPrecommitBackup) {
