@@ -288,6 +288,110 @@ describe("approved quality policy", () => {
 		]);
 	});
 
+	describe("picker flow descriptions", () => {
+		const grant = (accountId: string, line: string) => ({
+			accountId,
+			line,
+			authorization: "operator-approved",
+			scope: "outside-subscription",
+		});
+		function descriptions(input: ReturnType<typeof approvedInput>) {
+			const policy = compileQualityRoutingPolicy(input);
+			return Object.fromEntries(
+				(policy?.choices ?? []).map((choice) => [
+					choice.preference,
+					choice.description,
+				]),
+			);
+		}
+		const tail = ", then error · keeps last working model · ";
+
+		it("describes each ladder from enrolled lines in assignment-priority order", () => {
+			expect(descriptions(approvedInput())).toEqual({
+				auto: `Fable → Astra → Opus → Sol${tail}subscription only`,
+				fable: `Fable → Astra → Opus → Sol${tail}subscription only`,
+				astra: `Astra → Opus → Sol${tail}subscription only`,
+				opus: `Opus → Sol${tail}subscription only`,
+			});
+		});
+
+		it("orders the opus lane by assignment priority", () => {
+			const input = approvedInput();
+			input.assignments[2] = { ...input.assignments[2], priority: 1 };
+			input.assignments[3] = { ...input.assignments[3], priority: 0 };
+			expect(descriptions(input).opus).toBe(
+				`Sol → Opus${tail}subscription only`,
+			);
+		});
+
+		it("omits lines with no enrolled account", () => {
+			const input = approvedInput();
+			input.accounts[1] = { ...input.accounts[1], lines: ["gpt-sol"] };
+			expect(descriptions(input).auto).toBe(
+				`Fable → Opus → Sol${tail}subscription only`,
+			);
+		});
+
+		it("says requests fail when nothing on the ladder is enrolled", () => {
+			const input = approvedInput();
+			input.accounts = [
+				{
+					accountId: "native",
+					provider: "anthropic",
+					lines: ["claude-fable"],
+					priority: 0,
+				},
+			];
+			const text = descriptions(input);
+			expect(text.fable).toBe(`Fable${tail}subscription only`);
+			expect(text.astra).toBe(
+				"No enrolled account on this ladder · requests fail",
+			);
+			expect(text.opus).toBe(
+				"No enrolled account on this ladder · requests fail",
+			);
+		});
+
+		it("mentions paid use only for choices whose ladder has a granted line", () => {
+			const input = approvedInput();
+			const fableOnly = {
+				...input,
+				spendGrants: [grant("native", "claude-fable")],
+			};
+			const a = descriptions(fableOnly as typeof input);
+			expect(a.auto).toEndWith("paid use only where approved");
+			expect(a.astra).toEndWith("subscription only");
+			expect(a.opus).toEndWith("subscription only");
+			const solGrant = {
+				...input,
+				spendGrants: [grant("alternate", "gpt-sol")],
+			};
+			const b = descriptions(solGrant as typeof input);
+			expect(b.opus).toEndWith("paid use only where approved");
+			expect(b.astra).toEndWith("paid use only where approved");
+		});
+
+		it("stays one short clean line even in the worst case", () => {
+			const input = approvedInput();
+			const all = {
+				...input,
+				spendGrants: [
+					grant("native", "claude-fable"),
+					grant("native", "claude-opus"),
+					grant("alternate", "gpt-astra"),
+					grant("alternate", "gpt-sol"),
+				],
+			};
+			for (const text of Object.values(descriptions(all as typeof input))) {
+				expect(text.length).toBeLessThanOrEqual(100);
+				expect(text).not.toMatch(/[\r\n<]/);
+				expect(text).not.toContain("native");
+				expect(text).not.toContain("alternate");
+			}
+			expect(descriptions(all as typeof input).auto).toHaveLength(96);
+		});
+	});
+
 	it("canonicalizes unordered approvals without changing quality or the revision", () => {
 		const input = approvedInput();
 		const reversed = {

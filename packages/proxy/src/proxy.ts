@@ -895,6 +895,7 @@ async function handleProxyCoreImpl(
 					...qualityChoices.map((choice) => ({
 						id: choice.publicModelId,
 						display_name: choice.displayName,
+						description: choice.description,
 					})),
 				],
 				has_more: false,

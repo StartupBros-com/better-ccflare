@@ -697,8 +697,16 @@ it("all rejected candidates persist a zero-send explanation without a selected h
 
 it("adds enabled quality choices to local discovery without catalog or inference traffic", async () => {
 	const local = [
-		{ id: "claude-bccf-route-existing", display_name: "Existing" },
+		{
+			id: "claude-bccf-route-existing",
+			display_name: "Existing",
+			description:
+				"One pinned account, no fallback · subagents use the same account",
+		},
 	];
+	// Fixture enrolls only the Fable, Opus, Sonnet and Haiku lines, no grants.
+	const flowTail =
+		", then error · keeps last working model · subscription only";
 	ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry([
 		{
 			id: "existing",
@@ -719,14 +727,30 @@ it("adds enabled quality choices to local discovery without catalog or inference
 	) as typeof fetch;
 	const response = await send(new Request("http://localhost/v1/models"));
 	const body = (await response.json()) as {
-		data: { id: string; display_name: string }[];
+		data: { id: string; display_name: string; description: string }[];
 	};
 	expect(body.data).toEqual([
 		...local,
-		{ id: "claude-bccf-quality-auto", display_name: "Auto" },
-		{ id: "claude-bccf-quality-fable", display_name: "Fable-preferred" },
-		{ id: "claude-bccf-quality-astra", display_name: "Astra-preferred" },
-		{ id: "claude-bccf-quality-opus", display_name: "Opus-latest" },
+		{
+			id: "claude-bccf-quality-auto",
+			display_name: "Auto",
+			description: `Fable → Opus${flowTail}`,
+		},
+		{
+			id: "claude-bccf-quality-fable",
+			display_name: "Fable-preferred",
+			description: `Fable → Opus${flowTail}`,
+		},
+		{
+			id: "claude-bccf-quality-astra",
+			display_name: "Astra-preferred",
+			description: `Opus${flowTail}`,
+		},
+		{
+			id: "claude-bccf-quality-opus",
+			display_name: "Opus-latest",
+			description: `Opus${flowTail}`,
+		},
 	]);
 	expect(fetches).toBe(0);
 	const registry = ctx.modelRouteSessionRegistry;
