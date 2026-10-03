@@ -161,4 +161,151 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 		const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
 		expect(rows).toEqual([]);
 	});
+
+	describe("advisor tokens (R14)", () => {
+		function seedAdvisor(
+			id: string,
+			advisorModel: string | null,
+			opts: { billingType?: string | null; timestamp?: number } = {},
+		): void {
+			seed(db, {
+				id,
+				timestamp: opts.timestamp ?? 1000,
+				model: "claude-sonnet-5",
+				billingType: opts.billingType,
+			});
+			db.run(
+				`UPDATE requests SET advisor_model = ?, advisor_input_tokens = 7,
+				 advisor_output_tokens = 3, advisor_cache_read_input_tokens = 2,
+				 advisor_cache_creation_input_tokens = 1 WHERE id = ?`,
+				[advisorModel, id],
+			);
+		}
+
+		it("adds advisor tokens to the advisor model's own line with zero request count", async () => {
+			seedAdvisor("a1", "claude-opus-4");
+
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			const byModel = Object.fromEntries(rows.map((r) => [r.model, r]));
+			expect(byModel["claude-sonnet-5"]).toEqual({
+				model: "claude-sonnet-5",
+				requestCount: 1,
+				inputTokens: 100,
+				cacheReadInputTokens: 10,
+				cacheCreationInputTokens: 5,
+				outputTokens: 50,
+			});
+			expect(byModel["claude-opus-4"]).toEqual({
+				model: "claude-opus-4",
+				requestCount: 0,
+				inputTokens: 7,
+				cacheReadInputTokens: 2,
+				cacheCreationInputTokens: 1,
+				outputTokens: 3,
+			});
+		});
+
+		it("merges into an existing executor line for the same model without adding a request", async () => {
+			seed(db, { id: "x1", timestamp: 1000, model: "claude-opus-4" });
+			seedAdvisor("a1", "claude-opus-4");
+
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			const opus = rows.find((r) => r.model === "claude-opus-4");
+			expect(opus).toEqual({
+				model: "claude-opus-4",
+				requestCount: 1,
+				inputTokens: 107,
+				cacheReadInputTokens: 12,
+				cacheCreationInputTokens: 6,
+				outputTokens: 53,
+			});
+		});
+
+		it("leaves output identical when no row carries advisor data", async () => {
+			seed(db, { id: "r1", timestamp: 1000 });
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			expect(rows).toEqual([
+				{
+					model: "claude-sonnet-5",
+					requestCount: 1,
+					inputTokens: 100,
+					cacheReadInputTokens: 10,
+					cacheCreationInputTokens: 5,
+					outputTokens: 50,
+				},
+			]);
+		});
+
+		it("excludes advisor tokens on non-plan rows", async () => {
+			seedAdvisor("a1", "claude-opus-4", { billingType: "api" });
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			expect(rows).toEqual([]);
+		});
+	});
+
+	describe("advisor persistence via save()", () => {
+		const base = {
+			id: "s1",
+			method: "POST",
+			path: "/v1/messages",
+			accountUsed: "acc1",
+			statusCode: 200,
+			success: true,
+			errorMessage: null,
+			responseTime: 10,
+			failoverAttempts: 0,
+		};
+
+		it("round-trips the five advisor fields", async () => {
+			await repo.save({
+				...base,
+				usage: {
+					model: "claude-sonnet-5",
+					inputTokens: 1,
+					outputTokens: 2,
+					advisorModel: "claude-opus-4",
+					advisorInputTokens: 11,
+					advisorOutputTokens: 22,
+					advisorCacheReadInputTokens: 33,
+					advisorCacheCreationInputTokens: 44,
+				},
+			});
+			const row = db
+				.query(
+					`SELECT advisor_model, advisor_input_tokens, advisor_output_tokens,
+					 advisor_cache_read_input_tokens, advisor_cache_creation_input_tokens
+					 FROM requests WHERE id = 's1'`,
+				)
+				.get();
+			expect(row).toEqual({
+				advisor_model: "claude-opus-4",
+				advisor_input_tokens: 11,
+				advisor_output_tokens: 22,
+				advisor_cache_read_input_tokens: 33,
+				advisor_cache_creation_input_tokens: 44,
+			});
+		});
+
+		it("stores nulls when the request has no advisor usage", async () => {
+			await repo.save({
+				...base,
+				id: "s2",
+				usage: { model: "claude-sonnet-5", inputTokens: 1 },
+			});
+			const row = db
+				.query(
+					`SELECT advisor_model, advisor_input_tokens, advisor_output_tokens,
+					 advisor_cache_read_input_tokens, advisor_cache_creation_input_tokens
+					 FROM requests WHERE id = 's2'`,
+				)
+				.get();
+			expect(row).toEqual({
+				advisor_model: null,
+				advisor_input_tokens: null,
+				advisor_output_tokens: null,
+				advisor_cache_read_input_tokens: null,
+				advisor_cache_creation_input_tokens: null,
+			});
+		});
+	});
 });

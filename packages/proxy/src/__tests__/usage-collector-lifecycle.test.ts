@@ -1670,6 +1670,11 @@ describe("UsageCollector request lifecycle", () => {
 					inputTokens: 10,
 					outputTokens: 7,
 					totalTokens: 17,
+					advisorModel: HAIKU_MODEL,
+					advisorInputTokens: 11,
+					advisorOutputTokens: 13,
+					advisorCacheReadInputTokens: 0,
+					advisorCacheCreationInputTokens: 0,
 				});
 				expect(advisorLogs.events).toHaveLength(1);
 				expect(advisorLogs.events[0]?.data).toMatchObject({
@@ -1830,6 +1835,9 @@ describe("UsageCollector request lifecycle", () => {
 				expect(savedUsages.get(requestId)).toMatchObject({
 					costUsd: EXECUTOR_COST,
 				});
+				// A stale snapshot persists no advisor tokens.
+				expect(savedUsages.get(requestId)?.advisorModel).toBeUndefined();
+				expect(savedUsages.get(requestId)?.advisorOutputTokens).toBeUndefined();
 				expect(advisorLogs.events).toHaveLength(1);
 				expect(advisorLogs.events[0]?.data).toMatchObject({
 					requestId,

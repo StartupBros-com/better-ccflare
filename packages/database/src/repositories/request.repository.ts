@@ -157,6 +157,12 @@ export interface RequestData {
 		cacheCreationInputTokens?: number;
 		outputTokens?: number;
 		tokensPerSecond?: number;
+		// Advisor-iteration tokens (R14), separate from the executor columns above.
+		advisorModel?: string;
+		advisorInputTokens?: number;
+		advisorOutputTokens?: number;
+		advisorCacheReadInputTokens?: number;
+		advisorCacheCreationInputTokens?: number;
 	};
 }
 
@@ -197,9 +203,10 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				stream_terminal_state, client_session_id,
 				route_profile_id, requested_route_model, routed_provider, routed_model,
 				route_fallback_rung, route_home_action, route_repin_reason, route_candidate_id,
-				account_generation, cache_health_native, internal_origin, quality_decision, routing_attempt_summary
+				account_generation, cache_health_native, internal_origin, quality_decision, routing_attempt_summary,
+				advisor_model, advisor_input_tokens, advisor_output_tokens, advisor_cache_read_input_tokens, advisor_cache_creation_input_tokens
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (id) DO UPDATE SET
 				timestamp = EXCLUDED.timestamp,
 				method = EXCLUDED.method,
@@ -260,7 +267,12 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				cache_health_native = COALESCE(requests.cache_health_native, EXCLUDED.cache_health_native),
 				internal_origin = COALESCE(requests.internal_origin, EXCLUDED.internal_origin),
  quality_decision = COALESCE(requests.quality_decision, EXCLUDED.quality_decision),
- routing_attempt_summary = COALESCE(requests.routing_attempt_summary, EXCLUDED.routing_attempt_summary)
+ routing_attempt_summary = COALESCE(requests.routing_attempt_summary, EXCLUDED.routing_attempt_summary),
+				advisor_model = EXCLUDED.advisor_model,
+				advisor_input_tokens = EXCLUDED.advisor_input_tokens,
+				advisor_output_tokens = EXCLUDED.advisor_output_tokens,
+				advisor_cache_read_input_tokens = EXCLUDED.advisor_cache_read_input_tokens,
+				advisor_cache_creation_input_tokens = EXCLUDED.advisor_cache_creation_input_tokens
 		`,
 			[
 				data.id,
@@ -310,6 +322,11 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				data.accounting ? (data.accounting.internal ? 1 : 0) : null,
 				decision ? JSON.stringify(decision) : null,
 				attemptSummary ? JSON.stringify(attemptSummary) : null,
+				usage?.advisorModel ?? null,
+				usage?.advisorInputTokens ?? null,
+				usage?.advisorOutputTokens ?? null,
+				usage?.advisorCacheReadInputTokens ?? null,
+				usage?.advisorCacheCreationInputTokens ?? null,
 			],
 		);
 	}
@@ -720,6 +737,66 @@ export class RequestRepository extends BaseRepository<RequestData> {
 		`,
 			[accountId, fromMs, toMs],
 		);
+		// Advisor iterations (R14): tokens live in separate columns and belong
+		// to the advisor model's line. They add no request count.
+		const advisorRows = await this.query<{
+			model: string;
+			input_tokens: number;
+			cache_read_input_tokens: number;
+			cache_creation_input_tokens: number;
+			output_tokens: number;
+		}>(
+			`
+			SELECT
+				advisor_model as model,
+				SUM(COALESCE(advisor_input_tokens, 0)) as input_tokens,
+				SUM(COALESCE(advisor_cache_read_input_tokens, 0)) as cache_read_input_tokens,
+				SUM(COALESCE(advisor_cache_creation_input_tokens, 0)) as cache_creation_input_tokens,
+				SUM(COALESCE(advisor_output_tokens, 0)) as output_tokens
+			FROM requests
+			WHERE account_used = ?
+			  AND path = '/v1/messages'
+			  AND billing_type = 'plan'
+			  AND timestamp >= ? AND timestamp < ?
+			  AND advisor_model IS NOT NULL
+			GROUP BY advisor_model
+		`,
+			[accountId, fromMs, toMs],
+		);
+		const aggregates = this.mapTokenAggregateRows(rows);
+		for (const row of advisorRows) {
+			const advisorModel = row.model;
+			let target = aggregates.find((entry) => entry.model === advisorModel);
+			if (!target) {
+				target = {
+					model: advisorModel,
+					requestCount: 0,
+					inputTokens: 0,
+					cacheReadInputTokens: 0,
+					cacheCreationInputTokens: 0,
+					outputTokens: 0,
+				};
+				aggregates.push(target);
+			}
+			target.inputTokens += Number(row.input_tokens) || 0;
+			target.cacheReadInputTokens += Number(row.cache_read_input_tokens) || 0;
+			target.cacheCreationInputTokens +=
+				Number(row.cache_creation_input_tokens) || 0;
+			target.outputTokens += Number(row.output_tokens) || 0;
+		}
+		return aggregates;
+	}
+
+	private mapTokenAggregateRows(
+		rows: Array<{
+			model: string;
+			request_count: number;
+			input_tokens: number;
+			cache_read_input_tokens: number;
+			cache_creation_input_tokens: number;
+			output_tokens: number;
+		}>,
+	): WindowTokenAggregate[] {
 		return rows.map((row) => ({
 			// Bun.SQL returns COUNT()/SUM() as JavaScript strings on PostgreSQL
 			// (BIGINT stringified, see Bun#22188) — coerce to Number so this

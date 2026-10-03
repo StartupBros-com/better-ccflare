@@ -1922,6 +1922,54 @@ export class UsageCollector {
 				(state.usage.cacheReadInputTokens ?? 0) +
 				(state.usage.cacheCreationInputTokens ?? 0)
 			: undefined;
+		// Advisor tokens (R14): sums over exactly the iterations priced at
+		// finalize (billable and not stale), so tokens and cost agree. Computed
+		// eagerly because the write below runs later, after freeRequestState.
+		let advisorPersist:
+			| {
+					advisorModel?: string;
+					advisorInputTokens: number;
+					advisorOutputTokens: number;
+					advisorCacheReadInputTokens: number;
+					advisorCacheCreationInputTokens: number;
+			  }
+			| undefined;
+		if (
+			state.usage.iterationsSeq === state.usagePayloadSeq &&
+			state.usage.advisorIterations
+		) {
+			const billable = state.usage.advisorIterations.filter(
+				(iteration) => (iteration.output_tokens ?? 0) > 0,
+			);
+			if (billable.length > 0) {
+				const models = new Set(
+					billable.flatMap((iteration) =>
+						iteration.model ? [iteration.model] : [],
+					),
+				);
+				if (models.size > 1) {
+					log.info("anthropic_advisor_multiple_models", {
+						requestId: startMessage.requestId,
+						models: [...models],
+					});
+				}
+				advisorPersist = {
+					advisorModel: billable.find((iteration) => iteration.model)?.model,
+					advisorInputTokens: 0,
+					advisorOutputTokens: 0,
+					advisorCacheReadInputTokens: 0,
+					advisorCacheCreationInputTokens: 0,
+				};
+				for (const iteration of billable) {
+					advisorPersist.advisorInputTokens += iteration.input_tokens ?? 0;
+					advisorPersist.advisorOutputTokens += iteration.output_tokens ?? 0;
+					advisorPersist.advisorCacheReadInputTokens +=
+						iteration.cache_read_input_tokens ?? 0;
+					advisorPersist.advisorCacheCreationInputTokens +=
+						iteration.cache_creation_input_tokens ?? 0;
+				}
+			}
+		}
 		// No preliminary INSERT needed — dashboard tracks pending requests via SSE events, not DB queries.
 		this.asyncWriter.enqueue(async () => {
 			try {
@@ -1948,6 +1996,7 @@ export class UsageCollector {
 								cacheReadInputTokens: state.usage.cacheReadInputTokens,
 								cacheCreationInputTokens: state.usage.cacheCreationInputTokens,
 								tokensPerSecond: state.usage.tokensPerSecond,
+								...advisorPersist,
 							}
 						: undefined,
 					state.agentUsed,
