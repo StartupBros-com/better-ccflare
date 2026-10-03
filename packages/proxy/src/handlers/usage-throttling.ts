@@ -987,7 +987,10 @@ export function getUsageThrottleStatus(
 	opts?: {
 		requestModel?: string | null;
 		scopedMode?: "match" | "all";
-		/** Skip spent (>=100%) windows; windows with headroom are still paced. */
+		/**
+		 * Skip spent (>=100%) session/weekly_all windows; windows with headroom
+		 * and per-model weekly_scoped caps (still hard-blocking) are still paced.
+		 */
 		creditDrainActive?: boolean;
 	},
 ): UsageThrottleStatus {
@@ -1014,7 +1017,12 @@ export function getUsageThrottleStatus(
 			continue;
 		}
 		if (!isWindowThrottlingEnabled(window.window, settings)) continue;
-		if (opts?.creditDrainActive && window.utilization >= 100) continue;
+		if (
+			opts?.creditDrainActive &&
+			(window.kind === "session" || window.kind === "weekly_all") &&
+			window.utilization >= 100
+		)
+			continue;
 		if (window.resetAtMs === null) continue;
 		if (window.resetAtMs <= now) continue;
 		const startMs = computeWindowStartMs(window.resetAtMs, window.window);
@@ -1051,7 +1059,10 @@ export function getUsageThrottleUntil(
 	opts?: {
 		requestModel?: string | null;
 		scopedMode?: "match" | "all";
-		/** Skip spent (>=100%) windows; windows with headroom are still paced. */
+		/**
+		 * Skip spent (>=100%) session/weekly_all windows; windows with headroom
+		 * and per-model weekly_scoped caps (still hard-blocking) are still paced.
+		 */
 		creditDrainActive?: boolean;
 	},
 ): number | null {

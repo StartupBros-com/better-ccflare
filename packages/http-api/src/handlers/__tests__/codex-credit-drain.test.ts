@@ -20,16 +20,20 @@ const CREDITS = { has_credits: true, unlimited: false, balance: "10" };
 const touched = new Set<string>();
 
 /** A real owned poll: the only source of credit evidence. */
-async function ownedPoll(accountId: string, credits: Record<string, unknown>) {
+async function ownedPoll(
+	accountId: string,
+	credits: Record<string, unknown>,
+	usedPercent = 100,
+) {
 	touched.add(accountId);
 	const reset_at = Math.floor(Date.now() / 1000) + 3600;
 	globalThis.fetch = (async () =>
 		Response.json({
 			rate_limit: {
-				allowed: false,
-				limit_reached: true,
-				primary_window: { used_percent: 100, reset_at },
-				secondary_window: { used_percent: 100, reset_at },
+				allowed: usedPercent < 100,
+				limit_reached: usedPercent >= 100,
+				primary_window: { used_percent: usedPercent, reset_at },
+				secondary_window: { used_percent: usedPercent, reset_at },
 			},
 			credits,
 		})) as typeof fetch;
@@ -192,6 +196,31 @@ describe("GET /api/accounts — codex credit drain display", () => {
 		expect(account.codexCreditDrainEnabled).toBe(true);
 		expect(account.codexCreditDrainActive).toBe(false);
 		expect(account.rateLimitStatus).toContain("usage_exhausted");
+	});
+
+	it("armed with credits and both windows below 100%: active but not serving", async () => {
+		await insertAccount("c7", "codex");
+		await dbOps.setCodexCreditDrainEnabled("c7", true);
+		await ownedPoll("c7", CREDITS, 50);
+		const account = await listAccount("c7");
+		expect(account.codexCreditDrainActive).toBe(true);
+		expect(account.codexCreditDrainServing).toBe(false);
+	});
+
+	it("armed with credits and a spent window: active and serving", async () => {
+		await insertAccount("c8", "codex");
+		await dbOps.setCodexCreditDrainEnabled("c8", true);
+		await ownedPoll("c8", CREDITS);
+		const account = await listAccount("c8");
+		expect(account.codexCreditDrainActive).toBe(true);
+		expect(account.codexCreditDrainServing).toBe(true);
+	});
+
+	it("drain off with a spent window: not serving", async () => {
+		await insertAccount("c9", "codex");
+		await ownedPoll("c9", CREDITS);
+		const account = await listAccount("c9");
+		expect(account.codexCreditDrainServing).toBe(false);
 	});
 });
 

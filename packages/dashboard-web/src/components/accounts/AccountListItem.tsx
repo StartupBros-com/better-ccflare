@@ -132,7 +132,7 @@ export function CodexCreditDrainControl({
 				onCheckedChange={() => onToggle(account)}
 				title="Lets ccflare keep routing to this account after its plan window is spent, which spends purchased credits. Applies only while fresh usage data confirms credits are available."
 			/>
-			{account.codexCreditDrainActive && (
+			{account.codexCreditDrainServing && (
 				<span
 					className="text-xs font-medium text-amber-600"
 					title="Plan window is spent; requests are being served from purchased credits"

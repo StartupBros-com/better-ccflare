@@ -347,6 +347,11 @@ export interface AccountResponse {
 	codexCreditDrainEnabled?: boolean;
 	/** Enabled AND drain currently in effect (fresh credit evidence). */
 	codexCreditDrainActive?: boolean;
+	/**
+	 * Drain active AND an account-wide plan window (five_hour/seven_day) is
+	 * spent, i.e. requests are being served from purchased credits now.
+	 */
+	codexCreditDrainServing?: boolean;
 	peakHoursPauseEnabled?: boolean;
 	customEndpoint: string | null;
 	modelMappings: { [key: string]: string | string[] } | null; // Parsed model mappings (arrays = cycling models)

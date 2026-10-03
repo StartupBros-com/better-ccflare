@@ -1085,6 +1085,56 @@ describe("Codex credit drain relaxation", () => {
 		expect(result.exclusions.map((e) => e.scope)).toEqual(["family"]);
 	});
 
+	it("getUsageThrottleStatus keeps a spent weekly_scoped window throttled under creditDrainActive", () => {
+		const now = Date.UTC(2026, 3, 28, 12, 0, 0);
+		const weekReset = new Date(
+			now + 7 * 24 * 60 * 60 * 1000 - 60 * 60 * 1000,
+		).toISOString();
+		const data = {
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: weekReset,
+					scope: {
+						model: { id: null, display_name: "Fable" },
+						surface: null,
+					},
+				},
+			],
+		} as never;
+		const settings = { fiveHourEnabled: true, weeklyEnabled: true };
+		const all = getUsageThrottleStatus(data, settings, now, {
+			scopedMode: "all",
+			creditDrainActive: true,
+		});
+		expect(all.throttleUntil).not.toBeNull();
+		expect(all.throttledWindows).toContain("seven_day_fable");
+		const match = getUsageThrottleStatus(data, settings, now, {
+			scopedMode: "match",
+			requestModel: "claude-fable-5",
+			creditDrainActive: true,
+		});
+		expect(match.throttleUntil).not.toBeNull();
+		expect(match.throttledWindows).toContain("seven_day_fable");
+	});
+
+	it("getUsageThrottleStatus skips spent account-wide five_hour/seven_day windows under creditDrainActive", () => {
+		const now = Date.UTC(2026, 3, 28, 12, 0, 0);
+		const fiveHourReset = new Date(now + 2 * 60 * 60 * 1000).toISOString();
+		const weekReset = new Date(now + 3 * 24 * 60 * 60 * 1000).toISOString();
+		const data = {
+			five_hour: { utilization: 100, resets_at: fiveHourReset },
+			seven_day: { utilization: 100, resets_at: weekReset },
+		} as never;
+		const settings = { fiveHourEnabled: true, weeklyEnabled: true };
+		const status = getUsageThrottleStatus(data, settings, now, {
+			creditDrainActive: true,
+		});
+		expect(status.throttledWindows).toEqual([]);
+		expect(status.throttleUntil).toBeNull();
+	});
+
 	it("getUsageThrottleStatus skips only spent windows when creditDrainActive", () => {
 		const now = Date.UTC(2026, 3, 28, 12, 0, 0);
 		const fiveHourReset = new Date(now + 2 * 60 * 60 * 1000).toISOString();

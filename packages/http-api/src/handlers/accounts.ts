@@ -65,6 +65,7 @@ import { accountCreatedResponse } from "../utils/account-created-response";
 import {
 	computeRateLimitStatusDisplay,
 	getRepresentativeUsageResetMs,
+	isUsageExhausted,
 } from "./rate-limit-status";
 
 const log = new Logger("AccountsHandler");
@@ -648,6 +649,24 @@ export function createAccountsListHandler(
 				// Computed after usage resolution so an exhausted usage window can
 				// outrank stale header snapshots and the bare "OK" default
 				// (incident 2026-07-09: 100% weekly utilization displayed as "OK").
+				const representativeUtilization =
+					getRepresentativeUtilizationForProvider(
+						// FullUsageData is the http-api display shape (nullable
+						// utilization); the provider helpers read the same fields.
+						fullUsageData as AnyUsageData | null,
+						account.provider ?? "anthropic",
+					) ?? usageUtilization;
+				const representativeResetMs = getRepresentativeUsageResetMs(
+					fullUsageData,
+					account.provider ?? "anthropic",
+				);
+				const creditDrainServing =
+					creditDrainActive &&
+					isUsageExhausted(
+						representativeUtilization,
+						representativeResetMs,
+						now,
+					);
 				const rateLimitStatus = computeRateLimitStatusDisplay(
 					{
 						rate_limit_status: account.rate_limit_status ?? null,
@@ -663,21 +682,12 @@ export function createAccountsListHandler(
 						// overage pool is spent would be labelled usage_exhausted
 						// while it happily serves traffic. usageUtilization /
 						// usageWindow below still report the pool for display.
-						usageUtilization:
-							getRepresentativeUtilizationForProvider(
-								// FullUsageData is the http-api display shape (nullable
-								// utilization); the provider helpers read the same fields.
-								fullUsageData as AnyUsageData | null,
-								account.provider ?? "anthropic",
-							) ?? usageUtilization,
+						usageUtilization: representativeUtilization,
 						// Shared provider-aware derivation (same as /health) — a plain
 						// extractUsageResetMs(fullUsageData, usageWindow) silently loses
 						// the zai reset because usageWindow is the display label
 						// ("five_hour"), not the payload key ("tokens_limit").
-						usageResetMs: getRepresentativeUsageResetMs(
-							fullUsageData,
-							account.provider ?? "anthropic",
-						),
+						usageResetMs: representativeResetMs,
 						creditDrainActive,
 					},
 					now,
@@ -764,6 +774,7 @@ export function createAccountsListHandler(
 					peakHoursPauseEnabled: account.peak_hours_pause_enabled === 1,
 					codexCreditDrainEnabled: account.codex_credit_drain_enabled === 1,
 					codexCreditDrainActive: creditDrainActive,
+					codexCreditDrainServing: creditDrainServing,
 					customEndpoint: account.custom_endpoint,
 					modelMappings,
 					usageUtilization,

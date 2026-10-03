@@ -632,12 +632,22 @@ describe("AccountListItem Codex credit drain toggle", () => {
 		expect(calls).toEqual([account]);
 	});
 
-	it("shows the on-credits indicator only when drain is active", () => {
-		const active = render(
+	it("shows the on-credits indicator only when drain is serving from credits", () => {
+		const serving = render(
 			makeAccount({
 				provider: "codex",
 				codexCreditDrainEnabled: true,
 				codexCreditDrainActive: true,
+				codexCreditDrainServing: true,
+			}),
+			noop,
+		);
+		const armedOnly = render(
+			makeAccount({
+				provider: "codex",
+				codexCreditDrainEnabled: true,
+				codexCreditDrainActive: true,
+				codexCreditDrainServing: false,
 			}),
 			noop,
 		);
@@ -645,7 +655,8 @@ describe("AccountListItem Codex credit drain toggle", () => {
 			makeAccount({ provider: "codex", codexCreditDrainEnabled: true }),
 			noop,
 		);
-		expect(active).toContain("on credits");
+		expect(serving).toContain("on credits");
+		expect(armedOnly).not.toContain("on credits");
 		expect(inactive).not.toContain("on credits");
 	});
 });

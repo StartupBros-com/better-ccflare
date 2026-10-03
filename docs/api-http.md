@@ -509,7 +509,7 @@ Routing honors the flag only while fresh, poll-verified credit evidence exists (
 }
 ```
 
-`GET /api/accounts` returns `codexCreditDrainEnabled` (the setting) and `codexCreditDrainActive` (the setting AND fresh credit evidence, i.e. currently in effect). While active, a spent window is not reported as `usage_exhausted` or throttled, and `/health` counts the account as routable.
+`GET /api/accounts` returns `codexCreditDrainEnabled` (the setting) and `codexCreditDrainActive` (the setting AND fresh credit evidence, i.e. currently in effect). `codexCreditDrainServing` is true only while the account is active AND an account-wide plan window (`five_hour`/`seven_day`) is spent, i.e. requests are being served from purchased credits right now. While active, a spent window is not reported as `usage_exhausted` or throttled, and `/health` counts the account as routable.
 
 #### POST /api/accounts/:accountId/pause
 
