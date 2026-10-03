@@ -356,6 +356,13 @@ passive response-header writes, `usageCache.set` and manual refresh can neither
 create nor clear it. It expires after the capacity snapshot freshness window
 (3 minutes), and is dropped on `delete`, `stopPolling` and `clear`. Missing or
 stale evidence means the account is treated exactly like a "keep" account.
+Drain therefore needs owned usage polls at most 3 minutes apart. The default
+90-second poll interval (`USAGE_POLL_INTERVAL_MS` / `usage_poll_interval_ms`)
+qualifies. A longer interval makes drain intermittent. Selection stays
+consistent, because the hard-capacity snapshot goes stale on the same clock and
+fails open. Pacing has no freshness bound, so it resumes pacing spent windows
+once the evidence expires. Both cases fail closed: no credits are spent without
+fresh evidence.
 
 **What it does not change.** Auto/quality routes (`evaluateAutoCapacity`) still
 reject spent subscription windows, `weekly_scoped` family exclusions are
