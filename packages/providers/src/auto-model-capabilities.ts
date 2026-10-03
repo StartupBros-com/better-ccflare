@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+	REASONING_EFFORT_VALUES,
+	type ReasoningEffort,
+} from "@better-ccflare/openai-formats";
 import type {
 	QualityApprovedLine,
 	QualityProvider,
@@ -21,6 +25,8 @@ export interface AutoModelCapabilities {
 	/** Only Codex's absent/null catalog field delegates acceptance, not malformed data. */
 	readonly providerManagedOutput: boolean;
 	readonly inputModalities: readonly string[] | null;
+	/** Exact owned Codex catalog support; unknown never grants effort preservation. */
+	readonly supportedReasoningEfforts: readonly ReasoningEffort[] | null;
 	/** Provider-specific evidence, not a generic tool support grant. */
 	readonly toolEvidence: Readonly<Record<string, EvidenceValue>>;
 	readonly nativeCapabilities: EvidenceValue;
@@ -298,7 +304,25 @@ export function normalizeAutoModelCapabilities(
 	]) {
 		if (Object.hasOwn(raw, key)) toolEvidence[key] = evidenceValue(raw[key]);
 	}
+	const levels = raw.supported_reasoning_levels;
+	const supportedReasoningEfforts =
+		provider === "codex" &&
+		Array.isArray(levels) &&
+		levels.length > 0 &&
+		levels.length <= REASONING_EFFORT_VALUES.length &&
+		Array.from(levels).every(
+			(level) =>
+				level !== null &&
+				typeof level === "object" &&
+				!Array.isArray(level) &&
+				REASONING_EFFORT_VALUES.includes(level.effort),
+		)
+			? Object.freeze([
+					...new Set<ReasoningEffort>(levels.map((level) => level.effort)),
+				])
+			: null;
 	const facts = {
+		supportedReasoningEfforts,
 		contextWindow: positiveSafeCapacity(
 			provider === "codex" ? raw.context_window : raw.max_input_tokens,
 		),
