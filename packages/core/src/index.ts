@@ -82,6 +82,7 @@ export {
 	getModelMappings,
 	getStrictClaudeModelFamily,
 	isFamilyAliasModel,
+	isFirstPartyAnthropicAccount,
 	isValidClaudeModel,
 	isWellFormedConcreteClaudeModelId,
 	KNOWN_PATTERNS,

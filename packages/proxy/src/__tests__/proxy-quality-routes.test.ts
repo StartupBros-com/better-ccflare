@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as core from "@better-ccflare/core";
 import { compileQualityRoutingPolicy } from "@better-ccflare/core";
 import { AsyncDbWriter, DatabaseOperations } from "@better-ccflare/database";
 import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
@@ -3251,6 +3252,300 @@ describe("prewarmed native catalogs", () => {
 				value: { skippedLanes: expected },
 			});
 			expect(sends).toHaveLength(1);
+		});
+	});
+
+	describe("advisor native passthrough on Auto", () => {
+		const advisorTool = {
+			type: "advisor_20260301",
+			name: "advisor",
+			model: "claude-opus-5-5",
+		};
+		const readTool = {
+			name: "Read",
+			description: "Read a file",
+			input_schema: { type: "object", properties: {} },
+		};
+		const advisorHistory = [
+			{ role: "user", content: "hello" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "server_tool_use",
+						id: "srvtoolu_1",
+						name: "advisor",
+						input: {},
+					},
+					{
+						type: "advisor_tool_result",
+						tool_use_id: "srvtoolu_1",
+						content: { type: "advisor_result", text: "use a map" },
+					},
+					{ type: "text", text: "done" },
+				],
+			},
+			{ role: "user", content: "continue" },
+		];
+		const declaration = "the advisor tool is not available";
+		const historyOnly = "Advisor tool result content could not be processed";
+		/** Codex GETs answer with a codex catalog; native catalog GETs and POSTs keep working. */
+		function codexTransport() {
+			const transport = globalThis.fetch;
+			globalThis.fetch = Object.assign(
+				async (input: RequestInfo | URL, init?: RequestInit) => {
+					const req =
+						input instanceof Request ? input : new Request(input, init);
+					if (
+						req.method === "GET" &&
+						new URL(req.url).pathname !== "/v1/models"
+					)
+						return Response.json({
+							models: ["gpt-6-astra", "gpt-5.6-sol"].map((slug) => ({
+								slug,
+								context_window: 100000,
+								max_context_window: 100000,
+								max_output_tokens: 1000,
+								input_modalities: ["text"],
+							})),
+						});
+					return transport(input, init);
+				},
+				{ preconnect: () => {} },
+			) as typeof fetch;
+		}
+		function enrollCodex(
+			line: "gpt-astra" | "gpt-sol",
+			lane: "astra" | "opus",
+			only = false,
+		) {
+			const codex = {
+				...account("c"),
+				provider: "codex",
+				api_key: null,
+				access_token: "synthetic-codex",
+				expires_at: Date.now() + 3600000,
+			};
+			const base = ctx.config.getQualityRoutingPolicy();
+			if (!base) throw new Error("Missing policy fixture");
+			accounts = only ? [codex] : [...accounts, codex];
+			const policy = compileQualityRoutingPolicy({
+				version: base.version,
+				fallbacks: base.fallbacks,
+				assignments: [
+					...(only ? [] : base.assignments),
+					{ line, lane, priority: 0, upgrade: "same-line-supported" },
+				],
+				accounts: [
+					...(only ? [] : base.accounts),
+					{ accountId: "c", provider: "codex", lines: [line], priority: 0 },
+				],
+				spendGrants: [
+					{
+						accountId: "c",
+						line,
+						authorization: "operator-approved",
+						scope: "outside-subscription",
+					},
+				],
+			});
+			ctx.config.getQualityRoutingPolicy = () => policy;
+			codexTransport();
+		}
+		const capacity = (percentByAccount: (id: string) => number) => {
+			for (const a of accounts)
+				usageCache.set(a.id, {
+					limits: [
+						{
+							kind: "weekly_all",
+							percent: percentByAccount(a.id),
+							resets_at: Date.now() + 60000,
+						},
+					],
+					spend: { enabled: false },
+				} as never);
+		};
+		async function refusal(response: Response, phrase: string) {
+			expect(response.status).toBe(400);
+			const text = await response.text();
+			const parsed = JSON.parse(text) as {
+				error: { type: string; message: string; account_id?: string };
+			};
+			expect(parsed.error.type).toBe("invalid_request_error");
+			expect(parsed.error.message).toContain(phrase);
+			expect(text).not.toContain("not available for this organization");
+			expect(text).not.toContain("Input tag");
+			expect(parsed.error.account_id).toBeUndefined();
+		}
+
+		it("dispatches an advisor request on an enrolled first-party fable lane with the tools unchanged", async () => {
+			const tools = [readTool, advisorTool];
+			const response = await send(request(undefined, {}, { tools }));
+			expect(response.status).toBe(200);
+			await response.text();
+			await flush();
+			expect(sends).toHaveLength(1);
+			expect(sends[0]?.model).toBe("claude-fable-5-1");
+			expect(envelopes[0]?.tools).toEqual(tools);
+			expect((await home())?.lane).toBe("fable");
+		});
+		it("admits an advisor-history-only request on an available first-party lane", async () => {
+			const response = await send(
+				request(undefined, {}, { messages: advisorHistory }),
+			);
+			expect(response.status).toBe(200);
+			await response.text();
+			await flush();
+			expect(sends).toHaveLength(1);
+			expect(envelopes[0]?.messages).toEqual(advisorHistory);
+		});
+		it("refuses with the declaration text when the only candidate is a Codex lane", async () => {
+			enrollCodex("gpt-sol", "opus", true);
+			capacity(() => 10);
+			await getCodexModels("c", ctx);
+			const response = await send(
+				request("claude-bccf-quality-opus", {}, { tools: [advisorTool] }),
+			);
+			await refusal(response, declaration);
+			expect(sends).toHaveLength(0);
+		});
+		it("refuses when first-party lanes are at capacity and a Codex lane is available, and records why", async () => {
+			enrollCodex("gpt-astra", "astra");
+			capacity((id) => (id === "c" ? 10 : 100));
+			await withRealQualityHistory(async (operations, collector) => {
+				await getCodexModels("c", ctx);
+				const response = await send(
+					request(undefined, {}, { tools: [readTool, advisorTool] }),
+				);
+				await refusal(response, declaration);
+				await flush();
+				await collector.drain();
+				expect(sends).toHaveLength(0);
+				const history = await (
+					await createRequestsSummaryHandler(operations.getAdapter())()
+				).json();
+				expect(history).toHaveLength(1);
+				expect(history[0].statusCode).toBe(400);
+				expect(history[0].accountUsed).toBeNull();
+				expect(history[0].qualityDecision.selected).toBeNull();
+				expect(history[0].qualityDecision.skippedLanes).toEqual([
+					{ lane: "fable", reasons: { "provider-capacity-exhausted": 2 } },
+					{ lane: "astra", reasons: { "tools-unsupported": 1 } },
+					{ lane: "opus", reasons: { "provider-capacity-exhausted": 2 } },
+				]);
+				const root = (await service.status(scope))?.conversations[0];
+				expect(root?.home).toBeNull();
+				expect(root?.decision?.requestId).toBe(history[0].id);
+			});
+		});
+		describe("dispatch backstop reaches Auto", () => {
+			/** Selection said first-party for the next candidate only, so the Codex
+			 * candidate reaches proxyWithAccount and meets the dispatch backstop. */
+			function admitNextCandidateOnce() {
+				const spy = spyOn(core, "isFirstPartyAnthropicAccount");
+				spy.mockImplementationOnce(() => true);
+				restores.push(() => spy.mockRestore());
+			}
+			const fableScopedExhausted = (id: string) =>
+				usageCache.set(id, {
+					limits: [
+						{ kind: "weekly_all", percent: 10, resets_at: Date.now() + 60000 },
+						{
+							kind: "weekly_scoped",
+							percent: 100,
+							resets_at: Date.now() + 60000,
+							scope: { model: { display_name: "Fable" } },
+						},
+					],
+					spend: { enabled: false },
+				} as never);
+			it("skips a non-first-party candidate rejected at dispatch and lets the next first-party candidate serve", async () => {
+				enrollCodex("gpt-astra", "astra");
+				capacity(() => 10);
+				for (const id of ["a", "b"]) fableScopedExhausted(id);
+				await getCodexModels("c", ctx);
+				admitNextCandidateOnce();
+				const tools = [readTool, advisorTool];
+				const response = await send(request(undefined, {}, { tools }));
+				expect(response.status).toBe(200);
+				await response.text();
+				await flush();
+				expect(sends).toHaveLength(1);
+				expect(sends[0]?.model).toBe("claude-opus-5-5");
+				expect(envelopes[0]?.tools).toEqual(tools);
+			});
+			it("returns the advisor refusal when the dispatch backstop leaves no candidate", async () => {
+				enrollCodex("gpt-astra", "astra");
+				capacity((id) => (id === "c" ? 10 : 100));
+				await getCodexModels("c", ctx);
+				admitNextCandidateOnce();
+				const response = await send(
+					request(undefined, {}, { tools: [advisorTool] }),
+				);
+				await refusal(response, declaration);
+				expect(sends).toHaveLength(0);
+			});
+		});
+		it("uses the history-only text when advisor appears only in history", async () => {
+			enrollCodex("gpt-astra", "astra");
+			capacity((id) => (id === "c" ? 10 : 100));
+			await getCodexModels("c", ctx);
+			const response = await send(
+				request(undefined, {}, { messages: advisorHistory }),
+			);
+			await refusal(response, historyOnly);
+			expect(sends).toHaveLength(0);
+		});
+		it("keeps the existing unavailable terminal when every candidate is unavailable", async () => {
+			enrollCodex("gpt-astra", "astra");
+			capacity(() => 100);
+			await getCodexModels("c", ctx);
+			const response = await send(
+				request(undefined, {}, { tools: [advisorTool] }),
+			);
+			expect(response.status).toBe(503);
+			expect(
+				((await response.json()) as { error: { code: string } }).error.code,
+			).toBe("quality_route_unavailable");
+			expect(sends).toHaveLength(0);
+		});
+		it("skips an Auto candidate whose live account row carries a custom endpoint, and refuses advisor", async () => {
+			// Selection and catalog evidence still see the enrolled first-party
+			// account, so it is a real Auto candidate. The per-candidate row lookup
+			// returns it with a custom endpoint, which the advisor first-party check
+			// must reject before any wire is built.
+			const lookup = ctx.dbOps.getAccount;
+			ctx.dbOps.getAccount = async (id: string) => {
+				const row = await lookup(id);
+				return row
+					? { ...row, custom_endpoint: "https://gateway.invalid" }
+					: row;
+			};
+			const response = await send(
+				request(undefined, {}, { tools: [advisorTool] }),
+			);
+			await refusal(response, declaration);
+			expect(sends).toHaveLength(0);
+		});
+		it.each([
+			[
+				"a hosted web_search declaration",
+				{
+					tools: [
+						advisorTool,
+						{ type: "web_search_20250305", name: "web_search" },
+					],
+				},
+			],
+			[
+				"an unknown advisor_ type",
+				{ tools: [{ type: "advisor_20990101", name: "advisor" }] },
+			],
+		])("refuses %s beside advisor before any route is tried", async (_name, extra) => {
+			const response = await send(request(undefined, {}, extra));
+			await refusal(response, declaration);
+			expect(sends).toHaveLength(0);
+			expect(await home()).toBeUndefined();
 		});
 	});
 

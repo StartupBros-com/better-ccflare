@@ -7,6 +7,7 @@ import {
 	getModelFamily,
 	getModelList,
 	isAccountAvailable,
+	isFirstPartyAnthropicAccount,
 	isOfficialXaiEndpoint,
 	providerAcceptsClientModel,
 	resolveEffectiveComboMembership,
@@ -55,6 +56,7 @@ import {
 } from "../codex-model-catalog";
 import { evaluateServerToolReplayEligibility } from "../server-tool-replay-eligibility";
 import {
+	createNativeAnthropicToolRoutingError,
 	ServerToolRoutingError,
 	type ServerToolRoutingErrorReason,
 } from "../server-tool-routing-errors";
@@ -2064,14 +2066,32 @@ function applyXaiCacheAffinity(
 	return ctx.cacheAffinityOrderer?.order(accounts, meta) ?? accounts;
 }
 
-function getExcludedProviders(meta: RequestMeta): readonly string[] {
-	return (
+/**
+ * Synthetic exclusion entry that stands for "only first-party Anthropic
+ * accounts may serve this request". A NUL byte cannot arrive through the
+ * comma-separated header, so a client cannot spell it. Carrying the constraint
+ * through the same list as the header exclusions is what lets the ordinary,
+ * combo, capability-pool, native-quota and server-tool paths all inherit it.
+ */
+const NATIVE_ANTHROPIC_ONLY_EXCLUSION = "\u0000native-anthropic-only";
+
+function hasNativeAnthropicConstraint(meta: RequestMeta): boolean {
+	return meta.nativeAnthropicToolRequirement != null;
+}
+
+function getExcludedProviders(
+	meta: RequestMeta,
+	includeNativeConstraint = true,
+): readonly string[] {
+	const excluded =
 		meta.headers
 			?.get("x-better-ccflare-exclude-providers")
 			?.split(",")
 			.map((provider) => provider.trim())
-			.filter(Boolean) ?? []
-	);
+			.filter(Boolean) ?? [];
+	return includeNativeConstraint && hasNativeAnthropicConstraint(meta)
+		? [...excluded, NATIVE_ANTHROPIC_ONLY_EXCLUSION]
+		: excluded;
 }
 
 function isProviderExcludedForRequest(
@@ -2079,7 +2099,9 @@ function isProviderExcludedForRequest(
 	excludeProviders: readonly string[],
 ): boolean {
 	for (const excluded of excludeProviders) {
-		if (excluded === "anthropic-oauth") {
+		if (excluded === NATIVE_ANTHROPIC_ONLY_EXCLUSION) {
+			if (!isFirstPartyAnthropicAccount(account)) return true;
+		} else if (excluded === "anthropic-oauth") {
 			if (account.provider === "anthropic" && account.refresh_token != null) {
 				return true;
 			}
@@ -2088,6 +2110,168 @@ function isProviderExcludedForRequest(
 		}
 	}
 	return false;
+}
+
+// Per selection, the available non-first-party accounts the native constraint
+// removed after they passed every other eligibility gate. It separates a pool
+// that emptied because of the constraint (refuse, R5) from one that would have
+// emptied anyway (existing terminal, R7). Side-channel keyed by request, like
+// the other per-selection records here; reset wherever selection restarts.
+const nativeConstraintRemovedMap = new WeakMap<RequestMeta, Set<string>>();
+
+/**
+ * Ids of the available non-first-party accounts the most recent selection for
+ * this request removed under the native Anthropic constraint. Empty when the
+ * constraint is off or nothing servable was removed.
+ */
+export function getNativeConstraintRemovedAccountIds(
+	meta: RequestMeta,
+): ReadonlySet<string> {
+	return nativeConstraintRemovedMap.get(meta) ?? EMPTY_ACCOUNT_ID_SET;
+}
+
+const EMPTY_ACCOUNT_ID_SET: ReadonlySet<string> = new Set();
+
+/** Why handleProxy's usage-throttle stage would drop an account. */
+export type NativeRemovalUsageBlockKind = "predictive" | "reactive";
+
+/**
+ * Per-request probe of handleProxy's usage-throttle stage, registered before
+ * selection. Removed accounts never reach that stage, so without it a removed
+ * account that is predictively throttled or reactively depleted would count as
+ * servable and turn the pool's usage terminal into an advisor refusal. Must be
+ * side-effect free; null means the account passes the stage.
+ */
+export type NativeRemovalUsageGate = (
+	account: Account,
+	model: string | null,
+) => NativeRemovalUsageBlockKind | null;
+
+const nativeRemovalUsageGateMap = new WeakMap<
+	RequestMeta,
+	NativeRemovalUsageGate
+>();
+/** A removed account the usage stage would drop, with the model it was judged for. */
+export interface NativeRemovalUsageBlock {
+	account: Account;
+	kind: NativeRemovalUsageBlockKind;
+	model: string | null;
+}
+
+const nativeConstraintUsageBlockedMap = new WeakMap<
+	RequestMeta,
+	Map<string, NativeRemovalUsageBlock>
+>();
+
+export function setNativeRemovalUsageGate(
+	meta: RequestMeta,
+	gate: NativeRemovalUsageGate,
+): void {
+	nativeRemovalUsageGateMap.set(meta, gate);
+}
+
+/**
+ * Available non-first-party accounts the native constraint removed that the
+ * usage-throttle stage would also have dropped, by kind. The caller merges
+ * them into its throttled/depleted lists when the pool empties, so the pool
+ * keeps the terminal a non-advisor request would get (R7).
+ */
+export function getNativeConstraintUsageBlockedRemovals(
+	meta: RequestMeta,
+): ReadonlyArray<NativeRemovalUsageBlock> {
+	return [...(nativeConstraintUsageBlockedMap.get(meta)?.values() ?? [])];
+}
+
+/** True (and recorded) when the usage-throttle stage would drop the account. */
+function isNativeRemovalUsageBlocked(
+	meta: RequestMeta,
+	account: Account,
+	model: string | null,
+): boolean {
+	const kind = nativeRemovalUsageGateMap.get(meta)?.(account, model) ?? null;
+	if (kind === null) return false;
+	let blocked = nativeConstraintUsageBlockedMap.get(meta);
+	if (!blocked) {
+		blocked = new Map();
+		nativeConstraintUsageBlockedMap.set(meta, blocked);
+	}
+	blocked.set(account.id, { account, kind, model });
+	return true;
+}
+
+function createNativeConstraintRefusal(
+	meta: RequestMeta,
+): ServerToolRoutingError {
+	if (!meta.nativeAnthropicToolRequirement) {
+		throw new Error("native constraint refusal requires a requirement");
+	}
+	return createNativeAnthropicToolRoutingError(
+		meta.nativeAnthropicToolRequirement,
+	);
+}
+
+/**
+ * Whether the constraint removes this account and the account could otherwise
+ * have served: not paused or rate-limited, no capacity blocker for `model`, and
+ * not dropped by the usage-throttle stage handleProxy runs after selection.
+ * Callers pass only accounts that already cleared every other gate.
+ */
+function isServableNativeRemoval(
+	meta: RequestMeta,
+	account: Account,
+	model: string | null,
+	options: Omit<CandidateCapacityEvaluationOptions, "observationMeta">,
+): boolean {
+	if (!hasNativeAnthropicConstraint(meta)) return false;
+	if (isFirstPartyAnthropicAccount(account)) return false;
+	if (!isAccountAvailable(account)) return false;
+	if (
+		model !== null &&
+		evaluateCandidateCapacity(
+			account,
+			model,
+			canonicalizeBetaSignature(meta.headers?.get("anthropic-beta")),
+			Date.now(),
+			options,
+		).blockers.length > 0
+	) {
+		return false;
+	}
+	return !isNativeRemovalUsageBlocked(meta, account, model);
+}
+
+function recordNativeConstraintRemoval(
+	meta: RequestMeta,
+	accountId: string,
+): void {
+	let removed = nativeConstraintRemovedMap.get(meta);
+	if (!removed) {
+		removed = new Set();
+		nativeConstraintRemovedMap.set(meta, removed);
+	}
+	removed.add(accountId);
+}
+
+/**
+ * Split an already-gated pool into the accounts the native constraint keeps
+ * and the ones it removes, recording the servable removals.
+ */
+function applyNativeConstraint(
+	meta: RequestMeta,
+	accounts: Account[],
+	model: string | null,
+	options: Omit<CandidateCapacityEvaluationOptions, "observationMeta">,
+): Account[] {
+	if (!hasNativeAnthropicConstraint(meta)) return accounts;
+	const kept: Account[] = [];
+	for (const account of accounts) {
+		if (isFirstPartyAnthropicAccount(account)) {
+			kept.push(account);
+		} else if (isServableNativeRemoval(meta, account, model, options)) {
+			recordNativeConstraintRemoval(meta, account.id);
+		}
+	}
+	return kept;
 }
 
 /**
@@ -2617,10 +2801,46 @@ async function selectCapabilityDescendantAccounts(
 	syntheticProbe: boolean,
 	modelScopedCapacityRouting: ModelScopedCapacityRoutingMode,
 ): Promise<Account[]> {
+	const nativeRemovalCapacityOptions: Omit<
+		CandidateCapacityEvaluationOptions,
+		"observationMeta"
+	> = {
+		modelScopedCapacityRouting,
+		routeIntent: "capability",
+		syntheticProbe,
+	};
 	const profileId = meta.routeProfileId?.trim() || "capability-route";
 	const rootModel = meta.routeProfileLogicalModel?.trim();
 	if (!rootModel) throw capabilityRouteUnavailable(meta, []);
 	const excludedProviders = getExcludedProviders(meta);
+	const headerExcludedProviders = getExcludedProviders(meta, false);
+	// Same R5 test as the root capability branch, over the descendant's two pools
+	// (the profile's own accounts and the ordinary stock-model fallback).
+	const refuseIfNativeRemoved = (): void => {
+		if (!hasNativeAnthropicConstraint(meta)) return;
+		const pool = allAccounts.filter(
+			(account) =>
+				isAccountEligibleForRouteIntent(account, meta, ctx) &&
+				!isProviderExcludedForRequest(account, headerExcludedProviders) &&
+				(matchesCapabilityRouteProfile(account, meta) ||
+					isOrdinaryStockModelAccountEligible(account, effectiveModel)),
+		);
+		let found = false;
+		for (const account of applyImplicitFallbackPolicy(pool, ctx, "normal")) {
+			if (
+				isServableNativeRemoval(
+					meta,
+					account,
+					effectiveModel,
+					nativeRemovalCapacityOptions,
+				)
+			) {
+				recordNativeConstraintRemoval(meta, account.id);
+				found = true;
+			}
+		}
+		if (found) throw createNativeConstraintRefusal(meta);
+	};
 	const enrolledRootPool = allAccounts.filter(
 		(account) =>
 			isAccountEligibleForRouteIntent(account, meta, ctx) &&
@@ -2629,6 +2849,7 @@ async function selectCapabilityDescendantAccounts(
 	);
 	completeRoutingSelectionStage(meta, "profile_constraint");
 	if (enrolledRootPool.length === 0) {
+		refuseIfNativeRemoved();
 		throw capabilityRouteUnavailable(
 			meta,
 			enrolledRootPool,
@@ -2753,6 +2974,7 @@ async function selectCapabilityDescendantAccounts(
 		after: meta.routingCandidates.length,
 	});
 	if (candidateAccounts.length === 0) {
+		refuseIfNativeRemoved();
 		throw capabilityRouteUnavailable(meta, rootPool);
 	}
 	const eligibleCandidateIds = new Set(
@@ -2777,6 +2999,7 @@ async function selectCapabilityDescendantAccounts(
 	});
 	finalizeSelectionDiagnostics(meta, finalAccounts.length);
 	if (finalAccounts.length === 0) {
+		refuseIfNativeRemoved();
 		throw capabilityRouteUnavailable(meta, rootPool);
 	}
 	return finalAccounts;
@@ -2978,11 +3201,20 @@ async function selectAccountsForRequestInternal(
 	nativeQuotaContextMap.delete(meta);
 	nativeQuotaRequestContextMap.delete(meta);
 	capacityDeferredModelRoutesMap.delete(meta);
+	nativeConstraintRemovedMap.delete(meta);
+	nativeConstraintUsageBlockedMap.delete(meta);
 	meta.comboName = null;
 	meta.comboSlotIndex = null;
 	const effectiveModel =
 		model ?? resolveEffectiveModel(meta.appliedModel, meta.originalModel);
 	const modelScopedCapacityRouting = getModelScopedCapacityRoutingMode(ctx);
+	const nativeRemovalCapacityOptions = (
+		routeIntent: CapacityRouteIntent,
+	): Omit<CandidateCapacityEvaluationOptions, "observationMeta"> => ({
+		modelScopedCapacityRouting,
+		routeIntent,
+		syntheticProbe: options.syntheticProbe === true,
+	});
 	meta.affinityLaneKey = deriveAffinityLaneKey(meta, effectiveModel);
 	meta.hardExcludedAccountIds = null;
 	meta.quotaPressureByAccountId = null;
@@ -3034,6 +3266,22 @@ async function selectAccountsForRequestInternal(
 			);
 			if (!forcedAccount) {
 				throw new ForceRouteUnavailableError(forcedAccountId, "not_found");
+			}
+			// Header and profile pins alike: an advisor request is never sent to a
+			// non-first-party account, and the refusal names no account.
+			if (
+				hasNativeAnthropicConstraint(meta) &&
+				!isFirstPartyAnthropicAccount(forcedAccount)
+			) {
+				// A forced non-advisor request still reaches the usage-throttle
+				// stage, so a throttled pin keeps that terminal (R7).
+				if (
+					isAccountAvailable(forcedAccount) &&
+					isNativeRemovalUsageBlocked(meta, forcedAccount, effectiveModel)
+				) {
+					return [];
+				}
+				throw createNativeConstraintRefusal(meta);
 			}
 			if (
 				effectiveModel &&
@@ -3294,6 +3542,7 @@ async function selectAccountsForRequestInternal(
 			);
 		}
 		const excludedProviders = getExcludedProviders(meta);
+		const headerExcludedProviders = getExcludedProviders(meta, false);
 		let matchesRoute: (account: Account) => boolean;
 		let refreshImplicitAccountProofs:
 			| ((accounts: Account[]) => Promise<void>)
@@ -3361,6 +3610,30 @@ async function selectAccountsForRequestInternal(
 		} else {
 			matchesRoute = (account) => matchesCapabilityRouteProfile(account, meta);
 		}
+		// Applies the R5 test at a pool-exhaustion site: refuse when the native
+		// constraint removed an available account that matched the profile and
+		// cleared every other gate; otherwise the caller raises its own 503.
+		const refuseIfNativeRemoved = (): void => {
+			if (!hasNativeAnthropicConstraint(meta)) return;
+			let found = false;
+			for (const account of allAccounts) {
+				if (
+					isAccountEligibleForRouteIntent(account, meta, ctx) &&
+					matchesRoute(account) &&
+					!isProviderExcludedForRequest(account, headerExcludedProviders) &&
+					isServableNativeRemoval(
+						meta,
+						account,
+						effectiveModel,
+						nativeRemovalCapacityOptions("capability"),
+					)
+				) {
+					recordNativeConstraintRemoval(meta, account.id);
+					found = true;
+				}
+			}
+			if (found) throw createNativeConstraintRefusal(meta);
+		};
 		const selectGlobalHelperFallback = async (): Promise<Account[]> => {
 			const selected = await getOrderedAccounts(
 				meta,
@@ -3371,10 +3644,15 @@ async function selectAccountsForRequestInternal(
 				undefined,
 				[],
 				(accounts) =>
-					accounts.filter(
-						(account) =>
-							isAccountEligibleForRouteIntent(account, meta, ctx) &&
-							!isProviderExcludedForRequest(account, excludedProviders),
+					applyNativeConstraint(
+						meta,
+						accounts.filter(
+							(account) =>
+								isAccountEligibleForRouteIntent(account, meta, ctx) &&
+								!isProviderExcludedForRequest(account, headerExcludedProviders),
+						),
+						effectiveModel,
+						nativeRemovalCapacityOptions("capability"),
 					),
 				modelScopedCapacityRouting,
 			);
@@ -3398,6 +3676,7 @@ async function selectAccountsForRequestInternal(
 			if (meta.routeLineage?.kind === "helper") {
 				return selectGlobalHelperFallback();
 			}
+			refuseIfNativeRemoved();
 			throw capabilityRouteUnavailable(
 				meta,
 				matchingAccounts,
@@ -3456,13 +3735,16 @@ async function selectAccountsForRequestInternal(
 			if (meta.routeLineage?.kind === "helper") {
 				return selectGlobalHelperFallback();
 			}
+			refuseIfNativeRemoved();
 			throw capabilityRouteUnavailable(meta, matchingAccounts);
 		}
 		return available;
 	}
 
 	// Filter out excluded providers (e.g. claude-oauth excluded by the responses adapter)
-	const excludeProviders = getExcludedProviders(meta);
+	// Header exclusions only: the native constraint is applied last, so the
+	// accounts it removes can be told apart from the ones other gates removed.
+	const excludeProviders = getExcludedProviders(meta, false);
 	const isProviderExcluded = (account: Account): boolean => {
 		return isProviderExcludedForRequest(account, excludeProviders);
 	};
@@ -3483,7 +3765,7 @@ async function selectAccountsForRequestInternal(
 		const skipped = accounts.length - filtered.length;
 		if (skipped > 0) {
 			log.warn(
-				`Skipping ${skipped} account(s) excluded for this request type (Codex CLI traffic must not use Anthropic OAuth accounts)`,
+				`Skipping ${skipped} account(s) excluded for this request type by x-better-ccflare-exclude-providers`,
 			);
 		}
 		return filtered;
@@ -3627,7 +3909,7 @@ async function selectAccountsForRequestInternal(
 								isAccountEligibleForRouteIntent(account, meta, ctx) &&
 								!isProviderExcluded(account),
 						);
-					const implicitComboAccounts = filterCountHelperAccounts(
+					const implicitComboPool = filterCountHelperAccounts(
 						meta,
 						ctx,
 						applyImplicitFallbackPolicy(
@@ -3636,6 +3918,18 @@ async function selectAccountsForRequestInternal(
 							"combo",
 							meta,
 						),
+					);
+					// The native constraint applies after every other gate so the
+					// accounts it removes are known to have been otherwise eligible.
+					const nativeRemovedComboAccountIds = new Set(
+						hasNativeAnthropicConstraint(meta)
+							? implicitComboPool
+									.filter((account) => !isFirstPartyAnthropicAccount(account))
+									.map((account) => account.id)
+							: [],
+					);
+					const implicitComboAccounts = implicitComboPool.filter(
+						(account) => !nativeRemovedComboAccountIds.has(account.id),
 					);
 					const implicitComboAccountIds = new Set(
 						implicitComboAccounts.map((account) => account.id),
@@ -3679,11 +3973,21 @@ async function selectAccountsForRequestInternal(
 							continue;
 						}
 
-						if (
-							isProviderExcluded(account) ||
-							!implicitComboAccountIds.has(account.id)
-						)
+						if (isProviderExcluded(account)) continue;
+						if (nativeRemovedComboAccountIds.has(account.id)) {
+							if (
+								isServableNativeRemoval(
+									meta,
+									account,
+									member.logical_model,
+									nativeRemovalCapacityOptions("combo"),
+								)
+							) {
+								recordNativeConstraintRemoval(meta, account.id);
+							}
 							continue;
+						}
+						if (!implicitComboAccountIds.has(account.id)) continue;
 						const routing: RoutingCandidateMetadata = {
 							candidateId: member.id,
 							accountId: account.id,
@@ -4028,13 +4332,20 @@ async function selectAccountsForRequestInternal(
 				meta,
 				effectiveModel,
 			);
-			return effectiveModel &&
+			const served =
+				effectiveModel &&
 				isForceAccountModelEnabled(ctx) &&
 				!isInternalProbe(meta.headers, ctx)
-				? eligible.filter((account) =>
-						accountServesModel(account, effectiveModel),
-					)
-				: eligible;
+					? eligible.filter((account) =>
+							accountServesModel(account, effectiveModel),
+						)
+					: eligible;
+			return applyNativeConstraint(
+				meta,
+				served,
+				effectiveModel,
+				nativeRemovalCapacityOptions("ordinary"),
+			);
 		},
 		modelScopedCapacityRouting,
 	);
@@ -4047,7 +4358,23 @@ export async function selectAccountsForRequest(
 	options: AccountSelectionOptions = {},
 ): Promise<Account[]> {
 	try {
-		return await selectAccountsForRequestInternal(meta, ctx, model, options);
+		const selected = await selectAccountsForRequestInternal(
+			meta,
+			ctx,
+			model,
+			options,
+		);
+		// Native-caused emptiness refuses instead of reporting the pool's own
+		// terminal. A first-party route deferred for capacity is still attempted
+		// outside this list, so it keeps the request alive.
+		if (
+			selected.length === 0 &&
+			getNativeConstraintRemovedAccountIds(meta).size > 0 &&
+			getCapacityDeferredModelRoutes(meta).length === 0
+		) {
+			throw createNativeConstraintRefusal(meta);
+		}
+		return selected;
 	} catch (error) {
 		if (
 			error instanceof ServerToolRoutingError ||

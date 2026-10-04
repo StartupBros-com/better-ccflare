@@ -501,7 +501,9 @@ export function mapModelName(anthropicModel: string, account: Account): string {
  * This replaces the old behavior of falling back to `https://api.openai.com`,
  * which made missing endpoints silently route to OpenAI (R3).
  */
-export function getEndpointUrl(account: Account): string | null {
+export function getEndpointUrl(
+	account: Pick<Account, "custom_endpoint">,
+): string | null {
 	const customEndpointData = parseCustomEndpointData(account.custom_endpoint);
 
 	if (customEndpointData?.endpoint) {
@@ -519,6 +521,30 @@ export function getEndpointUrl(account: Account): string | null {
 
 	// No custom endpoint — return null so callers can fail closed (R3)
 	return null;
+}
+
+/**
+ * True only for an Anthropic account whose resolved endpoint is the
+ * first-party API (https://api.anthropic.com, no port or credentials).
+ * OAuth and API-key accounts both qualify. Fails closed on unparsable URLs.
+ */
+export function isFirstPartyAnthropicAccount(
+	account: Pick<Account, "provider" | "custom_endpoint">,
+): boolean {
+	if (account.provider !== "anthropic") return false;
+	const endpoint = getEndpointUrl(account) ?? "https://api.anthropic.com";
+	try {
+		const url = new URL(endpoint);
+		return (
+			url.protocol === "https:" &&
+			url.hostname === "api.anthropic.com" &&
+			!url.port &&
+			!url.username &&
+			!url.password
+		);
+	} catch {
+		return false;
+	}
 }
 
 /**

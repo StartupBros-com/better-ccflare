@@ -157,7 +157,71 @@ export interface RequestData {
 		cacheCreationInputTokens?: number;
 		outputTokens?: number;
 		tokensPerSecond?: number;
+		// Advisor-iteration tokens (R14), separate from the executor columns above.
+		advisorUsage?: AdvisorModelUsage[];
 	};
+}
+
+/** One advisor model's billable token totals within a request (R14). */
+export interface AdvisorModelUsage {
+	/** Null when the iterations named no model; window value counts it unpriced. */
+	model: string | null;
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadInputTokens: number;
+	cacheCreationInputTokens: number;
+}
+
+const ADVISOR_TOKEN_FIELDS = [
+	"inputTokens",
+	"outputTokens",
+	"cacheReadInputTokens",
+	"cacheCreationInputTokens",
+] as const;
+
+/** Reads a stored `advisor_usage` value. Anything this repository would not
+ * have written is left out of `entries` and reported through `malformed`. */
+function parseAdvisorUsage(raw: string): {
+	entries: AdvisorModelUsage[];
+	malformed: boolean;
+} {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return { entries: [], malformed: true };
+	}
+	if (!Array.isArray(parsed)) return { entries: [], malformed: true };
+	const entries: AdvisorModelUsage[] = [];
+	let malformed = false;
+	for (const entry of parsed) {
+		const fields =
+			typeof entry === "object" && entry !== null
+				? (entry as Record<string, unknown>)
+				: undefined;
+		const model = fields?.model ?? null;
+		if (!fields || (model !== null && typeof model !== "string")) {
+			malformed = true;
+			continue;
+		}
+		const usage: AdvisorModelUsage = {
+			model,
+			inputTokens: 0,
+			outputTokens: 0,
+			cacheReadInputTokens: 0,
+			cacheCreationInputTokens: 0,
+		};
+		for (const field of ADVISOR_TOKEN_FIELDS) {
+			const value = fields[field];
+			if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+				usage[field] = value;
+			} else {
+				malformed = true;
+			}
+		}
+		entries.push(usage);
+	}
+	return { entries, malformed };
 }
 
 export class RequestRepository extends BaseRepository<RequestData> {
@@ -197,9 +261,10 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				stream_terminal_state, client_session_id,
 				route_profile_id, requested_route_model, routed_provider, routed_model,
 				route_fallback_rung, route_home_action, route_repin_reason, route_candidate_id,
-				account_generation, cache_health_native, internal_origin, quality_decision, routing_attempt_summary
+				account_generation, cache_health_native, internal_origin, quality_decision, routing_attempt_summary,
+				advisor_usage
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (id) DO UPDATE SET
 				timestamp = EXCLUDED.timestamp,
 				method = EXCLUDED.method,
@@ -260,7 +325,8 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				cache_health_native = COALESCE(requests.cache_health_native, EXCLUDED.cache_health_native),
 				internal_origin = COALESCE(requests.internal_origin, EXCLUDED.internal_origin),
  quality_decision = COALESCE(requests.quality_decision, EXCLUDED.quality_decision),
- routing_attempt_summary = COALESCE(requests.routing_attempt_summary, EXCLUDED.routing_attempt_summary)
+ routing_attempt_summary = COALESCE(requests.routing_attempt_summary, EXCLUDED.routing_attempt_summary),
+				advisor_usage = EXCLUDED.advisor_usage
 		`,
 			[
 				data.id,
@@ -310,6 +376,7 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				data.accounting ? (data.accounting.internal ? 1 : 0) : null,
 				decision ? JSON.stringify(decision) : null,
 				attemptSummary ? JSON.stringify(attemptSummary) : null,
+				usage?.advisorUsage?.length ? JSON.stringify(usage.advisorUsage) : null,
 			],
 		);
 	}
@@ -720,6 +787,70 @@ export class RequestRepository extends BaseRepository<RequestData> {
 		`,
 			[accountId, fromMs, toMs],
 		);
+		// Advisor iterations (R14): advisor_usage holds per-model token totals
+		// as JSON. Each entry joins its own model's line and adds no request
+		// count. An entry with no model joins the '' line, as an executor row
+		// with no model does, so window value reports it unpriced rather than
+		// dropping it.
+		const advisorRows = await this.query<{ id: string; advisor_usage: string }>(
+			`
+			SELECT id, advisor_usage
+			FROM requests
+			WHERE account_used = ?
+			  AND path = '/v1/messages'
+			  AND billing_type = 'plan'
+			  AND timestamp >= ? AND timestamp < ?
+			  AND advisor_usage IS NOT NULL
+		`,
+			[accountId, fromMs, toMs],
+		);
+		const aggregates = this.mapTokenAggregateRows(rows);
+		const malformedAdvisorIds: string[] = [];
+		for (const row of advisorRows) {
+			const { entries, malformed } = parseAdvisorUsage(row.advisor_usage);
+			if (malformed) malformedAdvisorIds.push(row.id);
+			for (const usage of entries) {
+				const advisorModel = usage.model ?? "";
+				let target = aggregates.find((entry) => entry.model === advisorModel);
+				if (!target) {
+					target = {
+						model: advisorModel,
+						requestCount: 0,
+						inputTokens: 0,
+						cacheReadInputTokens: 0,
+						cacheCreationInputTokens: 0,
+						outputTokens: 0,
+					};
+					aggregates.push(target);
+				}
+				target.inputTokens += usage.inputTokens;
+				target.cacheReadInputTokens += usage.cacheReadInputTokens;
+				target.cacheCreationInputTokens += usage.cacheCreationInputTokens;
+				target.outputTokens += usage.outputTokens;
+			}
+		}
+		if (malformedAdvisorIds.length > 0) {
+			// Only save() writes advisor_usage, so these rows were altered
+			// elsewhere; whatever could not be read is missing from window value.
+			log.warn("Skipped malformed advisor_usage in window aggregate", {
+				accountId,
+				count: malformedAdvisorIds.length,
+				requestIds: malformedAdvisorIds.slice(0, 10),
+			});
+		}
+		return aggregates;
+	}
+
+	private mapTokenAggregateRows(
+		rows: Array<{
+			model: string;
+			request_count: number;
+			input_tokens: number;
+			cache_read_input_tokens: number;
+			cache_creation_input_tokens: number;
+			output_tokens: number;
+		}>,
+	): WindowTokenAggregate[] {
 		return rows.map((row) => ({
 			// Bun.SQL returns COUNT()/SUM() as JavaScript strings on PostgreSQL
 			// (BIGINT stringified, see Bun#22188) — coerce to Number so this

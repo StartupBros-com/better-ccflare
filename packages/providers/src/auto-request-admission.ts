@@ -18,6 +18,7 @@ import {
 	selectCodexDefaultReasoningEffort,
 } from "./request-capabilities";
 import {
+	deriveNativeAnthropicToolRequirement,
 	deriveServerToolRequirement,
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
@@ -98,6 +99,9 @@ export interface AutoRequestAdmissionInput {
 	readonly catalog: AutoCatalogEvidence | null;
 	/** Exact parsed physical request, after provider transformation. */
 	readonly finalBody: unknown;
+	/** Whether the candidate account is first-party Anthropic (KTD2). Only such a
+	 * candidate may carry advisor content; an absent value counts as false. */
+	readonly firstPartyAnthropic?: boolean;
 	/** Trusted provider implementation and selected account; not request-supplied proof. */
 	readonly hostedTools?: {
 		readonly provider: Provider;
@@ -586,6 +590,13 @@ export function evaluateAutoRequestAdmission(
 		return { status: "unknown", reason: "request-preservation-unknown" };
 	const original = JSON.parse(serialized) as Record<string, unknown>;
 	const final = record(input.finalBody);
+	// Advisor runs only where api.anthropic.com executes it (KTD8). Any other
+	// candidate, including an anthropic one on a custom endpoint, is unsuitable.
+	if (
+		deriveNativeAnthropicToolRequirement(original) !== undefined &&
+		(input.firstPartyAnthropic !== true || target.provider !== "anthropic")
+	)
+		return { status: "reject", reason: "tools-unsupported" };
 	if (target.provider === "anthropic")
 		return evaluateNativeAnthropicAdmission(input, target, original, final);
 	if (!final || final.model !== target.physicalModel)

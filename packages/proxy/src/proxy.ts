@@ -29,6 +29,7 @@ import {
 } from "@better-ccflare/providers";
 import type {
 	Account,
+	NativeAnthropicToolRequirement,
 	RequestMeta,
 	RoutingCandidateMetadata,
 	RoutingSelectionDiagnostics,
@@ -121,6 +122,8 @@ import {
 	evaluateNativeQuotaRequest,
 	getCapacityDeferredModelRoutes,
 	getClientVisibleServerToolAccountId,
+	getNativeConstraintRemovedAccountIds,
+	getNativeConstraintUsageBlockedRemovals,
 	getNativeQuotaCandidateModelUnavailableUntil,
 	getNativeQuotaContext,
 	getReactiveModelCapacityBlocker,
@@ -130,6 +133,8 @@ import {
 	isImplicitCodexDiscoveryEligible,
 	isNativeQuotaRequestCandidateEligible,
 	isNativeQuotaRouteAllowed,
+	type NativeRemovalUsageBlockKind,
+	setNativeRemovalUsageGate,
 } from "./handlers/account-selector";
 import {
 	type AnthropicDegradedRequestSendState,
@@ -185,6 +190,7 @@ import {
 } from "./routing-terminal-recorder";
 import { bindRequestPrivateServerToolReplay } from "./server-tool-replay-runtime";
 import {
+	createNativeAnthropicToolRoutingError,
 	createServerToolRoutingErrorResponse,
 	ServerToolCandidateCapabilityError,
 	ServerToolRoutingError,
@@ -1032,10 +1038,34 @@ async function handleProxyCoreImpl(
 							reason: error.reason,
 							accountId: clientVisibleAccountId,
 							capabilitySummary: error.capabilitySummary,
+							requestedToolTypes: error.requestedToolTypes,
 						}),
 			),
 			`server_tool_${error.reason}`,
 		);
+	};
+	// An advisor request whose first-party candidates are all throttled or
+	// depleted must not fall into the pool's own terminal while an available
+	// non-first-party account was removed only by the native constraint: that
+	// is an unserved advisor requirement (refuse, R5). With nothing removed the
+	// caller's existing terminal stands (R7).
+	const nativeConstraintRefusal = (
+		requirement: NativeAnthropicToolRequirement,
+	): Response => {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		return createUnservedServerToolRoutingErrorResponse(
+			createNativeAnthropicToolRoutingError(requirement),
+		);
+	};
+	const nativeConstraintEmptyPoolRefusal = (): Response | null => {
+		const requirement = requestMeta.nativeAnthropicToolRequirement;
+		if (
+			requirement == null ||
+			getNativeConstraintRemovedAccountIds(requestMeta).size === 0
+		) {
+			return null;
+		}
+		return nativeConstraintRefusal(requirement);
 	};
 	activeAnthropicPreCommitRescue?.registerRequestLifecycle(
 		getRequestLifecycleCoordinator(requestMeta),
@@ -1648,6 +1678,28 @@ async function handleProxyCoreImpl(
 	const serverToolRequirements = isCountHelper
 		? undefined
 		: derivedServerToolRequirements;
+	// Advisor is native-only: it never joins the hosted server-tool layer, and
+	// count_tokens declarations are neither filtered nor refused.
+	const nativeAnthropicToolRequirement = isCountHelper
+		? undefined
+		: finalRequestBodyContext.finalizeNativeAnthropicToolRequirement();
+	requestMeta.nativeAnthropicToolRequirement =
+		nativeAnthropicToolRequirement ?? null;
+	// Advisor beside a proxy-hosted tool, or an advisor_* type this proxy does not
+	// know, cannot be served by any single route. Refuse before replay binding.
+	// A request that is already invalid or unsupported keeps that error: dropping
+	// advisor would not make it routable.
+	if (
+		nativeAnthropicToolRequirement &&
+		!serverToolRequirements?.invalid?.length &&
+		!serverToolRequirements?.unsupported?.length &&
+		(serverToolRequirements !== undefined ||
+			nativeAnthropicToolRequirement.unknownDeclaredTypes.length > 0)
+	) {
+		return createUnservedServerToolRoutingErrorResponse(
+			createNativeAnthropicToolRoutingError(nativeAnthropicToolRequirement),
+		);
+	}
 	if (serverToolRequirements) {
 		requestMeta.serverToolRequirements = serverToolRequirements;
 		// Selection needs only the semantic presence bit. Keep the raw query out of
@@ -1894,6 +1946,39 @@ async function handleProxyCoreImpl(
 	requestMeta.codexPacingCohortId = pacingCohortKey?.slice(0, 16) ?? null;
 	const effectiveModel = resolveEffectiveModel(appliedModel, requestModel);
 	const syntheticProbe = trustedInternalKeepalive;
+	// Mirror applyUsageThrottling for accounts the native advisor constraint
+	// removes before they reach it, so a throttled/depleted one cannot turn the
+	// pool's usage terminal into an advisor refusal. Side-effect free: the
+	// reactive state is recorded when the empty-pool site merges the blocked ids.
+	setNativeRemovalUsageGate(
+		requestMeta,
+		(account, model): NativeRemovalUsageBlockKind | null => {
+			if (trustedInternalAutoRefresh || trustedInternalKeepalive) return null;
+			const now = Date.now();
+			const comboRouted = requestMeta.comboName != null;
+			const candidateModel = comboRouted
+				? null
+				: (model ?? appliedModel ?? requestModel ?? null);
+			if (
+				!comboRouted &&
+				getReactiveModelRecoveryAt({
+					accountId: account.id,
+					model: candidateModel,
+					betaSignature: req.headers.get("anthropic-beta"),
+					syntheticProbe,
+					now,
+				}) !== null
+			) {
+				return "reactive";
+			}
+			const throttleUntil = getPredictiveThrottleUntil(
+				account,
+				candidateModel,
+				now,
+			);
+			return throttleUntil && throttleUntil > now ? "predictive" : null;
+		},
+	);
 	const selectAccountsWithDeadline = (
 		options?: Parameters<typeof selectAccountsForRequest>[3],
 	) => {
@@ -2643,6 +2728,29 @@ async function handleProxyCoreImpl(
 		// throw below can leave a stale mapping (KTD-5).
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 
+		const emptyPoolRefusal = nativeConstraintEmptyPoolRefusal();
+		if (emptyPoolRefusal) return finishPacing(pacingSlot, emptyPoolRefusal);
+
+		// Removed non-first-party accounts the usage stage would also have
+		// dropped keep the pool's own usage terminal, as for a non-advisor request.
+		for (const {
+			account,
+			kind,
+			model,
+		} of getNativeConstraintUsageBlockedRemovals(requestMeta)) {
+			if (kind === "reactive") {
+				hasReactiveModelDepletion({
+					accountId: account.id,
+					model: model ?? appliedModel ?? requestModel ?? null,
+					betaSignature: req.headers.get("anthropic-beta"),
+					syntheticProbe,
+				});
+				reactivelyDepletedAccounts.push(account);
+			} else {
+				throttledAccounts.push(account);
+			}
+		}
+
 		const nativeTerminal = nativeQuotaTerminal("selection");
 		if (nativeTerminal) return finishPacing(pacingSlot, nativeTerminal);
 
@@ -2768,6 +2876,7 @@ async function handleProxyCoreImpl(
 					ctx.dbOps.getAllAccounts(),
 				),
 				req.headers,
+				requestMeta.nativeAnthropicToolRequirement != null,
 			);
 		} catch (error) {
 			log.error("Failed to load terminal account state", error);
@@ -4322,6 +4431,18 @@ async function handleProxyCoreImpl(
 		} else if (
 			deferredModelRoutes.length === 0 &&
 			!hasExhaustedLocalServerToolCapabilityFailures() &&
+			(reactivelyDepletedFallbackAccounts.length > 0 ||
+				throttledFallbackAccounts.length > 0) &&
+			requestMeta.nativeAnthropicToolRequirement != null &&
+			getNativeConstraintRemovedAccountIds(requestMeta).size > 0
+		) {
+			return finishPacing(
+				pacingSlot,
+				nativeConstraintRefusal(requestMeta.nativeAnthropicToolRequirement),
+			);
+		} else if (
+			deferredModelRoutes.length === 0 &&
+			!hasExhaustedLocalServerToolCapabilityFailures() &&
 			reactivelyDepletedFallbackAccounts.length > 0
 		) {
 			cacheBodyStore.discardStaged(requestMeta.id);
@@ -4733,6 +4854,13 @@ async function handleProxyCoreImpl(
 	}
 
 	completeRoutingSelectionStage(requestMeta, "usage_throttle");
+	// Nothing reached an upstream, so an available non-first-party account that
+	// only the native constraint removed is what the throttle terminals below
+	// would have been standing in for.
+	if (routingAttemptLedger.attemptedCount === 0) {
+		const refusal = nativeConstraintEmptyPoolRefusal();
+		if (refusal) return finishPacing(pacingSlot, refusal);
+	}
 	const exhaustedNativeTerminal = nativeQuotaTerminal("attempts");
 	if (exhaustedNativeTerminal) {
 		cacheBodyStore.discardStaged(requestMeta.id);
@@ -4885,6 +5013,7 @@ async function handleProxyCoreImpl(
 		const refreshedTerminalAccounts = filterRequestCompatibleAccounts(
 			await loadRoutingInventory(requestMeta, () => ctx.dbOps.getAllAccounts()),
 			req.headers,
+			requestMeta.nativeAnthropicToolRequirement != null,
 		);
 		terminalAccounts = mergeTerminalAccountState(
 			refreshedTerminalAccounts,

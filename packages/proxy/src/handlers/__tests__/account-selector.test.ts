@@ -48,6 +48,8 @@ const {
 	deriveAffinityLaneKey,
 	getClientVisibleServerToolAccountId,
 	getCapacityDeferredModelRoutes,
+	getNativeConstraintRemovedAccountIds,
+	getNativeConstraintUsageBlockedRemovals,
 	getComboSlotInfo,
 	getReactiveModelCapacityBlocker,
 	getRouteProfileConstraintViolation,
@@ -56,8 +58,10 @@ const {
 	isImplicitFallbackAccountAllowed,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
+	setNativeRemovalUsageGate,
 	setComboSlotInfo,
 } = await import("../account-selector");
+const { filterRequestCompatibleAccounts } = await import("../routing-terminal");
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -6679,5 +6683,535 @@ describe("U5 canary: KTD9 Vercel 429 is model-scoped, not an account bench (cons
 		// But isModelUnavailableError classifies the 429 as model-scoped,
 		// so it enters the model-fallback loop (try next model, not bench account)
 		expect(await isModelUnavailableError(response)).toBe(true);
+	});
+});
+
+describe("selectAccountsForRequest — native Anthropic advisor constraint", () => {
+	const MODEL_ID = "claude-sonnet-4-5";
+	const OPUS_ID = "claude-opus-4-8";
+	const DECLARED = {
+		declaredToolTypes: ["advisor_20260301"],
+		unknownDeclaredTypes: [],
+		hasHistory: false,
+	} as const;
+	const HISTORY_ONLY = {
+		declaredToolTypes: [],
+		unknownDeclaredTypes: [],
+		hasHistory: true,
+	} as const;
+	const FUTURE = () => Date.now() + 60 * 60_000;
+
+	// A non-first-party account that serves `model` unchanged, so it passes the
+	// ordinary stock-model fence and would reach the strategy without the
+	// native constraint.
+	function serving(
+		overrides: Partial<Account> & Pick<Account, "id">,
+		model = MODEL_ID,
+	): Account {
+		return makeAccount({
+			model_mappings: JSON.stringify({ [model]: model }),
+			...overrides,
+		});
+	}
+
+	function mixedPool(model = MODEL_ID): Account[] {
+		return [
+			serving({ id: "codex", provider: "codex" }, model),
+			serving({ id: "xai", provider: "xai" }, model),
+			serving(
+				{
+					id: "anthropic-compatible",
+					provider: "anthropic-compatible",
+					custom_endpoint: "https://compatible.example/v1",
+				},
+				model,
+			),
+			serving(
+				{
+					id: "anthropic-custom-endpoint",
+					provider: "anthropic",
+					custom_endpoint: "https://mac-studio.example:8080",
+				},
+				model,
+			),
+			serving({ id: "first-party-oauth", provider: "anthropic" }, model),
+			serving(
+				{
+					id: "first-party-api-key",
+					provider: "anthropic",
+					refresh_token: null,
+					api_key: "sk-ant-test",
+				},
+				model,
+			),
+		];
+	}
+
+	function advisorMeta(
+		requirement: RequestMeta["nativeAnthropicToolRequirement"] = DECLARED,
+		overrides: Partial<RequestMeta> = {},
+	): RequestMeta {
+		return makeRequestMeta({
+			nativeAnthropicToolRequirement: requirement,
+			...overrides,
+		});
+	}
+
+	function availableOnly(accounts: Account[]): Account[] {
+		return accounts.filter(
+			(account) => !account.paused && !account.rate_limited_until,
+		);
+	}
+
+	function selectedBy(ctx: ProxyContext): string[][] {
+		return (ctx.strategy.select as ReturnType<typeof mock>).mock.calls.map(
+			(call) => (call[0] as Account[]).map((account) => account.id),
+		);
+	}
+
+	async function rejection(promise: Promise<unknown>): Promise<unknown> {
+		try {
+			await promise;
+		} catch (error) {
+			return error;
+		}
+		throw new Error("expected selection to reject");
+	}
+
+	function expectRefusal(
+		error: unknown,
+		reason = "advisor_declaration_unavailable",
+	): void {
+		expect(error).toMatchObject({ name: "ServerToolRoutingError", reason });
+		expect((error as { accountId?: string }).accountId).toBeUndefined();
+	}
+
+	it("offers the strategy only first-party accounts from a mixed pool (AE1)", async () => {
+		const ctx = makeCtx({ accounts: mixedPool() });
+		const meta = advisorMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, MODEL_ID);
+
+		expect(selectedBy(ctx)).toEqual([
+			["first-party-oauth", "first-party-api-key"],
+		]);
+		expect(result.map(({ id }) => id)).toEqual([
+			"first-party-oauth",
+			"first-party-api-key",
+		]);
+		expect([...getNativeConstraintRemovedAccountIds(meta)].sort()).toEqual([
+			"anthropic-compatible",
+			"anthropic-custom-endpoint",
+			"codex",
+			"xai",
+		]);
+	});
+
+	it("selects a non-advisor request exactly as before and records no removal", async () => {
+		const ctx = makeCtx({ accounts: mixedPool() });
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, MODEL_ID);
+
+		expect(result).toHaveLength(6);
+		expect(selectedBy(ctx)[0]).toHaveLength(6);
+		expect(getNativeConstraintRemovedAccountIds(meta).size).toBe(0);
+	});
+
+	it("refuses a header force to a non-first-party account without consulting the strategy", async () => {
+		for (const id of [
+			"codex",
+			"xai",
+			"anthropic-compatible",
+			"anthropic-custom-endpoint",
+		]) {
+			const ctx = makeCtx({ accounts: mixedPool() });
+			const meta = advisorMeta(DECLARED, {
+				headers: new Headers({ "x-better-ccflare-account-id": id }),
+			});
+
+			expectRefusal(
+				await rejection(selectAccountsForRequest(meta, ctx, MODEL_ID)),
+			);
+			expect(ctx.strategy.select).not.toHaveBeenCalled();
+		}
+	});
+
+	it("returns the history reason for a history-only request on a forced non-first-party account", async () => {
+		const ctx = makeCtx({ accounts: mixedPool() });
+		const meta = advisorMeta(HISTORY_ONLY, {
+			headers: new Headers({ "x-better-ccflare-account-id": "codex" }),
+		});
+
+		expectRefusal(
+			await rejection(selectAccountsForRequest(meta, ctx, MODEL_ID)),
+			"advisor_history_unavailable",
+		);
+	});
+
+	it("serves a header force to a first-party account and keeps the paused 503 unchanged", async () => {
+		const ctx = makeCtx({ accounts: mixedPool() });
+		const served = await selectAccountsForRequest(
+			advisorMeta(DECLARED, {
+				headers: new Headers({
+					"x-better-ccflare-account-id": "first-party-api-key",
+				}),
+			}),
+			ctx,
+			MODEL_ID,
+		);
+		expect(served.map(({ id }) => id)).toEqual(["first-party-api-key"]);
+
+		const pausedPool = mixedPool();
+		(
+			pausedPool.find(
+				(account) => account.id === "first-party-oauth",
+			) as Account
+		).paused = true;
+		const error = await rejection(
+			selectAccountsForRequest(
+				advisorMeta(DECLARED, {
+					headers: new Headers({
+						"x-better-ccflare-account-id": "first-party-oauth",
+					}),
+				}),
+				makeCtx({ accounts: pausedPool }),
+				MODEL_ID,
+			),
+		);
+		expect(error).toBeInstanceOf(ForceRouteUnavailableError);
+		expect(error).toMatchObject({ reason: "paused" });
+	});
+
+	it("refuses a route profile pinned to a non-first-party account before any force-route 503, with no account id (AE2)", async () => {
+		for (const id of [
+			"codex",
+			"xai",
+			"anthropic-custom-endpoint",
+			"anthropic-compatible",
+		]) {
+			const pool = mixedPool();
+			// A pinned account that is also paused would otherwise raise the
+			// force-route 503; the refusal must win.
+			(pool.find((account) => account.id === id) as Account).paused = true;
+			const ctx = makeCtx({ accounts: pool });
+			const meta = advisorMeta(DECLARED, {
+				routeProfileId: "pinned-profile",
+				forcedAccountId: id,
+			});
+
+			const error = await rejection(
+				selectAccountsForRequest(meta, ctx, MODEL_ID),
+			);
+
+			expectRefusal(error);
+			expect((error as Error).message).not.toContain(id);
+			expect(ctx.strategy.select).not.toHaveBeenCalled();
+		}
+	});
+
+	function solProfile(overrides: Partial<RequestMeta> = {}): RequestMeta {
+		return makeRequestMeta({
+			routeProfileId: "sol-capability",
+			routeProfileSelection: "capability",
+			routeProfileLogicalModel: "claude-opus-5",
+			routeProfileExpectedPhysicalModel: "gpt-5.6-sol",
+			routeExpectedProvider: "codex",
+			...overrides,
+		});
+	}
+
+	it("refuses a capability profile over a Codex pool instead of a force-route 503", async () => {
+		const codex = makeAccount({
+			id: "codex-sol",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+
+		expectRefusal(
+			await rejection(
+				selectAccountsForRequest(
+					solProfile({ nativeAnthropicToolRequirement: DECLARED }),
+					makeCtx({ accounts: [codex] }),
+					"claude-opus-5",
+				),
+			),
+		);
+		// Without the constraint the same pool selects normally.
+		const control = await selectAccountsForRequest(
+			solProfile(),
+			makeCtx({ accounts: [codex] }),
+			"claude-opus-5",
+		);
+		expect(control.map(({ id }) => id)).toEqual(["codex-sol"]);
+	});
+
+	describe("with the usage-throttle gate registered", () => {
+		const codexPool = () => [
+			serving({ id: "codex", provider: "codex" }, MODEL_ID),
+		];
+		const descendantMeta = () =>
+			advisorMeta(DECLARED, {
+				routeLineage: { kind: "descendant", childHomeKey: null },
+			});
+		const refusalOrNull = async (meta: RequestMeta) => {
+			try {
+				await selectAccountsForRequest(
+					meta,
+					makeCtx({ accounts: codexPool() }),
+					MODEL_ID,
+				);
+			} catch (error) {
+				return error;
+			}
+			return null;
+		};
+
+		it("refuses a descendant over a non-first-party-only pool with no gate or a passing gate", async () => {
+			expectRefusal(await refusalOrNull(descendantMeta()));
+			const passing = descendantMeta();
+			setNativeRemovalUsageGate(passing, () => null);
+			expectRefusal(await refusalOrNull(passing));
+		});
+
+		it("does not refuse a descendant when the gate blocks the only non-first-party account", async () => {
+			const meta = descendantMeta();
+			setNativeRemovalUsageGate(meta, () => "predictive");
+			const outcome = await refusalOrNull(meta);
+			expect((outcome as Error | null)?.name).not.toBe(
+				"ServerToolRoutingError",
+			);
+			expect(getNativeConstraintRemovedAccountIds(meta).size).toBe(0);
+			expect(
+				getNativeConstraintUsageBlockedRemovals(meta).map(
+					({ account, kind }) => [account.id, kind],
+				),
+			).toEqual([["codex", "predictive"]]);
+		});
+
+		it("does not refuse a capability profile when the gate blocks the Codex pool member", async () => {
+			const codex = makeAccount({
+				id: "codex-sol",
+				provider: "codex",
+				model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+			});
+			const meta = solProfile({ nativeAnthropicToolRequirement: DECLARED });
+			setNativeRemovalUsageGate(meta, () => "reactive");
+			let outcome: unknown = null;
+			try {
+				await selectAccountsForRequest(
+					meta,
+					makeCtx({ accounts: [codex] }),
+					"claude-opus-5",
+				);
+			} catch (error) {
+				outcome = error;
+			}
+			expect((outcome as Error | null)?.name).not.toBe(
+				"ServerToolRoutingError",
+			);
+		});
+	});
+
+	it("keeps the capability-profile 503 when the Codex pool member could not serve anyway", async () => {
+		const exhausted = makeAccount({
+			id: "codex-sol-exhausted",
+			provider: "codex",
+			rate_limited_until: FUTURE(),
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+
+		const error = await rejection(
+			selectAccountsForRequest(
+				solProfile({ nativeAnthropicToolRequirement: DECLARED }),
+				makeCtx({ accounts: [exhausted] }),
+				"claude-opus-5",
+			),
+		);
+
+		expect(error).toBeInstanceOf(ForceRouteUnavailableError);
+	});
+
+	function opusSlots(...accountIds: Array<[string, number]>) {
+		return accountIds.map(([accountId, priority], index) => ({
+			id: `slot-${index}`,
+			combo_id: "combo-1",
+			account_id: accountId,
+			model: OPUS_ID,
+			priority,
+			enabled: true,
+		}));
+	}
+
+	it("refuses a combo whose only members are Codex and xAI, with no unknown-member warnings", async () => {
+		const warnings = spyOn(Logger.prototype, "warn").mockImplementation(
+			() => {},
+		);
+		try {
+			const pool = [
+				serving({ id: "codex", provider: "codex" }, OPUS_ID),
+				serving({ id: "xai", provider: "xai" }, OPUS_ID),
+			];
+			const combo = makeCombo(opusSlots(["codex", 1], ["xai", 2]));
+			const ctx = makeCtx({ accounts: pool, activeCombo: combo });
+			ctx.strategy.select = mock((all: Account[]) => availableOnly(all));
+
+			expectRefusal(
+				await rejection(selectAccountsForRequest(advisorMeta(), ctx, OPUS_ID)),
+			);
+			expect(
+				warnings.mock.calls.filter((call) =>
+					String(call[0]).includes("unknown account"),
+				),
+			).toEqual([]);
+		} finally {
+			warnings.mockRestore();
+		}
+	});
+
+	it("refuses a mixed combo whose first-party member is rate-limited while Codex is available, and keeps the existing terminal without Codex (AE4)", async () => {
+		const limited = serving(
+			{
+				id: "first-party-limited",
+				provider: "anthropic",
+				rate_limited_until: FUTURE(),
+			},
+			OPUS_ID,
+		);
+		const codex = serving({ id: "codex", provider: "codex" }, OPUS_ID);
+		const mixedCtx = makeCtx({
+			accounts: [limited, codex],
+			activeCombo: makeCombo(
+				opusSlots(["first-party-limited", 1], ["codex", 10]),
+			),
+		});
+		mixedCtx.strategy.select = mock((all: Account[]) => availableOnly(all));
+
+		expectRefusal(
+			await rejection(
+				selectAccountsForRequest(advisorMeta(), mixedCtx, OPUS_ID),
+			),
+		);
+
+		const soloCtx = makeCtx({
+			accounts: [limited],
+			activeCombo: makeCombo(opusSlots(["first-party-limited", 1])),
+		});
+		soloCtx.strategy.select = mock((all: Account[]) => availableOnly(all));
+		const soloMeta = advisorMeta();
+
+		expect(await selectAccountsForRequest(soloMeta, soloCtx, OPUS_ID)).toEqual(
+			[],
+		);
+		expect(getNativeConstraintRemovedAccountIds(soloMeta).size).toBe(0);
+	});
+
+	it("refuses when every first-party account is rate-limited and an available non-first-party account passed the stock-model fence (ordinary pool)", async () => {
+		const limited = serving({
+			id: "first-party-limited",
+			provider: "anthropic",
+			rate_limited_until: FUTURE(),
+		});
+		const codex = serving({ id: "codex", provider: "codex" });
+		const ctx = makeCtx({ accounts: [limited, codex] });
+		ctx.strategy.select = mock((all: Account[]) => availableOnly(all));
+
+		expectRefusal(
+			await rejection(selectAccountsForRequest(advisorMeta(), ctx, MODEL_ID)),
+		);
+		// No strategy call may have been offered a non-first-party account.
+		expect(selectedBy(ctx).flat()).not.toContain("codex");
+	});
+
+	it("never counts an account the stock-model fence removed", async () => {
+		const limited = serving({
+			id: "first-party-limited",
+			provider: "anthropic",
+			rate_limited_until: FUTURE(),
+		});
+		// No mapping: Codex's provider default fails the ordinary stock-model fence.
+		const fenced = makeAccount({
+			id: "codex-fenced",
+			provider: "codex",
+			model_mappings: null,
+		});
+		const ctx = makeCtx({ accounts: [limited, fenced] });
+		ctx.strategy.select = mock((all: Account[]) => availableOnly(all));
+		const meta = advisorMeta();
+
+		expect(await selectAccountsForRequest(meta, ctx, MODEL_ID)).toEqual([]);
+		expect(getNativeConstraintRemovedAccountIds(meta).size).toBe(0);
+	});
+
+	it("does not count a non-first-party account that is itself unavailable", async () => {
+		const limited = serving({
+			id: "first-party-limited",
+			provider: "anthropic",
+			rate_limited_until: FUTURE(),
+		});
+		const pausedCodex = serving({
+			id: "codex-paused",
+			provider: "codex",
+			paused: true,
+		});
+		const ctx = makeCtx({ accounts: [limited, pausedCodex] });
+		ctx.strategy.select = mock((all: Account[]) => availableOnly(all));
+
+		expect(
+			await selectAccountsForRequest(advisorMeta(), ctx, MODEL_ID),
+		).toEqual([]);
+	});
+
+	it("returns the native-quota combo result unchanged when every member is first-party", async () => {
+		const exhausted = makeAccount({
+			id: "first-party-exhausted",
+			provider: "anthropic",
+			rate_limited_until: FUTURE(),
+		});
+		const combo = makeCombo(opusSlots(["first-party-exhausted", 1]));
+		const policy = makeRoutingPolicy(combo, "opus", {
+			assignment: {
+				family: "opus",
+				combo_id: combo.id,
+				enabled: true,
+				membership_mode: "manual",
+				managed_model: null,
+				exhaustion_policy: "native_quota_wait",
+			},
+		});
+		async function run(meta: RequestMeta) {
+			const ctx = makeCtx({ accounts: [exhausted], routingPolicy: policy });
+			ctx.strategy.select = mock((all: Account[]) => availableOnly(all));
+			return selectAccountsForRequest(meta, ctx, OPUS_ID);
+		}
+
+		const control = await run(makeRequestMeta());
+		const advisorRequest = advisorMeta();
+		const advisor = await run(advisorRequest);
+
+		expect(advisor.map(({ id }) => id)).toEqual(control.map(({ id }) => id));
+		expect(getNativeConstraintRemovedAccountIds(advisorRequest).size).toBe(0);
+	});
+
+	it("resets the removal record on every selection", async () => {
+		const ctx = makeCtx({ accounts: mixedPool() });
+		const meta = advisorMeta();
+		await selectAccountsForRequest(meta, ctx, MODEL_ID);
+		expect(getNativeConstraintRemovedAccountIds(meta).size).toBe(4);
+
+		meta.nativeAnthropicToolRequirement = null;
+		await selectAccountsForRequest(meta, ctx, MODEL_ID);
+
+		expect(getNativeConstraintRemovedAccountIds(meta).size).toBe(0);
+	});
+
+	it("applies the constraint to the terminal account filter", () => {
+		const pool = mixedPool();
+		const headers = new Headers();
+
+		expect(
+			filterRequestCompatibleAccounts(pool, headers, true).map(({ id }) => id),
+		).toEqual(["first-party-oauth", "first-party-api-key"]);
+		expect(filterRequestCompatibleAccounts(pool, headers)).toHaveLength(6);
 	});
 });

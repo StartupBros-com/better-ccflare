@@ -1945,3 +1945,740 @@ describe("count helper capability before ranking", () => {
 		);
 	});
 });
+
+describe("advisor native passthrough request gate", () => {
+	const ADVISOR_TOOL = {
+		type: "advisor_20260301",
+		name: "advisor",
+		model: "claude-opus-5",
+	};
+	const ADVISOR_HISTORY = [
+		{
+			role: "assistant",
+			content: [
+				{
+					type: "server_tool_use",
+					id: "srvtoolu_1",
+					name: "advisor",
+					input: {},
+				},
+			],
+		},
+		{ role: "user", content: "continue" },
+	];
+
+	function makeFirstPartyAccount(): Account {
+		return makeAccount({
+			id: "first-party",
+			name: "first-party",
+			provider: "anthropic",
+			access_token: "test-token",
+			expires_at: Date.now() + 60 * 60_000,
+			custom_endpoint: null,
+			model_mappings: null,
+		});
+	}
+
+	function makeAdvisorRequest(
+		options: {
+			tools?: Array<Record<string, unknown>>;
+			messages?: unknown[];
+			path?: string;
+			replayIdentity?: "valid" | "missing";
+		} = {},
+	): Request {
+		const headers = new Headers({
+			"content-type": "application/json",
+			"anthropic-version": "2023-06-01",
+		});
+		if (options.replayIdentity !== "missing") {
+			headers.set("authorization", "Bearer server-tool-test-client");
+			headers.set("x-claude-code-session-id", "server-tool-test-session");
+		}
+		return new Request(`https://proxy.local${options.path ?? "/v1/messages"}`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				model: MODEL,
+				max_tokens: 16,
+				messages: options.messages ?? [{ role: "user", content: "hello" }],
+				tools: options.tools ?? [ADVISOR_TOOL],
+			}),
+		});
+	}
+
+	async function refusal(request: Request, accounts: Account[]) {
+		const { ctx, refreshCalls, mutations } = makeContext(accounts);
+		globalThis.fetch = mock(
+			async () => new Response("{}", { status: 500 }),
+		) as unknown as typeof fetch;
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = (await response.json()) as {
+			error: { code: string; reason: string; message: string };
+		};
+		return { ctx, refreshCalls, mutations, response, body };
+	}
+
+	it("admits an advisor-only request and reaches upstream in exactly one fetch", async () => {
+		const { ctx } = makeContext(makeFirstPartyAccount());
+		let forwarded: Record<string, unknown> | undefined;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const outbound = input instanceof Request ? input : new Request(input);
+			forwarded = (await outbound.clone().json()) as Record<string, unknown>;
+			return new Response(JSON.stringify({ type: "message", content: [] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		const request = makeAdvisorRequest();
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(forwarded?.tools).toEqual([ADVISOR_TOOL]);
+	});
+
+	it("refuses advisor plus a hosted web_search declaration before replay binding", async () => {
+		// A missing replay identity would yield replay_unavailable if binding ran.
+		const request = makeAdvisorRequest({
+			tools: [
+				ADVISOR_TOOL,
+				{ type: "web_search_20250305", name: "web_search" },
+			],
+			replayIdentity: "missing",
+		});
+		const { ctx, refreshCalls, mutations, response, body } = await refusal(
+			request,
+			[makeFirstPartyAccount()],
+		);
+
+		expect(response.status).toBe(400);
+		expect(body.error.reason).toBe("advisor_declaration_unavailable");
+		expect(body.error.message).toContain("the advisor tool is not available");
+		expect(body.error.message).not.toContain(
+			"not available for this organization",
+		);
+		expect(body.error.message).not.toContain("Input tag");
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+		expect(mutations.updateAccountUsage).toHaveBeenCalledTimes(0);
+		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+		expect(response.headers.has("x-better-ccflare-pool-status")).toBeFalse();
+		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBeFalse();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(usageHandleEnd.mock.calls[0]?.[0]).toMatchObject({
+			success: false,
+			error: "server_tool_advisor_declaration_unavailable",
+		});
+	});
+
+	it("refuses advisor history beside web-search replay history with the history phrase", async () => {
+		const request = makeAdvisorRequest({
+			tools: [],
+			replayIdentity: "missing",
+			messages: [
+				...ADVISOR_HISTORY,
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "web_search_tool_result",
+							tool_use_id: "srvtoolu_2",
+							content: [
+								{
+									type: "web_search_result",
+									encrypted_content: "bccf1.A256GCM.proxy-envelope",
+								},
+							],
+						},
+					],
+				},
+			],
+		});
+		const { ctx, response, body } = await refusal(request, [
+			makeFirstPartyAccount(),
+		]);
+
+		expect(response.status).toBe(400);
+		expect(body.error.reason).toBe("advisor_history_unavailable");
+		expect(body.error.message).toContain(
+			"Advisor tool result content could not be processed",
+		);
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+	});
+
+	it("refuses a declared unknown advisor type with the declaration phrase", async () => {
+		const request = makeAdvisorRequest({
+			tools: [{ type: "advisor_20270101", name: "advisor" }],
+		});
+		const { response, body } = await refusal(request, [
+			makeFirstPartyAccount(),
+		]);
+
+		expect(response.status).toBe(400);
+		expect(body.error.reason).toBe("advisor_declaration_unavailable");
+		expect(body.error.code).not.toBe("server_tool_unsupported_requirement");
+		expect(body.error.message).toContain("the advisor tool is not available");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+	});
+
+	it("keeps an unrelated typed tool on server_tool_unsupported_requirement", async () => {
+		const request = makeAdvisorRequest({
+			tools: [{ type: "code_execution_20250825", name: "code_execution" }],
+		});
+		const { response, body } = await refusal(request, [
+			makeFirstPartyAccount(),
+		]);
+
+		expect(response.status).toBe(400);
+		expect(body.error.code).toBe("server_tool_unsupported_requirement");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+	});
+
+	it("keeps an advisor-only main-chain request a root while a web_search request stays a helper", async () => {
+		async function selectedLineage(request: Request, account: Account) {
+			const { ctx } = makeContext(account, (provider) => {
+				provider.resolveServerToolCapability = (_requirements, tuple) => ({
+					decision: "proven",
+					proof: makeProof(tuple, `lineage:${tuple.candidateId}`),
+				});
+			});
+			const lineages: Array<RequestMeta["routeLineage"]> = [];
+			ctx.strategy.select = mock(
+				async (accounts: Account[], meta: RequestMeta) => {
+					lineages.push(meta.routeLineage);
+					return accounts;
+				},
+			);
+			globalThis.fetch = mock(
+				async () =>
+					new Response(JSON.stringify({ type: "message", content: [] }), {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					}),
+			) as unknown as typeof fetch;
+			await handleProxy(request, new URL(request.url), ctx);
+			return lineages;
+		}
+
+		const advisor = await selectedLineage(
+			makeAdvisorRequest(),
+			makeFirstPartyAccount(),
+		);
+		const hosted = await selectedLineage(
+			makeServerToolRequest(),
+			makeAccount(),
+		);
+
+		expect(advisor.length).toBeGreaterThan(0);
+		expect(advisor.every((lineage) => lineage?.kind === "root")).toBe(true);
+		expect(hosted.length).toBeGreaterThan(0);
+		expect(hosted.every((lineage) => lineage?.kind === "helper")).toBe(true);
+	});
+
+	it("neither filters nor refuses count_tokens that declares advisor", async () => {
+		const { ctx } = makeContext(makeFirstPartyAccount());
+		let seenMeta: RequestMeta | undefined;
+		ctx.strategy.select = mock(
+			async (accounts: Account[], meta: RequestMeta) => {
+				seenMeta = meta;
+				return accounts;
+			},
+		);
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ input_tokens: 3 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		) as unknown as typeof fetch;
+		const request = makeAdvisorRequest({ path: "/v1/messages/count_tokens" });
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(seenMeta?.nativeAnthropicToolRequirement).toBeNull();
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("advisor native-only selection through handleProxy", () => {
+	const ADVISOR_TOOL = {
+		type: "advisor_20260301",
+		name: "advisor",
+		model: "claude-opus-5",
+	};
+	const ADVISOR_BETA = "advisor-tool-2026-03-01";
+	const DECLARATION_PHRASE = "the advisor tool is not available";
+	const HISTORY_PHRASE = "Advisor tool result content could not be processed";
+
+	function firstParty(): Account {
+		return makeAccount({
+			id: "advisor-first-party",
+			name: "advisor-first-party",
+			provider: "anthropic",
+			access_token: "test-token",
+			expires_at: Date.now() + 60 * 60_000,
+			custom_endpoint: null,
+			model_mappings: null,
+			priority: 5,
+		});
+	}
+
+	// The default fixture provider is not first-party; it sorts ahead of the
+	// first-party account, so only the native constraint keeps it off the request.
+	function gateway(overrides: Partial<Account> = {}): Account {
+		return makeAccount({
+			id: "advisor-gateway",
+			name: "advisor-gateway",
+			priority: 0,
+			api_key: "gateway-key",
+			refresh_token: "",
+			...overrides,
+		});
+	}
+
+	function advisorRequest(
+		options: {
+			model?: string;
+			headers?: Record<string, string>;
+			tools?: Array<Record<string, unknown>>;
+			messages?: unknown[];
+		} = {},
+	): Request {
+		return new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: new Headers({
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+				"anthropic-beta": ADVISOR_BETA,
+				authorization: "Bearer server-tool-test-client",
+				"x-claude-code-session-id": "server-tool-test-session",
+				...options.headers,
+			}),
+			body: JSON.stringify({
+				model: options.model ?? MODEL,
+				max_tokens: 16,
+				messages: options.messages ?? [{ role: "user", content: "hello" }],
+				tools: options.tools ?? [ADVISOR_TOOL],
+			}),
+		});
+	}
+
+	async function refused(request: Request, accounts: Account[]) {
+		const { ctx, refreshCalls, mutations } = makeContext(accounts);
+		globalThis.fetch = mock(
+			async () => new Response("{}", { status: 500 }),
+		) as unknown as typeof fetch;
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = (await response.json()) as {
+			error: Record<string, unknown> & { message: string };
+		};
+		return { ctx, refreshCalls, mutations, response, body };
+	}
+
+	it("sends the request, tool object and beta header only to the first-party account in a mixed pool (AE1)", async () => {
+		const { ctx } = makeContext([gateway(), firstParty()]);
+		const fetched: Array<{
+			url: string;
+			beta: string | null;
+			body: Record<string, unknown>;
+		}> = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const outbound = input instanceof Request ? input : new Request(input);
+			fetched.push({
+				url: outbound.url,
+				beta: outbound.headers.get("anthropic-beta"),
+				body: (await outbound.clone().json()) as Record<string, unknown>,
+			});
+			return new Response(JSON.stringify({ type: "message", content: [] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		const request = advisorRequest();
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(fetched).toHaveLength(1);
+		expect(new URL(fetched[0].url).host).toBe("api.anthropic.com");
+		expect(fetched[0].beta).toContain(ADVISOR_BETA);
+		expect(fetched[0].body.tools).toEqual([ADVISOR_TOOL]);
+		const offered = (ctx.strategy.select as ReturnType<typeof mock>).mock.calls
+			.flatMap((call) => call[0] as Account[])
+			.map((account) => account.id);
+		expect(offered).not.toContain("advisor-gateway");
+	});
+
+	it("refuses a route profile pinned to a non-first-party account with no account id and zero fetches (AE2)", async () => {
+		const pinned = gateway({ id: "advisor-pinned-gateway" });
+		const { ctx, refreshCalls, mutations } = makeContext([
+			pinned,
+			firstParty(),
+		]);
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "advisor-pinned-profile",
+						displayName: "Advisor pinned profile",
+						accountId: pinned.id,
+						logicalModel: MODEL,
+						expectedProvider: pinned.provider,
+					},
+				]),
+			),
+		);
+		globalThis.fetch = mock(
+			async () => new Response("{}", { status: 500 }),
+		) as unknown as typeof fetch;
+		const request = advisorRequest({
+			model: "claude-bccf-route-advisor-pinned-profile",
+		});
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = (await response.json()) as {
+			error: { message: string; reason: string };
+		};
+
+		expect(response.status).toBe(400);
+		expect(body.error.reason).toBe("advisor_declaration_unavailable");
+		expect(body.error.message).toContain(DECLARATION_PHRASE);
+		expect(body.error).not.toHaveProperty("account_id");
+		expect(JSON.stringify(body)).not.toContain(pinned.id);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+		expect(mutations.updateAccountUsage).toHaveBeenCalledTimes(0);
+	});
+
+	it("refuses a header force to a non-first-party account with zero fetches", async () => {
+		const request = advisorRequest({
+			headers: { "x-better-ccflare-account-id": "advisor-gateway" },
+		});
+		const { response, body } = await refused(request, [
+			gateway(),
+			firstParty(),
+		]);
+
+		expect(response.status).toBe(400);
+		expect(body.error.message).toContain(DECLARATION_PHRASE);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+	});
+
+	describe("when throttling empties the native-filtered pool", () => {
+		const throttleFirstParty = (ctx: ProxyContext, account: Account) => {
+			ctx.config.getUsageThrottlingFiveHourEnabled = () => true;
+			usageCache.set(account.id, {
+				five_hour: {
+					utilization: 80,
+					resets_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+				},
+				seven_day: { utilization: 10, resets_at: null },
+			});
+		};
+		const depleteFirstParty = (account: Account) => {
+			usageCache.markModelScopedExhausted(
+				account.id,
+				MODEL,
+				ADVISOR_BETA,
+				Date.now() + 60_000,
+			);
+		};
+		const fetchSpy = () => {
+			globalThis.fetch = mock(
+				async () => new Response("{}", { status: 500 }),
+			) as unknown as typeof fetch;
+		};
+		const cleanup = (account: Account) => {
+			usageCache.delete(account.id);
+		};
+
+		it("refuses instead of the 529 when the first-party account is predictively throttled and a gateway is available", async () => {
+			const first = firstParty();
+			const { ctx, mutations } = makeContext([gateway(), first]);
+			throttleFirstParty(ctx, first);
+			fetchSpy();
+			try {
+				const request = advisorRequest();
+				const response = await handleProxy(request, new URL(request.url), ctx);
+				const body = (await response.json()) as {
+					error: { message: string; reason: string };
+				};
+
+				expect(response.status).toBe(400);
+				expect(body.error.reason).toBe("advisor_declaration_unavailable");
+				expect(body.error.message).toContain(DECLARATION_PHRASE);
+				expect(response.headers.has("retry-after")).toBeFalse();
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+				expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+			} finally {
+				cleanup(first);
+			}
+		});
+
+		it("keeps the 529 when the first-party account is predictively throttled and no other account is available", async () => {
+			const first = firstParty();
+			const { ctx } = makeContext([first]);
+			throttleFirstParty(ctx, first);
+			fetchSpy();
+			try {
+				const request = advisorRequest();
+				const response = await handleProxy(request, new URL(request.url), ctx);
+
+				expect(response.status).toBe(529);
+				expect(response.headers.has("retry-after")).toBeTrue();
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				cleanup(first);
+			}
+		});
+
+		it("refuses instead of the model-pool 503 when the first-party account is reactively model-depleted and a gateway is available", async () => {
+			const first = firstParty();
+			const { ctx } = makeContext([gateway(), first]);
+			depleteFirstParty(first);
+			fetchSpy();
+			try {
+				const request = advisorRequest();
+				const response = await handleProxy(request, new URL(request.url), ctx);
+				const body = (await response.json()) as {
+					error: { message: string; reason: string };
+				};
+
+				expect(response.status).toBe(400);
+				expect(body.error.reason).toBe("advisor_declaration_unavailable");
+				expect(body.error.message).toContain(DECLARATION_PHRASE);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				cleanup(first);
+			}
+		});
+
+		it("keeps the model-pool 503 when the first-party account is reactively model-depleted and no other account is available", async () => {
+			const first = firstParty();
+			const { ctx } = makeContext([first]);
+			depleteFirstParty(first);
+			fetchSpy();
+			try {
+				const request = advisorRequest();
+				const response = await handleProxy(request, new URL(request.url), ctx);
+
+				expect(response.status).toBe(503);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				cleanup(first);
+			}
+		});
+
+		it("refuses with zero fetches under CCFLARE_PASSTHROUGH_ON_EMPTY_POOL=1 rather than passing through to Anthropic", async () => {
+			process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+			const first = firstParty();
+			const { ctx } = makeContext([gateway(), first]);
+			throttleFirstParty(ctx, first);
+			fetchSpy();
+			try {
+				const request = advisorRequest();
+				const response = await handleProxy(request, new URL(request.url), ctx);
+
+				expect(response.status).toBe(400);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				cleanup(first);
+			}
+		});
+	});
+
+	describe("when the removed non-first-party account is itself usage-blocked", () => {
+		const throttleAccount = (ctx: ProxyContext, account: Account) => {
+			ctx.config.getUsageThrottlingFiveHourEnabled = () => true;
+			usageCache.set(account.id, {
+				five_hour: {
+					utilization: 80,
+					resets_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+				},
+				seven_day: { utilization: 10, resets_at: null },
+			});
+		};
+		const deplete = (account: Account) => {
+			usageCache.markModelScopedExhausted(
+				account.id,
+				MODEL,
+				ADVISOR_BETA,
+				Date.now() + 60_000,
+			);
+		};
+		const send = async (request: Request, ctx: ProxyContext) => {
+			globalThis.fetch = mock(
+				async () => new Response("{}", { status: 500 }),
+			) as unknown as typeof fetch;
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			const text = await response.text();
+			return { response, text };
+		};
+		const expectNoAdvisorPhrase = (text: string) => {
+			expect(text).not.toContain(DECLARATION_PHRASE);
+			expect(text).not.toContain(HISTORY_PHRASE);
+		};
+		const plainRequest = () => advisorRequest({ tools: [] });
+
+		it("returns the usage-throttle 529, not the refusal, when the only non-first-party account is predictively throttled", async () => {
+			const gw = gateway();
+			const { ctx } = makeContext([gw]);
+			throttleAccount(ctx, gw);
+			try {
+				const { response, text } = await send(advisorRequest(), ctx);
+				expect(response.status).toBe(529);
+				expectNoAdvisorPhrase(text);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+
+				const control = makeContext([gw]);
+				throttleAccount(control.ctx, gw);
+				const plain = await send(plainRequest(), control.ctx);
+				expect(plain.response.status).toBe(response.status);
+			} finally {
+				usageCache.delete(gw.id);
+			}
+		});
+
+		it("returns the model-pool terminal, not the refusal, when the only non-first-party account is reactively depleted", async () => {
+			const gw = gateway();
+			const { ctx } = makeContext([gw]);
+			deplete(gw);
+			try {
+				const { response, text } = await send(advisorRequest(), ctx);
+				expect(response.status).toBe(503);
+				expectNoAdvisorPhrase(text);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				usageCache.delete(gw.id);
+			}
+		});
+
+		it("keeps the 529 when both the first-party and the non-first-party account are throttled", async () => {
+			const first = firstParty();
+			const gw = gateway();
+			const { ctx } = makeContext([gw, first]);
+			throttleAccount(ctx, first);
+			throttleAccount(ctx, gw);
+			try {
+				const { response, text } = await send(advisorRequest(), ctx);
+				expect(response.status).toBe(529);
+				expectNoAdvisorPhrase(text);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				usageCache.delete(first.id);
+				usageCache.delete(gw.id);
+			}
+		});
+
+		it("still refuses when an unthrottled non-first-party account is available and no first-party account is", async () => {
+			const first = firstParty();
+			const { ctx } = makeContext([gateway(), first]);
+			throttleAccount(ctx, first);
+			try {
+				const { response, text } = await send(advisorRequest(), ctx);
+				expect(response.status).toBe(400);
+				expect(text).toContain(DECLARATION_PHRASE);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				usageCache.delete(first.id);
+			}
+		});
+
+		it("still refuses when the only non-first-party account is unthrottled", async () => {
+			const { ctx } = makeContext([gateway()]);
+			const { response, text } = await send(advisorRequest(), ctx);
+			expect(response.status).toBe(400);
+			expect(text).toContain(DECLARATION_PHRASE);
+			expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		});
+
+		it("returns the usage-throttle 529 for a force-routed non-first-party pin that is predictively throttled", async () => {
+			const gw = gateway();
+			const forced = { "x-better-ccflare-account-id": gw.id };
+			const { ctx } = makeContext([gw, firstParty()]);
+			throttleAccount(ctx, gw);
+			try {
+				const { response, text } = await send(
+					advisorRequest({ headers: forced }),
+					ctx,
+				);
+				expect(response.status).toBe(529);
+				expectNoAdvisorPhrase(text);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+
+				const control = makeContext([gw, firstParty()]);
+				throttleAccount(control.ctx, gw);
+				const plain = await send(
+					advisorRequest({ tools: [], headers: forced }),
+					control.ctx,
+				);
+				expect(plain.response.status).toBe(response.status);
+			} finally {
+				usageCache.delete(gw.id);
+			}
+		});
+
+		it("still refuses a force-routed non-first-party pin that is not throttled", async () => {
+			const gw = gateway();
+			const { ctx } = makeContext([gw, firstParty()]);
+			const { response, text } = await send(
+				advisorRequest({ headers: { "x-better-ccflare-account-id": gw.id } }),
+				ctx,
+			);
+			expect(response.status).toBe(400);
+			expect(text).toContain(DECLARATION_PHRASE);
+			expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		});
+	});
+
+	it("refuses a history-only request when only a non-first-party account is available (AE3)", async () => {
+		const request = advisorRequest({
+			tools: [],
+			messages: [
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "server_tool_use",
+							id: "srvtoolu_1",
+							name: "advisor",
+							input: {},
+						},
+					],
+				},
+				{ role: "user", content: "continue" },
+			],
+		});
+		const { ctx, refreshCalls, mutations, response, body } = await refused(
+			request,
+			[gateway()],
+		);
+
+		expect(response.status).toBe(400);
+		expect(body.error.reason).toBe("advisor_history_unavailable");
+		expect(body.error.message).toContain(HISTORY_PHRASE);
+		expect(body.error.message).not.toContain(
+			"not available for this organization",
+		);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+		expect(mutations.updateAccountUsage).toHaveBeenCalledTimes(0);
+		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+		expect(
+			(ctx.strategy.select as ReturnType<typeof mock>).mock.calls.flatMap(
+				(call) => call[0] as Account[],
+			),
+		).toEqual([]);
+	});
+});

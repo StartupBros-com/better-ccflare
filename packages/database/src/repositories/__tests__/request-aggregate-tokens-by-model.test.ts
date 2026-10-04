@@ -7,6 +7,7 @@
  */
 import { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, it } from "bun:test";
+import { logBus } from "@better-ccflare/logger";
 import { BunSqlAdapter } from "../../adapters/bun-sql-adapter";
 import { runMigrations } from "../../migrations";
 import { RequestRepository } from "../request.repository";
@@ -160,5 +161,267 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 	it("returns an empty array when nothing matches", async () => {
 		const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
 		expect(rows).toEqual([]);
+	});
+
+	describe("advisor tokens (R14)", () => {
+		const OPUS_ADVISOR = {
+			model: "claude-opus-4",
+			inputTokens: 7,
+			outputTokens: 3,
+			cacheReadInputTokens: 2,
+			cacheCreationInputTokens: 1,
+		};
+
+		function seedAdvisor(
+			id: string,
+			advisorUsage: unknown,
+			opts: { billingType?: string | null; timestamp?: number } = {},
+		): void {
+			seed(db, {
+				id,
+				timestamp: opts.timestamp ?? 1000,
+				model: "claude-sonnet-5",
+				billingType: opts.billingType,
+			});
+			db.run("UPDATE requests SET advisor_usage = ? WHERE id = ?", [
+				typeof advisorUsage === "string"
+					? advisorUsage
+					: JSON.stringify(advisorUsage),
+				id,
+			]);
+		}
+
+		it("adds advisor tokens to the advisor model's own line with zero request count", async () => {
+			seedAdvisor("a1", [OPUS_ADVISOR]);
+
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			const byModel = Object.fromEntries(rows.map((r) => [r.model, r]));
+			expect(byModel["claude-sonnet-5"]).toEqual({
+				model: "claude-sonnet-5",
+				requestCount: 1,
+				inputTokens: 100,
+				cacheReadInputTokens: 10,
+				cacheCreationInputTokens: 5,
+				outputTokens: 50,
+			});
+			expect(byModel["claude-opus-4"]).toEqual({
+				model: "claude-opus-4",
+				requestCount: 0,
+				inputTokens: 7,
+				cacheReadInputTokens: 2,
+				cacheCreationInputTokens: 1,
+				outputTokens: 3,
+			});
+		});
+
+		it("merges into an existing executor line for the same model without adding a request", async () => {
+			seed(db, { id: "x1", timestamp: 1000, model: "claude-opus-4" });
+			seedAdvisor("a1", [OPUS_ADVISOR]);
+
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			const opus = rows.find((r) => r.model === "claude-opus-4");
+			expect(opus).toEqual({
+				model: "claude-opus-4",
+				requestCount: 1,
+				inputTokens: 107,
+				cacheReadInputTokens: 12,
+				cacheCreationInputTokens: 6,
+				outputTokens: 53,
+			});
+		});
+
+		it("credits each advisor model in one request to its own line", async () => {
+			seedAdvisor("a1", [
+				OPUS_ADVISOR,
+				{
+					model: "claude-haiku-4",
+					inputTokens: 4,
+					outputTokens: 6,
+					cacheReadInputTokens: 0,
+					cacheCreationInputTokens: 8,
+				},
+			]);
+			seedAdvisor("a2", [OPUS_ADVISOR]);
+
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			const byModel = Object.fromEntries(rows.map((r) => [r.model, r]));
+			expect(byModel["claude-opus-4"]).toEqual({
+				model: "claude-opus-4",
+				requestCount: 0,
+				inputTokens: 14,
+				cacheReadInputTokens: 4,
+				cacheCreationInputTokens: 2,
+				outputTokens: 6,
+			});
+			expect(byModel["claude-haiku-4"]).toEqual({
+				model: "claude-haiku-4",
+				requestCount: 0,
+				inputTokens: 4,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 8,
+				outputTokens: 6,
+			});
+		});
+
+		it("counts a model-less advisor entry on the empty-model line rather than dropping it", async () => {
+			seedAdvisor("a1", [{ ...OPUS_ADVISOR, model: null }]);
+
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			expect(rows.find((r) => r.model === "")).toEqual({
+				model: "",
+				requestCount: 0,
+				inputTokens: 7,
+				cacheReadInputTokens: 2,
+				cacheCreationInputTokens: 1,
+				outputTokens: 3,
+			});
+		});
+
+		it("skips malformed advisor_usage, keeps valid entries beside it, and warns with the request ids", async () => {
+			seedAdvisor("a1", "not json");
+			seedAdvisor("a2", { model: "claude-opus-4", outputTokens: 3 });
+			seedAdvisor("a3", [null, "claude-opus-4"]);
+			seedAdvisor("a4", [
+				OPUS_ADVISOR,
+				{ ...OPUS_ADVISOR, model: 123 },
+				{ ...OPUS_ADVISOR, outputTokens: "9", inputTokens: -4 },
+			]);
+			seedAdvisor("a5", [OPUS_ADVISOR]);
+			const warnings: Array<{ level: string; data?: unknown }> = [];
+			const onLog = (event: { level: string; data?: unknown }) => {
+				if (event.level === "WARN") warnings.push(event);
+			};
+			logBus.on("log", onLog);
+			const rows = await repo
+				.aggregateTokensByModel("acc1", 0, 5000)
+				.finally(() => logBus.off("log", onLog));
+
+			const byModel = Object.fromEntries(rows.map((r) => [r.model, r]));
+			expect(byModel["claude-sonnet-5"]?.requestCount).toBe(5);
+			// a4's valid entry and the readable fields of its partly bad entry
+			// still count; a5 is untouched.
+			expect(byModel["claude-opus-4"]).toEqual({
+				model: "claude-opus-4",
+				requestCount: 0,
+				inputTokens: 7 + 7,
+				cacheReadInputTokens: 2 + 2 + 2,
+				cacheCreationInputTokens: 1 + 1 + 1,
+				outputTokens: 3 + 3,
+			});
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]?.data).toEqual({
+				accountId: "acc1",
+				count: 4,
+				requestIds: expect.arrayContaining(["a1", "a2", "a3", "a4"]),
+			});
+		});
+
+		it("leaves output identical when no row carries advisor data", async () => {
+			seed(db, { id: "r1", timestamp: 1000 });
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			expect(rows).toEqual([
+				{
+					model: "claude-sonnet-5",
+					requestCount: 1,
+					inputTokens: 100,
+					cacheReadInputTokens: 10,
+					cacheCreationInputTokens: 5,
+					outputTokens: 50,
+				},
+			]);
+		});
+
+		it("excludes advisor tokens on non-plan rows", async () => {
+			seedAdvisor("a1", [OPUS_ADVISOR], { billingType: "api" });
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			expect(rows).toEqual([]);
+		});
+	});
+
+	describe("advisor persistence via save()", () => {
+		const base = {
+			id: "s1",
+			method: "POST",
+			path: "/v1/messages",
+			accountUsed: "acc1",
+			statusCode: 200,
+			success: true,
+			errorMessage: null,
+			responseTime: 10,
+			failoverAttempts: 0,
+		};
+		const advisorUsage = [
+			{
+				model: "claude-opus-4",
+				inputTokens: 11,
+				outputTokens: 22,
+				cacheReadInputTokens: 33,
+				cacheCreationInputTokens: 44,
+			},
+			{
+				model: null,
+				inputTokens: 1,
+				outputTokens: 2,
+				cacheReadInputTokens: 3,
+				cacheCreationInputTokens: 4,
+			},
+		];
+
+		it("stores per-model advisor usage that the window aggregate reads back", async () => {
+			await repo.save({
+				...base,
+				billingType: "plan",
+				usage: {
+					model: "claude-sonnet-5",
+					inputTokens: 1,
+					outputTokens: 2,
+					advisorUsage,
+				},
+			});
+			const row = db
+				.query<{ advisor_usage: string }, []>(
+					"SELECT advisor_usage FROM requests WHERE id = 's1'",
+				)
+				.get();
+			expect(JSON.parse(row?.advisor_usage ?? "null")).toEqual(advisorUsage);
+
+			const rows = await repo.aggregateTokensByModel(
+				"acc1",
+				0,
+				Number.MAX_SAFE_INTEGER,
+			);
+			const byModel = Object.fromEntries(rows.map((r) => [r.model, r]));
+			expect(byModel["claude-opus-4"]).toEqual({
+				model: "claude-opus-4",
+				requestCount: 0,
+				inputTokens: 11,
+				cacheReadInputTokens: 33,
+				cacheCreationInputTokens: 44,
+				outputTokens: 22,
+			});
+			expect(byModel[""]).toEqual({
+				model: "",
+				requestCount: 0,
+				inputTokens: 1,
+				cacheReadInputTokens: 3,
+				cacheCreationInputTokens: 4,
+				outputTokens: 2,
+			});
+		});
+
+		it("stores null when the request has no advisor usage", async () => {
+			for (const [id, usage] of [
+				["s2", { model: "claude-sonnet-5", inputTokens: 1 }],
+				["s3", { model: "claude-sonnet-5", inputTokens: 1, advisorUsage: [] }],
+			] as const) {
+				await repo.save({ ...base, id, usage: { ...usage } });
+				const row = db
+					.query<{ advisor_usage: string | null }, [string]>(
+						"SELECT advisor_usage FROM requests WHERE id = ?",
+					)
+					.get(id);
+				expect(row).toEqual({ advisor_usage: null });
+			}
+		});
 	});
 });

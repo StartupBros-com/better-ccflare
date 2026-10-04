@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	createNativeAnthropicToolRoutingError,
 	createServerToolRoutingErrorResponse,
 	ServerToolRoutingError,
 } from "./server-tool-routing-errors";
@@ -41,6 +42,18 @@ describe("server-tool routing errors", () => {
 			"server_tool_replay_unavailable",
 		],
 		["temporary_unavailable", 503, "service_unavailable", "route_unavailable"],
+		[
+			"advisor_declaration_unavailable",
+			400,
+			"invalid_request_error",
+			"server_tool_advisor_declaration_unavailable",
+		],
+		[
+			"advisor_history_unavailable",
+			400,
+			"invalid_request_error",
+			"server_tool_advisor_history_unavailable",
+		],
 	] as const)("serializes %s as one stable Anthropic-compatible local error", async (reason, status, type, code) => {
 		const error = new ServerToolRoutingError({
 			reason,
@@ -130,6 +143,8 @@ describe("server-tool routing errors", () => {
 		"no_implementation",
 		"replay_unavailable",
 		"forced_incapable",
+		"advisor_declaration_unavailable",
+		"advisor_history_unavailable",
 	] as const)("never marks semantic outcome %s as finitely recoverable", (reason) => {
 		const response = createServerToolRoutingErrorResponse(
 			new ServerToolRoutingError({
@@ -144,5 +159,74 @@ describe("server-tool routing errors", () => {
 		expect(response.headers.has("x-better-ccflare-pool-status")).toBeFalse();
 		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBeFalse();
 		expect(response.headers.has("retry-after")).toBeFalse();
+	});
+
+	it.each([
+		[
+			"a declared advisor",
+			{
+				declaredToolTypes: ["advisor_20260301"],
+				unknownDeclaredTypes: [],
+				hasHistory: false,
+			},
+			"advisor_declaration_unavailable",
+			"the advisor tool is not available",
+			"Requested server tool(s): advisor_20260301.",
+		],
+		[
+			"a declared advisor with history",
+			{
+				declaredToolTypes: ["advisor_20260301"],
+				unknownDeclaredTypes: [],
+				hasHistory: true,
+			},
+			"advisor_declaration_unavailable",
+			"the advisor tool is not available",
+			"Requested server tool(s): advisor_20260301.",
+		],
+		[
+			"an unknown advisor type",
+			{
+				declaredToolTypes: [],
+				unknownDeclaredTypes: ["advisor_20270101"],
+				hasHistory: false,
+			},
+			"advisor_declaration_unavailable",
+			"the advisor tool is not available",
+			"Requested server tool(s): advisor_20270101.",
+		],
+		[
+			"history only",
+			{
+				declaredToolTypes: [],
+				unknownDeclaredTypes: [],
+				hasHistory: true,
+			},
+			"advisor_history_unavailable",
+			"Advisor tool result content could not be processed",
+			undefined,
+		],
+	] as const)("builds the recoverable refusal for %s", async (_name, requirement, reason, phrase, suffix) => {
+		const error = createNativeAnthropicToolRoutingError(requirement);
+		const response = createServerToolRoutingErrorResponse(error);
+		const body = (await response.json()) as { error: { message: string } };
+
+		expect(error.reason).toBe(reason);
+		expect(response.status).toBe(400);
+		expect(body.error.message).toContain(phrase);
+		if (suffix) expect(body.error.message).toContain(suffix);
+		expect(body.error.message).not.toContain(
+			"not available for this organization",
+		);
+		expect(body.error.message).not.toContain("Input tag");
+	});
+
+	it("keeps the declaration phrase out of the history-only refusal", () => {
+		const error = createNativeAnthropicToolRoutingError({
+			declaredToolTypes: [],
+			unknownDeclaredTypes: [],
+			hasHistory: true,
+		});
+		expect(error.message).not.toContain("the advisor tool is not available");
 	});
 });

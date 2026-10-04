@@ -493,6 +493,7 @@ export function ensureSchema(db: Database): void {
 			account_generation BIGINT,
 			cache_health_native INTEGER,
 			internal_origin INTEGER,
+			advisor_usage TEXT,
  quality_decision TEXT,
  routing_attempt_summary TEXT,
 			client_session_id TEXT,
@@ -1574,6 +1575,7 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		["account_generation", "BIGINT"],
 		["cache_health_native", "INTEGER"],
 		["internal_origin", "INTEGER"],
+		["advisor_usage", "TEXT"],
 		["quality_decision", "TEXT"],
 		["routing_attempt_summary", "TEXT"],
 	]) {

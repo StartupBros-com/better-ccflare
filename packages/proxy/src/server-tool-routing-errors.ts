@@ -1,4 +1,7 @@
-import type { ServerToolRoutingCapabilitySummary } from "@better-ccflare/types";
+import type {
+	NativeAnthropicToolRequirement,
+	ServerToolRoutingCapabilitySummary,
+} from "@better-ccflare/types";
 
 export type ServerToolRoutingErrorReason =
 	| "invalid_requirement"
@@ -6,7 +9,9 @@ export type ServerToolRoutingErrorReason =
 	| "no_implementation"
 	| "replay_unavailable"
 	| "temporary_unavailable"
-	| "forced_incapable";
+	| "forced_incapable"
+	| "advisor_declaration_unavailable"
+	| "advisor_history_unavailable";
 
 export type ServerToolCandidateCapabilityFailureReason =
 	| "candidate_binding_missing"
@@ -66,6 +71,24 @@ const ERROR_SPEC = Object.freeze({
 		code: "server_tool_force_route_unavailable",
 		message:
 			"The force-routed account cannot satisfy the requested server-tool semantics.",
+	}),
+	// Claude Code recovers from these 400s by dropping advisor and retrying, so
+	// each message carries the substring its recovery matcher looks for. They must
+	// not contain "not available for this organization" or "Input tag": those
+	// widen Claude Code's drop to the whole process or host.
+	advisor_declaration_unavailable: Object.freeze({
+		status: 400,
+		type: "invalid_request_error",
+		code: "server_tool_advisor_declaration_unavailable",
+		message:
+			"No route for this request can run advisor: the advisor tool is not available here.",
+	}),
+	advisor_history_unavailable: Object.freeze({
+		status: 400,
+		type: "invalid_request_error",
+		code: "server_tool_advisor_history_unavailable",
+		message:
+			"Advisor tool result content could not be processed by this route.",
 	}),
 } as const satisfies Record<
 	ServerToolRoutingErrorReason,
@@ -127,6 +150,27 @@ export class ServerToolRoutingError extends Error {
 		);
 		this.requestedToolTypes = requestedToolTypes;
 	}
+}
+
+/**
+ * The one refusal every advisor conflict site uses. A declared or unknown
+ * advisor type selects the declaration reason; history alone selects the
+ * history reason, so Claude Code strips only what it must.
+ */
+export function createNativeAnthropicToolRoutingError(
+	requirement: NativeAnthropicToolRequirement,
+): ServerToolRoutingError {
+	const declared = [
+		...requirement.declaredToolTypes,
+		...requirement.unknownDeclaredTypes,
+	];
+	if (declared.length > 0) {
+		return new ServerToolRoutingError({
+			reason: "advisor_declaration_unavailable",
+			requestedToolTypes: declared,
+		});
+	}
+	return new ServerToolRoutingError({ reason: "advisor_history_unavailable" });
 }
 
 /**

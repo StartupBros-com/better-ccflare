@@ -67,6 +67,7 @@ export function createRequestMetadata(
 		path: url.pathname,
 		timestamp: Date.now(),
 		headers: req.headers,
+		nativeAnthropicToolRequirement: null,
 	};
 }
 

@@ -6,6 +6,7 @@ import {
 	getModelFamily,
 	getModelList,
 	getOverloadRetryConfig,
+	isFirstPartyAnthropicAccount,
 	isOfficialXaiEndpoint,
 	isUsageExhausted,
 	logError,
@@ -2642,6 +2643,25 @@ export async function proxyWithAccount(
 	/** Refresh credential snapshot carried into the bounded same-account retry. */
 	staleTokenRefreshTokenAtStart?: string | null,
 ): Promise<ProxyWithAccountResult> {
+	// Dispatch backstop (KTD7): only api.anthropic.com executes the advisor tool,
+	// so a native-Anthropic requirement never leaves a first-party account. Every
+	// caller (main loop, deferred routes, native-quota queue, fallback waves,
+	// Auto) treats this candidate error as a skip. Reaching it means a selection
+	// site missed, hence error level. Runs before any refresh, transform or fetch.
+	if (
+		requestMeta.nativeAnthropicToolRequirement &&
+		!isFirstPartyAnthropicAccount(account)
+	) {
+		log.error(
+			`Advisor dispatch backstop: refusing non-first-party account ${account.id} (${account.provider}) for a native Anthropic tool requirement; a selection site missed it`,
+		);
+		throw new ServerToolCandidateCapabilityError({
+			accountId: account.id,
+			candidateId:
+				modelFallbackPolicy?.routeCandidateId ?? `account:${account.id}`,
+			reason: "provider_unavailable",
+		});
+	}
 	// Snapshot before any credential lookup. A recursive stale-token retry carries
 	// its original identity; an initial request captures the generation that was
 	// present before getValidAccessToken can await or mutate shared state. A later

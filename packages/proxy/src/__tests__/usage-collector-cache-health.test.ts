@@ -502,6 +502,50 @@ it("does not let a client format header reclassify a transformed Anthropic strea
 	expect(buckets[0]).toMatchObject({ eligible: 1, measured: 1, failed: 0 });
 });
 
+it("computes the cache outcome and token columns from executor tokens only when an advisor iteration is present", async () => {
+	const { row, buckets } = await forwardAccountingFixture({
+		body: JSON.stringify({
+			model: "served",
+			usage: {
+				input_tokens: 1_000,
+				cache_read_input_tokens: 9_000,
+				output_tokens: 10,
+				iterations: [
+					{
+						type: "message",
+						model: "served",
+						input_tokens: 1_000,
+						cache_read_input_tokens: 9_000,
+						output_tokens: 10,
+					},
+					{
+						type: "advisor_message",
+						model: "advisor-model",
+						input_tokens: 40_000,
+						cache_read_input_tokens: 0,
+						output_tokens: 700,
+					},
+				],
+			},
+		}),
+	});
+	expect(row).toMatchObject({
+		model: "served",
+		success: 1,
+		input_tokens: 1_000,
+		prompt_tokens: 10_000,
+		cache_read_input_tokens: 9_000,
+		output_tokens: 10,
+	});
+	expect(buckets[0]).toMatchObject({
+		eligible: 1,
+		measured: 1,
+		failed: 0,
+		inputTokens: 1_000,
+		cacheReadTokens: 9_000,
+	});
+});
+
 it("keeps the response model authoritative over non-stream fallback iteration metadata", async () => {
 	const { row, buckets } = await forwardAccountingFixture({
 		body: JSON.stringify({

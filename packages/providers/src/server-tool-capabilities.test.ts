@@ -4,10 +4,12 @@ import type { Account, ServerToolCapabilityTuple } from "@better-ccflare/types";
 import {
 	buildServerToolCapabilityProofKey,
 	buildServerToolCapabilityTupleKey,
+	deriveNativeAnthropicToolRequirement,
 	deriveServerToolRequirement,
 	indexServerToolCapabilityProofs,
 	materializeProviderServerToolCapabilityDecision as materializeDecision,
 	materializeProviderServerToolCapabilityTuple,
+	NATIVE_ANTHROPIC_PASSTHROUGH_TOOL_TYPES,
 	resolveServerToolCapability,
 	type ServerToolCapabilityProof,
 	type ServerToolReplayAtom,
@@ -2810,5 +2812,402 @@ describe("provider-owned server-tool decision materialization", () => {
 			},
 		});
 		expect(() => materializeDecision(provider, requirement, tuple)).toThrow();
+	});
+});
+
+describe("advisor native-Anthropic passthrough tool", () => {
+	const advisorTool = {
+		type: "advisor_20260301",
+		name: "advisor",
+		model: "claude-opus-4-8",
+	};
+	const clientFn = {
+		name: "read_file",
+		description: "read",
+		input_schema: { type: "object", properties: {} },
+	};
+	const advisorUse = {
+		type: "server_tool_use",
+		id: "srvtoolu_1",
+		name: "advisor",
+		input: {},
+	};
+	const resultVariants: Record<string, unknown>[] = [
+		{
+			type: "advisor_tool_result",
+			tool_use_id: "srvtoolu_1",
+			content: { type: "advisor_result", text: "do x" },
+		},
+		{
+			type: "advisor_tool_result",
+			tool_use_id: "srvtoolu_1",
+			content: { type: "advisor_redacted_result", encrypted_content: "abc" },
+		},
+		{
+			type: "advisor_tool_result",
+			tool_use_id: "srvtoolu_1",
+			content: { type: "advisor_tool_result_error", error_code: "overloaded" },
+		},
+	];
+
+	test("allowlist is frozen and contains only advisor_20260301", () => {
+		expect([...NATIVE_ANTHROPIC_PASSTHROUGH_TOOL_TYPES]).toEqual([
+			"advisor_20260301",
+		]);
+		expect(Object.isFrozen(NATIVE_ANTHROPIC_PASSTHROUGH_TOOL_TYPES)).toBe(true);
+	});
+
+	test("advisor tool alone yields no server-tool requirement", () => {
+		expect(
+			deriveServerToolRequirement({ tools: [advisorTool] }),
+		).toBeUndefined();
+	});
+
+	test("advisor plus client functions yields no server-tool requirement", () => {
+		expect(
+			deriveServerToolRequirement({ tools: [clientFn, advisorTool] }),
+		).toBeUndefined();
+	});
+
+	test("advisor plus web_search keeps the web_search requirement and no unsupported", () => {
+		const withAdvisor = deriveServerToolRequirement({
+			tools: [{ type: "web_search_20250305", name: "web_search" }, advisorTool],
+		});
+		const without = deriveServerToolRequirement({
+			tools: [{ type: "web_search_20250305", name: "web_search" }],
+		});
+		expect(withAdvisor?.unsupported).toBeUndefined();
+		expect(withAdvisor).toEqual(without as NonNullable<typeof without>);
+		expect(withAdvisor?.declarations?.length).toBe(1);
+	});
+
+	test("advisor plus code_execution marks only code_execution unsupported", () => {
+		const req = deriveServerToolRequirement({
+			tools: [
+				advisorTool,
+				{ type: "code_execution_20250825", name: "code_execution" },
+			],
+		});
+		expect(req?.unsupported).toEqual([{ type: "code_execution_20250825" }]);
+	});
+
+	test("an unknown advisor-like type is not an unsupported server tool", () => {
+		expect(
+			deriveServerToolRequirement({
+				tools: [{ type: "advisor_20270101", name: "advisor" }],
+			}),
+		).toBeUndefined();
+	});
+
+	for (const [i, result] of resultVariants.entries()) {
+		test(`advisor history variant ${i} creates no replay requirement`, () => {
+			expect(
+				deriveServerToolRequirement({
+					tools: [advisorTool],
+					messages: [
+						{ role: "user", content: "hi" },
+						{ role: "assistant", content: [advisorUse, result] },
+					],
+				}),
+			).toBeUndefined();
+		});
+	}
+
+	test("advisor history without a declared tool creates no requirement", () => {
+		expect(
+			deriveServerToolRequirement({
+				messages: [
+					{ role: "assistant", content: [advisorUse, resultVariants[0]] },
+				],
+			}),
+		).toBeUndefined();
+	});
+
+	test("web_search server_tool_use history still requires native-Anthropic input replay", () => {
+		const req = deriveServerToolRequirement({
+			tools: [advisorTool],
+			messages: [
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "server_tool_use",
+							id: "srvtoolu_2",
+							name: "web_search",
+							input: { query: "q" },
+						},
+					],
+				},
+			],
+		});
+		expect(req?.replay.input).toEqual(["native-Anthropic"]);
+	});
+
+	test("advisor and web_search history together still set native input", () => {
+		const req = deriveServerToolRequirement({
+			messages: [
+				{
+					role: "assistant",
+					content: [
+						advisorUse,
+						{
+							type: "server_tool_use",
+							id: "s3",
+							name: "web_search",
+							input: {},
+						},
+					],
+				},
+			],
+		});
+		expect(req?.replay.input).toEqual(["native-Anthropic"]);
+	});
+
+	describe("deriveNativeAnthropicToolRequirement", () => {
+		test("declared only", () => {
+			const r = deriveNativeAnthropicToolRequirement({ tools: [advisorTool] });
+			expect(r).toEqual({
+				declaredToolTypes: ["advisor_20260301"],
+				unknownDeclaredTypes: [],
+				hasHistory: false,
+			});
+			expect(Object.isFrozen(r)).toBe(true);
+			expect(Object.isFrozen(r?.declaredToolTypes)).toBe(true);
+		});
+
+		test("dedupes repeated declarations", () => {
+			expect(
+				deriveNativeAnthropicToolRequirement({
+					tools: [advisorTool, advisorTool],
+				})?.declaredToolTypes,
+			).toEqual(["advisor_20260301"]);
+		});
+
+		test("history only: server_tool_use advisor", () => {
+			expect(
+				deriveNativeAnthropicToolRequirement({
+					messages: [{ role: "assistant", content: [advisorUse] }],
+				}),
+			).toEqual({
+				declaredToolTypes: [],
+				unknownDeclaredTypes: [],
+				hasHistory: true,
+			});
+		});
+
+		test("history only: advisor_tool_result", () => {
+			expect(
+				deriveNativeAnthropicToolRequirement({
+					messages: [{ role: "user", content: [resultVariants[1]] }],
+				}),
+			).toEqual({
+				declaredToolTypes: [],
+				unknownDeclaredTypes: [],
+				hasHistory: true,
+			});
+		});
+
+		test("both declared and history", () => {
+			expect(
+				deriveNativeAnthropicToolRequirement({
+					tools: [advisorTool],
+					messages: [
+						{ role: "assistant", content: [advisorUse, resultVariants[0]] },
+					],
+				}),
+			).toEqual({
+				declaredToolTypes: ["advisor_20260301"],
+				unknownDeclaredTypes: [],
+				hasHistory: true,
+			});
+		});
+
+		test("neither yields undefined", () => {
+			expect(
+				deriveNativeAnthropicToolRequirement({
+					tools: [clientFn],
+					messages: [{ role: "user", content: "hi" }],
+				}),
+			).toBeUndefined();
+			expect(deriveNativeAnthropicToolRequirement(undefined)).toBeUndefined();
+			expect(deriveNativeAnthropicToolRequirement("x")).toBeUndefined();
+		});
+
+		test("unknown typed tool only yields undefined", () => {
+			expect(
+				deriveNativeAnthropicToolRequirement({
+					tools: [{ type: "code_execution_20250825", name: "code_execution" }],
+				}),
+			).toBeUndefined();
+		});
+
+		test("web_search history is not advisor history", () => {
+			expect(
+				deriveNativeAnthropicToolRequirement({
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{
+									type: "server_tool_use",
+									id: "s",
+									name: "web_search",
+									input: {},
+								},
+							],
+						},
+					],
+				}),
+			).toBeUndefined();
+		});
+
+		test("malformed tools entries are ignored", () => {
+			expect(
+				deriveNativeAnthropicToolRequirement({
+					tools: [null, 7, "x", [], { type: 5 }, { type: null }, advisorTool],
+				}),
+			).toEqual({
+				declaredToolTypes: ["advisor_20260301"],
+				unknownDeclaredTypes: [],
+				hasHistory: false,
+			});
+			expect(
+				deriveNativeAnthropicToolRequirement({ tools: "nope", messages: 5 }),
+			).toBeUndefined();
+		});
+
+		test("records an unknown advisor type apart from the known one", () => {
+			const r = deriveNativeAnthropicToolRequirement({
+				tools: [{ type: "advisor_20270101", name: "advisor" }],
+			});
+			expect(r).toEqual({
+				declaredToolTypes: [],
+				unknownDeclaredTypes: ["advisor_20270101"],
+				hasHistory: false,
+			});
+			expect(Object.isFrozen(r?.unknownDeclaredTypes)).toBe(true);
+		});
+
+		test("code_execution stays unsupported next to advisor (R17)", () => {
+			const body = {
+				tools: [advisorTool, { type: "code_execution_20250825", name: "x" }],
+			};
+			expect(deriveServerToolRequirement(body)?.unsupported).toEqual([
+				{ type: "code_execution_20250825" },
+			]);
+			expect(deriveNativeAnthropicToolRequirement(body)).toEqual({
+				declaredToolTypes: ["advisor_20260301"],
+				unknownDeclaredTypes: [],
+				hasHistory: false,
+			});
+		});
+
+		test("advisor plus web_search yields both requirements", () => {
+			const body = {
+				tools: [
+					{ type: "web_search_20250305", name: "web_search" },
+					advisorTool,
+				],
+			};
+			expect(deriveServerToolRequirement(body)?.declarations?.length).toBe(1);
+			expect(
+				deriveNativeAnthropicToolRequirement(body)?.declaredToolTypes,
+			).toEqual(["advisor_20260301"]);
+		});
+
+		test("advisor plus a client function yields the native requirement", () => {
+			const body = { tools: [clientFn, advisorTool] };
+			expect(deriveServerToolRequirement(body)).toBeUndefined();
+			expect(deriveNativeAnthropicToolRequirement(body)?.hasHistory).toBe(
+				false,
+			);
+		});
+
+		test("a dangling advisor server_tool_use (pause_turn resume) is history", () => {
+			expect(
+				deriveNativeAnthropicToolRequirement({
+					tools: [advisorTool],
+					messages: [{ role: "assistant", content: [advisorUse] }],
+				})?.hasHistory,
+			).toBe(true);
+		});
+
+		test("each advisor result variant is history", () => {
+			for (const result of resultVariants) {
+				expect(
+					deriveNativeAnthropicToolRequirement({
+						messages: [{ role: "user", content: [result] }],
+					})?.hasHistory,
+				).toBe(true);
+			}
+		});
+
+		test("advisor history beyond the replay scan message visit cap is still detected", () => {
+			const filler = Array.from({ length: 4_096 }, () => ({
+				role: "user",
+				content: "x",
+			}));
+			const r = deriveNativeAnthropicToolRequirement({
+				tools: [advisorTool],
+				messages: [...filler, { role: "assistant", content: [advisorUse] }],
+			});
+			expect(r?.hasHistory).toBe(true);
+		});
+
+		test("advisor history beyond the replay scan block visit cap is still detected", () => {
+			const blocks = Array.from({ length: 16_385 }, () => ({
+				type: "text",
+				text: "x",
+			}));
+			const r = deriveNativeAnthropicToolRequirement({
+				messages: [{ role: "assistant", content: [...blocks, advisorUse] }],
+			});
+			expect(r?.hasHistory).toBe(true);
+		});
+
+		test("a long conversation with no advisor content is not advisor-bound", () => {
+			const messages = Array.from({ length: 5_000 }, () => ({
+				role: "user",
+				content: [{ type: "text", text: "x" }],
+			}));
+			expect(
+				deriveNativeAnthropicToolRequirement({ messages }),
+			).toBeUndefined();
+			expect(
+				deriveNativeAnthropicToolRequirement({
+					tools: [
+						clientFn,
+						{ type: "web_search_20250305", name: "web_search" },
+					],
+					messages,
+				}),
+			).toBeUndefined();
+		});
+
+		test("a conversation with a huge block count and no advisor content is not advisor-bound", () => {
+			const blocks = Array.from({ length: 17_000 }, () => ({
+				type: "text",
+				text: "x",
+			}));
+			const messages = [{ role: "assistant", content: blocks }];
+			expect(
+				deriveNativeAnthropicToolRequirement({ messages }),
+			).toBeUndefined();
+			expect(
+				deriveNativeAnthropicToolRequirement({ tools: [clientFn], messages }),
+			).toBeUndefined();
+		});
+
+		test("unknown advisor_* types that normalize to the same value are recorded once", () => {
+			const long1 = `advisor_${"a".repeat(200)}`;
+			const long2 = `advisor_${"b".repeat(200)}`;
+			const r = deriveNativeAnthropicToolRequirement({
+				tools: [
+					{ type: long1, name: "advisor" },
+					{ type: long2, name: "advisor" },
+				],
+			});
+			expect(r?.unknownDeclaredTypes).toHaveLength(1);
+		});
 	});
 });

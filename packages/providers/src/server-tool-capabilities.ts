@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type {
 	Account,
 	ApproximateUserLocation,
+	NativeAnthropicToolRequirement,
 	ServerToolCapabilityDecision,
 	ServerToolCapabilityProof,
 	ServerToolCapabilityProofIndex,
@@ -24,6 +25,7 @@ import type {
 
 export type {
 	ApproximateUserLocation,
+	NativeAnthropicToolRequirement,
 	ServerToolCapabilityDecision,
 	ServerToolCapabilityProof,
 	ServerToolCapabilityProofIndex,
@@ -39,6 +41,13 @@ export type {
 
 const EXACT_WEB_SEARCH_TYPE = "web_search_20250305" as const;
 const REQUIREMENT_REVISION = 2 as const;
+/** Typed tools that only native Anthropic accounts serve; never proxy-owned. */
+export const NATIVE_ANTHROPIC_PASSTHROUGH_TOOL_TYPES: readonly string[] =
+	Object.freeze(["advisor_20260301"]);
+/** Server-tool name used by advisor server_tool_use history blocks. */
+export const ADVISOR_SERVER_TOOL_NAME = "advisor" as const;
+const ADVISOR_TOOL_TYPE_PREFIX = "advisor_" as const;
+const ADVISOR_RESULT_BLOCK_TYPE = "advisor_tool_result" as const;
 const MAX_DOMAINS = 10;
 const MAX_DOMAIN_LENGTH = 8 * 1024;
 const MAX_LOCATION_VALUE_LENGTH = 256;
@@ -371,7 +380,12 @@ function scanHistoricalReplay(
 					}
 					historyBlockVisits += 1;
 					if (!isRecord(block)) continue;
-					if (block.type === "server_tool_use") hasNativeInput = true;
+					if (
+						block.type === "server_tool_use" &&
+						block.name !== ADVISOR_SERVER_TOOL_NAME
+					) {
+						hasNativeInput = true;
+					}
 					if (block.type === "web_search_tool_result") {
 						let classifiedOpaqueReplay = false;
 						const resultContent = block.content;
@@ -437,6 +451,65 @@ function scanHistoricalReplay(
 	return Object.freeze({ input, output, requiresOutputReplay });
 }
 
+/**
+ * Derives the native-passthrough requirement for advisor: the declared tool
+ * and/or advisor blocks in history. The history walk is exact and uncapped: it
+ * visits every message and every top-level content block (reading only `type`
+ * and `name`) and stops at the first advisor block. The body is already fully
+ * parsed and bounded by the front guard's size limit. A capped scan cannot
+ * fail closed here: it would mark every long conversation advisor-bound, and
+ * since scanHistoricalReplay also fails closed on truncation (a hosted
+ * requirement), the advisor-beside-hosted gate would refuse that conversation
+ * on every route with no recoverable history to strip.
+ * Unknown `advisor_*` declarations are recorded, not treated as unsupported
+ * server tools, so the caller can refuse them with the declaration error.
+ */
+export function deriveNativeAnthropicToolRequirement(
+	body: unknown,
+): NativeAnthropicToolRequirement | undefined {
+	if (!isRecord(body)) return undefined;
+	const declared: string[] = [];
+	const unknown: string[] = [];
+	if (Array.isArray(body.tools)) {
+		for (const tool of body.tools) {
+			if (!isRecord(tool) || typeof tool.type !== "string") continue;
+			if (NATIVE_ANTHROPIC_PASSTHROUGH_TOOL_TYPES.includes(tool.type)) {
+				if (!declared.includes(tool.type)) declared.push(tool.type);
+			} else if (tool.type.startsWith(ADVISOR_TOOL_TYPE_PREFIX)) {
+				const retained = normalizeRetainedToolType(tool.type);
+				if (!unknown.includes(retained)) unknown.push(retained);
+			}
+		}
+	}
+
+	let hasHistory = false;
+	if (Array.isArray(body.messages)) {
+		outer: for (const message of body.messages) {
+			if (!isRecord(message) || !Array.isArray(message.content)) continue;
+			for (const block of message.content) {
+				if (!isRecord(block)) continue;
+				if (
+					block.type === ADVISOR_RESULT_BLOCK_TYPE ||
+					(block.type === "server_tool_use" &&
+						block.name === ADVISOR_SERVER_TOOL_NAME)
+				) {
+					hasHistory = true;
+					break outer;
+				}
+			}
+		}
+	}
+
+	if (declared.length === 0 && unknown.length === 0 && !hasHistory) {
+		return undefined;
+	}
+	return Object.freeze({
+		declaredToolTypes: Object.freeze(declared),
+		unknownDeclaredTypes: Object.freeze(unknown),
+		hasHistory,
+	});
+}
+
 export function deriveServerToolRequirement(
 	body: unknown,
 	options: DeriveServerToolRequirementOptions = {},
@@ -477,6 +550,13 @@ export function deriveServerToolRequirement(
 						Object.freeze({ type: UNKNOWN_TYPED_TOOL }),
 					);
 				}
+				continue;
+			}
+
+			if (
+				NATIVE_ANTHROPIC_PASSTHROUGH_TOOL_TYPES.includes(tool.type) ||
+				tool.type.startsWith(ADVISOR_TOOL_TYPE_PREFIX)
+			) {
 				continue;
 			}
 

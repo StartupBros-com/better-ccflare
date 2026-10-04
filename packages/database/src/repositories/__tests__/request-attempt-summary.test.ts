@@ -197,7 +197,16 @@ test("PostgreSQL fresh/upgrade schema and adapter writes preserve the bounded fi
 		routingAttemptSummary: summary,
 	});
 	const write = lastWrite as unknown as { sql: string; params: unknown[] };
-	expect(JSON.parse(write.params.at(-1) as string)).toEqual(summary);
+	// Bind by column position, not "last param": later columns follow it.
+	const insertColumns = (
+		write.sql.match(/INSERT INTO requests \(([^)]*)\)/)?.[1] ?? ""
+	)
+		.split(",")
+		.map((column) => column.trim());
+	const summaryIndex = insertColumns.indexOf("routing_attempt_summary");
+	expect(summaryIndex).toBeGreaterThanOrEqual(0);
+	expect(insertColumns).toHaveLength(write.params.length);
+	expect(JSON.parse(write.params[summaryIndex] as string)).toEqual(summary);
 	expect(write.sql).toContain(
 		"routing_attempt_summary = COALESCE(requests.routing_attempt_summary, EXCLUDED.routing_attempt_summary)",
 	);

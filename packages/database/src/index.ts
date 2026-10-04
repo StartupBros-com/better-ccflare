@@ -92,6 +92,7 @@ export {
 	type QualitySettlement,
 	type QualityTrustedChild,
 } from "./repositories/quality-route.repository";
+export type { AdvisorModelUsage } from "./repositories/request.repository";
 export {
 	ROUTING_ATTEMPT_SUMMARY_WINDOWS,
 	type RoutingAttemptData,
