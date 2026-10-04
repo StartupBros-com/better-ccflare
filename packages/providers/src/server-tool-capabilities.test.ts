@@ -3142,7 +3142,7 @@ describe("advisor native-Anthropic passthrough tool", () => {
 			}
 		});
 
-		test("advisor history past the message visit cap fails closed", () => {
+		test("advisor history beyond the replay scan message visit cap is still detected", () => {
 			const filler = Array.from({ length: 4_096 }, () => ({
 				role: "user",
 				content: "x",
@@ -3154,7 +3154,7 @@ describe("advisor native-Anthropic passthrough tool", () => {
 			expect(r?.hasHistory).toBe(true);
 		});
 
-		test("advisor history past the block visit cap fails closed", () => {
+		test("advisor history beyond the replay scan block visit cap is still detected", () => {
 			const blocks = Array.from({ length: 16_385 }, () => ({
 				type: "text",
 				text: "x",
@@ -3163,6 +3163,51 @@ describe("advisor native-Anthropic passthrough tool", () => {
 				messages: [{ role: "assistant", content: [...blocks, advisorUse] }],
 			});
 			expect(r?.hasHistory).toBe(true);
+		});
+
+		test("a long conversation with no advisor content is not advisor-bound", () => {
+			const messages = Array.from({ length: 5_000 }, () => ({
+				role: "user",
+				content: [{ type: "text", text: "x" }],
+			}));
+			expect(
+				deriveNativeAnthropicToolRequirement({ messages }),
+			).toBeUndefined();
+			expect(
+				deriveNativeAnthropicToolRequirement({
+					tools: [
+						clientFn,
+						{ type: "web_search_20250305", name: "web_search" },
+					],
+					messages,
+				}),
+			).toBeUndefined();
+		});
+
+		test("a conversation with a huge block count and no advisor content is not advisor-bound", () => {
+			const blocks = Array.from({ length: 17_000 }, () => ({
+				type: "text",
+				text: "x",
+			}));
+			const messages = [{ role: "assistant", content: blocks }];
+			expect(
+				deriveNativeAnthropicToolRequirement({ messages }),
+			).toBeUndefined();
+			expect(
+				deriveNativeAnthropicToolRequirement({ tools: [clientFn], messages }),
+			).toBeUndefined();
+		});
+
+		test("unknown advisor_* types that normalize to the same value are recorded once", () => {
+			const long1 = `advisor_${"a".repeat(200)}`;
+			const long2 = `advisor_${"b".repeat(200)}`;
+			const r = deriveNativeAnthropicToolRequirement({
+				tools: [
+					{ type: long1, name: "advisor" },
+					{ type: long2, name: "advisor" },
+				],
+			});
+			expect(r?.unknownDeclaredTypes).toHaveLength(1);
 		});
 	});
 });

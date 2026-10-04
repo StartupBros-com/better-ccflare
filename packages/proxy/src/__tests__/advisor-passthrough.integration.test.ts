@@ -460,3 +460,81 @@ describe("advisor upstream error handling on a first-party account", () => {
 		);
 	});
 });
+
+// A conversation past the hosted replay scan's visit caps gets a hosted replay
+// requirement from main's scanHistoricalReplay (it fails closed on truncation),
+// and the Anthropic provider owns no hosted server-tool capability, so main
+// refuses it with server_tool_capability_unavailable on every route. That is
+// main behavior (R16). The advisor gate must not add its own refusal on top: a
+// refusal carrying the advisor history text sends Claude Code into a strip and
+// retry loop for history that does not exist.
+describe("long conversations without advisor content (R16)", () => {
+	const LONG_COUNT = 4_200;
+	const ADVISOR_PHRASES = [
+		"the advisor tool is not available",
+		"Advisor tool result content could not be processed",
+	];
+	const plain = () =>
+		Array.from({ length: LONG_COUNT }, (_, i) => ({
+			role: i % 2 === 0 ? "user" : "assistant",
+			content: "x",
+		}));
+	const longRequest = (messages: unknown[]) =>
+		new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+				authorization: "Bearer advisor-test-client",
+				"x-claude-code-session-id": "advisor-long-session",
+			},
+			body: JSON.stringify({ model: MODEL, max_tokens: 32, messages }),
+		});
+	async function send(messages: unknown[]) {
+		const { ctx } = makeContext([makeAccount()]);
+		const calls = installFetch(() => jsonOk());
+		const request = longRequest(messages);
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			ctx,
+			"key-1",
+		);
+		const text = await response.text();
+		return { calls, status: response.status, text };
+	}
+
+	it("does not attach the advisor history refusal to a plain long conversation", async () => {
+		const { calls, status, text } = await send(plain());
+		for (const phrase of ADVISOR_PHRASES) expect(text).not.toContain(phrase);
+		expect(JSON.parse(text).error.code).toBe(
+			"server_tool_capability_unavailable",
+		);
+		expect(status).toBe(400);
+		expect(calls).toHaveLength(0);
+	});
+
+	it("refuses long advisor history with the recoverable text, and stripping it removes the advisor refusal", async () => {
+		const withHistory = await send([
+			...plain(),
+			...ADVISOR_HISTORY_MESSAGES.slice(1),
+		]);
+		expect(withHistory.status).toBe(400);
+		expect(withHistory.text).toContain(
+			"Advisor tool result content could not be processed",
+		);
+		expect(withHistory.calls).toHaveLength(0);
+
+		// Claude Code strips the advisor blocks and retries: the retry must not hit
+		// the advisor refusal again (it reaches main's own long-conversation
+		// behavior instead of looping).
+		const stripped = await send([
+			...plain(),
+			{ role: "assistant", content: [{ type: "text", text: "ok" }] },
+			{ role: "user", content: "thanks, continue" },
+		]);
+		for (const phrase of ADVISOR_PHRASES) {
+			expect(stripped.text).not.toContain(phrase);
+		}
+	});
+});

@@ -453,8 +453,14 @@ function scanHistoricalReplay(
 
 /**
  * Derives the native-passthrough requirement for advisor: the declared tool
- * and/or advisor blocks in history. Traversal uses the same caps as
- * scanHistoricalReplay and fails closed (hasHistory) when they are hit.
+ * and/or advisor blocks in history. The history walk is exact and uncapped: it
+ * visits every message and every top-level content block (reading only `type`
+ * and `name`) and stops at the first advisor block. The body is already fully
+ * parsed and bounded by the front guard's size limit. A capped scan cannot
+ * fail closed here: it would mark every long conversation advisor-bound, and
+ * since scanHistoricalReplay also fails closed on truncation (a hosted
+ * requirement), the advisor-beside-hosted gate would refuse that conversation
+ * on every route with no recoverable history to strip.
  * Unknown `advisor_*` declarations are recorded, not treated as unsupported
  * server tools, so the caller can refuse them with the declaration error.
  */
@@ -469,32 +475,18 @@ export function deriveNativeAnthropicToolRequirement(
 			if (!isRecord(tool) || typeof tool.type !== "string") continue;
 			if (NATIVE_ANTHROPIC_PASSTHROUGH_TOOL_TYPES.includes(tool.type)) {
 				if (!declared.includes(tool.type)) declared.push(tool.type);
-			} else if (
-				tool.type.startsWith(ADVISOR_TOOL_TYPE_PREFIX) &&
-				!unknown.includes(tool.type)
-			) {
-				unknown.push(normalizeRetainedToolType(tool.type));
+			} else if (tool.type.startsWith(ADVISOR_TOOL_TYPE_PREFIX)) {
+				const retained = normalizeRetainedToolType(tool.type);
+				if (!unknown.includes(retained)) unknown.push(retained);
 			}
 		}
 	}
 
 	let hasHistory = false;
-	let messageVisits = 0;
-	let blockVisits = 0;
 	if (Array.isArray(body.messages)) {
 		outer: for (const message of body.messages) {
-			if (messageVisits >= MAX_HISTORY_MESSAGE_VISITS) {
-				hasHistory = true;
-				break;
-			}
-			messageVisits += 1;
 			if (!isRecord(message) || !Array.isArray(message.content)) continue;
 			for (const block of message.content) {
-				if (blockVisits >= MAX_HISTORY_BLOCK_VISITS) {
-					hasHistory = true;
-					break outer;
-				}
-				blockVisits += 1;
 				if (!isRecord(block)) continue;
 				if (
 					block.type === ADVISOR_RESULT_BLOCK_TYPE ||
