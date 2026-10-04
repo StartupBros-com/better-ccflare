@@ -43,6 +43,7 @@ import {
 	surfaceQualityReason,
 } from "../quality-route-candidates";
 import { QualityRouteService } from "../quality-route-service";
+import { ServerToolCandidateCapabilityError } from "../server-tool-routing-errors";
 import * as collectors from "../usage-collector";
 
 const scope: QualityVerifiedSession = {
@@ -2611,6 +2612,10 @@ describe("prewarmed native catalogs", () => {
 		expect((await service.status(scope))?.preference).toBe("auto");
 	});
 	it("unsupported hosted work remains typed unavailable rather than bypassing accounting", async () => {
+		// A custom-endpoint Anthropic account is not first-party, so it has no
+		// native web_search lane and no hosted tuple: nothing may be sent.
+		for (const a of accounts)
+			a.custom_endpoint = "https://relay.example.invalid";
 		const response = await send(
 			request(
 				undefined,
@@ -2624,6 +2629,80 @@ describe("prewarmed native catalogs", () => {
 		).toBe("quality_route_unavailable");
 		expect(sends).toHaveLength(0);
 		expect(await home()).toBeUndefined();
+	});
+	describe("native web_search on first-party Anthropic targets", () => {
+		const searchTool = {
+			type: "web_search_20250305",
+			name: "web_search",
+			max_uses: 8,
+			search_profile: "fast",
+		};
+		it("dispatches the tool object intact with exactly one send", async () => {
+			const response = await send(
+				request(undefined, {}, { tools: [searchTool] }),
+			);
+			expect(response.status).toBe(200);
+			await response.text();
+			expect(sends).toHaveLength(1);
+			expect(envelopes[0]?.tools).toEqual([searchTool]);
+		});
+		it("demotes the forced web_search choice for a model that rejects forced choice", async () => {
+			const response = await send(
+				request(
+					undefined,
+					{},
+					{
+						tools: [searchTool],
+						tool_choice: { type: "tool", name: "web_search" },
+					},
+				),
+			);
+			expect(response.status).toBe(200);
+			await response.text();
+			expect(sends).toHaveLength(1);
+			expect(envelopes[0]?.tools).toEqual([searchTool]);
+			expect(envelopes[0]?.tool_choice).toEqual({ type: "auto" });
+		});
+		it("still refuses every other forced choice with zero sends", async () => {
+			const response = await send(
+				request(
+					undefined,
+					{},
+					{ tools: [searchTool], tool_choice: { type: "any" } },
+				),
+			);
+			expect(response.status).toBe(503);
+			expect(sends).toHaveLength(0);
+		});
+		it("skips a candidate whose capability proof is refused and serves the next", async () => {
+			const provider = getProvider("anthropic");
+			if (!provider?.transformRequestBody)
+				throw new Error("missing native provider");
+			const transform = provider.transformRequestBody.bind(provider);
+			let refused = 0;
+			const spy = spyOn(provider, "transformRequestBody").mockImplementation(
+				async (...args) => {
+					if (refused++ === 0)
+						throw new ServerToolCandidateCapabilityError({
+							accountId: "a",
+							candidateId: "synthetic",
+							reason: "other_lane_dispatched",
+						});
+					return transform(...args);
+				},
+			);
+			try {
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				expect(response.status).toBe(200);
+				await response.text();
+				expect(refused).toBeGreaterThan(1);
+				expect(sends).toHaveLength(1);
+			} finally {
+				spy.mockRestore();
+			}
+		});
 	});
 	it("quota exhaustion during preparation blocks the physical send even with manual throttles disabled", async () => {
 		const provider = getProvider("anthropic");

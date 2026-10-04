@@ -20,6 +20,7 @@ import {
 import {
 	deriveNativeAnthropicToolRequirement,
 	deriveServerToolRequirement,
+	isNativeWebSearchPassthroughEligible,
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
 } from "./server-tool-capabilities";
@@ -529,6 +530,21 @@ function hostedToolsDecision(
 	return null;
 }
 
+/** The one forced choice the native web_search lane demotes to `auto` at
+ * dispatch (proxy-operations demoteForcedWebSearchChoice): exactly
+ * `{type: "tool", name: "web_search"}`. Admission must not refuse what dispatch
+ * will rewrite; every other forced choice keeps the veto.
+ */
+function isDemotableForcedWebSearchChoice(body: unknown): boolean {
+	const choice = record(record(body)?.tool_choice);
+	return (
+		choice !== null &&
+		Object.keys(choice).length === 2 &&
+		choice.type === "tool" &&
+		choice.name === "web_search"
+	);
+}
+
 /** Native Anthropic pass-through. Stock routing applies no request-shape,
  * modality, or context admission for the same account and model, so Auto must
  * not refuse what stock would send: only proven rejections skip a lane. The
@@ -545,7 +561,26 @@ function evaluateNativeAnthropicAdmission(
 ): QualityAdmissionDecision {
 	if (!final || final.model !== target.physicalModel)
 		return { status: "reject", reason: "model-unsupported" };
+	const hosted = deriveServerToolRequirement(original);
+	// First-party web_search is forwarded to api.anthropic.com, which executes
+	// it; no hosted tuple exists or is needed. Advisor beside it stays refused by
+	// the caller's native-requirement gate.
+	const nativeWebSearch =
+		input.firstPartyAnthropic === true &&
+		deriveNativeAnthropicToolRequirement(original) === undefined &&
+		isNativeWebSearchPassthroughEligible(hosted, true);
+	// Provider transformation may already have dropped the choice from the final
+	// body, so each side only has to carry no forced choice other than the
+	// demotable one.
+	const onlyDemotableForced = (candidate: unknown) =>
+		!hasForcedToolChoice(candidate) ||
+		isDemotableForcedWebSearchChoice(candidate);
+	const demotedChoice =
+		nativeWebSearch &&
+		onlyDemotableForced(original) &&
+		onlyDemotableForced(final);
 	if (
+		!demotedChoice &&
 		(hasForcedToolChoice(original) || hasForcedToolChoice(final)) &&
 		!supportsForcedToolChoice(target.physicalModel)
 	)
@@ -559,8 +594,7 @@ function evaluateNativeAnthropicAdmission(
 		if (finalOutput !== null && finalOutput < output)
 			return { status: "reject", reason: "output-unsupported" };
 	}
-	const hosted = deriveServerToolRequirement(original);
-	if (hosted) {
+	if (hosted && !nativeWebSearch) {
 		const decision = hostedToolsDecision(input, target, hosted);
 		if (decision) return decision;
 	}

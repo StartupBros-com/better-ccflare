@@ -16,6 +16,7 @@ import {
 	type AutoRequestRequirements,
 	captureAutoRequestRequirements,
 	isAutoCatalogEvidenceCurrent,
+	isNativeWebSearchPassthroughEligible,
 	resolveAutoModelTargets,
 	resolveProviderForAccount,
 	usageCache,
@@ -741,8 +742,17 @@ export async function routeQualityRequest(input: {
 					audience: `api-key-id:${session.principalId.trim()}`,
 					lineage: session.sessionId,
 				}))
-			)
-				return unavailable("tool-replay-unavailable");
+			) {
+				// Same rule as handleProxy: a first-party Anthropic account serves
+				// web_search natively without replay authority, so continue with
+				// native candidates only (the loop skips every other candidate).
+				if (
+					!isNativeWebSearchPassthroughEligible(serverTools, true) ||
+					!(await ctx.dbOps.getAllAccounts()).some(isFirstPartyAnthropicAccount)
+				)
+					return unavailable("tool-replay-unavailable");
+				meta.serverToolReplayBound = false;
+			}
 		}
 		let advisorSkipped = false;
 		const degraded = ctx.anthropicDegradedMode?.createRequestAdmission({
@@ -784,6 +794,14 @@ export async function routeQualityRequest(input: {
 				: { status: "unknown", reason: "capacity-evidence-unknown" };
 			if (capacityDecision.status !== "admit") {
 				recordSkip(candidate.target.lane, capacityDecision.reason);
+				continue;
+			}
+			// With no replay authority only the native web_search lane is servable.
+			if (
+				meta.serverToolReplayBound === false &&
+				!isFirstPartyAnthropicAccount(account)
+			) {
+				recordSkip(candidate.target.lane, "tools-unsupported");
 				continue;
 			}
 			// A candidate that passed availability and capacity but cannot run advisor
@@ -1099,6 +1117,17 @@ export async function routeQualityRequest(input: {
 					nativeRequirement
 				) {
 					advisorSkipped = true;
+					recordSkip(candidate.target.lane, "tools-unsupported");
+					continue;
+				}
+				// A web_search request has other lanes and candidates: a refused
+				// capability (including the other lane having already dispatched) is
+				// a per-candidate skip, never a whole-request failure.
+				if (
+					error instanceof ServerToolCandidateCapabilityError &&
+					serverTools &&
+					!nativeRequirement
+				) {
 					recordSkip(candidate.target.lane, "tools-unsupported");
 					continue;
 				}
