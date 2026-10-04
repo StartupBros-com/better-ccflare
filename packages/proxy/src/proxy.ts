@@ -886,7 +886,9 @@ async function handleProxyCoreImpl(
 		req.method === "GET" &&
 		url.pathname === "/v1/models" &&
 		ctx.qualityRouteService
-			? (ctx.config?.getQualityRoutingPolicy?.()?.choices ?? [])
+			? (ctx.config?.getQualityRoutingPolicy?.()?.choices ?? []).filter(
+					(choice) => choice.listed,
+				)
 			: [];
 	if (
 		req.method === "GET" &&

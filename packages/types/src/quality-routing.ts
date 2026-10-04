@@ -71,6 +71,8 @@ export interface QualityRouteChoice {
 	readonly publicModelId: QualityPublicModelId;
 	readonly displayName: string;
 	readonly description: string;
+	/** Shown in /v1/models discovery. An unlisted id still resolves for saved defaults. */
+	readonly listed: boolean;
 }
 
 /** Compilation is pure. A revision change is not a retry or home-change command. */

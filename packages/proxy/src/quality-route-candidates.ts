@@ -206,11 +206,17 @@ export function compileQualityCandidates(
 				: resolved.current;
 		if (!evidence) {
 			const catalog = catalogFor(account.id, account.provider, true);
-			const reason: QualityAdmissionReason = !catalog
-				? "evidence-missing"
-				: !isAutoCatalogEvidenceCurrent(catalog)
-					? "catalog-evidence-stale"
-					: "model-unsupported";
+			// Catalog preparation sends no metadata traffic to unavailable or
+			// reauth-flagged accounts, so their missing evidence is an availability
+			// fact, not an evidence gap. The flag can be set without a pause.
+			const reason: QualityAdmissionReason =
+				!isAccountAvailable(account) || account.requires_reauth
+					? "account-unavailable"
+					: !catalog
+						? "evidence-missing"
+						: !isAutoCatalogEvidenceCurrent(catalog)
+							? "catalog-evidence-stale"
+							: "model-unsupported";
 			// A stored predecessor and current target must not double-count one
 			// account/line evidence failure. Only bounded enums and counts survive.
 			const key = JSON.stringify([account.id, line, reason]);
@@ -293,7 +299,11 @@ export function compileQualityCandidates(
 		) as QualitySkippedLanes,
 	});
 }
-function unavailable(reason: string, status = 503): Response {
+function unavailable(
+	reason: string,
+	status = 503,
+	detail?: { message: string; lanes: QualitySkippedLanes },
+): Response {
 	return Response.json(
 		{
 			type: "error",
@@ -301,10 +311,51 @@ function unavailable(reason: string, status = 503): Response {
 				type: status === 400 ? "invalid_request_error" : "service_unavailable",
 				code: "quality_route_unavailable",
 				reason,
+				...detail,
 			},
 		},
 		{ status, headers: { "cache-control": "no-store" } },
 	);
+}
+
+/** Most informative first: a request-shape refusal on an account with room beats
+ * evidence that may refresh, which beats proven exhaustion, which beats config. */
+export const QUALITY_REASON_RANK: readonly QualityAdmissionReason[] =
+	Object.freeze([
+		"request-preservation-unknown",
+		"input-accounting-unknown",
+		"modality-unsupported",
+		"tools-unsupported",
+		"output-unsupported",
+		"context-unsupported",
+		"credential-evidence-unknown",
+		"capacity-evidence-unknown",
+		"billing-evidence-unknown",
+		"catalog-evidence-stale",
+		"evidence-missing",
+		"subscription-exhausted",
+		"provider-capacity-exhausted",
+		"spend-not-authorized",
+		"account-unavailable",
+		"model-unsupported",
+		"line-not-approved",
+		"account-not-enrolled",
+		"lane-unavailable",
+	]);
+const reasonRank = (reason: QualityAdmissionReason) =>
+	QUALITY_REASON_RANK.indexOf(reason);
+/** Best-ranked reason of a request's recorded skips; ties go to the first recorded. */
+export function surfaceQualityReason(
+	reasons: Iterable<QualityAdmissionReason>,
+): QualityAdmissionReason {
+	let best: QualityAdmissionReason = "lane-unavailable";
+	let seen = false;
+	for (const reason of reasons)
+		if (!seen || reasonRank(reason) < reasonRank(best)) {
+			best = reason;
+			seen = true;
+		}
+	return best;
 }
 function workerRole(
 	model: string | null,
@@ -583,7 +634,7 @@ export async function routeQualityRequest(input: {
 			QualityLane,
 			Partial<Record<QualityAdmissionReason, number>>
 		>();
-		let lastAdmissionReason: QualityAdmissionReason = "lane-unavailable";
+		const recordedReasons: QualityAdmissionReason[] = [];
 		const attemptedLanes = new Set<QualityLane>();
 		const summaries = (through?: QualityLane): QualitySkippedLanes =>
 			lanes
@@ -604,7 +655,7 @@ export async function routeQualityRequest(input: {
 			compilationOnly = false,
 		) => {
 			if (!compilationOnly) attemptedLanes.add(lane);
-			lastAdmissionReason = reason;
+			recordedReasons.push(reason);
 			const reasons = skipped.get(lane) ?? {};
 			reasons[reason] = Math.min(1_000_000, (reasons[reason] ?? 0) + count);
 			skipped.set(lane, reasons);
@@ -1068,7 +1119,11 @@ export async function routeQualityRequest(input: {
 				createNativeAnthropicToolRoutingError(nativeRequirement),
 			);
 		await persistRejection();
-		const response = unavailable(lastAdmissionReason);
+		const surfacedReason = surfaceQualityReason(recordedReasons);
+		const response = unavailable(surfacedReason, 503, {
+			message: `Auto could not serve this request: ${surfacedReason} (see error.lanes)`,
+			lanes: summaries(),
+		});
 		void recordRoutingTerminalRequest({
 			collector: tryGetUsageCollector(),
 			requestMeta: meta,

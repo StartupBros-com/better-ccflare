@@ -1095,7 +1095,7 @@ describe("Claude Code background merge policy at ingress and provider transport"
 	it.each([
 		false,
 		true,
-	])("quality admission exempts only the policy edit (additional cache TTL mutation=%s)", async (mutateTtl) => {
+	])("quality admission forwards the policy edit and stock's cache TTL stamp (system_prompt_cache_ttl_1h=%s)", async (mutateTtl) => {
 		qualityFixture = true;
 		const db = new Database(":memory:");
 		ensureSchema(db);
@@ -1152,15 +1152,18 @@ describe("Claude Code background merge policy at ingress and provider transport"
 			];
 			const payload = { ...body(system), model: "claude-bccf-quality-auto" };
 			const response = await send(payload, ctx, options);
-			if (mutateTtl) {
-				expect(response.status).toBe(503);
-				expect(outbound).toHaveLength(0);
-				return;
-			}
+			// A native Auto target is admitted as stock would send it, so stock's
+			// own 1h TTL stamp is forwarded rather than refused (#428).
 			expect(response.status).toBe(200);
 			expect(outbound).toHaveLength(1);
 			expect(outbound[0].body.system).toEqual([
-				{ ...system[0], text: HOST.replace(DIRECTIVE, POLICY) },
+				{
+					...system[0],
+					text: HOST.replace(DIRECTIVE, POLICY),
+					cache_control: mutateTtl
+						? { type: "ephemeral", ttl: "1h" }
+						: { type: "ephemeral" },
+				},
 			]);
 			assertPolicy(outbound[0].raw);
 			const denied = await send({ ...payload, max_tokens: 1001 }, ctx, options);
