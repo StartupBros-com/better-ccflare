@@ -377,8 +377,6 @@ function codexTranslatableBlock(
  */
 function codexTranslatesWithoutLoss(
 	original: Record<string, unknown>,
-	capabilities: AutoModelCapabilities | null,
-	physicalModel: string,
 ): boolean {
 	if (!onlyKeys(original, CODEX_REQUEST_KEYS)) return false;
 	if (original.system !== undefined && typeof original.system !== "string") {
@@ -428,21 +426,45 @@ function codexTranslatesWithoutLoss(
 			typeof output.effort !== "string"
 		)
 			return false;
-		try {
-			// The adapter clamps to the nearest supported effort and throws on an
-			// invalid value; resolve exactly as convertToCodexFormat does.
-			resolveAnthropicReasoningEffort(original, {
-				sourceModel:
-					typeof original.model === "string" ? original.model : undefined,
-				targetModel: physicalModel,
-				supportedTargetEfforts:
-					capabilities?.supportedReasoningEfforts ?? undefined,
-			});
-		} catch {
-			return false;
-		}
 	}
 	return true;
+}
+
+/** The adapter clamps effort against the account's reasoning snapshot, which a
+ * catalog refresh republishes independently of the revision this target was
+ * resolved from. The wire must carry exactly the effort the pinned evidence
+ * yields: a clamp both agree on is stock's deterministic transform, while a
+ * disagreement means the body was built from another catalog generation.
+ */
+function codexWireEffortDecision(
+	original: Record<string, unknown>,
+	final: Record<string, unknown>,
+	capabilities: AutoModelCapabilities | null,
+	physicalModel: string,
+): QualityAdmissionDecision | null {
+	const wire = record(final.reasoning)?.effort;
+	if (typeof wire !== "string")
+		return { status: "unknown", reason: "request-preservation-unknown" };
+	const supported = capabilities?.supportedReasoningEfforts;
+	if (supported?.length && !supported.some((effort) => effort === wire))
+		return { status: "unknown", reason: "catalog-evidence-stale" };
+	if (!Object.hasOwn(original, "output_config")) return null;
+	let resolved: string | undefined;
+	try {
+		// The adapter clamps to the nearest supported effort and throws on an
+		// invalid value; resolve exactly as convertToCodexFormat does.
+		resolved = resolveAnthropicReasoningEffort(original, {
+			sourceModel:
+				typeof original.model === "string" ? original.model : undefined,
+			targetModel: physicalModel,
+			supportedTargetEfforts: supported ?? undefined,
+		}).effort;
+	} catch {
+		return { status: "unknown", reason: "request-preservation-unknown" };
+	}
+	return resolved === wire
+		? null
+		: { status: "unknown", reason: "catalog-evidence-stale" };
 }
 
 /** Hosted server tools are proven per target by the provider materializer, the
@@ -531,7 +553,8 @@ function evaluateNativeAnthropicAdmission(
  * translate and send deterministically. It is stricter than stock only where the
  * adapter silently loses content (see codexTranslatesWithoutLoss). The final body
  * is checked only to prove it was actually translated (a Responses body, not the
- * untranslated Anthropic one) and to carry the same model and output cap. Context
+ * untranslated Anthropic one), to carry the same model and output cap, and to
+ * carry the reasoning effort the pinned catalog evidence resolves. Context
  * fit uses stock's estimator and reserve: fail open when the window is unknown,
  * and no output reserve where the subscription endpoint drops max_output_tokens.
  * A missing max_tokens is admitted (the adapter forwards no cap).
@@ -585,8 +608,15 @@ export function evaluateAutoRequestAdmission(
 	}
 	if (!hosted && !clientTools(original))
 		return { status: "unknown", reason: "tools-unsupported" };
-	if (!codexTranslatesWithoutLoss(original, capabilities, target.physicalModel))
+	if (!codexTranslatesWithoutLoss(original))
 		return { status: "unknown", reason: "request-preservation-unknown" };
+	const effort = codexWireEffortDecision(
+		original,
+		final,
+		capabilities,
+		target.physicalModel,
+	);
+	if (effort) return effort;
 	if (capabilities?.maxContextWindow == null) return { status: "admit" };
 	// Mirrors stock admitConcreteCodexModel: the same estimator, no local
 	// headroom, and the reserve the wire carries (the subscription endpoint

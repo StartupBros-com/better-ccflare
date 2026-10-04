@@ -1275,7 +1275,7 @@ The operator-approved **2026-10-01 `allow-unbounded-output` contract** applies o
 
 A native Anthropic target is admitted as stock routing to the same account and model would send it. Only proven rejections remain: the requested model, the forced `tool_choice` guard, a known output ceiling, an unshrunk `max_tokens`, and the hosted-tool materializer. Request shape, modality and context are left to upstream, which validates them exactly as it does for stock.
 
-A Codex target admits what the stock Codex adapter translates deterministically, including its stateful transforms: the Agent/Task orchestration filter, the Skill nudge, a forced StructuredOutput `tool_choice`, skill elision, cache breakpoints, and schema and `tool_use` input sanitizing. Admission checks the original request rather than rebuilding the adapter's output. The final body only has to be a translated Responses body with the same model and an unshrunk cap. Signed or redacted thinking history, top-level `thinking`, `context_management`, sampling and stop keys, boolean `defer_loading`, and ToolSearch `tool_reference` results are admitted, because the adapter drops or serializes them without losing user content. Auto stays stricter than stock only where the adapter silently loses content, or where the shape is unknown:
+A Codex target admits what the stock Codex adapter translates deterministically, including its stateful transforms: the Agent/Task orchestration filter, the Skill nudge, a forced StructuredOutput `tool_choice`, skill elision, cache breakpoints, and schema and `tool_use` input sanitizing. Admission checks the original request rather than rebuilding the adapter's output. The final body only has to be a translated Responses body with the same model, an unshrunk cap, and the reasoning effort the pinned catalog evidence resolves. Signed or redacted thinking history, top-level `thinking`, `context_management`, sampling and stop keys, boolean `defer_loading`, and ToolSearch `tool_reference` results are admitted, because the adapter drops or serializes them without losing user content. Auto stays stricter than stock only where the adapter silently loses content, or where the shape is unknown:
 
 - images and documents (dropped, or a placeholder inside a tool result)
 - hosted-tool blocks
@@ -1284,7 +1284,7 @@ A Codex target admits what the stock Codex adapter translates deterministically,
 - a `tool_choice` naming an undeclared tool
 - an `output_config` that the adapter's effort resolver rejects
 
-An effort the catalog does not list is admitted, because the adapter clamps it, as it does for stock.
+An effort the catalog does not list is admitted, because the adapter clamps it, as it does for stock. The clamp must match the catalog revision the target was resolved from. The adapter reads a reasoning snapshot that a catalog refresh republishes separately, so a wire effort that disagrees with the pinned evidence skips the lane as `catalog-evidence-stale`.
 
 ### Implementation and acceptance status
 

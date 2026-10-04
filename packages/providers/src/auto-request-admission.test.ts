@@ -144,19 +144,13 @@ describe("Codex Auto official effort preservation", () => {
 			});
 		}
 	});
-	it("does not compare final reasoning (the adapter owns the clamp; admission checks the original)", async () => {
+	it("reads only the wire effort, which must be the one the pinned evidence resolves", async () => {
 		const original = { ...effortBody, output_config: { effort: "high" } };
 		const finalBody = await translateEffort(original);
 		for (const reasoning of [
-			undefined,
-			null,
-			[],
-			"high",
-			{},
-			{ effort: "low" },
-			{ effort: 1 },
+			{ effort: "high" },
 			{ effort: "high", summary: "auto" },
-		]) {
+		])
 			expect(
 				evaluateAutoRequestAdmission({
 					...effortCatalog(),
@@ -164,7 +158,24 @@ describe("Codex Auto official effort preservation", () => {
 					finalBody: { ...finalBody, reasoning },
 				}).status,
 			).toBe("admit");
-		}
+		expect(
+			evaluateAutoRequestAdmission({
+				...effortCatalog(),
+				requirements: captureAutoRequestRequirements(original),
+				finalBody: { ...finalBody, reasoning: { effort: "low" } },
+			}),
+		).toMatchObject({ status: "unknown", reason: "catalog-evidence-stale" });
+		for (const reasoning of [undefined, null, [], "high", {}, { effort: 1 }])
+			expect(
+				evaluateAutoRequestAdmission({
+					...effortCatalog(),
+					requirements: captureAutoRequestRequirements(original),
+					finalBody: { ...finalBody, reasoning },
+				}),
+			).toMatchObject({
+				status: "unknown",
+				reason: "request-preservation-unknown",
+			});
 	});
 	it("never admits original legacy reasoning, alone or alongside official effort", async () => {
 		for (const original of [
@@ -192,7 +203,6 @@ describe("Codex Auto official effort preservation", () => {
 			null,
 			[],
 			"high",
-			[{ effort: "low" }],
 			[{ effort: "high" }, { effort: "unknown" }],
 			[{}],
 			[null],
@@ -233,7 +243,24 @@ describe("Codex Auto official effort preservation", () => {
 		["xhigh", "high"],
 		["minimal", "low"],
 		["max", "xhigh"],
-	])("admits actual adapter clamp %s to %s (a deterministic stock transform)", async (effort, clamped) => {
+		["high", "low"],
+	])("admits actual adapter clamp %s to %s when the pinned catalog agrees (a deterministic stock transform)", async (effort, clamped) => {
+		const original = { ...effortBody, output_config: { effort } };
+		const finalBody = await translateEffort(original, [clamped]);
+		expect(finalBody.reasoning).toEqual({ effort: clamped });
+		expect(
+			evaluateAutoRequestAdmission({
+				...effortCatalog([{ effort: clamped }]),
+				finalBody,
+				requirements: captureAutoRequestRequirements(original),
+			}).status,
+		).toBe("admit");
+	});
+	it.each([
+		["xhigh", "high"],
+		["minimal", "low"],
+		["max", "xhigh"],
+	])("rejects actual adapter clamp %s to %s despite current support", async (effort, clamped) => {
 		const original = { ...effortBody, output_config: { effort } };
 		// The retained adapter generation differs from the newly published owned catalog.
 		const finalBody = await translateEffort(original, [clamped], [effort]);
@@ -243,6 +270,41 @@ describe("Codex Auto official effort preservation", () => {
 				...effortCatalog([{ effort }]),
 				finalBody,
 				requirements: captureAutoRequestRequirements(original),
+			}),
+		).toMatchObject({ status: "unknown", reason: "catalog-evidence-stale" });
+	});
+	it("rejects a listed wire effort that is not the pinned catalog's clamp", async () => {
+		const original = { ...effortBody, output_config: { effort: "high" } };
+		// An older generation lacked high and clamped it to low; the pinned catalog
+		// lists both, so the wire effort is listed yet is not what was requested.
+		const finalBody = await translateEffort(original, ["low"]);
+		expect(finalBody.reasoning).toEqual({ effort: "low" });
+		expect(
+			evaluateAutoRequestAdmission({
+				...effortCatalog([{ effort: "low" }, { effort: "high" }]),
+				finalBody,
+				requirements: captureAutoRequestRequirements(original),
+			}),
+		).toMatchObject({ status: "unknown", reason: "catalog-evidence-stale" });
+	});
+	it("rejects a default effort the pinned catalog does not list, and admits one it does", async () => {
+		// No requested effort: the adapter picks its default from its own generation.
+		const stale = await translateEffort(effortBody);
+		expect(stale.reasoning).toEqual({ effort: "medium" });
+		expect(
+			evaluateAutoRequestAdmission({
+				...effortCatalog([{ effort: "high" }]),
+				finalBody: stale,
+				requirements: captureAutoRequestRequirements(effortBody),
+			}),
+		).toMatchObject({ status: "unknown", reason: "catalog-evidence-stale" });
+		const current = await translateEffort(effortBody, ["high"]);
+		expect(current.reasoning).toEqual({ effort: "high" });
+		expect(
+			evaluateAutoRequestAdmission({
+				...effortCatalog([{ effort: "high" }]),
+				finalBody: current,
+				requirements: captureAutoRequestRequirements(effortBody),
 			}).status,
 		).toBe("admit");
 	});
@@ -1353,6 +1415,25 @@ describe("Codex Auto admits what the stock Codex route translates deterministica
 		});
 		const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
 		if (!catalog || !target) throw new Error("missing codex target");
+		// Production publishes the adapter's reasoning map from the same listing as
+		// the Auto evidence (codex-model-catalog), so translate with that generation.
+		const levels = raw.supported_reasoning_levels;
+		setCodexAccountModelContextMetadata("codex-contract", [
+			{
+				id: "gpt-6-astra",
+				contextWindow: null,
+				maxContextWindow: null,
+				effectiveContextPercent: null,
+				supportedReasoningEfforts: Array.isArray(levels)
+					? levels.map(
+							(level: { effort?: string } | null) => level?.effort ?? "",
+						)
+					: undefined,
+			},
+		]);
+		const reasoningSnapshot =
+			captureCodexModelReasoningSnapshot("codex-contract");
+		clearCodexAccountModelContextMetadata("codex-contract");
 		// An adapter throw (invalid effort, unknown tool_choice) is swallowed by the
 		// proxy, which then forwards the untranslated body. Stand in a translated
 		// body so the original-side check is what refuses.
@@ -1363,6 +1444,9 @@ describe("Codex Auto admits what the stock Codex route translates deterministica
 					body: JSON.stringify({ ...original, model: "gpt-6-astra" }),
 					headers: { "content-type": "application/json" },
 				}),
+				undefined,
+				undefined,
+				{ reasoningSnapshot },
 			)
 			.then((response) => response.json())
 			.catch(() => ({ model: "gpt-6-astra", input: [] }));
