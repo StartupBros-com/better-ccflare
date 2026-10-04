@@ -1938,19 +1938,20 @@ export class UsageCollector {
 				(iteration) => (iteration.output_tokens ?? 0) > 0,
 			);
 			if (billable.length > 0) {
-				const models = new Set(
-					billable.flatMap((iteration) =>
-						iteration.model ? [iteration.model] : [],
-					),
-				);
+				// Plan-window value prices these tokens under advisor_model, so a
+				// model is recorded only when every billable iteration names the
+				// same one. Mixed or missing models keep the token totals with a
+				// null model, which window value skips rather than misprices.
+				const models = new Set(billable.map((iteration) => iteration.model));
+				const [advisorModel] = models;
 				if (models.size > 1) {
 					log.info("anthropic_advisor_multiple_models", {
 						requestId: startMessage.requestId,
-						models: [...models],
+						models: [...models].map((model) => model ?? "(unspecified)"),
 					});
 				}
 				advisorPersist = {
-					advisorModel: billable.find((iteration) => iteration.model)?.model,
+					advisorModel: models.size === 1 ? advisorModel : undefined,
 					advisorInputTokens: 0,
 					advisorOutputTokens: 0,
 					advisorCacheReadInputTokens: 0,

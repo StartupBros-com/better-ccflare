@@ -1686,6 +1686,38 @@ describe("UsageCollector request lifecycle", () => {
 				);
 			});
 
+			it("persists advisor tokens with no model when billable iterations do not share one", async () => {
+				useDeterministicModelPricing();
+				const { collector, savedUsages } = harness();
+				const second = { input_tokens: 23, output_tokens: 29 };
+				for (const [label, model] of [
+					["mixed", OPUS_MODEL],
+					["missing", undefined],
+				] as const) {
+					const requestId = `stream-advisor-${label}-model`;
+					collector.handleStart(makeStartMessage(requestId));
+					collector.handleChunk(
+						requestId,
+						advisorStream(FABLE_MODEL, { input_tokens: 10, output_tokens: 7 }, [
+							executorIteration,
+							advisorIteration,
+							{ type: "advisor_message", model, ...second },
+						]),
+					);
+					await collector.handleEnd({ type: "end", requestId, success: true });
+					await collector.drain();
+
+					// Window value prices advisor tokens under advisor_model, so
+					// neither model may absorb the other's tokens.
+					const saved = savedUsages.get(requestId);
+					expect(saved?.advisorModel).toBeUndefined();
+					expect(saved).toMatchObject({
+						advisorInputTokens: 11 + 23,
+						advisorOutputTokens: 13 + 29,
+					});
+				}
+			});
+
 			it("prices the equivalent non-streaming JSON response identically", async () => {
 				useDeterministicModelPricing();
 				const { collector, savedUsages } = harness();

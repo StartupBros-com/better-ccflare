@@ -738,7 +738,9 @@ export class RequestRepository extends BaseRepository<RequestData> {
 			[accountId, fromMs, toMs],
 		);
 		// Advisor iterations (R14): tokens live in separate columns and belong
-		// to the advisor model's line. They add no request count.
+		// to the advisor model's line. They add no request count. A null
+		// advisor_model means the iterations named no single model; those
+		// tokens are skipped rather than priced as another model.
 		const advisorRows = await this.query<{
 			model: string;
 			input_tokens: number;
