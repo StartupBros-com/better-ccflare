@@ -866,13 +866,102 @@ describe("prewarmed native catalogs", () => {
 		}
 	}
 
+	// A Claude Code main-conversation turn (#429): thinking history, adaptive
+	// thinking with effort, context_management, a 1h cache TTL, a sanitized
+	// schema, a deferred tool and a ToolSearch tool_reference result.
+	const claudeCodeShaped = {
+		max_tokens: 1000,
+		temperature: 1,
+		thinking: { type: "adaptive" },
+		output_config: { effort: "xhigh" },
+		context_management: { edits: [{ type: "clear_thinking_20251015" }] },
+		system: [
+			{
+				type: "text",
+				text: "You are Claude Code.",
+				cache_control: { type: "ephemeral", ttl: "1h" },
+			},
+		],
+		tools: [
+			{
+				name: "Read",
+				description: "Read a file",
+				input_schema: {
+					$schema: "http://json-schema.org/draft-07/schema#",
+					type: "object",
+					properties: { file_path: { type: "string", format: "uri" } },
+					required: ["file_path"],
+				},
+			},
+			{
+				name: "ToolSearch",
+				description: "Load deferred tools",
+				input_schema: {
+					type: "object",
+					properties: { query: { type: "string" } },
+				},
+			},
+			{
+				name: "TaskCreate",
+				description: "Create a task",
+				defer_loading: true,
+				input_schema: {
+					type: "object",
+					properties: { subject: { type: "string" } },
+				},
+			},
+		],
+		messages: [
+			{ role: "user", content: "Read the config." },
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "Read it first.", signature: "sig" },
+					{
+						type: "tool_use",
+						id: "toolu_read",
+						name: "Read",
+						input: { file_path: "/tmp/config.json" },
+					},
+					{
+						type: "tool_use",
+						id: "toolu_search",
+						name: "ToolSearch",
+						input: { query: "select:TaskCreate" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "toolu_read",
+						content: [{ type: "text", text: "{}" }],
+					},
+					{
+						type: "tool_result",
+						tool_use_id: "toolu_search",
+						content: [{ type: "tool_reference", tool_name: "TaskCreate" }],
+					},
+					{
+						type: "text",
+						text: "Now summarize.",
+						cache_control: { type: "ephemeral" },
+					},
+				],
+			},
+		],
+	};
 	it.each([
 		"success",
 		"context-overflow",
 		"missing-catalog",
+		"claude-code-shaped",
 	])("first Auto fallback persists Astra winner after %s through real history", async (mode) => {
 		let rejectContext = mode === "context-overflow";
 		if (mode === "missing-catalog") resetModelCatalogForTest();
+		let wire: { url: string; body: Record<string, unknown> } | undefined;
 		const codex = {
 			...account("c"),
 			provider: "codex",
@@ -947,6 +1036,7 @@ describe("prewarmed native catalogs", () => {
 						],
 					});
 				const body = (await req.json()) as { model: string };
+				wire = { url: req.url, body };
 				sends.push({
 					model: body.model,
 					authorization: req.headers.get("authorization"),
@@ -1001,7 +1091,11 @@ describe("prewarmed native catalogs", () => {
 				}
 				rejectContext = false;
 			}
-			const response = await send();
+			const response = await send(
+				mode === "claude-code-shaped"
+					? request(undefined, {}, claudeCodeShaped)
+					: undefined,
+			);
 			expect({
 				status: response.status,
 				error: response.ok ? null : await response.clone().text(),
@@ -1035,6 +1129,25 @@ describe("prewarmed native catalogs", () => {
 				accounting: { kind: "estimate" },
 			});
 			expect(history[0].routeProvenance?.repinReason ?? null).toBeNull();
+			if (mode === "claude-code-shaped") {
+				// The real adapter translated it for the subscription endpoint,
+				// which drops max_output_tokens, so the admitted reserve is 0.
+				expect(wire?.url).toContain("chatgpt.com/backend-api/codex");
+				expect(wire?.body).not.toHaveProperty("messages");
+				expect(wire?.body).not.toHaveProperty("max_output_tokens");
+				expect(Array.isArray(wire?.body.input)).toBe(true);
+				expect(JSON.stringify(wire?.body.input)).toContain(
+					'{\\"type\\":\\"tool_reference\\",\\"tool_name\\":\\"TaskCreate\\"}',
+				);
+				expect(
+					(wire?.body.tools as { name?: string }[]).map((tool) => tool.name),
+				).toContain("TaskCreate");
+				expect(history[0].qualityDecision.accounting).toMatchObject({
+					source: "stock-codex-estimate-v1",
+					headroom: 0,
+					requestedOutput: 0,
+				});
+			}
 			const state = await service.status(scope);
 			expect(state?.conversations[0]?.lastSuccessfulDecision?.requestId).toBe(
 				history[0].id,

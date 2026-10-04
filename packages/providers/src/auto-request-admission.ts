@@ -1,8 +1,9 @@
-import { isDeepStrictEqual } from "node:util";
 import {
+	getModelFamily,
 	hasForcedToolChoice,
 	supportsForcedToolChoice,
 } from "@better-ccflare/core";
+import { resolveAnthropicReasoningEffort } from "@better-ccflare/openai-formats";
 import type { QualityAdmissionDecision } from "@better-ccflare/types";
 import {
 	type AutoCatalogEvidence,
@@ -12,6 +13,10 @@ import {
 	positiveSafeCapacity,
 	resolveAutoModelTargets,
 } from "./auto-model-capabilities";
+import {
+	estimateAnthropicAdmissionTokens,
+	selectCodexDefaultReasoningEffort,
+} from "./request-capabilities";
 import {
 	deriveNativeAnthropicToolRequirement,
 	deriveServerToolRequirement,
@@ -164,6 +169,11 @@ function modalities(body: Record<string, unknown>): Set<string> | null {
 				}
 				return false; // A URL/file has no established content type.
 			}
+			case "thinking":
+			case "redacted_thinking":
+				// Provider reasoning is not portable: the Codex adapter drops it, so it
+				// carries no modality and is not content the target must accept.
+				return true;
 			case "tool_result":
 				return (
 					typeof block.tool_use_id === "string" &&
@@ -176,8 +186,14 @@ function modalities(body: Record<string, unknown>): Set<string> | null {
 					]) &&
 					(block.is_error === undefined ||
 						typeof block.is_error === "boolean") &&
-					visit(block.content)
+					// The adapter replaces a tool_result image with a placeholder:
+					// that is lossy content, not a modality to match.
+					codexToolResultContent(block.content) &&
+					(block.content === undefined || visit(block.content))
 				);
+			case "tool_reference":
+				// ToolSearch's pointer to a declared tool: no modality.
+				return toolReferenceBlock(block);
 			case "tool_use":
 				found.add("text");
 				return (
@@ -190,7 +206,11 @@ function modalities(body: Record<string, unknown>): Set<string> | null {
 				return false;
 		}
 	};
-	if (body.system !== undefined && !visit(body.system)) return null;
+	if (
+		body.system !== undefined &&
+		(textBlocks(body.system, "") === null || !visit(body.system))
+	)
+		return null;
 	if (!Array.isArray(body.messages) || body.messages.length === 0) return null;
 	for (const message of body.messages) {
 		const entry = record(message);
@@ -208,7 +228,8 @@ function onlyKeys(
 
 /** Client function tools supported by Codex's existing function adapter. This
  * does NOT infer hosted-tool support from a flag. Unknown tool variants/schemas
- * are deliberately outside this contract.
+ * are deliberately outside this contract. `defer_loading` is a Claude Code
+ * tool-search hint the adapter drops while still sending the full function.
  */
 function clientTools(body: Record<string, unknown>): boolean {
 	return (
@@ -223,7 +244,10 @@ function clientTools(body: Record<string, unknown>): boolean {
 						"description",
 						"input_schema",
 						"cache_control",
+						"defer_loading",
 					]) &&
+					(tool.defer_loading === undefined ||
+						typeof tool.defer_loading === "boolean") &&
 					typeof tool.name === "string" &&
 					tool.name.length > 0 &&
 					(tool.description === undefined ||
@@ -252,106 +276,86 @@ function textBlocks(value: unknown, separator: string): string | null {
 	return texts.join(separator);
 }
 
-/** Compare semantic content against the existing Codex adapter's supported
- * ordinary text/function mapping. This does not translate or re-run its stateful
- * orchestration machinery. Dropped tools, sanitized arguments, truncated input,
- * opaque replay items and schema changes all fail this comparison.
+const CODEX_REQUEST_KEYS = [
+	"model",
+	"messages",
+	"system",
+	"tools",
+	"tool_choice",
+	"max_tokens",
+	"stream",
+	"metadata",
+	"output_config",
+	// Accepted but ignored by the adapter: it neither forwards nor depends on them.
+	"thinking",
+	"context_management",
+	"temperature",
+	"top_p",
+	"top_k",
+	"stop_sequences",
+] as const;
+
+function textBlockOnly(block: Record<string, unknown>): boolean {
+	return (
+		block.type === "text" &&
+		typeof block.text === "string" &&
+		onlyKeys(block, ["type", "text", "cache_control"])
+	);
+}
+
+function toolReferenceBlock(block: Record<string, unknown>): boolean {
+	return (
+		block.type === "tool_reference" &&
+		typeof block.tool_name === "string" &&
+		onlyKeys(block, ["type", "tool_name", "cache_control"])
+	);
+}
+
+/** tool_result content the adapter carries intact: text, or ToolSearch's
+ * tool_reference blocks, which it serializes as JSON text. It replaces an image
+ * with a placeholder and omits large structured blocks, so those do not qualify.
  */
-function codexPreserves(
-	original: Record<string, unknown>,
-	final: Record<string, unknown>,
-	capabilities: AutoModelCapabilities | null,
+function codexToolResultContent(content: unknown): boolean {
+	if (content === undefined || typeof content === "string") return true;
+	return (
+		Array.isArray(content) &&
+		content.every((item) => {
+			const block = record(item);
+			return (
+				block !== null && (textBlockOnly(block) || toolReferenceBlock(block))
+			);
+		})
+	);
+}
+
+/** One message content block the Codex adapter translates without dropping user
+ * content. Reasoning is dropped by design (it is not portable across providers),
+ * so it is not loss; images, documents and hosted-tool blocks are.
+ */
+function codexTranslatableBlock(
+	block: Record<string, unknown>,
+	role: string,
 ): boolean {
-	if (Object.hasOwn(original, "output_config")) {
-		const output = record(original.output_config);
-		const reasoning = record(final.reasoning);
-		if (
-			!output ||
-			!onlyKeys(output, ["effort"]) ||
-			typeof output.effort !== "string" ||
-			!capabilities?.supportedReasoningEfforts?.some(
-				(effort) => effort === output.effort,
-			) ||
-			!reasoning ||
-			!onlyKeys(reasoning, ["effort"]) ||
-			reasoning.effort !== output.effort
-		)
-			return false;
-	}
-	if (
-		!onlyKeys(original, [
-			"model",
-			"messages",
-			"system",
-			"tools",
-			"tool_choice",
-			"max_tokens",
-			"stream",
-			"metadata",
-			"output_config",
-		]) ||
-		!onlyKeys(final, [
-			"model",
-			"input",
-			"instructions",
-			"tools",
-			"tool_choice",
-			"parallel_tool_calls",
-			"max_output_tokens",
-			"stream",
-			"store",
-			"reasoning",
-			"include",
-			"prompt_cache_key",
-		])
-	)
-		return false;
-	const system =
-		original.system === undefined ? "" : textBlocks(original.system, "\n\n");
-	if (
-		system === null ||
-		final.instructions !== (system || "You are a helpful assistant.")
-	)
-		return false;
-	if (!Array.isArray(original.messages) || !Array.isArray(final.input))
-		return false;
-	const expected: unknown[] = [];
-	for (const value of original.messages) {
-		const message = record(value);
-		if (
-			!message ||
-			!onlyKeys(message, ["role", "content"]) ||
-			!["user", "assistant", "system", "developer"].includes(
-				String(message.role),
-			)
-		)
-			return false;
-		const role = message.role === "developer" ? "system" : message.role;
-		const blocks =
-			typeof message.content === "string"
-				? [{ type: "text", text: message.content }]
-				: message.content;
-		if (!Array.isArray(blocks)) return false;
-		for (const value of blocks) {
-			const block = record(value);
-			if (!block) return false;
-			if (
-				block.type === "text" &&
-				typeof block.text === "string" &&
-				onlyKeys(block, ["type", "text", "cache_control"])
-			) {
-				expected.push(["text", role, block.text]);
-			} else if (
-				block.type === "tool_use" &&
+	switch (block.type) {
+		case "text":
+			return textBlockOnly(block);
+		case "thinking":
+			return (
+				role === "assistant" &&
+				onlyKeys(block, ["type", "thinking", "signature"])
+			);
+		case "redacted_thinking":
+			return role === "assistant" && onlyKeys(block, ["type", "data"]);
+		case "tool_use":
+			return (
 				role === "assistant" &&
 				typeof block.id === "string" &&
 				typeof block.name === "string" &&
-				record(block.input) &&
+				record(block.input) !== null &&
 				onlyKeys(block, ["type", "id", "name", "input", "cache_control"])
-			) {
-				expected.push(["call", block.id, block.name, block.input]);
-			} else if (
-				block.type === "tool_result" &&
+			);
+		case "tool_result":
+			return (
 				role === "user" &&
 				typeof block.tool_use_id === "string" &&
 				onlyKeys(block, [
@@ -360,111 +364,128 @@ function codexPreserves(
 					"content",
 					"is_error",
 					"cache_control",
-				])
-			) {
-				const content = textBlocks(block.content, "\n");
-				if (content === null) return false;
-				expected.push([
-					"result",
-					block.tool_use_id,
-					`${block.is_error === true ? "[tool error] " : ""}${content}`,
-				]);
-			} else return false;
+				]) &&
+				(block.is_error === undefined || typeof block.is_error === "boolean") &&
+				codexToolResultContent(block.content)
+			);
+		default:
+			return false;
+	}
+}
+
+/** Original-side check that the Codex adapter translates this request without
+ * silently losing user content. It deliberately does NOT rebuild or compare the
+ * adapter's output: stock routing applies stateful, deterministic transforms (the
+ * Agent/Task orchestration filter, the Skill nudge, forced StructuredOutput
+ * tool_choice, skill elision, cache breakpoints, schema sanitising, tool_use
+ * input sanitising) that a rebuild cannot mirror, and Auto must not refuse what
+ * stock would send. Stricter than stock only where the adapter drops content
+ * (images, PDFs, hosted-tool blocks, non-text system blocks) or where a request
+ * shape is unknown.
+ */
+function codexTranslatesWithoutLoss(
+	original: Record<string, unknown>,
+): boolean {
+	if (!onlyKeys(original, CODEX_REQUEST_KEYS)) return false;
+	if (original.system !== undefined && typeof original.system !== "string") {
+		if (!Array.isArray(original.system)) return false;
+		for (const value of original.system) {
+			const block = record(value);
+			if (!block || !textBlockOnly(block)) return false;
 		}
 	}
-	const actual: unknown[] = [];
-	for (const value of final.input) {
-		const item = record(value);
-		if (!item) return false;
-		if (
-			(item.type === undefined || item.type === "message") &&
-			Array.isArray(item.content) &&
-			onlyKeys(item, ["type", "role", "content"])
-		) {
-			for (const value of item.content) {
-				const block = record(value);
-				if (
-					!block ||
-					block.type !==
-						(item.role === "assistant" ? "output_text" : "input_text") ||
-					typeof block.text !== "string" ||
-					!onlyKeys(block, ["type", "text"])
-				)
-					return false;
-				actual.push(["text", item.role, block.text]);
-			}
-		} else if (
-			item.type === "function_call" &&
-			typeof item.arguments === "string" &&
-			onlyKeys(item, ["type", "call_id", "name", "arguments", "status"])
-		) {
-			try {
-				actual.push([
-					"call",
-					item.call_id,
-					item.name,
-					JSON.parse(item.arguments),
-				]);
-			} catch {
-				return false;
-			}
-		} else if (
-			item.type === "function_call_output" &&
-			typeof item.output === "string" &&
-			onlyKeys(item, ["type", "call_id", "output", "status"])
-		) {
-			actual.push(["result", item.call_id, item.output]);
-		} else return false;
-	}
-	if (!isDeepStrictEqual(expected, actual)) return false;
-	const tools = (original.tools ?? []) as Record<string, unknown>[];
-	const finalTools = final.tools ?? [];
-	if (!Array.isArray(finalTools) || tools.length !== finalTools.length)
+	if (!Array.isArray(original.messages) || original.messages.length === 0)
 		return false;
-	for (const [index, tool] of tools.entries()) {
-		const translated = record(finalTools[index]);
+	for (const value of original.messages) {
+		const message = record(value);
 		if (
-			!translated ||
-			!onlyKeys(translated, [
-				"type",
-				"name",
-				"description",
-				"parameters",
-				"strict",
-			]) ||
-			translated.type !== "function" ||
-			translated.name !== tool.name ||
-			translated.description !== tool.description ||
-			translated.strict !== false ||
-			!isDeepStrictEqual(translated.parameters, tool.input_schema)
+			!message ||
+			!onlyKeys(message, ["role", "content"]) ||
+			typeof message.role !== "string" ||
+			!["user", "assistant", "system", "developer"].includes(message.role)
+		)
+			return false;
+		if (typeof message.content === "string") continue;
+		if (!Array.isArray(message.content)) return false;
+		for (const item of message.content) {
+			const block = record(item);
+			if (!block || !codexTranslatableBlock(block, message.role)) return false;
+		}
+	}
+	if (original.tool_choice !== undefined) {
+		const choice = record(original.tool_choice);
+		if (
+			!choice ||
+			!onlyKeys(choice, ["type", "name", "disable_parallel_tool_use"])
+		)
+			return false;
+		if (choice.type === "tool") {
+			const tools = Array.isArray(original.tools) ? original.tools : [];
+			if (!tools.some((tool) => record(tool)?.name === choice.name))
+				return false;
+		} else if (!["auto", "any", "none"].includes(String(choice.type)))
+			return false;
+	}
+	if (Object.hasOwn(original, "output_config")) {
+		const output = record(original.output_config);
+		if (
+			!output ||
+			!onlyKeys(output, ["effort"]) ||
+			typeof output.effort !== "string"
 		)
 			return false;
 	}
-	const choice = record(original.tool_choice);
-	if (
-		original.tool_choice !== undefined &&
-		(!choice ||
-			!onlyKeys(choice, ["type", "name", "disable_parallel_tool_use"]))
-	)
-		return false;
-	let expectedChoice: unknown;
-	if (choice) {
-		if (
-			choice.type === "tool" &&
-			tools.some((tool) => tool.name === choice.name)
-		)
-			expectedChoice = { type: "function", name: choice.name };
-		else if (choice.type === "any") expectedChoice = "required";
-		else if (choice.type === "auto" || choice.type === "none")
-			expectedChoice = choice.type;
-		else return false;
+	return true;
+}
+
+/** The adapter picks the effort from the account's reasoning snapshot, which a
+ * catalog refresh republishes independently of the revision this target was
+ * resolved from. The wire must carry exactly the effort the pinned evidence
+ * yields, requested or default: a choice both agree on is stock's deterministic
+ * transform, while a disagreement means the body was built from another catalog
+ * generation.
+ */
+function codexWireEffortDecision(
+	original: Record<string, unknown>,
+	final: Record<string, unknown>,
+	capabilities: AutoModelCapabilities | null,
+	physicalModel: string,
+): QualityAdmissionDecision | null {
+	const wire = record(final.reasoning)?.effort;
+	if (typeof wire !== "string")
+		return { status: "unknown", reason: "request-preservation-unknown" };
+	const supported = capabilities?.supportedReasoningEfforts;
+	const pinned = supported?.length
+		? {
+				supportedEfforts: supported,
+				...(capabilities?.defaultReasoningEffort
+					? { defaultEffort: capabilities.defaultReasoningEffort }
+					: {}),
+			}
+		: null;
+	const model = typeof original.model === "string" ? original.model : null;
+	let expected: string | undefined;
+	try {
+		// The adapter clamps to the nearest supported effort and throws on an
+		// invalid value; resolve exactly as convertToCodexFormat does.
+		expected = resolveAnthropicReasoningEffort(original, {
+			sourceModel: model ?? undefined,
+			targetModel: physicalModel,
+			supportedTargetEfforts: pinned?.supportedEfforts,
+		}).effort;
+	} catch {
+		return { status: "unknown", reason: "request-preservation-unknown" };
 	}
-	return (
-		isDeepStrictEqual(expectedChoice, final.tool_choice) &&
-		(choice?.disable_parallel_tool_use === true
-			? final.parallel_tool_calls === false
-			: final.parallel_tool_calls === undefined)
+	// For a quality route the proxy sends the adapter the original request
+	// model's family (requestMeta.originalModel; appliedModel is unset there).
+	expected ??= selectCodexDefaultReasoningEffort(
+		physicalModel,
+		model ? getModelFamily(model) : null,
+		pinned,
 	);
+	return expected === wire
+		? null
+		: { status: "unknown", reason: "catalog-evidence-stale" };
 }
 
 /** Hosted server tools are proven per target by the provider materializer, the
@@ -547,10 +568,17 @@ function evaluateNativeAnthropicAdmission(
 }
 
 /** Evaluate original requirements before final representation, so translation
- * cannot hide images, tools, or the requested output. Local accounting is an
- * explicitly labelled operational estimate, not an exact tokenizer guarantee.
- * Codex subscription translation omits max_output_tokens: retaining the caller's
- * reserve here does not enforce a generation cap, even with a known catalog ceiling.
+ * cannot hide images, tools, or the requested output.
+ *
+ * Codex target contract: Auto must not refuse what the stock Codex route would
+ * translate and send deterministically. It is stricter than stock only where the
+ * adapter silently loses content (see codexTranslatesWithoutLoss). The final body
+ * is checked only to prove it was actually translated (a Responses body, not the
+ * untranslated Anthropic one), to carry the same model and output cap, and to
+ * carry the reasoning effort the pinned catalog evidence resolves. Context
+ * fit uses stock's estimator and reserve: fail open when the window is unknown,
+ * and no output reserve where the subscription endpoint drops max_output_tokens.
+ * A missing max_tokens is admitted (the adapter forwards no cap).
  */
 export function evaluateAutoRequestAdmission(
 	input: AutoRequestAdmissionInput,
@@ -573,15 +601,25 @@ export function evaluateAutoRequestAdmission(
 		return evaluateNativeAnthropicAdmission(input, target, original, final);
 	if (!final || final.model !== target.physicalModel)
 		return { status: "reject", reason: "model-unsupported" };
+	if (target.provider !== "codex")
+		return { status: "unknown", reason: "request-preservation-unknown" };
+	// A swallowed translation failure forwards the untranslated Anthropic body.
+	if (!Array.isArray(final.input) || Object.hasOwn(final, "messages"))
+		return { status: "unknown", reason: "request-preservation-unknown" };
 	const capabilities = target.capabilities;
 	const output = positiveSafeCapacity(original.max_tokens);
-	if (output === null)
-		return { status: "unknown", reason: "output-unsupported" };
-	if (
-		capabilities?.maxOutputTokens != null &&
-		output > capabilities.maxOutputTokens
-	)
-		return { status: "reject", reason: "output-unsupported" };
+	if (output !== null) {
+		if (
+			capabilities?.maxOutputTokens != null &&
+			output > capabilities.maxOutputTokens
+		)
+			return { status: "reject", reason: "output-unsupported" };
+		if (
+			final.max_output_tokens !== undefined &&
+			positiveSafeCapacity(final.max_output_tokens) !== output
+		)
+			return { status: "reject", reason: "output-unsupported" };
+	}
 	const requestedModalities = modalities(original);
 	if (
 		requestedModalities &&
@@ -598,85 +636,44 @@ export function evaluateAutoRequestAdmission(
 	}
 	if (!hosted && !clientTools(original))
 		return { status: "unknown", reason: "tools-unsupported" };
-	if (target.provider === "codex") {
-		if (
-			final.max_output_tokens !== undefined &&
-			positiveSafeCapacity(final.max_output_tokens) !== output
-		)
-			return { status: "reject", reason: "output-unsupported" };
-		if (!codexPreserves(original, final, capabilities))
-			return { status: "unknown", reason: "request-preservation-unknown" };
-	} else return { status: "unknown", reason: "request-preservation-unknown" };
-	if (!requestedModalities || !capabilities?.inputModalities)
-		return { status: "unknown", reason: "modality-unsupported" };
-	const providerManagedOutput =
-		target.provider === "codex" && capabilities.providerManagedOutput === true;
-	if (capabilities.maxOutputTokens === null && !providerManagedOutput)
-		return { status: "unknown", reason: "output-unsupported" };
-	if (capabilities.maxContextWindow === null)
-		return { status: "unknown", reason: "context-unsupported" };
-	// Operational policy, NOT a tokenizer guarantee: one token per UTF-8 byte of
-	// the entire final JSON envelope, plus 25% and 1024 tokens of framing headroom.
-	// This intentionally overcounts JSON/schema/protocol fields. It is independent
-	// of request/header token claims. No media or server-tool hidden prompt estimate.
-	// Provider count_tokens is itself an estimate; no request-bound trusted count
-	// owner exists here yet, so do not accept a caller-supplied count or valid=true.
-	if (
-		hosted ||
-		[...requestedModalities].some((value) => value !== "text") ||
-		Object.keys(original).some(
-			(key) =>
-				![
-					"model",
-					"messages",
-					"system",
-					"tools",
-					"tool_choice",
-					"max_tokens",
-					"stream",
-					"metadata",
-					"temperature",
-					"top_p",
-					"top_k",
-					"stop_sequences",
-					"output_config",
-				].includes(key),
-		)
-	)
-		return { status: "unknown", reason: "input-accounting-unknown" };
-	const envelopeBytes = new TextEncoder().encode(JSON.stringify(final)).length;
-	const inputEstimate = envelopeBytes;
-	const headroom = Math.ceil(inputEstimate / 4) + 1024;
-	// Use the smaller advertised current/maximum window; a larger maximum is
-	// not permission to silently opt into a different context configuration.
-	const rawContextLimit = Math.min(
-		capabilities.maxContextWindow,
-		capabilities.contextWindow ?? capabilities.maxContextWindow,
+	if (!codexTranslatesWithoutLoss(original))
+		return { status: "unknown", reason: "request-preservation-unknown" };
+	const effort = codexWireEffortDecision(
+		original,
+		final,
+		capabilities,
+		target.physicalModel,
 	);
+	if (effort) return effort;
+	if (capabilities?.maxContextWindow == null) return { status: "admit" };
+	// Mirrors stock admitConcreteCodexModel: the same estimator, no local
+	// headroom, and the reserve the wire carries (the subscription endpoint
+	// deletes max_output_tokens, so it reserves 0). This is an estimate, not a
+	// tokenizer guarantee. Unlike stock, which defers a low-confidence overflow
+	// to the provider, Auto skips the lane: it has another rung to try.
+	const inputEstimate = estimateAnthropicAdmissionTokens(original).tokens;
+	const reserve = positiveSafeCapacity(final.max_output_tokens) ?? 0;
+	// Stock's window (resolveModelContextCapability): the maximum window at the
+	// effective percent.
 	const contextLimit = Math.floor(
-		(rawContextLimit * (capabilities.effectiveContextPercent ?? 100)) / 100,
+		(capabilities.maxContextWindow *
+			(capabilities.effectiveContextPercent ?? 100)) /
+			100,
 	);
-	return {
-		...decideAutoContextFit({
-			inputUpperBound: inputEstimate + headroom,
-			requestedOutput: output,
-			contextLimit,
-			outputLimit: capabilities.maxOutputTokens,
-			...(providerManagedOutput
-				? { outputLimitMode: "provider-managed" as const }
-				: {}),
-		}),
-		accounting: {
-			source: "local-envelope-v1",
-			kind: "estimate",
-			envelopeBytes,
-			inputEstimate,
-			headroom,
-			requestedOutput: output,
-			outputLimit:
-				capabilities.maxOutputTokens === null
-					? { kind: "provider-managed", tokens: null }
-					: { kind: "catalog", tokens: capabilities.maxOutputTokens },
-		},
+	const ceiling = capabilities.maxOutputTokens;
+	const accounting: NonNullable<QualityAdmissionDecision["accounting"]> = {
+		source: "stock-codex-estimate-v1",
+		kind: "estimate",
+		envelopeBytes: new TextEncoder().encode(JSON.stringify(original)).length,
+		inputEstimate,
+		headroom: 0,
+		requestedOutput: reserve,
+		outputLimit:
+			ceiling === null
+				? { kind: "provider-managed", tokens: null }
+				: { kind: "catalog", tokens: ceiling },
 	};
+	return inputEstimate > contextLimit - reserve
+		? { status: "reject", reason: "context-unsupported", accounting }
+		: { status: "admit", accounting };
 }
