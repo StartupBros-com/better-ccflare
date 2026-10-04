@@ -172,42 +172,56 @@ export interface AdvisorModelUsage {
 	cacheCreationInputTokens: number;
 }
 
-function advisorTokenCount(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0
-		? value
-		: 0;
-}
+const ADVISOR_TOKEN_FIELDS = [
+	"inputTokens",
+	"outputTokens",
+	"cacheReadInputTokens",
+	"cacheCreationInputTokens",
+] as const;
 
-/** Reads a stored `advisor_usage` value, skipping anything that is not an
- * entry this repository wrote. */
-function parseAdvisorUsage(raw: string): AdvisorModelUsage[] {
+/** Reads a stored `advisor_usage` value. Anything this repository would not
+ * have written is left out of `entries` and reported through `malformed`. */
+function parseAdvisorUsage(raw: string): {
+	entries: AdvisorModelUsage[];
+	malformed: boolean;
+} {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
-		log.warn("Skipping unparseable advisor_usage value");
-		return [];
+		return { entries: [], malformed: true };
 	}
-	if (!Array.isArray(parsed)) return [];
+	if (!Array.isArray(parsed)) return { entries: [], malformed: true };
 	const entries: AdvisorModelUsage[] = [];
+	let malformed = false;
 	for (const entry of parsed) {
-		if (typeof entry !== "object" || entry === null) continue;
-		const { model } = entry as { model?: unknown };
-		if (model !== null && model !== undefined && typeof model !== "string") {
+		const fields =
+			typeof entry === "object" && entry !== null
+				? (entry as Record<string, unknown>)
+				: undefined;
+		const model = fields?.model ?? null;
+		if (!fields || (model !== null && typeof model !== "string")) {
+			malformed = true;
 			continue;
 		}
-		const tokens = entry as Record<string, unknown>;
-		entries.push({
-			model: model ?? null,
-			inputTokens: advisorTokenCount(tokens.inputTokens),
-			outputTokens: advisorTokenCount(tokens.outputTokens),
-			cacheReadInputTokens: advisorTokenCount(tokens.cacheReadInputTokens),
-			cacheCreationInputTokens: advisorTokenCount(
-				tokens.cacheCreationInputTokens,
-			),
-		});
+		const usage: AdvisorModelUsage = {
+			model,
+			inputTokens: 0,
+			outputTokens: 0,
+			cacheReadInputTokens: 0,
+			cacheCreationInputTokens: 0,
+		};
+		for (const field of ADVISOR_TOKEN_FIELDS) {
+			const value = fields[field];
+			if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+				usage[field] = value;
+			} else {
+				malformed = true;
+			}
+		}
+		entries.push(usage);
 	}
-	return entries;
+	return { entries, malformed };
 }
 
 export class RequestRepository extends BaseRepository<RequestData> {
@@ -778,9 +792,9 @@ export class RequestRepository extends BaseRepository<RequestData> {
 		// count. An entry with no model joins the '' line, as an executor row
 		// with no model does, so window value reports it unpriced rather than
 		// dropping it.
-		const advisorRows = await this.query<{ advisor_usage: string }>(
+		const advisorRows = await this.query<{ id: string; advisor_usage: string }>(
 			`
-			SELECT advisor_usage
+			SELECT id, advisor_usage
 			FROM requests
 			WHERE account_used = ?
 			  AND path = '/v1/messages'
@@ -791,8 +805,11 @@ export class RequestRepository extends BaseRepository<RequestData> {
 			[accountId, fromMs, toMs],
 		);
 		const aggregates = this.mapTokenAggregateRows(rows);
+		const malformedAdvisorIds: string[] = [];
 		for (const row of advisorRows) {
-			for (const usage of parseAdvisorUsage(row.advisor_usage)) {
+			const { entries, malformed } = parseAdvisorUsage(row.advisor_usage);
+			if (malformed) malformedAdvisorIds.push(row.id);
+			for (const usage of entries) {
 				const advisorModel = usage.model ?? "";
 				let target = aggregates.find((entry) => entry.model === advisorModel);
 				if (!target) {
@@ -811,6 +828,15 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				target.cacheCreationInputTokens += usage.cacheCreationInputTokens;
 				target.outputTokens += usage.outputTokens;
 			}
+		}
+		if (malformedAdvisorIds.length > 0) {
+			// Only save() writes advisor_usage, so these rows were altered
+			// elsewhere; whatever could not be read is missing from window value.
+			log.warn("Skipped malformed advisor_usage in window aggregate", {
+				accountId,
+				count: malformedAdvisorIds.length,
+				requestIds: malformedAdvisorIds.slice(0, 10),
+			});
 		}
 		return aggregates;
 	}

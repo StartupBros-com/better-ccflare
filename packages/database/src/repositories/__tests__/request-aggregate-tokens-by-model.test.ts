@@ -7,6 +7,7 @@
  */
 import { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, it } from "bun:test";
+import { logBus } from "@better-ccflare/logger";
 import { BunSqlAdapter } from "../../adapters/bun-sql-adapter";
 import { runMigrations } from "../../migrations";
 import { RequestRepository } from "../request.repository";
@@ -276,22 +277,43 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 			});
 		});
 
-		it("ignores an advisor_usage value that is not a JSON array of entries", async () => {
+		it("skips malformed advisor_usage, keeps valid entries beside it, and warns with the request ids", async () => {
 			seedAdvisor("a1", "not json");
 			seedAdvisor("a2", { model: "claude-opus-4", outputTokens: 3 });
 			seedAdvisor("a3", [null, "claude-opus-4"]);
-
-			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
-			expect(rows).toEqual([
-				{
-					model: "claude-sonnet-5",
-					requestCount: 3,
-					inputTokens: 300,
-					cacheReadInputTokens: 30,
-					cacheCreationInputTokens: 15,
-					outputTokens: 150,
-				},
+			seedAdvisor("a4", [
+				OPUS_ADVISOR,
+				{ ...OPUS_ADVISOR, model: 123 },
+				{ ...OPUS_ADVISOR, outputTokens: "9", inputTokens: -4 },
 			]);
+			seedAdvisor("a5", [OPUS_ADVISOR]);
+			const warnings: Array<{ level: string; data?: unknown }> = [];
+			const onLog = (event: { level: string; data?: unknown }) => {
+				if (event.level === "WARN") warnings.push(event);
+			};
+			logBus.on("log", onLog);
+			const rows = await repo
+				.aggregateTokensByModel("acc1", 0, 5000)
+				.finally(() => logBus.off("log", onLog));
+
+			const byModel = Object.fromEntries(rows.map((r) => [r.model, r]));
+			expect(byModel["claude-sonnet-5"]?.requestCount).toBe(5);
+			// a4's valid entry and the readable fields of its partly bad entry
+			// still count; a5 is untouched.
+			expect(byModel["claude-opus-4"]).toEqual({
+				model: "claude-opus-4",
+				requestCount: 0,
+				inputTokens: 7 + 7,
+				cacheReadInputTokens: 2 + 2 + 2,
+				cacheCreationInputTokens: 1 + 1 + 1,
+				outputTokens: 3 + 3,
+			});
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]?.data).toEqual({
+				accountId: "acc1",
+				count: 4,
+				requestIds: expect.arrayContaining(["a1", "a2", "a3", "a4"]),
+			});
 		});
 
 		it("leaves output identical when no row carries advisor data", async () => {

@@ -1922,9 +1922,9 @@ export class UsageCollector {
 				(state.usage.cacheReadInputTokens ?? 0) +
 				(state.usage.cacheCreationInputTokens ?? 0)
 			: undefined;
-		// Advisor tokens (R14): per-model sums over exactly the iterations
-		// priced at finalize (billable and not stale), so tokens and cost
-		// agree. Plan-window value prices each model's entry at that model; an
+		// Advisor tokens (R14): per-model sums over the iterations finalize
+		// prices (billable and not stale), so tokens and cost cover the same
+		// iterations. Plan-window value prices each model's entry at that model; an
 		// iteration naming no model keeps a null model and counts as unpriced.
 		// Computed eagerly because the write below runs later, after
 		// freeRequestState.

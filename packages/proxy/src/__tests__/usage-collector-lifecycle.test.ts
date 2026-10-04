@@ -1902,7 +1902,7 @@ describe("UsageCollector request lifecycle", () => {
 					costUsd: EXECUTOR_COST,
 				});
 				// A stale snapshot persists no advisor tokens.
-				expect(savedUsages.get(requestId)?.advisorUsage).toBeUndefined();
+				expect(savedUsages.get(requestId)).not.toHaveProperty("advisorUsage");
 				expect(advisorLogs.events).toHaveLength(1);
 				expect(advisorLogs.events[0]?.data).toMatchObject({
 					requestId,
