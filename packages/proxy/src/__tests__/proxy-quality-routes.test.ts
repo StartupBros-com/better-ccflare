@@ -3378,14 +3378,22 @@ describe("prewarmed native catalogs", () => {
 			).toBe("quality_route_unavailable");
 			expect(sends).toHaveLength(0);
 		});
-		it("does not admit an enrolled anthropic account on a custom endpoint for advisor", async () => {
-			for (const a of accounts) a.custom_endpoint = "https://gateway.invalid";
-			// A custom endpoint also voids the native catalog evidence, so such an
-			// account is not an Auto candidate at all; advisor must never reach it.
+		it("skips an Auto candidate whose live account row carries a custom endpoint, and refuses advisor", async () => {
+			// Selection and catalog evidence still see the enrolled first-party
+			// account, so it is a real Auto candidate. The per-candidate row lookup
+			// returns it with a custom endpoint, which the advisor first-party check
+			// must reject before any wire is built.
+			const lookup = ctx.dbOps.getAccount;
+			ctx.dbOps.getAccount = async (id: string) => {
+				const row = await lookup(id);
+				return row
+					? { ...row, custom_endpoint: "https://gateway.invalid" }
+					: row;
+			};
 			const response = await send(
 				request(undefined, {}, { tools: [advisorTool] }),
 			);
-			expect(response.status).not.toBe(200);
+			await refusal(response, declaration);
 			expect(sends).toHaveLength(0);
 		});
 		it.each([
