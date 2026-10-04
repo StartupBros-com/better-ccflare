@@ -2157,7 +2157,16 @@ describe("native quota wait execution", () => {
 			});
 			const response = await handleProxy(request, new URL(request.url), ctx);
 			expect(transport).not.toHaveBeenCalled();
-			expect(response.status).toBe(503);
+			// This pool has no replay runtime. It used to end at replay_unavailable
+			// (503) before selection; a first-party Anthropic pool can now be served
+			// natively without replay, so the request reaches selection. The mocked
+			// provider declares no logical-model capability, so no candidate is
+			// proven and the typed permanent refusal is the honest answer. Neither
+			// outcome defers the backups or sends upstream.
+			expect(response.status).toBe(400);
+			expect(
+				((await response.json()) as { error: { code: string } }).error.code,
+			).toBe("server_tool_capability_unavailable");
 			expect(response.headers.get("x-should-retry")).not.toBe("true");
 		} finally {
 			restore();
