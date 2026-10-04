@@ -45,7 +45,8 @@ The design of the fix is in [routing-architecture.md, "Advisor native routing co
 
 - **`/advisor off` as the stopgap.** Claude Code keeps a conversation's declared advisor tool, so the prompt prefix stays stable, until `/clear` or `/compact` (auto memory [claude]). Turning the setting off didn't remove the tool from the chat that was already failing.
   - The 2.1.289 `/advisor` message says turning the advisor on or off "applies right away", and that only a model change waits for `/clear` or `/compact`. Newer clients may therefore behave differently.
-  - The escape that works on both versions is `/clear`, or relaunching the session with `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1 claude --resume <id>`.
+  - With the advisor off, `/clear` gets out: it starts a new conversation, which no longer declares the tool. `/clear` alone is not enough, because while `advisorModel` is still set the new conversation declares the advisor again.
+  - Relaunching with `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1 claude --resume <id>` should also work, since that variable turns the client's advisor gate off. This comes from reading the client code; nobody has tried it.
 - **Treating advisor like hosted web search.** The proxy runs `web_search_20250305` itself through its hosted-tool layer. It can't do the same for advisor, because only `api.anthropic.com` executes an advisor call. So advisor became a constraint on which accounts may carry the request, not a capability some provider implements. The routing doc gives the full reasoning.
 - **Totalling advisor tokens from the iterations kept for pricing.** The first cut of `advisor_usage` summed only the advisor iterations retained for pricing, which stop at `MAX_USAGE_ITERATIONS = 64` (`packages/proxy/src/usage-collector.ts:194`). Billable advisor tokens past the 64th iteration were silently dropped. A cross-model review caught it before merge. The totals are now built over the full raw `usage.iterations` array (`usage-collector.ts:96-99`, `:359`).
 - **Two traps in the first production check.**
@@ -87,9 +88,9 @@ The refusals work because Claude Code recovers from advisor errors by matching s
 - **Know the client-side advisor facts when reading a report.** These were checked in the Claude Code 2.1.289 binary:
   - `/advisor <model>` in a terminal saves `advisorModel` to user settings, so it applies to every new session on the machine. `/advisor off` there is global too.
   - The per-session controls are the `--advisor <model>` launch flag and `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`.
-  - The advisor must rank at least as high as the main model on the catalog's `advisor_rank`: Haiku 4.5 = 1, Sonnet 5 = 4, Sonnet 5.5 = 6, Opus 5 and 5.5 = 7, Fable 5.1 = 9. Equal ranks are allowed, so a Fable chat gets Fable advising Fable. Opus can't advise a Fable chat, and the client quietly leaves the advisor out instead.
+  - The advisor must rank at least as high as the main model on the catalog's `advisor_rank`: Haiku 4.5 = 1, Sonnet 5 = 4, Sonnet 5.5 = 6, Opus 5 and 5.5 = 7, Fable 5.1 = 9. Equal ranks are allowed, so a Fable chat gets Fable advising Fable. Opus can't advise a Fable chat. The client leaves the advisor out, with the reason "advisor must be at least as capable as the base model"; whether that reason is shown to the user was not checked.
   - Subagents check the same setting against their own model. This comes from reading the code; no subagent advisor call has been observed yet.
-- **Expect large, uncached advisor input.** Each advisor call sends the whole transcript to the advisor model with no cache: the first live call read 199,528 input tokens and 0 cached. It counts against the advisor model's quota, not the main model's.
+- **Expect large, uncached advisor input.** Each advisor call sends the whole transcript to the advisor model with no cache. The first three production calls on 2026-10-04 read 199,528, 217,727 and 231,684 input tokens, all with 0 cached. Two of them came from Opus 5.5 chats with a Fable advisor, so the mixed-model case works too. better-ccflare prices advisor tokens at the advisor model's rate, not the main model's.
 
 ## Related Issues
 
