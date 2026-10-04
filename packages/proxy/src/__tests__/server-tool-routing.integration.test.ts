@@ -2496,6 +2496,150 @@ describe("advisor native-only selection through handleProxy", () => {
 		});
 	});
 
+	describe("when the removed non-first-party account is itself usage-blocked", () => {
+		const throttleAccount = (ctx: ProxyContext, account: Account) => {
+			ctx.config.getUsageThrottlingFiveHourEnabled = () => true;
+			usageCache.set(account.id, {
+				five_hour: {
+					utilization: 80,
+					resets_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+				},
+				seven_day: { utilization: 10, resets_at: null },
+			});
+		};
+		const deplete = (account: Account) => {
+			usageCache.markModelScopedExhausted(
+				account.id,
+				MODEL,
+				ADVISOR_BETA,
+				Date.now() + 60_000,
+			);
+		};
+		const send = async (request: Request, ctx: ProxyContext) => {
+			globalThis.fetch = mock(
+				async () => new Response("{}", { status: 500 }),
+			) as unknown as typeof fetch;
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			const text = await response.text();
+			return { response, text };
+		};
+		const expectNoAdvisorPhrase = (text: string) => {
+			expect(text).not.toContain(DECLARATION_PHRASE);
+			expect(text).not.toContain(HISTORY_PHRASE);
+		};
+		const plainRequest = () => advisorRequest({ tools: [] });
+
+		it("returns the usage-throttle 529, not the refusal, when the only non-first-party account is predictively throttled", async () => {
+			const gw = gateway();
+			const { ctx } = makeContext([gw]);
+			throttleAccount(ctx, gw);
+			try {
+				const { response, text } = await send(advisorRequest(), ctx);
+				expect(response.status).toBe(529);
+				expectNoAdvisorPhrase(text);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+
+				const control = makeContext([gw]);
+				throttleAccount(control.ctx, gw);
+				const plain = await send(plainRequest(), control.ctx);
+				expect(plain.response.status).toBe(response.status);
+			} finally {
+				usageCache.delete(gw.id);
+			}
+		});
+
+		it("returns the model-pool terminal, not the refusal, when the only non-first-party account is reactively depleted", async () => {
+			const gw = gateway();
+			const { ctx } = makeContext([gw]);
+			deplete(gw);
+			try {
+				const { response, text } = await send(advisorRequest(), ctx);
+				expect(response.status).toBe(503);
+				expectNoAdvisorPhrase(text);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				usageCache.delete(gw.id);
+			}
+		});
+
+		it("keeps the 529 when both the first-party and the non-first-party account are throttled", async () => {
+			const first = firstParty();
+			const gw = gateway();
+			const { ctx } = makeContext([gw, first]);
+			throttleAccount(ctx, first);
+			throttleAccount(ctx, gw);
+			try {
+				const { response, text } = await send(advisorRequest(), ctx);
+				expect(response.status).toBe(529);
+				expectNoAdvisorPhrase(text);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				usageCache.delete(first.id);
+				usageCache.delete(gw.id);
+			}
+		});
+
+		it("still refuses when an unthrottled non-first-party account is available and no first-party account is", async () => {
+			const first = firstParty();
+			const { ctx } = makeContext([gateway(), first]);
+			throttleAccount(ctx, first);
+			try {
+				const { response, text } = await send(advisorRequest(), ctx);
+				expect(response.status).toBe(400);
+				expect(text).toContain(DECLARATION_PHRASE);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+			} finally {
+				usageCache.delete(first.id);
+			}
+		});
+
+		it("still refuses when the only non-first-party account is unthrottled", async () => {
+			const { ctx } = makeContext([gateway()]);
+			const { response, text } = await send(advisorRequest(), ctx);
+			expect(response.status).toBe(400);
+			expect(text).toContain(DECLARATION_PHRASE);
+			expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		});
+
+		it("returns the usage-throttle 529 for a force-routed non-first-party pin that is predictively throttled", async () => {
+			const gw = gateway();
+			const forced = { "x-better-ccflare-account-id": gw.id };
+			const { ctx } = makeContext([gw, firstParty()]);
+			throttleAccount(ctx, gw);
+			try {
+				const { response, text } = await send(
+					advisorRequest({ headers: forced }),
+					ctx,
+				);
+				expect(response.status).toBe(529);
+				expectNoAdvisorPhrase(text);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+
+				const control = makeContext([gw, firstParty()]);
+				throttleAccount(control.ctx, gw);
+				const plain = await send(
+					advisorRequest({ tools: [], headers: forced }),
+					control.ctx,
+				);
+				expect(plain.response.status).toBe(response.status);
+			} finally {
+				usageCache.delete(gw.id);
+			}
+		});
+
+		it("still refuses a force-routed non-first-party pin that is not throttled", async () => {
+			const gw = gateway();
+			const { ctx } = makeContext([gw, firstParty()]);
+			const { response, text } = await send(
+				advisorRequest({ headers: { "x-better-ccflare-account-id": gw.id } }),
+				ctx,
+			);
+			expect(response.status).toBe(400);
+			expect(text).toContain(DECLARATION_PHRASE);
+			expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		});
+	});
+
 	it("refuses a history-only request when only a non-first-party account is available (AE3)", async () => {
 		const request = advisorRequest({
 			tools: [],

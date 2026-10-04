@@ -49,6 +49,7 @@ const {
 	getClientVisibleServerToolAccountId,
 	getCapacityDeferredModelRoutes,
 	getNativeConstraintRemovedAccountIds,
+	getNativeConstraintUsageBlockedRemovals,
 	getComboSlotInfo,
 	getReactiveModelCapacityBlocker,
 	getRouteProfileConstraintViolation,
@@ -57,6 +58,7 @@ const {
 	isImplicitFallbackAccountAllowed,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
+	setNativeRemovalUsageGate,
 	setComboSlotInfo,
 } = await import("../account-selector");
 const { filterRequestCompatibleAccounts } = await import("../routing-terminal");
@@ -6942,6 +6944,73 @@ describe("selectAccountsForRequest — native Anthropic advisor constraint", () 
 			"claude-opus-5",
 		);
 		expect(control.map(({ id }) => id)).toEqual(["codex-sol"]);
+	});
+
+	describe("with the usage-throttle gate registered", () => {
+		const codexPool = () => [
+			serving({ id: "codex", provider: "codex" }, MODEL_ID),
+		];
+		const descendantMeta = () =>
+			advisorMeta(DECLARED, {
+				routeLineage: { kind: "descendant", childHomeKey: null },
+			});
+		const refusalOrNull = async (meta: RequestMeta) => {
+			try {
+				await selectAccountsForRequest(
+					meta,
+					makeCtx({ accounts: codexPool() }),
+					MODEL_ID,
+				);
+			} catch (error) {
+				return error;
+			}
+			return null;
+		};
+
+		it("refuses a descendant over a non-first-party-only pool with no gate or a passing gate", async () => {
+			expectRefusal(await refusalOrNull(descendantMeta()));
+			const passing = descendantMeta();
+			setNativeRemovalUsageGate(passing, () => null);
+			expectRefusal(await refusalOrNull(passing));
+		});
+
+		it("does not refuse a descendant when the gate blocks the only non-first-party account", async () => {
+			const meta = descendantMeta();
+			setNativeRemovalUsageGate(meta, () => "predictive");
+			const outcome = await refusalOrNull(meta);
+			expect((outcome as Error | null)?.name).not.toBe(
+				"ServerToolRoutingError",
+			);
+			expect(getNativeConstraintRemovedAccountIds(meta).size).toBe(0);
+			expect(
+				getNativeConstraintUsageBlockedRemovals(meta).map(
+					({ account, kind }) => [account.id, kind],
+				),
+			).toEqual([["codex", "predictive"]]);
+		});
+
+		it("does not refuse a capability profile when the gate blocks the Codex pool member", async () => {
+			const codex = makeAccount({
+				id: "codex-sol",
+				provider: "codex",
+				model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+			});
+			const meta = solProfile({ nativeAnthropicToolRequirement: DECLARED });
+			setNativeRemovalUsageGate(meta, () => "reactive");
+			let outcome: unknown = null;
+			try {
+				await selectAccountsForRequest(
+					meta,
+					makeCtx({ accounts: [codex] }),
+					"claude-opus-5",
+				);
+			} catch (error) {
+				outcome = error;
+			}
+			expect((outcome as Error | null)?.name).not.toBe(
+				"ServerToolRoutingError",
+			);
+		});
 	});
 
 	it("keeps the capability-profile 503 when the Codex pool member could not serve anyway", async () => {

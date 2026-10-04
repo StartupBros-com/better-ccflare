@@ -123,6 +123,7 @@ import {
 	getCapacityDeferredModelRoutes,
 	getClientVisibleServerToolAccountId,
 	getNativeConstraintRemovedAccountIds,
+	getNativeConstraintUsageBlockedRemovals,
 	getNativeQuotaCandidateModelUnavailableUntil,
 	getNativeQuotaContext,
 	getReactiveModelCapacityBlocker,
@@ -132,6 +133,8 @@ import {
 	isImplicitCodexDiscoveryEligible,
 	isNativeQuotaRequestCandidateEligible,
 	isNativeQuotaRouteAllowed,
+	type NativeRemovalUsageBlockKind,
+	setNativeRemovalUsageGate,
 } from "./handlers/account-selector";
 import {
 	type AnthropicDegradedRequestSendState,
@@ -1941,6 +1944,39 @@ async function handleProxyCoreImpl(
 	requestMeta.codexPacingCohortId = pacingCohortKey?.slice(0, 16) ?? null;
 	const effectiveModel = resolveEffectiveModel(appliedModel, requestModel);
 	const syntheticProbe = trustedInternalKeepalive;
+	// Mirror applyUsageThrottling for accounts the native advisor constraint
+	// removes before they reach it, so a throttled/depleted one cannot turn the
+	// pool's usage terminal into an advisor refusal. Side-effect free: the
+	// reactive state is recorded when the empty-pool site merges the blocked ids.
+	setNativeRemovalUsageGate(
+		requestMeta,
+		(account, model): NativeRemovalUsageBlockKind | null => {
+			if (trustedInternalAutoRefresh || trustedInternalKeepalive) return null;
+			const now = Date.now();
+			const comboRouted = requestMeta.comboName != null;
+			const candidateModel = comboRouted
+				? null
+				: (model ?? appliedModel ?? requestModel ?? null);
+			if (
+				!comboRouted &&
+				getReactiveModelRecoveryAt({
+					accountId: account.id,
+					model: candidateModel,
+					betaSignature: req.headers.get("anthropic-beta"),
+					syntheticProbe,
+					now,
+				}) !== null
+			) {
+				return "reactive";
+			}
+			const throttleUntil = getPredictiveThrottleUntil(
+				account,
+				candidateModel,
+				now,
+			);
+			return throttleUntil && throttleUntil > now ? "predictive" : null;
+		},
+	);
 	const selectAccountsWithDeadline = (
 		options?: Parameters<typeof selectAccountsForRequest>[3],
 	) => {
@@ -2692,6 +2728,26 @@ async function handleProxyCoreImpl(
 
 		const emptyPoolRefusal = nativeConstraintEmptyPoolRefusal();
 		if (emptyPoolRefusal) return finishPacing(pacingSlot, emptyPoolRefusal);
+
+		// Removed non-first-party accounts the usage stage would also have
+		// dropped keep the pool's own usage terminal, as for a non-advisor request.
+		for (const {
+			account,
+			kind,
+			model,
+		} of getNativeConstraintUsageBlockedRemovals(requestMeta)) {
+			if (kind === "reactive") {
+				hasReactiveModelDepletion({
+					accountId: account.id,
+					model: model ?? appliedModel ?? requestModel ?? null,
+					betaSignature: req.headers.get("anthropic-beta"),
+					syntheticProbe,
+				});
+				reactivelyDepletedAccounts.push(account);
+			} else {
+				throttledAccounts.push(account);
+			}
+		}
 
 		const nativeTerminal = nativeQuotaTerminal("selection");
 		if (nativeTerminal) return finishPacing(pacingSlot, nativeTerminal);

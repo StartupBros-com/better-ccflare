@@ -2132,6 +2132,73 @@ export function getNativeConstraintRemovedAccountIds(
 
 const EMPTY_ACCOUNT_ID_SET: ReadonlySet<string> = new Set();
 
+/** Why handleProxy's usage-throttle stage would drop an account. */
+export type NativeRemovalUsageBlockKind = "predictive" | "reactive";
+
+/**
+ * Per-request probe of handleProxy's usage-throttle stage, registered before
+ * selection. Removed accounts never reach that stage, so without it a removed
+ * account that is predictively throttled or reactively depleted would count as
+ * servable and turn the pool's usage terminal into an advisor refusal. Must be
+ * side-effect free; null means the account passes the stage.
+ */
+export type NativeRemovalUsageGate = (
+	account: Account,
+	model: string | null,
+) => NativeRemovalUsageBlockKind | null;
+
+const nativeRemovalUsageGateMap = new WeakMap<
+	RequestMeta,
+	NativeRemovalUsageGate
+>();
+/** A removed account the usage stage would drop, with the model it was judged for. */
+export interface NativeRemovalUsageBlock {
+	account: Account;
+	kind: NativeRemovalUsageBlockKind;
+	model: string | null;
+}
+
+const nativeConstraintUsageBlockedMap = new WeakMap<
+	RequestMeta,
+	Map<string, NativeRemovalUsageBlock>
+>();
+
+export function setNativeRemovalUsageGate(
+	meta: RequestMeta,
+	gate: NativeRemovalUsageGate,
+): void {
+	nativeRemovalUsageGateMap.set(meta, gate);
+}
+
+/**
+ * Available non-first-party accounts the native constraint removed that the
+ * usage-throttle stage would also have dropped, by kind. The caller merges
+ * them into its throttled/depleted lists when the pool empties, so the pool
+ * keeps the terminal a non-advisor request would get (R7).
+ */
+export function getNativeConstraintUsageBlockedRemovals(
+	meta: RequestMeta,
+): ReadonlyArray<NativeRemovalUsageBlock> {
+	return [...(nativeConstraintUsageBlockedMap.get(meta)?.values() ?? [])];
+}
+
+/** True (and recorded) when the usage-throttle stage would drop the account. */
+function isNativeRemovalUsageBlocked(
+	meta: RequestMeta,
+	account: Account,
+	model: string | null,
+): boolean {
+	const kind = nativeRemovalUsageGateMap.get(meta)?.(account, model) ?? null;
+	if (kind === null) return false;
+	let blocked = nativeConstraintUsageBlockedMap.get(meta);
+	if (!blocked) {
+		blocked = new Map();
+		nativeConstraintUsageBlockedMap.set(meta, blocked);
+	}
+	blocked.set(account.id, { account, kind, model });
+	return true;
+}
+
 function createNativeConstraintRefusal(
 	meta: RequestMeta,
 ): ServerToolRoutingError {
@@ -2145,7 +2212,8 @@ function createNativeConstraintRefusal(
 
 /**
  * Whether the constraint removes this account and the account could otherwise
- * have served: not paused or rate-limited, and no capacity blocker for `model`.
+ * have served: not paused or rate-limited, no capacity blocker for `model`, and
+ * not dropped by the usage-throttle stage handleProxy runs after selection.
  * Callers pass only accounts that already cleared every other gate.
  */
 function isServableNativeRemoval(
@@ -2157,16 +2225,19 @@ function isServableNativeRemoval(
 	if (!hasNativeAnthropicConstraint(meta)) return false;
 	if (isFirstPartyAnthropicAccount(account)) return false;
 	if (!isAccountAvailable(account)) return false;
-	if (model === null) return true;
-	return (
+	if (
+		model !== null &&
 		evaluateCandidateCapacity(
 			account,
 			model,
 			canonicalizeBetaSignature(meta.headers?.get("anthropic-beta")),
 			Date.now(),
 			options,
-		).blockers.length === 0
-	);
+		).blockers.length > 0
+	) {
+		return false;
+	}
+	return !isNativeRemovalUsageBlocked(meta, account, model);
 }
 
 function recordNativeConstraintRemoval(
@@ -3131,6 +3202,7 @@ async function selectAccountsForRequestInternal(
 	nativeQuotaRequestContextMap.delete(meta);
 	capacityDeferredModelRoutesMap.delete(meta);
 	nativeConstraintRemovedMap.delete(meta);
+	nativeConstraintUsageBlockedMap.delete(meta);
 	meta.comboName = null;
 	meta.comboSlotIndex = null;
 	const effectiveModel =
@@ -3201,6 +3273,14 @@ async function selectAccountsForRequestInternal(
 				hasNativeAnthropicConstraint(meta) &&
 				!isFirstPartyAnthropicAccount(forcedAccount)
 			) {
+				// A forced non-advisor request still reaches the usage-throttle
+				// stage, so a throttled pin keeps that terminal (R7).
+				if (
+					isAccountAvailable(forcedAccount) &&
+					isNativeRemovalUsageBlocked(meta, forcedAccount, effectiveModel)
+				) {
+					return [];
+				}
 				throw createNativeConstraintRefusal(meta);
 			}
 			if (
