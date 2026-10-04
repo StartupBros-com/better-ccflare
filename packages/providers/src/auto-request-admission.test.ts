@@ -1007,29 +1007,21 @@ describe("Auto advisor admission is decided by first-party status", () => {
 			"admit",
 		);
 	});
-	it("admits advisor history blocks that carry cache_control on a first-party candidate", () => {
-		const cacheControl = { type: "ephemeral" };
-		const messages = advisorHistory.map((message) =>
-			Array.isArray(message.content)
-				? {
-						...message,
-						content: message.content.map((block) =>
-							block.type === "text"
-								? block
-								: { ...block, cache_control: cacheControl },
-						),
-					}
-				: message,
-		);
-		expect(decide({ ...body, messages }, true).status).toBe("admit");
-	});
 	it("admits advisor history with extra keys on a first-party candidate, as stock routing sends it", () => {
 		// #430: native admission applies only proven rejections, no shape check.
-		for (const index of [0, 1]) {
-			const messages = structuredClone(advisorHistory);
-			(messages[1].content as Record<string, unknown>[])[index].bogus = 1;
-			expect(decide({ ...body, messages }, true).status).toBe("admit");
-		}
+		// cache_control is the extra key Claude Code actually sends.
+		for (const extra of [
+			{ cache_control: { type: "ephemeral" } },
+			{ bogus: 1 },
+		])
+			for (const index of [0, 1]) {
+				const messages = structuredClone(advisorHistory);
+				Object.assign(
+					(messages[1].content as Record<string, unknown>[])[index],
+					extra,
+				);
+				expect(decide({ ...body, messages }, true).status).toBe("admit");
+			}
 	});
 	it("does not admit the advisor declaration on a native candidate that is not first-party", () => {
 		for (const firstParty of [false, undefined])
