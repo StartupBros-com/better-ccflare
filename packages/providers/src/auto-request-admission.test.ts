@@ -1044,6 +1044,29 @@ describe("Auto advisor admission is decided by first-party status", () => {
 			reason: "tools-unsupported",
 		});
 	});
+	it("does not admit advisor content on a non-Anthropic target even when the caller passes firstPartyAnthropic", () => {
+		const { catalog, target } = effortCatalog();
+		const codex = (original: Record<string, unknown>) =>
+			evaluateAutoRequestAdmission({
+				catalog,
+				target,
+				requirements: captureAutoRequestRequirements(original),
+				finalBody: { ...original, model: target.physicalModel },
+				firstPartyAnthropic: true,
+			});
+		for (const original of [
+			{ ...body, tools: [advisorTool] },
+			{ ...body, messages: advisorHistory },
+		])
+			expect(codex(original)).toEqual({
+				status: "reject",
+				reason: "tools-unsupported",
+			});
+		expect(codex(body)).not.toEqual({
+			status: "reject",
+			reason: "tools-unsupported",
+		});
+	});
 	it("leaves an unknown advisor type to the request-level guard and hosted tools to the materializer", () => {
 		// #430: no native shape check. An unknown advisor_* type is refused by the
 		// request-level unknownDeclaredTypes guard, not by candidate admission.
