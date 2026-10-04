@@ -36,7 +36,11 @@ import {
 } from "../model-catalog";
 import { ModelRouteSessionRegistry } from "../model-route-profiles";
 import { handleProxy } from "../proxy";
-import { compileQualityCandidates } from "../quality-route-candidates";
+import {
+	compileQualityCandidates,
+	QUALITY_REASON_RANK,
+	surfaceQualityReason,
+} from "../quality-route-candidates";
 import { QualityRouteService } from "../quality-route-service";
 import * as collectors from "../usage-collector";
 
@@ -796,8 +800,9 @@ describe("prewarmed native catalogs", () => {
 					accountId: "a",
 					physicalModel: "claude-fable-5-1",
 				},
-				accounting: { kind: "estimate", source: "local-envelope-v1" },
 			});
+			// Native Anthropic admission claims no local token accounting.
+			expect(history[0].qualityDecision.accounting).toBeUndefined();
 			expect(history[0].qualityDecision.selected.evidenceRef).toBeUndefined();
 			expect(
 				history[0].qualityDecision.selected.catalogRevision,
@@ -1144,11 +1149,6 @@ describe("prewarmed native catalogs", () => {
 				description: `Fable → Opus${flowTail}`,
 			},
 			{
-				id: "claude-bccf-quality-fable",
-				display_name: "Fable-preferred",
-				description: `Fable → Opus${flowTail}`,
-			},
-			{
 				id: "claude-bccf-quality-astra",
 				display_name: "Astra-preferred",
 				description: `Opus${flowTail}`,
@@ -1269,7 +1269,7 @@ describe("prewarmed native catalogs", () => {
 	it.each([
 		false,
 		true,
-	])("counts all deferred schema bytes even with defer_loading=%s", async (defer_loading) => {
+	])("does not refuse a large deferred schema locally, defer_loading=%s (upstream is the arbiter, as for stock)", async (defer_loading) => {
 		const tool = {
 			name: "lookup",
 			defer_loading,
@@ -1285,9 +1285,10 @@ describe("prewarmed native catalogs", () => {
 				},
 			),
 		);
-		expect(response.status).toBe(503);
-		expect(sends).toHaveLength(0);
-		expect(await home()).toBeUndefined();
+		expect(response.status).toBe(200);
+		await response.text();
+		await flush();
+		expect(sends).toHaveLength(1);
 	});
 
 	it.each([
@@ -1299,11 +1300,6 @@ describe("prewarmed native catalogs", () => {
 			context_management: { edits: [{ type: "clear_thinking_20251015" }] },
 		},
 		{ context_management: { edits: [{ type: "future_edit" }] } },
-		{
-			tools: [
-				{ type: "custom", name: "lookup", input_schema: { type: "object" } },
-			],
-		},
 		{
 			tools: [
 				{
@@ -1329,8 +1325,30 @@ describe("prewarmed native catalogs", () => {
 				},
 			],
 		},
-	])("does not broaden native admission to unknown or incompatible shapes: %j", async (body) => {
+	])("admits unusual native shapes exactly as stock would send them: %j", async (body) => {
 		const response = await send(request(undefined, {}, body));
+		expect(response.status).toBe(200);
+		await response.text();
+		await flush();
+		expect(sends).toHaveLength(1);
+	});
+
+	it("still defers a hosted-looking tool type to the shared materializer decision", async () => {
+		const response = await send(
+			request(
+				undefined,
+				{},
+				{
+					tools: [
+						{
+							type: "custom",
+							name: "lookup",
+							input_schema: { type: "object" },
+						},
+					],
+				},
+			),
+		);
 		expect(response.status).toBe(503);
 		expect(sends).toHaveLength(0);
 		expect(await home()).toBeUndefined();
@@ -3121,5 +3139,233 @@ describe("prewarmed native catalogs", () => {
 			});
 			expect(sends).toHaveLength(1);
 		});
+	});
+
+	it("terminal 503 names the surfaced reason and bounded lanes without changing status or code", async () => {
+		for (const a of accounts)
+			usageCache.set(a.id, {
+				limits: [
+					{ kind: "weekly_all", percent: 100, resets_at: Date.now() + 60000 },
+				],
+				spend: { enabled: false },
+			} as never);
+		const response = await send();
+		expect(response.status).toBe(503);
+		const body = (await response.json()) as {
+			type: string;
+			error: {
+				type: string;
+				code: string;
+				reason: string;
+				message: string;
+				lanes: unknown;
+			};
+		};
+		expect(body.type).toBe("error");
+		expect(body.error.type).toBe("service_unavailable");
+		expect(body.error.code).toBe("quality_route_unavailable");
+		expect(body.error.reason).toBe("provider-capacity-exhausted");
+		expect(body.error.message).toBe(
+			"Auto could not serve this request: provider-capacity-exhausted (see error.lanes)",
+		);
+		expect(body.error.lanes).toEqual([
+			{ lane: "fable", reasons: { "provider-capacity-exhausted": 2 } },
+			{ lane: "opus", reasons: { "provider-capacity-exhausted": 2 } },
+		]);
+	});
+
+	it("terminal 503 surfaces an earlier request-shape reason over later capacity skips", async () => {
+		// Incident B shape: the last recorded skip is a capacity reason, but the
+		// surfaced reason must be the better-ranked request-shape one.
+		const transport = globalThis.fetch;
+		globalThis.fetch = Object.assign(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const req = input instanceof Request ? input : new Request(input, init);
+				if (req.method !== "GET") return transport(input, init);
+				const catalog = (await (await transport(input, init)).json()) as {
+					data: { id: string; max_tokens: number }[];
+				};
+				for (const model of catalog.data)
+					if (/^claude-(fable|opus)/.test(model.id)) model.max_tokens = 10;
+				return Response.json(catalog);
+			},
+			{ preconnect: () => {} },
+		) as typeof fetch;
+		resetModelCatalogForTest();
+		for (const a of accounts)
+			await fetchLiveModels(ctx, { allowOAuth: true, accountId: a.id });
+		// Account "a" is tried first and refused for request shape; account "b"
+		// is tried later and refused for capacity.
+		accounts[0].priority = 0;
+		accounts[1].priority = 1;
+		usageCache.set("b", {
+			limits: [
+				{ kind: "weekly_all", percent: 100, resets_at: Date.now() + 60000 },
+			],
+			spend: { enabled: false },
+		} as never);
+		const response = await send();
+		expect(response.status).toBe(503);
+		const body = (await response.json()) as {
+			error: {
+				reason: string;
+				lanes: { lane: string; reasons: Record<string, number> }[];
+			};
+		};
+		expect(sends).toHaveLength(0);
+		const laneReasons = Object.fromEntries(
+			body.error.lanes.map((l) => [l.lane, Object.keys(l.reasons)]),
+		);
+		expect(laneReasons.fable).toContain("output-unsupported");
+		expect(laneReasons.opus).toContain("provider-capacity-exhausted");
+		expect(body.error.reason).toBe("output-unsupported");
+	});
+
+	it("non-terminal quality errors keep their original body shape", async () => {
+		const response = await send(request("claude-bccf-quality-nope"));
+		expect(response.status).toBe(400);
+		const body = (await response.json()) as { error: Record<string, unknown> };
+		expect(body.error.message).toBeUndefined();
+		expect(body.error.lanes).toBeUndefined();
+	});
+
+	describe("surfaced 503 reason ranking", () => {
+		const expand = (multiset: Record<string, number>) =>
+			Object.entries(multiset).flatMap(([reason, n]) =>
+				Array.from({ length: n }, () => reason as never),
+			);
+		it("production Incident B multiset surfaces request-preservation-unknown", () => {
+			const fable = {
+				"evidence-missing": 1,
+				"subscription-exhausted": 1,
+				"request-preservation-unknown": 2,
+				"provider-capacity-exhausted": 1,
+			};
+			const astra = {
+				"capacity-evidence-unknown": 1,
+				"provider-capacity-exhausted": 2,
+			};
+			const opus = {
+				"evidence-missing": 1,
+				"request-preservation-unknown": 3,
+				"provider-capacity-exhausted": 3,
+				"capacity-evidence-unknown": 1,
+			};
+			// The last recorded reason in production was provider-capacity-exhausted.
+			expect(
+				surfaceQualityReason([
+					...expand(fable),
+					...expand(astra),
+					...expand(opus),
+				]),
+			).toBe("request-preservation-unknown");
+		});
+		it("is independent of recording order and prefers the better tier", () => {
+			expect(
+				surfaceQualityReason([
+					"provider-capacity-exhausted",
+					"evidence-missing",
+				]),
+			).toBe("evidence-missing");
+			expect(
+				surfaceQualityReason([
+					"evidence-missing",
+					"provider-capacity-exhausted",
+				]),
+			).toBe("evidence-missing");
+			expect(
+				surfaceQualityReason(["account-unavailable", "subscription-exhausted"]),
+			).toBe("subscription-exhausted");
+			expect(
+				surfaceQualityReason(["tools-unsupported", "tools-unsupported"]),
+			).toBe("tools-unsupported");
+		});
+		it("empty record falls back to lane-unavailable", () => {
+			expect(surfaceQualityReason([])).toBe("lane-unavailable");
+		});
+		it("ranks every QualityAdmissionReason exactly once", () => {
+			const all = [
+				"account-not-enrolled",
+				"line-not-approved",
+				"account-unavailable",
+				"model-unsupported",
+				"evidence-missing",
+				"context-unsupported",
+				"subscription-exhausted",
+				"spend-not-authorized",
+				"lane-unavailable",
+				"provider-capacity-exhausted",
+				"capacity-evidence-unknown",
+				"billing-evidence-unknown",
+				"catalog-evidence-stale",
+				"credential-evidence-unknown",
+				"input-accounting-unknown",
+				"output-unsupported",
+				"modality-unsupported",
+				"tools-unsupported",
+				"request-preservation-unknown",
+			];
+			expect([...QUALITY_REASON_RANK].sort()).toEqual([...all].sort());
+			expect(new Set(QUALITY_REASON_RANK).size).toBe(
+				QUALITY_REASON_RANK.length,
+			);
+		});
+	});
+
+	it("labels cooled-down, paused and reauth-flagged accounts without evidence account-unavailable", async () => {
+		const policy = ctx.config.getQualityRoutingPolicy();
+		if (!policy) throw new Error("missing policy fixture");
+		resetModelCatalogForTest();
+		failCatalogAcquisition();
+		const cooled = { ...accounts[0], rate_limited_until: Date.now() + 60_000 };
+		const paused = { ...accounts[1], paused: true };
+		const compiledUnavailable = compileQualityCandidates(
+			policy,
+			{ kind: "main", preference: "auto" },
+			[cooled, paused],
+		);
+		expect(compiledUnavailable.candidates).toEqual([]);
+		expect(compiledUnavailable.skippedLanes).toEqual([
+			{ lane: "fable", reasons: { "account-unavailable": 2 } },
+			{ lane: "opus", reasons: { "account-unavailable": 2 } },
+		]);
+		// The repository can set requires_reauth without pausing the account, and
+		// catalog preparation skips flagged accounts, so this is availability too.
+		const compiledReauth = compileQualityCandidates(
+			policy,
+			{ kind: "main", preference: "auto" },
+			accounts.map((account) => ({ ...account, requires_reauth: true })),
+		);
+		expect(compiledReauth.candidates).toEqual([]);
+		expect(compiledReauth.skippedLanes).toEqual([
+			{ lane: "fable", reasons: { "account-unavailable": 2 } },
+			{ lane: "opus", reasons: { "account-unavailable": 2 } },
+		]);
+		const compiledAvailable = compileQualityCandidates(
+			policy,
+			{ kind: "main", preference: "auto" },
+			accounts,
+		);
+		expect(compiledAvailable.skippedLanes).toEqual([
+			{ lane: "fable", reasons: { "evidence-missing": 2 } },
+			{ lane: "opus", reasons: { "evidence-missing": 2 } },
+		]);
+	});
+
+	it("keeps the Fable-preferred id routable though discovery hides it", async () => {
+		const policy = ctx.config.getQualityRoutingPolicy();
+		expect(
+			policy?.choices.map((choice) => [choice.preference, choice.listed]),
+		).toEqual([
+			["auto", true],
+			["fable", false],
+			["astra", true],
+			["opus", true],
+		]);
+		const response = await send(request("claude-bccf-quality-fable"));
+		expect(response.status).toBe(200);
+		await response.text();
+		await flush();
+		expect((await service.status(scope))?.preference).toBe("fable");
 	});
 });

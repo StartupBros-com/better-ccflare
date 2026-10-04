@@ -286,6 +286,12 @@ describe("approved quality policy", () => {
 			"claude-bccf-quality-astra",
 			"claude-bccf-quality-opus",
 		]);
+		expect(policy?.choices.map((choice) => choice.listed)).toEqual([
+			true,
+			false,
+			true,
+			true,
+		]);
 	});
 
 	describe("picker flow descriptions", () => {
