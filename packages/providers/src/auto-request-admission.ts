@@ -207,7 +207,7 @@ function modalities(
 				return (
 					typeof block.id === "string" &&
 					record(block.input) !== null &&
-					onlyKeys(block, ["type", "id", "name", "input"])
+					onlyKeys(block, ["type", "id", "name", "input", "cache_control"])
 				);
 			case "advisor_tool_result":
 				if (!advisor) return false;
@@ -215,7 +215,7 @@ function modalities(
 				return (
 					typeof block.tool_use_id === "string" &&
 					record(block.content) !== null &&
-					onlyKeys(block, ["type", "tool_use_id", "content"])
+					onlyKeys(block, ["type", "tool_use_id", "content", "cache_control"])
 				);
 			default:
 				return false;
