@@ -297,7 +297,7 @@ Accepted intent is the durable principal/session preference and revision. A home
 
 ### Admission estimate versus capability fact
 
-`local-envelope-v1` counts the entire final JSON envelope conservatively (UTF-8 bytes, 25% plus 1024 headroom, full original output reserve). It is an operational estimate, not a tokenizer guarantee or proof of subscription entitlement. Deferral and planned history clearing do not remove bytes from the estimate. Source-owned fresh account capability facts remain necessary; unknown output, media, opaque thinking or billing contracts cannot be invented from the estimate.
+`local-envelope-v1` counts the entire final JSON envelope conservatively (UTF-8 bytes, 25% plus 1024 headroom, full original output reserve). It is an operational estimate, not a tokenizer guarantee or proof of subscription entitlement. Deferral and planned history clearing do not remove bytes from the estimate. Source-owned fresh account capability facts remain necessary; unknown output, media, opaque thinking or billing contracts cannot be invented from the estimate. Both apply to translated (Codex) targets only: a native Anthropic target is admitted as stock routing would send it, keeping only proven rejections, and gets no local context estimate, because stock does none for Anthropic.
 
 ### Dispatch fence and decision provenance
 
