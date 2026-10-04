@@ -194,6 +194,17 @@ Comparing it with logical-final usage requires matching the populations and resp
 source's token semantics: a cache-inclusive input total already includes cache reads, while
 an additive input count must be combined with the separate cache-read and cache-write counts.
 
+### Advisor usage
+
+The tokens a response spends consulting Claude Code's advisor, the second model Anthropic runs
+partway through a response (see Native passthrough tool). They are billed at the advisor
+model's own rate.
+
+They are recorded per advisor model and never folded into the serving model's own token
+counts. They are counted in full even when the per-consultation detail kept for pricing is
+capped. A response that exceeds that cap is marked billing-incomplete rather than
+under-reported. An advisor model with no known price keeps its tokens but adds nothing to cost.
+
 ### Canonical usage window
 
 One provider-reported capacity measurement, normalized into the single shape the rest of
