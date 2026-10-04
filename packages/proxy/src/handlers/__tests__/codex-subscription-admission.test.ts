@@ -206,6 +206,51 @@ describe("Codex subscription-only source evidence (fake metadata transport)", ()
 				},
 			],
 		],
+		["limit_reached absent", [{ ...roomy(), rate_limit: { allowed: true } }]],
+		[
+			"a negative used_percent",
+			[
+				{
+					...roomy(),
+					rate_limit: {
+						allowed: true,
+						limit_reached: false,
+						primary_window: { used_percent: -1 },
+					},
+				},
+			],
+		],
+		[
+			"a string used_percent",
+			[
+				{
+					...roomy(),
+					rate_limit: {
+						allowed: true,
+						limit_reached: false,
+						primary_window: { used_percent: "50" },
+					},
+				},
+			],
+		],
+		[
+			"a non-object window",
+			[
+				{
+					...roomy(),
+					rate_limit: {
+						allowed: true,
+						limit_reached: false,
+						primary_window: "x",
+					},
+				},
+			],
+		],
+		["a non-string limit_name", [{ ...roomy(), limit_name: 5 }]],
+		[
+			"metered_feature absent",
+			[{ limit_name: "codex_other", rate_limit: roomy().rate_limit }],
+		],
 		["malformed entry {}", [{}]],
 		["one roomy and one malformed entry", [roomy(), {}]],
 		["a non-array object", { limit_reached: false }],

@@ -1588,6 +1588,14 @@ describe("Codex Auto admits what the stock Codex route translates deterministica
 			},
 		],
 		[
+			"tool_choice any with tools",
+			{ ...base, tools: [readTool], tool_choice: { type: "any" } },
+		],
+		[
+			"tool_choice none with tools",
+			{ ...base, tools: [readTool], tool_choice: { type: "none" } },
+		],
+		[
 			"missing max_tokens",
 			{ model: "auto", messages: [{ role: "user", content: "hi" }] },
 		],
@@ -1733,6 +1741,55 @@ describe("Codex Auto admits what the stock Codex route translates deterministica
 			{
 				...base,
 				tool_choice: { type: "tool", name: "Nope" },
+				tools: [readTool],
+			},
+		],
+		[
+			"tool_choice with an unknown type",
+			{ ...base, tool_choice: { type: "bogus" }, tools: [readTool] },
+		],
+		[
+			"message with an unknown role",
+			{ ...base, messages: [{ role: "tool", content: "x" }] },
+		],
+		[
+			"message with an extra key",
+			{ ...base, messages: [{ role: "user", content: "hi", name: "x" }] },
+		],
+		["system as an object", { ...base, system: { type: "text", text: "sys" } }],
+		["no messages", { ...base, messages: [] }],
+		[
+			"tool_use with a non-object input",
+			{
+				...base,
+				messages: assistantTurn([
+					{ type: "tool_use", id: "c1", name: "Read", input: "x" },
+				]),
+				tools: [readTool],
+			},
+		],
+		[
+			"tool_result with a non-boolean is_error",
+			{
+				...base,
+				messages: [
+					{ role: "user", content: "go" },
+					{
+						role: "assistant",
+						content: [{ type: "tool_use", id: "c1", name: "Read", input: {} }],
+					},
+					{
+						role: "user",
+						content: [
+							{
+								type: "tool_result",
+								tool_use_id: "c1",
+								content: "ok",
+								is_error: "yes",
+							},
+						],
+					},
+				],
 				tools: [readTool],
 			},
 		],
