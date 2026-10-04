@@ -150,6 +150,72 @@ describe("Codex subscription-only source evidence (fake metadata transport)", ()
 			).status,
 		).not.toBe("admit");
 	});
+	const roomy = () => ({
+		limit_name: "codex_other",
+		metered_feature: "codex_other",
+		rate_limit: {
+			allowed: true,
+			limit_reached: false,
+			primary_window: { used_percent: 88, limit_window_seconds: 1800 },
+		},
+	});
+	it.each([
+		["null", null],
+		["an empty array", []],
+		["one entry with room", [roomy()]],
+		[
+			"entries with null windows",
+			[
+				{
+					...roomy(),
+					rate_limit: {
+						allowed: true,
+						limit_reached: false,
+						primary_window: null,
+					},
+				},
+			],
+		],
+	])("additional limits %s do not veto Auto capacity", async (_n, value) => {
+		expect(
+			decision(await poll({ ...payload(), additional_rate_limits: value }))
+				.status,
+		).toBe("admit");
+	});
+	it.each([
+		[
+			"limit_reached true",
+			[{ ...roomy(), rate_limit: { allowed: true, limit_reached: true } }],
+		],
+		[
+			"allowed false",
+			[{ ...roomy(), rate_limit: { allowed: false, limit_reached: false } }],
+		],
+		["rate_limit null", [{ ...roomy(), rate_limit: null }]],
+		["rate_limit absent", [{ limit_name: "x", metered_feature: "x" }]],
+		[
+			"window at 100",
+			[
+				{
+					...roomy(),
+					rate_limit: {
+						allowed: true,
+						limit_reached: false,
+						secondary_window: { used_percent: 100 },
+					},
+				},
+			],
+		],
+		["malformed entry {}", [{}]],
+		["one roomy and one malformed entry", [roomy(), {}]],
+		["a non-array object", { limit_reached: false }],
+		["a string", "none"],
+	])("additional limits %s stay unknown", async (_n, value) => {
+		expect(
+			decision(await poll({ ...payload(), additional_rate_limits: value }))
+				.status,
+		).not.toBe("admit");
+	});
 	it("does not admit expired windows", async () => {
 		const body = payload();
 		body.rate_limit.secondary_window.reset_at = 1;
