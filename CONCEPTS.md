@@ -203,7 +203,8 @@ model's own rate.
 They are recorded per advisor model and never folded into the serving model's own token
 counts. They are counted in full even when the per-consultation detail kept for pricing is
 capped. A response that exceeds that cap is marked billing-incomplete rather than
-under-reported. An advisor model with no known price keeps its tokens but adds nothing to cost.
+under-reported. An advisor model with no known price keeps its tokens and contributes no
+estimated cost, so the response is marked billing-incomplete.
 
 ### Canonical usage window
 
