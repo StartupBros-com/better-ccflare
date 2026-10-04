@@ -1916,12 +1916,22 @@ describe("UsageCollector request lifecycle", () => {
 				const { collector, savedUsages } = harness();
 				const requestId = "stream-advisor-overflow";
 				const advisorLogs = captureAdvisorLogs();
-				const advisorEntries = Array.from({ length: 66 }, () => ({
-					type: "advisor_message",
-					model: HAIKU_MODEL,
-					input_tokens: 1,
-					output_tokens: 1,
-				}));
+				// The two entries past the retained limit name their own model.
+				const advisorEntries = Array.from({ length: 66 }, (_, index) =>
+					index < 64
+						? {
+								type: "advisor_message",
+								model: HAIKU_MODEL,
+								input_tokens: 1,
+								output_tokens: 1,
+							}
+						: {
+								type: "advisor_message",
+								model: OPUS_MODEL,
+								input_tokens: 2,
+								output_tokens: 3,
+							},
+				);
 				try {
 					collector.handleStart(makeStartMessage(requestId));
 					collector.handleChunk(
@@ -1945,6 +1955,66 @@ describe("UsageCollector request lifecycle", () => {
 					billingIncomplete: true,
 					iterationsTruncated: true,
 				});
+				// Persisted advisor tokens cover all 66 billable iterations, not
+				// only the 64 that were priced.
+				expect(savedUsages.get(requestId)?.advisorUsage).toEqual([
+					{
+						model: HAIKU_MODEL,
+						inputTokens: 64,
+						outputTokens: 64,
+						cacheReadInputTokens: 0,
+						cacheCreationInputTokens: 0,
+					},
+					{
+						model: OPUS_MODEL,
+						inputTokens: 4,
+						outputTokens: 6,
+						cacheReadInputTokens: 0,
+						cacheCreationInputTokens: 0,
+					},
+				]);
+			});
+
+			it("folds advisor models past the distinct-model limit into the unpriced entry", async () => {
+				useDeterministicModelPricing();
+				modelPricedImplementation = async (model) =>
+					!model.startsWith("advisor-limit-");
+				const { collector, savedUsages } = harness();
+				const requestId = "stream-advisor-model-limit";
+				const advisorEntries = Array.from({ length: 18 }, (_, index) => ({
+					type: "advisor_message",
+					model: `advisor-limit-${index}`,
+					input_tokens: index + 1,
+					output_tokens: 1,
+				}));
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					advisorStream(FABLE_MODEL, { input_tokens: 10, output_tokens: 7 }, [
+						executorIteration,
+						{ type: "advisor_message", input_tokens: 5, output_tokens: 1 },
+						...advisorEntries,
+					]),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+
+				// The model-less entry does not count toward the limit: 16 named
+				// models keep their own entry, and the 17th and 18th join the
+				// model-less entry, which plan-window value counts as unpriced.
+				const tokens = (inputTokens: number) => ({
+					inputTokens,
+					outputTokens: 1,
+					cacheReadInputTokens: 0,
+					cacheCreationInputTokens: 0,
+				});
+				expect(savedUsages.get(requestId)?.advisorUsage).toEqual([
+					{ model: null, ...tokens(5 + 17 + 18), outputTokens: 3 },
+					...Array.from({ length: 16 }, (_, index) => ({
+						model: `advisor-limit-${index}`,
+						...tokens(index + 1),
+					})),
+				]);
 			});
 
 			it("marks billing incomplete and keeps the executor cost when advisor pricing misses the deadline", async () => {
@@ -2019,6 +2089,8 @@ describe("UsageCollector request lifecycle", () => {
 				expect(savedUsages.get(requestId)).toMatchObject({
 					costUsd: EXECUTOR_COST,
 				});
+				// A non-billable advisor iteration persists no advisor tokens.
+				expect(savedUsages.get(requestId)).not.toHaveProperty("advisorUsage");
 				expect(estimateCostUSD).toHaveBeenCalledTimes(1);
 				for (const event of advisorLogs.events) {
 					expect(event.data).not.toHaveProperty("billingIncomplete");
