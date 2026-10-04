@@ -152,6 +152,7 @@ function matchCompiledContract(
 		requirements.unsupported?.length ||
 		requirements.declarations?.length !== 1 ||
 		requirements.declarations[0]?.type !== "web_search_20250305" ||
+		requirements.declarations[0].searchProfile !== undefined ||
 		!hasCompiledOptionBounds(requirements.declarations[0]) ||
 		typeof requirements.profileId !== "string" ||
 		requirements.profileId.length === 0 ||

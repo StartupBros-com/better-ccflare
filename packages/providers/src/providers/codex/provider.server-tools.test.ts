@@ -1654,3 +1654,25 @@ describe("Codex exact hosted-search attempt plan", () => {
 		}
 	});
 });
+
+describe("Codex hosted-search search_profile fail-closed", () => {
+	test("refuses to build a tuple for a declaration carrying search_profile", () => {
+		const body = claudeCodeForcedSearchBody();
+		const plain = deriveServerToolRequirement(body);
+		if (!plain) throw new Error("expected forced WebSearch requirement");
+		expect(materializeCodexTuple(plain)).toBeDefined();
+
+		const tools = (body.tools as Record<string, unknown>[]).map((tool) =>
+			tool.type === "web_search_20250305"
+				? { ...tool, search_profile: "fast" }
+				: tool,
+		);
+		const withProfile = deriveServerToolRequirement({ ...body, tools });
+		if (!withProfile) throw new Error("expected search_profile requirement");
+		expect(withProfile.declarations?.[0]).toMatchObject({
+			searchProfile: "fast",
+		});
+		expect(withProfile.invalid).toBeUndefined();
+		expect(materializeCodexTuple(withProfile)).toBeUndefined();
+	});
+});
