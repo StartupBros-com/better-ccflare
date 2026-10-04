@@ -3312,7 +3312,7 @@ describe("prewarmed native catalogs", () => {
 		});
 	});
 
-	it("labels cooled-down and paused accounts without evidence account-unavailable", async () => {
+	it("labels cooled-down, paused and reauth-flagged accounts without evidence account-unavailable", async () => {
 		const policy = ctx.config.getQualityRoutingPolicy();
 		if (!policy) throw new Error("missing policy fixture");
 		resetModelCatalogForTest();
@@ -3326,6 +3326,18 @@ describe("prewarmed native catalogs", () => {
 		);
 		expect(compiledUnavailable.candidates).toEqual([]);
 		expect(compiledUnavailable.skippedLanes).toEqual([
+			{ lane: "fable", reasons: { "account-unavailable": 2 } },
+			{ lane: "opus", reasons: { "account-unavailable": 2 } },
+		]);
+		// The repository can set requires_reauth without pausing the account, and
+		// catalog preparation skips flagged accounts, so this is availability too.
+		const compiledReauth = compileQualityCandidates(
+			policy,
+			{ kind: "main", preference: "auto" },
+			accounts.map((account) => ({ ...account, requires_reauth: true })),
+		);
+		expect(compiledReauth.candidates).toEqual([]);
+		expect(compiledReauth.skippedLanes).toEqual([
 			{ lane: "fable", reasons: { "account-unavailable": 2 } },
 			{ lane: "opus", reasons: { "account-unavailable": 2 } },
 		]);

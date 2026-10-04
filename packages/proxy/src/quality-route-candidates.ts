@@ -196,15 +196,17 @@ export function compileQualityCandidates(
 				: resolved.current;
 		if (!evidence) {
 			const catalog = catalogFor(account.id, account.provider, true);
-			// Catalog preparation sends no metadata traffic to unavailable accounts,
-			// so their missing evidence is an availability fact, not an evidence gap.
-			const reason: QualityAdmissionReason = !isAccountAvailable(account)
-				? "account-unavailable"
-				: !catalog
-					? "evidence-missing"
-					: !isAutoCatalogEvidenceCurrent(catalog)
-						? "catalog-evidence-stale"
-						: "model-unsupported";
+			// Catalog preparation sends no metadata traffic to unavailable or
+			// reauth-flagged accounts, so their missing evidence is an availability
+			// fact, not an evidence gap. The flag can be set without a pause.
+			const reason: QualityAdmissionReason =
+				!isAccountAvailable(account) || account.requires_reauth
+					? "account-unavailable"
+					: !catalog
+						? "evidence-missing"
+						: !isAutoCatalogEvidenceCurrent(catalog)
+							? "catalog-evidence-stale"
+							: "model-unsupported";
 			// A stored predecessor and current target must not double-count one
 			// account/line evidence failure. Only bounded enums and counts survive.
 			const key = JSON.stringify([account.id, line, reason]);
