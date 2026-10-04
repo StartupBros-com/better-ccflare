@@ -130,6 +130,47 @@ function quotaWindow(value: unknown): CodexQuotaWindow {
 				: reset,
 	});
 }
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function windowHasRoom(value: unknown): boolean {
+	if (value === undefined || value === null) return true;
+	if (!isPlainObject(value)) return false;
+	const used = value.used_percent;
+	return (
+		typeof used === "number" && Number.isFinite(used) && used >= 0 && used < 100
+	);
+}
+function additionalEntryHasRoom(entry: unknown): boolean {
+	if (!isPlainObject(entry)) return false;
+	if (
+		typeof entry.limit_name !== "string" ||
+		typeof entry.metered_feature !== "string"
+	)
+		return false;
+	const limit = entry.rate_limit;
+	if (!isPlainObject(limit)) return false;
+	return (
+		limit.allowed === true &&
+		limit.limit_reached === false &&
+		windowHasRoom(limit.primary_window) &&
+		windowHasRoom(limit.secondary_window)
+	);
+}
+/**
+ * Whether extra per-feature limits could still block the request.
+ * openai/codex declares `additional_rate_limits` as a serde double_option
+ * (key absent, `null`, or an array) and its CLI flattens null to absent, so
+ * undefined, null and [] mean "no additional limits". An entry that itself
+ * proves room cannot be why a request fails, whichever model it applies to
+ * (nothing maps entries to model slugs). Exhausted, unknown or malformed
+ * entries might apply, so they stay unknown rather than becoming a reject.
+ */
+function additionalLimitsUnknown(value: unknown): boolean {
+	if (value === undefined || value === null) return false;
+	if (!Array.isArray(value)) return true;
+	return !value.every(additionalEntryHasRoom);
+}
 function subscriptionFacts(
 	body: WhamUsageResponse,
 	fiveHour: UsageWindow | null,
@@ -148,12 +189,9 @@ function subscriptionFacts(
 		balance,
 		primary: quotaWindow(body.rate_limit?.primary_window),
 		secondary: quotaWindow(body.rate_limit?.secondary_window),
-		additionalLimitsUnknown:
-			body.additional_rate_limits !== undefined &&
-			!(
-				Array.isArray(body.additional_rate_limits) &&
-				body.additional_rate_limits.length === 0
-			),
+		additionalLimitsUnknown: additionalLimitsUnknown(
+			body.additional_rate_limits,
+		),
 		omittedLegacyWindows: Object.freeze([
 			...(fiveHour ? [] : ["five_hour"]),
 			...(sevenDay ? [] : ["seven_day"]),

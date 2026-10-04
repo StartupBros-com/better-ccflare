@@ -3,6 +3,7 @@ import {
 	CodexProvider,
 	captureAutoRequestRequirements,
 	createAutoCatalogEvidence,
+	estimateAnthropicAdmissionTokens,
 	resolveAutoModelTargets,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -355,14 +356,20 @@ it.each([
 				}),
 			).toMatchObject({
 				status: "admit",
-				accounting: { requestedOutput: 20 },
+				// The subscription wire carries no cap, so stock reserves nothing.
+				accounting: { requestedOutput: 0 },
 			});
 			return;
 		}
 		if (malformed) {
+			// Stock never checks a malformed ceiling, so Auto admits it; the
+			// subscription wire carries no cap, so nothing is reserved.
 			expect(evaluateQualityRouteAdmission(input)).toMatchObject({
-				status: "unknown",
-				reason: "output-unsupported",
+				status: "admit",
+				accounting: {
+					requestedOutput: 0,
+					outputLimit: { kind: "provider-managed", tokens: null },
+				},
 			});
 			return;
 		}
@@ -372,7 +379,9 @@ it.each([
 				: {
 						status: "admit",
 						accounting: {
-							requestedOutput: 20,
+							// The subscription endpoint drops max_output_tokens: stock
+							// reserves 0 whatever the catalog ceiling.
+							requestedOutput: 0,
 							outputLimit:
 								ceiling == null
 									? { kind: "provider-managed", tokens: null }
@@ -391,23 +400,8 @@ it.each([
 				"20",
 				Number.MAX_SAFE_INTEGER + 1,
 			]) {
-				expect(
-					evaluateQualityRouteAdmission({
-						...input,
-						request: {
-							...input.request,
-							requirements: captureAutoRequestRequirements({
-								...original,
-								max_tokens,
-							}),
-						},
-					}),
-				).toMatchObject({ status: "unknown", reason: "output-unsupported" });
-			}
-			const bytes = new TextEncoder().encode(JSON.stringify(finalBody)).length;
-			const inputBudget = bytes + Math.ceil(bytes / 4) + 1024;
-			for (const excess of [0, 1]) {
-				const max_tokens = 272000 - inputBudget + excess;
+				// A missing or invalid max_tokens is admitted: the adapter forwards no
+				// cap and stock sends it. The provider-managed reserve is 0 either way.
 				expect(
 					evaluateQualityRouteAdmission({
 						...input,
@@ -420,14 +414,47 @@ it.each([
 						},
 					}),
 				).toMatchObject({
+					status: "admit",
+					accounting: { requestedOutput: 0 },
+				});
+			}
+			// Stock's estimator and a zero reserve against stock's window: the
+			// 872000 maximum (no percent advertised), not the 272000 current one.
+			const window = 872000;
+			const estimateFor = (padding: number) =>
+				estimateAnthropicAdmissionTokens({
+					...original,
+					messages: [{ role: "user", content: "x".repeat(padding) }],
+				}).tokens;
+			let padding = Math.max(0, (window - estimateFor(0)) * 2);
+			while (estimateFor(padding + 1) <= window) padding++;
+			while (estimateFor(padding) > window) padding--;
+			for (const excess of [0, 1]) {
+				expect(
+					evaluateQualityRouteAdmission({
+						...input,
+						request: {
+							...input.request,
+							requirements: captureAutoRequestRequirements({
+								...original,
+								messages: [
+									{ role: "user", content: "x".repeat(padding + excess) },
+								],
+							}),
+						},
+					}),
+				).toMatchObject({
 					status: excess === 0 ? "admit" : "reject",
 					...(excess === 1 ? { reason: "context-unsupported" } : {}),
 					accounting: {
-						requestedOutput: max_tokens,
+						headroom: 0,
+						requestedOutput: 0,
 						outputLimit: { kind: "provider-managed", tokens: null },
 					},
 				});
 			}
+			// The final body is not rebuilt: a translated body with different tools or
+			// input still admits; only an untranslated one (no Responses input) is refused.
 			for (const changed of [
 				{ ...finalBody, input: [] },
 				{ ...finalBody, tools: [] },
@@ -436,12 +463,19 @@ it.each([
 					evaluateQualityRouteAdmission({
 						...input,
 						request: { ...input.request, finalBody: changed },
-					}),
-				).toMatchObject({
-					status: "unknown",
-					reason: "request-preservation-unknown",
-				});
+					}).status,
+				).toBe("admit");
 			}
+			const { input: _translatedInput, ...untranslated } = finalBody;
+			expect(
+				evaluateQualityRouteAdmission({
+					...input,
+					request: { ...input.request, finalBody: untranslated },
+				}),
+			).toMatchObject({
+				status: "unknown",
+				reason: "request-preservation-unknown",
+			});
 			expect(
 				evaluateQualityRouteAdmission({
 					...input,
