@@ -1,4 +1,9 @@
 import { getConfiguredModelMapping } from "@better-ccflare/core";
+import {
+	isGpt56SolModel,
+	type ReasoningEffort,
+	resolveAnthropicReasoningEffort,
+} from "@better-ccflare/openai-formats";
 import type {
 	Account,
 	ComboRouteClass,
@@ -242,6 +247,35 @@ export function captureCodexModelReasoningSnapshot(
 	accountId: string,
 ): ReadonlyMap<string, CodexModelReasoningMetadata> | null {
 	return codexReasoningByAccount.get(accountId) ?? null;
+}
+
+/** The effort the Codex adapter sends when the request names none. Auto
+ * admission resolves the same choice from its pinned catalog evidence, so the
+ * two share this function rather than each keeping a copy.
+ */
+export function selectCodexDefaultReasoningEffort(
+	physicalModel: string,
+	logicalModelFamily: string | null | undefined,
+	metadata: CodexModelReasoningMetadata | null | undefined,
+): ReasoningEffort {
+	const established: ReasoningEffort =
+		logicalModelFamily === "fable" && isGpt56SolModel(physicalModel)
+			? "xhigh"
+			: "medium";
+	// Retain our established default when supported; otherwise prefer the
+	// catalog's validated default before clamping to an advertised level.
+	const preferred = metadata?.supportedEfforts.includes(established)
+		? established
+		: (metadata?.defaultEffort ?? established);
+	return (
+		resolveAnthropicReasoningEffort(
+			{ reasoning: { effort: preferred } },
+			{
+				targetModel: physicalModel,
+				supportedTargetEfforts: metadata?.supportedEfforts,
+			},
+		).effort ?? established
+	);
 }
 
 export function setCodexAccountModelContextMetadata(

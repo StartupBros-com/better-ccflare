@@ -10,7 +10,10 @@ import {
 	decideAutoContextFit,
 	evaluateAutoRequestAdmission,
 } from "./auto-request-admission";
-import { CodexProvider } from "./providers/codex/provider";
+import {
+	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
+	CodexProvider,
+} from "./providers/codex/provider";
 import {
 	captureCodexModelReasoningSnapshot,
 	clearCodexAccountModelContextMetadata,
@@ -22,6 +25,8 @@ import { CODEX_REASONING_RETENTION_PREFIX } from "./utils/codex-reasoning-retent
 function effortCatalog(
 	levels: unknown = [{ effort: "high" }],
 	accountId = "effort-owner",
+	defaultLevel?: string,
+	model = "gpt-6-astra",
 ) {
 	const catalog = createAutoCatalogEvidence({
 		accountId,
@@ -31,17 +36,21 @@ function effortCatalog(
 		expiresAt: Date.now() + 60000,
 		models: [
 			{
-				id: "gpt-6-astra",
+				id: model,
 				capabilities: normalizeAutoModelCapabilities("codex", {
 					context_window: 10000,
 					max_context_window: 10000,
 					input_modalities: ["text"],
 					supported_reasoning_levels: levels,
+					...(defaultLevel ? { default_reasoning_level: defaultLevel } : {}),
 				}),
 			},
 		],
 	});
-	const target = resolveAutoModelTargets(catalog, "gpt-astra").current;
+	const target = resolveAutoModelTargets(
+		catalog,
+		model === "gpt-6-astra" ? "gpt-astra" : "gpt-sol",
+	).current;
 	if (!catalog || !target) throw new Error("missing effort target");
 	return { catalog, target };
 }
@@ -49,14 +58,21 @@ async function translateEffort(
 	original: Record<string, unknown>,
 	supported = ["minimal", "low", "medium", "high", "xhigh", "max"],
 	refreshed?: string[],
+	options: {
+		defaultEffort?: string;
+		model?: string;
+		logicalFamily?: string;
+	} = {},
 ) {
+	const model = options.model ?? "gpt-6-astra";
 	setCodexAccountModelContextMetadata("effort-owner", [
 		{
-			id: "gpt-6-astra",
+			id: model,
 			contextWindow: 10000,
 			maxContextWindow: 10000,
 			effectiveContextPercent: 100,
 			supportedReasoningEfforts: supported,
+			defaultReasoningEffort: options.defaultEffort ?? null,
 		},
 	]);
 	const reasoningSnapshot = captureCodexModelReasoningSnapshot("effort-owner");
@@ -82,8 +98,14 @@ async function translateEffort(
 	const transformed = await new CodexProvider().transformRequestBody(
 		new Request("https://example.invalid/v1/messages", {
 			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(original),
+			headers: {
+				"content-type": "application/json",
+				// The proxy sets this from the original request's model family.
+				...(options.logicalFamily
+					? { [CODEX_LOGICAL_MODEL_FAMILY_HEADER]: options.logicalFamily }
+					: {}),
+			},
+			body: JSON.stringify({ ...original, model }),
 		}),
 		undefined,
 		undefined,
@@ -284,6 +306,71 @@ describe("Codex Auto official effort preservation", () => {
 				...effortCatalog([{ effort: "low" }, { effort: "high" }]),
 				finalBody,
 				requirements: captureAutoRequestRequirements(original),
+			}),
+		).toMatchObject({ status: "unknown", reason: "catalog-evidence-stale" });
+	});
+	it("binds the catalog default to the pinned generation when the adapter's own default is unsupported", async () => {
+		// Same supported set, different catalog defaults. medium is unlisted, so the
+		// adapter falls back to its snapshot's default.
+		const finalBody = await translateEffort(
+			effortBody,
+			["low", "high"],
+			undefined,
+			{
+				defaultEffort: "high",
+			},
+		);
+		expect(finalBody.reasoning).toEqual({ effort: "high" });
+		const levels = [{ effort: "low" }, { effort: "high" }];
+		expect(
+			evaluateAutoRequestAdmission({
+				...effortCatalog(levels, "effort-owner", "low"),
+				finalBody,
+				requirements: captureAutoRequestRequirements(effortBody),
+			}),
+		).toMatchObject({ status: "unknown", reason: "catalog-evidence-stale" });
+		expect(
+			evaluateAutoRequestAdmission({
+				...effortCatalog(levels, "effort-owner", "high"),
+				finalBody,
+				requirements: captureAutoRequestRequirements(effortBody),
+			}).status,
+		).toBe("admit");
+	});
+	it("derives the default from the original request's family (Fable on gpt-5.6-sol defaults to xhigh)", async () => {
+		const supported = ["low", "medium", "high", "xhigh"];
+		const levels = supported.map((effort) => ({ effort }));
+		const finalBody = await translateEffort(effortBody, supported, undefined, {
+			model: "gpt-5.6-sol",
+			logicalFamily: "fable",
+		});
+		expect(finalBody.reasoning).toEqual({ effort: "xhigh" });
+		const evidence = effortCatalog(
+			levels,
+			"effort-owner",
+			"medium",
+			"gpt-5.6-sol",
+		);
+		expect(
+			evaluateAutoRequestAdmission({
+				...evidence,
+				finalBody,
+				requirements: captureAutoRequestRequirements({
+					...effortBody,
+					model: "claude-bccf-quality-fable",
+				}),
+			}).status,
+		).toBe("admit");
+		// A request whose family is not Fable gets medium from the adapter, so an
+		// xhigh wire was not built for it.
+		expect(
+			evaluateAutoRequestAdmission({
+				...evidence,
+				finalBody,
+				requirements: captureAutoRequestRequirements({
+					...effortBody,
+					model: "claude-bccf-quality-auto",
+				}),
 			}),
 		).toMatchObject({ status: "unknown", reason: "catalog-evidence-stale" });
 	});

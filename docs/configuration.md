@@ -1284,7 +1284,7 @@ A Codex target admits what the stock Codex adapter translates deterministically,
 - a `tool_choice` naming an undeclared tool
 - an `output_config` that the adapter's effort resolver rejects
 
-An effort the catalog does not list is admitted, because the adapter clamps it, as it does for stock. The clamp must match the catalog revision the target was resolved from. The adapter reads a reasoning snapshot that a catalog refresh republishes separately, so a wire effort that disagrees with the pinned evidence skips the lane as `catalog-evidence-stale`.
+An effort the catalog does not list is admitted, because the adapter clamps it, as it does for stock. The wire effort must match the catalog revision the target was resolved from. That covers both a requested effort's clamp and, when the request names no effort, the adapter's default: `medium`, or `xhigh` for a Fable request on `gpt-5.6-sol`, falling back to the catalog's `default_reasoning_level` when that default is unlisted. The adapter reads a reasoning snapshot that a catalog refresh republishes separately, so a wire effort that disagrees with the pinned evidence skips the lane as `catalog-evidence-stale`.
 
 ### Implementation and acceptance status
 

@@ -23,7 +23,6 @@ import {
 import { Logger } from "@better-ccflare/logger";
 import {
 	type AnthropicReasoningEffortSource,
-	isGpt56SolModel,
 	type ReasoningEffort,
 	resolveAnthropicReasoningEffort,
 	sanitizeSchemaForOpenAI,
@@ -59,6 +58,7 @@ import {
 	captureCodexModelReasoningSnapshot,
 	estimateAnthropicRequestTokens,
 	resolveModelContextCapability,
+	selectCodexDefaultReasoningEffort,
 } from "../../request-capabilities";
 import type {
 	ProviderAttemptPlanContext,
@@ -4773,24 +4773,6 @@ export class CodexProvider extends BaseProvider {
 
 		// Codex always requires streaming upstream; non-streaming clients are handled
 		// on the response side via transformSseResponseToJson.
-		const defaultReasoningEffort =
-			logicalModelFamily === "fable" && isGpt56SolModel(physicalModel)
-				? "xhigh"
-				: "medium";
-		// Retain our established default when supported; otherwise prefer the
-		// catalog's validated default before clamping to an advertised level.
-		const preferredDefault = reasoningMetadata?.supportedEfforts.includes(
-			defaultReasoningEffort,
-		)
-			? defaultReasoningEffort
-			: (reasoningMetadata?.defaultEffort ?? defaultReasoningEffort);
-		const resolvedDefault = resolveAnthropicReasoningEffort(
-			{ reasoning: { effort: preferredDefault } },
-			{
-				targetModel: physicalModel,
-				supportedTargetEfforts: reasoningMetadata?.supportedEfforts,
-			},
-		);
 		const codexRequest: CodexRequest = {
 			model: physicalModel,
 			input,
@@ -4803,8 +4785,11 @@ export class CodexProvider extends BaseProvider {
 			reasoning: {
 				effort:
 					reasoningResolution.effort ??
-					resolvedDefault.effort ??
-					defaultReasoningEffort,
+					selectCodexDefaultReasoningEffort(
+						physicalModel,
+						logicalModelFamily,
+						reasoningMetadata,
+					),
 			},
 		};
 

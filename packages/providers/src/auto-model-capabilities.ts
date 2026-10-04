@@ -27,6 +27,9 @@ export interface AutoModelCapabilities {
 	readonly inputModalities: readonly string[] | null;
 	/** Exact owned Codex catalog support; unknown never grants effort preservation. */
 	readonly supportedReasoningEfforts: readonly ReasoningEffort[] | null;
+	/** The catalog's default effort, kept only when it is one of
+	 * supportedReasoningEfforts, as the adapter's reasoning snapshot keeps it. */
+	readonly defaultReasoningEffort: ReasoningEffort | null;
 	/** Provider-specific evidence, not a generic tool support grant. */
 	readonly toolEvidence: Readonly<Record<string, EvidenceValue>>;
 	readonly nativeCapabilities: EvidenceValue;
@@ -321,8 +324,12 @@ export function normalizeAutoModelCapabilities(
 					...new Set<ReasoningEffort>(levels.map((level) => level.effort)),
 				])
 			: null;
+	const defaultLevel = raw.default_reasoning_level;
 	const facts = {
 		supportedReasoningEfforts,
+		defaultReasoningEffort:
+			supportedReasoningEfforts?.find((effort) => effort === defaultLevel) ??
+			null,
 		contextWindow: positiveSafeCapacity(
 			provider === "codex" ? raw.context_window : raw.max_input_tokens,
 		),

@@ -1,4 +1,5 @@
 import {
+	getModelFamily,
 	hasForcedToolChoice,
 	supportsForcedToolChoice,
 } from "@better-ccflare/core";
@@ -12,7 +13,10 @@ import {
 	positiveSafeCapacity,
 	resolveAutoModelTargets,
 } from "./auto-model-capabilities";
-import { estimateAnthropicAdmissionTokens } from "./request-capabilities";
+import {
+	estimateAnthropicAdmissionTokens,
+	selectCodexDefaultReasoningEffort,
+} from "./request-capabilities";
 import {
 	deriveServerToolRequirement,
 	materializeProviderServerToolCapabilityDecision,
@@ -430,11 +434,12 @@ function codexTranslatesWithoutLoss(
 	return true;
 }
 
-/** The adapter clamps effort against the account's reasoning snapshot, which a
+/** The adapter picks the effort from the account's reasoning snapshot, which a
  * catalog refresh republishes independently of the revision this target was
  * resolved from. The wire must carry exactly the effort the pinned evidence
- * yields: a clamp both agree on is stock's deterministic transform, while a
- * disagreement means the body was built from another catalog generation.
+ * yields, requested or default: a choice both agree on is stock's deterministic
+ * transform, while a disagreement means the body was built from another catalog
+ * generation.
  */
 function codexWireEffortDecision(
 	original: Record<string, unknown>,
@@ -446,23 +451,35 @@ function codexWireEffortDecision(
 	if (typeof wire !== "string")
 		return { status: "unknown", reason: "request-preservation-unknown" };
 	const supported = capabilities?.supportedReasoningEfforts;
-	if (supported?.length && !supported.some((effort) => effort === wire))
-		return { status: "unknown", reason: "catalog-evidence-stale" };
-	if (!Object.hasOwn(original, "output_config")) return null;
-	let resolved: string | undefined;
+	const pinned = supported?.length
+		? {
+				supportedEfforts: supported,
+				...(capabilities?.defaultReasoningEffort
+					? { defaultEffort: capabilities.defaultReasoningEffort }
+					: {}),
+			}
+		: null;
+	const model = typeof original.model === "string" ? original.model : null;
+	let expected: string | undefined;
 	try {
 		// The adapter clamps to the nearest supported effort and throws on an
 		// invalid value; resolve exactly as convertToCodexFormat does.
-		resolved = resolveAnthropicReasoningEffort(original, {
-			sourceModel:
-				typeof original.model === "string" ? original.model : undefined,
+		expected = resolveAnthropicReasoningEffort(original, {
+			sourceModel: model ?? undefined,
 			targetModel: physicalModel,
-			supportedTargetEfforts: supported ?? undefined,
+			supportedTargetEfforts: pinned?.supportedEfforts,
 		}).effort;
 	} catch {
 		return { status: "unknown", reason: "request-preservation-unknown" };
 	}
-	return resolved === wire
+	// For a quality route the proxy sends the adapter the original request
+	// model's family (requestMeta.originalModel; appliedModel is unset there).
+	expected ??= selectCodexDefaultReasoningEffort(
+		physicalModel,
+		model ? getModelFamily(model) : null,
+		pinned,
+	);
+	return expected === wire
 		? null
 		: { status: "unknown", reason: "catalog-evidence-stale" };
 }
