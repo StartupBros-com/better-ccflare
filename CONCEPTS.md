@@ -165,6 +165,17 @@ Anthropic account. Where no such account would serve, the request is refused wit
 client recognizes as "drop this tool and retry", never stripped silently. It is distinct from a
 hosted server tool such as WebSearch, which a provider route serves under an exact reviewed proof.
 
+### Native web-search passthrough
+
+The second way to serve `web_search_20250305`, beside hosted WebSearch. `api.anthropic.com`
+executes the tool itself, so a first-party Anthropic account serves the request with the
+declaration forwarded unchanged, no capability tuple, no proof and no replay envelopes. Hosted
+WebSearch is the other lane: a provider such as Codex runs the search under an exact reviewed
+tuple and the proxy translates the result. Advisor passthrough (see Native passthrough tool) is
+a different mechanism: advisor has no hosted lane, so it only constrains the pool to first-party
+accounts, whereas web_search keeps both lanes and one search runs per request. A forced
+`web_search` tool choice is demoted to `auto` on this lane for models that reject forced choice.
+
 ## Usage measurement
 
 ### Cache parity
