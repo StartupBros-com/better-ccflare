@@ -1670,11 +1670,15 @@ describe("UsageCollector request lifecycle", () => {
 					inputTokens: 10,
 					outputTokens: 7,
 					totalTokens: 17,
-					advisorModel: HAIKU_MODEL,
-					advisorInputTokens: 11,
-					advisorOutputTokens: 13,
-					advisorCacheReadInputTokens: 0,
-					advisorCacheCreationInputTokens: 0,
+					advisorUsage: [
+						{
+							model: HAIKU_MODEL,
+							inputTokens: 11,
+							outputTokens: 13,
+							cacheReadInputTokens: 0,
+							cacheCreationInputTokens: 0,
+						},
+					],
 				});
 				expect(advisorLogs.events).toHaveLength(1);
 				expect(advisorLogs.events[0]?.data).toMatchObject({
@@ -1686,13 +1690,48 @@ describe("UsageCollector request lifecycle", () => {
 				);
 			});
 
-			it("persists advisor tokens with no model when billable iterations do not share one", async () => {
+			it("persists advisor tokens per model so no model absorbs another's", async () => {
 				useDeterministicModelPricing();
 				const { collector, savedUsages } = harness();
-				const second = { input_tokens: 23, output_tokens: 29 };
-				for (const [label, model] of [
-					["mixed", OPUS_MODEL],
-					["missing", undefined],
+				const second = {
+					input_tokens: 23,
+					output_tokens: 29,
+					cache_read_input_tokens: 5,
+					cache_creation_input_tokens: 3,
+				};
+				const haiku = {
+					model: HAIKU_MODEL,
+					inputTokens: 11,
+					outputTokens: 13,
+					cacheReadInputTokens: 0,
+					cacheCreationInputTokens: 0,
+				};
+				const secondTotals = {
+					inputTokens: 23,
+					outputTokens: 29,
+					cacheReadInputTokens: 5,
+					cacheCreationInputTokens: 3,
+				};
+				for (const [label, model, expected] of [
+					[
+						"same",
+						HAIKU_MODEL,
+						[
+							{
+								model: HAIKU_MODEL,
+								inputTokens: 11 + 23,
+								outputTokens: 13 + 29,
+								cacheReadInputTokens: 5,
+								cacheCreationInputTokens: 3,
+							},
+						],
+					],
+					[
+						"mixed",
+						OPUS_MODEL,
+						[haiku, { model: OPUS_MODEL, ...secondTotals }],
+					],
+					["missing", undefined, [haiku, { model: null, ...secondTotals }]],
 				] as const) {
 					const requestId = `stream-advisor-${label}-model`;
 					collector.handleStart(makeStartMessage(requestId));
@@ -1707,14 +1746,9 @@ describe("UsageCollector request lifecycle", () => {
 					await collector.handleEnd({ type: "end", requestId, success: true });
 					await collector.drain();
 
-					// Window value prices advisor tokens under advisor_model, so
-					// neither model may absorb the other's tokens.
-					const saved = savedUsages.get(requestId);
-					expect(saved?.advisorModel).toBeUndefined();
-					expect(saved).toMatchObject({
-						advisorInputTokens: 11 + 23,
-						advisorOutputTokens: 13 + 29,
-					});
+					// Plan-window value prices each entry at its own model, and a
+					// model-less entry as unpriced, so every billable token is kept.
+					expect(savedUsages.get(requestId)?.advisorUsage).toEqual(expected);
 				}
 			});
 
@@ -1868,8 +1902,7 @@ describe("UsageCollector request lifecycle", () => {
 					costUsd: EXECUTOR_COST,
 				});
 				// A stale snapshot persists no advisor tokens.
-				expect(savedUsages.get(requestId)?.advisorModel).toBeUndefined();
-				expect(savedUsages.get(requestId)?.advisorOutputTokens).toBeUndefined();
+				expect(savedUsages.get(requestId)?.advisorUsage).toBeUndefined();
 				expect(advisorLogs.events).toHaveLength(1);
 				expect(advisorLogs.events[0]?.data).toMatchObject({
 					requestId,

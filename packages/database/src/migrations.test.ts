@@ -2202,24 +2202,14 @@ describe("Muse Spark provider migration", () => {
 	});
 });
 
-describe("advisor usage columns on requests", () => {
-	const ADVISOR_COLUMNS = [
-		"advisor_model",
-		"advisor_input_tokens",
-		"advisor_output_tokens",
-		"advisor_cache_read_input_tokens",
-		"advisor_cache_creation_input_tokens",
-	];
-
-	it("exist on a fresh schema", () => {
+describe("advisor usage column on requests", () => {
+	it("exists on a fresh schema", () => {
 		const db = new Database(":memory:");
 		runMigrations(db);
-		expect(sqliteColumns(db, "requests")).toEqual(
-			expect.arrayContaining(ADVISOR_COLUMNS),
-		);
+		expect(sqliteColumns(db, "requests")).toContain("advisor_usage");
 	});
 
-	it("are added to an upgraded database, leaving existing rows null", () => {
+	it("is added to an upgraded database, leaving existing rows null", () => {
 		const db = new Database(":memory:");
 		// A pre-advisor requests table, as an older install would hold it.
 		db.run(
@@ -2228,16 +2218,12 @@ describe("advisor usage columns on requests", () => {
 		db.run(
 			"INSERT INTO requests (id, timestamp, method, path) VALUES ('old', 1, 'POST', '/v1/messages')",
 		);
-		expect(sqliteColumns(db, "requests")).not.toContain("advisor_model");
+		expect(sqliteColumns(db, "requests")).not.toContain("advisor_usage");
 
 		runMigrations(db);
 
-		expect(sqliteColumns(db, "requests")).toEqual(
-			expect.arrayContaining(ADVISOR_COLUMNS),
-		);
-		const row = db
-			.query("SELECT advisor_model, advisor_output_tokens FROM requests")
-			.get();
-		expect(row).toEqual({ advisor_model: null, advisor_output_tokens: null });
+		expect(sqliteColumns(db, "requests")).toContain("advisor_usage");
+		const row = db.query("SELECT advisor_usage FROM requests").get();
+		expect(row).toEqual({ advisor_usage: null });
 	});
 });

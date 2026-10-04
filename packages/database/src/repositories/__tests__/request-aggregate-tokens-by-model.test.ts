@@ -163,9 +163,17 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 	});
 
 	describe("advisor tokens (R14)", () => {
+		const OPUS_ADVISOR = {
+			model: "claude-opus-4",
+			inputTokens: 7,
+			outputTokens: 3,
+			cacheReadInputTokens: 2,
+			cacheCreationInputTokens: 1,
+		};
+
 		function seedAdvisor(
 			id: string,
-			advisorModel: string | null,
+			advisorUsage: unknown,
 			opts: { billingType?: string | null; timestamp?: number } = {},
 		): void {
 			seed(db, {
@@ -174,16 +182,16 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				model: "claude-sonnet-5",
 				billingType: opts.billingType,
 			});
-			db.run(
-				`UPDATE requests SET advisor_model = ?, advisor_input_tokens = 7,
-				 advisor_output_tokens = 3, advisor_cache_read_input_tokens = 2,
-				 advisor_cache_creation_input_tokens = 1 WHERE id = ?`,
-				[advisorModel, id],
-			);
+			db.run("UPDATE requests SET advisor_usage = ? WHERE id = ?", [
+				typeof advisorUsage === "string"
+					? advisorUsage
+					: JSON.stringify(advisorUsage),
+				id,
+			]);
 		}
 
 		it("adds advisor tokens to the advisor model's own line with zero request count", async () => {
-			seedAdvisor("a1", "claude-opus-4");
+			seedAdvisor("a1", [OPUS_ADVISOR]);
 
 			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
 			const byModel = Object.fromEntries(rows.map((r) => [r.model, r]));
@@ -207,7 +215,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 
 		it("merges into an existing executor line for the same model without adding a request", async () => {
 			seed(db, { id: "x1", timestamp: 1000, model: "claude-opus-4" });
-			seedAdvisor("a1", "claude-opus-4");
+			seedAdvisor("a1", [OPUS_ADVISOR]);
 
 			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
 			const opus = rows.find((r) => r.model === "claude-opus-4");
@@ -219,6 +227,71 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheCreationInputTokens: 6,
 				outputTokens: 53,
 			});
+		});
+
+		it("credits each advisor model in one request to its own line", async () => {
+			seedAdvisor("a1", [
+				OPUS_ADVISOR,
+				{
+					model: "claude-haiku-4",
+					inputTokens: 4,
+					outputTokens: 6,
+					cacheReadInputTokens: 0,
+					cacheCreationInputTokens: 8,
+				},
+			]);
+			seedAdvisor("a2", [OPUS_ADVISOR]);
+
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			const byModel = Object.fromEntries(rows.map((r) => [r.model, r]));
+			expect(byModel["claude-opus-4"]).toEqual({
+				model: "claude-opus-4",
+				requestCount: 0,
+				inputTokens: 14,
+				cacheReadInputTokens: 4,
+				cacheCreationInputTokens: 2,
+				outputTokens: 6,
+			});
+			expect(byModel["claude-haiku-4"]).toEqual({
+				model: "claude-haiku-4",
+				requestCount: 0,
+				inputTokens: 4,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 8,
+				outputTokens: 6,
+			});
+		});
+
+		it("counts a model-less advisor entry on the empty-model line rather than dropping it", async () => {
+			seedAdvisor("a1", [{ ...OPUS_ADVISOR, model: null }]);
+
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			expect(rows.find((r) => r.model === "")).toEqual({
+				model: "",
+				requestCount: 0,
+				inputTokens: 7,
+				cacheReadInputTokens: 2,
+				cacheCreationInputTokens: 1,
+				outputTokens: 3,
+			});
+		});
+
+		it("ignores an advisor_usage value that is not a JSON array of entries", async () => {
+			seedAdvisor("a1", "not json");
+			seedAdvisor("a2", { model: "claude-opus-4", outputTokens: 3 });
+			seedAdvisor("a3", [null, "claude-opus-4"]);
+
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			expect(rows).toEqual([
+				{
+					model: "claude-sonnet-5",
+					requestCount: 3,
+					inputTokens: 300,
+					cacheReadInputTokens: 30,
+					cacheCreationInputTokens: 15,
+					outputTokens: 150,
+				},
+			]);
 		});
 
 		it("leaves output identical when no row carries advisor data", async () => {
@@ -237,7 +310,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 		});
 
 		it("excludes advisor tokens on non-plan rows", async () => {
-			seedAdvisor("a1", "claude-opus-4", { billingType: "api" });
+			seedAdvisor("a1", [OPUS_ADVISOR], { billingType: "api" });
 			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
 			expect(rows).toEqual([]);
 		});
@@ -255,57 +328,78 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 			responseTime: 10,
 			failoverAttempts: 0,
 		};
+		const advisorUsage = [
+			{
+				model: "claude-opus-4",
+				inputTokens: 11,
+				outputTokens: 22,
+				cacheReadInputTokens: 33,
+				cacheCreationInputTokens: 44,
+			},
+			{
+				model: null,
+				inputTokens: 1,
+				outputTokens: 2,
+				cacheReadInputTokens: 3,
+				cacheCreationInputTokens: 4,
+			},
+		];
 
-		it("round-trips the five advisor fields", async () => {
+		it("stores per-model advisor usage that the window aggregate reads back", async () => {
 			await repo.save({
 				...base,
+				billingType: "plan",
 				usage: {
 					model: "claude-sonnet-5",
 					inputTokens: 1,
 					outputTokens: 2,
-					advisorModel: "claude-opus-4",
-					advisorInputTokens: 11,
-					advisorOutputTokens: 22,
-					advisorCacheReadInputTokens: 33,
-					advisorCacheCreationInputTokens: 44,
+					advisorUsage,
 				},
 			});
 			const row = db
-				.query(
-					`SELECT advisor_model, advisor_input_tokens, advisor_output_tokens,
-					 advisor_cache_read_input_tokens, advisor_cache_creation_input_tokens
-					 FROM requests WHERE id = 's1'`,
+				.query<{ advisor_usage: string }, []>(
+					"SELECT advisor_usage FROM requests WHERE id = 's1'",
 				)
 				.get();
-			expect(row).toEqual({
-				advisor_model: "claude-opus-4",
-				advisor_input_tokens: 11,
-				advisor_output_tokens: 22,
-				advisor_cache_read_input_tokens: 33,
-				advisor_cache_creation_input_tokens: 44,
+			expect(JSON.parse(row?.advisor_usage ?? "null")).toEqual(advisorUsage);
+
+			const rows = await repo.aggregateTokensByModel(
+				"acc1",
+				0,
+				Number.MAX_SAFE_INTEGER,
+			);
+			const byModel = Object.fromEntries(rows.map((r) => [r.model, r]));
+			expect(byModel["claude-opus-4"]).toEqual({
+				model: "claude-opus-4",
+				requestCount: 0,
+				inputTokens: 11,
+				cacheReadInputTokens: 33,
+				cacheCreationInputTokens: 44,
+				outputTokens: 22,
+			});
+			expect(byModel[""]).toEqual({
+				model: "",
+				requestCount: 0,
+				inputTokens: 1,
+				cacheReadInputTokens: 3,
+				cacheCreationInputTokens: 4,
+				outputTokens: 2,
 			});
 		});
 
-		it("stores nulls when the request has no advisor usage", async () => {
-			await repo.save({
-				...base,
-				id: "s2",
-				usage: { model: "claude-sonnet-5", inputTokens: 1 },
-			});
-			const row = db
-				.query(
-					`SELECT advisor_model, advisor_input_tokens, advisor_output_tokens,
-					 advisor_cache_read_input_tokens, advisor_cache_creation_input_tokens
-					 FROM requests WHERE id = 's2'`,
-				)
-				.get();
-			expect(row).toEqual({
-				advisor_model: null,
-				advisor_input_tokens: null,
-				advisor_output_tokens: null,
-				advisor_cache_read_input_tokens: null,
-				advisor_cache_creation_input_tokens: null,
-			});
+		it("stores null when the request has no advisor usage", async () => {
+			for (const [id, usage] of [
+				["s2", { model: "claude-sonnet-5", inputTokens: 1 }],
+				["s3", { model: "claude-sonnet-5", inputTokens: 1, advisorUsage: [] }],
+			] as const) {
+				await repo.save({ ...base, id, usage: { ...usage } });
+				const row = db
+					.query<{ advisor_usage: string | null }, [string]>(
+						"SELECT advisor_usage FROM requests WHERE id = ?",
+					)
+					.get(id);
+				expect(row).toEqual({ advisor_usage: null });
+			}
 		});
 	});
 });

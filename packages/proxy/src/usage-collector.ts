@@ -9,7 +9,11 @@ import {
 	TIME_CONSTANTS,
 	type TurnEvidence,
 } from "@better-ccflare/core";
-import { AsyncDbWriter, DatabaseOperations } from "@better-ccflare/database";
+import {
+	type AdvisorModelUsage,
+	AsyncDbWriter,
+	DatabaseOperations,
+} from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import {
 	type AgentAttributionSource,
@@ -1918,54 +1922,39 @@ export class UsageCollector {
 				(state.usage.cacheReadInputTokens ?? 0) +
 				(state.usage.cacheCreationInputTokens ?? 0)
 			: undefined;
-		// Advisor tokens (R14): sums over exactly the iterations priced at
-		// finalize (billable and not stale), so tokens and cost agree. Computed
-		// eagerly because the write below runs later, after freeRequestState.
-		let advisorPersist:
-			| {
-					advisorModel?: string;
-					advisorInputTokens: number;
-					advisorOutputTokens: number;
-					advisorCacheReadInputTokens: number;
-					advisorCacheCreationInputTokens: number;
-			  }
-			| undefined;
+		// Advisor tokens (R14): per-model sums over exactly the iterations
+		// priced at finalize (billable and not stale), so tokens and cost
+		// agree. Plan-window value prices each model's entry at that model; an
+		// iteration naming no model keeps a null model and counts as unpriced.
+		// Computed eagerly because the write below runs later, after
+		// freeRequestState.
+		let advisorUsage: AdvisorModelUsage[] | undefined;
 		if (
 			state.usage.iterationsSeq === state.usagePayloadSeq &&
 			state.usage.advisorIterations
 		) {
-			const billable = state.usage.advisorIterations.filter(
-				(iteration) => (iteration.output_tokens ?? 0) > 0,
-			);
-			if (billable.length > 0) {
-				// Plan-window value prices these tokens under advisor_model, so a
-				// model is recorded only when every billable iteration names the
-				// same one. Mixed or missing models keep the token totals with a
-				// null model, which window value skips rather than misprices.
-				const models = new Set(billable.map((iteration) => iteration.model));
-				const [advisorModel] = models;
-				if (models.size > 1) {
-					log.info("anthropic_advisor_multiple_models", {
-						requestId: startMessage.requestId,
-						models: [...models].map((model) => model ?? "(unspecified)"),
-					});
+			const byModel = new Map<string | null, AdvisorModelUsage>();
+			for (const iteration of state.usage.advisorIterations) {
+				if ((iteration.output_tokens ?? 0) <= 0) continue;
+				const model = iteration.model ?? null;
+				let totals = byModel.get(model);
+				if (!totals) {
+					totals = {
+						model,
+						inputTokens: 0,
+						outputTokens: 0,
+						cacheReadInputTokens: 0,
+						cacheCreationInputTokens: 0,
+					};
+					byModel.set(model, totals);
 				}
-				advisorPersist = {
-					advisorModel: models.size === 1 ? advisorModel : undefined,
-					advisorInputTokens: 0,
-					advisorOutputTokens: 0,
-					advisorCacheReadInputTokens: 0,
-					advisorCacheCreationInputTokens: 0,
-				};
-				for (const iteration of billable) {
-					advisorPersist.advisorInputTokens += iteration.input_tokens ?? 0;
-					advisorPersist.advisorOutputTokens += iteration.output_tokens ?? 0;
-					advisorPersist.advisorCacheReadInputTokens +=
-						iteration.cache_read_input_tokens ?? 0;
-					advisorPersist.advisorCacheCreationInputTokens +=
-						iteration.cache_creation_input_tokens ?? 0;
-				}
+				totals.inputTokens += iteration.input_tokens ?? 0;
+				totals.outputTokens += iteration.output_tokens ?? 0;
+				totals.cacheReadInputTokens += iteration.cache_read_input_tokens ?? 0;
+				totals.cacheCreationInputTokens +=
+					iteration.cache_creation_input_tokens ?? 0;
 			}
+			if (byModel.size > 0) advisorUsage = [...byModel.values()];
 		}
 		// No preliminary INSERT needed — dashboard tracks pending requests via SSE events, not DB queries.
 		this.asyncWriter.enqueue(async () => {
@@ -1993,7 +1982,7 @@ export class UsageCollector {
 								cacheReadInputTokens: state.usage.cacheReadInputTokens,
 								cacheCreationInputTokens: state.usage.cacheCreationInputTokens,
 								tokensPerSecond: state.usage.tokensPerSecond,
-								...advisorPersist,
+								...(advisorUsage ? { advisorUsage } : {}),
 							}
 						: undefined,
 					state.agentUsed,
