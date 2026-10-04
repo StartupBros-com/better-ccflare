@@ -140,12 +140,19 @@ export type QualityAdmissionDecision = (
 ) &
 	Readonly<{
 		accounting?: {
-			readonly source: "local-envelope-v1";
+			/**
+			 * local-envelope-v1 (before #429): UTF-8 bytes of the whole final envelope,
+			 * 25% plus 1024 headroom, the caller's full reserve. stock-codex-estimate-v1:
+			 * stock Codex admission's estimate of the original request, no headroom,
+			 * and the reserve the wire carries. Persisted rows keep their label.
+			 */
+			readonly source: "local-envelope-v1" | "stock-codex-estimate-v1";
 			readonly kind: "estimate";
+			/** Bytes of the final envelope (local-envelope-v1) or the original request. */
 			readonly envelopeBytes: number;
 			readonly inputEstimate: number;
 			readonly headroom: number;
-			/** Original caller reserve for estimated fit; not a wire-enforced Codex subscription cap. */
+			/** Output reserved for the estimated fit; not a wire-enforced Codex subscription cap. */
 			readonly requestedOutput: number;
 			/** Model ceiling metadata, not a per-request cap; null delegates acceptance/length to the provider. */
 			readonly outputLimit?:
@@ -365,7 +372,8 @@ export function sanitizeQualityDecision(
 			if (
 				!qualityObject(a) ||
 				!qualityKeys(a, ["source", "kind", "outputLimit", ...numbers]) ||
-				a.source !== "local-envelope-v1" ||
+				(a.source !== "local-envelope-v1" &&
+					a.source !== "stock-codex-estimate-v1") ||
 				a.kind !== "estimate" ||
 				numbers.some(
 					(key) =>
@@ -395,7 +403,10 @@ export function sanitizeQualityDecision(
 				} else return null;
 			}
 			accounting = {
-				source: "local-envelope-v1",
+				source:
+					a.source === "local-envelope-v1"
+						? "local-envelope-v1"
+						: "stock-codex-estimate-v1",
 				kind: "estimate",
 				envelopeBytes: Number(a.envelopeBytes),
 				inputEstimate: Number(a.inputEstimate),
