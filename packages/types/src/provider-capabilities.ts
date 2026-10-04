@@ -70,7 +70,7 @@ export interface NativeAnthropicToolRequirement {
 	readonly declaredToolTypes: readonly string[];
 	/** Declared `advisor_*` types the proxy does not recognise (refused, R9). */
 	readonly unknownDeclaredTypes: readonly string[];
-	/** Advisor blocks appear in message history; fails closed when truncated. */
+	/** Advisor blocks appear in message history (exact, uncapped scan). */
 	readonly hasHistory: boolean;
 }
 

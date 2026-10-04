@@ -1288,7 +1288,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 		expect(ctx.asyncWriter.enqueue).toHaveBeenCalledTimes(0);
 	});
 
-	it("rejects a non-first-party account for an advisor request before refresh, transform or fetch", async () => {
+	it("rejects a non-first-party account for an advisor request before any upstream fetch", async () => {
 		const account = makeAccount({
 			id: "codex-acc",
 			name: "codex-acc",

@@ -85,7 +85,7 @@ export function evaluateQualityRouteAdmission(
 	if (capacity.status !== "admit") return capacity;
 	const fit = evaluateAutoRequestAdmission({
 		...request,
-		firstPartyAnthropic: isFirstPartyAnthropicAccount(account as Account),
+		firstPartyAnthropic: isFirstPartyAnthropicAccount(account),
 	});
 	if (fit.status === "reject") return fit;
 	const selected = input.selectedCredentials;

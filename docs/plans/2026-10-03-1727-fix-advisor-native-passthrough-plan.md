@@ -291,9 +291,9 @@ U7 depends on nothing and can run alongside Phase B.
 - **Files:** `packages/core/src/model-mappings.ts`, `packages/core/src/index.ts`, `packages/core/src/model-mappings.test.ts`, `packages/providers/src/server-tool-capabilities.ts`, `packages/providers/src/server-tool-capabilities.test.ts`, `packages/types/src/provider-capabilities.ts`.
 - **Approach:**
   1. Start from the uncommitted worktree changes to these six files. Keep what matches KTD1-KTD3 and discard the rest.
-  2. Flip truncated traversal to `hasHistory: true`, and invert the existing test that asserts the opposite.
+  2. Walk every message and top-level block exactly, with no visit cap, and stop at the first advisor block (KTD3, revised during review on 2026-10-03; the original step made truncated traversal set `hasHistory: true`).
   3. Record unknown `advisor_*` declared types on the native requirement and keep them out of `unsupported`.
-- **Patterns to follow:** `isOfficialXaiEndpoint` in `packages/core/src/xai.ts`; the bounded traversal in `scanHistoricalReplay`.
+- **Patterns to follow:** `isOfficialXaiEndpoint` in `packages/core/src/xai.ts`; the block-type checks in `scanHistoricalReplay`, without its visit caps.
 - **Execution note:** implement test-first. The partial tests are input, not proof.
 - **Test scenarios:**
   - Predicate: anthropic with null `custom_endpoint` is true; `https://api.anthropic.com` and `https://api.anthropic.com/v1` are true.
@@ -303,12 +303,12 @@ U7 depends on nothing and can run alongside Phase B.
   - Derivation: advisor plus a client function tool yields the advisor requirement and no server-tool requirement.
   - Derivation: history only (`server_tool_use` named `advisor`, then `advisor_tool_result` holding each of `advisor_result`, `advisor_redacted_result`, `advisor_tool_result_error`) yields `hasHistory: true` and no replay requirement.
   - Derivation: a dangling `server_tool_use` named `advisor` with no result (a `pause_turn` resume) yields `hasHistory: true`.
-  - Derivation: advisor history placed past the message visit cap yields `hasHistory: true`.
+  - Derivation: advisor history placed past the replay scan's message or block visit cap yields `hasHistory: true`, and a conversation past either cap with no advisor content yields no requirement.
   - Derivation: a `server_tool_use` named `web_search` still produces its replay requirement.
   - Derivation: a declared `advisor_20270101` is recorded as an unknown advisor type and is not in `unsupported`.
   - Derivation: `code_execution_20250825` stays in `unsupported` (R17).
   - Derivation: advisor plus `web_search_20250305` yields both requirements.
-- **Verification:** both derivations are pure, return frozen values, and agree on traversal caps. Existing web_search derivation tests pass unchanged.
+- **Verification:** both derivations are pure and return frozen values; the advisor walk is uncapped (KTD3). Existing web_search derivation tests pass unchanged.
 
 ### U2. Request wiring, refusal reasons, and gate checks
 
