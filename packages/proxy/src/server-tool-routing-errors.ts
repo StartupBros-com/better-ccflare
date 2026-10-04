@@ -23,7 +23,8 @@ export type ServerToolCandidateCapabilityFailureReason =
 	| "capability_unproven"
 	| "replay_unavailable"
 	| "proof_mismatch"
-	| "proof_drift";
+	| "proof_drift"
+	| "other_lane_dispatched";
 
 interface ServerToolRoutingErrorOptions {
 	readonly reason: ServerToolRoutingErrorReason;

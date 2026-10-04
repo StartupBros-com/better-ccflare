@@ -18,6 +18,7 @@ import type { ProxyContext } from "../handlers";
 // Focused proxy tests must not load ignored embedded worker artifacts.
 const { getProvider } = await import("@better-ccflare/providers");
 const usageCollectorModule = await import("../usage-collector");
+const accountSelectorModule = await import("../handlers/account-selector");
 const { handleProxy } = await import("../proxy");
 const { createReadyServerToolReplayRuntimeForTest } = await import(
 	"./helpers/server-tool-replay-runtime"
@@ -724,5 +725,320 @@ describe("hosted web_search request contrast", () => {
 		expect(calls).toHaveLength(1);
 		expect(new URL(calls[0]?.url ?? "").host).toBe("capability.invalid");
 		expect(new URL(calls[0]?.url ?? "").search).toBe("");
+	});
+});
+
+// In-process account health survives between tests, so every account built
+// below gets an id no other test has throttled.
+let accountSeq = 0;
+function freshAccount(overrides: Partial<Account> = {}): Account {
+	accountSeq += 1;
+	return makeAccount({
+		id: `ws-native-${accountSeq}`,
+		name: `ws-native-${accountSeq}`,
+		...overrides,
+	});
+}
+function freshHostedAccount(overrides: Partial<Account> = {}): Account {
+	accountSeq += 1;
+	return makeHostedAccount({
+		id: `ws-hosted-${accountSeq}`,
+		name: `ws-hosted-${accountSeq}`,
+		...overrides,
+	});
+}
+
+// A hosted fixture and a first-party account share one pool. The hosted
+// provider is wrapped in spies so a skipped hosted candidate is observable on
+// the provider path itself, not only through globalThis.fetch.
+function makeSpiedHostedProvider(): {
+	provider: Provider;
+	buildUrl: ReturnType<typeof spyOn>;
+	transform: ReturnType<typeof spyOn>;
+} {
+	const provider = makeHostedProvider();
+	const buildUrl = spyOn(provider, "buildUrl");
+	const transform = spyOn(provider, "transformRequestBody");
+	return { provider, buildUrl, transform };
+}
+
+const HOSTED_HOST = "capability.invalid";
+
+function rateLimited(): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: { type: "rate_limit_error", message: "rate limited" },
+		}),
+		{
+			status: 429,
+			headers: { "content-type": "application/json", "retry-after": "60" },
+		},
+	);
+}
+
+describe("one search per request across lanes", () => {
+	it("executes exactly one search when a proven hosted fixture is ordered ahead of the first-party account", async () => {
+		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+		const { provider } = makeSpiedHostedProvider();
+		const { ctx } = makeContext(
+			[freshHostedAccount({ priority: 0 }), freshAccount({ priority: 5 })],
+			READY_SERVER_TOOL_REPLAY_RUNTIME,
+			provider,
+		);
+		const calls = installFetch(() => jsonOk("claude-sonnet-4-5"));
+		const { request } = makeHelperRequest({ model: "claude-sonnet-4-5" });
+
+		const { response } = await run(ctx, request);
+
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		expect(new URL(calls[0]?.url ?? "").host).toBe(HOSTED_HOST);
+	});
+
+	for (const status of [429, 500]) {
+		it(`skips the hosted candidate once a native send began and failed with ${status}`, async () => {
+			delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+			const { provider, buildUrl, transform } = makeSpiedHostedProvider();
+			const { ctx } = makeContext(
+				[freshAccount({ priority: 0 }), freshHostedAccount({ priority: 5 })],
+				READY_SERVER_TOOL_REPLAY_RUNTIME,
+				provider,
+			);
+			const calls = installFetch(() =>
+				status === 429
+					? rateLimited()
+					: new Response(
+							JSON.stringify({
+								type: "error",
+								error: { type: "api_error", message: "boom" },
+							}),
+							{
+								status,
+								headers: { "content-type": "application/json" },
+							},
+						),
+			);
+			const { request } = makeHelperRequest({ model: "claude-sonnet-4-5" });
+
+			const { response } = await run(ctx, request);
+
+			expect(response.status).toBeGreaterThanOrEqual(400);
+			const hosts = calls.map((call) => new URL(call.url).host);
+			expect(hosts).not.toContain(HOSTED_HOST);
+			expect(hosts).toContain("api.anthropic.com");
+			// The hosted attempt never reached transform or transport.
+			expect(transform).not.toHaveBeenCalled();
+			expect(buildUrl).not.toHaveBeenCalled();
+		});
+	}
+
+	it("skips the first-party candidate once a hosted dispatch is claimed", async () => {
+		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+		const { provider } = makeSpiedHostedProvider();
+		const { ctx } = makeContext(
+			[freshHostedAccount({ priority: 0 }), freshAccount({ priority: 5 })],
+			READY_SERVER_TOOL_REPLAY_RUNTIME,
+			provider,
+		);
+		const calls = installFetch(
+			() =>
+				new Response(
+					JSON.stringify({
+						type: "error",
+						error: { type: "api_error", message: "hosted failed" },
+					}),
+					{ status: 500, headers: { "content-type": "application/json" } },
+				),
+		);
+		const { request } = makeHelperRequest({ model: "claude-sonnet-4-5" });
+
+		const { response } = await run(ctx, request);
+
+		expect(response.status).toBeGreaterThanOrEqual(400);
+		const hosts = calls.map((call) => new URL(call.url).host);
+		expect(hosts).toEqual([HOSTED_HOST]);
+	});
+
+	it("keeps native-to-native failover unchanged beside a hosted fixture", async () => {
+		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+		const { provider } = makeSpiedHostedProvider();
+		const { ctx } = makeContext(
+			[
+				freshAccount({ priority: 0 }),
+				freshAccount({
+					priority: 1,
+					access_token: "oauth-access-token-b",
+				}),
+				freshHostedAccount({ priority: 5 }),
+			],
+			READY_SERVER_TOOL_REPLAY_RUNTIME,
+			provider,
+		);
+		const calls = installFetch((call) =>
+			call.headers.get("authorization") === "Bearer oauth-access-token"
+				? rateLimited()
+				: jsonOk("claude-sonnet-4-5"),
+		);
+		const { request } = makeHelperRequest({ model: "claude-sonnet-4-5" });
+
+		const { response } = await run(ctx, request);
+
+		expect(response.status).toBe(200);
+		expect(calls.map((call) => new URL(call.url).host)).toEqual([
+			"api.anthropic.com",
+			"api.anthropic.com",
+		]);
+	});
+});
+
+describe("native web_search dispatch backstop", () => {
+	it("never fetches a non-first-party capacity-deferred route that bypasses selection", async () => {
+		const codex = freshAccount({
+			id: "codex-a",
+			name: "codex-a",
+			provider: "codex",
+			priority: 5,
+		});
+		// Selection serves the first-party account, which then fails over; the
+		// deferred Codex route is injected behind selection's back and must be
+		// refused at dispatch because it carries no proven hosted capability.
+		const { ctx } = makeContext([freshAccount()]);
+		const deferred = spyOn(
+			accountSelectorModule,
+			"getCapacityDeferredModelRoutes",
+		).mockReturnValue([
+			{
+				account: codex,
+				model: "gpt-5.6-sol",
+				candidateId: `capacity-deferred:${encodeURIComponent(codex.id)}`,
+				fallbackRank: 0,
+				familyOccurrence: null,
+			},
+		]);
+		const calls = installFetch(() => rateLimited());
+		const { request } = makeHelperRequest();
+
+		try {
+			const { response } = await run(ctx, request);
+			expect(deferred).toHaveBeenCalled();
+			expect(response.status).toBeGreaterThanOrEqual(400);
+			const hosts = calls.map((call) => new URL(call.url).host);
+			expect(hosts.length).toBeGreaterThan(0);
+			for (const host of hosts) expect(host).toBe("api.anthropic.com");
+		} finally {
+			deferred.mockRestore();
+		}
+	});
+});
+
+describe("replay issuance lease on the native lane", () => {
+	async function observedRuntime() {
+		const reservations: number[] = [];
+		const runtime = await createReadyServerToolReplayRuntimeForTest({
+			onReserveReplayIssuanceRange: (reservation) => {
+				reservations.push(reservation.reservationSize);
+			},
+		});
+		return { runtime, reservations };
+	}
+
+	it("reserves one request-private range for a natively served request and holds nothing afterwards", async () => {
+		const { runtime, reservations } = await observedRuntime();
+		const { ctx } = makeContext([freshAccount()], runtime);
+		installFetch(() => sseOk());
+
+		const first = await run(ctx, makeHelperRequest({ stream: true }).request);
+		const second = await run(ctx, makeHelperRequest({ stream: true }).request);
+
+		expect(first.response.status).toBe(200);
+		expect(second.response.status).toBe(200);
+		// One range per inbound request, none shared and none retained: the second
+		// request is not blocked by, and does not reuse, the first one's lease.
+		expect(reservations).toHaveLength(2);
+	});
+
+	it("does not reserve again for failover or retry after a failed native attempt", async () => {
+		const { runtime, reservations } = await observedRuntime();
+		const { ctx } = makeContext(
+			[
+				freshAccount(),
+				freshAccount({
+					priority: 1,
+					access_token: "oauth-access-token-b",
+				}),
+			],
+			runtime,
+		);
+		installFetch((call) =>
+			call.headers.get("authorization") === "Bearer oauth-access-token"
+				? rateLimited()
+				: jsonOk(),
+		);
+
+		const { response } = await run(ctx, makeHelperRequest().request);
+		expect(response.status).toBe(200);
+		expect(reservations).toHaveLength(1);
+
+		const failing = makeContext([freshAccount()], runtime);
+		installFetch(() => rateLimited());
+		const failed = await run(failing.ctx, makeHelperRequest().request);
+		expect(failed.response.status).toBeGreaterThanOrEqual(400);
+		expect(reservations).toHaveLength(2);
+	});
+
+	it("leaves no lease state behind when the client cancels a native request", async () => {
+		const { runtime, reservations } = await observedRuntime();
+		const { ctx } = makeContext([freshAccount()], runtime);
+		const controller = new AbortController();
+		const { clientBody } = makeHelperRequest();
+		const cancelled = new Request("https://proxy.local/v1/messages?beta=true", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+				"anthropic-beta": CLIENT_BETA,
+				authorization: "Bearer websearch-test-client",
+				"x-claude-code-session-id": "websearch-session",
+			},
+			body: JSON.stringify(clientBody),
+			signal: controller.signal,
+		});
+		let fetchStarted: () => void = () => undefined;
+		const started = new Promise<void>((resolve) => {
+			fetchStarted = resolve;
+		});
+		globalThis.fetch = mock(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const signal =
+					init?.signal ?? (input instanceof Request ? input.signal : undefined);
+				fetchStarted();
+				return await new Promise<Response>((_resolve, reject) => {
+					signal?.addEventListener("abort", () =>
+						reject(new DOMException("aborted", "AbortError")),
+					);
+				});
+			},
+		) as unknown as typeof fetch;
+
+		const pending = handleProxy(
+			cancelled,
+			new URL(cancelled.url),
+			ctx,
+			"key-1",
+		).then(
+			(response) => response.text().then(() => response.status),
+			() => -1,
+		);
+		await started;
+		controller.abort();
+		await pending;
+
+		expect(reservations).toHaveLength(1);
+		// A later request on the same runtime reserves its own fresh range.
+		installFetch(() => jsonOk());
+		const next = await run(ctx, makeHelperRequest().request);
+		expect(next.response.status).toBe(200);
+		expect(reservations).toHaveLength(2);
 	});
 });

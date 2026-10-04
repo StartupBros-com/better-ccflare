@@ -3248,7 +3248,19 @@ export async function proxyWithAccount(
 			physicalModel: string | null,
 			requireSelectedCandidateBinding: boolean,
 		): ExactServerToolCapabilityBinding | null => {
-			if (!serverToolRequirements || nativeWebSearchLane) return null;
+			if (!serverToolRequirements) return null;
+			// One search per request across lanes: a claimed hosted dispatch rules out
+			// every native candidate and a begun native send rules out every hosted
+			// one. Both are per-candidate skips, never terminal errors.
+			if (
+				nativeWebSearchLane
+					? routingAttemptLedger?.hostedDispatchState === "hosted_dispatched"
+					: routingAttemptLedger?.nativeSearchDispatchState ===
+						"native_dispatched"
+			) {
+				throw candidateCapabilityError("other_lane_dispatched");
+			}
+			if (nativeWebSearchLane) return null;
 			if (!physicalModel) throw candidateCapabilityError("tuple_unavailable");
 
 			const currentProvider = resolveProviderForAccount(
@@ -4432,6 +4444,9 @@ export async function proxyWithAccount(
 				};
 				const recordPhysicalDispatch = (): void => {
 					ensureNativeQuotaDispatch();
+					if (nativeWebSearchLane) {
+						routingAttemptLedger?.markNativeSearchDispatched();
+					}
 					routingAttemptLedger?.recordPhysicalAttempt({
 						provider: attemptPlan.providerName,
 						logicalModel: clientRequestedModel,
