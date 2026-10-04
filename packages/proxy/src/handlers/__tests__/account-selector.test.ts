@@ -32,6 +32,10 @@ import {
 	ModelRouteSessionRegistry,
 	parseModelRouteProfiles,
 } from "../../model-route-profiles";
+import {
+	createServerToolRoutingErrorResponse,
+	type ServerToolRoutingError,
+} from "../../server-tool-routing-errors";
 import type { ProxyContext } from "../proxy-types";
 
 const {
@@ -361,6 +365,12 @@ function serverToolMeta(overrides: Partial<RequestMeta> = {}): RequestMeta {
 		...overrides,
 	});
 }
+
+// A first-party Anthropic account is natively web_search-capable and never
+// consults the provider's tuple decision, so fixtures that exercise a mocked
+// "anthropic" provider decision use the console alias: it resolves to the same
+// provider but is not a first-party account.
+const HOSTED_FIXTURE_PROVIDER = "claude-console-api";
 
 const cachedUsageAccountIds = new Set<string>();
 
@@ -5700,11 +5710,13 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 				auto_fallback_enabled: true,
 				rate_limit_reset: Date.now() - 5_000,
 				rate_limited_until: Date.now() - 5_000,
+				provider: HOSTED_FIXTURE_PROVIDER,
 				model_mappings: JSON.stringify({ opus: "physical-incapable" }),
 			});
 			const capable = makeAccount({
 				id: "capable-control",
 				priority: 1,
+				provider: HOSTED_FIXTURE_PROVIDER,
 				model_mappings: JSON.stringify({ opus: "physical-capable" }),
 			});
 			const ctx = makeCtx({ accounts: [incapable, capable] });
@@ -6141,11 +6153,13 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			const owner = makeAccount({
 				id: "degraded-owner",
 				priority: 0,
+				provider: HOSTED_FIXTURE_PROVIDER,
 				model_mappings: JSON.stringify({ opus: "physical-owner" }),
 			});
 			const fallback = makeAccount({
 				id: "degraded-fallback",
 				priority: 1,
+				provider: HOSTED_FIXTURE_PROVIDER,
 				model_mappings: JSON.stringify({ opus: "physical-fallback" }),
 			});
 			const ownerSnapshot = {
@@ -7213,5 +7227,381 @@ describe("selectAccountsForRequest — native Anthropic advisor constraint", () 
 			filterRequestCompatibleAccounts(pool, headers, true).map(({ id }) => id),
 		).toEqual(["first-party-oauth", "first-party-api-key"]);
 		expect(filterRequestCompatibleAccounts(pool, headers)).toHaveLength(6);
+	});
+});
+
+describe("selectAccountsForRequest — native web_search passthrough lane", () => {
+	const MODEL_ID = "claude-sonnet-4-5";
+	const HOSTED_PROVIDER = "u2-hosted-proven";
+	const NATIVE_PROOF_KEY = "native-passthrough:web_search_20250305";
+
+	function serving(
+		overrides: Partial<Account> & Pick<Account, "id">,
+		model = MODEL_ID,
+	): Account {
+		return makeAccount({
+			model_mappings: JSON.stringify({ [model]: model }),
+			...overrides,
+		});
+	}
+
+	function webSearchPool(model = MODEL_ID): Account[] {
+		return [
+			serving({ id: "codex", provider: "codex" }, model),
+			serving({ id: "xai", provider: "xai" }, model),
+			serving(
+				{
+					id: "anthropic-compatible",
+					provider: "anthropic-compatible",
+					custom_endpoint: "https://compatible.example/v1",
+				},
+				model,
+			),
+			serving(
+				{
+					id: "anthropic-custom-endpoint",
+					provider: "anthropic",
+					custom_endpoint: "https://mac-studio.example:8080",
+				},
+				model,
+			),
+			serving({ id: "first-party-oauth", provider: "anthropic" }, model),
+			serving(
+				{
+					id: "first-party-api-key",
+					provider: "anthropic",
+					refresh_token: null,
+					api_key: "sk-ant-test",
+				},
+				model,
+			),
+		];
+	}
+
+	function catalogEntry(meta: RequestMeta, accountId: string) {
+		const entry = meta.routingCandidateCatalog?.find(
+			(candidate) => candidate.accountId === accountId,
+		);
+		if (!entry) throw new Error(`no catalog entry for ${accountId}`);
+		return entry.serverToolCapability;
+	}
+
+	async function rejection(promise: Promise<unknown>): Promise<unknown> {
+		try {
+			await promise;
+		} catch (error) {
+			return error;
+		}
+		throw new Error("expected selection to reject");
+	}
+
+	it("proves only first-party Anthropic accounts and records a reason for every other pool member", async () => {
+		const ctx = makeCtx({ accounts: webSearchPool() });
+		const meta = serverToolMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, MODEL_ID);
+
+		expect(result.map(({ id }) => id)).toEqual([
+			"first-party-oauth",
+			"first-party-api-key",
+		]);
+		for (const id of ["first-party-oauth", "first-party-api-key"]) {
+			expect(catalogEntry(meta, id)).toEqual({
+				resolvedProvider: "anthropic",
+				physicalModel: MODEL_ID,
+				decision: "proven",
+				reason: null,
+				proofKey: NATIVE_PROOF_KEY,
+				lane: "native_passthrough",
+				inputReplayMode: [],
+				outputReplayMode: [],
+				replayRuntimeStatus: "not_required",
+			});
+		}
+		for (const id of [
+			"codex",
+			"xai",
+			"anthropic-compatible",
+			"anthropic-custom-endpoint",
+		]) {
+			const capability = catalogEntry(meta, id);
+			expect(capability?.decision).toBe("unknown");
+			expect(capability?.reason).toBe("tuple_unavailable");
+			expect(capability?.proofKey).toBeNull();
+			expect(capability?.lane).toBeUndefined();
+		}
+		expect(meta.serverToolCapabilitySummary).toMatchObject({
+			structuralCandidateCount: 6,
+			provenCandidateCount: 2,
+			unknownCandidateCount: 4,
+			replayIneligibleCandidateCount: 0,
+			eligibleCandidateCount: 2,
+		});
+	});
+
+	it("does not reorder the strategy input: priority order decides between lanes", async () => {
+		const ctx = makeCtx({ accounts: webSearchPool() });
+		await selectAccountsForRequest(serverToolMeta(), ctx, MODEL_ID);
+
+		const offered = (ctx.strategy.select as ReturnType<typeof mock>).mock
+			.calls[0]?.[0] as Account[];
+		expect(offered.map(({ id }) => id)).toEqual([
+			"first-party-oauth",
+			"first-party-api-key",
+		]);
+	});
+
+	it("keeps a first-party account unproven when its logical model has no physical preview", async () => {
+		const unmapped = makeAccount({ id: "first-party-unmapped" });
+		const ctx = makeCtx({ accounts: [unmapped] });
+		const meta = serverToolMeta();
+
+		const error = await rejection(
+			selectAccountsForRequest(meta, ctx, "gpt-5.6-sol"),
+		);
+
+		expect(error).toMatchObject({
+			name: "ServerToolRoutingError",
+			reason: "no_implementation",
+		});
+		expect(catalogEntry(meta, "first-party-unmapped")).toMatchObject({
+			decision: "unknown",
+			reason: "physical_model_unavailable",
+			physicalModel: null,
+			proofKey: null,
+		});
+		expect(catalogEntry(meta, "first-party-unmapped")?.lane).toBeUndefined();
+	});
+
+	it("answers no_implementation when no first-party account exists", async () => {
+		const pool = webSearchPool().filter(
+			({ id }) => !id.startsWith("first-party"),
+		);
+		const ctx = makeCtx({ accounts: pool });
+		const meta = serverToolMeta();
+
+		const error = await rejection(
+			selectAccountsForRequest(meta, ctx, MODEL_ID),
+		);
+
+		expect(error).toMatchObject({
+			name: "ServerToolRoutingError",
+			reason: "no_implementation",
+		});
+		expect(meta.serverToolCapabilitySummary).toMatchObject({
+			structuralCandidateCount: 4,
+			provenCandidateCount: 0,
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("answers temporary_unavailable when every first-party account is excluded", async () => {
+		const pool = webSearchPool();
+		for (const account of pool) {
+			if (account.id.startsWith("first-party")) account.paused = true;
+		}
+		const ctx = makeCtx({ accounts: pool });
+		const meta = serverToolMeta();
+
+		const error = await rejection(
+			selectAccountsForRequest(meta, ctx, MODEL_ID),
+		);
+
+		expect(error).toMatchObject({
+			name: "ServerToolRoutingError",
+			reason: "temporary_unavailable",
+		});
+		const response = createServerToolRoutingErrorResponse(
+			error as ServerToolRoutingError,
+		);
+		expect(response.status).toBe(503);
+		const body = (await response.json()) as {
+			error: { code: string; reason: string; capability: unknown };
+		};
+		expect(body.error.code).toBe("route_unavailable");
+		expect(body.error.reason).toBe("temporary_unavailable");
+		expect(body.error.capability).toMatchObject({
+			provenCandidateCount: 2,
+			temporarilyUnavailableProvenCandidateCount: 2,
+			eligibleCandidateCount: 0,
+		});
+		expect(catalogEntry(meta, "first-party-oauth")?.lane).toBe(
+			"native_passthrough",
+		);
+	});
+
+	it("does not admit the native lane for proxy-opaque replay history", async () => {
+		const ctx = makeCtx({ accounts: webSearchPool() });
+		const meta = serverToolMeta({
+			serverToolRequirements: Object.freeze({
+				...SERVER_TOOL_REQUIREMENTS,
+				replay: Object.freeze({
+					input: Object.freeze(["proxy-evidence-v1" as const]),
+					output: Object.freeze([]),
+					requiresOutputReplay: true,
+				}),
+			}),
+		});
+
+		const error = await rejection(
+			selectAccountsForRequest(meta, ctx, MODEL_ID),
+		);
+
+		expect(error).toMatchObject({
+			name: "ServerToolRoutingError",
+			reason: "no_implementation",
+		});
+		for (const { id } of webSearchPool()) {
+			const capability = catalogEntry(meta, id);
+			expect(capability?.decision).toBe("unknown");
+			expect(capability?.proofKey).toBeNull();
+			expect(capability?.lane).toBeUndefined();
+		}
+	});
+
+	it("does not admit the native lane for a second typed tool", async () => {
+		const ctx = makeCtx({ accounts: webSearchPool() });
+		const meta = serverToolMeta({
+			serverToolRequirements: Object.freeze({
+				...SERVER_TOOL_REQUIREMENTS,
+				declarations: Object.freeze([
+					Object.freeze({ type: "web_search_20250305" as const, maxUses: 1 }),
+					Object.freeze({ type: "web_search_20250305" as const, maxUses: 2 }),
+				]),
+			}),
+		});
+
+		const error = await rejection(
+			selectAccountsForRequest(meta, ctx, MODEL_ID),
+		);
+
+		expect(error).toMatchObject({ reason: "no_implementation" });
+		expect(catalogEntry(meta, "first-party-oauth")?.lane).toBeUndefined();
+	});
+
+	describe("replay bind failure (serverToolReplayBound === false)", () => {
+		function installHostedProvider(): Provider | undefined {
+			return installCapabilityProvider({
+				name: HOSTED_PROVIDER,
+				decision: provenDecision,
+			});
+		}
+
+		function hostedAccount(): Account {
+			return serving({ id: "hosted-proven", provider: HOSTED_PROVIDER });
+		}
+
+		it("serves a mixed pool from both lanes while the bind holds", async () => {
+			installHostedProvider();
+			const ctx = makeCtx({
+				accounts: [
+					hostedAccount(),
+					serving({ id: "first-party-oauth", provider: "anthropic" }),
+				],
+			});
+			const meta = serverToolMeta();
+
+			const result = await selectAccountsForRequest(meta, ctx, MODEL_ID);
+
+			expect(result.map(({ id }) => id)).toEqual([
+				"hosted-proven",
+				"first-party-oauth",
+			]);
+			expect(catalogEntry(meta, "hosted-proven")).toMatchObject({
+				decision: "proven",
+				replayRuntimeStatus: "not_required",
+			});
+			expect(catalogEntry(meta, "hosted-proven")?.lane).toBeUndefined();
+		});
+
+		it("offers native candidates only and marks the hosted candidate replay-ineligible", async () => {
+			installHostedProvider();
+			const ctx = makeCtx({
+				accounts: [
+					hostedAccount(),
+					serving({ id: "first-party-oauth", provider: "anthropic" }),
+				],
+			});
+			const meta = serverToolMeta({ serverToolReplayBound: false });
+
+			const result = await selectAccountsForRequest(meta, ctx, MODEL_ID);
+
+			expect(result.map(({ id }) => id)).toEqual(["first-party-oauth"]);
+			expect(catalogEntry(meta, "hosted-proven")).toMatchObject({
+				decision: "proven",
+				replayRuntimeStatus: "output_unavailable",
+			});
+			expect(catalogEntry(meta, "first-party-oauth")).toMatchObject({
+				decision: "proven",
+				lane: "native_passthrough",
+				replayRuntimeStatus: "not_required",
+			});
+			expect(meta.serverToolCapabilitySummary).toMatchObject({
+				provenCandidateCount: 2,
+				replayIneligibleCandidateCount: 1,
+				eligibleCandidateCount: 1,
+			});
+		});
+
+		it("keeps replay_unavailable when only hosted candidates exist", async () => {
+			installHostedProvider();
+			const ctx = makeCtx({ accounts: [hostedAccount()] });
+			const meta = serverToolMeta({ serverToolReplayBound: false });
+
+			const error = await rejection(
+				selectAccountsForRequest(meta, ctx, MODEL_ID),
+			);
+
+			expect(error).toMatchObject({
+				name: "ServerToolRoutingError",
+				reason: "replay_unavailable",
+			});
+		});
+	});
+
+	describe("forced account (x-better-ccflare-account-id)", () => {
+		it("admits a forced first-party account for web_search", async () => {
+			for (const id of ["first-party-oauth", "first-party-api-key"]) {
+				const ctx = makeCtx({ accounts: webSearchPool() });
+				const meta = serverToolMeta({
+					headers: new Headers({ "x-better-ccflare-account-id": id }),
+				});
+
+				const result = await selectAccountsForRequest(meta, ctx, MODEL_ID);
+
+				expect(result.map(({ id: accountId }) => accountId)).toEqual([id]);
+				expect(catalogEntry(meta, id)).toMatchObject({
+					decision: "proven",
+					lane: "native_passthrough",
+					proofKey: NATIVE_PROOF_KEY,
+				});
+			}
+		});
+
+		it("keeps a forced non-first-party account forced_incapable", async () => {
+			for (const id of [
+				"codex",
+				"xai",
+				"anthropic-compatible",
+				"anthropic-custom-endpoint",
+			]) {
+				const ctx = makeCtx({ accounts: webSearchPool() });
+				const meta = serverToolMeta({
+					headers: new Headers({ "x-better-ccflare-account-id": id }),
+				});
+
+				const error = await rejection(
+					selectAccountsForRequest(meta, ctx, MODEL_ID),
+				);
+
+				expect(error).toMatchObject({
+					name: "ServerToolRoutingError",
+					reason: "forced_incapable",
+					accountId: id,
+				});
+				expect(catalogEntry(meta, id)?.decision).toBe("unknown");
+				expect(ctx.strategy.select).not.toHaveBeenCalled();
+			}
+		});
 	});
 });
