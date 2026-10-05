@@ -4,6 +4,7 @@ import type { UsageSnapshot } from "@better-ccflare/providers";
 import { getWindowCapStates } from "@better-ccflare/proxy/usage-throttling";
 import {
 	unknownWindowCapWarnings,
+	unsupportedProviderWindowCapWarnings,
 	WindowCapTransitionTracker,
 } from "./window-cap-transitions";
 
@@ -100,6 +101,23 @@ describe("WindowCapTransitionTracker", () => {
 		});
 	});
 
+	it("says when a capped window is missing from a fresh usage payload", () => {
+		const tracker = new WindowCapTransitionTracker();
+		const fresh = {
+			data: liveData(10, now + 24 * HOUR),
+			observedAt: now,
+		} as unknown as UsageSnapshot;
+		const events = tracker.observe(
+			"acct-1",
+			"protected",
+			getWindowCapStates(fresh, { seven_day_fable_weekly: 80 }, { now }),
+		);
+		expect(events).toHaveLength(1);
+		expect(events[0]?.kind).toBe("engaged");
+		expect(events[0]?.message).toContain("seven_day_fable_weekly");
+		expect(events[0]?.message).toContain("not in the usage payload");
+	});
+
 	it("warns once per reset cycle at cap + 10, again in the next cycle", () => {
 		const tracker = new WindowCapTransitionTracker();
 		const cycle1 = now + 24 * HOUR;
@@ -151,5 +169,33 @@ describe("startup unknown-account warning", () => {
 		const warnings = unknownWindowCapWarnings(unknown);
 		expect(warnings).toHaveLength(1);
 		expect(warnings[0]).toContain("ghost-id");
+	});
+});
+
+describe("startup unsupported-provider warning", () => {
+	it("warns for a capped account whose provider reports no Anthropic usage windows", () => {
+		const warnings = unsupportedProviderWindowCapWarnings(
+			{ "zai-1": { seven_day: 90 }, "acct-1": { seven_day_fable: 80 } },
+			[
+				{ id: "zai-1", name: "zai-main", provider: "zai" },
+				{ id: "acct-1", name: "protected", provider: "anthropic" },
+				{ id: "codex-1", name: "codex-main", provider: "codex" },
+			],
+		);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain("zai-main");
+		expect(warnings[0]).toContain("zai");
+	});
+
+	it("does not warn for capped Anthropic and Codex accounts", () => {
+		expect(
+			unsupportedProviderWindowCapWarnings(
+				{ "acct-1": { seven_day_fable: 80 }, "codex-1": { seven_day: 90 } },
+				[
+					{ id: "acct-1", name: "protected", provider: "anthropic" },
+					{ id: "codex-1", name: "codex-main", provider: "codex" },
+				],
+			),
+		).toEqual([]);
 	});
 });

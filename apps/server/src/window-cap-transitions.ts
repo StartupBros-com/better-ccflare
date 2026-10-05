@@ -56,7 +56,7 @@ export class WindowCapTransitionTracker {
 				events.push({
 					kind: "engaged",
 					level: "info",
-					message: `Usage cap engaged for account ${accountName} (${accountId}): ${state.windowKey} at ${state.utilization ?? "unknown"}% against cap ${state.cap}% (${state.reason})`,
+					message: `Usage cap engaged for account ${accountName} (${accountId}): ${state.windowKey} ${state.reason === "stale" ? "has no current reading (snapshot stale or window not in the usage payload)" : `at ${state.utilization}%`} against cap ${state.cap}% (${state.reason})`,
 					fields,
 				});
 			} else if (!state.engaged && wasEngaged) {
@@ -90,6 +90,29 @@ export class WindowCapTransitionTracker {
 }
 
 /** One startup warning per capped account id that matches no loaded account. */
+/**
+ * Caps read Anthropic-format usage windows (five_hour, seven_day,
+ * seven_day_<family>), which Anthropic and Codex accounts report. On any other
+ * provider the capped window never appears, so the cap holds that scope
+ * excluded indefinitely; say so once at startup.
+ */
+export function unsupportedProviderWindowCapWarnings(
+	caps: Readonly<Record<string, unknown>>,
+	accounts: readonly { id: string; name: string; provider: string }[],
+): string[] {
+	return accounts
+		.filter(
+			(account) =>
+				Object.hasOwn(caps, account.id) &&
+				account.provider !== "anthropic" &&
+				account.provider !== "codex",
+		)
+		.map(
+			(account) =>
+				`account_window_caps on account ${account.name} (${account.id}) cannot be evaluated: ${account.provider} accounts do not report the usage windows caps read, so the capped scope stays excluded`,
+		);
+}
+
 export function unknownWindowCapWarnings(
 	unknownIds: readonly string[],
 ): string[] {

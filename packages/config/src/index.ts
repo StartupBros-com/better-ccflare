@@ -18,6 +18,7 @@ import {
 	DEFAULT_AGENT_MODEL,
 	DEFAULT_STRATEGY,
 	getModelFamily,
+	weeklyScopedWindowKey,
 	isValidStrategy,
 	NETWORK,
 	type StrategyName,
@@ -89,7 +90,11 @@ export function parseAccountWindowCapKey(
 		return { scope: "account", modelFamily: null };
 	}
 	if (!key.startsWith("seven_day_")) return null;
-	const modelFamily = getModelFamily(key.slice("seven_day_".length));
+	const suffix = key.slice("seven_day_".length);
+	// Only the exact slug the normalizer builds can ever match a window; any
+	// other spelling would hold the family excluded with no reading behind it.
+	if (weeklyScopedWindowKey(suffix) !== key) return null;
+	const modelFamily = getModelFamily(suffix);
 	return modelFamily ? { scope: "family", modelFamily } : null;
 }
 

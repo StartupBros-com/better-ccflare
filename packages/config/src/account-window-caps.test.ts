@@ -102,6 +102,9 @@ describe("account_window_caps", () => {
 		"seven_day_bogus",
 		"monthly",
 		"seven_day_",
+		// Never equal to a normalized window key, so they would block silently.
+		"seven_day_Fable",
+		"seven_day_fable-pro",
 	])("refuses window key %p", (key) => {
 		expect(() =>
 			parseAccountWindowCaps(JSON.stringify({ "acct-1": { [key]: 50 } })),
@@ -109,6 +112,11 @@ describe("account_window_caps", () => {
 		expect(() =>
 			parseAccountWindowCaps(JSON.stringify({ "acct-1": { [key]: 50 } })),
 		).toThrow(new RegExp(key));
+	});
+
+	it("accepts a scoped key slugged from a model display name", () => {
+		const caps = { a: { seven_day_opus_4_7: 70 } };
+		expect(parseAccountWindowCaps(JSON.stringify(caps))).toEqual(caps);
 	});
 
 	it("accepts every canonical window key", () => {

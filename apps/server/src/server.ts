@@ -143,6 +143,7 @@ import {
 } from "./usage-polling-lifecycle";
 import {
 	unknownWindowCapWarnings,
+	unsupportedProviderWindowCapWarnings,
 	WindowCapTransitionTracker,
 } from "./window-cap-transitions";
 
@@ -2669,12 +2670,16 @@ Available endpoints:
 		`Loaded ${accounts.length} accounts (${activeAccounts.length} active)`,
 	);
 	try {
-		for (const message of unknownWindowCapWarnings(
-			findUnknownAccountWindowCapIds(
-				config.getAccountWindowCaps(),
-				accounts.map((a) => a.id),
+		const windowCaps = config.getAccountWindowCaps();
+		for (const message of [
+			...unknownWindowCapWarnings(
+				findUnknownAccountWindowCapIds(
+					windowCaps,
+					accounts.map((a) => a.id),
+				),
 			),
-		))
+			...unsupportedProviderWindowCapWarnings(windowCaps, accounts),
+		])
 			log.warn(message);
 	} catch (err) {
 		log.warn(`Failed to validate account_window_caps account ids: ${err}`);
