@@ -512,12 +512,11 @@ describe("native web_search passthrough dispatch", () => {
 		}
 	});
 
-	// Hygiene pin, not a red-first fix: it passes with the delete in
-	// demoteForcedWebSearchChoice removed, because transformRequestBodyModel's
-	// rebuild (model-mapping.ts readBodyForTransform) already drops the inbound
-	// content-length before dispatch. The delete is defence in depth; this
-	// asserts the wire property either way (no header, or one matching the body).
-	it("hygiene pin: upstream never receives a stale content-length after demotion", async () => {
+	// Wire property on the JSON path. It does not exercise the delete in
+	// demoteForcedWebSearchChoice: transformRequestBodyModel's rebuild
+	// (model-mapping.ts readBodyForTransform) already drops the inbound
+	// content-length for JSON bodies. The non-JSON test below pins the delete.
+	it("upstream never receives a stale content-length after demoting a JSON body", async () => {
 		const { ctx } = makeContext([makeAccount()]);
 		const calls = installFetch(() => jsonOk());
 		const { request, clientBody } = makeHelperRequest({
@@ -538,6 +537,31 @@ describe("native web_search passthrough dispatch", () => {
 		);
 		expect(sent === null || sent === actual).toBe(true);
 		expect(calls[0]?.body.tool_choice).toEqual({ type: "auto" });
+	});
+
+	it("drops the inbound content-length when demoting a body the model-mapping rebuild skipped (non-JSON content-type)", async () => {
+		const { ctx } = makeContext([makeAccount()]);
+		const calls = installFetch(() => jsonOk());
+		const { request, clientBody } = makeHelperRequest({
+			model: "claude-opus-5-5",
+		});
+		request.headers.set("content-type", "text/plain;charset=UTF-8");
+		const inboundLength = String(
+			new TextEncoder().encode(JSON.stringify(clientBody)).length,
+		);
+		request.headers.set("content-length", inboundLength);
+
+		const { response } = await run(ctx, request);
+
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.body.tool_choice).toEqual({ type: "auto" });
+		const actual = String(
+			new TextEncoder().encode(calls[0]?.rawBody ?? "").length,
+		);
+		expect(actual).not.toBe(inboundLength);
+		const sent = calls[0]?.headers.get("content-length");
+		expect(sent === null || sent === actual).toBe(true);
 	});
 
 	it("refuses a forced web_search choice carrying extra keys before any send, so it never reaches upstream undemoted", async () => {
