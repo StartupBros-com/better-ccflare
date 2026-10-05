@@ -1289,7 +1289,10 @@ describe("native Anthropic admission never refuses what stock routing would send
 		max_input_tokens: 10000,
 		max_tokens: 20000,
 	};
-	function nativeEvidence(raw: Record<string, unknown> = nativeRaw) {
+	function nativeEvidence(
+		raw: Record<string, unknown> = nativeRaw,
+		line: Parameters<typeof resolveAutoModelTargets>[1] = "claude-fable",
+	) {
 		const catalog = createAutoCatalogEvidence({
 			accountId: "native-parity",
 			provider: "anthropic",
@@ -1303,7 +1306,7 @@ describe("native Anthropic admission never refuses what stock routing would send
 				},
 			],
 		});
-		const target = resolveAutoModelTargets(catalog, "claude-fable").current;
+		const target = resolveAutoModelTargets(catalog, line).current;
 		if (!catalog || !target) throw new Error("missing native target");
 		return { catalog, target };
 	}
@@ -1603,6 +1606,117 @@ describe("native Anthropic admission never refuses what stock routing would send
 				},
 			}),
 		).toMatchObject({ status: "unknown", reason: "tools-unsupported" });
+	});
+
+	describe("native web_search passthrough", () => {
+		const searchTool = { type: "web_search_20250305", name: "web_search" };
+		const opusRaw = {
+			id: "claude-opus-5-5",
+			max_input_tokens: 10000,
+			max_tokens: 20000,
+		};
+		const searchBody = { ...base, tools: [searchTool] };
+		const decide = (
+			original: Record<string, unknown>,
+			firstPartyAnthropic: boolean | undefined,
+			raw: Record<string, unknown> = nativeRaw,
+		) =>
+			evaluateAutoRequestAdmission({
+				...nativeEvidence(
+					raw,
+					raw === opusRaw ? "claude-opus" : "claude-fable",
+				),
+				requirements: captureAutoRequestRequirements(original),
+				finalBody: { ...original, model: String(raw.id) },
+				...(firstPartyAnthropic === undefined ? {} : { firstPartyAnthropic }),
+			});
+
+		it("admits a web_search request on a first-party Anthropic target without tuple proof", () => {
+			expect(decide(searchBody, true)).toEqual({ status: "admit" });
+		});
+		it("admits the Claude Code helper shape with search_profile, domains and max_uses", () => {
+			const helper = {
+				...base,
+				tools: [
+					{
+						...searchTool,
+						max_uses: 8,
+						allowed_domains: ["example.com"],
+						search_profile: "fast",
+					},
+				],
+				tool_choice: { type: "auto" },
+			};
+			expect(decide(helper, true)).toEqual({ status: "admit" });
+		});
+		it("admits the forced web_search choice on claude-opus-5-5, which dispatch demotes", () => {
+			const forced = {
+				...searchBody,
+				tool_choice: { type: "tool", name: "web_search" },
+			};
+			expect(decide(forced, true, opusRaw)).toEqual({ status: "admit" });
+		});
+		it("admits the forced web_search choice when provider transformation already dropped it", () => {
+			const forced = {
+				...searchBody,
+				tool_choice: { type: "tool", name: "web_search" },
+			};
+			expect(
+				evaluateAutoRequestAdmission({
+					...nativeEvidence(opusRaw, "claude-opus"),
+					requirements: captureAutoRequestRequirements(forced),
+					finalBody: { ...searchBody, model: "claude-opus-5-5" },
+					firstPartyAnthropic: true,
+				}),
+			).toEqual({ status: "admit" });
+		});
+		it("keeps every other forced choice rejected on a first-party target", () => {
+			for (const tool_choice of [
+				{ type: "any" },
+				{ type: "tool", name: "Read" },
+				{ type: "tool", name: "web_search", disable_parallel_tool_use: true },
+			])
+				expect(
+					decide({ ...searchBody, tool_choice }, true, opusRaw),
+				).toMatchObject({ status: "reject", reason: "tools-unsupported" });
+			expect(
+				decide({ ...base, tool_choice: { type: "any" } }, true, opusRaw),
+			).toMatchObject({ status: "reject", reason: "tools-unsupported" });
+		});
+		it("does not admit a web_search request on a non-first-party Anthropic target", () => {
+			for (const firstParty of [false, undefined])
+				expect(decide(searchBody, firstParty)).toMatchObject({
+					status: "unknown",
+					reason: "tools-unsupported",
+				});
+			expect(
+				decide(
+					{ ...searchBody, tool_choice: { type: "tool", name: "web_search" } },
+					false,
+					opusRaw,
+				),
+			).toMatchObject({ status: "reject", reason: "tools-unsupported" });
+		});
+		it("does not admit shapes the shared predicate refuses", () => {
+			const duplicate = { ...base, tools: [searchTool, { ...searchTool }] };
+			const second = {
+				...base,
+				tools: [searchTool, { type: "web_fetch_20250910", name: "web_fetch" }],
+			};
+			for (const original of [duplicate, second])
+				expect(decide(original, true).status).not.toBe("admit");
+		});
+		it("keeps Codex rungs tuple-proven only even when the caller claims first-party", async () => {
+			const original = { ...base, tools: [searchTool] };
+			const codex = await codexEvidence(original);
+			expect(
+				evaluateAutoRequestAdmission({
+					...codex,
+					requirements: captureAutoRequestRequirements(original),
+					firstPartyAnthropic: true,
+				}),
+			).toMatchObject({ status: "unknown", reason: "tools-unsupported" });
+		});
 	});
 });
 

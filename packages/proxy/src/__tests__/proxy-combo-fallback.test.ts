@@ -2157,8 +2157,119 @@ describe("native quota wait execution", () => {
 			});
 			const response = await handleProxy(request, new URL(request.url), ctx);
 			expect(transport).not.toHaveBeenCalled();
-			expect(response.status).toBe(503);
+			// This pool has no replay runtime. It used to end at replay_unavailable
+			// (503) before selection; a first-party Anthropic pool can now be served
+			// natively without replay, so the request reaches selection. The mocked
+			// provider declares no logical-model capability, so no candidate is
+			// proven and the typed permanent refusal is the honest answer. Neither
+			// outcome defers the backups or sends upstream.
+			expect(response.status).toBe(400);
+			expect(
+				((await response.json()) as { error: { code: string } }).error.code,
+			).toBe("server_tool_capability_unavailable");
 			expect(response.headers.get("x-should-retry")).not.toBe("true");
+		} finally {
+			restore();
+		}
+	});
+
+	it("serves a saturated first-party native pool for web_search once the provider declares the capability", async () => {
+		const realAnthropic = getProvider("anthropic");
+		const { accounts, ctx, restore, calls } = nativePool();
+		// nativePool mocks the anthropic provider, which declares no logical-model
+		// capability; the real provider does, as in production.
+		if (realAnthropic) registerProvider(realAnthropic);
+		for (const account of accounts) putUsage(account, 100);
+		globalThis.fetch = mock(async (input: Request) => {
+			calls.push({
+				account: new URL(input.url).host,
+				model: (await input.clone().json()).model,
+			});
+			return new Response('{"type":"message","content":[]}', {
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-fable-5",
+					messages: [{ role: "user", content: "offline capability fixture" }],
+					max_tokens: 16,
+					tools: [{ type: "web_search_20250305", name: "web_search" }],
+				}),
+			});
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			// Same saturation as the sibling above, but the first-party pool is a
+			// proven native web_search lane, so the saturated Fable slot falls to
+			// the Opus backup exactly like a plain request and one search is sent.
+			expect(response.status).toBe(200);
+			expect(calls).toEqual([
+				{ account: "api.anthropic.com", model: "claude-opus-4-8" },
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it.each([
+		{
+			label: "demotes when the physical model rejects forced choice",
+			clientModel: "claude-opus-5",
+			physicalModel: "claude-opus-5-5",
+			expected: { type: "auto" },
+		},
+		{
+			label: "forwards the forced choice when only the client model rejects it",
+			clientModel: "claude-opus-5-5",
+			physicalModel: "claude-opus-5",
+			expected: { type: "tool", name: "web_search" },
+		},
+	])("web_search forced choice is keyed on the physical model: $label", async ({
+		clientModel,
+		physicalModel,
+		expected,
+	}) => {
+		const realAnthropic = getProvider("anthropic");
+		const { accounts, combo, ctx, restore } = nativePool();
+		if (realAnthropic) registerProvider(realAnthropic);
+		// One slot: the client model differs from the physical model the combo
+		// sends upstream.
+		combo.slots = [
+			{
+				id: "physical-slot",
+				combo_id: combo.id,
+				account_id: accounts[0]?.id ?? "native-a",
+				model: physicalModel,
+				priority: 0,
+				enabled: true,
+			},
+		];
+		const bodies: Array<Record<string, unknown>> = [];
+		globalThis.fetch = mock(async (input: Request) => {
+			bodies.push((await input.clone().json()) as Record<string, unknown>);
+			return new Response('{"type":"message","content":[]}', {
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: clientModel,
+					messages: [{ role: "user", content: "physical model fixture" }],
+					max_tokens: 16,
+					tools: [{ type: "web_search_20250305", name: "web_search" }],
+					tool_choice: { type: "tool", name: "web_search" },
+				}),
+			});
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(200);
+			expect(bodies).toHaveLength(1);
+			expect(bodies[0]?.model).toBe(physicalModel);
+			expect(bodies[0]?.tool_choice).toEqual(expected);
 		} finally {
 			restore();
 		}

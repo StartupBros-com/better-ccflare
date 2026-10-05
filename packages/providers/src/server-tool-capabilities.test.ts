@@ -7,6 +7,8 @@ import {
 	deriveNativeAnthropicToolRequirement,
 	deriveServerToolRequirement,
 	indexServerToolCapabilityProofs,
+	isDemotableForcedWebSearchChoice,
+	isNativeWebSearchPassthroughEligible,
 	materializeProviderServerToolCapabilityDecision as materializeDecision,
 	materializeProviderServerToolCapabilityTuple,
 	NATIVE_ANTHROPIC_PASSTHROUGH_TOOL_TYPES,
@@ -3209,5 +3211,314 @@ describe("advisor native-Anthropic passthrough tool", () => {
 			});
 			expect(r?.unknownDeclaredTypes).toHaveLength(1);
 		});
+	});
+});
+
+describe("search_profile declarations", () => {
+	test("normalizes a bounded printable search_profile without changing profile identity for declarations without it", () => {
+		const base = { type: "web_search_20250305", name: "web_search" };
+		const plain = deriveServerToolRequirement({ tools: [base] });
+		const withProfile = deriveServerToolRequirement({
+			tools: [{ ...base, search_profile: "fast" }],
+		});
+		expect(withProfile?.invalid).toBeUndefined();
+		expect(withProfile?.declarations).toEqual([
+			{ type: "web_search_20250305", searchProfile: "fast" },
+		]);
+		expect(withProfile?.profileId).toBe(plain?.profileId);
+		expect(withProfile?.optionProfileId).not.toBe(plain?.optionProfileId);
+		expect(plain?.optionProfileId).toBe(
+			deriveServerToolRequirement({ tools: [{ ...base }] })?.optionProfileId,
+		);
+	});
+
+	test("pins the option profile id of a declaration without search_profile", () => {
+		const requirement = deriveServerToolRequirement({
+			tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8 }],
+		});
+		const canonical = JSON.stringify([
+			"web_search_20250305",
+			8,
+			null,
+			null,
+			null,
+		]);
+		const digest = new Bun.CryptoHasher("sha256")
+			.update("better-ccflare/server-tool-option-profile/v1\0")
+			.update(canonical)
+			.digest("hex");
+		expect(requirement?.optionProfileId).toBe(
+			`server-tool-option-profile-v1.sha256.${digest}`,
+		);
+	});
+
+	test("rejects non-string, empty, oversized and non-printable search_profile values", () => {
+		for (const value of [
+			1,
+			null,
+			{},
+			[],
+			"",
+			"x".repeat(65),
+			"fa\nst",
+			"fa\u0000st",
+			"faést",
+		]) {
+			const requirement = deriveServerToolRequirement({
+				tools: [
+					{
+						type: "web_search_20250305",
+						name: "web_search",
+						search_profile: value,
+					},
+				],
+			});
+			expect(requirement?.declarations).toBeUndefined();
+			expect(requirement?.invalid).toEqual([
+				{ type: "web_search_20250305", reason: "invalid_options" },
+			]);
+		}
+	});
+});
+
+describe("isNativeWebSearchPassthroughEligible", () => {
+	const searchTool = {
+		type: "web_search_20250305",
+		name: "web_search",
+		max_uses: 8,
+	};
+	const helperBody = (overrides: Record<string, unknown> = {}) => ({
+		stream: true,
+		tools: [searchTool],
+		tool_choice: { type: "tool", name: "web_search" },
+		messages: [{ role: "user", content: "Perform a web search" }],
+		...overrides,
+	});
+	const nativeAssistantHistory = {
+		role: "assistant",
+		content: [
+			{ type: "server_tool_use", id: "srvtoolu_1", name: "web_search" },
+			{
+				type: "web_search_tool_result",
+				tool_use_id: "srvtoolu_1",
+				content: [],
+			},
+		],
+	};
+	const eligible = (body: unknown, firstParty = true) =>
+		isNativeWebSearchPassthroughEligible(
+			deriveServerToolRequirement(body),
+			firstParty,
+		);
+
+	test("accepts the fresh Claude Code helper shape", () => {
+		expect(eligible(helperBody())).toBe(true);
+	});
+
+	test("accepts auto choice, no choice, JSON mode, domains, user_location, max_uses and search_profile", () => {
+		expect(eligible(helperBody({ tool_choice: { type: "auto" } }))).toBe(true);
+		expect(eligible(helperBody({ tool_choice: undefined }))).toBe(true);
+		expect(eligible(helperBody({ stream: false }))).toBe(true);
+		expect(
+			eligible(
+				helperBody({
+					tools: [{ ...searchTool, allowed_domains: ["example.com/docs"] }],
+				}),
+			),
+		).toBe(true);
+		expect(
+			eligible(
+				helperBody({
+					tools: [{ ...searchTool, blocked_domains: ["example.com"] }],
+				}),
+			),
+		).toBe(true);
+		expect(
+			eligible(
+				helperBody({
+					tools: [
+						{
+							...searchTool,
+							user_location: { type: "approximate", country: "US" },
+						},
+					],
+				}),
+			),
+		).toBe(true);
+		expect(
+			eligible(
+				helperBody({ tools: [{ ...searchTool, search_profile: "fast" }] }),
+			),
+		).toBe(true);
+	});
+
+	test("accepts native-Anthropic history and mixed client functions", () => {
+		expect(
+			eligible(
+				helperBody({
+					tool_choice: { type: "auto" },
+					messages: [nativeAssistantHistory],
+				}),
+			),
+		).toBe(true);
+		expect(
+			eligible(
+				helperBody({
+					tool_choice: { type: "auto" },
+					tools: [
+						{ name: "Lookup", input_schema: { type: "object" } },
+						searchTool,
+					],
+				}),
+			),
+		).toBe(true);
+	});
+
+	test("rejects a non-first-party account and undefined requirements", () => {
+		expect(eligible(helperBody(), false)).toBe(false);
+		expect(isNativeWebSearchPassthroughEligible(undefined, true)).toBe(false);
+	});
+
+	test("rejects invalid, unsupported and duplicate declarations", () => {
+		expect(
+			eligible(helperBody({ tools: [{ ...searchTool, max_uses: 99 }] })),
+		).toBe(false);
+		expect(
+			eligible(
+				helperBody({
+					tools: [
+						searchTool,
+						{ type: "web_fetch_20250910", name: "web_fetch" },
+					],
+				}),
+			),
+		).toBe(false);
+		expect(eligible(helperBody({ tools: [searchTool, searchTool] }))).toBe(
+			false,
+		);
+		expect(eligible(helperBody({ tool_choice: { type: "any" } }))).toBe(false);
+	});
+
+	test("rejects proxy-opaque bccf history and truncated scans", () => {
+		expect(
+			eligible(
+				helperBody({
+					tool_choice: { type: "auto" },
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{
+									type: "server_tool_use",
+									id: "srvtoolu_1",
+									name: "web_search",
+								},
+								{
+									type: "web_search_tool_result",
+									tool_use_id: "srvtoolu_1",
+									content: [
+										{
+											type: "web_search_result",
+											url: "https://example.com",
+											title: "t",
+											encrypted_content: "bccf2.fixture",
+										},
+									],
+								},
+							],
+						},
+					],
+				}),
+			),
+		).toBe(false);
+		const filler = Array.from({ length: 4_200 }, () => ({
+			role: "user",
+			content: "x",
+		}));
+		const truncated = deriveServerToolRequirement(
+			helperBody({ tool_choice: { type: "auto" }, messages: filler }),
+		);
+		expect(truncated?.replay.output).toContain("proxy-evidence-v1");
+		expect(isNativeWebSearchPassthroughEligible(truncated, true)).toBe(false);
+	});
+
+	test("rejects history-only requests with no declaration", () => {
+		expect(eligible({ messages: [nativeAssistantHistory] })).toBe(false);
+	});
+
+	test("rejects a second typed tool beside web_search", () => {
+		expect(
+			eligible(
+				helperBody({
+					tools: [searchTool, { type: "text_editor_20250124", name: "e" }],
+				}),
+			),
+		).toBe(false);
+	});
+
+	test("leaves advisor beside web_search to the caller's native-requirement gate", () => {
+		const body = helperBody({
+			tools: [searchTool, { type: "advisor_20260301", name: "advisor" }],
+		});
+		const requirements = deriveServerToolRequirement(body);
+		expect(requirements?.unsupported).toBeUndefined();
+		expect(
+			deriveNativeAnthropicToolRequirement(body)?.declaredToolTypes,
+		).toEqual(["advisor_20260301"]);
+	});
+});
+
+describe("isDemotableForcedWebSearchChoice", () => {
+	test("accepts exactly {type: tool, name: web_search}", () => {
+		expect(
+			isDemotableForcedWebSearchChoice({
+				tool_choice: { type: "tool", name: "web_search" },
+			}),
+		).toBe(true);
+	});
+
+	test("rejects an extra key such as disable_parallel_tool_use", () => {
+		expect(
+			isDemotableForcedWebSearchChoice({
+				tool_choice: {
+					type: "tool",
+					name: "web_search",
+					disable_parallel_tool_use: true,
+				},
+			}),
+		).toBe(false);
+	});
+
+	test("rejects another tool name", () => {
+		expect(
+			isDemotableForcedWebSearchChoice({
+				tool_choice: { type: "tool", name: "bash" },
+			}),
+		).toBe(false);
+	});
+
+	test("rejects type any and auto", () => {
+		expect(
+			isDemotableForcedWebSearchChoice({
+				tool_choice: { type: "any", name: "web_search" },
+			}),
+		).toBe(false);
+		expect(
+			isDemotableForcedWebSearchChoice({ tool_choice: { type: "auto" } }),
+		).toBe(false);
+	});
+
+	test("rejects null, missing, and non-object shapes", () => {
+		expect(isDemotableForcedWebSearchChoice({ tool_choice: null })).toBe(false);
+		expect(isDemotableForcedWebSearchChoice({})).toBe(false);
+		expect(
+			isDemotableForcedWebSearchChoice({ tool_choice: "web_search" }),
+		).toBe(false);
+		expect(
+			isDemotableForcedWebSearchChoice({ tool_choice: ["tool", "web_search"] }),
+		).toBe(false);
+		expect(isDemotableForcedWebSearchChoice(null)).toBe(false);
+		expect(isDemotableForcedWebSearchChoice("x")).toBe(false);
+		expect(isDemotableForcedWebSearchChoice(undefined)).toBe(false);
 	});
 });

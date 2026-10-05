@@ -362,6 +362,7 @@ export class RoutingAttemptLedger {
 	private lastPhysicalAccountId: string | null | undefined;
 	private retainedTerminalResponse: RetainedTerminalResponse | null = null;
 	private hostedDispatch: HostedDispatchState = "undispatched";
+	private nativeSearchDispatched = false;
 	private physicalBudgetRequestId: string | null = null;
 	private physicalBudgetTerminalizer:
 		| PhysicalAttemptBudgetTerminalizer
@@ -416,6 +417,20 @@ export class RoutingAttemptLedger {
 		if (this.hostedDispatch === "hosted_dispatched") return false;
 		this.hostedDispatch = "hosted_dispatched";
 		return true;
+	}
+
+	/** Whether a native web_search physical send already began for this request. */
+	get nativeSearchDispatchState(): "undispatched" | "native_dispatched" {
+		return this.nativeSearchDispatched ? "native_dispatched" : "undispatched";
+	}
+
+	/**
+	 * Record that a first-party account began a native web_search send. Like the
+	 * hosted claim it is monotonic: a search may already have executed upstream,
+	 * so hosted candidates are skipped for the rest of the request.
+	 */
+	markNativeSearchDispatched(): void {
+		this.nativeSearchDispatched = true;
 	}
 
 	/**

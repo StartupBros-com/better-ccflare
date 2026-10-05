@@ -20,6 +20,8 @@ import {
 import {
 	deriveNativeAnthropicToolRequirement,
 	deriveServerToolRequirement,
+	isDemotableForcedWebSearchChoice,
+	isNativeWebSearchPassthroughEligible,
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
 } from "./server-tool-capabilities";
@@ -545,7 +547,26 @@ function evaluateNativeAnthropicAdmission(
 ): QualityAdmissionDecision {
 	if (!final || final.model !== target.physicalModel)
 		return { status: "reject", reason: "model-unsupported" };
+	const hosted = deriveServerToolRequirement(original);
+	// First-party web_search is forwarded to api.anthropic.com, which executes
+	// it; no hosted tuple exists or is needed. Advisor beside it stays refused by
+	// the caller's native-requirement gate.
+	const nativeWebSearch =
+		input.firstPartyAnthropic === true &&
+		deriveNativeAnthropicToolRequirement(original) === undefined &&
+		isNativeWebSearchPassthroughEligible(hosted, true);
+	// Provider transformation may already have dropped the choice from the final
+	// body, so each side only has to carry no forced choice other than the
+	// demotable one.
+	const onlyDemotableForced = (candidate: unknown) =>
+		!hasForcedToolChoice(candidate) ||
+		isDemotableForcedWebSearchChoice(candidate);
+	const demotedChoice =
+		nativeWebSearch &&
+		onlyDemotableForced(original) &&
+		onlyDemotableForced(final);
 	if (
+		!demotedChoice &&
 		(hasForcedToolChoice(original) || hasForcedToolChoice(final)) &&
 		!supportsForcedToolChoice(target.physicalModel)
 	)
@@ -559,8 +580,7 @@ function evaluateNativeAnthropicAdmission(
 		if (finalOutput !== null && finalOutput < output)
 			return { status: "reject", reason: "output-unsupported" };
 	}
-	const hosted = deriveServerToolRequirement(original);
-	if (hosted) {
+	if (hosted && !nativeWebSearch) {
 		const decision = hostedToolsDecision(input, target, hosted);
 		if (decision) return decision;
 	}

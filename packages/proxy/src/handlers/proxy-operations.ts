@@ -11,6 +11,7 @@ import {
 	isUsageExhausted,
 	logError,
 	ProviderError,
+	supportsForcedToolChoice,
 	TIME_CONSTANTS,
 } from "@better-ccflare/core";
 import type { RoutingAttemptData } from "@better-ccflare/database";
@@ -44,6 +45,8 @@ import {
 	isAnthropicOutOfCredits,
 	isCodexResponseIdRejectionError,
 	isCodexSubscriptionEndpoint,
+	isDemotableForcedWebSearchChoice,
+	isNativeWebSearchPassthroughEligible,
 	materializeProviderAttemptPlan,
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
@@ -211,6 +214,9 @@ import {
 import { peekSseForZai1305 } from "./zai-1305";
 
 const log = new Logger("ProxyOperations");
+// Requests whose forced web_search tool_choice was already logged as demoted, so
+// retries and failover across accounts warn once per request.
+const demotedWebSearchChoiceRequests = new WeakSet<object>();
 
 type RoutingAttemptWrite = Omit<RoutingAttemptData, "id">;
 
@@ -3246,6 +3252,16 @@ export async function proxyWithAccount(
 			replay: RequestPrivateServerToolReplay;
 		}>;
 		const serverToolRequirements = requestMeta.serverToolRequirements;
+		// A first-party Anthropic account executes web_search itself, so this
+		// attempt forwards the request natively: no capability tuple, proof, replay
+		// envelope or hosted-dispatch claim. Computed from the live account, never
+		// from the request alone, and shared with selection through one predicate.
+		const nativeWebSearchLane =
+			serverToolRequirements !== undefined &&
+			isNativeWebSearchPassthroughEligible(
+				serverToolRequirements,
+				isFirstPartyAnthropicAccount(account),
+			);
 		// Proof binds only query presence, while provider planning keeps the raw query
 		// unless admission already classified the exact Claude beta alias as absent.
 		const serverToolCapabilityQuery =
@@ -3254,8 +3270,12 @@ export async function proxyWithAccount(
 					? "present"
 					: ""
 				: url.search;
+		// The hosted lane drops the client's own query; the native lane forwards it,
+		// so an Anthropic beta query such as ?beta=true reaches api.anthropic.com.
 		const serverToolAttemptPlanQuery =
-			serverToolRequirements && requestMeta.serverToolQueryPresent === false
+			serverToolRequirements &&
+			!nativeWebSearchLane &&
+			requestMeta.serverToolQueryPresent === false
 				? ""
 				: url.search;
 		const candidateCapabilityError = (
@@ -3279,6 +3299,18 @@ export async function proxyWithAccount(
 			requireSelectedCandidateBinding: boolean,
 		): ExactServerToolCapabilityBinding | null => {
 			if (!serverToolRequirements) return null;
+			// One search per request across lanes: a claimed hosted dispatch rules out
+			// every native candidate and a begun native send rules out every hosted
+			// one. Both are per-candidate skips, never terminal errors.
+			if (
+				nativeWebSearchLane
+					? routingAttemptLedger?.hostedDispatchState === "hosted_dispatched"
+					: routingAttemptLedger?.nativeSearchDispatchState ===
+						"native_dispatched"
+			) {
+				throw candidateCapabilityError("other_lane_dispatched");
+			}
+			if (nativeWebSearchLane) return null;
 			if (!physicalModel) throw candidateCapabilityError("tuple_unavailable");
 
 			const currentProvider = resolveProviderForAccount(
@@ -3446,6 +3478,7 @@ export async function proxyWithAccount(
 		const assertAttemptPlanCapabilityIsCurrent = (
 			plan: ProviderAttemptPlan,
 		): void => {
+			if (nativeWebSearchLane) return;
 			const current = resolveExactServerToolCapability(
 				plan.physicalModel,
 				false,
@@ -4268,6 +4301,49 @@ export async function proxyWithAccount(
 		 * transport is covered without a matching release beside it.
 		 */
 		const nativeClaimedModels = new Set<string | null>();
+		/**
+		 * Anthropic answers a forced tool_choice with a 400 on some models, and the
+		 * Claude Code WebSearch helper forces `web_search`. On the native lane only,
+		 * rewrite exactly that choice to `auto` when the model this transport sends
+		 * does not accept it. The check reads the body about to go upstream, so it
+		 * sees the provider's model mapping and every retry or fallback model, and
+		 * nothing else (replay body, cache identity, client body) is touched.
+		 */
+		const demoteForcedWebSearchChoice = async (
+			transportRequest: Request,
+		): Promise<Request> => {
+			if (isSyntheticProviderResponse(transportRequest))
+				return transportRequest;
+			let body: Record<string, unknown>;
+			try {
+				body = await readRequestJson<Record<string, unknown>>(transportRequest);
+			} catch {
+				return transportRequest;
+			}
+			if (
+				typeof body.model !== "string" ||
+				!isDemotableForcedWebSearchChoice(body) ||
+				supportsForcedToolChoice(body.model)
+			) {
+				return transportRequest;
+			}
+			if (!demotedWebSearchChoiceRequests.has(requestMeta)) {
+				demotedWebSearchChoiceRequests.add(requestMeta);
+				log.warn(
+					`Demoted forced web_search tool_choice to auto for ${body.model}: the model rejects forced tool choice`,
+				);
+			}
+			body.tool_choice = { type: "auto" };
+			// The inbound content-length describes the original body, not this one.
+			const headers = new Headers(transportRequest.headers);
+			headers.delete("content-length");
+			return new Request(transportRequest.url, {
+				method: transportRequest.method,
+				headers,
+				body: JSON.stringify(body),
+				signal: transportRequest.signal,
+			});
+		};
 		const executeCacheAwareProviderAttempt = async (
 			transportRequest: Request,
 			replayBody: ArrayBuffer | null,
@@ -4317,6 +4393,10 @@ export async function proxyWithAccount(
 				// Preserve only trusted local synthetic-response markers; no
 				// x-better-ccflare-* metadata may reach a real upstream transport.
 				transportRequest = sanitizeInternalTransportHeaders(transportRequest);
+				if (nativeWebSearchLane) {
+					transportRequest =
+						await demoteForcedWebSearchChoice(transportRequest);
+				}
 				const trustedTransportHeaders = new Headers(transportRequest.headers);
 				applyXaiConvIdHeader(
 					trustedTransportHeaders,
@@ -4412,6 +4492,9 @@ export async function proxyWithAccount(
 				};
 				const recordPhysicalDispatch = (): void => {
 					ensureNativeQuotaDispatch();
+					if (nativeWebSearchLane) {
+						routingAttemptLedger?.markNativeSearchDispatched();
+					}
 					routingAttemptLedger?.recordPhysicalAttempt({
 						provider: attemptPlan.providerName,
 						logicalModel: clientRequestedModel,

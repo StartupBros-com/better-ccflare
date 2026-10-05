@@ -43,6 +43,8 @@ import {
 	surfaceQualityReason,
 } from "../quality-route-candidates";
 import { QualityRouteService } from "../quality-route-service";
+import * as replayRuntime from "../server-tool-replay-runtime";
+import { ServerToolCandidateCapabilityError } from "../server-tool-routing-errors";
 import * as collectors from "../usage-collector";
 
 const scope: QualityVerifiedSession = {
@@ -50,6 +52,10 @@ const scope: QualityVerifiedSession = {
 	principalId: "test-principal",
 	sessionId: "test-session",
 };
+const { createReadyServerToolReplayRuntimeForTest } = await import(
+	"./helpers/server-tool-replay-runtime"
+);
+const readyReplayRuntime = await createReadyServerToolReplayRuntimeForTest();
 const originalFetch = globalThis.fetch;
 let db: Database;
 let service: QualityRouteService;
@@ -2611,6 +2617,10 @@ describe("prewarmed native catalogs", () => {
 		expect((await service.status(scope))?.preference).toBe("auto");
 	});
 	it("unsupported hosted work remains typed unavailable rather than bypassing accounting", async () => {
+		// A custom-endpoint Anthropic account is not first-party, so it has no
+		// native web_search lane and no hosted tuple: nothing may be sent.
+		for (const a of accounts)
+			a.custom_endpoint = "https://relay.example.invalid";
 		const response = await send(
 			request(
 				undefined,
@@ -2624,6 +2634,159 @@ describe("prewarmed native catalogs", () => {
 		).toBe("quality_route_unavailable");
 		expect(sends).toHaveLength(0);
 		expect(await home()).toBeUndefined();
+	});
+	describe("native web_search on first-party Anthropic targets", () => {
+		const searchTool = {
+			type: "web_search_20250305",
+			name: "web_search",
+			max_uses: 8,
+			search_profile: "fast",
+		};
+		it("dispatches the tool object intact with exactly one send", async () => {
+			const response = await send(
+				request(undefined, {}, { tools: [searchTool] }),
+			);
+			expect(response.status).toBe(200);
+			await response.text();
+			expect(sends).toHaveLength(1);
+			expect(envelopes[0]?.tools).toEqual([searchTool]);
+		});
+		it("demotes the forced web_search choice for a model that rejects forced choice", async () => {
+			const response = await send(
+				request(
+					undefined,
+					{},
+					{
+						tools: [searchTool],
+						tool_choice: { type: "tool", name: "web_search" },
+					},
+				),
+			);
+			expect(response.status).toBe(200);
+			await response.text();
+			expect(sends).toHaveLength(1);
+			expect(envelopes[0]?.tools).toEqual([searchTool]);
+			expect(envelopes[0]?.tool_choice).toEqual({ type: "auto" });
+		});
+		it("still refuses every other forced choice with zero sends", async () => {
+			const response = await send(
+				request(
+					undefined,
+					{},
+					{ tools: [searchTool], tool_choice: { type: "any" } },
+				),
+			);
+			expect(response.status).toBe(503);
+			expect(sends).toHaveLength(0);
+		});
+		it("skips a candidate whose capability proof is refused and serves the next", async () => {
+			const provider = getProvider("anthropic");
+			if (!provider?.transformRequestBody)
+				throw new Error("missing native provider");
+			const transform = provider.transformRequestBody.bind(provider);
+			let refused = 0;
+			const spy = spyOn(provider, "transformRequestBody").mockImplementation(
+				async (...args) => {
+					if (refused++ === 0)
+						throw new ServerToolCandidateCapabilityError({
+							accountId: "a",
+							candidateId: "synthetic",
+							reason: "other_lane_dispatched",
+						});
+					return transform(...args);
+				},
+			);
+			try {
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				expect(response.status).toBe(200);
+				await response.text();
+				expect(refused).toBeGreaterThan(1);
+				expect(sends).toHaveLength(1);
+			} finally {
+				spy.mockRestore();
+			}
+		});
+		it("keeps attempt-unavailable for a capability error that is not the other-lane skip", async () => {
+			const provider = getProvider("anthropic");
+			if (!provider?.transformRequestBody)
+				throw new Error("missing native provider");
+			const transform = provider.transformRequestBody.bind(provider);
+			let refused = 0;
+			let calls = 0;
+			const spy = spyOn(provider, "transformRequestBody").mockImplementation(
+				async (...args) => {
+					calls++;
+					if (refused++ === 0)
+						throw new ServerToolCandidateCapabilityError({
+							accountId: "a",
+							candidateId: "synthetic",
+							reason: "proof_drift",
+						});
+					return transform(...args);
+				},
+			);
+			try {
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				expect(response.status).toBe(503);
+				await response.text();
+				// No further candidate is tried or served after a non-lane refusal.
+				expect(calls).toBe(1);
+				expect(sends).toHaveLength(0);
+			} finally {
+				spy.mockRestore();
+			}
+		});
+		describe("with a ready server-tool replay runtime (bind succeeds)", () => {
+			let bindResults: boolean[];
+			beforeEach(() => {
+				ctx.serverToolReplay = readyReplayRuntime;
+				bindResults = [];
+				const bind = replayRuntime.bindRequestPrivateServerToolReplay;
+				const spy = spyOn(
+					replayRuntime,
+					"bindRequestPrivateServerToolReplay",
+				).mockImplementation(async (...args) => {
+					const bound = await bind(...args);
+					bindResults.push(bound);
+					return bound;
+				});
+				restores.push(() => spy.mockRestore());
+			});
+			it("serves a native web_search request with one send and the tool intact", async () => {
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				expect(response.status).toBe(200);
+				await response.text();
+				// The production bind path ran and succeeded, not the unbound fallback.
+				expect(bindResults).toEqual([true]);
+				expect(sends).toHaveLength(1);
+				expect(envelopes[0]?.tools).toEqual([searchTool]);
+			});
+			it("demotes the forced web_search choice for claude-opus-5-5 under a successful bind", async () => {
+				const response = await send(
+					request(
+						"claude-opus-5-5",
+						{},
+						{
+							tools: [searchTool],
+							tool_choice: { type: "tool", name: "web_search" },
+						},
+					),
+				);
+				expect(response.status).toBe(200);
+				await response.text();
+				expect(bindResults).toEqual([true]);
+				expect(sends).toHaveLength(1);
+				expect(sends[0]?.model).toBe("claude-opus-5-5");
+				expect(envelopes[0]?.tools).toEqual([searchTool]);
+				expect(envelopes[0]?.tool_choice).toEqual({ type: "auto" });
+			});
+		});
 	});
 	it("quota exhaustion during preparation blocks the physical send even with manual throttles disabled", async () => {
 		const provider = getProvider("anthropic");
@@ -3483,6 +3646,130 @@ describe("prewarmed native catalogs", () => {
 					request(undefined, {}, { tools: [advisorTool] }),
 				);
 				await refusal(response, declaration);
+				expect(sends).toHaveLength(0);
+			});
+		});
+		describe("native web_search continues after a failed replay bind", () => {
+			const searchTool = {
+				type: "web_search_20250305",
+				name: "web_search",
+				max_uses: 8,
+				search_profile: "fast",
+			};
+			let bindResults: boolean[];
+			beforeEach(() => {
+				// No replay runtime: the production bind runs and fails.
+				ctx.serverToolReplay = undefined;
+				bindResults = [];
+				const bind = replayRuntime.bindRequestPrivateServerToolReplay;
+				const spy = spyOn(
+					replayRuntime,
+					"bindRequestPrivateServerToolReplay",
+				).mockImplementation(async (...args) => {
+					const bound = await bind(...args);
+					bindResults.push(bound);
+					return bound;
+				});
+				restores.push(() => spy.mockRestore());
+			});
+			const fableScopedExhausted = (id: string) =>
+				usageCache.set(id, {
+					limits: [
+						{ kind: "weekly_all", percent: 10, resets_at: Date.now() + 60000 },
+						{
+							kind: "weekly_scoped",
+							percent: 100,
+							resets_at: Date.now() + 60000,
+							scope: { model: { display_name: "Fable" } },
+						},
+					],
+					spend: { enabled: false },
+				} as never);
+			it("serves the request on the first-party target with one send when the bind fails", async () => {
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				expect(response.status).toBe(200);
+				await response.text();
+				expect(bindResults).toEqual([false]);
+				expect(sends).toHaveLength(1);
+				expect(envelopes[0]?.tools).toEqual([searchTool]);
+			});
+			it("skips a non-first-party rung ahead of the first-party target and sends only to the first-party one", async () => {
+				enrollCodex("gpt-astra", "astra");
+				capacity(() => 10);
+				// The fable lane is exhausted, so the codex astra rung is reached before
+				// the first-party opus rung.
+				for (const id of ["a", "b"]) fableScopedExhausted(id);
+				await getCodexModels("c", ctx);
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				expect(response.status).toBe(200);
+				await response.text();
+				await flush();
+				expect(bindResults).toEqual([false]);
+				expect(sends).toHaveLength(1);
+				expect(sends[0]?.model).toBe("claude-opus-5-5");
+				expect(envelopes[0]?.tools).toEqual([searchTool]);
+			});
+			const replayUnavailable = async (response: Response) => {
+				expect(response.status).toBe(503);
+				const { error } = (await response.json()) as {
+					error: { code: string; reason: string };
+				};
+				expect(error.code).toBe("quality_route_unavailable");
+				expect(error.reason).toBe("tool-replay-unavailable");
+			};
+			it("refuses with tool-replay-unavailable when the bind fails on a request the native lane cannot serve", async () => {
+				// A result sealed in this proxy's replay envelope needs the hosted lane.
+				const proxyOpaqueHistory = [
+					{ role: "user", content: "search" },
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "server_tool_use",
+								id: "srvtoolu_x",
+								name: "web_search",
+								input: { query: "q" },
+							},
+							{
+								type: "web_search_tool_result",
+								tool_use_id: "srvtoolu_x",
+								content: [
+									{
+										type: "web_search_result",
+										title: "t",
+										url: "https://example.com",
+										encrypted_content: "bccf1.A256GCM.proxy-envelope",
+									},
+								],
+							},
+						],
+					},
+					{ role: "user", content: "continue" },
+				];
+				const response = await send(
+					request(
+						undefined,
+						{},
+						{ tools: [searchTool], messages: proxyOpaqueHistory },
+					),
+				);
+				await replayUnavailable(response);
+				expect(bindResults).toEqual([false]);
+				expect(sends).toHaveLength(0);
+			});
+			it("refuses with tool-replay-unavailable when the bind fails and no first-party account is in inventory", async () => {
+				const all = ctx.dbOps.getAllAccounts;
+				ctx.dbOps.getAllAccounts = async () =>
+					(await all()).filter((a) => !core.isFirstPartyAnthropicAccount(a));
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				await replayUnavailable(response);
+				expect(bindResults).toEqual([false]);
 				expect(sends).toHaveLength(0);
 			});
 		});

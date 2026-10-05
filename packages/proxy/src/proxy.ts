@@ -3,6 +3,7 @@ import {
 	formatXaiCacheCanary,
 	getModelFamily,
 	isAccountAvailable,
+	isFirstPartyAnthropicAccount,
 	isForceAccountModelEnabled as isForceAccountModelRewriteEnabled,
 	MAX_REQUEST_BODY_BYTES,
 	PAUSE_REASON_NEEDS_REAUTH,
@@ -23,6 +24,7 @@ import {
 	deriveXaiConversationIdentity,
 	estimateAnthropicAdmissionTokens,
 	isCacheFlightRecorderEnabled,
+	isNativeWebSearchPassthroughEligible,
 	isOfficialXaiEndpoint,
 	isXaiCacheNativeEnabled,
 	type RequestObservation,
@@ -1728,9 +1730,24 @@ async function handleProxyCoreImpl(
 				},
 			))
 		) {
-			return createUnservedServerToolRoutingErrorResponse(
-				new ServerToolRoutingError({ reason: "replay_unavailable" }),
-			);
+			// A first-party Anthropic account serves web_search natively and needs no
+			// replay authority. When the request could be served that way, keep going
+			// with native candidates only; selection marks hosted candidates
+			// replay-ineligible. Otherwise the bind failure stays terminal, before
+			// any selection or provider work.
+			if (
+				!isNativeWebSearchPassthroughEligible(serverToolRequirements, true) ||
+				!(
+					await loadRoutingInventory(requestMeta, () =>
+						ctx.dbOps.getAllAccounts(),
+					)
+				).some(isFirstPartyAnthropicAccount)
+			) {
+				return createUnservedServerToolRoutingErrorResponse(
+					new ServerToolRoutingError({ reason: "replay_unavailable" }),
+				);
+			}
+			requestMeta.serverToolReplayBound = false;
 		}
 	}
 	const finalParsedBody = finalRequestBodyContext.getParsedJson();

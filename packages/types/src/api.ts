@@ -80,6 +80,12 @@ export interface RoutingCandidateServerToolCapability {
 	readonly decision: "proven" | "unsupported" | "unknown";
 	readonly reason: RoutingCandidateServerToolCapabilityReason | null;
 	readonly proofKey: string | null;
+	/**
+	 * Set when the candidate is admitted as a first-party Anthropic native
+	 * passthrough instead of a provider-proven hosted tuple. Its proofKey is a
+	 * sentinel, never a tuple digest.
+	 */
+	readonly lane?: "native_passthrough";
 	readonly inputReplayMode: readonly ServerToolReplayAtom[];
 	readonly outputReplayMode: readonly ServerToolReplayAtom[];
 	readonly replayRuntimeStatus:
@@ -265,6 +271,12 @@ export interface RequestMeta {
 	 * `/v1/messages?beta=true` namespace alias is classified as absent.
 	 */
 	serverToolQueryPresent?: boolean;
+	/**
+	 * False when the replay keyring could not bind for this request, so only
+	 * candidates that need no replay (native passthrough) may serve it.
+	 * Undefined means the bind was not attempted or succeeded.
+	 */
+	serverToolReplayBound?: boolean;
 	/** Aggregate capability/admission evidence for the structural candidate pool. */
 	serverToolCapabilitySummary?: ServerToolRoutingCapabilitySummary;
 	/** Active combo name (set when combo routing is used) */

@@ -51,6 +51,7 @@ const ADVISOR_RESULT_BLOCK_TYPE = "advisor_tool_result" as const;
 const MAX_DOMAINS = 10;
 const MAX_DOMAIN_LENGTH = 8 * 1024;
 const MAX_LOCATION_VALUE_LENGTH = 256;
+const MAX_SEARCH_PROFILE_LENGTH = 64;
 const MAX_ISSUE_RECORDS = 8;
 const MAX_RETAINED_TOOL_TYPE_LENGTH = 128;
 const MAX_HISTORY_MESSAGE_VISITS = 4_096;
@@ -233,6 +234,7 @@ function normalizeExactDeclaration(
 		"allowed_domains",
 		"blocked_domains",
 		"user_location",
+		"search_profile",
 	]);
 	if (!hasOnlyKeys(tool, allowed) || tool.name !== "web_search")
 		return undefined;
@@ -243,6 +245,7 @@ function normalizeExactDeclaration(
 		allowedDomains?: readonly string[];
 		blockedDomains?: readonly string[];
 		userLocation?: ApproximateUserLocation;
+		searchProfile?: string;
 	} = { type: EXACT_WEB_SEARCH_TYPE };
 
 	if (tool.max_uses !== undefined) {
@@ -272,6 +275,17 @@ function normalizeExactDeclaration(
 		const location = normalizeLocation(tool.user_location);
 		if (!location) return undefined;
 		declaration.userLocation = location;
+	}
+	if (tool.search_profile !== undefined) {
+		if (
+			typeof tool.search_profile !== "string" ||
+			tool.search_profile.length === 0 ||
+			tool.search_profile.length > MAX_SEARCH_PROFILE_LENGTH ||
+			!/^[\x21-\x7e]+$/u.test(tool.search_profile)
+		) {
+			return undefined;
+		}
+		declaration.searchProfile = tool.search_profile;
 	}
 
 	return Object.freeze(declaration);
@@ -309,7 +323,7 @@ function buildWebSearchOptionProfileId(
 	const sorted = (values: readonly string[] | undefined) =>
 		values === undefined ? null : [...values].sort();
 	const location = declaration.userLocation;
-	const canonical = JSON.stringify([
+	const canonicalFields: unknown[] = [
 		declaration.type,
 		declaration.maxUses ?? null,
 		sorted(declaration.allowedDomains),
@@ -323,7 +337,13 @@ function buildWebSearchOptionProfileId(
 					location.country ?? null,
 					location.timezone ?? null,
 				],
-	]);
+	];
+	// Appended only when present so declarations without search_profile keep
+	// their existing option-profile identity.
+	if (declaration.searchProfile !== undefined) {
+		canonicalFields.push(declaration.searchProfile);
+	}
+	const canonical = JSON.stringify(canonicalFields);
 	const digest = createHash("sha256")
 		.update(OPTION_PROFILE_DOMAIN, "utf8")
 		.update(canonical, "utf8")
@@ -508,6 +528,54 @@ export function deriveNativeAnthropicToolRequirement(
 		unknownDeclaredTypes: Object.freeze(unknown),
 		hasHistory,
 	});
+}
+
+/**
+ * True when a web_search request may be served by a first-party Anthropic
+ * account as a native passthrough instead of a hosted lane. The caller computes
+ * `firstPartyAnthropic` from the live account, never from the request.
+ */
+export function isNativeWebSearchPassthroughEligible(
+	requirements: ServerToolRequirements | undefined,
+	firstPartyAnthropic: boolean,
+): boolean {
+	if (firstPartyAnthropic !== true || requirements === undefined) return false;
+	if (requirements.invalid?.length || requirements.unsupported?.length) {
+		return false;
+	}
+	if (
+		requirements.declarations?.length !== 1 ||
+		requirements.declarations[0]?.type !== EXACT_WEB_SEARCH_TYPE
+	) {
+		return false;
+	}
+	const isNativeOnly = (atoms: readonly ServerToolReplayAtom[]) =>
+		atoms.every((atom) => atom === "native-Anthropic");
+	return (
+		isNativeOnly(requirements.replay.input) &&
+		isNativeOnly(requirements.replay.output)
+	);
+}
+
+/**
+ * The one forced choice the native web_search lane demotes to `auto` at
+ * dispatch: `tool_choice` is exactly `{type: "tool", name: "web_search"}` (two
+ * keys, so `disable_parallel_tool_use` or any other key keeps the veto).
+ * Admission and dispatch share this so they cannot disagree on what is
+ * rewritten.
+ */
+export function isDemotableForcedWebSearchChoice(body: unknown): boolean {
+	if (typeof body !== "object" || body === null || Array.isArray(body))
+		return false;
+	const choice = (body as { tool_choice?: unknown }).tool_choice;
+	if (typeof choice !== "object" || choice === null || Array.isArray(choice))
+		return false;
+	const keys = Object.keys(choice);
+	return (
+		keys.length === 2 &&
+		(choice as { type?: unknown }).type === "tool" &&
+		(choice as { name?: unknown }).name === "web_search"
+	);
 }
 
 export function deriveServerToolRequirement(

@@ -29,6 +29,8 @@ export interface WebSearchServerToolDeclaration {
 	readonly allowedDomains?: readonly string[];
 	readonly blockedDomains?: readonly string[];
 	readonly userLocation?: ApproximateUserLocation;
+	/** Claude Code's `search_profile`; forwarded only on the native lane. */
+	readonly searchProfile?: string;
 }
 
 export interface InvalidServerToolRequirement {

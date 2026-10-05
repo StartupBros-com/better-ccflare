@@ -20,6 +20,7 @@ import {
 	canonicalizeBetaSignature,
 	deriveComboRouteClass,
 	getProviderPathCapability,
+	isNativeWebSearchPassthroughEligible,
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
 	resolveAccountLogicalModelCapability,
@@ -475,6 +476,31 @@ function previewCandidatePhysicalModel(
 	}
 }
 
+/**
+ * Sentinel proof key for the first-party Anthropic native web_search lane. It
+ * is not a tuple digest: native candidates have no provider-proven tuple, so
+ * nothing may feed this value to the hosted proof, replay or attempt-plan code.
+ */
+const NATIVE_WEB_SEARCH_PASSTHROUGH_PROOF_KEY =
+	"native-passthrough:web_search_20250305";
+
+function nativeWebSearchPassthroughCapability(
+	account: Account,
+	physicalModel: string,
+): RoutingCandidateServerToolCapability {
+	return Object.freeze({
+		resolvedProvider: account.provider,
+		physicalModel,
+		decision: "proven",
+		reason: null,
+		proofKey: NATIVE_WEB_SEARCH_PASSTHROUGH_PROOF_KEY,
+		lane: "native_passthrough",
+		inputReplayMode: freezeReplayMode([]),
+		outputReplayMode: freezeReplayMode([]),
+		replayRuntimeStatus: "not_required",
+	});
+}
+
 function freezeReplayMode<T extends readonly string[]>(mode: T): T {
 	return Object.freeze([...mode]) as unknown as T;
 }
@@ -503,6 +529,7 @@ function validateProviderCapabilityDecision(
 	tuple: ServerToolCapabilityTuple,
 	requirements: NonNullable<RequestMeta["serverToolRequirements"]>,
 	ctx: ProxyContext,
+	replayBound: boolean | undefined,
 ): RoutingCandidateServerToolCapability {
 	const base = {
 		resolvedProvider: tuple.provider,
@@ -532,7 +559,7 @@ function validateProviderCapabilityDecision(
 	const proofKey = buildServerToolCapabilityProofKey(proof.revision, tuple);
 	if (proofKey === undefined)
 		throw new TypeError("Invalid capability proof key");
-	const runtimeStatus =
+	let runtimeStatus: RoutingCandidateServerToolCapability["replayRuntimeStatus"] =
 		decision.decision === "proven"
 			? evaluateServerToolReplayEligibility(
 					requirements,
@@ -541,6 +568,11 @@ function validateProviderCapabilityDecision(
 					ctx.serverToolReplay,
 				).status
 			: "not_required";
+	// The request's replay keyring could not bind, so no hosted candidate can
+	// issue or read replay envelopes; only the native lane may serve it.
+	if (decision.decision === "proven" && replayBound === false) {
+		runtimeStatus = "output_unavailable";
+	}
 	return Object.freeze({
 		resolvedProvider: tuple.provider,
 		physicalModel: tuple.model,
@@ -591,6 +623,14 @@ function evaluateCandidateServerToolCapability(input: {
 			reason: "physical_model_unavailable",
 		});
 	}
+	if (
+		isNativeWebSearchPassthroughEligible(
+			requirements,
+			isFirstPartyAnthropicAccount(input.account),
+		)
+	) {
+		return nativeWebSearchPassthroughCapability(input.account, physicalModel);
+	}
 	const requestTarget = splitRequestTarget(input.meta.path);
 	const capabilityQuery =
 		input.meta.serverToolQueryPresent === undefined
@@ -633,6 +673,7 @@ function evaluateCandidateServerToolCapability(input: {
 			tuple,
 			requirements,
 			input.ctx,
+			input.meta.serverToolReplayBound,
 		);
 	} catch {
 		return unknownCandidateCapability({

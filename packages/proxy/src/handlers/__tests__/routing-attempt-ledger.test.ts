@@ -251,6 +251,16 @@ describe("RoutingAttemptLedger", () => {
 		expect(ledger.hostedDispatchState).toBe("hosted_dispatched");
 	});
 
+	it("exposes a monotonic native search dispatch state independent of hosted ownership", () => {
+		const ledger = new RoutingAttemptLedger();
+
+		expect(ledger.nativeSearchDispatchState).toBe("undispatched");
+		ledger.markNativeSearchDispatched();
+		ledger.markNativeSearchDispatched();
+		expect(ledger.nativeSearchDispatchState).toBe("native_dispatched");
+		expect(ledger.hostedDispatchState).toBe("undispatched");
+	});
+
 	it("allows exactly one competing microtask to claim hosted dispatch", async () => {
 		const ledger = new RoutingAttemptLedger();
 		const claims = await Promise.all(
