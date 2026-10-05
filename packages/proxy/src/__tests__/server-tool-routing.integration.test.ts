@@ -304,6 +304,7 @@ function makeServerToolRequest(
 		model?: string;
 		query?: string;
 		claudeCodeForcedChoice?: boolean;
+		clientFunction?: boolean;
 		replayIdentity?: "valid" | "missing" | "ambiguous";
 	} = {},
 ): Request {
@@ -340,6 +341,15 @@ function makeServerToolRequest(
 			max_tokens: 16,
 			stream: options.claudeCodeForcedChoice === true,
 			tools: [
+				...(options.clientFunction
+					? [
+							{
+								name: "client_lookup",
+								description: "A client-side function tool",
+								input_schema: { type: "object", properties: {} },
+							},
+						]
+					: []),
 				{
 					type: "web_search_20250305",
 					name: "web_search",
@@ -2719,6 +2729,7 @@ describe("route-profile WebSearch helper falls to the global proven lane", () =>
 	function makeSoftProfileHarness(
 		logicalModel = "claude-opus-5",
 		withNative = true,
+		configureProvider?: (provider: Provider) => void,
 	) {
 		const pool = makeAccount({
 			id: "helper-pool-account",
@@ -2728,7 +2739,7 @@ describe("route-profile WebSearch helper falls to the global proven lane", () =>
 			model_mappings: JSON.stringify({ opus: PHYSICAL, sonnet: MODEL }),
 		});
 		const accounts = withNative ? [pool, makeNativeAccount()] : [pool];
-		const harness = makeContext(accounts);
+		const harness = makeContext(accounts, configureProvider);
 		harness.ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
 			parseModelRouteProfiles(
 				JSON.stringify([
@@ -2963,5 +2974,81 @@ describe("route-profile WebSearch helper falls to the global proven lane", () =>
 		});
 		expect(bound.status).toBe(200);
 		expect(String(calls[0]?.body.model)).toBe("claude-opus-5-5");
+	});
+	it("keeps a picker-model main-loop root that declares web_search plus client functions a root", async () => {
+		const { ctx, calls } = makeSoftProfileHarness(
+			"claude-opus-5",
+			true,
+			(provider) => {
+				provider.resolveServerToolCapability = (_requirements, tuple) => ({
+					decision: "proven",
+					proof: makeProof(tuple, `pool-proof:${tuple.candidateId}`),
+				});
+			},
+		);
+		const profileIds: Array<string | null | undefined> = [];
+		const lineages: Array<RequestMeta["routeLineage"]> = [];
+		ctx.strategy.select = mock(
+			async (accounts: Account[], meta: RequestMeta) => {
+				profileIds.push(meta.routeProfileId);
+				lineages.push(meta.routeLineage);
+				return accounts;
+			},
+		);
+
+		const root = await sendHelper(ctx, {
+			model: PICKER,
+			clientFunction: true,
+			claudeCodeForcedChoice: false,
+		});
+		expect(root.status).toBe(200);
+		expect(new URL(calls[0]?.url ?? "").host).toBe("capability.invalid");
+		expect(lineages.every((lineage) => lineage?.kind === "root")).toBe(true);
+
+		// The root committed the profile binding: a later stock-model subagent
+		// helper inherits it.
+		profileIds.length = 0;
+		const helper = await sendHelper(ctx, {
+			model: "claude-opus-5-5",
+			claudeCodeAgentId: "agent-1",
+		});
+		expect(helper.status).toBe(200);
+		expect(profileIds.length).toBeGreaterThan(0);
+		expect(profileIds.every((id) => id === PROFILE_ID)).toBe(true);
+	});
+
+	it("keeps a subagent request that declares web_search plus client functions a descendant", async () => {
+		const { ctx } = makeSoftProfileHarness(
+			"claude-opus-5",
+			true,
+			(provider) => {
+				provider.resolveServerToolCapability = (_requirements, tuple) => ({
+					decision: "proven",
+					proof: makeProof(tuple, `pool-proof:${tuple.candidateId}`),
+				});
+			},
+		);
+		const lineages: Array<RequestMeta["routeLineage"]> = [];
+		ctx.strategy.select = mock(
+			async (accounts: Account[], meta: RequestMeta) => {
+				lineages.push(meta.routeLineage);
+				return accounts;
+			},
+		);
+		expect((await sendRoot(ctx, PICKER)).status).toBe(200);
+		lineages.length = 0;
+
+		const response = await sendHelper(ctx, {
+			model: PICKER,
+			claudeCodeAgentId: "agent-1",
+			clientFunction: true,
+			claudeCodeForcedChoice: false,
+		});
+
+		expect(response.status).toBe(200);
+		expect(lineages.length).toBeGreaterThan(0);
+		expect(lineages.every((lineage) => lineage?.kind === "descendant")).toBe(
+			true,
+		);
 	});
 });

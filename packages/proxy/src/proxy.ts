@@ -1299,10 +1299,16 @@ async function handleProxyCoreImpl(
 	requestMeta.agentAttributionSource = agentAttributionSource;
 	const isCountHelper = url.pathname === "/v1/messages/count_tokens";
 	// The quality route runs before profile resolution, so the helper preview is
-	// taken here: a server-tool helper never commits root intent on either path.
+	// taken here. A helper-shaped request (a hosted server tool and no client
+	// function tools, as Claude Code builds WebSearch) never commits root intent
+	// on either path; a request that also declares client functions is a real
+	// main-loop turn and keeps committing as before.
 	const serverToolPreview = isCountHelper
 		? undefined
 		: finalRequestBodyContext.previewServerToolRequirements();
+	const serverToolHelperShaped =
+		serverToolPreview !== undefined &&
+		serverToolPreview.hasClientFunctions !== true;
 	const qualityResponse = await routeQualityRequest({
 		req,
 		url,
@@ -1315,7 +1321,7 @@ async function handleProxyCoreImpl(
 		requirements: qualityRequirements,
 		serverToolQueryPresent: hasServerToolCapabilityQuery(url),
 		onRootAccepted: () =>
-			serverToolPreview === undefined &&
+			!serverToolHelperShaped &&
 			modelRouteRegistry?.commitNative(
 				{
 					callerIdentity: routeCallerIdentity(req, apiKeyId),
@@ -1345,11 +1351,16 @@ async function handleProxyCoreImpl(
 		effectiveModelAfterInterception !== null &&
 		modelRouteRegistry?.hasPublicModelId(effectiveModelAfterInterception) ===
 			true;
-	// Lineage is decoupled from profile resolution: any request declaring a
-	// hosted server tool is a helper (it commits no root intent, creates no
-	// home, and may fall to the global proven lane under a soft profile), even
-	// when it carries a picker model or child markers.
-	const isServerToolHelper = serverToolPreview !== undefined;
+	// Lineage is decoupled from profile resolution: a helper-shaped request (a
+	// hosted server tool, no client functions) is a helper in every shape (it
+	// commits no root intent, creates no home, and may fall to the global proven
+	// lane under a soft profile), even with a picker model or child markers. A
+	// request that also declares client functions is a helper only in the
+	// pre-existing stock-model, non-subagent shape.
+	const isServerToolHelper =
+		serverToolPreview !== undefined &&
+		(serverToolHelperShaped ||
+			(!isSubagent && !configuredOriginalPicker && !configuredEffectivePicker));
 	if (isServerToolHelper) {
 		requestMeta.routeLineage = { kind: "helper", childHomeKey: null };
 	}
