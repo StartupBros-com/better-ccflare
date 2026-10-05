@@ -6,6 +6,7 @@ import {
 } from "@better-ccflare/providers";
 import type {
 	Account,
+	AccountWindowCaps,
 	QualityAdmissionDecision,
 	QualityRoutingPolicy,
 } from "@better-ccflare/types";
@@ -14,7 +15,7 @@ import {
 	type AutoResolvedCredentials,
 	validateNativeAutoCatalogCredentials,
 } from "../model-catalog";
-import { evaluateAutoCapacity } from "./usage-throttling";
+import { evaluateAutoCapacity, evaluateWindowCaps } from "./usage-throttling";
 
 export interface QualityRouteAdmissionInput {
 	readonly account: Pick<
@@ -39,6 +40,33 @@ export interface QualityRouteAdmissionInput {
 		readonly observedAt: number;
 		readonly data: unknown;
 	};
+	/** Per-account usage-window caps, read by the caller; this function reads no config. */
+	readonly accountWindowCaps?: AccountWindowCaps | null;
+}
+
+/**
+ * Cap verdict for one account and one physical request model, shared by every
+ * Auto capacity site (none of them passes through evaluateCandidateCapacity).
+ * Over cap and missing or stale evidence both reject, so the cap is labeled
+ * apart from exhaustion; an uncapped account returns null and keeps today's behavior.
+ */
+export function evaluateAccountWindowCapAdmission(input: {
+	readonly accountId: string;
+	readonly requestModel: string;
+	readonly snapshot: {
+		readonly data: unknown;
+		readonly observedAt: number;
+	} | null;
+	readonly caps: AccountWindowCaps | null | undefined;
+}): QualityAdmissionDecision | null {
+	const exclusions = evaluateWindowCaps(
+		input.snapshot,
+		input.caps?.[input.accountId],
+		{ requestModel: input.requestModel },
+	);
+	return exclusions.length > 0
+		? { status: "reject", reason: "account-window-cap" }
+		: null;
 }
 
 /** Shared selection/physical pre-dispatch guard. U5 must invoke again after
@@ -73,6 +101,13 @@ export function evaluateQualityRouteAdmission(
 		return { status: "unknown", reason: "catalog-evidence-stale" };
 	if (usage.accountId !== account.id || usage.provider !== account.provider)
 		return { status: "unknown", reason: "capacity-evidence-unknown" };
+	const capped = evaluateAccountWindowCapAdmission({
+		accountId: account.id,
+		requestModel: target.physicalModel,
+		snapshot: usage,
+		caps: input.accountWindowCaps,
+	});
+	if (capped) return capped;
 	const capacity = evaluateAutoCapacity(usage.data, {
 		accountId: account.id,
 		provider: target.provider,

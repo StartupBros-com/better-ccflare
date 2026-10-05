@@ -100,6 +100,8 @@ async function decryptForList(id: string, json: string): Promise<string> {
 export interface RequestData {
 	routingAttemptSummary?: RequestRoutingAttemptSummary | null;
 	qualityDecision?: QualityDecisionRecord | null;
+	/** Bounded JSON of anthropic-ratelimit-unified-* headers (Fable 2xx only). */
+	unifiedRatelimitHeaders?: string | null;
 	accounting?: RequestAccountingContext;
 	id: string;
 	method: string;
@@ -262,9 +264,9 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				route_profile_id, requested_route_model, routed_provider, routed_model,
 				route_fallback_rung, route_home_action, route_repin_reason, route_candidate_id,
 				account_generation, cache_health_native, internal_origin, quality_decision, routing_attempt_summary,
-				advisor_usage
+				advisor_usage, unified_ratelimit_headers
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (id) DO UPDATE SET
 				timestamp = EXCLUDED.timestamp,
 				method = EXCLUDED.method,
@@ -326,7 +328,8 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				internal_origin = COALESCE(requests.internal_origin, EXCLUDED.internal_origin),
  quality_decision = COALESCE(requests.quality_decision, EXCLUDED.quality_decision),
  routing_attempt_summary = COALESCE(requests.routing_attempt_summary, EXCLUDED.routing_attempt_summary),
-				advisor_usage = EXCLUDED.advisor_usage
+				advisor_usage = EXCLUDED.advisor_usage,
+				unified_ratelimit_headers = COALESCE(requests.unified_ratelimit_headers, EXCLUDED.unified_ratelimit_headers)
 		`,
 			[
 				data.id,
@@ -377,6 +380,7 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				decision ? JSON.stringify(decision) : null,
 				attemptSummary ? JSON.stringify(attemptSummary) : null,
 				usage?.advisorUsage?.length ? JSON.stringify(usage.advisorUsage) : null,
+				data.unifiedRatelimitHeaders || null,
 			],
 		);
 	}

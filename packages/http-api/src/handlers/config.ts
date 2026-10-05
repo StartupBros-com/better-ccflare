@@ -419,6 +419,13 @@ export function createConfigHandlers(
 			});
 		},
 
+		getAccountWindowCaps: (): Response => {
+			return jsonResponse({
+				caps: config.getAccountWindowCaps(),
+				source: config.getAccountWindowCapsSource(),
+			});
+		},
+
 		setModelCapacityRouting: async (req: Request): Promise<Response> => {
 			const body = await req.json();
 			if (body.mode !== "off" && body.mode !== "exhausted") {

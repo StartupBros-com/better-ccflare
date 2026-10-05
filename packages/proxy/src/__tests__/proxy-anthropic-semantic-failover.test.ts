@@ -1448,7 +1448,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(persistence.handleStart).toHaveBeenCalledTimes(1);
 		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
 		expect(persistence.savedRequests).toHaveLength(1);
-		expect(persistence.savedRequests[0]?.at(-1)).toMatchObject({
+		expect(persistence.savedRequests[0]?.at(-2)).toMatchObject({
 			physicalAttemptCount: 2,
 			routeCount: 1,
 			outputOriginOrdinal: 2,
@@ -4161,7 +4161,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			routedModel: "gpt-5.3-codex",
 			profileId: null,
 		});
-		expect(saved.at(-1)).toMatchObject({
+		expect(saved.at(-2)).toMatchObject({
 			version: 1,
 			physicalAttemptCount: 2,
 			routeCount: 1,
@@ -4192,7 +4192,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				},
 			],
 		});
-		expect(JSON.stringify(saved.at(-1))).not.toContain(
+		expect(JSON.stringify(saved.at(-2))).not.toContain(
 			"private-fixture-content",
 		);
 	});

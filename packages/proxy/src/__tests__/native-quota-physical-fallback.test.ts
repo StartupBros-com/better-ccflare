@@ -414,6 +414,39 @@ describe("native quota physical model fallbacks", () => {
 		expect(pool.calls).toEqual([DATED_FABLE]);
 	});
 
+	it("returns the model_pool_exhausted 503, not the native quota-wait 429, when every Fable slot is over its window cap", async () => {
+		const pool = nativePool();
+		const resetsAt = new Date(Date.now() + 86_400_000).toISOString();
+		// Live raw shape: flat windows plus Fable as an inactive weekly_scoped row.
+		usageCache.set(pool.account.id, {
+			five_hour: { utilization: 10, resets_at: resetsAt },
+			seven_day: { utilization: 40, resets_at: resetsAt },
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 85,
+					is_active: false,
+					resets_at: resetsAt,
+					scope: { model: { id: null, display_name: "Fable" }, surface: null },
+				},
+			],
+		} as never);
+		(
+			pool.ctx.config as unknown as { getAccountWindowCaps: () => unknown }
+		).getAccountWindowCaps = () => ({
+			[pool.account.id]: { seven_day_fable: 80 },
+		});
+		pool.fetch((model) => success(model));
+		const response = await pool.send();
+		expect(response.status).toBe(503);
+		const body = await response.json();
+		expect(body.error.code).toBe("model_pool_exhausted");
+		expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(0);
+		// Opus backup is not family-exhaustion evidence: nothing is dispatched.
+		expect(pool.calls).toEqual([]);
+	});
+
 	it.each([
 		"family",
 		"endpoint",

@@ -607,6 +607,7 @@ export function sanitizeRequestRoutingAttemptSummary(
 export interface RequestRow {
 	routing_attempt_summary?: string | null;
 	quality_decision?: string | null;
+	unified_ratelimit_headers?: string | null;
 	id: string;
 	timestamp: number;
 	method: string;

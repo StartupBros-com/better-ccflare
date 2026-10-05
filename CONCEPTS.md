@@ -267,6 +267,20 @@ so an active flag is load-bearing information in the first case and merely a def
 the second; read it accordingly. Inactive windows are worth recording for historical
 completeness, but must not drive routing or alerting decisions.
 
+### Usage-window cap
+
+An operator-set ceiling, as a percent, on one account's canonical usage window (see Canonical
+usage window), below which the proxy keeps selecting the account and at or above which it stops
+selecting it for that window's scope: one model family for a scoped weekly key, the whole account
+for an account-wide key.
+
+A cap is the one reader of an inactive window (see Binding limit). The binding-limit rule keeps
+inactive windows out of routing because they are not what the provider is enforcing; a cap is
+not an enforcement signal but a reservation of headroom, so it reads the window's utilization
+whether or not the provider marks it active. A capped window with no fresh snapshot counts as
+over cap for that account, the opposite of the fail-open default elsewhere.
+*Avoid:* soft limit, quota reserve
+
 ### Point budget
 
 A ceiling on how many measurement points a single fleet-wide history read may return.

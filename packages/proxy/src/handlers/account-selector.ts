@@ -31,6 +31,7 @@ import {
 import type {
 	Account,
 	AccountQuotaPressure,
+	AccountWindowCaps,
 	AffinityOwnerDirective,
 	ComboFamily,
 	ComboMembershipSource,
@@ -83,9 +84,11 @@ import {
 } from "./routing-selection-diagnostics";
 import {
 	evaluateHardCapacity,
+	evaluateWindowCaps,
 	getWeeklyQuotaPressure,
 	type HardCapacityExclusion,
 	isCodexCreditDrainActive,
+	type WindowCapExclusion,
 } from "./usage-throttling";
 
 const log = new Logger("AccountSelector");
@@ -831,7 +834,8 @@ export class ForceRouteUnavailableError extends Error {
 const comboSlotInfoMap = new WeakMap<RequestMeta, ComboSlotInfo>();
 
 export interface RoutingCapacityBlocker {
-	readonly source: "usage_snapshot" | "reactive_marker";
+	/** `window_cap` is an operator-set soft cap, not provider exhaustion. */
+	readonly source: "usage_snapshot" | "reactive_marker" | "window_cap";
 	readonly scope: "account" | "family" | "model";
 	readonly window: string;
 	readonly windowKind:
@@ -839,7 +843,8 @@ export interface RoutingCapacityBlocker {
 		| "weekly_all"
 		| "weekly_scoped"
 		| "reactive_model"
-		| "reactive_family";
+		| "reactive_family"
+		| "window_cap";
 	readonly modelFamily: string | null;
 	readonly utilization: number | null;
 	readonly resetAtMs: number | null;
@@ -1100,6 +1105,19 @@ export function isNativeQuotaRouteAllowed(
 		)
 	)
 		return false;
+	// Final per-candidate gate for every dispatch wave, deferred Opus backups
+	// included: a capped account+model is never handed to upstream.
+	const requestContext = nativeQuotaRequestContextMap.get(meta);
+	if (
+		requestContext &&
+		evaluateAccountWindowCapBlockers(
+			account.id,
+			member.logical_model,
+			Date.now(),
+			getAccountWindowCaps(requestContext),
+		).length > 0
+	)
+		return false;
 	const evaluation = evaluateNativeQuotaRequest(meta, Date.now(), account);
 	if (evaluation?.structuralError)
 		nativeQuotaContextMap.set(meta, {
@@ -1287,6 +1305,40 @@ function snapshotBlocker(
 	};
 }
 
+function windowCapBlocker(
+	exclusion: WindowCapExclusion,
+): RoutingCapacityBlocker {
+	return {
+		source: "window_cap",
+		scope: exclusion.scope,
+		window: exclusion.window,
+		windowKind: "window_cap",
+		modelFamily: exclusion.modelFamily,
+		utilization: exclusion.utilization,
+		resetAtMs: exclusion.resetAtMs,
+		evidenceExpiresAt: exclusion.evidenceExpiresAt,
+	};
+}
+
+/**
+ * Per-account usage-window cap blockers for one request model. Independent of
+ * model-scoped capacity mode, route intent and snapshot presence: a capped
+ * account with no fresh snapshot fails closed, an uncapped one yields none.
+ */
+function evaluateAccountWindowCapBlockers(
+	accountId: string,
+	model: string,
+	now: number,
+	windowCaps: AccountWindowCaps,
+): RoutingCapacityBlocker[] {
+	const caps = windowCaps[accountId];
+	if (!caps) return [];
+	return evaluateWindowCaps(usageCache.getSnapshot(accountId), caps, {
+		requestModel: model,
+		now,
+	}).map(windowCapBlocker);
+}
+
 /**
  * Look up exact model+client-beta direct failure evidence in one place. Family
  * markers can extend this helper without duplicating selector paths.
@@ -1347,6 +1399,12 @@ interface CandidateCapacityEvaluationOptions {
 	readonly modelScopedCapacityRouting: ModelScopedCapacityRoutingMode;
 	readonly routeIntent: CapacityRouteIntent;
 	readonly syntheticProbe: boolean;
+	/** Read once per selection; never per candidate. */
+	readonly windowCaps: AccountWindowCaps;
+}
+
+function getAccountWindowCaps(ctx: ProxyContext): AccountWindowCaps {
+	return ctx.config?.getAccountWindowCaps?.() ?? {};
 }
 
 function getModelScopedCapacityRoutingMode(
@@ -1434,6 +1492,17 @@ function evaluateCandidateCapacity(
 		);
 		if (reactive) blockers.push(reactive);
 	}
+
+	// Outside the model-scoped gate on purpose: flipping the capacity mode must
+	// not disable the cap, and force routes honor it.
+	blockers.push(
+		...evaluateAccountWindowCapBlockers(
+			account.id,
+			model,
+			now,
+			options.windowCaps,
+		),
+	);
 
 	if (options.observationMeta) {
 		const key = routingDiagnosticCandidateKey(account.id, model);
@@ -2378,6 +2447,7 @@ export function isImplicitCodexDiscoveryEligible(
 				modelScopedCapacityRouting: getModelScopedCapacityRoutingMode(ctx),
 				routeIntent: "capability",
 				syntheticProbe,
+				windowCaps: getAccountWindowCaps(ctx),
 			},
 		).blockers.length === 0
 	);
@@ -2849,6 +2919,7 @@ async function selectCapabilityDescendantAccounts(
 		modelScopedCapacityRouting,
 		routeIntent: "capability",
 		syntheticProbe,
+		windowCaps: getAccountWindowCaps(ctx),
 	};
 	const profileId = meta.routeProfileId?.trim() || "capability-route";
 	const rootModel = meta.routeProfileLogicalModel?.trim();
@@ -2986,6 +3057,7 @@ async function selectCapabilityDescendantAccounts(
 					specification.constraint === "profile" ? "capability" : "ordinary",
 				observationMeta: meta,
 				syntheticProbe,
+				windowCaps: nativeRemovalCapacityOptions.windowCaps,
 			},
 		);
 		routing.quotaPressure = evaluation.quotaPressure;
@@ -3081,6 +3153,7 @@ export async function getOrderedAccounts(
 				? "capability"
 				: "ordinary",
 			syntheticProbe,
+			windowCaps: getAccountWindowCaps(ctx),
 		};
 		const loadedAccounts =
 			preloadedAccounts ??
@@ -3249,12 +3322,14 @@ async function selectAccountsForRequestInternal(
 	const effectiveModel =
 		model ?? resolveEffectiveModel(meta.appliedModel, meta.originalModel);
 	const modelScopedCapacityRouting = getModelScopedCapacityRoutingMode(ctx);
+	const windowCaps = getAccountWindowCaps(ctx);
 	const nativeRemovalCapacityOptions = (
 		routeIntent: CapacityRouteIntent,
 	): Omit<CandidateCapacityEvaluationOptions, "observationMeta"> => ({
 		modelScopedCapacityRouting,
 		routeIntent,
 		syntheticProbe: options.syntheticProbe === true,
+		windowCaps,
 	});
 	meta.affinityLaneKey = deriveAffinityLaneKey(meta, effectiveModel);
 	meta.hardExcludedAccountIds = null;
@@ -3464,6 +3539,7 @@ async function selectAccountsForRequestInternal(
 							routeIntent: "force",
 							observationMeta: meta,
 							syntheticProbe: options.syntheticProbe === true,
+							windowCaps,
 						},
 					);
 					meta.quotaPressureByAccountId = evaluation.quotaPressure
@@ -4002,6 +4078,7 @@ async function selectAccountsForRequestInternal(
 						modelScopedCapacityRouting,
 						routeIntent: "combo",
 						syntheticProbe: options.syntheticProbe === true,
+						windowCaps,
 					};
 					for (const [ordinal, member] of resolution.members.entries()) {
 						const account = accountMap.get(member.account_id);
@@ -4097,6 +4174,16 @@ async function selectAccountsForRequestInternal(
 								);
 								if (exact) blockers.push(exact);
 							}
+							// The rebuild above replaces evaluateCandidateCapacity's blockers;
+							// the cap is not part of the native policy's capacities.
+							blockers.push(
+								...evaluateAccountWindowCapBlockers(
+									account.id,
+									member.logical_model,
+									now,
+									capacityOptions.windowCaps,
+								),
+							);
 							evaluation = {
 								...evaluation,
 								blockers,

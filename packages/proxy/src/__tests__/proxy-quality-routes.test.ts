@@ -3916,6 +3916,79 @@ describe("prewarmed native catalogs", () => {
 		expect(body.error.reason).toBe("output-unsupported");
 	});
 
+	describe("per-account usage-window caps", () => {
+		/** Live shape: flat five_hour/seven_day, Fable only as an inactive weekly_scoped limits[] row. */
+		const liveFable = (fablePercent: number) =>
+			({
+				five_hour: { utilization: 10, resets_at: Date.now() + 3 * 3600_000 },
+				seven_day: { utilization: 20, resets_at: Date.now() + 3 * 3600_000 },
+				limits: [
+					{
+						kind: "weekly_scoped",
+						percent: fablePercent,
+						resets_at: Date.now() + 3 * 3600_000,
+						is_active: false,
+						scope: { model: { display_name: "Fable" } },
+					},
+				],
+				spend: { enabled: false },
+			}) as never;
+		const capA = (caps: Record<string, Record<string, number>>) => {
+			(
+				ctx.config as unknown as { getAccountWindowCaps: () => typeof caps }
+			).getAccountWindowCaps = () => caps;
+		};
+
+		it("without a cap the protected account still serves Fable (control)", async () => {
+			usageCache.set("a", liveFable(85));
+			const response = await send();
+			expect(response.status).toBe(200);
+			await response.text();
+			expect(sends).toEqual([
+				{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+			]);
+		});
+
+		it("an over-cap account is skipped for the Fable line and another account serves it", async () => {
+			capA({ a: { seven_day_fable: 80 } });
+			usageCache.set("a", liveFable(85));
+			const response = await send();
+			expect(response.status).toBe(200);
+			await response.text();
+			expect(sends).toEqual([
+				{ model: "claude-fable-5-1", authorization: "synthetic-b" },
+			]);
+		});
+
+		it("excludes the capped account from the Fable lane only; its Opus line still serves", async () => {
+			capA({ a: { seven_day_fable: 80 } });
+			usageCache.set("a", liveFable(85));
+			usageCache.set("b", {
+				limits: [
+					{ kind: "weekly_all", percent: 100, resets_at: Date.now() + 60000 },
+				],
+				spend: { enabled: false },
+			} as never);
+			const response = await send();
+			await response.text();
+			expect(sends).toEqual([
+				{ model: "claude-opus-5-5", authorization: "synthetic-a" },
+			]);
+		});
+
+		it("a capped account with no usage snapshot is excluded instead of failing open", async () => {
+			capA({ a: { seven_day_fable: 80 } });
+			usageCache.delete("a");
+			const response = await send();
+			expect(response.status).toBe(200);
+			await response.text();
+			expect(sends[0]).toEqual({
+				model: "claude-fable-5-1",
+				authorization: "synthetic-b",
+			});
+		});
+	});
+
 	it("non-terminal quality errors keep their original body shape", async () => {
 		const response = await send(request("claude-bccf-quality-nope"));
 		expect(response.status).toBe(400);
@@ -3990,6 +4063,7 @@ describe("prewarmed native catalogs", () => {
 				"spend-not-authorized",
 				"lane-unavailable",
 				"provider-capacity-exhausted",
+				"account-window-cap",
 				"capacity-evidence-unknown",
 				"billing-evidence-unknown",
 				"catalog-evidence-stale",

@@ -1,7 +1,9 @@
+import { parseAccountWindowCapKey } from "@better-ccflare/config";
 import {
 	collectAutoCapacityEvidence,
 	computeWindowStartMs,
 	getModelFamily,
+	normalizeProviderUsageWindows,
 	weeklyScopedWindowKey,
 } from "@better-ccflare/core";
 import {
@@ -13,6 +15,7 @@ import {
 import type {
 	Account,
 	AccountBindingConstraint,
+	CanonicalUsageWindow,
 	QualityAdmissionDecision,
 	QualityApprovedLine,
 	QualityProvider,
@@ -818,6 +821,251 @@ export function evaluateHardCapacity(
 				? null
 				: Math.max(...exclusions.map((entry) => entry.evidenceExpiresAt)),
 	};
+}
+
+/** Default usage poll interval; a stale capped window is rechecked then. */
+const DEFAULT_WINDOW_CAP_STALE_RECHECK_MS = 90_000;
+
+export type WindowCapReason =
+	| "over_cap"
+	| "below_cap"
+	| "stale"
+	| "reset_passed";
+
+export interface WindowCapExclusion {
+	readonly scope: "account" | "family";
+	readonly window: string;
+	readonly modelFamily: string | null;
+	/** Null when the snapshot is missing, stale, or lacks the capped window. */
+	readonly utilization: number | null;
+	readonly cap: number;
+	readonly reason: Extract<WindowCapReason, "over_cap" | "stale">;
+	readonly resetAtMs: number | null;
+	readonly evidenceExpiresAt: number;
+}
+
+export interface WindowCapState {
+	readonly windowKey: string;
+	readonly cap: number;
+	readonly utilization: number | null;
+	readonly resetsAtMs: number | null;
+	readonly engaged: boolean;
+	readonly reason: WindowCapReason;
+	/** When the evidence behind an engaged cap lapses; null when not engaged. */
+	readonly evidenceExpiresAt: number | null;
+}
+
+type WindowCapMap = Readonly<Record<string, number>> | null | undefined;
+
+/** The evaluator reads only the raw payload and its poll time. */
+type WindowCapSnapshot = {
+	readonly data: unknown;
+	readonly observedAt: number;
+};
+
+interface WindowCapTarget {
+	readonly windowKey: string;
+	readonly cap: number;
+	readonly scope: "account" | "family";
+	readonly modelFamily: string | null;
+}
+
+/** Account-wide keys and seven_day_<family> keys; anything else never caps. */
+function windowCapTargets(caps: WindowCapMap): WindowCapTarget[] {
+	const targets: WindowCapTarget[] = [];
+	for (const [windowKey, cap] of Object.entries(caps ?? {})) {
+		if (typeof cap !== "number" || !Number.isFinite(cap)) continue;
+		const target = parseAccountWindowCapKey(windowKey);
+		if (target) targets.push({ windowKey, cap, ...target });
+	}
+	return targets;
+}
+
+/** The highest-utilization row of a window key's rows; undefined when empty. */
+function highestRow(
+	rows: readonly CanonicalUsageWindow[],
+): CanonicalUsageWindow | undefined {
+	return rows.reduce<CanonicalUsageWindow | undefined>(
+		(top, row) => (top && top.utilization >= row.utilization ? top : row),
+		undefined,
+	);
+}
+
+/**
+ * One capped window's state over every row the payload carries for its key.
+ * Reads utilization whether or not a row is `active` (the live Fable row is an
+ * inactive limits[] row below 100%), and never reads spend or extra usage. A
+ * row whose reset passed is discarded; any remaining row at or above the cap
+ * engages it until the latest such row resets.
+ */
+function resolveWindowCap(
+	target: WindowCapTarget,
+	snapshot: WindowCapSnapshot | null,
+	windows: ReadonlyMap<string, readonly CanonicalUsageWindow[]>,
+	now: number,
+	snapshotFreshnessMs: number,
+	staleRecheckMs: number,
+): WindowCapState {
+	const rows = windows.get(target.windowKey) ?? [];
+	const live = rows.filter(
+		(row) => row.resetsAtMs === null || row.resetsAtMs > now,
+	);
+	const base = { windowKey: target.windowKey, cap: target.cap };
+	const passed = live.length === 0 ? highestRow(rows) : undefined;
+	if (passed) {
+		return {
+			...base,
+			utilization: passed.utilization,
+			resetsAtMs: passed.resetsAtMs,
+			engaged: false,
+			reason: "reset_passed",
+			evidenceExpiresAt: null,
+		};
+	}
+	const freshness = snapshot
+		? evaluateSnapshotFreshness(snapshot.observedAt, now, snapshotFreshnessMs)
+		: null;
+	const top = highestRow(live);
+	if (!snapshot || !freshness?.fresh || !top) {
+		return {
+			...base,
+			utilization: null,
+			resetsAtMs: top?.resetsAtMs ?? null,
+			engaged: true,
+			reason: "stale",
+			evidenceExpiresAt: now + staleRecheckMs,
+		};
+	}
+	if (top.utilization >= target.cap) {
+		const blockingResets = live
+			.filter((row) => row.utilization >= target.cap)
+			.map((row) => row.resetsAtMs);
+		const resetsAtMs = blockingResets.every(
+			(reset): reset is number => reset !== null,
+		)
+			? Math.max(...blockingResets)
+			: null;
+		const freshnessExpiry = freshness.expiresAt ?? now + staleRecheckMs;
+		return {
+			...base,
+			utilization: top.utilization,
+			resetsAtMs,
+			engaged: true,
+			reason: "over_cap",
+			evidenceExpiresAt:
+				resetsAtMs === null
+					? freshnessExpiry
+					: Math.min(resetsAtMs, freshnessExpiry),
+		};
+	}
+	return {
+		...base,
+		utilization: top.utilization,
+		resetsAtMs: top.resetsAtMs,
+		engaged: false,
+		reason: "below_cap",
+		evidenceExpiresAt: null,
+	};
+}
+
+/**
+ * Every canonical row per window key. The shared normalizer keeps one row per
+ * key (first wins), which would let a lower same-key row hide an over-cap one
+ * depending on payload order, so the flat windows and each limits[] row are
+ * normalized on their own and all of them kept.
+ */
+function windowCapContext(
+	snapshot: WindowCapSnapshot | null,
+): ReadonlyMap<string, readonly CanonicalUsageWindow[]> {
+	const byKey = new Map<string, CanonicalUsageWindow[]>();
+	const data = snapshot?.data;
+	if (!data || typeof data !== "object" || Array.isArray(data)) return byKey;
+	const { limits, ...flat } = data as { limits?: unknown };
+	const payloads: unknown[] = [
+		flat,
+		...(Array.isArray(limits) ? limits.map((row) => ({ limits: [row] })) : []),
+	];
+	for (const payload of payloads) {
+		for (const window of normalizeProviderUsageWindows(payload, "anthropic")) {
+			const rows = byKey.get(window.windowKey);
+			if (rows) rows.push(window);
+			else byKey.set(window.windowKey, [window]);
+		}
+	}
+	return byKey;
+}
+
+/**
+ * Per-account usage-window caps for one request model. Separate from
+ * evaluateHardCapacity on purpose: that one is shared with combo policy and the
+ * health view. Accounts without caps return [] and keep fail-open behavior;
+ * a capped window with missing or stale evidence fails closed.
+ */
+export function evaluateWindowCaps(
+	snapshot: WindowCapSnapshot | null,
+	caps: WindowCapMap,
+	options: {
+		requestModel: string | null;
+		now?: number;
+		snapshotFreshnessMs?: number;
+		staleRecheckMs?: number;
+	},
+): readonly WindowCapExclusion[] {
+	const targets = windowCapTargets(caps);
+	if (targets.length === 0) return [];
+	const now = options.now ?? Date.now();
+	const requestFamily = options.requestModel
+		? getModelFamily(options.requestModel)
+		: null;
+	const windows = windowCapContext(snapshot);
+	const exclusions: WindowCapExclusion[] = [];
+	for (const target of targets) {
+		if (target.scope === "family" && target.modelFamily !== requestFamily) {
+			continue;
+		}
+		const state = resolveWindowCap(
+			target,
+			snapshot,
+			windows,
+			now,
+			options.snapshotFreshnessMs ?? DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS,
+			options.staleRecheckMs ?? DEFAULT_WINDOW_CAP_STALE_RECHECK_MS,
+		);
+		if (!state.engaged || state.evidenceExpiresAt === null) continue;
+		exclusions.push({
+			scope: target.scope,
+			window: target.windowKey,
+			modelFamily: target.modelFamily,
+			utilization: state.utilization,
+			cap: target.cap,
+			reason: state.reason === "stale" ? "stale" : "over_cap",
+			resetAtMs: state.resetsAtMs,
+			evidenceExpiresAt: state.evidenceExpiresAt,
+		});
+	}
+	return exclusions;
+}
+
+/** Poll-time cap state, one entry per capped window; no request model involved. */
+export function getWindowCapStates(
+	snapshot: WindowCapSnapshot | null,
+	caps: WindowCapMap,
+	options: { now?: number; snapshotFreshnessMs?: number } = {},
+): readonly WindowCapState[] {
+	const targets = windowCapTargets(caps);
+	if (targets.length === 0) return [];
+	const now = options.now ?? Date.now();
+	const windows = windowCapContext(snapshot);
+	return targets.map((target) =>
+		resolveWindowCap(
+			target,
+			snapshot,
+			windows,
+			now,
+			options.snapshotFreshnessMs ?? DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS,
+			DEFAULT_WINDOW_CAP_STALE_RECHECK_MS,
+		),
+	);
 }
 
 export type QuotaPressureBand =
