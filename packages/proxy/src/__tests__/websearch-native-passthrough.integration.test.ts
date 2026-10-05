@@ -211,6 +211,35 @@ const WEB_SEARCH_TOOL = {
 };
 const FORCED_CHOICE = { type: "tool", name: "web_search" };
 const CLIENT_BETA = "claude-code-20250219,interleaved-thinking-2025-05-14";
+// A prior web_search result sealed in this proxy's own replay envelope, which
+// only the hosted lane can open.
+const PROXY_OPAQUE_HISTORY = [
+	{ role: "user", content: "search" },
+	{
+		role: "assistant",
+		content: [
+			{
+				type: "server_tool_use",
+				id: "srvtoolu_x",
+				name: "web_search",
+				input: { query: "q" },
+			},
+			{
+				type: "web_search_tool_result",
+				tool_use_id: "srvtoolu_x",
+				content: [
+					{
+						type: "web_search_result",
+						title: "t",
+						url: "https://example.com",
+						encrypted_content: "bccf1.A256GCM.proxy-envelope",
+					},
+				],
+			},
+		],
+	},
+	{ role: "user", content: "continue" },
+];
 
 // The WebSearch helper request exactly as Claude Code 2.1.289 sends it.
 function makeHelperRequest(
@@ -572,10 +601,12 @@ describe("native web_search passthrough dispatch", () => {
 			toolChoice: { ...FORCED_CHOICE, disable_parallel_tool_use: true },
 		});
 
-		const { response } = await run(ctx, request);
+		const { response, text } = await run(ctx, request);
 
 		expect(response.status).toBe(400);
 		expect(calls).toHaveLength(0);
+		// The requirement parser rejects the choice, before selection or demotion.
+		expect(JSON.parse(text).error.code).toBe("server_tool_invalid_requirement");
 	});
 
 	it("refuses advisor beside web_search before any send", async () => {
@@ -597,10 +628,13 @@ describe("native web_search passthrough dispatch", () => {
 			body: JSON.stringify(advisorBody),
 		});
 
-		const { response } = await run(ctx, advisorRequest);
+		const { response, text } = await run(ctx, advisorRequest);
 
 		expect(response.status).toBe(400);
 		expect(calls).toHaveLength(0);
+		expect(JSON.parse(text).error.code).toBe(
+			"server_tool_advisor_declaration_unavailable",
+		);
 	});
 
 	it("serves a first-party account with the replay runtime disabled", async () => {
@@ -659,39 +693,29 @@ describe("native web_search passthrough dispatch", () => {
 		});
 	});
 
+	it("keeps replay_unavailable with zero sends when the bind fails and a first-party account is present but the request is not native-eligible", async () => {
+		// Proxy-opaque history passes the invalid and unsupported checks, so it
+		// reaches the bind-failure gate, where only the eligibility arm refuses it.
+		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+		const { ctx } = makeContext([makeAccount()], { status: "disabled" });
+		const calls = installFetch(() => jsonOk());
+		const { request } = makeHelperRequest({ messages: PROXY_OPAQUE_HISTORY });
+
+		const { response, text } = await run(ctx, request);
+
+		expect(calls).toHaveLength(0);
+		expect(response.status).toBe(503);
+		expect(JSON.parse(text).error).toMatchObject({
+			code: "server_tool_replay_unavailable",
+			reason: "replay_unavailable",
+		});
+	});
+
 	it("refuses proxy-opaque history with zero sends", async () => {
 		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 		const { ctx } = makeContext([makeAccount()]);
 		const calls = installFetch(() => jsonOk());
-		const { request } = makeHelperRequest({
-			messages: [
-				{ role: "user", content: "search" },
-				{
-					role: "assistant",
-					content: [
-						{
-							type: "server_tool_use",
-							id: "srvtoolu_x",
-							name: "web_search",
-							input: { query: "q" },
-						},
-						{
-							type: "web_search_tool_result",
-							tool_use_id: "srvtoolu_x",
-							content: [
-								{
-									type: "web_search_result",
-									title: "t",
-									url: "https://example.com",
-									encrypted_content: "bccf1.A256GCM.proxy-envelope",
-								},
-							],
-						},
-					],
-				},
-				{ role: "user", content: "continue" },
-			],
-		});
+		const { request } = makeHelperRequest({ messages: PROXY_OPAQUE_HISTORY });
 
 		const { response, text } = await run(ctx, request);
 

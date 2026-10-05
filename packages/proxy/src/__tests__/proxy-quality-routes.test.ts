@@ -3713,6 +3713,65 @@ describe("prewarmed native catalogs", () => {
 				expect(sends[0]?.model).toBe("claude-opus-5-5");
 				expect(envelopes[0]?.tools).toEqual([searchTool]);
 			});
+			const replayUnavailable = async (response: Response) => {
+				expect(response.status).toBe(503);
+				const { error } = (await response.json()) as {
+					error: { code: string; reason: string };
+				};
+				expect(error.code).toBe("quality_route_unavailable");
+				expect(error.reason).toBe("tool-replay-unavailable");
+			};
+			it("refuses with tool-replay-unavailable when the bind fails on a request the native lane cannot serve", async () => {
+				// A result sealed in this proxy's replay envelope needs the hosted lane.
+				const proxyOpaqueHistory = [
+					{ role: "user", content: "search" },
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "server_tool_use",
+								id: "srvtoolu_x",
+								name: "web_search",
+								input: { query: "q" },
+							},
+							{
+								type: "web_search_tool_result",
+								tool_use_id: "srvtoolu_x",
+								content: [
+									{
+										type: "web_search_result",
+										title: "t",
+										url: "https://example.com",
+										encrypted_content: "bccf1.A256GCM.proxy-envelope",
+									},
+								],
+							},
+						],
+					},
+					{ role: "user", content: "continue" },
+				];
+				const response = await send(
+					request(
+						undefined,
+						{},
+						{ tools: [searchTool], messages: proxyOpaqueHistory },
+					),
+				);
+				await replayUnavailable(response);
+				expect(bindResults).toEqual([false]);
+				expect(sends).toHaveLength(0);
+			});
+			it("refuses with tool-replay-unavailable when the bind fails and no first-party account is in inventory", async () => {
+				const all = ctx.dbOps.getAllAccounts;
+				ctx.dbOps.getAllAccounts = async () =>
+					(await all()).filter((a) => !core.isFirstPartyAnthropicAccount(a));
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				await replayUnavailable(response);
+				expect(bindResults).toEqual([false]);
+				expect(sends).toHaveLength(0);
+			});
 		});
 		it("uses the history-only text when advisor appears only in history", async () => {
 			enrollCodex("gpt-astra", "astra");
