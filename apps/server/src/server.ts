@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import {
 	Config,
 	filterEnabledProviderModelDefaultOverrides,
+	findUnknownAccountWindowCapIds,
 	loadServerToolReplayKeys,
 	type RuntimeConfig,
 	readGuardCorrelationSecret,
@@ -117,6 +118,7 @@ import {
 	unregisterPollingRestarter,
 	unregisterRefreshClearer,
 } from "@better-ccflare/proxy";
+import { getWindowCapStates } from "@better-ccflare/proxy/usage-throttling";
 import { validatePathOrThrow } from "@better-ccflare/security";
 import {
 	type Account,
@@ -139,6 +141,10 @@ import {
 	UsagePollingLifecycle,
 	unregisterServerLifecycleCallbacks,
 } from "./usage-polling-lifecycle";
+import {
+	unknownWindowCapWarnings,
+	WindowCapTransitionTracker,
+} from "./window-cap-transitions";
 
 /**
  * Build a load-balancing strategy from its enum name. Add new strategies here
@@ -996,6 +1002,11 @@ export async function refreshPollingAccessToken(
 	return accessToken;
 }
 
+// Poll-time account_window_caps transition memory (R7, KTD7). Module-level:
+// the poll callbacks are per-account closures and the memory is keyed by
+// account+window.
+const windowCapTransitions = new WindowCapTransitionTracker();
+
 /**
  * Start recurring usage polling for `account`, refreshing its access token
  * (via refreshPollingAccessToken, above) each cycle. Retries with backoff up
@@ -1158,6 +1169,39 @@ export function startUsagePollingWithRefresh(
 						} catch (err) {
 							logger.warn(
 								`Failed to evaluate usage-window alerts for account ${accountId}: ${err}`,
+							);
+						}
+						if (!(await isCurrent())) return;
+
+						// account_window_caps transition log (R7). Best-effort: never
+						// fatal to polling. Only accounts present in the cap map.
+						try {
+							const caps = container
+								.resolve<Config>(SERVICE_KEYS.Config)
+								.getAccountWindowCaps()[accountId];
+							if (caps) {
+								const states = getWindowCapStates(
+									{ data: payload.data, observedAt: now },
+									caps,
+									{ now },
+								);
+								const accountName =
+									(await proxyContext.dbOps.getAccount(accountId))?.name ??
+									account.name;
+								if (!(await isCurrent())) return;
+								for (const event of windowCapTransitions.observe(
+									accountId,
+									accountName,
+									states,
+								)) {
+									if (event.level === "warn")
+										logger.warn(event.message, event.fields);
+									else logger.info(event.message, event.fields);
+								}
+							}
+						} catch (err) {
+							logger.warn(
+								`Failed to evaluate account window caps for account ${accountId}: ${err}`,
 							);
 						}
 						if (!(await isCurrent())) return;
@@ -2624,6 +2668,17 @@ Available endpoints:
 	log.info(
 		`Loaded ${accounts.length} accounts (${activeAccounts.length} active)`,
 	);
+	try {
+		for (const message of unknownWindowCapWarnings(
+			findUnknownAccountWindowCapIds(
+				config.getAccountWindowCaps(),
+				accounts.map((a) => a.id),
+			),
+		))
+			log.warn(message);
+	} catch (err) {
+		log.warn(`Failed to validate account_window_caps account ids: ${err}`);
+	}
 	if (activeAccounts.length === 0) {
 		log.warn(
 			"No active accounts available - requests will be forwarded without authentication",
