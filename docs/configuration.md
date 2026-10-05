@@ -13,6 +13,7 @@ This guide covers all configuration options for better-ccflare, including file-b
 - [Claude Code Model Route Profiles](#claude-code-model-route-profiles)
 - [Anthropic Degraded Mode](#anthropic-degraded-mode)
 - [Implicit Fallback Drain Policy](#implicit-fallback-drain-policy)
+- [Account Usage-Window Caps](#account-usage-window-caps)
 - [Guard Request-Body and Admission Limits](#guard-request-body-and-admission-limits)
 - [Model Catalog](#model-catalog)
 - [Editable Provider Model Defaults](#editable-provider-model-defaults)
@@ -83,6 +84,7 @@ The configuration file is stored at:
 | `session_duration_ms` | number | `18000000` (5 hours) | Session persistence duration in milliseconds |
 | `port` | number | `8080` | HTTP server port |
 | `model_scoped_capacity_routing` | `"off"` \| `"exhausted"` | `"off"` | Per-model-family capacity exclusion mode. `"off"` leaves account selection unchanged; `"exhausted"` enables fail-open exclusion for exhausted model-family capacity. `MODEL_SCOPED_CAPACITY_ROUTING` takes precedence when it contains a valid value. |
+| `account_window_caps` | object `{ "<accountId>": { "<windowKey>": 1-99 } }` or JSON string | `{}` | Per-account usage-window caps. At or above the percent, the proxy stops selecting that account for the window's scope: `seven_day_<family>` (for example `seven_day_fable`) excludes one model family, `five_hour` and `seven_day` exclude the account. Independent of `model_scoped_capacity_routing`. `CCFLARE_ACCOUNT_WINDOW_CAPS_JSON` takes precedence. An invalid value refuses startup. See [Account Usage-Window Caps](#account-usage-window-caps). |
 
 ### Load Balancing Strategy
 
@@ -155,6 +157,7 @@ These environment variables are not stored in the configuration file and must be
 | — (no env var) | Whether saved combos take part in routing at all. Config-file-only (`combos_enabled`), default off; the Combos tab remains visible and this switch controls routing only. Manage via Settings → Advanced → Combos or `GET`/`POST /api/config/combos-enabled` | `false` | n/a — config file or API only |
 | — (no env var) | Whether the model requested by a client must be the model sent upstream (`force_account_model`), skipping combos, agent model preferences, and provider default-model mapping | `false` | n/a — config file or API only |
 | `MODEL_SCOPED_CAPACITY_ROUTING` | `off` suppresses family/model snapshots and reactive blockers for ordinary, capability, combo, and fallback lanes; account-wide availability blockers remain, and exact forced routes still fail closed. `exhausted` skips an account for a request when its weekly per-model-family cap (`limits[] kind=weekly_scoped`, e.g. a Fable/Opus/Sonnet-specific quota) is at/above 100% with a future reset AND overage cannot serve the account (`spend`/`extra_usage` signal unavailable; unknown or available fails open). Observed `out_of_credits` 429s additionally sideline the (account, family) pair for 5 minutes to bridge telemetry lag. When the model-scoped filter removes every account from an otherwise non-empty candidate pool, the fork returns retryable HTTP `503` JSON: `type: error`, `error.type: service_unavailable`, `error.code: model_pool_exhausted`. When a finite model recovery is known, the response may also include capped `Retry-After`, `x-better-ccflare-pool-status: exhausted`, and `x-better-ccflare-recovery-scope: model`; `Retry-After` is not guaranteed. Telemetry can lag up to the poll interval; with polling degraded, expect one probe 429 per family every ~5 minutes. Same as the `model_scoped_capacity_routing` config-file field; a valid environment value takes precedence and locks the dashboard setting read-only. | `off` | `MODEL_SCOPED_CAPACITY_ROUTING=exhausted` |
+| `CCFLARE_ACCOUNT_WINDOW_CAPS_JSON` | Strict JSON for `account_window_caps`; overrides the config-file value when set, and an empty string means no caps. Malformed JSON, an unknown window key, or a percent outside 1-99 refuses startup | unset | `CCFLARE_ACCOUNT_WINDOW_CAPS_JSON='{"<accountId>":{"seven_day_fable":80}}'` |
 | `CCFLARE_IMPLICIT_FALLBACK_MODE` | Restart-scoped policy for implicit normal/combo fallback. `observe` reports what enforcement would exclude; `enforce` removes denied route classes. Explicit forced and capability-profile routes are outside this policy | `off` | `CCFLARE_IMPLICIT_FALLBACK_MODE=observe` |
 | `CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES` | Comma-separated route classes that are explicit exceptions to the active denial set: `oauth-subscription`, `api-key`, `local`, or `cloud-credential` | empty | `CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES=oauth-subscription,local` |
 | `CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES` | Comma-separated route classes to deny for implicit fallback. In `observe`/`enforce`, `api-key` and `cloud-credential` are denied by default unless allowed explicitly | empty (plus active defaults) | `CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES=api-key,cloud-credential` |
@@ -687,6 +690,28 @@ After an activation restart, inspect the service journal for the rate-limited te
 The front guard exposes its effective body limits and bounded counters at `GET /_guard/health`; monitor root and `runtime.limits` `maxRequestBodyBytes` and `maxBufferedRequestBodyBytes`, plus root `maxBodyReaders`, `requestDrainTimeoutMs`, `active`, `queued`, `bodyReaders`, `draining`, and `counters.oversizedRequestBodies`/`counters.requestDrainTimeouts`. Root `bodyReaders.reservationLimitBytes`, `reservedBytes`, and `reservedBytesPeak` show the aggregate budget, current reservation, and high-water mark. Useful journal terms are `guard_request_body_too_large`, `guard_request_drain_timeout`, `guard_queue_full`, `guard_body_reader_queue_full`, `guard_admission_error`, and `guard_draining`. These records contain bounded metadata only; request bodies and credentials are not logged.
 
 To roll back the drain, set `CCFLARE_IMPLICIT_FALLBACK_MODE=off` in the service environment and **restart** the process (run `systemctl daemon-reload` first if a systemd drop-in changed). Restarting clears the process-local policy snapshot and diagnostics; it does not alter account data or current production state outside that restart.
+
+## Account Usage-Window Caps
+
+`account_window_caps` keeps chosen accounts below a percent of a usage window. The main use is the account Claude Code itself is signed in as. Claude Code reads that account's own weekly allowance, not the pool's, and once that allowance is exhausted it asks for consent before billing a Fable request to usage credits. A background session cannot answer, so after `dialogExpiry` it switches the session to another model. Capping the signed-in account keeps its own windows below 100% while the pool keeps using it for everything else.
+
+```json
+{
+  "account_window_caps": {
+    "c8a3bf6a-0a5e-41ca-8796-81f5dd4f41de": { "seven_day_fable": 80, "seven_day": 90 }
+  }
+}
+```
+
+- **Keys.** Account ids are `accounts.id` values. Window keys are `five_hour`, `seven_day`, or `seven_day_<family>` where `<family>` names a model family (for example `fable`, `opus`, `sonnet`). Percents are integers from 1 to 99. Anything else refuses startup with a `ValidationError` naming the account, window and value. An account id that matches no account logs a startup warning and is kept.
+- **Scope.** A `seven_day_<family>` cap stops selecting the account for that family only; a `five_hour` or `seven_day` cap stops selecting it for every model. The example serves Fable until the account's weekly Fable usage reaches 80%, then Opus, Sonnet and Haiku until its all-models weekly window reaches 90%, then nothing until the window resets.
+- **Routes.** The cap applies on ordinary, capability, combo (including `native_quota_wait` combos and their deferred backups), forced, and Auto quality routes, whatever `model_scoped_capacity_routing` says and whether or not the account can bill overage.
+- **Evidence.** The cap reads the latest usage poll, including a window the provider marks inactive. A capped window with no snapshot, a snapshot older than three minutes, or no such window in the payload counts as over cap; accounts without caps are unaffected. A window whose reset time has passed releases at once. After a restart, a capped account is excluded from its capped scope until its first poll lands (about 90 seconds).
+- **Responses.** When caps alone leave no account for a request, the proxy returns HTTP 503 `model_pool_exhausted` (not the native quota-wait 429), with `Retry-After` taken from the snapshot's freshness expiry rather than the window's reset. Auto quality routing records the skip with reason `account-window-cap`.
+- **Logs.** Each usage poll logs `Usage cap engaged` or `Usage cap released` once per transition, and `Usage cap leak` once per window per reset cycle when an engaged window reaches the cap plus 10 points: usage is still climbing after the proxy stopped selecting the account, so something outside the proxy is drawing on it.
+- **Read-only API.** `GET /api/config/account-window-caps` returns the effective map and its source (`env`, `file`, or `default`). There is no write endpoint; edit the config file or the environment and restart.
+
+To roll back, remove the key (or set `CCFLARE_ACCOUNT_WINDOW_CAPS_JSON={}`) and restart.
 
 ## Guard Request-Body and Admission Limits
 
