@@ -790,7 +790,7 @@ async function handleProxyImpl(
 		throw error;
 	} finally {
 		// Committed roots remove their complete pending lineage, making this a
-		// no-op. Every early response or throw withdraws only its own newest intent.
+		// no-op. Every early response or throw withdraws only its own intent.
 		ctx.modelRouteSessionRegistry?.cancelRootIntent(
 			rootIntentInput,
 			rootIntentGeneration,

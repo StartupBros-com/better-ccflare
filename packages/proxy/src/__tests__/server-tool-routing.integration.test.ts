@@ -3016,10 +3016,19 @@ describe("route-profile WebSearch helper falls to the global proven lane", () =>
 		const helperGate = new Promise<void>((resolve) => {
 			releaseHelper = resolve;
 		});
+		// Signals that the helper reached its upstream call, so it has already been
+		// classified; waiting on this keeps the test free of timing assumptions.
+		let helperArrived: () => void = () => {};
+		const helperInFlight = new Promise<void>((resolve) => {
+			helperArrived = resolve;
+		});
 		const gatedFetch = globalThis.fetch;
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const url = input instanceof Request ? input.url : String(input);
-			if (new URL(url).host === "api.anthropic.com") await helperGate;
+			if (new URL(url).host === "api.anthropic.com") {
+				helperArrived();
+				await helperGate;
+			}
 			return gatedFetch(input);
 		}) as unknown as typeof fetch;
 		let releaseRoot: () => void = () => {};
@@ -3055,7 +3064,7 @@ describe("route-profile WebSearch helper falls to the global proven lane", () =>
 		// A non-subagent picker-model helper for P1 is classified and in flight
 		// while the root still selects.
 		const pendingHelper = sendHelper(ctx, { model: PICKER });
-		await new Promise((resolve) => setTimeout(resolve, 20));
+		await helperInFlight;
 		releaseRoot();
 		expect((await pendingRoot).status).toBe(200);
 		releaseHelper();
