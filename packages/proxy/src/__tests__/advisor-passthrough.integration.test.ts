@@ -16,6 +16,8 @@ const { SessionStrategy } = await import("@better-ccflare/load-balancer");
 const accountSelectorModule = await import("../handlers/account-selector");
 const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");
+const { recordAdvisorResultOwner, resetAdvisorResultOwnershipForTests } =
+	await import("../advisor-result-ownership");
 const { createReadyServerToolReplayRuntimeForTest } = await import(
 	"./helpers/server-tool-replay-runtime"
 );
@@ -536,5 +538,218 @@ describe("long conversations without advisor content (R16)", () => {
 		for (const phrase of ADVISOR_PHRASES) {
 			expect(stripped.text).not.toContain(phrase);
 		}
+	});
+});
+
+// Advisor results are encrypted and bound to the Anthropic account that
+// produced them. Replaying them to a different first-party account is a
+// deterministic upstream 400, so the proxy strips foreign results per attempt
+// and, when ownership is unknown, recovers reactively on the same account.
+describe("advisor result ownership across accounts", () => {
+	const KA = "54f97ec3-c398-4c6b-b337-942aec61b3de";
+	const KB = "0a1b2c3d-1111-4222-8333-444455556666";
+	const ADVISOR_ERROR_400 = {
+		type: "error",
+		error: {
+			type: "invalid_request_error",
+			message: "Advisor tool result content could not be processed.",
+		},
+	};
+
+	function blobFor(ownerKey: string): string {
+		const header = Buffer.from([
+			0x12, 0x80, 0x01, 0x0a, 0x2a, 0x08, 0x14, 0x18, 0x02, 0x22, 0x24,
+		]);
+		const bytes = Buffer.concat([
+			header,
+			Buffer.from(ownerKey, "ascii"),
+			Buffer.alloc(120, 0x7e),
+		]);
+		return bytes.toString("base64");
+	}
+
+	function historyMessages(ownerKey: string) {
+		return [
+			{ role: "user", content: "review my plan" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "server_tool_use",
+						id: "srvtoolu_A1",
+						name: "advisor",
+						input: {},
+					},
+					{
+						type: "advisor_tool_result",
+						tool_use_id: "srvtoolu_A1",
+						content: {
+							type: "advisor_redacted_result",
+							encrypted_content: blobFor(ownerKey),
+						},
+					},
+					{ type: "text", text: "ok" },
+				],
+			},
+			{ role: "user", content: "thanks, continue" },
+		];
+	}
+
+	function requestWith(messages: unknown[]): {
+		request: Request;
+		clientBody: Record<string, unknown>;
+	} {
+		const clientBody = {
+			model: MODEL,
+			max_tokens: 32,
+			stream: false,
+			tools: [OTHER_TOOL, ADVISOR_TOOL],
+			messages,
+		};
+		return {
+			clientBody,
+			request: new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"anthropic-version": "2023-06-01",
+					"anthropic-beta": ADVISOR_BETA,
+					authorization: "Bearer advisor-test-client",
+					"x-claude-code-session-id": "advisor-owner-session",
+				},
+				body: JSON.stringify(clientBody),
+			}),
+		};
+	}
+
+	const serialized = (value: unknown) => JSON.stringify(value);
+	const isA = (call: UpstreamCall) =>
+		call.headers.get("authorization") === "Bearer oauth-access-token";
+
+	function twoAccounts() {
+		const a = makeAccount({ id: "anthropic-a", name: "anthropic-a" });
+		const b = makeAccount({
+			id: "anthropic-b",
+			name: "anthropic-b",
+			priority: 1,
+			access_token: "oauth-access-token-b",
+		});
+		return { a, b };
+	}
+
+	beforeEach(() => {
+		resetAdvisorResultOwnershipForTests();
+		recordAdvisorResultOwner("anthropic-a", KA);
+		recordAdvisorResultOwner("anthropic-b", KB);
+	});
+	afterEach(() => {
+		resetAdvisorResultOwnershipForTests();
+	});
+
+	it("strips another account's advisor result when failing over, keeping it for the owner", async () => {
+		const { a, b } = twoAccounts();
+		const { ctx } = makeContext([a, b]);
+		const calls = installFetch((call) => {
+			if (isA(call)) throw new TypeError("fetch failed");
+			return jsonOk();
+		});
+		const { request } = requestWith(historyMessages(KA));
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			ctx,
+			"key-1",
+		);
+		await response.text();
+
+		expect(response.status).toBe(200);
+		const aCall = calls.find(isA);
+		const bCall = calls.find((c) => !isA(c));
+		expect(aCall).toBeDefined();
+		expect(bCall).toBeDefined();
+		expect(serialized(aCall?.body.messages)).toContain("advisor_tool_result");
+		const bText = serialized(bCall?.body.messages);
+		expect(bText).not.toContain("advisor_tool_result");
+		expect(bText).not.toContain("server_tool_use");
+		expect(bText).toContain('"text":"ok"');
+		expect(bText).not.toContain("[Advisor response]");
+	});
+
+	it("leaves the history untouched when the owning account serves the request", async () => {
+		const { a, b } = twoAccounts();
+		const { ctx } = makeContext([a, b]);
+		const calls = installFetch(() => jsonOk());
+		const { request, clientBody } = requestWith(historyMessages(KA));
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			ctx,
+			"key-1",
+		);
+		await response.text();
+
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		expect(isA(calls[0] as UpstreamCall)).toBe(true);
+		expect(calls[0]?.body.messages).toEqual(clientBody.messages as never);
+	});
+
+	it("recovers an unattributed advisor 400 once on the same account with every advisor result removed", async () => {
+		resetAdvisorResultOwnershipForTests();
+		const { a } = twoAccounts();
+		const { ctx } = makeContext([a]);
+		const calls = installFetch((_call, index) =>
+			index === 0
+				? new Response(JSON.stringify(ADVISOR_ERROR_400), {
+						status: 400,
+						headers: { "content-type": "application/json" },
+					})
+				: jsonOk(),
+		);
+		const { request } = requestWith(historyMessages(KB));
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			ctx,
+			"key-1",
+		);
+		await response.text();
+
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(2);
+		for (const call of calls) expect(isA(call)).toBe(true);
+		expect(serialized(calls[0]?.body.messages)).toContain(
+			"advisor_tool_result",
+		);
+		const retryText = serialized(calls[1]?.body.messages);
+		expect(retryText).not.toContain("advisor_tool_result");
+		expect(retryText).not.toContain("server_tool_use");
+	});
+
+	it("forwards a request with no advisor history unchanged in one call", async () => {
+		const { a, b } = twoAccounts();
+		const { ctx } = makeContext([a, b]);
+		const calls = installFetch(() => jsonOk());
+		const messages = [
+			{ role: "user", content: "hello" },
+			{ role: "assistant", content: [{ type: "text", text: "hi" }] },
+			{ role: "user", content: "again" },
+		];
+		const { request } = requestWith(messages);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			ctx,
+			"key-1",
+		);
+		await response.text();
+
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.body.messages).toEqual(messages as never);
 	});
 });

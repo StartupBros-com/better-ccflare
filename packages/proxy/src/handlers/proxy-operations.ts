@@ -74,6 +74,12 @@ import {
 	RECOVERY_STATUS_HEADER,
 } from "@better-ccflare/types/routing-recovery";
 import { assertManagedWorkAvailable } from "../../../../scripts/ccflare-managed-timing.mjs";
+import {
+	isAdvisorResultUnprocessableMessage,
+	mayContainAdvisorResult,
+	stripAllAdvisorResults,
+	stripForeignAdvisorResults,
+} from "../advisor-result-ownership";
 import { isNativeAnthropicOAuthDegradedModeEligible } from "../anthropic-degraded-eligibility";
 import {
 	type AnthropicDegradedAdmissionDecision,
@@ -1697,6 +1703,25 @@ async function readResponseCloneJson(
 	}
 }
 
+async function isAdvisorResultUnprocessableError(
+	response: Response,
+	readJson: ResponseJsonReader = readResponseCloneJson,
+): Promise<boolean> {
+	if (response.status !== 400) return false;
+	const contentType = response.headers.get("content-type");
+	if (!contentType?.includes("application/json")) return false;
+
+	// Cloned only after the content-type gate above (same discipline as
+	// isInvalidThinkingSignatureError; see issue #356).
+	const json = (await readJson(response)) as {
+		error?: { message?: unknown };
+	} | null;
+	const message = json?.error?.message;
+	return (
+		typeof message === "string" && isAdvisorResultUnprocessableMessage(message)
+	);
+}
+
 async function isInvalidThinkingSignatureError(
 	response: Response,
 	readJson: ResponseJsonReader = readResponseCloneJson,
@@ -3186,6 +3211,30 @@ export async function proxyWithAccount(
 					effectiveBodyContext = new RequestBodyContext(strippedBuffer);
 					effectiveBodyBuffer = strippedBuffer;
 				}
+			}
+		}
+
+		// Advisor results are encrypted and bound to the Anthropic account that
+		// produced them. Replaying another account's results (failover, session
+		// move) is a deterministic upstream 400, so drop foreign ones per attempt.
+		if (
+			isFirstPartyAnthropicAccount(account) &&
+			effectiveBodyBuffer &&
+			mayContainAdvisorResult(effectiveBodyBuffer)
+		) {
+			const parsedBody = effectiveBodyContext.getParsedJson();
+			const stripped = parsedBody
+				? stripForeignAdvisorResults(parsedBody, account.id)
+				: null;
+			if (stripped) {
+				log.info(
+					`Stripped ${stripped.strippedResults} foreign advisor result(s) (${stripped.thinkingStrippedMessages} message(s) had thinking removed) for account ${account.name}`,
+				);
+				effectiveBodyContext = RequestBodyContext.fromParsed(
+					effectiveBodyBuffer,
+					stripped.body,
+				);
+				effectiveBodyBuffer = effectiveBodyContext.getBuffer();
 			}
 		}
 
@@ -5198,6 +5247,75 @@ export async function proxyWithAccount(
 					},
 				);
 				await discardUpstreamBody(exhaustedRawResponse);
+			}
+		}
+
+		// Reactive backstop for advisor results the proactive strip could not
+		// attribute (unknown owner): upstream rejects them with a 400. Drop every
+		// advisor result and replay once on the same account.
+		if (
+			!hostedDispatchCommitted() &&
+			isFirstPartyAnthropicAccount(account) &&
+			(await isAdvisorResultUnprocessableError(
+				rawResponse,
+				readAttemptBoundJson,
+			))
+		) {
+			const replayParsed = currentReplayBody
+				? new RequestBodyContext(currentReplayBody).getParsedJson()
+				: null;
+			const advisorStripped = replayParsed
+				? stripAllAdvisorResults(replayParsed)
+				: null;
+			const strippedBodyBuffer =
+				advisorStripped && currentReplayBody
+					? RequestBodyContext.fromParsed(
+							currentReplayBody,
+							advisorStripped.body,
+						).getBuffer()
+					: null;
+
+			if (strippedBodyBuffer && strippedBodyBuffer !== currentReplayBody) {
+				log.info(
+					`Upstream rejected advisor tool results for account ${account.name}, retrying with ${advisorStripped?.strippedResults ?? 0} advisor result(s) removed`,
+				);
+				const retryRequestInit: RequestInit & { duplex?: "half" } = {
+					method: req.method,
+					headers,
+					body: new Uint8Array(strippedBodyBuffer),
+					duplex: "half",
+					signal: req.signal,
+				};
+
+				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
+				stampCodexAttempt(headers, "other_retry");
+				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
+				retrySourceRequest = retryProviderRequest.clone();
+
+				let retryTransformedRequest = await transformWithCurrentAttemptPlan(
+					attemptPlan,
+					retryProviderRequest,
+				);
+				retryTransformedRequest = await enforcePhysicalModelAfterTransform(
+					retryTransformedRequest,
+					currentTransportModel,
+				);
+				retryTransformedTemplate = retryTransformedRequest.clone();
+
+				const retryTransportRequest = retryTransformedTemplate.clone();
+				currentReplayBody = strippedBodyBuffer;
+				currentCacheIdentityHasCacheControl = undefined;
+				rawResponse = await executeCacheAwareProviderAttempt(
+					retryTransportRequest,
+					currentReplayBody,
+					currentCacheIdentityHasCacheControl,
+					currentTransportModel,
+				);
+			} else {
+				log.warn(
+					"No advisor results to strip or filtering failed, proceeding with original error response",
+				);
 			}
 		}
 

@@ -29,6 +29,11 @@ import {
 	toStreamTerminalState,
 } from "@better-ccflare/types/request";
 import { formatCost } from "@better-ccflare/ui-common";
+import {
+	advisorResultOwnerKeyFromBlock,
+	getAdvisorResultOwnerKey,
+	recordAdvisorResultOwner,
+} from "./advisor-result-ownership";
 import { cacheBodyStore } from "./cache-body-store";
 import {
 	extractProjectAttributionFromParts,
@@ -491,6 +496,37 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 		unresolvedBillableIterationCount;
 }
 
+/**
+ * Learn the account -> advisor owner-key mapping from an advisor_tool_result
+ * block in an upstream response. Only first-party Anthropic accounts mint
+ * these blobs. Never throws: this runs inside the response parser.
+ */
+function observeAdvisorResultBlock(block: unknown, state: RequestState): void {
+	try {
+		if (
+			!block ||
+			typeof block !== "object" ||
+			(block as Record<string, unknown>).type !== "advisor_tool_result"
+		) {
+			return;
+		}
+		const accountId = state.startMessage.accountId;
+		if (
+			!accountId ||
+			accountId === NO_ACCOUNT_ID ||
+			state.startMessage.providerName !== "anthropic"
+		) {
+			return;
+		}
+		const key = advisorResultOwnerKeyFromBlock(block);
+		if (key && getAdvisorResultOwnerKey(accountId) !== key) {
+			recordAdvisorResultOwner(accountId, key);
+		}
+	} catch {
+		// Best-effort learning only.
+	}
+}
+
 // Extract usage data from non-stream JSON response bodies
 function extractUsageFromJson(
 	json: {
@@ -518,6 +554,7 @@ function extractUsageFromJson(
 				continue;
 			}
 			const contentBlock = rawContentBlock as Record<string, unknown>;
+			observeAdvisorResultBlock(contentBlock, state);
 			if (contentBlock.type !== "fallback") continue;
 
 			state.fallbackBlockSeen = true;
@@ -638,6 +675,10 @@ function extractUsageFromData(
 
 		const isFallbackContentBlock =
 			isContentBlockStart && parsed.content_block?.type === "fallback";
+
+		if (isContentBlockStart) {
+			observeAdvisorResultBlock(parsed.content_block, state);
+		}
 
 		// Track streaming start time on first content block. A fallback seam
 		// is itself a content_block_start/stop pair with no deltas (per
