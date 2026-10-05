@@ -460,6 +460,58 @@ describe("native web_search passthrough dispatch", () => {
 		}
 	});
 
+	it("demotes every attempt of one request but logs the demotion warn once across a failover", async () => {
+		const { Logger } = await import("@better-ccflare/logger");
+		const warn = spyOn(Logger.prototype, "warn").mockImplementation(
+			() => undefined,
+		);
+		try {
+			const first = freshAccount({ priority: 0 });
+			const second = freshAccount({
+				priority: 1,
+				access_token: "oauth-access-token-second",
+			});
+			const { ctx } = makeContext([first, second]);
+			const calls = installFetch((call) =>
+				call.headers.get("authorization") === "Bearer oauth-access-token"
+					? new Response(
+							JSON.stringify({
+								type: "error",
+								error: { type: "rate_limit_error", message: "rate limited" },
+							}),
+							{
+								status: 429,
+								headers: {
+									"content-type": "application/json",
+									"retry-after": "60",
+								},
+							},
+						)
+					: jsonOk("claude-opus-5-5"),
+			);
+			const { request, clientBody } = makeHelperRequest({
+				model: "claude-opus-5-5",
+			});
+
+			const { response } = await run(ctx, request);
+
+			expect(response.status).toBe(200);
+			expect(calls).toHaveLength(2);
+			for (const call of calls) {
+				expect(call.body).toEqual({
+					...clientBody,
+					tool_choice: { type: "auto" },
+				});
+			}
+			const demotions = warn.mock.calls.filter((call) =>
+				String(call[0]).includes("Demoted forced web_search tool_choice"),
+			);
+			expect(demotions).toHaveLength(1);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	// Hygiene pin, not a red-first fix: it passes with the delete in
 	// demoteForcedWebSearchChoice removed, because transformRequestBodyModel's
 	// rebuild (model-mapping.ts readBodyForTransform) already drops the inbound

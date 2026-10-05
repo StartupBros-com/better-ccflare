@@ -330,6 +330,10 @@ function installCapabilityProvider(input: {
 				replayDecoderRevision: "decoder-v1",
 				requestTransport: "test-request-v1",
 				responseTransport: "test-response-v1",
+				// A configured custom endpoint must be echoed back by the tuple.
+				...(context.account.customEndpointConfigured
+					? { normalizedEndpoint: context.account.customEndpoint }
+					: {}),
 			};
 			return tuple;
 		},
@@ -371,6 +375,23 @@ function serverToolMeta(overrides: Partial<RequestMeta> = {}): RequestMeta {
 // "anthropic" provider decision use the console alias: it resolves to the same
 // provider but is not a first-party account.
 const HOSTED_FIXTURE_PROVIDER = "claude-console-api";
+// Auto-resume of a reset-qualified paused account is keyed on provider ===
+// "anthropic", so the resume tests stay on that provider and become hosted via
+// a non-first-party endpoint instead of the console alias.
+const HOSTED_FIXTURE_ENDPOINT = "https://hosted-fixture.example";
+
+// Proves a catalog entry came from the mocked hosted decision, not the native
+// first-party lane (which carries a lane tag and the native sentinel proofKey).
+function expectHostedProof(meta: RequestMeta, accountId: string): void {
+	const entry = meta.routingCandidateCatalog?.find(
+		(candidate) => candidate.accountId === accountId,
+	);
+	expect(entry?.serverToolCapability?.decision).toBe("proven");
+	expect(entry?.serverToolCapability?.lane).toBeUndefined();
+	expect(entry?.serverToolCapability?.proofKey).not.toBe(
+		"native-passthrough:web_search_20250305",
+	);
+}
 
 const cachedUsageAccountIds = new Set<string>();
 
@@ -5418,6 +5439,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 		try {
 			const account = makeAccount({
 				id: "normal-overage-resume",
+				custom_endpoint: HOSTED_FIXTURE_ENDPOINT,
 				paused: true,
 				pause_reason: "overage",
 				auto_fallback_enabled: true,
@@ -5459,6 +5481,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 				temporarilyUnavailableProvenCandidateCount: 0,
 				eligibleCandidateCount: 1,
 			});
+			expectHostedProof(meta, account.id);
 		} finally {
 			if (previous) registerProvider(previous);
 		}
@@ -5472,6 +5495,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 		try {
 			const account = makeAccount({
 				id: "capacity-manual-no-resume",
+				provider: HOSTED_FIXTURE_PROVIDER,
 				paused: true,
 				pause_reason: "manual",
 				auto_fallback_enabled: true,
@@ -5505,6 +5529,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 				temporarilyUnavailableProvenCandidateCount: 1,
 				eligibleCandidateCount: 0,
 			});
+			expectHostedProof(meta, account.id);
 		} finally {
 			if (previous) registerProvider(previous);
 		}
@@ -5518,6 +5543,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 		try {
 			const account = makeAccount({
 				id: "capacity-overage-resume",
+				custom_endpoint: HOSTED_FIXTURE_ENDPOINT,
 				paused: true,
 				pause_reason: "overage",
 				auto_fallback_enabled: true,
@@ -5563,6 +5589,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 				temporarilyUnavailableProvenCandidateCount: 1,
 				eligibleCandidateCount: 1,
 			});
+			expectHostedProof(meta, account.id);
 		} finally {
 			if (previous) registerProvider(previous);
 		}
@@ -5576,6 +5603,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 		try {
 			const account = makeAccount({
 				id: "combo-rate-window-resume",
+				custom_endpoint: HOSTED_FIXTURE_ENDPOINT,
 				paused: true,
 				pause_reason: "rate_limit_window",
 				auto_fallback_enabled: true,
@@ -5646,6 +5674,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 				provenCandidateCount: 2,
 				eligibleCandidateCount: 2,
 			});
+			expectHostedProof(meta, account.id);
 		} finally {
 			if (previous) registerProvider(previous);
 		}
@@ -5660,6 +5689,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			try {
 				const account = makeAccount({
 					id: `non-resumable-${pauseReason}`,
+					provider: HOSTED_FIXTURE_PROVIDER,
 					paused: true,
 					pause_reason: pauseReason,
 					auto_fallback_enabled: true,
@@ -5685,6 +5715,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 					temporarilyUnavailableProvenCandidateCount: 1,
 					eligibleCandidateCount: 0,
 				});
+				expectHostedProof(meta, account.id);
 			} finally {
 				if (previous) registerProvider(previous);
 			}

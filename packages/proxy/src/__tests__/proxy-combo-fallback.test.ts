@@ -2214,6 +2214,68 @@ describe("native quota wait execution", () => {
 	});
 
 	it.each([
+		{
+			label: "demotes when the physical model rejects forced choice",
+			clientModel: "claude-opus-5",
+			physicalModel: "claude-opus-5-5",
+			expected: { type: "auto" },
+		},
+		{
+			label: "forwards the forced choice when only the client model rejects it",
+			clientModel: "claude-opus-5-5",
+			physicalModel: "claude-opus-5",
+			expected: { type: "tool", name: "web_search" },
+		},
+	])("web_search forced choice is keyed on the physical model: $label", async ({
+		clientModel,
+		physicalModel,
+		expected,
+	}) => {
+		const realAnthropic = getProvider("anthropic");
+		const { accounts, combo, ctx, restore } = nativePool();
+		if (realAnthropic) registerProvider(realAnthropic);
+		// One slot: the client model differs from the physical model the combo
+		// sends upstream.
+		combo.slots = [
+			{
+				id: "physical-slot",
+				combo_id: combo.id,
+				account_id: accounts[0]?.id ?? "native-a",
+				model: physicalModel,
+				priority: 0,
+				enabled: true,
+			},
+		];
+		const bodies: Array<Record<string, unknown>> = [];
+		globalThis.fetch = mock(async (input: Request) => {
+			bodies.push((await input.clone().json()) as Record<string, unknown>);
+			return new Response('{"type":"message","content":[]}', {
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: clientModel,
+					messages: [{ role: "user", content: "physical model fixture" }],
+					max_tokens: 16,
+					tools: [{ type: "web_search_20250305", name: "web_search" }],
+					tool_choice: { type: "tool", name: "web_search" },
+				}),
+			});
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			expect(response.status).toBe(200);
+			expect(bodies).toHaveLength(1);
+			expect(bodies[0]?.model).toBe(physicalModel);
+			expect(bodies[0]?.tool_choice).toEqual(expected);
+		} finally {
+			restore();
+		}
+	});
+
+	it.each([
 		"public-force",
 		"profile",
 		"excluded-profile",

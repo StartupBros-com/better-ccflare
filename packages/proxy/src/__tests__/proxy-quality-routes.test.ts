@@ -43,6 +43,7 @@ import {
 	surfaceQualityReason,
 } from "../quality-route-candidates";
 import { QualityRouteService } from "../quality-route-service";
+import * as replayRuntime from "../server-tool-replay-runtime";
 import { ServerToolCandidateCapabilityError } from "../server-tool-routing-errors";
 import * as collectors from "../usage-collector";
 
@@ -51,6 +52,10 @@ const scope: QualityVerifiedSession = {
 	principalId: "test-principal",
 	sessionId: "test-session",
 };
+const { createReadyServerToolReplayRuntimeForTest } = await import(
+	"./helpers/server-tool-replay-runtime"
+);
+const readyReplayRuntime = await createReadyServerToolReplayRuntimeForTest();
 const originalFetch = globalThis.fetch;
 let db: Database;
 let service: QualityRouteService;
@@ -2734,6 +2739,53 @@ describe("prewarmed native catalogs", () => {
 			} finally {
 				spy.mockRestore();
 			}
+		});
+		describe("with a ready server-tool replay runtime (bind succeeds)", () => {
+			let bindResults: boolean[];
+			beforeEach(() => {
+				ctx.serverToolReplay = readyReplayRuntime;
+				bindResults = [];
+				const bind = replayRuntime.bindRequestPrivateServerToolReplay;
+				const spy = spyOn(
+					replayRuntime,
+					"bindRequestPrivateServerToolReplay",
+				).mockImplementation(async (...args) => {
+					const bound = await bind(...args);
+					bindResults.push(bound);
+					return bound;
+				});
+				restores.push(() => spy.mockRestore());
+			});
+			it("serves a native web_search request with one send and the tool intact", async () => {
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				expect(response.status).toBe(200);
+				await response.text();
+				// The production bind path ran and succeeded, not the unbound fallback.
+				expect(bindResults).toEqual([true]);
+				expect(sends).toHaveLength(1);
+				expect(envelopes[0]?.tools).toEqual([searchTool]);
+			});
+			it("demotes the forced web_search choice for claude-opus-5-5 under a successful bind", async () => {
+				const response = await send(
+					request(
+						"claude-opus-5-5",
+						{},
+						{
+							tools: [searchTool],
+							tool_choice: { type: "tool", name: "web_search" },
+						},
+					),
+				);
+				expect(response.status).toBe(200);
+				await response.text();
+				expect(bindResults).toEqual([true]);
+				expect(sends).toHaveLength(1);
+				expect(sends[0]?.model).toBe("claude-opus-5-5");
+				expect(envelopes[0]?.tools).toEqual([searchTool]);
+				expect(envelopes[0]?.tool_choice).toEqual({ type: "auto" });
+			});
 		});
 	});
 	it("quota exhaustion during preparation blocks the physical send even with manual throttles disabled", async () => {
