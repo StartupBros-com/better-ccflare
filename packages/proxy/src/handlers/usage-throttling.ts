@@ -2,17 +2,20 @@ import {
 	collectAutoCapacityEvidence,
 	computeWindowStartMs,
 	getModelFamily,
+	normalizeProviderUsageWindows,
 	weeklyScopedWindowKey,
 } from "@better-ccflare/core";
 import {
 	type AnyUsageData,
 	type CodexSubscriptionFacts,
 	getCodexSubscriptionFacts,
+	type UsageSnapshot,
 	usageCache,
 } from "@better-ccflare/providers";
 import type {
 	Account,
 	AccountBindingConstraint,
+	CanonicalUsageWindow,
 	QualityAdmissionDecision,
 	QualityApprovedLine,
 	QualityProvider,
@@ -818,6 +821,208 @@ export function evaluateHardCapacity(
 				? null
 				: Math.max(...exclusions.map((entry) => entry.evidenceExpiresAt)),
 	};
+}
+
+/** Default usage poll interval; a stale capped window is rechecked then. */
+const DEFAULT_WINDOW_CAP_STALE_RECHECK_MS = 90_000;
+
+export type WindowCapReason =
+	| "over_cap"
+	| "below_cap"
+	| "stale"
+	| "reset_passed";
+
+export interface WindowCapExclusion {
+	readonly scope: "account" | "family";
+	readonly window: string;
+	readonly modelFamily: string | null;
+	/** Null when the snapshot is missing, stale, or lacks the capped window. */
+	readonly utilization: number | null;
+	readonly cap: number;
+	readonly reason: "over_cap" | "stale";
+	readonly resetAtMs: number | null;
+	readonly evidenceExpiresAt: number;
+}
+
+export interface WindowCapState {
+	readonly windowKey: string;
+	readonly cap: number;
+	readonly utilization: number | null;
+	readonly resetsAtMs: number | null;
+	readonly engaged: boolean;
+	readonly reason: WindowCapReason;
+	/** When the evidence behind an engaged cap lapses; null when not engaged. */
+	readonly evidenceExpiresAt: number | null;
+}
+
+type WindowCapMap = Readonly<Record<string, number>> | null | undefined;
+
+interface WindowCapTarget {
+	readonly windowKey: string;
+	readonly cap: number;
+	readonly scope: "account" | "family";
+	readonly modelFamily: string | null;
+}
+
+/** Account-wide keys and seven_day_<family> keys; anything else never caps. */
+function windowCapTargets(caps: WindowCapMap): WindowCapTarget[] {
+	const targets: WindowCapTarget[] = [];
+	for (const [windowKey, cap] of Object.entries(caps ?? {})) {
+		if (typeof cap !== "number" || !Number.isFinite(cap)) continue;
+		if (windowKey === "five_hour" || windowKey === "seven_day") {
+			targets.push({ windowKey, cap, scope: "account", modelFamily: null });
+		} else if (windowKey.startsWith("seven_day_")) {
+			const modelFamily = getModelFamily(windowKey.slice("seven_day_".length));
+			if (modelFamily) {
+				targets.push({ windowKey, cap, scope: "family", modelFamily });
+			}
+		}
+	}
+	return targets;
+}
+
+/**
+ * One capped window's state. Reads utilization whether or not the window is
+ * `active` (the live Fable row is an inactive limits[] row below 100%), and
+ * never reads spend or extra usage.
+ */
+function resolveWindowCap(
+	target: WindowCapTarget,
+	snapshot: UsageSnapshot | null,
+	windows: ReadonlyMap<string, CanonicalUsageWindow>,
+	now: number,
+	snapshotFreshnessMs: number,
+	staleRecheckMs: number,
+): WindowCapState {
+	const window = windows.get(target.windowKey);
+	const base = { windowKey: target.windowKey, cap: target.cap };
+	if (window && window.resetsAtMs !== null && window.resetsAtMs <= now) {
+		return {
+			...base,
+			utilization: window.utilization,
+			resetsAtMs: window.resetsAtMs,
+			engaged: false,
+			reason: "reset_passed",
+			evidenceExpiresAt: null,
+		};
+	}
+	const freshness = snapshot
+		? evaluateSnapshotFreshness(snapshot.observedAt, now, snapshotFreshnessMs)
+		: null;
+	if (!snapshot || !freshness?.fresh || !window) {
+		return {
+			...base,
+			utilization: null,
+			resetsAtMs: window?.resetsAtMs ?? null,
+			engaged: true,
+			reason: "stale",
+			evidenceExpiresAt: now + staleRecheckMs,
+		};
+	}
+	if (window.utilization >= target.cap) {
+		const freshnessExpiry = freshness.expiresAt ?? now + staleRecheckMs;
+		return {
+			...base,
+			utilization: window.utilization,
+			resetsAtMs: window.resetsAtMs,
+			engaged: true,
+			reason: "over_cap",
+			evidenceExpiresAt:
+				window.resetsAtMs === null
+					? freshnessExpiry
+					: Math.min(window.resetsAtMs, freshnessExpiry),
+		};
+	}
+	return {
+		...base,
+		utilization: window.utilization,
+		resetsAtMs: window.resetsAtMs,
+		engaged: false,
+		reason: "below_cap",
+		evidenceExpiresAt: null,
+	};
+}
+
+function windowCapContext(snapshot: UsageSnapshot | null) {
+	return new Map(
+		(snapshot
+			? normalizeProviderUsageWindows(snapshot.data, "anthropic")
+			: []
+		).map((window) => [window.windowKey, window] as const),
+	);
+}
+
+/**
+ * Per-account usage-window caps for one request model. Separate from
+ * evaluateHardCapacity on purpose: that one is shared with combo policy and the
+ * health view. Accounts without caps return [] and keep fail-open behavior;
+ * a capped window with missing or stale evidence fails closed.
+ */
+export function evaluateWindowCaps(
+	snapshot: UsageSnapshot | null,
+	caps: WindowCapMap,
+	options: {
+		requestModel: string | null;
+		now?: number;
+		snapshotFreshnessMs?: number;
+		staleRecheckMs?: number;
+	},
+): readonly WindowCapExclusion[] {
+	const targets = windowCapTargets(caps);
+	if (targets.length === 0) return [];
+	const now = options.now ?? Date.now();
+	const requestFamily = options.requestModel
+		? getModelFamily(options.requestModel)
+		: null;
+	const windows = windowCapContext(snapshot);
+	const exclusions: WindowCapExclusion[] = [];
+	for (const target of targets) {
+		if (target.scope === "family" && target.modelFamily !== requestFamily) {
+			continue;
+		}
+		const state = resolveWindowCap(
+			target,
+			snapshot,
+			windows,
+			now,
+			options.snapshotFreshnessMs ?? DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS,
+			options.staleRecheckMs ?? DEFAULT_WINDOW_CAP_STALE_RECHECK_MS,
+		);
+		if (!state.engaged || state.evidenceExpiresAt === null) continue;
+		exclusions.push({
+			scope: target.scope,
+			window: target.windowKey,
+			modelFamily: target.modelFamily,
+			utilization: state.utilization,
+			cap: target.cap,
+			reason: state.reason === "stale" ? "stale" : "over_cap",
+			resetAtMs: state.resetsAtMs,
+			evidenceExpiresAt: state.evidenceExpiresAt,
+		});
+	}
+	return exclusions;
+}
+
+/** Poll-time cap state, one entry per capped window; no request model involved. */
+export function getWindowCapStates(
+	snapshot: UsageSnapshot | null,
+	caps: WindowCapMap,
+	options: { now?: number; snapshotFreshnessMs?: number } = {},
+): readonly WindowCapState[] {
+	const targets = windowCapTargets(caps);
+	if (targets.length === 0) return [];
+	const now = options.now ?? Date.now();
+	const windows = windowCapContext(snapshot);
+	return targets.map((target) =>
+		resolveWindowCap(
+			target,
+			snapshot,
+			windows,
+			now,
+			options.snapshotFreshnessMs ?? DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS,
+			DEFAULT_WINDOW_CAP_STALE_RECHECK_MS,
+		),
+	);
 }
 
 export type QuotaPressureBand =
