@@ -1,4 +1,8 @@
-import type { WindowCapState } from "@better-ccflare/proxy/usage-throttling";
+import {
+	getWindowCapStates,
+	type WindowCapState,
+} from "@better-ccflare/proxy/usage-throttling";
+import type { AccountWindowCaps } from "@better-ccflare/types";
 
 /** Points above the cap at which an engaged window is considered to be leaking. */
 export const WINDOW_CAP_LEAK_MARGIN = 10;
@@ -24,19 +28,27 @@ interface WindowTrackState {
 }
 
 /**
- * Poll-time cap transition memory (KTD7): turns per-poll WindowCapState lists
- * into at most one log event per engage/release transition, plus one cap-leak
+ * Poll-time cap transition memory (KTD7), also fed between polls by
+ * sweepWindowCapTransitions: turns WindowCapState lists into at most one log
+ * event per engage/release transition, plus one cap-leak
  * warning per window per reset cycle. In-memory only: a restart re-logs an
  * engaged window once, and logs nothing for a window that is not engaged.
  */
 export class WindowCapTransitionTracker {
 	private readonly windows = new Map<string, WindowTrackState>();
+	private readonly accounts = new Set<string>();
+
+	/** Accounts observed at least once; the only ones a sweep re-observes. */
+	observedAccountIds(): string[] {
+		return [...this.accounts];
+	}
 
 	observe(
 		accountId: string,
 		accountName: string,
 		states: readonly WindowCapState[],
 	): WindowCapLogEvent[] {
+		this.accounts.add(accountId);
 		const events: WindowCapLogEvent[] = [];
 		for (const state of states) {
 			const key = `${accountId}\u0000${state.windowKey}`;
@@ -89,6 +101,48 @@ export class WindowCapTransitionTracker {
 		}
 		return events;
 	}
+}
+
+/** How often the server re-observes cap state between polls. */
+export const WINDOW_CAP_SWEEP_INTERVAL_MS = 30_000;
+
+/**
+ * Routing re-evaluates cap evidence on every request, so a cached snapshot
+ * aging past freshness engages a below-cap window, and a passed reset releases
+ * one, with no poll callback to observe it. Re-observe each account a poll has
+ * observed from the snapshot routing reads; the tracker drops repeats. An
+ * account no poll has observed is left alone (the restart contract above).
+ */
+export async function sweepWindowCapTransitions(
+	tracker: WindowCapTransitionTracker,
+	caps: Readonly<AccountWindowCaps>,
+	deps: {
+		/** Current account name; null when the account no longer exists. */
+		accountName: (accountId: string) => Promise<string | null>;
+		getSnapshot: (
+			accountId: string,
+		) => { readonly data: unknown; readonly observedAt: number } | null;
+		now: () => number;
+	},
+): Promise<WindowCapLogEvent[]> {
+	const events: WindowCapLogEvent[] = [];
+	for (const accountId of tracker.observedAccountIds()) {
+		if (!Object.hasOwn(caps, accountId)) continue;
+		const accountName = await deps.accountName(accountId);
+		if (accountName === null) continue;
+		// Read the snapshot after the await: a poll landing during it must not be
+		// overwritten by the older state read before it.
+		events.push(
+			...tracker.observe(
+				accountId,
+				accountName,
+				getWindowCapStates(deps.getSnapshot(accountId), caps[accountId], {
+					now: deps.now(),
+				}),
+			),
+		);
+	}
+	return events;
 }
 
 /**

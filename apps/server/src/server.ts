@@ -142,8 +142,10 @@ import {
 	unregisterServerLifecycleCallbacks,
 } from "./usage-polling-lifecycle";
 import {
+	sweepWindowCapTransitions,
 	unevaluableWindowCapWarnings,
 	unknownWindowCapWarnings,
+	WINDOW_CAP_SWEEP_INTERVAL_MS,
 	WindowCapTransitionTracker,
 } from "./window-cap-transitions";
 
@@ -675,6 +677,7 @@ let usagePollingLifecycle: UsagePollingLifecycle<NodeJS.Timeout> | null = null;
 let cacheFlightCohortSealService: CohortSealService | null = null;
 let cacheKeepaliveScheduler: CacheKeepaliveScheduler | null = null;
 let memoryMonitorInterval: Timer | null = null;
+let windowCapSweepInterval: Timer | null = null;
 
 export const DEVICE_SETUP_RECOVERY_INTERVAL_MS = 30_000;
 
@@ -2748,6 +2751,35 @@ Available endpoints:
 		);
 	}
 
+	// account_window_caps transitions between polls (R7): routing fails a capped
+	// window closed once its snapshot goes stale, which no poll callback sees
+	// during a poll outage.
+	const windowCapLog = new Logger("UsagePolling");
+	windowCapSweepInterval = setInterval(() => {
+		void (async () => {
+			try {
+				const events = await sweepWindowCapTransitions(
+					windowCapTransitions,
+					config.getAccountWindowCaps(),
+					{
+						accountName: async (accountId) =>
+							(await dbOps.getAccount(accountId))?.name ?? null,
+						getSnapshot: (accountId) => usageCache.getSnapshot(accountId),
+						now: () => Date.now(),
+					},
+				);
+				for (const event of events) {
+					if (event.level === "warn")
+						windowCapLog.warn(event.message, event.fields);
+					else windowCapLog.info(event.message, event.fields);
+				}
+			} catch (err) {
+				windowCapLog.warn(`Failed to sweep account window caps: ${err}`);
+			}
+		})();
+	}, WINDOW_CAP_SWEEP_INTERVAL_MS);
+	windowCapSweepInterval.unref();
+
 	// Start usage polling for NanoGPT accounts (PayG with optional subscription tracking)
 	const nanogptAccounts = accounts.filter((a) => a.provider === "nanogpt");
 	if (nanogptAccounts.length > 0) {
@@ -3349,6 +3381,10 @@ async function handleGracefulShutdown(signal: string) {
 			await drainServerResponses(shuttingDownServer, drainMs);
 		}
 
+		if (windowCapSweepInterval) {
+			clearInterval(windowCapSweepInterval);
+			windowCapSweepInterval = null;
+		}
 		usageCache.clear(); // Stop all usage polling
 		await drainUsageCollector();
 		if (shuttingDownServer) {

@@ -3,6 +3,7 @@ import { findUnknownAccountWindowCapIds } from "@better-ccflare/config";
 import type { UsageSnapshot } from "@better-ccflare/providers";
 import { getWindowCapStates } from "@better-ccflare/proxy/usage-throttling";
 import {
+	sweepWindowCapTransitions,
 	unevaluableWindowCapWarnings,
 	unknownWindowCapWarnings,
 	WindowCapTransitionTracker,
@@ -178,6 +179,138 @@ describe("WindowCapTransitionTracker", () => {
 				},
 			]),
 		).toEqual([]);
+	});
+});
+
+// pro-gate round 3 P2: routing re-checks evidence freshness on every request,
+// so a poll outage engages a below-cap window with no poll callback to log it.
+describe("sweepWindowCapTransitions (pro-gate round 3 P2)", () => {
+	const FRESHNESS = 3 * 60_000;
+	const reset = now + 24 * HOUR;
+	const caps = { "acct-1": CAP };
+
+	/** The usage cache as routing reads it: one entry per account, or none. */
+	function cache(entries: Record<string, { percent: number; at: number }>) {
+		return (accountId: string): UsageSnapshot | null => {
+			const entry = entries[accountId];
+			return entry
+				? ({
+						data: liveData(entry.percent, reset),
+						observedAt: entry.at,
+					} as unknown as UsageSnapshot)
+				: null;
+		};
+	}
+
+	function sweep(
+		tracker: WindowCapTransitionTracker,
+		getSnapshot: (accountId: string) => UsageSnapshot | null,
+		at: number,
+		accountName: (accountId: string) => Promise<string | null> = async () =>
+			"protected",
+	) {
+		return sweepWindowCapTransitions(tracker, caps, {
+			accountName,
+			getSnapshot,
+			now: () => at,
+		});
+	}
+
+	it("logs a stale engagement when polls stop past freshness, then the release when a fresh below-cap poll resumes", async () => {
+		const tracker = new WindowCapTransitionTracker();
+		expect(poll(tracker, 50, reset, now)).toEqual([]);
+
+		const lastPoll = cache({ "acct-1": { percent: 50, at: now } });
+		expect(await sweep(tracker, lastPoll, now + FRESHNESS - 1)).toEqual([]);
+
+		const stale = await sweep(tracker, lastPoll, now + FRESHNESS + 1);
+		expect(stale.map((e) => e.kind)).toEqual(["engaged"]);
+		expect(stale[0]?.fields).toMatchObject({
+			accountId: "acct-1",
+			window: "seven_day_fable",
+			utilization: null,
+			reason: "stale",
+		});
+		// Further ticks of the same outage add nothing.
+		expect(await sweep(tracker, lastPoll, now + 2 * FRESHNESS)).toEqual([]);
+
+		const resumed = now + 2 * FRESHNESS + 1;
+		const released = poll(tracker, 50, reset, resumed);
+		expect(released.map((e) => e.kind)).toEqual(["released"]);
+		expect(released[0]?.fields).toMatchObject({
+			utilization: 50,
+			reason: "below_cap",
+		});
+	});
+
+	it("logs a stale engagement once the cache entry is gone, and the sweep releases on a fresh cache write", async () => {
+		const tracker = new WindowCapTransitionTracker();
+		poll(tracker, 50, reset, now);
+		const gone = await sweep(tracker, cache({}), now + 11 * 60_000);
+		expect(gone.map((e) => e.kind)).toEqual(["engaged"]);
+
+		const at = now + 12 * 60_000;
+		const back = await sweep(
+			tracker,
+			cache({ "acct-1": { percent: 40, at } }),
+			at,
+		);
+		expect(back.map((e) => e.kind)).toEqual(["released"]);
+	});
+
+	it("does not duplicate a transition the poll already logged", async () => {
+		const tracker = new WindowCapTransitionTracker();
+		expect(poll(tracker, 85, reset, now).map((e) => e.kind)).toEqual([
+			"engaged",
+		]);
+		expect(
+			await sweep(tracker, cache({ "acct-1": { percent: 85, at: now } }), now),
+		).toEqual([]);
+	});
+
+	it("leaves an account no poll has observed alone, keeping the restart contract", async () => {
+		const tracker = new WindowCapTransitionTracker();
+		expect(await sweep(tracker, cache({}), now + 11 * 60_000)).toEqual([]);
+	});
+
+	it("skips an observed account that no longer exists or is no longer capped", async () => {
+		const tracker = new WindowCapTransitionTracker();
+		poll(tracker, 50, reset, now);
+		const later = now + 11 * 60_000;
+		expect(await sweep(tracker, cache({}), later, async () => null)).toEqual(
+			[],
+		);
+		expect(
+			await sweepWindowCapTransitions(
+				tracker,
+				{},
+				{
+					accountName: async () => "protected",
+					getSnapshot: cache({}),
+					now: () => later,
+				},
+			),
+		).toEqual([]);
+	});
+
+	it("reads the snapshot after resolving the account, so it never logs an older state over a newer poll", async () => {
+		const tracker = new WindowCapTransitionTracker();
+		poll(tracker, 50, reset, now);
+		const resumed = now + 2 * FRESHNESS;
+		let entries: Record<string, { percent: number; at: number }> = {
+			"acct-1": { percent: 50, at: now },
+		};
+		const events = await sweep(
+			tracker,
+			(accountId) => cache(entries)(accountId),
+			resumed,
+			async () => {
+				// A poll lands while the sweep awaits the account lookup.
+				entries = { "acct-1": { percent: 50, at: resumed } };
+				return "protected";
+			},
+		);
+		expect(events).toEqual([]);
 	});
 });
 
