@@ -319,7 +319,9 @@ function isModelRouteIntentRequest(req: Request, url: URL): boolean {
 
 /**
  * Helper-shaped: a declared hosted server tool and no client function tools, as
- * Claude Code builds WebSearch. History replay atoms alone are not a helper.
+ * Claude Code builds WebSearch. History replay atoms alone are not a helper, and
+ * neither is a request with an unrecognized typed tool (a client tool labelled
+ * `type: "custom"` is filed as unsupported, so it cannot prove helper shape).
  */
 export function isHelperShapedServerToolPreview(
 	preview: ServerToolRequirements | undefined,
@@ -327,6 +329,7 @@ export function isHelperShapedServerToolPreview(
 	return (
 		preview !== undefined &&
 		preview.hasClientFunctions !== true &&
+		(preview.unsupported?.length ?? 0) === 0 &&
 		((preview.declarations?.length ?? 0) > 0 ||
 			(preview.invalid?.length ?? 0) > 0)
 	);

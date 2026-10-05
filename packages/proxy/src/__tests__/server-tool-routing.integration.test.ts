@@ -3220,6 +3220,26 @@ describe("route-profile WebSearch helper falls to the global proven lane", () =>
 				}),
 			),
 		).toBe(false);
+		// An unrecognized typed tool (here a client tool labelled type "custom",
+		// which the classifier files as unsupported) means the request cannot be
+		// proven a helper, so it keeps root-intent and lineage behaviour.
+		expect(
+			isHelperShapedServerToolPreview(
+				preview({
+					model: PICKER,
+					max_tokens: 16,
+					messages: history,
+					tools: [
+						declared,
+						{
+							type: "custom",
+							name: "client_lookup",
+							input_schema: { type: "object" },
+						},
+					],
+				}),
+			),
+		).toBe(false);
 		expect(isHelperShapedServerToolPreview(undefined)).toBe(false);
 	});
 
