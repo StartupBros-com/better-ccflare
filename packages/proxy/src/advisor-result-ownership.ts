@@ -65,24 +65,27 @@ export function advisorResultOwnerKeyFromBlock(block: unknown): string | null {
 	);
 }
 
+// Each account has one current key. A key may be shared by several accounts
+// (seats in one organization can decrypt each other's results), so the
+// reverse index holds a set rather than evicting the earlier account.
 const keyByAccount = new Map<string, string>();
-const accountByKey = new Map<string, string>();
+const accountsByKey = new Map<string, Set<string>>();
 
 export function recordAdvisorResultOwner(
 	accountId: string,
 	ownerKey: string,
 ): void {
 	const previousKey = keyByAccount.get(accountId);
-	const previousAccount = accountByKey.get(ownerKey);
-	if (previousKey === ownerKey && previousAccount === accountId) return;
-	if (previousAccount !== undefined && previousAccount !== accountId) {
-		keyByAccount.delete(previousAccount);
-	}
-	if (previousKey !== undefined && previousKey !== ownerKey) {
-		accountByKey.delete(previousKey);
+	if (previousKey === ownerKey) return;
+	if (previousKey !== undefined) {
+		const previousOwners = accountsByKey.get(previousKey);
+		previousOwners?.delete(accountId);
+		if (previousOwners?.size === 0) accountsByKey.delete(previousKey);
 	}
 	keyByAccount.set(accountId, ownerKey);
-	accountByKey.set(ownerKey, accountId);
+	const owners = accountsByKey.get(ownerKey) ?? new Set<string>();
+	owners.add(accountId);
+	accountsByKey.set(ownerKey, owners);
 	log.info(`Advisor result owner key mapped to account ${accountId}`);
 }
 
@@ -92,15 +95,15 @@ export function getAdvisorResultOwnerKey(
 	return keyByAccount.get(accountId);
 }
 
-export function getAdvisorResultOwnerAccount(
+export function getAdvisorResultOwnerAccounts(
 	ownerKey: string,
-): string | undefined {
-	return accountByKey.get(ownerKey);
+): ReadonlySet<string> | undefined {
+	return accountsByKey.get(ownerKey);
 }
 
 export function resetAdvisorResultOwnershipForTests(): void {
 	keyByAccount.clear();
-	accountByKey.clear();
+	accountsByKey.clear();
 }
 
 export function mayContainAdvisorResult(buffer: ArrayBuffer | null): boolean {
@@ -230,8 +233,8 @@ export function stripForeignAdvisorResults(
 	return stripAdvisorResults(body, (key) => {
 		if (key === null) return false;
 		if (targetKey !== undefined) return key !== targetKey;
-		const owner = getAdvisorResultOwnerAccount(key);
-		return owner !== undefined && owner !== targetAccountId;
+		const owners = getAdvisorResultOwnerAccounts(key);
+		return owners !== undefined && !owners.has(targetAccountId);
 	});
 }
 

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	ADVISOR_RESULT_UNPROCESSABLE_MARKERS,
 	advisorResultOwnerKeyFromBlock,
-	getAdvisorResultOwnerAccount,
+	getAdvisorResultOwnerAccounts,
 	getAdvisorResultOwnerKey,
 	isAdvisorResultUnprocessableMessage,
 	mayContainAdvisorResult,
@@ -266,16 +266,34 @@ describe("copy-on-write", () => {
 });
 
 describe("registry", () => {
-	test("is 1:1 and resettable", () => {
+	test("accounts sharing a key coexist; re-keying moves one account", () => {
 		recordAdvisorResultOwner("a", KEY_A);
 		recordAdvisorResultOwner("b", KEY_A);
-		expect(getAdvisorResultOwnerKey("a")).toBeUndefined();
-		expect(getAdvisorResultOwnerAccount(KEY_A)).toBe("b");
+		expect(getAdvisorResultOwnerKey("a")).toBe(KEY_A);
+		expect(getAdvisorResultOwnerKey("b")).toBe(KEY_A);
+		expect([...(getAdvisorResultOwnerAccounts(KEY_A) ?? [])].sort()).toEqual([
+			"a",
+			"b",
+		]);
 		recordAdvisorResultOwner("b", KEY_B);
-		expect(getAdvisorResultOwnerAccount(KEY_A)).toBeUndefined();
-		expect(getAdvisorResultOwnerKey("b")).toBe(KEY_B);
+		expect([...(getAdvisorResultOwnerAccounts(KEY_A) ?? [])]).toEqual(["a"]);
+		expect([...(getAdvisorResultOwnerAccounts(KEY_B) ?? [])]).toEqual(["b"]);
+		recordAdvisorResultOwner("a", KEY_B);
+		expect(getAdvisorResultOwnerAccounts(KEY_A)).toBeUndefined();
 		resetAdvisorResultOwnershipForTests();
 		expect(getAdvisorResultOwnerKey("b")).toBeUndefined();
+	});
+	test("a shared key never strips another seat's own results", () => {
+		recordAdvisorResultOwner("a", KEY_A);
+		recordAdvisorResultOwner("b", KEY_A);
+		const body = {
+			messages: [user(), asst(use("s1"), result("s1", KEY_A), text("ok"))],
+		};
+		expect(stripForeignAdvisorResults(body, "a")).toBeNull();
+		expect(stripForeignAdvisorResults(body, "b")).toBeNull();
+		// An account with no learned key is not among the key's known owners,
+		// so it still gets the result stripped.
+		expect(stripForeignAdvisorResults(body, "c")?.strippedResults).toBe(1);
 	});
 });
 
