@@ -881,26 +881,42 @@ function windowCapTargets(caps: WindowCapMap): WindowCapTarget[] {
 	return targets;
 }
 
+/** The highest-utilization row of a window key's rows; undefined when empty. */
+function highestRow(
+	rows: readonly CanonicalUsageWindow[],
+): CanonicalUsageWindow | undefined {
+	return rows.reduce<CanonicalUsageWindow | undefined>(
+		(top, row) => (top && top.utilization >= row.utilization ? top : row),
+		undefined,
+	);
+}
+
 /**
- * One capped window's state. Reads utilization whether or not the window is
- * `active` (the live Fable row is an inactive limits[] row below 100%), and
- * never reads spend or extra usage.
+ * One capped window's state over every row the payload carries for its key.
+ * Reads utilization whether or not a row is `active` (the live Fable row is an
+ * inactive limits[] row below 100%), and never reads spend or extra usage. A
+ * row whose reset passed is discarded; any remaining row at or above the cap
+ * engages it until the latest such row resets.
  */
 function resolveWindowCap(
 	target: WindowCapTarget,
 	snapshot: WindowCapSnapshot | null,
-	windows: ReadonlyMap<string, CanonicalUsageWindow>,
+	windows: ReadonlyMap<string, readonly CanonicalUsageWindow[]>,
 	now: number,
 	snapshotFreshnessMs: number,
 	staleRecheckMs: number,
 ): WindowCapState {
-	const window = windows.get(target.windowKey);
+	const rows = windows.get(target.windowKey) ?? [];
+	const live = rows.filter(
+		(row) => row.resetsAtMs === null || row.resetsAtMs > now,
+	);
 	const base = { windowKey: target.windowKey, cap: target.cap };
-	if (window && window.resetsAtMs !== null && window.resetsAtMs <= now) {
+	const passed = live.length === 0 ? highestRow(rows) : undefined;
+	if (passed) {
 		return {
 			...base,
-			utilization: window.utilization,
-			resetsAtMs: window.resetsAtMs,
+			utilization: passed.utilization,
+			resetsAtMs: passed.resetsAtMs,
 			engaged: false,
 			reason: "reset_passed",
 			evidenceExpiresAt: null,
@@ -909,47 +925,74 @@ function resolveWindowCap(
 	const freshness = snapshot
 		? evaluateSnapshotFreshness(snapshot.observedAt, now, snapshotFreshnessMs)
 		: null;
-	if (!snapshot || !freshness?.fresh || !window) {
+	const top = highestRow(live);
+	if (!snapshot || !freshness?.fresh || !top) {
 		return {
 			...base,
 			utilization: null,
-			resetsAtMs: window?.resetsAtMs ?? null,
+			resetsAtMs: top?.resetsAtMs ?? null,
 			engaged: true,
 			reason: "stale",
 			evidenceExpiresAt: now + staleRecheckMs,
 		};
 	}
-	if (window.utilization >= target.cap) {
+	if (top.utilization >= target.cap) {
+		const blockingResets = live
+			.filter((row) => row.utilization >= target.cap)
+			.map((row) => row.resetsAtMs);
+		const resetsAtMs = blockingResets.every(
+			(reset): reset is number => reset !== null,
+		)
+			? Math.max(...blockingResets)
+			: null;
 		const freshnessExpiry = freshness.expiresAt ?? now + staleRecheckMs;
 		return {
 			...base,
-			utilization: window.utilization,
-			resetsAtMs: window.resetsAtMs,
+			utilization: top.utilization,
+			resetsAtMs,
 			engaged: true,
 			reason: "over_cap",
 			evidenceExpiresAt:
-				window.resetsAtMs === null
+				resetsAtMs === null
 					? freshnessExpiry
-					: Math.min(window.resetsAtMs, freshnessExpiry),
+					: Math.min(resetsAtMs, freshnessExpiry),
 		};
 	}
 	return {
 		...base,
-		utilization: window.utilization,
-		resetsAtMs: window.resetsAtMs,
+		utilization: top.utilization,
+		resetsAtMs: top.resetsAtMs,
 		engaged: false,
 		reason: "below_cap",
 		evidenceExpiresAt: null,
 	};
 }
 
-function windowCapContext(snapshot: WindowCapSnapshot | null) {
-	return new Map(
-		(snapshot
-			? normalizeProviderUsageWindows(snapshot.data, "anthropic")
-			: []
-		).map((window) => [window.windowKey, window] as const),
-	);
+/**
+ * Every canonical row per window key. The shared normalizer keeps one row per
+ * key (first wins), which would let a lower same-key row hide an over-cap one
+ * depending on payload order, so the flat windows and each limits[] row are
+ * normalized on their own and all of them kept.
+ */
+function windowCapContext(
+	snapshot: WindowCapSnapshot | null,
+): ReadonlyMap<string, readonly CanonicalUsageWindow[]> {
+	const byKey = new Map<string, CanonicalUsageWindow[]>();
+	const data = snapshot?.data;
+	if (!data || typeof data !== "object" || Array.isArray(data)) return byKey;
+	const { limits, ...flat } = data as { limits?: unknown };
+	const payloads: unknown[] = [
+		flat,
+		...(Array.isArray(limits) ? limits.map((row) => ({ limits: [row] })) : []),
+	];
+	for (const payload of payloads) {
+		for (const window of normalizeProviderUsageWindows(payload, "anthropic")) {
+			const rows = byKey.get(window.windowKey);
+			if (rows) rows.push(window);
+			else byKey.set(window.windowKey, [window]);
+		}
+	}
+	return byKey;
 }
 
 /**

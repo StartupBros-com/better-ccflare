@@ -189,6 +189,76 @@ describe("evaluateWindowCaps", () => {
 		).toHaveLength(1);
 	});
 
+	// pro-gate round 1 P1: same-key rows must not collapse to whichever came first.
+	function fableRow(percent: number, resets_at = resetAt) {
+		return {
+			kind: "weekly_scoped",
+			percent,
+			resets_at,
+			is_active: false,
+			scope: { model: { display_name: "Fable" } },
+		};
+	}
+
+	it("P1: blocks when any same-key Fable row is over cap, in either payload order", () => {
+		const opts = { requestModel: FABLE, now };
+		for (const limits of [
+			[fableRow(40), fableRow(85)],
+			[fableRow(85), fableRow(40)],
+		]) {
+			const out = evaluateWindowCaps(
+				snap(liveData(null, { limits })),
+				fableCap,
+				opts,
+			);
+			expect(out).toHaveLength(1);
+			expect(out[0]).toMatchObject({
+				window: "seven_day_fable",
+				reason: "over_cap",
+				utilization: 85,
+			});
+		}
+	});
+
+	it("P1: a flat seven_day_fable does not shadow a higher limits[] row", () => {
+		const out = evaluateWindowCaps(
+			snap(
+				liveData(85, {
+					seven_day_fable: { utilization: 40, resets_at: resetAt },
+				}),
+			),
+			fableCap,
+			{ requestModel: FABLE, now },
+		);
+		expect(out[0]).toMatchObject({ reason: "over_cap", utilization: 85 });
+	});
+
+	it("P1: ignores a same-key row whose reset passed when a live row is below cap", () => {
+		const out = evaluateWindowCaps(
+			snap(liveData(null, { limits: [fableRow(95, now - MIN), fableRow(40)] })),
+			fableCap,
+			{ requestModel: FABLE, now },
+		);
+		expect(out).toEqual([]);
+	});
+
+	it("P1: holds the cap until the later reset of two blocking rows", () => {
+		const out = evaluateWindowCaps(
+			snap(
+				liveData(null, {
+					limits: [fableRow(90, now + MIN), fableRow(85, now + 2 * MIN)],
+				}),
+			),
+			fableCap,
+			{ requestModel: FABLE, now },
+		);
+		expect(out[0]).toMatchObject({
+			utilization: 90,
+			resetAtMs: now + 2 * MIN,
+			evidenceExpiresAt: now + 2 * MIN,
+		});
+	});
+
 	it("returns one exclusion per engaged cap when family and account caps are both over", () => {
 		const out = evaluateWindowCaps(
 			snap(
@@ -241,6 +311,21 @@ describe("getWindowCapStates", () => {
 			engaged: false,
 			reason: "reset_passed",
 		});
+	});
+
+	it("P1: reports the highest same-key utilization, whatever the row order", () => {
+		const limits = [40, 85].map((percent) => ({
+			kind: "weekly_scoped",
+			percent,
+			resets_at: resetAt,
+			is_active: false,
+			scope: { model: { display_name: "Fable" } },
+		}));
+		expect(
+			getWindowCapStates(snap(liveData(null, { limits })), fableCap, {
+				now,
+			})[0],
+		).toMatchObject({ engaged: true, reason: "over_cap", utilization: 85 });
 	});
 
 	it("returns nothing without caps", () => {
