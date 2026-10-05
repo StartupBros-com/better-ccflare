@@ -65,9 +65,10 @@ export function advisorResultOwnerKeyFromBlock(block: unknown): string | null {
 	);
 }
 
-// Each account has one current key. A key may be shared by several accounts
-// (seats in one organization can decrypt each other's results), so the
-// reverse index holds a set rather than evicting the earlier account.
+// Each account has one current key. Production has so far shown one key per
+// account, but if the key is per organization, seats of one organization would
+// share it, so the reverse index holds a set rather than evicting the earlier
+// account.
 const keyByAccount = new Map<string, string>();
 const accountsByKey = new Map<string, Set<string>>();
 
@@ -225,6 +226,10 @@ export function stripAdvisorResults(
 	};
 }
 
+// A target whose key is not learned yet still loses results learned from other
+// accounts: keeping them would cost a guaranteed upstream 400 before the
+// backstop strips everything, while stripping costs only advice the target
+// could read if it shared the producer's key.
 export function stripForeignAdvisorResults(
 	body: Readonly<Record<string, unknown>>,
 	targetAccountId: string,

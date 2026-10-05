@@ -729,6 +729,61 @@ describe("advisor result ownership across accounts", () => {
 		expect(retryText).not.toContain("server_tool_use");
 	});
 
+	it("surfaces a second advisor 400 unchanged after the one same-account retry", async () => {
+		resetAdvisorResultOwnershipForTests();
+		const { a } = twoAccounts();
+		const { ctx } = makeContext([a]);
+		const calls = installFetch(
+			() =>
+				new Response(JSON.stringify(ADVISOR_ERROR_400), {
+					status: 400,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const { request } = requestWith(historyMessages(KB));
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			ctx,
+			"key-1",
+		);
+		const text = await response.text();
+
+		expect(response.status).toBe(400);
+		expect(calls).toHaveLength(2);
+		expect(text).toContain(
+			"Advisor tool result content could not be processed.",
+		);
+	});
+
+	it("strips a result learned from another account when failing over to an account with no learned key", async () => {
+		resetAdvisorResultOwnershipForTests();
+		recordAdvisorResultOwner("anthropic-a", KA);
+		const { a, b } = twoAccounts();
+		const { ctx } = makeContext([a, b]);
+		const calls = installFetch((call) => {
+			if (isA(call)) throw new TypeError("fetch failed");
+			return jsonOk();
+		});
+		const { request } = requestWith(historyMessages(KA));
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			ctx,
+			"key-1",
+		);
+		await response.text();
+
+		expect(response.status).toBe(200);
+		const bCall = calls.find((c) => !isA(c));
+		expect(bCall).toBeDefined();
+		expect(serialized(bCall?.body.messages)).not.toContain(
+			"advisor_tool_result",
+		);
+	});
+
 	it("forwards a request with no advisor history unchanged in one call", async () => {
 		const { a, b } = twoAccounts();
 		const { ctx } = makeContext([a, b]);
