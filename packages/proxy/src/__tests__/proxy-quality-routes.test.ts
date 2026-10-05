@@ -2651,6 +2651,43 @@ describe("prewarmed native catalogs", () => {
 			expect(sends).toHaveLength(1);
 			expect(envelopes[0]?.tools).toEqual([searchTool]);
 		});
+		it("keeps a route-profile binding when a helper-shaped web_search request rides an enrolled quality model", async () => {
+			const registry = new ModelRouteSessionRegistry([
+				{
+					id: "pinned",
+					publicModelId: "claude-bccf-route-pinned",
+					discoveryModelId: "claude-bccf-route-pinned",
+					displayName: "Pinned",
+					accountId: "a",
+					logicalModel: "claude-opus-5-5",
+					expectedProvider: "anthropic",
+				},
+			]);
+			ctx.modelRouteSessionRegistry = registry;
+			const inherits = () =>
+				registry.resolve({
+					callerIdentity: `api-key-id:${scope.principalId}`,
+					requestModel: "claude-opus-5-5",
+					sessionId: scope.sessionId,
+					isSubagent: true,
+				});
+			await (await send(request("claude-bccf-route-pinned"))).text();
+			expect(inherits()).toMatchObject({ kind: "route", source: "inherited" });
+
+			const helper = await send(
+				request("claude-bccf-quality-auto", {}, { tools: [searchTool] }),
+			);
+			expect(helper.status).toBe(200);
+			await helper.text();
+			await flush();
+
+			// The helper neither cleared nor staled the binding.
+			expect(inherits()).toMatchObject({
+				kind: "route",
+				source: "inherited",
+				profile: { id: "pinned" },
+			});
+		});
 		it("demotes the forced web_search choice for a model that rejects forced choice", async () => {
 			const response = await send(
 				request(

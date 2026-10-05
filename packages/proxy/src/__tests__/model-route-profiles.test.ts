@@ -1082,7 +1082,7 @@ describe("ModelRouteSessionRegistry", () => {
 		).toEqual({ kind: "native" });
 	});
 
-	it("only cancels the current reservation and cannot revive an older root", () => {
+	it("withdraws an older reservation without disturbing a later root", () => {
 		const configured = profile();
 		const alternate = alternateProfile();
 		const registry = new ModelRouteSessionRegistry([configured, alternate]);
@@ -1102,7 +1102,7 @@ describe("ModelRouteSessionRegistry", () => {
 		const earlierIntent = registry.beginRootIntent(earlierInput);
 		const laterIntent = registry.beginRootIntent(laterInput);
 
-		expect(registry.cancelRootIntent(earlierInput, earlierIntent)).toBe(false);
+		expect(registry.cancelRootIntent(earlierInput, earlierIntent)).toBe(true);
 		const later = registry.resolve(laterInput, laterIntent);
 		registry.commitExplicit(laterInput, later);
 
@@ -1117,6 +1117,43 @@ describe("ModelRouteSessionRegistry", () => {
 			source: "inherited",
 			profile: alternate,
 		});
+	});
+
+	it("keeps a withdrawn older reservation withdrawn when the newer root aborts", () => {
+		const configured = profile();
+		const alternate = alternateProfile();
+		const registry = new ModelRouteSessionRegistry([configured, alternate]);
+		const baseInput = {
+			callerIdentity: "caller",
+			sessionId: "withdrawn-helper-stays-withdrawn",
+			isSubagent: false,
+		};
+		const helperInput = {
+			...baseInput,
+			requestModel: configured.publicModelId,
+		};
+		const abortedRootInput = {
+			...baseInput,
+			requestModel: alternate.publicModelId,
+		};
+		// A helper withdraws at classification while a newer root still holds the
+		// newest reservation; that root then terminates before it commits.
+		const helperIntent = registry.beginRootIntent(helperInput);
+		const abortedRootIntent = registry.beginRootIntent(abortedRootInput);
+		registry.cancelRootIntent(helperInput, helperIntent);
+		registry.cancelRootIntent(abortedRootInput, abortedRootIntent);
+
+		const helper = registry.resolve(helperInput, helperIntent);
+		expect(helper).toMatchObject({ kind: "route", generation: null });
+		registry.commitExplicit(helperInput, helper);
+
+		expect(
+			resolveRequest(registry, {
+				...baseInput,
+				requestModel: "claude-sonnet-4-5",
+				isSubagent: true,
+			}),
+		).toEqual({ kind: "native" });
 	});
 
 	it("prevents an older explicit resolve from resurrecting after a newer native clear", () => {

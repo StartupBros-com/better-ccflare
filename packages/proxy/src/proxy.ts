@@ -36,6 +36,7 @@ import type {
 	RoutingCandidateMetadata,
 	RoutingSelectionDiagnostics,
 	RoutingSelectionZeroAttemptReason,
+	ServerToolRequirements,
 } from "@better-ccflare/types";
 import { registerManagedTerminal } from "../../../scripts/ccflare-managed-timing.mjs";
 import {
@@ -313,6 +314,24 @@ function isModelRouteIntentRequest(req: Request, url: URL): boolean {
 		req.method === "POST" &&
 		(url.pathname === "/v1/messages" ||
 			url.pathname === "/v1/messages/count_tokens")
+	);
+}
+
+/**
+ * Helper-shaped: a declared hosted server tool and no client function tools, as
+ * Claude Code builds WebSearch. History replay atoms alone are not a helper, and
+ * neither is a request with an unrecognized typed tool (a client tool labelled
+ * `type: "custom"` is filed as unsupported, so it cannot prove helper shape).
+ */
+export function isHelperShapedServerToolPreview(
+	preview: ServerToolRequirements | undefined,
+): boolean {
+	return (
+		preview !== undefined &&
+		preview.hasClientFunctions !== true &&
+		(preview.unsupported?.length ?? 0) === 0 &&
+		((preview.declarations?.length ?? 0) > 0 ||
+			(preview.invalid?.length ?? 0) > 0)
 	);
 }
 
@@ -771,7 +790,7 @@ async function handleProxyImpl(
 		throw error;
 	} finally {
 		// Committed roots remove their complete pending lineage, making this a
-		// no-op. Every early response or throw withdraws only its own newest intent.
+		// no-op. Every early response or throw withdraws only its own intent.
 		ctx.modelRouteSessionRegistry?.cancelRootIntent(
 			rootIntentInput,
 			rootIntentGeneration,
@@ -1297,6 +1316,29 @@ async function handleProxyCoreImpl(
 			? requestBodyContext
 			: new RequestBodyContext(finalBodyBuffer);
 	requestMeta.agentAttributionSource = agentAttributionSource;
+	const isCountHelper = url.pathname === "/v1/messages/count_tokens";
+	// The quality route runs before profile resolution, so the helper preview is
+	// taken here. A helper-shaped request (a declared hosted server tool and no
+	// client function tools, as Claude Code builds WebSearch) withdraws its own
+	// root-intent reservation below, so no commit path (quality route, explicit
+	// or native) can commit or clear a binding for it and it cannot make a
+	// concurrent root's commit stale; a request that also declares client
+	// functions is a real main-loop turn and keeps its reservation.
+	const serverToolPreview = isCountHelper
+		? undefined
+		: finalRequestBodyContext.previewServerToolRequirements();
+	const serverToolHelperShaped =
+		isHelperShapedServerToolPreview(serverToolPreview);
+	if (serverToolHelperShaped) {
+		modelRouteRegistry?.cancelRootIntent(
+			{
+				callerIdentity: routeCallerIdentity(req, apiKeyId),
+				sessionId: req.headers.get("x-claude-code-session-id"),
+				isSubagent,
+			},
+			rootIntentGeneration,
+		);
+	}
 	const qualityResponse = await routeQualityRequest({
 		req,
 		url,
@@ -1338,19 +1380,27 @@ async function handleProxyCoreImpl(
 		effectiveModelAfterInterception !== null &&
 		modelRouteRegistry?.hasPublicModelId(effectiveModelAfterInterception) ===
 			true;
-	const isCountHelper = url.pathname === "/v1/messages/count_tokens";
-	const serverToolPreview = isCountHelper
-		? undefined
-		: finalRequestBodyContext.previewServerToolRequirements();
+	// Lineage is decoupled from profile resolution: a helper-shaped request (a
+	// declared hosted server tool, no client functions) is a helper in every shape (it
+	// commits no root intent, creates no home, and may fall to the global proven
+	// lane under a soft profile), even with a picker model or child markers. A
+	// request that also declares client functions is a helper only in the
+	// pre-existing stock-model, non-subagent shape.
 	const isServerToolHelper =
 		serverToolPreview !== undefined &&
-		!isSubagent &&
-		!configuredOriginalPicker &&
-		!configuredEffectivePicker;
-	const inheritsRouteProfile = isSubagent || isServerToolHelper;
+		(serverToolHelperShaped ||
+			(!isSubagent && !configuredOriginalPicker && !configuredEffectivePicker));
 	if (isServerToolHelper) {
 		requestMeta.routeLineage = { kind: "helper", childHomeKey: null };
 	}
+	// Resolution is unchanged: a picker-model helper resolves as an explicit
+	// profile by its picker id, a subagent helper inherits as a child, and only
+	// a stock-model, non-subagent helper inherits the session binding here.
+	const inheritsRouteProfile =
+		isSubagent ||
+		(isServerToolHelper &&
+			!configuredOriginalPicker &&
+			!configuredEffectivePicker);
 	// A stale picker selected directly in /model is not a native clear. Children,
 	// however, are classified entirely by their post-interception effective model.
 	if (!isSubagent && originalReservedPicker && !configuredOriginalPicker) {
@@ -1418,7 +1468,13 @@ async function handleProxyCoreImpl(
 			);
 		}
 		if (source === "explicit") {
-			applyExplicitModelRoute(finalRequestBodyContext, profile);
+			// A helper takes the profile's model only: its defaultEffort could turn a
+			// servable helper (thinking disabled) into an upstream 400.
+			if (isServerToolHelper) {
+				finalRequestBodyContext.setModel(profile.logicalModel);
+			} else {
+				applyExplicitModelRoute(finalRequestBodyContext, profile);
+			}
 			finalBodyBuffer = finalRequestBodyContext.getBuffer();
 			appliedModel = profile.logicalModel;
 			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
@@ -2947,6 +3003,8 @@ async function handleProxyCoreImpl(
 		return finishPacing(pacingSlot, terminal.response);
 	}
 
+	// A helper-shaped request withdrew its reservation at classification, so the
+	// registry's own generation check makes both arms below no-ops for it.
 	if (
 		modelRouteResolution?.kind === "route" &&
 		modelRouteResolution.source === "explicit" &&

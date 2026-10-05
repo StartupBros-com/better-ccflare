@@ -654,8 +654,10 @@ export class ModelRouteSessionRegistry {
 	}
 
 	/**
-	 * Withdraw a root that terminates before it is routed. Only the active
-	 * reservation may withdraw: an older request cannot disturb a later root.
+	 * Withdraw a request's own reservation, wherever it sits: a root that
+	 * terminates before it is routed, or a helper at classification. Removing an
+	 * older entry leaves a later root newest, so it is never disturbed, and a
+	 * withdrawn generation can never become current again when a newer root aborts.
 	 */
 	cancelRootIntent(
 		input: ModelRouteRootIntentInput,
@@ -665,9 +667,11 @@ export class ModelRouteSessionRegistry {
 		const key = this.bindingKey(input.callerIdentity, input.sessionId);
 		if (!key) return false;
 		const current = this.getRootIntentState(key, this.now());
-		const newest = current?.entries.at(-1);
-		if (!current || newest?.generation !== generation) return false;
-		const entries = current.entries.slice(0, -1);
+		if (!current) return false;
+		const entries = current.entries.filter(
+			(entry) => entry.generation !== generation,
+		);
+		if (entries.length === current.entries.length) return false;
 		if (entries.length === 0) {
 			this.rootIntents.delete(key);
 		} else {
