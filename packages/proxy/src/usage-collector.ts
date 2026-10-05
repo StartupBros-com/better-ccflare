@@ -224,16 +224,25 @@ const MAX_UNIFIED_RATELIMIT_VALUE_CHARS = 128;
 
 /**
  * Bounded JSON of the unified rate-limit headers Claude Code saw on a
- * successful Fable-family response, or null for any other response. Headers
- * are taken in order; the first bound reached ends the capture and a
- * `truncated: true` marker records that some were left out.
+ * successful Fable-family response, or null for any other response. Success
+ * means a 2xx status and a successful end: a 200 stream that errors, ends
+ * truncated or is cancelled before completion is not one. Headers are taken
+ * in order; the first bound reached ends the capture and a `truncated: true`
+ * marker records that some were left out.
  */
 export function captureUnifiedRatelimitHeaders(
+	success: boolean,
 	status: number | undefined,
 	servedModel: string | undefined,
 	headers: Record<string, string> | undefined,
 ): string | null {
-	if (!headers || status === undefined || status < 200 || status >= 300) {
+	if (
+		!success ||
+		!headers ||
+		status === undefined ||
+		status < 200 ||
+		status >= 300
+	) {
 		return null;
 	}
 	if (!servedModel || getModelFamily(servedModel) !== "fable") return null;
@@ -2078,6 +2087,7 @@ export class UsageCollector {
 				? state.usage.advisorUsage
 				: undefined;
 		const unifiedRatelimitHeaders = captureUnifiedRatelimitHeaders(
+			msg.success,
 			startMessage.responseStatus,
 			state.usage.model,
 			startMessage.responseHeaders,

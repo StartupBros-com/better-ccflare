@@ -5,14 +5,24 @@
 import { expect, test } from "bun:test";
 import { AsyncDbWriter, DatabaseOperations } from "@better-ccflare/database";
 import { UsageCollector } from "../usage-collector";
-import type { StartMessage } from "../worker-messages";
+import type { EndMessage, StartMessage } from "../worker-messages";
 
 const PREFIX = "anthropic-ratelimit-unified-";
+
+interface CaptureOptions {
+	/** Defaults to `status < 300`, the header-based outcome. */
+	success?: boolean;
+	/** Expose the model through a streamed message_start, not a JSON body. */
+	stream?: boolean;
+	error?: string;
+	streamTerminalState?: EndMessage["streamTerminalState"];
+}
 
 async function capture(
 	model: string,
 	status: number,
 	headers: Record<string, string>,
+	options: CaptureOptions = {},
 ): Promise<string | null> {
 	const ambientUrl = process.env.DATABASE_URL;
 	let db: DatabaseOperations;
@@ -43,7 +53,7 @@ async function capture(
 			project: null,
 			responseStatus: status,
 			responseHeaders: headers,
-			isStream: false,
+			isStream: options.stream === true,
 			providerName: "anthropic",
 			accountBillingType: null,
 			accountAutoPauseOnOverageEnabled: null,
@@ -56,17 +66,33 @@ async function capture(
 			failoverAttempts: 0,
 		};
 		collector.handleStart(start);
-		const body = JSON.stringify({
-			model,
-			content: [{ type: "text", text: "hi" }],
-			usage: { input_tokens: 1, output_tokens: 1 },
-		});
-		await collector.handleEnd({
+		const end: EndMessage = {
 			type: "end",
 			requestId: "r1",
-			success: status < 300,
-			responseBody: Buffer.from(body).toString("base64"),
-		});
+			success: options.success ?? status < 300,
+			...(options.error ? { error: options.error } : {}),
+			...(options.streamTerminalState
+				? { streamTerminalState: options.streamTerminalState }
+				: {}),
+		};
+		if (options.stream) {
+			const sse = `event: message_start\ndata: ${JSON.stringify({
+				type: "message_start",
+				message: {
+					model,
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			})}\n\n`;
+			collector.handleChunk("r1", new TextEncoder().encode(sse));
+		} else {
+			const body = JSON.stringify({
+				model,
+				content: [{ type: "text", text: "hi" }],
+				usage: { input_tokens: 1, output_tokens: 1 },
+			});
+			end.responseBody = Buffer.from(body).toString("base64");
+		}
+		await collector.handleEnd(end);
 		await collector.drain();
 		const row = (await db
 			.getAdapter()
@@ -148,4 +174,43 @@ test("Sonnet 200 leaves the column null", async () => {
 
 test("Fable 429 leaves the column null", async () => {
 	expect(await capture("claude-fable-5", 429, unified(12))).toBeNull();
+});
+
+test("Fable 200 stream that completes stores the unified headers", async () => {
+	const stored = await capture("claude-fable-5", 200, unified(3), {
+		stream: true,
+		success: true,
+		streamTerminalState: "complete",
+	});
+	expect(Object.keys(JSON.parse(stored as string))).toEqual(
+		Object.keys(unified(3)),
+	);
+});
+
+test("pro-gate round 4 P2: Fable 200 stream that ends truncated leaves the column null", async () => {
+	expect(
+		await capture("claude-fable-5", 200, unified(3), {
+			stream: true,
+			success: false,
+			error: "anthropic_incomplete_eof",
+			streamTerminalState: "truncated",
+		}),
+	).toBeNull();
+});
+
+test("pro-gate round 4 P2: Fable 200 stream cancelled by the client leaves the column null", async () => {
+	expect(
+		await capture("claude-fable-5", 200, unified(3), {
+			stream: true,
+			success: false,
+			error: "downstream_cancelled",
+			streamTerminalState: "client_cancelled",
+		}),
+	).toBeNull();
+});
+
+test("pro-gate round 4 P2: Fable 200 non-stream response marked failed leaves the column null", async () => {
+	expect(
+		await capture("claude-fable-5", 200, unified(3), { success: false }),
+	).toBeNull();
 });
