@@ -74,13 +74,23 @@ export const ACCOUNT_WINDOW_CAPS_ENV =
 	"CCFLARE_ACCOUNT_WINDOW_CAPS_JSON" as const;
 const MAX_ACCOUNT_WINDOW_CAPS_JSON_BYTES = 256 * 1024;
 
-function isValidAccountWindowCapKey(key: string): boolean {
-	if (key === "five_hour" || key === "seven_day") return true;
-	// Same rule the usage normalizer applies to scoped weekly keys (scopeForKey).
-	return (
-		key.startsWith("seven_day_") &&
-		getModelFamily(key.slice("seven_day_".length)) !== null
-	);
+/**
+ * What an account_window_caps window key caps: five_hour and seven_day cap the
+ * account, seven_day_<family> caps one model family (the usage normalizer's
+ * scoped-key rule, scopeForKey). Null for any other key.
+ */
+export function parseAccountWindowCapKey(
+	key: string,
+):
+	| { readonly scope: "account"; readonly modelFamily: null }
+	| { readonly scope: "family"; readonly modelFamily: string }
+	| null {
+	if (key === "five_hour" || key === "seven_day") {
+		return { scope: "account", modelFamily: null };
+	}
+	if (!key.startsWith("seven_day_")) return null;
+	const modelFamily = getModelFamily(key.slice("seven_day_".length));
+	return modelFamily ? { scope: "family", modelFamily } : null;
 }
 
 /** Strict, validated cap map; any invalid declaration refuses startup. */
@@ -132,7 +142,7 @@ export function parseAccountWindowCaps(raw: unknown): AccountWindowCaps {
 		}
 		const accountCaps: Record<string, number> = {};
 		for (const [windowKey, percent] of Object.entries(windows)) {
-			if (!isValidAccountWindowCapKey(windowKey)) {
+			if (!parseAccountWindowCapKey(windowKey)) {
 				throw new ValidationError(
 					`account_window_caps: account ${accountId} has unknown window key ${windowKey}`,
 					"account_window_caps",
@@ -1424,6 +1434,10 @@ export function resolveImplicitFallbackPolicyConfig(
 }
 
 export class Config extends EventEmitter {
+	private accountWindowCapsCache: {
+		readonly raw: unknown;
+		readonly caps: AccountWindowCaps;
+	} | null = null;
 	private configPath: string;
 	private data: ConfigData = {};
 
@@ -1443,9 +1457,15 @@ export class Config extends EventEmitter {
 
 	getAccountWindowCaps(): AccountWindowCaps {
 		const fromEnv = process.env[ACCOUNT_WINDOW_CAPS_ENV];
-		return parseAccountWindowCaps(
-			fromEnv !== undefined ? fromEnv : this.data.account_window_caps,
-		);
+		const raw = fromEnv !== undefined ? fromEnv : this.data.account_window_caps;
+		// Routing reads this per candidate; re-parse only when the source changes.
+		if (
+			!this.accountWindowCapsCache ||
+			this.accountWindowCapsCache.raw !== raw
+		) {
+			this.accountWindowCapsCache = { raw, caps: parseAccountWindowCaps(raw) };
+		}
+		return this.accountWindowCapsCache.caps;
 	}
 
 	getAccountWindowCapsSource(): "env" | "file" | "default" {

@@ -1,3 +1,4 @@
+import { parseAccountWindowCapKey } from "@better-ccflare/config";
 import {
 	collectAutoCapacityEvidence,
 	computeWindowStartMs,
@@ -839,7 +840,7 @@ export interface WindowCapExclusion {
 	/** Null when the snapshot is missing, stale, or lacks the capped window. */
 	readonly utilization: number | null;
 	readonly cap: number;
-	readonly reason: "over_cap" | "stale";
+	readonly reason: Extract<WindowCapReason, "over_cap" | "stale">;
 	readonly resetAtMs: number | null;
 	readonly evidenceExpiresAt: number;
 }
@@ -869,14 +870,8 @@ function windowCapTargets(caps: WindowCapMap): WindowCapTarget[] {
 	const targets: WindowCapTarget[] = [];
 	for (const [windowKey, cap] of Object.entries(caps ?? {})) {
 		if (typeof cap !== "number" || !Number.isFinite(cap)) continue;
-		if (windowKey === "five_hour" || windowKey === "seven_day") {
-			targets.push({ windowKey, cap, scope: "account", modelFamily: null });
-		} else if (windowKey.startsWith("seven_day_")) {
-			const modelFamily = getModelFamily(windowKey.slice("seven_day_".length));
-			if (modelFamily) {
-				targets.push({ windowKey, cap, scope: "family", modelFamily });
-			}
-		}
+		const target = parseAccountWindowCapKey(windowKey);
+		if (target) targets.push({ windowKey, cap, ...target });
 	}
 	return targets;
 }
