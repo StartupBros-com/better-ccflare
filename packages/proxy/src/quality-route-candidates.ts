@@ -1120,11 +1120,12 @@ export async function routeQualityRequest(input: {
 					recordSkip(candidate.target.lane, "tools-unsupported");
 					continue;
 				}
-				// A web_search request has other lanes and candidates: a refused
-				// capability (including the other lane having already dispatched) is
-				// a per-candidate skip, never a whole-request failure.
+				// A web_search request has other lanes and candidates, but only the
+				// other lane having already dispatched is a per-candidate skip. Every
+				// other capability refusal keeps the pre-native behaviour below.
 				if (
 					error instanceof ServerToolCandidateCapabilityError &&
+					error.reason === "other_lane_dispatched" &&
 					serverTools &&
 					!nativeRequirement
 				) {

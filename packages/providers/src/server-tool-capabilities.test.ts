@@ -7,6 +7,7 @@ import {
 	deriveNativeAnthropicToolRequirement,
 	deriveServerToolRequirement,
 	indexServerToolCapabilityProofs,
+	isDemotableForcedWebSearchChoice,
 	isNativeWebSearchPassthroughEligible,
 	materializeProviderServerToolCapabilityDecision as materializeDecision,
 	materializeProviderServerToolCapabilityTuple,
@@ -3464,5 +3465,60 @@ describe("isNativeWebSearchPassthroughEligible", () => {
 		expect(
 			deriveNativeAnthropicToolRequirement(body)?.declaredToolTypes,
 		).toEqual(["advisor_20260301"]);
+	});
+});
+
+describe("isDemotableForcedWebSearchChoice", () => {
+	test("accepts exactly {type: tool, name: web_search}", () => {
+		expect(
+			isDemotableForcedWebSearchChoice({
+				tool_choice: { type: "tool", name: "web_search" },
+			}),
+		).toBe(true);
+	});
+
+	test("rejects an extra key such as disable_parallel_tool_use", () => {
+		expect(
+			isDemotableForcedWebSearchChoice({
+				tool_choice: {
+					type: "tool",
+					name: "web_search",
+					disable_parallel_tool_use: true,
+				},
+			}),
+		).toBe(false);
+	});
+
+	test("rejects another tool name", () => {
+		expect(
+			isDemotableForcedWebSearchChoice({
+				tool_choice: { type: "tool", name: "bash" },
+			}),
+		).toBe(false);
+	});
+
+	test("rejects type any and auto", () => {
+		expect(
+			isDemotableForcedWebSearchChoice({
+				tool_choice: { type: "any", name: "web_search" },
+			}),
+		).toBe(false);
+		expect(
+			isDemotableForcedWebSearchChoice({ tool_choice: { type: "auto" } }),
+		).toBe(false);
+	});
+
+	test("rejects null, missing, and non-object shapes", () => {
+		expect(isDemotableForcedWebSearchChoice({ tool_choice: null })).toBe(false);
+		expect(isDemotableForcedWebSearchChoice({})).toBe(false);
+		expect(
+			isDemotableForcedWebSearchChoice({ tool_choice: "web_search" }),
+		).toBe(false);
+		expect(
+			isDemotableForcedWebSearchChoice({ tool_choice: ["tool", "web_search"] }),
+		).toBe(false);
+		expect(isDemotableForcedWebSearchChoice(null)).toBe(false);
+		expect(isDemotableForcedWebSearchChoice("x")).toBe(false);
+		expect(isDemotableForcedWebSearchChoice(undefined)).toBe(false);
 	});
 });

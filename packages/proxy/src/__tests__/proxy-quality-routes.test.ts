@@ -2703,6 +2703,38 @@ describe("prewarmed native catalogs", () => {
 				spy.mockRestore();
 			}
 		});
+		it("keeps attempt-unavailable for a capability error that is not the other-lane skip", async () => {
+			const provider = getProvider("anthropic");
+			if (!provider?.transformRequestBody)
+				throw new Error("missing native provider");
+			const transform = provider.transformRequestBody.bind(provider);
+			let refused = 0;
+			let calls = 0;
+			const spy = spyOn(provider, "transformRequestBody").mockImplementation(
+				async (...args) => {
+					calls++;
+					if (refused++ === 0)
+						throw new ServerToolCandidateCapabilityError({
+							accountId: "a",
+							candidateId: "synthetic",
+							reason: "proof_drift",
+						});
+					return transform(...args);
+				},
+			);
+			try {
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				expect(response.status).toBe(503);
+				await response.text();
+				// No further candidate is tried or served after a non-lane refusal.
+				expect(calls).toBe(1);
+				expect(sends).toHaveLength(0);
+			} finally {
+				spy.mockRestore();
+			}
+		});
 	});
 	it("quota exhaustion during preparation blocks the physical send even with manual throttles disabled", async () => {
 		const provider = getProvider("anthropic");

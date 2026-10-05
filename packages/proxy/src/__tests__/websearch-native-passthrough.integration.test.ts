@@ -460,7 +460,12 @@ describe("native web_search passthrough dispatch", () => {
 		}
 	});
 
-	it("never forwards a stale content-length after demoting the forced choice", async () => {
+	// Hygiene pin, not a red-first fix: it passes with the delete in
+	// demoteForcedWebSearchChoice removed, because transformRequestBodyModel's
+	// rebuild (model-mapping.ts readBodyForTransform) already drops the inbound
+	// content-length before dispatch. The delete is defence in depth; this
+	// asserts the wire property either way (no header, or one matching the body).
+	it("hygiene pin: upstream never receives a stale content-length after demotion", async () => {
 		const { ctx } = makeContext([makeAccount()]);
 		const calls = installFetch(() => jsonOk());
 		const { request, clientBody } = makeHelperRequest({

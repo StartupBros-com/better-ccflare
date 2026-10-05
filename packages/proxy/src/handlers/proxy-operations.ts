@@ -45,6 +45,7 @@ import {
 	isAnthropicOutOfCredits,
 	isCodexResponseIdRejectionError,
 	isCodexSubscriptionEndpoint,
+	isDemotableForcedWebSearchChoice,
 	isNativeWebSearchPassthroughEligible,
 	materializeProviderAttemptPlan,
 	materializeProviderServerToolCapabilityDecision,
@@ -3261,6 +3262,14 @@ export async function proxyWithAccount(
 				throw candidateCapabilityError("other_lane_dispatched");
 			}
 			if (nativeWebSearchLane) return null;
+			// Defence in depth, untested: a request whose replay range failed to bind
+			// may only be served natively. Selection already marks hosted candidates
+			// replay-ineligible in that case, and a failed bind leaves no
+			// request-private replay authority, so the `!replay` check below throws
+			// the same error. No current route reaches this line; it only keeps a
+			// future dispatch path from sending hosted work without replay authority.
+			if (requestMeta.serverToolReplayBound === false)
+				throw candidateCapabilityError("replay_unavailable");
 			if (!physicalModel) throw candidateCapabilityError("tuple_unavailable");
 
 			const currentProvider = resolveProviderForAccount(
@@ -4270,14 +4279,9 @@ export async function proxyWithAccount(
 			} catch {
 				return transportRequest;
 			}
-			const choice = body.tool_choice;
 			if (
 				typeof body.model !== "string" ||
-				typeof choice !== "object" ||
-				choice === null ||
-				Object.keys(choice).length !== 2 ||
-				(choice as { type?: unknown }).type !== "tool" ||
-				(choice as { name?: unknown }).name !== "web_search" ||
+				!isDemotableForcedWebSearchChoice(body) ||
 				supportsForcedToolChoice(body.model)
 			) {
 				return transportRequest;

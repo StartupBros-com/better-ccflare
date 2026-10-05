@@ -557,6 +557,27 @@ export function isNativeWebSearchPassthroughEligible(
 	);
 }
 
+/**
+ * The one forced choice the native web_search lane demotes to `auto` at
+ * dispatch: `tool_choice` is exactly `{type: "tool", name: "web_search"}` (two
+ * keys, so `disable_parallel_tool_use` or any other key keeps the veto).
+ * Admission and dispatch share this so they cannot disagree on what is
+ * rewritten.
+ */
+export function isDemotableForcedWebSearchChoice(body: unknown): boolean {
+	if (typeof body !== "object" || body === null || Array.isArray(body))
+		return false;
+	const choice = (body as { tool_choice?: unknown }).tool_choice;
+	if (typeof choice !== "object" || choice === null || Array.isArray(choice))
+		return false;
+	const keys = Object.keys(choice);
+	return (
+		keys.length === 2 &&
+		(choice as { type?: unknown }).type === "tool" &&
+		(choice as { name?: unknown }).name === "web_search"
+	);
+}
+
 export function deriveServerToolRequirement(
 	body: unknown,
 	options: DeriveServerToolRequirementOptions = {},

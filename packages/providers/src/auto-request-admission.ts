@@ -20,6 +20,7 @@ import {
 import {
 	deriveNativeAnthropicToolRequirement,
 	deriveServerToolRequirement,
+	isDemotableForcedWebSearchChoice,
 	isNativeWebSearchPassthroughEligible,
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
@@ -528,21 +529,6 @@ function hostedToolsDecision(
 		return { status: "unknown", reason: "tools-unsupported" };
 	}
 	return null;
-}
-
-/** The one forced choice the native web_search lane demotes to `auto` at
- * dispatch (proxy-operations demoteForcedWebSearchChoice): exactly
- * `{type: "tool", name: "web_search"}`. Admission must not refuse what dispatch
- * will rewrite; every other forced choice keeps the veto.
- */
-function isDemotableForcedWebSearchChoice(body: unknown): boolean {
-	const choice = record(record(body)?.tool_choice);
-	return (
-		choice !== null &&
-		Object.keys(choice).length === 2 &&
-		choice.type === "tool" &&
-		choice.name === "web_search"
-	);
 }
 
 /** Native Anthropic pass-through. Stock routing applies no request-shape,
