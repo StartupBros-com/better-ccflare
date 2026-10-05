@@ -31,7 +31,7 @@ tags:
 
 ## Problem
 
-Claude Code's WebSearch tool sends a helper request: `POST /v1/messages?beta=true` with the main-loop model, one user message `Perform a web search for the query: ...`, `thinking: {type: "disabled"}`, `tool_choice: {type: "tool", name: "web_search"}`, no client tools, and one tool `{type: "web_search_20250305", name: "web_search", max_uses: 8, search_profile?: "fast", allowed_domains?, blocked_domains?}` (read from the Claude Code 2.1.289 binary). The proxy refused it before any send, although `api.anthropic.com` executes that tool itself (refs #279, #282, #431, #432).
+Claude Code's WebSearch tool sends a helper request: `POST /v1/messages?beta=true` with the main-loop model, one user message `Perform a web search for the query: ...`, `thinking: {type: "disabled"}`, `tool_choice: {type: "tool", name: "web_search"}`, no client tools, and one tool `{type: "web_search_20250305", name: "web_search", max_uses: 8, search_profile?: "fast", allowed_domains?, blocked_domains?}` (read from the Claude Code 2.1.289 binary). `search_profile: "fast"` is conditional: the client sends it only when the tool input's `mode` is `"standard"` and its web-search-mode config is enabled (the `tengu_sleepy_shore` flag or `CLAUDE_CODE_WEB_SEARCH_FAST_ARG`). "Main-loop model" means the session's `/model` choice as sent, so in a session on a route profile the helper's model is the picker id `claude-bccf-route-<id>`. The proxy refused it before any send, although `api.anthropic.com` executes that tool itself (refs #279, #282, #431, #432).
 
 The design is in [routing-architecture.md, "Hosted WebSearch routing contract"](../../routing-architecture.md#hosted-websearch-routing-contract) and [CONCEPTS.md](../../../CONCEPTS.md). This doc covers how it looked, what did not work, and how to check it in production.
 
@@ -43,7 +43,7 @@ The design is in [routing-architecture.md, "Hosted WebSearch routing contract"](
 ## What Didn't Work
 
 - **PR #282, the honest error only.** It replaced a misleading failure with the typed `no_implementation` refusal and deferred "implementing Anthropic native-passthrough capability tuples". The refusal was accurate for the pool as modelled, but the pool model was wrong, so every helper request still failed.
-- **Hosted proof for Anthropic.** A candidate counted only when its provider built a capability tuple. Only Codex does, and only with a `claude-* -> gpt-5.6-sol` mapping that production does not have. The anthropic provider has no capability hooks, so `provenCandidateCount` stayed 0 in `capabilityPoolErrorReason`.
+- **Hosted proof for Anthropic.** A candidate counted only when its provider built a capability tuple. Only Codex does, and only for physical model `gpt-5.6-sol` (`CODEX_SERVER_TOOL_MODEL` in `packages/providers/src/providers/codex/server-tools.ts`). Production Codex accounts serve `gpt-6-astra`, `gpt-6.1-sol` and `gpt-6-sol`, so the hosted lane can prove no current Codex account, whatever the declaration carries. The database records no hosted web_search success. The anthropic provider has no capability hooks, so `provenCandidateCount` stayed 0 in `capabilityPoolErrorReason`.
 - **Reusing the advisor machinery.** `NATIVE_ANTHROPIC_ONLY_EXCLUSION` and `nativeAnthropicToolRequirement` make a tool first-party only. Applied to web_search they would also strip the Codex hosted lane, so web_search got its own predicate instead.
 
 ## Solution
@@ -60,25 +60,32 @@ web_search has two lanes: the proven hosted lane (Codex, unchanged and fail-clos
 
 ### Findings behind the design
 
-- **Forced tool_choice.** Anthropic's docs ("Forcing tool use") reject `tool_choice` `any` or `tool` with a 400 on Opus 5.5, Sonnet 5.5 and Fable 5.1, with no server-tool exemption. Claude Code 2.1.289 demotes a forced choice only when extended thinking is on, and the helper sends `thinking: disabled`, so it sends the forced choice on exactly those models. On the native lane the proxy rewrites a `tool_choice` that is exactly `{type: "tool", name: "web_search"}` to `{type: "auto"}` when `supportsForcedToolChoice` is false for the model actually sent (`demoteForcedWebSearchChoice` in `proxy-operations.ts`), and logs once per request at warn level. Other forced choices pass through. Auto admission accepts only that demotable shape. `supportsForcedToolChoice` matches the three undated ids exactly, so a dated or suffixed alias of those models would reach Anthropic undemoted and get its visible 400. Neither the repo nor the production helper rows carry such an alias today. The function is shared with three other callers (the Responses translator, Auto admission and the agent interceptor), so widening its match belongs to its own change.
+- **Forced tool_choice.** Anthropic's docs ("Forcing tool use") reject `tool_choice` `any` or `tool` with a 400 on Opus 5.5, Sonnet 5.5 and Fable 5.1, with no server-tool exemption. Claude Code 2.1.289 demotes a forced choice to `auto` itself when thinking is on, and also when the helper asks for disabled thinking on a model whose client capability table carries `rejects_disabled_thinking`: it then omits `thinking` and sends `auto`. Opus 5.5, Sonnet 5.5, Fable 5, Fable 5.1 and Mythos 5.1 carry that tag. This was read from the binary, not observed on the wire. So for a helper whose model is one of those, the client already sends `auto`, and the proxy logs nothing. The proxy's demotion is the backstop for a helper whose model the proxy changes before sending, for example through an account model mapping, a route profile's `logicalModel` or a combo. On the native lane the proxy rewrites a `tool_choice` that is exactly `{type: "tool", name: "web_search"}` to `{type: "auto"}` when `supportsForcedToolChoice` is false for the model actually sent (`demoteForcedWebSearchChoice` in `proxy-operations.ts`), and logs once per request at warn level. Other forced choices pass through. Auto admission accepts only that demotable shape. `supportsForcedToolChoice` matches the three undated ids exactly, so a dated or suffixed alias of those models would reach Anthropic undemoted and get its visible 400. Neither the repo nor the production helper rows carry such an alias today. The function is shared with three other callers (the Responses translator, Auto admission and the agent interceptor), so widening its match belongs to its own change.
 - **`search_profile`.** The helper may send `search_profile: "fast"`. Before this fix the field made the declaration invalid options. It now derives as a valid hosted requirement that Codex still refuses to prove, so such requests are servable only on the native lane.
 - **Replay keyring.** Production has `CCFLARE_SERVER_TOOL_REPLAY_KEYS_FILE`, so the replay bind succeeds and the bind-failure path is a degraded case. A natively served request still binds and burns one counter range it never uses; the claimant is an in-memory closure, so no lease is left outstanding.
 
 ## Verification
 
-No scripted request may reach a real Anthropic account (`AGENTS.md`). Tests use fake upstreams only (`websearch-native-passthrough.integration.test.ts`). After deploy, the operator runs one interactive WebSearch in Claude Code, then reads read-only:
+No scripted request may reach a real Anthropic account (`AGENTS.md`). Tests use fake upstreams only (`websearch-native-passthrough.integration.test.ts`). After deploy, the operator runs one interactive WebSearch in Claude Code, then checks it read-only.
+
+**Served helpers carry no marker in `requests`.** Only a refusal records the routing decision (`routing_attempt_summary.decision.origin = "trusted_helper"`). A served helper stores the plain attempt summary, and production stores no request payloads. Do not count served helpers by token shape either: "large uncached input, no cache, one attempt" also matches WebFetch's summarizer requests. Start from the transcript instead:
+
+1. Find the WebSearch `tool_use` in the session transcript (`~/.claude/projects/<project>/<session>.jsonl`, plus `<session>/subagents/**/agent-*.jsonl` for subagents and workflow agents).
+2. Its `tool_result` shows `Web search results for query: ...` with links when served, or `API Error: 400 No configured provider route implements the requested server-tool semantics` when refused.
+3. The proxy row is the session's `/v1/messages` row that starts when that assistant turn ends (`agent_used` is the session id).
+
+Refusals, including those in route-profile sessions, can be counted directly:
 
 ```sql
 -- sqlite3 -readonly ~/.config/better-ccflare/better-ccflare.db
-SELECT datetime(timestamp/1000,'unixepoch','localtime') t, model, account_used, status_code, error_message
+SELECT date(timestamp/1000,'unixepoch','localtime') d, coalesce(route_profile_id,'-') profile,
+       substr(error_message,1,40) err, count(*)
 FROM requests
-WHERE routing_attempt_summary LIKE '%trusted_helper%'
-ORDER BY timestamp DESC LIMIT 10;
+WHERE error_message LIKE '%server_tool%'
+GROUP BY 1,2,3 ORDER BY 1 DESC LIMIT 20;
 ```
 
-The helper row should have an `account_used`, `status_code = 200` and no `server_tool_*` error. The Claude Code transcript for that turn must show real search results (`Web search results for query: ...` with links).
-
-**Falsification observation.** A 200 helper row with no search results in the transcript would mean the `auto` demotion degraded the helper. The fallback design is then to forward the forced choice unchanged and retry once with `auto` on Anthropic's forced-tool-use 400. Only the operator can make that observation, and until then the demotion is unconfirmed live.
+**Falsification observation.** A 200 helper row with no search results in the transcript would mean the `auto` demotion degraded the helper. The fallback design is then to forward the forced choice unchanged and retry once with `auto` on Anthropic's forced-tool-use 400. Live, as of 2026-10-05 at `023a82f2`: one interactive Opus 5.5 WebSearch returned real results. The journal (`LOG_LEVEL=warn`) has no `Demoted forced web_search` line for it, which matches the client sending `auto` itself on that model (see the forced tool_choice finding above). So an `auto` choice has served a real search once, but the proxy's own demotion has not been seen firing live.
 
 ## Prevention
 

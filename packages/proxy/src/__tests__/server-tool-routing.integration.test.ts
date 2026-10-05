@@ -28,6 +28,7 @@ import {
 } from "../model-route-profiles";
 
 // Focused proxy tests must not load ignored embedded worker artifacts.
+const { supportsForcedToolChoice } = await import("@better-ccflare/core");
 const { buildServerToolCapabilityProofKey, getProvider, usageCache } =
 	await import("@better-ccflare/providers");
 const { selectAccountsForRequest } = await import(
@@ -297,6 +298,8 @@ function makeServerToolRequest(
 	options: {
 		invalid?: boolean;
 		agentId?: string;
+		claudeCodeAgentId?: string;
+		sessionId?: string;
 		forcedAccountId?: string;
 		model?: string;
 		query?: string;
@@ -310,13 +313,19 @@ function makeServerToolRequest(
 	});
 	if (options.replayIdentity !== "missing") {
 		headers.set("authorization", "Bearer server-tool-test-client");
-		headers.set("x-claude-code-session-id", "server-tool-test-session");
+		headers.set(
+			"x-claude-code-session-id",
+			options.sessionId ?? "server-tool-test-session",
+		);
 	}
 	if (options.replayIdentity === "ambiguous") {
 		headers.set("x-api-key", "second-server-tool-test-client");
 	}
 	if (options.agentId) {
 		headers.set("x-better-ccflare-agent-id", options.agentId);
+	}
+	if (options.claudeCodeAgentId) {
+		headers.set("x-claude-code-agent-id", options.claudeCodeAgentId);
 	}
 	if (options.forcedAccountId) {
 		headers.set("x-better-ccflare-account-id", options.forcedAccountId);
@@ -2680,5 +2689,279 @@ describe("advisor native-only selection through handleProxy", () => {
 				(call) => call[0] as Account[],
 			),
 		).toEqual([]);
+	});
+});
+
+describe("route-profile WebSearch helper falls to the global proven lane", () => {
+	const PROFILE_ID = "helper-soft-profile";
+	const PICKER = `claude-bccf-route-${PROFILE_ID}`;
+	const PHYSICAL = "gpt-5.6-sol";
+	const ROOT_BODY = {
+		messages: [{ role: "user", content: "establish" }],
+		max_tokens: 16,
+	};
+
+	function makeNativeAccount(): Account {
+		return makeAccount({
+			id: "first-party-anthropic",
+			name: "first-party-anthropic",
+			provider: "anthropic",
+			priority: 10,
+			custom_endpoint: null,
+			model_mappings: null,
+			access_token: "anthropic-oauth-token",
+			expires_at: Date.now() + 60 * 60_000,
+		});
+	}
+
+	// The pool account has no hosted proof, so the profile cannot serve a
+	// web_search helper itself; only the global lane can.
+	function makeSoftProfileHarness(
+		logicalModel = "claude-opus-5",
+		withNative = true,
+	) {
+		const pool = makeAccount({
+			id: "helper-pool-account",
+			name: "helper-pool-account",
+			access_token: "pool-token",
+			expires_at: Date.now() + 60 * 60_000,
+			model_mappings: JSON.stringify({ opus: PHYSICAL, sonnet: MODEL }),
+		});
+		const accounts = withNative ? [pool, makeNativeAccount()] : [pool];
+		const harness = makeContext(accounts);
+		harness.ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: PROFILE_ID,
+						displayName: "Helper soft profile",
+						selection: "capability",
+						logicalModel,
+						expectedProvider: "capability-test",
+						expectedPhysicalModel: PHYSICAL,
+					},
+				]),
+			),
+		);
+		const calls: { url: string; body: Record<string, unknown> }[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			calls.push({
+				url: request.url,
+				body: (await request.clone().json()) as Record<string, unknown>,
+			});
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		return { ...harness, calls, accounts };
+	}
+
+	async function sendRoot(
+		ctx: ProxyContext,
+		model: string,
+		sessionId = "server-tool-test-session",
+	): Promise<Response> {
+		const root = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer server-tool-test-client",
+				"x-claude-code-session-id": sessionId,
+			},
+			body: JSON.stringify({ model, ...ROOT_BODY }),
+		});
+		return handleProxy(root, new URL(root.url), ctx, "key-1");
+	}
+
+	async function sendHelper(
+		ctx: ProxyContext,
+		options: Parameters<typeof makeServerToolRequest>[0],
+	): Promise<Response> {
+		const helper = makeServerToolRequest({
+			claudeCodeForcedChoice: true,
+			query: "beta=true",
+			...options,
+		});
+		return handleProxy(helper, new URL(helper.url), ctx, "key-1");
+	}
+
+	function expectServedNatively(
+		calls: { url: string; body: Record<string, unknown> }[],
+		sentModelOverride?: string,
+	): void {
+		const native = calls.slice(1);
+		expect(native).toHaveLength(1);
+		const url = new URL(native[0]?.url ?? "");
+		expect(url.host).toBe("api.anthropic.com");
+		expect(url.searchParams.get("beta")).toBe("true");
+		const body = native[0]?.body ?? {};
+		const model = String(body.model);
+		expect(model.startsWith("claude-")).toBe(true);
+		if (sentModelOverride) expect(model).toBe(sentModelOverride);
+		expect(body.tools).toEqual([
+			expect.objectContaining({ type: "web_search_20250305" }),
+		]);
+		const choice = body.tool_choice as { type: string; name?: string };
+		if (supportsForcedToolChoice(model)) {
+			expect(choice).toEqual({ type: "tool", name: "web_search" });
+		} else {
+			expect(choice).toEqual({ type: "auto" });
+		}
+	}
+
+	it("serves a picker-model helper natively when the profile pool has no hosted proof", async () => {
+		const { ctx, calls } = makeSoftProfileHarness();
+		expect((await sendRoot(ctx, PICKER)).status).toBe(200);
+
+		const response = await sendHelper(ctx, { model: PICKER });
+
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(2);
+		expectServedNatively(calls, "claude-opus-5");
+	});
+
+	it("serves a subagent helper inheriting the binding natively, with the profile logical model", async () => {
+		const { ctx, calls } = makeSoftProfileHarness();
+		expect((await sendRoot(ctx, PICKER)).status).toBe(200);
+
+		const response = await sendHelper(ctx, {
+			model: "claude-opus-5-5",
+			claudeCodeAgentId: "agent-1",
+		});
+
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(2);
+		expectServedNatively(calls, "claude-opus-5");
+	});
+
+	it("serves a subagent helper that uses the picker model natively", async () => {
+		const { ctx, calls } = makeSoftProfileHarness();
+		expect((await sendRoot(ctx, PICKER)).status).toBe(200);
+
+		const response = await sendHelper(ctx, {
+			model: PICKER,
+			claudeCodeAgentId: "agent-1",
+		});
+
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(2);
+		expectServedNatively(calls, "claude-opus-5");
+	});
+
+	it("demotes the forced choice only when the sent model rejects it", async () => {
+		const { ctx, calls } = makeSoftProfileHarness("claude-opus-5-5");
+		expect((await sendRoot(ctx, PICKER)).status).toBe(200);
+
+		const response = await sendHelper(ctx, { model: PICKER });
+
+		expect(response.status).toBe(200);
+		expectServedNatively(calls, "claude-opus-5-5");
+		expect((calls[1]?.body.tool_choice as { type: string }).type).toBe("auto");
+	});
+
+	it("keeps a legacy exact-account profile fail-closed for a picker-model helper", async () => {
+		const exact = makeAccount({
+			id: "exact-profile-account",
+			name: "exact-profile-account",
+			access_token: "exact-token",
+			expires_at: Date.now() + 60 * 60_000,
+		});
+		const { ctx, calls } = makeSoftProfileHarness();
+		ctx.dbOps.getAllAccounts = mock(async () => [exact, makeNativeAccount()]);
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "exact-helper-profile",
+						displayName: "Exact helper profile",
+						accountId: exact.id,
+						logicalModel: MODEL,
+						expectedProvider: exact.provider,
+					},
+				]),
+			),
+		);
+		const exactPicker = "claude-bccf-route-exact-helper-profile";
+		calls.length = 0;
+
+		const response = await sendHelper(ctx, { model: exactPicker });
+		const body = (await response.json()) as {
+			error: { type: string; reason: string };
+		};
+
+		expect(response.status).toBe(503);
+		expect(body.error).toMatchObject({
+			type: "force_route_unavailable",
+			reason: "forced_incapable",
+		});
+		expect(response.headers.get("x-better-ccflare-force-route")).toBe(
+			"unavailable",
+		);
+		expect(calls).toHaveLength(0);
+	});
+
+	it("does not let a served helper rebind the session or disturb the next root", async () => {
+		const { ctx, calls } = makeSoftProfileHarness();
+		const other = "claude-bccf-route-helper-other-profile";
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: PROFILE_ID,
+						displayName: "Helper soft profile",
+						selection: "capability",
+						logicalModel: "claude-opus-5",
+						expectedProvider: "capability-test",
+						expectedPhysicalModel: PHYSICAL,
+					},
+					{
+						id: "helper-other-profile",
+						displayName: "Other helper profile",
+						selection: "capability",
+						logicalModel: "claude-opus-5-5",
+						expectedProvider: "capability-test",
+						expectedPhysicalModel: PHYSICAL,
+					},
+				]),
+			),
+		);
+
+		// A helper naming another profile is not a root choice: it must not rebind
+		// the session away from the profile the last root picked.
+		expect((await sendRoot(ctx, PICKER)).status).toBe(200);
+		expect((await sendHelper(ctx, { model: other })).status).toBe(200);
+		calls.length = 0;
+		const stillBound = await sendHelper(ctx, {
+			model: "claude-sonnet-5-5",
+			claudeCodeAgentId: "agent-1",
+		});
+		expect(stillBound.status).toBe(200);
+		expect(String(calls[0]?.body.model)).toBe("claude-opus-5");
+
+		// explicit root -> helper -> native root clears the binding.
+		expect((await sendHelper(ctx, { model: PICKER })).status).toBe(200);
+		expect((await sendRoot(ctx, MODEL)).status).toBe(200);
+		calls.length = 0;
+		const cleared = await sendHelper(ctx, {
+			model: "claude-opus-5-5",
+			claudeCodeAgentId: "agent-1",
+		});
+		expect(cleared.status).toBe(200);
+		// No binding is left to inherit, so the body model is not rewritten to
+		// the profile's logical model.
+		expect(String(calls.at(-1)?.body.model)).toBe("claude-opus-5-5");
+
+		// native root -> helper -> explicit root binds the new profile.
+		expect((await sendHelper(ctx, { model: PICKER })).status).toBe(200);
+		expect((await sendRoot(ctx, other)).status).toBe(200);
+		calls.length = 0;
+		const bound = await sendHelper(ctx, {
+			model: "claude-sonnet-5-5",
+			claudeCodeAgentId: "agent-1",
+		});
+		expect(bound.status).toBe(200);
+		expect(String(calls[0]?.body.model)).toBe("claude-opus-5-5");
 	});
 });

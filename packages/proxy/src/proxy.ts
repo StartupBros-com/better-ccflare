@@ -1297,6 +1297,12 @@ async function handleProxyCoreImpl(
 			? requestBodyContext
 			: new RequestBodyContext(finalBodyBuffer);
 	requestMeta.agentAttributionSource = agentAttributionSource;
+	const isCountHelper = url.pathname === "/v1/messages/count_tokens";
+	// The quality route runs before profile resolution, so the helper preview is
+	// taken here: a server-tool helper never commits root intent on either path.
+	const serverToolPreview = isCountHelper
+		? undefined
+		: finalRequestBodyContext.previewServerToolRequirements();
 	const qualityResponse = await routeQualityRequest({
 		req,
 		url,
@@ -1309,6 +1315,7 @@ async function handleProxyCoreImpl(
 		requirements: qualityRequirements,
 		serverToolQueryPresent: hasServerToolCapabilityQuery(url),
 		onRootAccepted: () =>
+			serverToolPreview === undefined &&
 			modelRouteRegistry?.commitNative(
 				{
 					callerIdentity: routeCallerIdentity(req, apiKeyId),
@@ -1338,19 +1345,22 @@ async function handleProxyCoreImpl(
 		effectiveModelAfterInterception !== null &&
 		modelRouteRegistry?.hasPublicModelId(effectiveModelAfterInterception) ===
 			true;
-	const isCountHelper = url.pathname === "/v1/messages/count_tokens";
-	const serverToolPreview = isCountHelper
-		? undefined
-		: finalRequestBodyContext.previewServerToolRequirements();
-	const isServerToolHelper =
-		serverToolPreview !== undefined &&
-		!isSubagent &&
-		!configuredOriginalPicker &&
-		!configuredEffectivePicker;
-	const inheritsRouteProfile = isSubagent || isServerToolHelper;
+	// Lineage is decoupled from profile resolution: any request declaring a
+	// hosted server tool is a helper (it commits no root intent, creates no
+	// home, and may fall to the global proven lane under a soft profile), even
+	// when it carries a picker model or child markers.
+	const isServerToolHelper = serverToolPreview !== undefined;
 	if (isServerToolHelper) {
 		requestMeta.routeLineage = { kind: "helper", childHomeKey: null };
 	}
+	// Resolution is unchanged: a picker-model helper resolves as an explicit
+	// profile by its picker id, a subagent helper inherits as a child, and only
+	// a stock-model, non-subagent helper inherits the session binding here.
+	const inheritsRouteProfile =
+		isSubagent ||
+		(isServerToolHelper &&
+			!configuredOriginalPicker &&
+			!configuredEffectivePicker);
 	// A stale picker selected directly in /model is not a native clear. Children,
 	// however, are classified entirely by their post-interception effective model.
 	if (!isSubagent && originalReservedPicker && !configuredOriginalPicker) {
@@ -2947,7 +2957,12 @@ async function handleProxyCoreImpl(
 		return finishPacing(pacingSlot, terminal.response);
 	}
 
+	// A helper never commits or clears root intent; its reservation is withdrawn
+	// by handleProxy's finally. A helper that resolves natively already resolved
+	// as a child (commitNative ignores it); the gate keeps both arms explicit.
+	const commitsRootIntent = requestMeta.routeLineage?.kind !== "helper";
 	if (
+		commitsRootIntent &&
 		modelRouteResolution?.kind === "route" &&
 		modelRouteResolution.source === "explicit" &&
 		(modelRouteResolution.profile.selection === "capability"
@@ -2961,7 +2976,11 @@ async function handleProxyCoreImpl(
 			modelRouteResolutionInput,
 			modelRouteResolution,
 		);
-	} else if (modelRouteResolution?.kind === "native" && accounts.length > 0) {
+	} else if (
+		commitsRootIntent &&
+		modelRouteResolution?.kind === "native" &&
+		accounts.length > 0
+	) {
 		modelRouteRegistry?.commitNative(
 			modelRouteResolutionInput,
 			modelRouteResolution,
