@@ -481,7 +481,7 @@ export async function routeQualityRequest(input: {
 		return unavailable("conflicting-quality-id", 400);
 	const reserved = model?.startsWith(QUALITY_MODEL_PREFIX) === true;
 	const policy = ctx.config.getQualityRoutingPolicy?.();
-	// Re-parsed per call, so read once per request and share across every site.
+	// Read once per request and shared across every site.
 	const accountWindowCaps = ctx.config.getAccountWindowCaps?.();
 	const service = ctx.qualityRouteService;
 	const preference = policy?.choices.find(

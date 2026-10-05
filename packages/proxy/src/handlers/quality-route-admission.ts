@@ -60,7 +60,7 @@ export function evaluateAccountWindowCapAdmission(input: {
 	readonly caps: AccountWindowCaps | null | undefined;
 }): QualityAdmissionDecision | null {
 	const exclusions = evaluateWindowCaps(
-		input.snapshot as Parameters<typeof evaluateWindowCaps>[0],
+		input.snapshot,
 		input.caps?.[input.accountId],
 		{ requestModel: input.requestModel },
 	);

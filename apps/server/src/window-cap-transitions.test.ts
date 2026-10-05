@@ -3,8 +3,8 @@ import { findUnknownAccountWindowCapIds } from "@better-ccflare/config";
 import type { UsageSnapshot } from "@better-ccflare/providers";
 import { getWindowCapStates } from "@better-ccflare/proxy/usage-throttling";
 import {
+	unevaluableWindowCapWarnings,
 	unknownWindowCapWarnings,
-	unsupportedProviderWindowCapWarnings,
 	WindowCapTransitionTracker,
 } from "./window-cap-transitions";
 
@@ -142,6 +142,27 @@ describe("WindowCapTransitionTracker", () => {
 		expect(leaks(poll(tracker, 90, cycle2, later))).toHaveLength(1);
 	});
 
+	it("still warns about a leak for a cap within 10 points of 100", () => {
+		const tracker = new WindowCapTransitionTracker();
+		const resetsAt = now + 24 * HOUR;
+		const at = (percent: number) =>
+			tracker.observe(
+				"acct-1",
+				"protected",
+				getWindowCapStates(
+					{
+						data: liveData(percent, resetsAt),
+						observedAt: now,
+					} as unknown as UsageSnapshot,
+					{ seven_day_fable: 95 },
+					{ now },
+				),
+			);
+		expect(at(96).map((e) => e.kind)).toEqual(["engaged"]);
+		expect(at(100).map((e) => e.kind)).toEqual(["cap-leak"]);
+		expect(at(100)).toEqual([]);
+	});
+
 	it("does not warn about a leak when the window is not engaged", () => {
 		const tracker = new WindowCapTransitionTracker();
 		expect(
@@ -172,30 +193,52 @@ describe("startup unknown-account warning", () => {
 	});
 });
 
-describe("startup unsupported-provider warning", () => {
-	it("warns for a capped account whose provider reports no Anthropic usage windows", () => {
-		const warnings = unsupportedProviderWindowCapWarnings(
-			{ "zai-1": { seven_day: 90 }, "acct-1": { seven_day_fable: 80 } },
-			[
-				{ id: "zai-1", name: "zai-main", provider: "zai" },
-				{ id: "acct-1", name: "protected", provider: "anthropic" },
-				{ id: "codex-1", name: "codex-main", provider: "codex" },
-			],
-		);
-		expect(warnings).toHaveLength(1);
-		expect(warnings[0]).toContain("zai-main");
-		expect(warnings[0]).toContain("zai");
+describe("startup unevaluable-cap warning", () => {
+	// Stand-in for the server's accountSupportsRefreshBackedUsagePolling:
+	// a Codex account on a custom endpoint is not polled.
+	const polled = (account: { custom_endpoint?: string | null }) =>
+		!account.custom_endpoint;
+	const caps = {
+		"zai-1": { seven_day: 90 },
+		"codex-custom": { seven_day: 90 },
+		"no-token": { seven_day_fable: 80 },
+		"acct-1": { seven_day_fable: 80 },
+		"codex-1": { seven_day: 90 },
+	};
+	const accounts = [
+		{ id: "zai-1", name: "zai-main", provider: "zai", access_token: "t" },
+		{
+			id: "codex-custom",
+			name: "codex-custom",
+			provider: "codex",
+			custom_endpoint: "https://openai-compatible.example",
+			access_token: "t",
+		},
+		{ id: "no-token", name: "no-token", provider: "anthropic" },
+		{
+			id: "acct-1",
+			name: "protected",
+			provider: "anthropic",
+			refresh_token: "r",
+		},
+		{ id: "codex-1", name: "codex-main", provider: "codex", access_token: "t" },
+		{ id: "uncapped", name: "uncapped", provider: "zai" },
+	];
+
+	it("warns once for each capped account whose cap windows are never polled", () => {
+		const warnings = unevaluableWindowCapWarnings(caps, accounts, polled);
+		expect(warnings).toHaveLength(3);
+		expect(warnings.join("\n")).toContain("zai-main");
+		expect(warnings.join("\n")).toContain("codex-custom");
+		expect(warnings.join("\n")).toContain("no-token");
 	});
 
-	it("does not warn for capped Anthropic and Codex accounts", () => {
-		expect(
-			unsupportedProviderWindowCapWarnings(
-				{ "acct-1": { seven_day_fable: 80 }, "codex-1": { seven_day: 90 } },
-				[
-					{ id: "acct-1", name: "protected", provider: "anthropic" },
-					{ id: "codex-1", name: "codex-main", provider: "codex" },
-				],
-			),
-		).toEqual([]);
+	it("does not warn for polled Anthropic and Codex accounts or uncapped ones", () => {
+		const warnings = unevaluableWindowCapWarnings(caps, accounts, polled).join(
+			"\n",
+		);
+		expect(warnings).not.toContain("protected");
+		expect(warnings).not.toContain("codex-main");
+		expect(warnings).not.toContain("uncapped");
 	});
 });

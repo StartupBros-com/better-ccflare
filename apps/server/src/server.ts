@@ -142,8 +142,8 @@ import {
 	unregisterServerLifecycleCallbacks,
 } from "./usage-polling-lifecycle";
 import {
+	unevaluableWindowCapWarnings,
 	unknownWindowCapWarnings,
-	unsupportedProviderWindowCapWarnings,
 	WindowCapTransitionTracker,
 } from "./window-cap-transitions";
 
@@ -2678,7 +2678,11 @@ Available endpoints:
 					accounts.map((a) => a.id),
 				),
 			),
-			...unsupportedProviderWindowCapWarnings(windowCaps, accounts),
+			...unevaluableWindowCapWarnings(
+				windowCaps,
+				accounts,
+				accountSupportsRefreshBackedUsagePolling,
+			),
 		])
 			log.warn(message);
 	} catch (err) {

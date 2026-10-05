@@ -71,7 +71,9 @@ export class WindowCapTransitionTracker {
 			if (
 				state.engaged &&
 				state.utilization !== null &&
-				state.utilization >= state.cap + WINDOW_CAP_LEAK_MARGIN &&
+				// Utilization saturates at 100, so a cap above 90 leaks at 100.
+				state.utilization >=
+					Math.min(state.cap + WINDOW_CAP_LEAK_MARGIN, 100) &&
 				leakWarnedCycle !== state.resetsAtMs
 			) {
 				leakWarnedCycle = state.resetsAtMs;
@@ -89,30 +91,45 @@ export class WindowCapTransitionTracker {
 	}
 }
 
-/** One startup warning per capped account id that matches no loaded account. */
 /**
  * Caps read Anthropic-format usage windows (five_hour, seven_day,
- * seven_day_<family>), which Anthropic and Codex accounts report. On any other
- * provider the capped window never appears, so the cap holds that scope
- * excluded indefinitely; say so once at startup.
+ * seven_day_<family>) from the refresh-backed usage poll, which only polled
+ * Anthropic and Codex accounts holding a token report. Any other capped
+ * account never gets a reading, so its cap holds the scope excluded
+ * indefinitely with no poll to log it; say so once at startup.
  */
-export function unsupportedProviderWindowCapWarnings(
+export function unevaluableWindowCapWarnings(
 	caps: Readonly<Record<string, unknown>>,
-	accounts: readonly { id: string; name: string; provider: string }[],
+	accounts: readonly {
+		id: string;
+		name: string;
+		provider: string;
+		custom_endpoint?: string | null;
+		access_token?: string | null;
+		refresh_token?: string | null;
+	}[],
+	supportsUsagePolling: (account: {
+		provider: string;
+		custom_endpoint?: string | null;
+	}) => boolean,
 ): string[] {
 	return accounts
 		.filter(
 			(account) =>
 				Object.hasOwn(caps, account.id) &&
-				account.provider !== "anthropic" &&
-				account.provider !== "codex",
+				!(
+					(account.provider === "anthropic" || account.provider === "codex") &&
+					supportsUsagePolling(account) &&
+					Boolean(account.access_token || account.refresh_token)
+				),
 		)
 		.map(
 			(account) =>
-				`account_window_caps on account ${account.name} (${account.id}) cannot be evaluated: ${account.provider} accounts do not report the usage windows caps read, so the capped scope stays excluded`,
+				`account_window_caps on account ${account.name} (${account.id}) cannot be evaluated: this ${account.provider} account is not polled for the usage windows caps read, so the capped scope stays excluded`,
 		);
 }
 
+/** One startup warning per capped account id that matches no loaded account. */
 export function unknownWindowCapWarnings(
 	unknownIds: readonly string[],
 ): string[] {

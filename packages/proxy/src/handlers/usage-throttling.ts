@@ -10,7 +10,6 @@ import {
 	type AnyUsageData,
 	type CodexSubscriptionFacts,
 	getCodexSubscriptionFacts,
-	type UsageSnapshot,
 	usageCache,
 } from "@better-ccflare/providers";
 import type {
@@ -858,6 +857,12 @@ export interface WindowCapState {
 
 type WindowCapMap = Readonly<Record<string, number>> | null | undefined;
 
+/** The evaluator reads only the raw payload and its poll time. */
+type WindowCapSnapshot = {
+	readonly data: unknown;
+	readonly observedAt: number;
+};
+
 interface WindowCapTarget {
 	readonly windowKey: string;
 	readonly cap: number;
@@ -883,7 +888,7 @@ function windowCapTargets(caps: WindowCapMap): WindowCapTarget[] {
  */
 function resolveWindowCap(
 	target: WindowCapTarget,
-	snapshot: UsageSnapshot | null,
+	snapshot: WindowCapSnapshot | null,
 	windows: ReadonlyMap<string, CanonicalUsageWindow>,
 	now: number,
 	snapshotFreshnessMs: number,
@@ -938,7 +943,7 @@ function resolveWindowCap(
 	};
 }
 
-function windowCapContext(snapshot: UsageSnapshot | null) {
+function windowCapContext(snapshot: WindowCapSnapshot | null) {
 	return new Map(
 		(snapshot
 			? normalizeProviderUsageWindows(snapshot.data, "anthropic")
@@ -954,7 +959,7 @@ function windowCapContext(snapshot: UsageSnapshot | null) {
  * a capped window with missing or stale evidence fails closed.
  */
 export function evaluateWindowCaps(
-	snapshot: UsageSnapshot | null,
+	snapshot: WindowCapSnapshot | null,
 	caps: WindowCapMap,
 	options: {
 		requestModel: string | null;
@@ -1000,7 +1005,7 @@ export function evaluateWindowCaps(
 
 /** Poll-time cap state, one entry per capped window; no request model involved. */
 export function getWindowCapStates(
-	snapshot: UsageSnapshot | null,
+	snapshot: WindowCapSnapshot | null,
 	caps: WindowCapMap,
 	options: { now?: number; snapshotFreshnessMs?: number } = {},
 ): readonly WindowCapState[] {
