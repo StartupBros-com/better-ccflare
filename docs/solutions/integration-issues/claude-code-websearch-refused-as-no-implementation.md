@@ -53,7 +53,8 @@ web_search has two lanes: the proven hosted lane (Codex, unchanged and fail-clos
 - `isNativeWebSearchPassthroughEligible(requirements, firstPartyAnthropic)` is the one shared predicate, used by selection, dispatch, Auto admission and the Auto candidate loop. It needs a first-party account, exactly one valid `web_search_20250305` declaration, and replay atoms that are empty or `native-Anthropic` only. `proxy-evidence-v1` (`bccf...`) history and truncated scans exclude the native lane.
 - Selection admits a first-party candidate as `proven` with `lane: "native_passthrough"` and a sentinel proof key, only when its physical-model preview is non-null. Order is not changed.
 - Dispatch skips tuple, proof and replay resolution on the native lane, keeps the `?beta=true` query, and never claims the hosted-dispatch ledger.
-- One search per request: after a native send begins, hosted candidates are skipped, and after a hosted claim, native candidates are skipped (`other_lane_dispatched`, a per-candidate skip).
+- One search per request: after a native send begins, hosted candidates are skipped, and after a hosted claim, native candidates are skipped (`other_lane_dispatched`, a per-candidate skip). In the Auto loop only that reason is a skip; any other capability error keeps `attempt-unavailable`.
+- Known limits: a native send that fails with a 429 or 5xx still makes hosted candidates skip for the rest of the request (lost availability, never a second search), and a natively served request still reserves one request-private replay range at bind (no envelope is issued).
 - If the replay bind fails, a native-eligible request continues native-only (`serverToolReplayBound = false`). Hosted-only pools keep `replay_unavailable`.
 - `search_profile` is accepted (1 to 64 printable ASCII characters) and forwarded on the native lane. The Codex tuple builder refuses a declaration carrying it.
 
