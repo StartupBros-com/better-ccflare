@@ -591,6 +591,30 @@ describe("native web_search passthrough dispatch", () => {
 		expect(new URL(calls[0]?.url ?? "").host).toBe("api.anthropic.com");
 	});
 
+	it("continues to the first-party account when the replay bind fails and a hosted candidate is ordered ahead of it", async () => {
+		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+		const { provider, buildUrl, transform } = makeSpiedHostedProvider();
+		const { ctx } = makeContext(
+			[freshHostedAccount({ priority: 0 }), freshAccount({ priority: 5 })],
+			{ status: "disabled" },
+			provider,
+		);
+		const calls = installFetch(() => jsonOk("claude-sonnet-4-5"));
+		const { request } = makeHelperRequest({ model: "claude-sonnet-4-5" });
+
+		const { response } = await run(ctx, request);
+
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		expect(new URL(calls[0]?.url ?? "").host).toBe("api.anthropic.com");
+		expect(calls.map((call) => new URL(call.url).host)).not.toContain(
+			HOSTED_HOST,
+		);
+		// The hosted candidate was marked output_unavailable before any provider work.
+		expect(transform).not.toHaveBeenCalled();
+		expect(buildUrl).not.toHaveBeenCalled();
+	});
+
 	it("keeps replay_unavailable with zero sends when only a hosted route exists and the runtime is disabled", async () => {
 		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 		const { ctx } = makeContext(

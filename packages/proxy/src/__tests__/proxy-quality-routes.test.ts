@@ -3649,6 +3649,71 @@ describe("prewarmed native catalogs", () => {
 				expect(sends).toHaveLength(0);
 			});
 		});
+		describe("native web_search continues after a failed replay bind", () => {
+			const searchTool = {
+				type: "web_search_20250305",
+				name: "web_search",
+				max_uses: 8,
+				search_profile: "fast",
+			};
+			let bindResults: boolean[];
+			beforeEach(() => {
+				// No replay runtime: the production bind runs and fails.
+				ctx.serverToolReplay = undefined;
+				bindResults = [];
+				const bind = replayRuntime.bindRequestPrivateServerToolReplay;
+				const spy = spyOn(
+					replayRuntime,
+					"bindRequestPrivateServerToolReplay",
+				).mockImplementation(async (...args) => {
+					const bound = await bind(...args);
+					bindResults.push(bound);
+					return bound;
+				});
+				restores.push(() => spy.mockRestore());
+			});
+			const fableScopedExhausted = (id: string) =>
+				usageCache.set(id, {
+					limits: [
+						{ kind: "weekly_all", percent: 10, resets_at: Date.now() + 60000 },
+						{
+							kind: "weekly_scoped",
+							percent: 100,
+							resets_at: Date.now() + 60000,
+							scope: { model: { display_name: "Fable" } },
+						},
+					],
+					spend: { enabled: false },
+				} as never);
+			it("serves the request on the first-party target with one send when the bind fails", async () => {
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				expect(response.status).toBe(200);
+				await response.text();
+				expect(bindResults).toEqual([false]);
+				expect(sends).toHaveLength(1);
+				expect(envelopes[0]?.tools).toEqual([searchTool]);
+			});
+			it("skips a non-first-party rung ahead of the first-party target and sends only to the first-party one", async () => {
+				enrollCodex("gpt-astra", "astra");
+				capacity(() => 10);
+				// The fable lane is exhausted, so the codex astra rung is reached before
+				// the first-party opus rung.
+				for (const id of ["a", "b"]) fableScopedExhausted(id);
+				await getCodexModels("c", ctx);
+				const response = await send(
+					request(undefined, {}, { tools: [searchTool] }),
+				);
+				expect(response.status).toBe(200);
+				await response.text();
+				await flush();
+				expect(bindResults).toEqual([false]);
+				expect(sends).toHaveLength(1);
+				expect(sends[0]?.model).toBe("claude-opus-5-5");
+				expect(envelopes[0]?.tools).toEqual([searchTool]);
+			});
+		});
 		it("uses the history-only text when advisor appears only in history", async () => {
 			enrollCodex("gpt-astra", "astra");
 			capacity((id) => (id === "c" ? 10 : 100));
