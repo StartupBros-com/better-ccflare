@@ -57,6 +57,7 @@ web_search has two lanes: the proven hosted lane (Codex, unchanged and fail-clos
 - Known limits: a native send that fails with a 429 or 5xx still makes hosted candidates skip for the rest of the request (lost availability, never a second search), and a natively served request still reserves one request-private replay range at bind (no envelope is issued). Native search results are very likely bound to the producing Anthropic organization (verified for advisor in #439, inferred for web search). History that carries them, such as a `pause_turn` continuation, can get a 400 after failover to another first-party account. The owner-preference and strip seam is #439's.
 - If the replay bind fails, a native-eligible request continues native-only (`serverToolReplayBound = false`). Hosted-only pools keep `replay_unavailable`.
 - `search_profile` is accepted (1 to 64 printable ASCII characters) and forwarded on the native lane. The Codex tuple builder refuses a declaration carrying it.
+- Route-profile sessions: a helper that uses the picker model id or carries child headers gets helper lineage, and under a soft capability profile it falls to the native lane. Exact-account, force-routed and bounded profiles stay fail-closed for it (refs PR #447).
 
 ### Findings behind the design
 

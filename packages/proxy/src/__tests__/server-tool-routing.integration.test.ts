@@ -35,7 +35,10 @@ const { selectAccountsForRequest } = await import(
 	"../handlers/account-selector"
 );
 const usageCollectorModule = await import("../usage-collector");
-const { handleProxy } = await import("../proxy");
+const { handleProxy, isHelperShapedServerToolPreview } = await import(
+	"../proxy"
+);
+const { RequestBodyContext } = await import("../request-body-context");
 const { codexWebSocketTransport } = await import(
 	"../codex-websocket-transport"
 );
@@ -2975,6 +2978,251 @@ describe("route-profile WebSearch helper falls to the global proven lane", () =>
 		expect(bound.status).toBe(200);
 		expect(String(calls[0]?.body.model)).toBe("claude-opus-5-5");
 	});
+	function twoProfileRegistry(
+		defaultEffort?: string,
+	): ModelRouteSessionRegistry {
+		return new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: PROFILE_ID,
+						displayName: "Helper soft profile",
+						selection: "capability",
+						logicalModel: "claude-opus-5",
+						expectedProvider: "capability-test",
+						expectedPhysicalModel: PHYSICAL,
+						...(defaultEffort ? { defaultEffort } : {}),
+					},
+					{
+						id: "helper-p2-profile",
+						displayName: "Second helper profile",
+						selection: "capability",
+						logicalModel: "claude-opus-5-5",
+						expectedProvider: "capability-test",
+						expectedPhysicalModel: PHYSICAL,
+					},
+				]),
+			),
+		);
+	}
+
+	it("does not let a helper reservation make a concurrent selecting root's commit stale", async () => {
+		const { ctx, calls } = makeSoftProfileHarness();
+		ctx.modelRouteSessionRegistry = twoProfileRegistry();
+		const p2Picker = "claude-bccf-route-helper-p2-profile";
+		// Hold the native helper's upstream call so its request (and, before the
+		// fix, its root-intent reservation) is still live when the root commits.
+		let releaseHelper: () => void = () => {};
+		const helperGate = new Promise<void>((resolve) => {
+			releaseHelper = resolve;
+		});
+		const gatedFetch = globalThis.fetch;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (new URL(url).host === "api.anthropic.com") await helperGate;
+			return gatedFetch(input);
+		}) as unknown as typeof fetch;
+		let releaseRoot: () => void = () => {};
+		const delayed = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer server-tool-test-client",
+				"x-claude-code-session-id": "server-tool-test-session",
+			},
+			body: new ReadableStream({
+				start(controller) {
+					releaseRoot = () => {
+						controller.enqueue(
+							new TextEncoder().encode(
+								JSON.stringify({ model: p2Picker, ...ROOT_BODY }),
+							),
+						);
+						controller.close();
+					};
+				},
+			}),
+			duplex: "half",
+		} as RequestInit);
+		const pendingRoot = handleProxy(
+			delayed,
+			new URL(delayed.url),
+			ctx,
+			"key-1",
+		);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		// A non-subagent picker-model helper for P1 is classified and in flight
+		// while the root still selects.
+		const pendingHelper = sendHelper(ctx, { model: PICKER });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		releaseRoot();
+		expect((await pendingRoot).status).toBe(200);
+		releaseHelper();
+		expect((await pendingHelper).status).toBe(200);
+
+		calls.length = 0;
+		const inherited = await sendHelper(ctx, {
+			model: "claude-sonnet-5-5",
+			claudeCodeAgentId: "agent-1",
+		});
+		expect(inherited.status).toBe(200);
+		// The session is bound to P2 (logicalModel claude-opus-5-5), not P1/none.
+		expect(String(calls[0]?.body.model)).toBe("claude-opus-5-5");
+	});
+
+	it("does not inject the profile defaultEffort into a picker-model helper, but still into a root", async () => {
+		const { ctx, calls } = makeSoftProfileHarness();
+		ctx.modelRouteSessionRegistry = twoProfileRegistry("xhigh");
+		expect((await sendRoot(ctx, PICKER)).status).toBe(200);
+		const rootBody = calls[0]?.body as {
+			output_config?: { effort?: string };
+		};
+		expect(rootBody.output_config?.effort).toBe("xhigh");
+
+		calls.length = 0;
+		const response = await sendHelper(ctx, { model: PICKER });
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		const body = calls[0]?.body as { output_config?: { effort?: string } };
+		expect(body.output_config?.effort).toBeUndefined();
+	});
+
+	it("refuses a picker-model helper with a typed server-tool error when no lane exists", async () => {
+		const { ctx, calls } = makeSoftProfileHarness("claude-opus-5", false);
+		const response = await sendHelper(ctx, { model: PICKER });
+		const body = (await response.json()) as {
+			error: { code: string; reason: string };
+		};
+		expect(response.status).toBe(400);
+		expect(body.error).toMatchObject({
+			code: "server_tool_capability_unavailable",
+			reason: "no_implementation",
+		});
+		expect(calls).toHaveLength(0);
+	});
+
+	it("fails a helper-shaped child closed under a bound exact-account profile", async () => {
+		const exact = makeAccount({
+			id: "exact-profile-account",
+			name: "exact-profile-account",
+			access_token: "exact-token",
+			expires_at: Date.now() + 60 * 60_000,
+		});
+		const { ctx, calls } = makeSoftProfileHarness();
+		ctx.dbOps.getAllAccounts = mock(async () => [exact, makeNativeAccount()]);
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "exact-helper-profile",
+						displayName: "Exact helper profile",
+						accountId: exact.id,
+						logicalModel: MODEL,
+						expectedProvider: exact.provider,
+					},
+				]),
+			),
+		);
+		const exactPicker = "claude-bccf-route-exact-helper-profile";
+		expect((await sendRoot(ctx, exactPicker)).status).toBe(200);
+		calls.length = 0;
+
+		const response = await sendHelper(ctx, {
+			model: "claude-opus-5-5",
+			claudeCodeAgentId: "agent-1",
+		});
+		const body = (await response.json()) as {
+			error: { type: string; reason: string };
+		};
+
+		expect(response.status).toBe(503);
+		expect(body.error).toMatchObject({
+			type: "force_route_unavailable",
+			reason: "forced_incapable",
+		});
+		expect(response.headers.get("x-better-ccflare-force-route")).toBe(
+			"unavailable",
+		);
+		expect(calls).toHaveLength(0);
+	});
+
+	it("requires a declared hosted server tool for helper shape", () => {
+		const preview = (body: Record<string, unknown>) =>
+			new RequestBodyContext(
+				new TextEncoder().encode(JSON.stringify(body)).buffer as ArrayBuffer,
+			).previewServerToolRequirements();
+		const history = [
+			{ role: "user", content: "search" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "server_tool_use",
+						id: "srvtoolu_hist",
+						name: "web_search",
+						input: { query: "x" },
+					},
+				],
+			},
+			{ role: "user", content: "continue" },
+		];
+		// No declaration: history replay atoms alone are not a helper.
+		const historyOnly = preview({
+			model: PICKER,
+			max_tokens: 16,
+			messages: history,
+		});
+		expect(historyOnly).toBeDefined();
+		expect(isHelperShapedServerToolPreview(historyOnly)).toBe(false);
+		const declared = {
+			type: "web_search_20250305",
+			name: "web_search",
+		};
+		expect(
+			isHelperShapedServerToolPreview(
+				preview({
+					model: PICKER,
+					max_tokens: 16,
+					messages: history,
+					tools: [declared],
+				}),
+			),
+		).toBe(true);
+		// An invalid declaration is still a helper declaration.
+		expect(
+			isHelperShapedServerToolPreview(
+				preview({
+					model: PICKER,
+					max_tokens: 16,
+					messages: history,
+					tools: [
+						{
+							...declared,
+							allowed_domains: ["a.example"],
+							blocked_domains: ["b.example"],
+						},
+					],
+				}),
+			),
+		).toBe(true);
+		// Client functions alongside the declaration: a real main-loop turn.
+		expect(
+			isHelperShapedServerToolPreview(
+				preview({
+					model: PICKER,
+					max_tokens: 16,
+					messages: history,
+					tools: [
+						declared,
+						{ name: "client_lookup", input_schema: { type: "object" } },
+					],
+				}),
+			),
+		).toBe(false);
+		expect(isHelperShapedServerToolPreview(undefined)).toBe(false);
+	});
+
 	it("keeps a picker-model main-loop root that declares web_search plus client functions a root", async () => {
 		const { ctx, calls } = makeSoftProfileHarness(
 			"claude-opus-5",

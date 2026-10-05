@@ -36,6 +36,7 @@ import type {
 	RoutingCandidateMetadata,
 	RoutingSelectionDiagnostics,
 	RoutingSelectionZeroAttemptReason,
+	ServerToolRequirements,
 } from "@better-ccflare/types";
 import { registerManagedTerminal } from "../../../scripts/ccflare-managed-timing.mjs";
 import {
@@ -313,6 +314,21 @@ function isModelRouteIntentRequest(req: Request, url: URL): boolean {
 		req.method === "POST" &&
 		(url.pathname === "/v1/messages" ||
 			url.pathname === "/v1/messages/count_tokens")
+	);
+}
+
+/**
+ * Helper-shaped: a declared hosted server tool and no client function tools, as
+ * Claude Code builds WebSearch. History replay atoms alone are not a helper.
+ */
+export function isHelperShapedServerToolPreview(
+	preview: ServerToolRequirements | undefined,
+): boolean {
+	return (
+		preview !== undefined &&
+		preview.hasClientFunctions !== true &&
+		((preview.declarations?.length ?? 0) > 0 ||
+			(preview.invalid?.length ?? 0) > 0)
 	);
 }
 
@@ -1299,16 +1315,27 @@ async function handleProxyCoreImpl(
 	requestMeta.agentAttributionSource = agentAttributionSource;
 	const isCountHelper = url.pathname === "/v1/messages/count_tokens";
 	// The quality route runs before profile resolution, so the helper preview is
-	// taken here. A helper-shaped request (a hosted server tool and no client
-	// function tools, as Claude Code builds WebSearch) never commits root intent
-	// on either path; a request that also declares client functions is a real
-	// main-loop turn and keeps committing as before.
+	// taken here. A helper-shaped request (a declared hosted server tool and no
+	// client function tools, as Claude Code builds WebSearch) withdraws its own
+	// root-intent reservation below, so no commit path (quality route, explicit
+	// or native) can commit or clear a binding for it and it cannot make a
+	// concurrent root's commit stale; a request that also declares client
+	// functions is a real main-loop turn and keeps its reservation.
 	const serverToolPreview = isCountHelper
 		? undefined
 		: finalRequestBodyContext.previewServerToolRequirements();
 	const serverToolHelperShaped =
-		serverToolPreview !== undefined &&
-		serverToolPreview.hasClientFunctions !== true;
+		isHelperShapedServerToolPreview(serverToolPreview);
+	if (serverToolHelperShaped) {
+		modelRouteRegistry?.cancelRootIntent(
+			{
+				callerIdentity: routeCallerIdentity(req, apiKeyId),
+				sessionId: req.headers.get("x-claude-code-session-id"),
+				isSubagent,
+			},
+			rootIntentGeneration,
+		);
+	}
 	const qualityResponse = await routeQualityRequest({
 		req,
 		url,
@@ -1321,7 +1348,6 @@ async function handleProxyCoreImpl(
 		requirements: qualityRequirements,
 		serverToolQueryPresent: hasServerToolCapabilityQuery(url),
 		onRootAccepted: () =>
-			!serverToolHelperShaped &&
 			modelRouteRegistry?.commitNative(
 				{
 					callerIdentity: routeCallerIdentity(req, apiKeyId),
@@ -1352,7 +1378,7 @@ async function handleProxyCoreImpl(
 		modelRouteRegistry?.hasPublicModelId(effectiveModelAfterInterception) ===
 			true;
 	// Lineage is decoupled from profile resolution: a helper-shaped request (a
-	// hosted server tool, no client functions) is a helper in every shape (it
+	// declared hosted server tool, no client functions) is a helper in every shape (it
 	// commits no root intent, creates no home, and may fall to the global proven
 	// lane under a soft profile), even with a picker model or child markers. A
 	// request that also declares client functions is a helper only in the
@@ -1439,7 +1465,13 @@ async function handleProxyCoreImpl(
 			);
 		}
 		if (source === "explicit") {
-			applyExplicitModelRoute(finalRequestBodyContext, profile);
+			// A helper takes the profile's model only: its defaultEffort could turn a
+			// servable helper (thinking disabled) into an upstream 400.
+			if (isServerToolHelper) {
+				finalRequestBodyContext.setModel(profile.logicalModel);
+			} else {
+				applyExplicitModelRoute(finalRequestBodyContext, profile);
+			}
 			finalBodyBuffer = finalRequestBodyContext.getBuffer();
 			appliedModel = profile.logicalModel;
 			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
@@ -2968,12 +3000,9 @@ async function handleProxyCoreImpl(
 		return finishPacing(pacingSlot, terminal.response);
 	}
 
-	// A helper never commits or clears root intent; its reservation is withdrawn
-	// by handleProxy's finally. A helper that resolves natively already resolved
-	// as a child (commitNative ignores it); the gate keeps both arms explicit.
-	const commitsRootIntent = requestMeta.routeLineage?.kind !== "helper";
+	// A helper-shaped request withdrew its reservation at classification, so the
+	// registry's own generation check makes both arms below no-ops for it.
 	if (
-		commitsRootIntent &&
 		modelRouteResolution?.kind === "route" &&
 		modelRouteResolution.source === "explicit" &&
 		(modelRouteResolution.profile.selection === "capability"
@@ -2987,11 +3016,7 @@ async function handleProxyCoreImpl(
 			modelRouteResolutionInput,
 			modelRouteResolution,
 		);
-	} else if (
-		commitsRootIntent &&
-		modelRouteResolution?.kind === "native" &&
-		accounts.length > 0
-	) {
+	} else if (modelRouteResolution?.kind === "native" && accounts.length > 0) {
 		modelRouteRegistry?.commitNative(
 			modelRouteResolutionInput,
 			modelRouteResolution,
