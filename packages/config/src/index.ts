@@ -17,6 +17,7 @@ import {
 	compileQualityRoutingPolicy,
 	DEFAULT_AGENT_MODEL,
 	DEFAULT_STRATEGY,
+	getModelFamily,
 	isValidStrategy,
 	NETWORK,
 	type StrategyName,
@@ -29,6 +30,7 @@ import {
 import { Logger } from "@better-ccflare/logger";
 import { validatePathOrThrow } from "@better-ccflare/security";
 import {
+	type AccountWindowCaps,
 	type AlertType,
 	CACHE_HEALTH_BUCKET_MS,
 	CACHE_HEALTH_DEFAULT_POLICY,
@@ -66,6 +68,103 @@ export function parseQualityRoutingPolicy(
 			"quality_routing_policy: JSON must contain a policy object",
 		);
 	return compileQualityRoutingPolicy(value);
+}
+
+export const ACCOUNT_WINDOW_CAPS_ENV =
+	"CCFLARE_ACCOUNT_WINDOW_CAPS_JSON" as const;
+const MAX_ACCOUNT_WINDOW_CAPS_JSON_BYTES = 256 * 1024;
+
+function isValidAccountWindowCapKey(key: string): boolean {
+	if (key === "five_hour" || key === "seven_day") return true;
+	// Same rule the usage normalizer applies to scoped weekly keys (scopeForKey).
+	return (
+		key.startsWith("seven_day_") &&
+		getModelFamily(key.slice("seven_day_".length)) !== null
+	);
+}
+
+/** Strict, validated cap map; any invalid declaration refuses startup. */
+export function parseAccountWindowCaps(raw: unknown): AccountWindowCaps {
+	if (raw === undefined) return {};
+	let value: unknown = raw;
+	if (typeof raw === "string") {
+		if (Buffer.byteLength(raw, "utf8") > MAX_ACCOUNT_WINDOW_CAPS_JSON_BYTES) {
+			throw new ValidationError(
+				"account_window_caps: JSON exceeds 262144 bytes",
+				"account_window_caps",
+			);
+		}
+		if (raw.trim() === "") return {};
+		if (!new StrictJsonScanner(raw).scan()) {
+			throw new ValidationError(
+				"account_window_caps: must be strict JSON without duplicate keys or excessive depth",
+				"account_window_caps",
+			);
+		}
+		value = JSON.parse(raw);
+	}
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		throw new ValidationError(
+			"account_window_caps: must be an object mapping account ids to window caps",
+			"account_window_caps",
+			value,
+		);
+	}
+	const caps: AccountWindowCaps = {};
+	for (const [accountId, windows] of Object.entries(value)) {
+		if (accountId.trim() === "") {
+			throw new ValidationError(
+				"account_window_caps: account id must not be empty",
+				"account_window_caps",
+				accountId,
+			);
+		}
+		if (
+			windows === null ||
+			typeof windows !== "object" ||
+			Array.isArray(windows)
+		) {
+			throw new ValidationError(
+				`account_window_caps: account ${accountId} must map window keys to percents`,
+				"account_window_caps",
+				windows,
+			);
+		}
+		const accountCaps: Record<string, number> = {};
+		for (const [windowKey, percent] of Object.entries(windows)) {
+			if (!isValidAccountWindowCapKey(windowKey)) {
+				throw new ValidationError(
+					`account_window_caps: account ${accountId} has unknown window key ${windowKey}`,
+					"account_window_caps",
+					windowKey,
+				);
+			}
+			if (
+				typeof percent !== "number" ||
+				!Number.isInteger(percent) ||
+				percent < 1 ||
+				percent > 99
+			) {
+				throw new ValidationError(
+					`account_window_caps: account ${accountId} window ${windowKey} percent must be an integer from 1 to 99, got ${JSON.stringify(percent)}`,
+					"account_window_caps",
+					percent,
+				);
+			}
+			accountCaps[windowKey] = percent;
+		}
+		caps[accountId] = accountCaps;
+	}
+	return caps;
+}
+
+/** Account ids in the cap map that match no known account (warn, never reject). */
+export function findUnknownAccountWindowCapIds(
+	caps: AccountWindowCaps,
+	knownAccountIds: Iterable<string>,
+): string[] {
+	const known = new Set(knownAccountIds);
+	return Object.keys(caps).filter((id) => !known.has(id));
 }
 
 export type ModelScopedCapacityRoutingMode = "off" | "exhausted";
@@ -911,6 +1010,7 @@ export function filterEnabledProviderModelDefaultOverrides(
 
 export interface ConfigData {
 	quality_routing_policy?: QualityRoutingPolicyConfig | string;
+	account_window_caps?: AccountWindowCaps | string;
 	lb_strategy?: StrategyName;
 	client_id?: string;
 	retry_attempts?: number;
@@ -1001,6 +1101,7 @@ export interface ConfigData {
 		| boolean
 		| ProviderModelDefaultOverrides
 		| QualityRoutingPolicyConfig
+		| AccountWindowCaps
 		| undefined;
 }
 
@@ -1337,6 +1438,19 @@ export class Config extends EventEmitter {
 		// Outside loadConfig's legacy parse-recovery catch: invalid policy must
 		// abort startup, never silently disable an explicitly enrolled route.
 		this.getQualityRoutingPolicy();
+		this.getAccountWindowCaps();
+	}
+
+	getAccountWindowCaps(): AccountWindowCaps {
+		const fromEnv = process.env[ACCOUNT_WINDOW_CAPS_ENV];
+		return parseAccountWindowCaps(
+			fromEnv !== undefined ? fromEnv : this.data.account_window_caps,
+		);
+	}
+
+	getAccountWindowCapsSource(): "env" | "file" | "default" {
+		if (process.env[ACCOUNT_WINDOW_CAPS_ENV] !== undefined) return "env";
+		return this.data.account_window_caps !== undefined ? "file" : "default";
 	}
 
 	getQualityRoutingPolicy(): QualityRoutingPolicy | null {
@@ -1400,6 +1514,7 @@ export class Config extends EventEmitter {
 
 	set(key: string, value: string | number | boolean): void {
 		if (key === "quality_routing_policy") parseQualityRoutingPolicy(value);
+		if (key === "account_window_caps") parseAccountWindowCaps(value);
 		const oldValue = this.data[key];
 		this.data[key] = value;
 		this.saveConfig();
@@ -2533,8 +2648,11 @@ export class Config extends EventEmitter {
 
 	getAllSettings(): Record<string, string | number | boolean | undefined> {
 		const anthropicDegradedMode = this.getAnthropicDegradedModeConfig();
-		const { quality_routing_policy: qualityRoutingPolicy, ...settings } =
-			this.data;
+		const {
+			quality_routing_policy: qualityRoutingPolicy,
+			account_window_caps: _accountWindowCaps,
+			...settings
+		} = this.data;
 		// Include current strategy (which might come from env)
 		return {
 			...settings,
@@ -2548,6 +2666,7 @@ export class Config extends EventEmitter {
 								: JSON.stringify(qualityRoutingPolicy),
 					}
 				: {}),
+			account_window_caps: JSON.stringify(this.getAccountWindowCaps()),
 			lb_strategy: this.getStrategy(),
 			default_agent_model: this.getDefaultAgentModel(),
 			data_retention_days: this.getDataRetentionDays(),

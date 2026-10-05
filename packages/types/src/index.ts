@@ -1,5 +1,6 @@
 // Re-export all types organized by domain
 export * from "./account";
+export * from "./account-window-caps";
 export * from "./agent";
 export * from "./agent-constants";
 export * from "./alerts";
