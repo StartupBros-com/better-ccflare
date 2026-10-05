@@ -460,6 +460,68 @@ describe("native web_search passthrough dispatch", () => {
 		}
 	});
 
+	it("never forwards a stale content-length after demoting the forced choice", async () => {
+		const { ctx } = makeContext([makeAccount()]);
+		const calls = installFetch(() => jsonOk());
+		const { request, clientBody } = makeHelperRequest({
+			model: "claude-opus-5-5",
+		});
+		request.headers.set(
+			"content-length",
+			String(new TextEncoder().encode(JSON.stringify(clientBody)).length),
+		);
+
+		const { response } = await run(ctx, request);
+
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		const sent = calls[0]?.headers.get("content-length");
+		const actual = String(
+			new TextEncoder().encode(calls[0]?.rawBody ?? "").length,
+		);
+		expect(sent === null || sent === actual).toBe(true);
+		expect(calls[0]?.body.tool_choice).toEqual({ type: "auto" });
+	});
+
+	it("refuses a forced web_search choice carrying extra keys before any send, so it never reaches upstream undemoted", async () => {
+		const { ctx } = makeContext([makeAccount()]);
+		const calls = installFetch(() => jsonOk());
+		const { request } = makeHelperRequest({
+			model: "claude-opus-5-5",
+			toolChoice: { ...FORCED_CHOICE, disable_parallel_tool_use: true },
+		});
+
+		const { response } = await run(ctx, request);
+
+		expect(response.status).toBe(400);
+		expect(calls).toHaveLength(0);
+	});
+
+	it("refuses advisor beside web_search before any send", async () => {
+		const { ctx } = makeContext([makeAccount()]);
+		const calls = installFetch(() => jsonOk());
+		const { request, clientBody } = makeHelperRequest({
+			model: "claude-opus-5",
+		});
+		const advisorBody = {
+			...clientBody,
+			tools: [
+				...(clientBody.tools as unknown[]),
+				{ type: "advisor_20260301", name: "advisor", model: "claude-opus-5" },
+			],
+		};
+		const advisorRequest = new Request(request.url, {
+			method: "POST",
+			headers: request.headers,
+			body: JSON.stringify(advisorBody),
+		});
+
+		const { response } = await run(ctx, advisorRequest);
+
+		expect(response.status).toBe(400);
+		expect(calls).toHaveLength(0);
+	});
+
 	it("serves a first-party account with the replay runtime disabled", async () => {
 		const { ctx } = makeContext([makeAccount()], { status: "disabled" });
 		const calls = installFetch(() => jsonOk());

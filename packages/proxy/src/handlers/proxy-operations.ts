@@ -4289,9 +4289,12 @@ export async function proxyWithAccount(
 				);
 			}
 			body.tool_choice = { type: "auto" };
+			// The inbound content-length describes the original body, not this one.
+			const headers = new Headers(transportRequest.headers);
+			headers.delete("content-length");
 			return new Request(transportRequest.url, {
 				method: transportRequest.method,
-				headers: new Headers(transportRequest.headers),
+				headers,
 				body: JSON.stringify(body),
 				signal: transportRequest.signal,
 			});
