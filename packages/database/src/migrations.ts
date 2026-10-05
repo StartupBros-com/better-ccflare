@@ -496,6 +496,7 @@ export function ensureSchema(db: Database): void {
 			advisor_usage TEXT,
  quality_decision TEXT,
  routing_attempt_summary TEXT,
+			unified_ratelimit_headers TEXT,
 			client_session_id TEXT,
 			route_profile_id TEXT,
 			requested_route_model TEXT,
@@ -1578,6 +1579,7 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		["advisor_usage", "TEXT"],
 		["quality_decision", "TEXT"],
 		["routing_attempt_summary", "TEXT"],
+		["unified_ratelimit_headers", "TEXT"],
 	]) {
 		if (!tableHasColumn(db, "requests", column)) {
 			db.run(`ALTER TABLE requests ADD COLUMN ${column} ${type}`);

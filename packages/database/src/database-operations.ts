@@ -1548,6 +1548,7 @@ OAuth tokens will need to be re-authenticated.
 		accounting?: RequestData["accounting"],
 		qualityDecision?: RequestData["qualityDecision"],
 		routingAttemptSummary?: RequestData["routingAttemptSummary"],
+		unifiedRatelimitHeaders?: string | null,
 	): Promise<void> {
 		await withDatabaseRetry(
 			() =>
@@ -1578,6 +1579,7 @@ OAuth tokens will need to be re-authenticated.
 					accounting,
 					qualityDecision,
 					routingAttemptSummary,
+					unifiedRatelimitHeaders,
 				}),
 			this.retryConfig,
 			"saveRequest",

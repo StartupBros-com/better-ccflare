@@ -4,6 +4,7 @@ import {
 	cacheOutcomeFromTokens,
 	estimateCostUSD,
 	formatXaiCacheCanary,
+	getModelFamily,
 	isModelPriced,
 	SseFrameBuffer,
 	TIME_CONSTANTS,
@@ -35,6 +36,7 @@ import {
 	recordAdvisorResultOwner,
 } from "./advisor-result-ownership";
 import { cacheBodyStore } from "./cache-body-store";
+import { isUpstreamEvidenceHeader } from "./handlers/proxy-operations";
 import {
 	extractProjectAttributionFromParts,
 	sanitizeProjectName,
@@ -214,6 +216,53 @@ const MAX_PENDING_DROPPED_MARKERS = 1024;
 // Debounce window before the buffered dropped-marker map is flushed. Keeps
 // the write off the request path entirely; drain() flushes immediately.
 const PENDING_DROPPED_MARKER_FLUSH_MS = 250;
+
+const UNIFIED_RATELIMIT_HEADER_PREFIX = "anthropic-ratelimit-unified-";
+const MAX_UNIFIED_RATELIMIT_HEADERS = 32;
+const MAX_UNIFIED_RATELIMIT_JSON_CHARS = 4096;
+const MAX_UNIFIED_RATELIMIT_VALUE_CHARS = 128;
+
+/**
+ * Bounded JSON of the unified rate-limit headers Claude Code saw on a
+ * successful Fable-family response, or null for any other response. Headers
+ * are taken in order; the first bound reached ends the capture and a
+ * `truncated: true` marker records that some were left out.
+ */
+export function captureUnifiedRatelimitHeaders(
+	status: number | undefined,
+	servedModel: string | undefined,
+	headers: Record<string, string> | undefined,
+): string | null {
+	if (!headers || status === undefined || status < 200 || status >= 300) {
+		return null;
+	}
+	if (!servedModel || getModelFamily(servedModel) !== "fable") return null;
+	const selected = Object.entries(headers).filter(
+		([name]) =>
+			name.startsWith(UNIFIED_RATELIMIT_HEADER_PREFIX) &&
+			isUpstreamEvidenceHeader(name),
+	);
+	const kept: Record<string, string> = {};
+	let count = 0;
+	let truncated = false;
+	for (const [name, value] of selected) {
+		const candidate = {
+			...kept,
+			[name]: value.slice(0, MAX_UNIFIED_RATELIMIT_VALUE_CHARS),
+		};
+		if (
+			count >= MAX_UNIFIED_RATELIMIT_HEADERS ||
+			JSON.stringify({ ...candidate, truncated: true }).length >
+				MAX_UNIFIED_RATELIMIT_JSON_CHARS
+		) {
+			truncated = true;
+			break;
+		}
+		Object.assign(kept, candidate);
+		count++;
+	}
+	return JSON.stringify(truncated ? { ...kept, truncated: true } : kept);
+}
 
 // Check if a request should be logged
 function shouldLogRequest(path: string, status: number): boolean {
@@ -2028,6 +2077,11 @@ export class UsageCollector {
 			state.usage.advisorUsage?.length
 				? state.usage.advisorUsage
 				: undefined;
+		const unifiedRatelimitHeaders = captureUnifiedRatelimitHeaders(
+			startMessage.responseStatus,
+			state.usage.model,
+			startMessage.responseHeaders,
+		);
 		// No preliminary INSERT needed — dashboard tracks pending requests via SSE events, not DB queries.
 		this.asyncWriter.enqueue(async () => {
 			try {
@@ -2076,6 +2130,7 @@ export class UsageCollector {
 					startMessage.accounting,
 					sanitizeQualityDecision(startMessage.qualityDecision),
 					msg.routingAttemptSummary,
+					unifiedRatelimitHeaders,
 				);
 			} catch (error) {
 				log.error(

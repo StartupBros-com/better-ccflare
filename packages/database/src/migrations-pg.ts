@@ -701,6 +701,7 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			advisor_usage TEXT,
  quality_decision TEXT,
  routing_attempt_summary TEXT,
+			unified_ratelimit_headers TEXT,
 			client_session_id TEXT,
 			route_profile_id TEXT,
 			requested_route_model TEXT,
@@ -1622,6 +1623,7 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			["advisor_usage", "TEXT"],
 			["quality_decision", "TEXT"],
 			["routing_attempt_summary", "TEXT"],
+			["unified_ratelimit_headers", "TEXT"],
 		].map(([column, type]) => ({
 			table: "requests",
 			column,

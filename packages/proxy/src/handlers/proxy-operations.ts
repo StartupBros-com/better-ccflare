@@ -593,7 +593,7 @@ function truncateEvidenceText(value: string, maxChars: number): string {
 	return stripTrailingUnpairedHighSurrogate(value.slice(0, maxChars));
 }
 
-function isUpstreamEvidenceHeader(name: string): boolean {
+export function isUpstreamEvidenceHeader(name: string): boolean {
 	if (
 		UPSTREAM_EVIDENCE_SENSITIVE_HEADER_PARTS.some((part) => name.includes(part))
 	) {
