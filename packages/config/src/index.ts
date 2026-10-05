@@ -125,7 +125,9 @@ export function parseAccountWindowCaps(raw: unknown): AccountWindowCaps {
 			value,
 		);
 	}
-	const caps: AccountWindowCaps = {};
+	// Null prototype: a "__proto__" account id must stay an own, warned entry,
+	// not hit the prototype setter, and lookups must never inherit a cap.
+	const caps: AccountWindowCaps = Object.create(null);
 	for (const [accountId, windows] of Object.entries(value)) {
 		if (accountId.trim() === "") {
 			throw new ValidationError(

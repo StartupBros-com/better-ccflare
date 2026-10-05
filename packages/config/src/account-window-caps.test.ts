@@ -154,6 +154,25 @@ describe("account_window_caps", () => {
 		).toThrow();
 	});
 
+	it("keeps a __proto__ account id as an own entry and reports it unknown (pro-gate r2 P2)", () => {
+		const raw = '{"__proto__":{"seven_day_fable":80},"known":{"five_hour":50}}';
+		const caps = parseAccountWindowCaps(raw);
+		expect(Object.keys(caps)).toContain("__proto__");
+		expect(findUnknownAccountWindowCapIds(caps, ["known"])).toEqual([
+			"__proto__",
+		]);
+		expect(Object.getPrototypeOf(caps)).toBeNull();
+		expect((caps as Record<string, unknown>).seven_day_fable).toBeUndefined();
+
+		withConfigFile(JSON.parse(raw), (path) => {
+			const fileCaps = new Config(path).getAccountWindowCaps();
+			expect(findUnknownAccountWindowCapIds(fileCaps, ["known"])).toEqual([
+				"__proto__",
+			]);
+			expect(Object.getPrototypeOf(fileCaps)).toBeNull();
+		});
+	});
+
 	it("lists account ids that have no matching account", () => {
 		const caps = { known: { five_hour: 50 }, gone: { seven_day: 90 } };
 		expect(findUnknownAccountWindowCapIds(caps, ["known", "other"])).toEqual([
