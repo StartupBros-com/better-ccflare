@@ -349,6 +349,28 @@ describe("deriveServerToolRequirement", () => {
 		expect(JSON.stringify(requirement)).not.toContain("1920");
 	});
 
+	test('files a client tool labelled type "custom" as an unrecognized typed tool, not a client function', () => {
+		const declared = { type: "web_search_20250305", name: "web_search" };
+		const clientTool = {
+			name: "client_lookup",
+			input_schema: { type: "object" },
+		};
+
+		const labelled = deriveServerToolRequirement({
+			tools: [declared, { type: "custom", ...clientTool }],
+		});
+		expect(labelled?.declarations).toHaveLength(1);
+		expect(labelled?.unsupported).toEqual([{ type: "custom" }]);
+		expect(labelled?.hasClientFunctions).toBeUndefined();
+
+		// Only an untyped tool with a name and an input_schema is a client function.
+		const untyped = deriveServerToolRequirement({
+			tools: [declared, clientTool],
+		});
+		expect(untyped?.hasClientFunctions).toBe(true);
+		expect(untyped?.unsupported).toBeUndefined();
+	});
+
 	test("historical native and proxy-opaque blocks create replay obligations only", () => {
 		const requirement = deriveServerToolRequirement({
 			messages: [

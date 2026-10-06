@@ -7426,6 +7426,56 @@ describe("selectAccountsForRequest — native web_search passthrough lane", () =
 		expect(ctx.strategy.select).not.toHaveBeenCalled();
 	});
 
+	describe("no first-party account but a hosted-proven candidate", () => {
+		function poolWithHostedProven(paused: boolean): Account[] {
+			installCapabilityProvider({
+				name: HOSTED_PROVIDER,
+				decision: provenDecision,
+			});
+			return [
+				...webSearchPool().filter(({ id }) => !id.startsWith("first-party")),
+				serving({ id: "hosted-proven", provider: HOSTED_PROVIDER, paused }),
+			];
+		}
+
+		it("serves the helper on the hosted lane", async () => {
+			const ctx = makeCtx({ accounts: poolWithHostedProven(false) });
+			const meta = serverToolMeta();
+
+			const result = await selectAccountsForRequest(meta, ctx, MODEL_ID);
+
+			expect(result.map(({ id }) => id)).toEqual(["hosted-proven"]);
+			expectHostedProof(meta, "hosted-proven");
+		});
+
+		it("answers temporary_unavailable, not no_implementation, when the hosted candidate is unavailable", async () => {
+			const ctx = makeCtx({ accounts: poolWithHostedProven(true) });
+			const meta = serverToolMeta();
+
+			const error = await rejection(
+				selectAccountsForRequest(meta, ctx, MODEL_ID),
+			);
+
+			expect(error).toMatchObject({
+				name: "ServerToolRoutingError",
+				reason: "temporary_unavailable",
+			});
+			const response = createServerToolRoutingErrorResponse(
+				error as ServerToolRoutingError,
+			);
+			expect(response.status).toBe(503);
+			const body = (await response.json()) as {
+				error: { code: string; reason: string };
+			};
+			expect(body.error.code).toBe("route_unavailable");
+			expect(meta.serverToolCapabilitySummary).toMatchObject({
+				structuralCandidateCount: 5,
+				provenCandidateCount: 1,
+				eligibleCandidateCount: 0,
+			});
+		});
+	});
+
 	it("answers temporary_unavailable when every first-party account is excluded", async () => {
 		const pool = webSearchPool();
 		for (const account of pool) {

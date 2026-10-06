@@ -1,6 +1,7 @@
 ---
 title: Claude Code WebSearch was refused locally as no_implementation although first-party Anthropic accounts run it
 date: 2026-10-04
+last_updated: 2026-10-05
 category: integration-issues
 module: server-tool-routing
 problem_type: integration_issue
@@ -25,6 +26,7 @@ tags:
   - tool-choice
   - search-profile
   - fail-closed
+  - route-profiles
 ---
 
 # Claude Code WebSearch was refused locally as no_implementation although first-party Anthropic accounts run it
@@ -57,7 +59,8 @@ web_search has two lanes: the proven hosted lane (Codex, unchanged and fail-clos
 - Known limits: a native send that fails with a 429 or 5xx still makes hosted candidates skip for the rest of the request (lost availability, never a second search), and a natively served request still reserves one request-private replay range at bind (no envelope is issued). Native search results are very likely bound to the producing Anthropic organization (verified for advisor in #439, inferred for web search). History that carries them, such as a `pause_turn` continuation, can get a 400 after failover to another first-party account. The owner-preference and strip seam is #439's.
 - If the replay bind fails, a native-eligible request continues native-only (`serverToolReplayBound = false`). Hosted-only pools keep `replay_unavailable`.
 - `search_profile` is accepted (1 to 64 printable ASCII characters) and forwarded on the native lane. The Codex tuple builder refuses a declaration carrying it.
-- Route-profile sessions: a helper that uses the picker model id or carries child headers gets helper lineage, and under a soft capability profile it falls to the native lane. Exact-account, force-routed and bounded profiles stay fail-closed for it (refs PR #447).
+- Route-profile sessions (PR #447, `ceef6bf0`): a helper-shaped request gets helper lineage whatever its model id or child headers say, and under a soft capability profile it can fall to the native lane. A request is helper-shaped only when it has a declared hosted server tool (valid or not), no client functions, and no unrecognized typed tool (`isHelperShapedServerToolPreview` in `proxy.ts`). A client function is an untyped tool with a `name` and an `input_schema`. A client tool labelled `type: "custom"` is not one: the classifier files it as an unrecognized typed tool (`unsupported`), so it disqualifies the shape. A helper-shaped request withdraws its own root-intent reservation at classification and takes the profile's `logicalModel` but never its `defaultEffort`. Details and the two remaining limits are in [routing-architecture.md, "Claude Code Model Route Profiles"](../../routing-architecture.md#claude-code-model-route-profiles).
+- Fail-closed outcomes when no lane can take a helper. `capabilityPoolErrorReason` in `account-selector.ts` counts proven candidates across both lanes, native and hosted. No proven candidate in either lane (no first-party Anthropic account and no hosted-proven candidate): 400 `server_tool_capability_unavailable`. A missing first-party account alone is not enough: a hosted-proven candidate serves the helper, or the request gets a 503 when that candidate is unavailable. Candidates prove it but none is available for this request: 503 `route_unavailable`. An exact-account profile whose account cannot serve it: 503 `server_tool_force_route_unavailable` (codes in `packages/proxy/src/server-tool-routing-errors.ts`).
 
 ### Findings behind the design
 
@@ -75,6 +78,8 @@ No scripted request may reach a real Anthropic account (`AGENTS.md`). Tests use 
 2. Its `tool_result` shows `Web search results for query: ...` with links when served, or `API Error: 400 No configured provider route implements the requested server-tool semantics` when refused.
 3. The proxy row is the session's `/v1/messages` row that starts when that assistant turn ends (`agent_used` is the session id).
 
+Join each `tool_result` to its `tool_use` by id. Do not grep transcripts for the success or refusal string: sessions that discuss this fix quote both strings, so a plain grep over-counts.
+
 Refusals, including those in route-profile sessions, can be counted directly:
 
 ```sql
@@ -86,7 +91,7 @@ WHERE error_message LIKE '%server_tool%'
 GROUP BY 1,2,3 ORDER BY 1 DESC LIMIT 20;
 ```
 
-**Falsification observation.** A 200 helper row with no search results in the transcript would mean the `auto` demotion degraded the helper. The fallback design is then to forward the forced choice unchanged and retry once with `auto` on Anthropic's forced-tool-use 400. Live, as of 2026-10-05 at `023a82f2`: one interactive Opus 5.5 WebSearch returned real results. The journal (`LOG_LEVEL=warn`) has no `Demoted forced web_search` line for it, which matches the client sending `auto` itself on that model (see the forced tool_choice finding above). So an `auto` choice has served a real search once, but the proxy's own demotion has not been seen firing live.
+**Falsification observation.** A 200 helper row with no search results in the transcript would mean the `auto` demotion degraded the helper. The fallback design is then to forward the forced choice unchanged and retry once with `auto` on Anthropic's forced-tool-use 400. Live, as of 2026-10-05 at `023a82f2`: one interactive Opus 5.5 WebSearch returned real results. The journal (`LOG_LEVEL=warn`) has no `Demoted forced web_search` line for it, which matches the client sending `auto` itself on that model (see the forced tool_choice finding above). So an `auto` choice has served a real search once, but the proxy's own demotion has not been seen firing live. No route-profile WebSearch has been observed served since #447 deployed as `ceef6bf0`; the first check is a real interactive session on a soft capability profile.
 
 ## Prevention
 
@@ -94,11 +99,15 @@ GROUP BY 1,2,3 ORDER BY 1 DESC LIMIT 20;
 - **Check a refusal against production rows.** Five candidates and zero proven, with `all_unavailable`, was visible for two weeks.
 - **Re-read the helper request after a Claude Code upgrade.** The forced choice, `thinking: disabled` and `search_profile` are facts about one client version (see `retire_when`).
 - **Keep the native lane per-candidate.** Cross-lane exclusion is a skip, never a terminal error, or a failed native send would end a request that a hosted lane could still serve.
-- **Known gaps.** `usage.server_tool_use.web_search_requests` is not priced (subscription accounts include it, API-key accounts are undercounted), and cache-keepalive staging is not applicable to the helper, which sends no `cache_control`.
+- **A request that must not change session routing must withdraw its own reservation, by identity, as soon as it is classified.** Before #447, call-site gates stopped a route-profile helper from committing, but its reservation stayed pending. A same-session root that was still selecting when the helper arrived was then no longer the newest reservation, and its commit was rejected as stale. Withdrawing at classification fixed that, but withdrawal still worked only while the reservation was the newest. A helper classified behind a newer root kept its reservation, and if that root aborted, the helper's generation became current again and could bind the session to its picker. Withdrawal now removes the request's own generation wherever it sits in the pending list. Both fixes are in #447.
+- **Known gaps.** `usage.server_tool_use.web_search_requests` is not priced (subscription accounts include it, API-key accounts are undercounted; #452), and cache-keepalive staging is not applicable to the helper, which sends no `cache_control`.
 
 ## Related Issues
 
 - #279: the original WebSearch no-implementation report.
 - #282: made the refusal honest and deferred native tuples.
+- #441: the native passthrough lane on first-party Anthropic accounts (`023a82f2`).
+- #447: route-profile helpers reach the native lane under a soft profile (`ceef6bf0`).
+- #452: pricing `web_search_requests` for API-key accounts.
 - #431: long conversations past the replay-scan caps may be refused with `server_tool_no_implementation`; out of scope here.
 - #432: advisor native passthrough, the pattern this reuses. See [Claude Code /advisor was refused as an unsupported server tool](./claude-code-advisor-refused-as-unsupported-server-tool.md).
