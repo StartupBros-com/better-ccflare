@@ -23,7 +23,6 @@ import {
 } from "@better-ccflare/providers";
 import type {
 	Account,
-	AccountWindowCaps,
 	QualityAdmissionDecision,
 	QualityAdmissionReason,
 	QualityLane,
@@ -53,10 +52,7 @@ import {
 	proxyWithAccount,
 } from "./handlers/proxy-operations";
 import type { ProxyContext } from "./handlers/proxy-types";
-import {
-	evaluateAccountWindowCapAdmission,
-	evaluateQualityRouteAdmission,
-} from "./handlers/quality-route-admission";
+import { evaluateQualityRouteAdmission } from "./handlers/quality-route-admission";
 import { hasHardAnthropicAccountSignal } from "./handlers/rate-limit-scope";
 import { RoutingAttemptLedger } from "./handlers/routing-attempt-ledger";
 import { evaluateAutoCapacity } from "./handlers/usage-throttling";
@@ -340,7 +336,6 @@ export const QUALITY_REASON_RANK: readonly QualityAdmissionReason[] =
 		"evidence-missing",
 		"subscription-exhausted",
 		"provider-capacity-exhausted",
-		"account-window-cap",
 		"spend-not-authorized",
 		"account-unavailable",
 		"model-unsupported",
@@ -400,7 +395,6 @@ function replacementFor(
 	conversation: QualityConversation | null,
 	policy: QualityRoutingPolicy,
 	accounts: readonly Account[],
-	accountWindowCaps?: AccountWindowCaps,
 ): QualityReplacementAuthority {
 	const home = conversation?.home;
 	if (!home || home.intentRevision !== conversation.revision) return null;
@@ -428,16 +422,6 @@ function replacementFor(
 	)
 		unavailable = true;
 	const usage = usageCache.getSnapshot(target.accountId);
-	// A capped home is genuinely unavailable for its line, stale evidence included.
-	if (
-		evaluateAccountWindowCapAdmission({
-			accountId: target.accountId,
-			requestModel: target.physicalModel,
-			snapshot: usage,
-			caps: accountWindowCaps,
-		})
-	)
-		unavailable = true;
 	if (usage) {
 		const capacity = evaluateAutoCapacity(usage.data, {
 			accountId: target.accountId,
@@ -481,8 +465,6 @@ export async function routeQualityRequest(input: {
 		return unavailable("conflicting-quality-id", 400);
 	const reserved = model?.startsWith(QUALITY_MODEL_PREFIX) === true;
 	const policy = ctx.config.getQualityRoutingPolicy?.();
-	// Read once per request and shared across every site.
-	const accountWindowCaps = ctx.config.getAccountWindowCaps?.();
 	const service = ctx.qualityRouteService;
 	const preference = policy?.choices.find(
 		(c) => c.publicModelId === model,
@@ -800,24 +782,16 @@ export async function routeQualityRequest(input: {
 			// unrelated DB/cache object mutation rewrite the selected wire identity.
 			const account = { ...selectedAccount };
 			const capacity = usageCache.getSnapshot(account.id);
-			const capDecision = evaluateAccountWindowCapAdmission({
-				accountId: account.id,
-				requestModel: candidate.target.physicalModel,
-				snapshot: capacity,
-				caps: accountWindowCaps,
-			});
-			const capacityDecision: QualityAdmissionDecision = capDecision
-				? capDecision
-				: capacity
-					? evaluateAutoCapacity(capacity.data, {
-							accountId: account.id,
-							provider: candidate.target.provider,
-							line: candidate.target.line,
-							requestModel: candidate.target.physicalModel,
-							observedAt: capacity.observedAt,
-							spendGrants: policy.spendGrants,
-						})
-					: { status: "unknown", reason: "capacity-evidence-unknown" };
+			const capacityDecision: QualityAdmissionDecision = capacity
+				? evaluateAutoCapacity(capacity.data, {
+						accountId: account.id,
+						provider: candidate.target.provider,
+						line: candidate.target.line,
+						requestModel: candidate.target.physicalModel,
+						observedAt: capacity.observedAt,
+						spendGrants: policy.spendGrants,
+					})
+				: { status: "unknown", reason: "capacity-evidence-unknown" };
 			if (capacityDecision.status !== "admit") {
 				recordSkip(candidate.target.lane, capacityDecision.reason);
 				continue;
@@ -868,7 +842,6 @@ export async function routeQualityRequest(input: {
 					conversation,
 					currentPolicy,
 					latestHomeAccount ? [latestHomeAccount] : [],
-					accountWindowCaps,
 				);
 			let accounting: QualityAdmissionDecision["accounting"];
 			const check = () => {
@@ -903,7 +876,6 @@ export async function routeQualityRequest(input: {
 						accountId: account.id,
 						provider: account.provider,
 					},
-					accountWindowCaps,
 					request: {
 						requirements,
 						target: candidate.evidence,

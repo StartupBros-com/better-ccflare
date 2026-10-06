@@ -759,7 +759,6 @@ We recommend using one of the workarounds above until the npm bug is fixed.
 - **Auto-refresh** - Automatically start new usage windows when they reset
 - **Usage Window Alignment** - Sessions automatically align with Claude OAuth usage window resets for optimal resource utilization
 - **Usage Throttling** - Configurable monthly token/cost limits per account with peak-hours auto-pause for Zai accounts
-- **Usage-Window Caps** - Keep an account below an operator-set percent of its five-hour, weekly, or per-model weekly window (`account_window_caps`), for example the account Claude Code is signed in as, so its own allowance never runs out
 - **503 on Pool Exhaustion** - Returns HTTP 503 when all accounts are rate-limited or paused, enabling client-side retry logic
 - **Rate Limit Audit Trail** - Tracks when and why each account became rate-limited (`rate_limited_reason`, `rate_limited_at`)
 

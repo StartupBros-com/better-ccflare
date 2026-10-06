@@ -5,9 +5,17 @@ date: 2026-10-05
 artifact_contract: ce-unified-plan/v1
 product_contract_source: ce-plan-bootstrap
 execution: code
+status: superseded
 ---
 
 # Account Usage-Window Cap - Plan
+
+> **Superseded 2026-10-05 by #450. The cap was reverted.** The premise below is wrong. In Claude Code 2.1.289, the usage-credits consent dialog is armed by a process-wide latch, and only `/v1/messages` responses set it. Every such response passes through this proxy:
+>
+> - a Fable 200 carrying `anthropic-ratelimit-unified-overage-in-use: true`, or
+> - a `credits_required` 429.
+>
+> The signed-in account's own weekly window never feeds that latch. Capping that account only held back capacity. The guard now drops the header at the last hop (`scripts/ccflare-guard.mjs`). The `requests.unified_ratelimit_headers` capture from this plan is kept.
 
 ## Goal Capsule
 

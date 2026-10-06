@@ -329,13 +329,8 @@ function modelOnlyCapacity(
 						(candidate) =>
 							candidate.exclusions.length > 0 &&
 							candidate.exclusions.every(
-								// An operator cap is a lane-level policy hold even when the
-								// capped window is account-wide: the 503 is a loud, retryable
-								// failure, never a silent switch to another model.
 								(blocker) =>
-									blocker.scope === "family" ||
-									blocker.scope === "model" ||
-									blocker.source === "window_cap",
+									blocker.scope === "family" || blocker.scope === "model",
 							),
 					)
 				);
@@ -351,20 +346,12 @@ function finiteCandidateRecovery(
 	if (
 		candidate.exclusions.some(
 			(blocker) =>
-				blocker.scope === "account" &&
-				blocker.source !== "usage_snapshot" &&
-				blocker.source !== "window_cap",
+				blocker.scope === "account" && blocker.source !== "usage_snapshot",
 		)
 	) {
 		return null;
 	}
-	// A cap releases when evidence next lets the selector re-evaluate it (the
-	// poll-freshness or window-reset expiry), not at the window's reset days away.
-	const resetTimes = candidate.exclusions.map((blocker) =>
-		blocker.source === "window_cap"
-			? blocker.evidenceExpiresAt
-			: blocker.resetAtMs,
-	);
+	const resetTimes = candidate.exclusions.map((blocker) => blocker.resetAtMs);
 	if (!resetTimes.every((resetAtMs) => isFiniteFuture(resetAtMs, now))) {
 		return null;
 	}
