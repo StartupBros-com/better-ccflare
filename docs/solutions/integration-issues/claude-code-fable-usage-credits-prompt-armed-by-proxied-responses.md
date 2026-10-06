@@ -1,5 +1,5 @@
 ---
-title: Claude Code's Fable usage-credits prompt was armed by a proxied response header, not the login account's quota
+title: Claude Code's Fable usage-credits prompt is armed by proxied responses, not the login account's quota
 date: 2026-10-05
 category: integration-issues
 module: upstream-integration
@@ -29,13 +29,13 @@ tags:
   - client-trigger
 ---
 
-# Claude Code's Fable usage-credits prompt was armed by a proxied response header, not the login account's quota
+# Claude Code's Fable usage-credits prompt is armed by proxied responses, not the login account's quota
 
 ## Problem
 
 Now and then, a background Claude Code session running Fable 5.1 behind the proxy stopped using Fable. Claude Code held the next Fable turn on a "Fable now uses usage credits" consent dialog. In a background session nobody answers it, so it expired and the session switched model or ended the turn.
 
-#444 and PR #445 assumed the Claude Code login account's own weekly Fable allowance drove the prompt. They built a per-account cap to keep that account from draining. Nobody checked that premise against the client. Reading the client showed that proxied responses arm the prompt, so PR #451 reverted the cap and drops one response header at the guard. The tracking issue is #450.
+#444 and PR #445 assumed the Claude Code login account's own weekly Fable allowance drove the prompt. They built a per-account cap to keep that account from draining. Nobody checked that premise against the client. Reading the client showed that only proxied responses, or a server flag, can arm the prompt. The login account's quota is not one of them. So PR #451 reverted the cap. At the guard, it also drops the one response header that can arm the prompt from a successful response. Nobody captured which response armed it in either incident (see Why This Works). The tracking issue is #450.
 
 Status as of this writing: PR #451 was deployed on 2026-10-06 at 01:25Z. Confirmation is pending on #450. The bar is zero `model_consent_fallback` events in background Fable sessions through 2026-10-13.
 
@@ -90,11 +90,13 @@ What follows was read in the Claude Code 2.1.289 binary on 2026-10-05. It descri
 
 The header describes the pool account that served that request, not the client's login. So behind a pool, one response served by an account with overage in use arms the prompt for the whole client process. Dropping the header at the last hop closes setter 1. The login account's quota never reaches either setter, which is why capping it could not help.
 
+Nobody captured the response that armed the prompt in either incident. So setter 1 is a channel the client code proves exists, not the one shown to have fired. The proxy sent neither session a 429 near the switch. But the latch is sticky, so a 429 earlier in the same process could also explain an incident, and so could the flag.
+
 Not covered:
 
 - **Setter 2 is still open.** A `credits_required` 429 still reaches the client on a quality route, because quality attempts deliver unproven 429s rather than fail over (`packages/proxy/src/handlers/proxy-operations.ts:8143`). None of the 56 quality-routed requests on record by 2026-10-05 was a 429.
 - **The server flag.** No proxy change can affect it.
-- **The header has not been seen in traffic.** No captured Fable response has carried `overage-in-use: true` yet: 0 of 45 by 2026-10-05. This channel was closed by reading the client code.
+- **The header has not been seen in traffic.** No captured Fable response has carried `overage-in-use: true` yet: 0 of 45 by 2026-10-05. Capture started with #445, after both incidents, so this sample cannot show what either incident received. This channel was closed by reading the client code.
 
 ## Prevention
 
