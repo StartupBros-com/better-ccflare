@@ -5,7 +5,7 @@ date: 2026-10-04
 topic: provider-server-tool-capabilities
 artifact_readiness: historical
 implementation_status: shipped
-operational_status: deployed
+operational_status: deployed-and-verified
 closed: 2026-10-05
 shipped_prs:
   native_lane: 441
@@ -14,9 +14,9 @@ shipped_prs:
 
 # Serve Claude Code WebSearch natively on first-party Anthropic accounts
 
-> **Closed implementation record (2026-10-05).** Decisions 1-9 shipped in [PR #441](https://github.com/StartupBros-com/better-ccflare/pull/441) (`023a82f2`). [PR #447](https://github.com/StartupBros-com/better-ccflare/pull/447) (`ceef6bf0`) followed with something this plan did not foresee. A WebSearch helper in a route-profile session withdraws its own root-intent reservation at classification and takes the profile's `logicalModel` but never its `defaultEffort`. Under a soft capability profile it can then fall to this native lane, while exact-account, force-routed and bounded profiles stay fail-closed. That behaviour and its two remaining limits are canonical in [Claude Code Model Route Profiles](../routing-architecture.md#claude-code-model-route-profiles), and the native lane in [Hosted WebSearch routing contract](../routing-architecture.md#hosted-websearch-routing-contract). Both are deployed as `ceef6bf0`.
+> **Closed implementation record (2026-10-05).** Decisions 1-9 shipped in [PR #441](https://github.com/StartupBros-com/better-ccflare/pull/441) (`023a82f2`). [PR #447](https://github.com/StartupBros-com/better-ccflare/pull/447) (`ceef6bf0`) followed with something this plan did not foresee. A WebSearch helper in a route-profile session withdraws its own root-intent reservation at classification and takes the profile's `logicalModel` but never its `defaultEffort`. Under a soft capability profile it can then fall to this native lane, while exact-account, force-routed and bounded profiles stay fail-closed. That behaviour and its two remaining limits are canonical in [Claude Code Model Route Profiles](../routing-architecture.md#claude-code-model-route-profiles), and the native lane in [Hosted WebSearch routing contract](../routing-architecture.md#hosted-websearch-routing-contract). Both were first deployed as `ceef6bf0`.
 >
-> Live evidence so far is one interactive WebSearch, served with real results on 2026-10-05 at `023a82f2`, so decision 7 was not falsified by it. No route-profile WebSearch has been observed served since #447. Issue #279 stays open for that check, the reporter's confirmation and its seven-day telemetry condition.
+> Live evidence is two interactive WebSearches, both served with real results. The first was a native Opus 5.5 helper on 2026-10-05 at `023a82f2`. The second, on 2026-10-06 at `a6341d04` (which contains #447), came from a `codex-pool-astra` session whose main loop stayed on Codex `gpt-6.1-sol`. Its helper fell to this native lane and was served on a first-party Anthropic account as `claude-opus-5`, in one attempt. Neither search needed the proxy's forced-choice demotion, so decision 7 is not falsified, but the demotion has not been seen firing live. Issue #279 stays open for the reporter's confirmation and its seven-day telemetry condition.
 >
 > The SQL in "Verification boundary" below cannot find a served helper: only a refusal carries the `trusted_helper` marker. Use the transcript procedure in [the solutions doc's Verification section](../solutions/integration-issues/claude-code-websearch-refused-as-no-implementation.md#verification) instead. Pricing `usage.server_tool_use.web_search_requests` (decision 10) is tracked in #452.
 

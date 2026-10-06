@@ -1,7 +1,7 @@
 ---
 title: Claude Code WebSearch was refused locally as no_implementation although first-party Anthropic accounts run it
 date: 2026-10-04
-last_updated: 2026-10-05
+last_updated: 2026-10-06
 category: integration-issues
 module: server-tool-routing
 problem_type: integration_issue
@@ -76,7 +76,7 @@ No scripted request may reach a real Anthropic account (`AGENTS.md`). Tests use 
 
 1. Find the WebSearch `tool_use` in the session transcript (`~/.claude/projects/<project>/<session>.jsonl`, plus `<session>/subagents/**/agent-*.jsonl` for subagents and workflow agents).
 2. Its `tool_result` shows `Web search results for query: ...` with links when served, or `API Error: 400 No configured provider route implements the requested server-tool semantics` when refused.
-3. The proxy row is the session's `/v1/messages` row that starts when that assistant turn ends (`agent_used` is the session id).
+3. The proxy row is the session's `/v1/messages` row (`agent_used` is the session id) whose start, `timestamp - response_time_ms`, falls when that assistant turn ends. Match on that start, not on `timestamp`: `requests.timestamp` is the completion time. In two samples of the latest 500 production rows on 2026-10-06 it equalled the last attempt's `outcomeObservedAt` in `routing_attempt_summary` on 498 and on 500, and the first attempt's `startedAt` on none.
 
 Join each `tool_result` to its `tool_use` by id. Do not grep transcripts for the success or refusal string: sessions that discuss this fix quote both strings, so a plain grep over-counts.
 
@@ -91,7 +91,7 @@ WHERE error_message LIKE '%server_tool%'
 GROUP BY 1,2,3 ORDER BY 1 DESC LIMIT 20;
 ```
 
-**Falsification observation.** A 200 helper row with no search results in the transcript would mean the `auto` demotion degraded the helper. The fallback design is then to forward the forced choice unchanged and retry once with `auto` on Anthropic's forced-tool-use 400. Live, as of 2026-10-05 at `023a82f2`: one interactive Opus 5.5 WebSearch returned real results. The journal (`LOG_LEVEL=warn`) has no `Demoted forced web_search` line for it, which matches the client sending `auto` itself on that model (see the forced tool_choice finding above). So an `auto` choice has served a real search once, but the proxy's own demotion has not been seen firing live. No route-profile WebSearch has been observed served since #447 deployed as `ceef6bf0`; the first check is a real interactive session on a soft capability profile.
+**Falsification observation.** A 200 helper row with no search results in the transcript would mean the `auto` demotion degraded the helper. The fallback design is then to forward the forced choice unchanged and retry once with `auto` on Anthropic's forced-tool-use 400. Live, as of 2026-10-05 at `023a82f2`: one interactive Opus 5.5 WebSearch returned real results. The journal (`LOG_LEVEL=warn`) has no `Demoted forced web_search` line for it, which matches the client sending `auto` itself on that model (see the forced tool_choice finding above). So an `auto` choice has served a real search once, but the proxy's own demotion has not been seen firing live. The first route-profile WebSearch was served on 2026-10-06 at 01:57Z at `a6341d04`, which contains #447, from a `codex-pool-astra` session whose main loop stayed on Codex. Its helper row has `route_profile_id = codex-pool-astra` and `original_model = claude-bccf-route-codex-pool-astra`, and it was served in one attempt on a first-party Anthropic account; the attempt records logical model `claude-bccf-route-codex-pool-astra` and physical model `claude-opus-5`. `supportsForcedToolChoice` is true for `claude-opus-5`, so that search did not need the demotion either, whatever choice the client sent.
 
 ## Prevention
 
