@@ -17,7 +17,7 @@ related_components:
   - guard
   - usage-collector
   - quality-routing
-retire_when: "Claude Code changes which responses set its Fable usage-credits latch; after a Claude Code upgrade, check the installed binary's strings for 'fableCreditsRequired' and 'anthropic-ratelimit-unified-overage-in-use' (both still present in 2.1.290)"
+retire_when: "Claude Code changes which responses set its Fable usage-credits latch; after a Claude Code upgrade, check the installed binary's strings for 'fableCreditsRequired' and 'anthropic-ratelimit-unified-overage-in-use' (both strings still present in 2.1.290; setter behavior not re-read there)"
 tags:
   - claude-code
   - fable
