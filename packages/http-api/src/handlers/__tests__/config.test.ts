@@ -714,30 +714,3 @@ describe("strategy source (real config)", () => {
 		expect(getBody).toEqual({ strategy: "least-used", strategySource: "env" });
 	});
 });
-
-describe("getAccountWindowCaps handler", () => {
-	it("returns the effective cap map and its source", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "better-ccflare-caps-handler-"));
-		try {
-			const config = new Config(join(dir, "config.json"));
-			const handlers = createConfigHandlers(config, {
-				port: 8080,
-				tlsEnabled: false,
-			});
-			expect(await handlers.getAccountWindowCaps().json()).toEqual({
-				caps: {},
-				source: "default",
-			});
-			config.set(
-				"account_window_caps",
-				JSON.stringify({ "acct-1": { seven_day_fable: 80 } }),
-			);
-			expect(await handlers.getAccountWindowCaps().json()).toEqual({
-				caps: { "acct-1": { seven_day_fable: 80 } },
-				source: "file",
-			});
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
-	});
-});

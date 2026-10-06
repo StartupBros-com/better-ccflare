@@ -4,7 +4,6 @@ import { dirname, join } from "node:path";
 import {
 	Config,
 	filterEnabledProviderModelDefaultOverrides,
-	findUnknownAccountWindowCapIds,
 	loadServerToolReplayKeys,
 	type RuntimeConfig,
 	readGuardCorrelationSecret,
@@ -118,7 +117,6 @@ import {
 	unregisterPollingRestarter,
 	unregisterRefreshClearer,
 } from "@better-ccflare/proxy";
-import { getWindowCapStates } from "@better-ccflare/proxy/usage-throttling";
 import { validatePathOrThrow } from "@better-ccflare/security";
 import {
 	type Account,
@@ -141,13 +139,6 @@ import {
 	UsagePollingLifecycle,
 	unregisterServerLifecycleCallbacks,
 } from "./usage-polling-lifecycle";
-import {
-	sweepWindowCapTransitions,
-	unevaluableWindowCapWarnings,
-	unknownWindowCapWarnings,
-	WINDOW_CAP_SWEEP_INTERVAL_MS,
-	WindowCapTransitionTracker,
-} from "./window-cap-transitions";
 
 /**
  * Build a load-balancing strategy from its enum name. Add new strategies here
@@ -677,7 +668,6 @@ let usagePollingLifecycle: UsagePollingLifecycle<NodeJS.Timeout> | null = null;
 let cacheFlightCohortSealService: CohortSealService | null = null;
 let cacheKeepaliveScheduler: CacheKeepaliveScheduler | null = null;
 let memoryMonitorInterval: Timer | null = null;
-let windowCapSweepInterval: Timer | null = null;
 
 export const DEVICE_SETUP_RECOVERY_INTERVAL_MS = 30_000;
 
@@ -1006,11 +996,6 @@ export async function refreshPollingAccessToken(
 	return accessToken;
 }
 
-// Poll-time account_window_caps transition memory (R7, KTD7). Module-level:
-// the poll callbacks are per-account closures and the memory is keyed by
-// account+window.
-const windowCapTransitions = new WindowCapTransitionTracker();
-
 /**
  * Start recurring usage polling for `account`, refreshing its access token
  * (via refreshPollingAccessToken, above) each cycle. Retries with backoff up
@@ -1173,39 +1158,6 @@ export function startUsagePollingWithRefresh(
 						} catch (err) {
 							logger.warn(
 								`Failed to evaluate usage-window alerts for account ${accountId}: ${err}`,
-							);
-						}
-						if (!(await isCurrent())) return;
-
-						// account_window_caps transition log (R7). Best-effort: never
-						// fatal to polling. Only accounts present in the cap map.
-						try {
-							const caps = container
-								.resolve<Config>(SERVICE_KEYS.Config)
-								.getAccountWindowCaps()[accountId];
-							if (caps) {
-								const states = getWindowCapStates(
-									{ data: payload.data, observedAt: now },
-									caps,
-									{ now },
-								);
-								const accountName =
-									(await proxyContext.dbOps.getAccount(accountId))?.name ??
-									account.name;
-								if (!(await isCurrent())) return;
-								for (const event of windowCapTransitions.observe(
-									accountId,
-									accountName,
-									states,
-								)) {
-									if (event.level === "warn")
-										logger.warn(event.message, event.fields);
-									else logger.info(event.message, event.fields);
-								}
-							}
-						} catch (err) {
-							logger.warn(
-								`Failed to evaluate account window caps for account ${accountId}: ${err}`,
 							);
 						}
 						if (!(await isCurrent())) return;
@@ -2672,25 +2624,6 @@ Available endpoints:
 	log.info(
 		`Loaded ${accounts.length} accounts (${activeAccounts.length} active)`,
 	);
-	try {
-		const windowCaps = config.getAccountWindowCaps();
-		for (const message of [
-			...unknownWindowCapWarnings(
-				findUnknownAccountWindowCapIds(
-					windowCaps,
-					accounts.map((a) => a.id),
-				),
-			),
-			...unevaluableWindowCapWarnings(
-				windowCaps,
-				accounts,
-				accountSupportsRefreshBackedUsagePolling,
-			),
-		])
-			log.warn(message);
-	} catch (err) {
-		log.warn(`Failed to validate account_window_caps account ids: ${err}`);
-	}
 	if (activeAccounts.length === 0) {
 		log.warn(
 			"No active accounts available - requests will be forwarded without authentication",
@@ -2750,35 +2683,6 @@ Available endpoints:
 			`No refresh-backed usage accounts found, usage polling will not start`,
 		);
 	}
-
-	// account_window_caps transitions between polls (R7): routing fails a capped
-	// window closed once its snapshot goes stale, which no poll callback sees
-	// during a poll outage.
-	const windowCapLog = new Logger("UsagePolling");
-	windowCapSweepInterval = setInterval(() => {
-		void (async () => {
-			try {
-				const events = await sweepWindowCapTransitions(
-					windowCapTransitions,
-					config.getAccountWindowCaps(),
-					{
-						accountName: async (accountId) =>
-							(await dbOps.getAccount(accountId))?.name ?? null,
-						getSnapshot: (accountId) => usageCache.getSnapshot(accountId),
-						now: () => Date.now(),
-					},
-				);
-				for (const event of events) {
-					if (event.level === "warn")
-						windowCapLog.warn(event.message, event.fields);
-					else windowCapLog.info(event.message, event.fields);
-				}
-			} catch (err) {
-				windowCapLog.warn(`Failed to sweep account window caps: ${err}`);
-			}
-		})();
-	}, WINDOW_CAP_SWEEP_INTERVAL_MS);
-	windowCapSweepInterval.unref();
 
 	// Start usage polling for NanoGPT accounts (PayG with optional subscription tracking)
 	const nanogptAccounts = accounts.filter((a) => a.provider === "nanogpt");
@@ -3381,10 +3285,6 @@ async function handleGracefulShutdown(signal: string) {
 			await drainServerResponses(shuttingDownServer, drainMs);
 		}
 
-		if (windowCapSweepInterval) {
-			clearInterval(windowCapSweepInterval);
-			windowCapSweepInterval = null;
-		}
 		usageCache.clear(); // Stop all usage polling
 		await drainUsageCollector();
 		if (shuttingDownServer) {

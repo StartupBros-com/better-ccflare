@@ -19,7 +19,6 @@ This document explains how better-ccflare picks an account for each proxied requ
    - [least-used](#least-used-leastusedstrategy)
 6. [Usage Throttling](#usage-throttling)
 7. [Model-Capacity Routing](#model-capacity-routing)
-   - [Per-account usage-window caps](#per-account-usage-window-caps)
 8. [Selection Diagnostics](#selection-diagnostics)
 9. [Auto-Fallback](#auto-fallback)
 
@@ -394,17 +393,6 @@ flowchart TD
 ```
 
 *Source: this fork implements the filter inline rather than in upstream's standalone `model-capacity.ts` module — see `packages/proxy/src/handlers/account-selector.ts` (`getReactiveModelCapacityBlocker`, the hard-capacity exclusion path), `packages/proxy/src/handlers/usage-throttling.ts` (`evaluateHardCapacity`), `packages/proxy/src/handlers/routing-terminal.ts` (the `model_pool_exhausted` terminal outcome), and `packages/proxy/src/handlers/proxy-operations.ts` (the `out_of_credits` 429 handler that feeds the reactive cache — distinct from the unrelated `all_models_exhausted_429` per-account cooldown reason used when an account's own configured model-fallback list is exhausted`).*
-
-### Per-account usage-window caps
-
-`account_window_caps` is the third capacity predicate, beside hard capacity and the reactive markers, and the only one an operator sets. A cap is not provider exhaustion: its blocker carries `source: "window_cap"` so the routing capacity context and pool-floor events label it apart from `usage_snapshot` and `reactive_marker` evidence. Configuration and operator behavior are in [the configuration guide](./configuration.md#account-usage-window-caps).
-
-- **Evaluation.** `evaluateWindowCaps` reads the canonical windows from `normalizeProviderUsageWindows`, including inactive ones (see "Usage-window cap" in `CONCEPTS.md`, the one exception to the binding-limit rule), and fails closed for a capped account whose snapshot is missing, stale, or lacks the window. A passed window reset releases before the staleness check.
-- **Enforcement.** `evaluateCandidateCapacity` appends cap blockers for every route intent, outside the `model_scoped_capacity_routing` gate and even without a snapshot. The `native_quota_wait` combo branch rebuilds its blockers from the native policy, which cannot see caps, so it appends them again before its admission check; a capped Fable slot is then a capacity exclusion and is not family-exhaustion evidence, so no Opus backup opens on its account. `isNativeQuotaRouteAllowed`, the gate every native dispatch wave passes, refuses a capped account and model. Auto quality routing applies the same check at its three admission sites and rejects with `account-window-cap`.
-- **Terminal.** `modelOnlyCapacity` treats a cap blocker as lane-scoped even for an account-wide window, so a lane emptied only by caps returns the retryable `model_pool_exhausted` 503; `finiteCandidateRecovery` takes its recovery from the cap's evidence expiry, so `Retry-After` points at the next poll, not the weekly reset.
-- **Observability.** Transitions are computed at poll time and on a 30-second sweep of the cached snapshot routing reads, never per request: `apps/server/src/window-cap-transitions.ts` logs one line per engage or release and one cap-leak warning per window per reset cycle at the cap plus 10 points. The sweep covers what no poll callback sees, a snapshot aging past freshness during a poll outage, and only for accounts a poll has already observed.
-
-*Source: `packages/proxy/src/handlers/usage-throttling.ts` (`evaluateWindowCaps`, `getWindowCapStates`), `packages/proxy/src/handlers/account-selector.ts` (`evaluateAccountWindowCapBlockers`, `isNativeQuotaRouteAllowed`), `packages/proxy/src/handlers/routing-terminal.ts`, `packages/proxy/src/handlers/quality-route-admission.ts` (`evaluateAccountWindowCapAdmission`), and `apps/server/src/window-cap-transitions.ts`.*
 
 ## Per-account Codex credit drain
 

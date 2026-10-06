@@ -96,6 +96,15 @@ export const GUARD_REQUEST_ID_HEADER = "x-better-ccflare-guard-request-id";
 export const GUARD_CORRELATION_SECRET_HEADER =
 	"x-better-ccflare-guard-correlation-secret";
 const PROXY_REQUEST_ID_HEADER = "x-better-ccflare-request-id";
+// Claude Code (2.1.289) latches "Fable requires usage credits" for the whole
+// process when one Fable response carries this header as "true", then holds
+// the next Fable turn on a consent prompt that expires in background sessions
+// and switches the session to another model. The header describes whichever
+// pool account served the request, not the client's own login, so it is
+// dropped at this last hop. The backend still records the upstream value in
+// requests.unified_ratelimit_headers. See #450.
+export const UNIFIED_OVERAGE_IN_USE_HEADER =
+	"anthropic-ratelimit-unified-overage-in-use";
 export const GUARD_CORRELATION_SECRET_ENV = "CCFLARE_GUARD_CORRELATION_SECRET";
 
 const GUARD_CORRELATION_VERSION = "v1";
@@ -401,7 +410,8 @@ function responseHeaders(fetchHeaders, bodyLength = null) {
 			lower === GUARD_CORRELATION_SECRET_HEADER ||
 			lower === MANAGED_TIMING_HEADER ||
 			lower === CLIENT_TIMEOUT_HEADER ||
-			lower === PROXY_REQUEST_ID_HEADER
+			lower === PROXY_REQUEST_ID_HEADER ||
+			lower === UNIFIED_OVERAGE_IN_USE_HEADER
 		) {
 			return;
 		}

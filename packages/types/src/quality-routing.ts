@@ -123,7 +123,6 @@ export type QualityAdmissionReason =
 	| "spend-not-authorized"
 	| "lane-unavailable"
 	| "provider-capacity-exhausted"
-	| "account-window-cap"
 	| "capacity-evidence-unknown"
 	| "billing-evidence-unknown"
 	| "catalog-evidence-stale"
@@ -229,7 +228,6 @@ const QUALITY_REASONS = [
 	"spend-not-authorized",
 	"lane-unavailable",
 	"provider-capacity-exhausted",
-	"account-window-cap",
 	"capacity-evidence-unknown",
 	"billing-evidence-unknown",
 	"catalog-evidence-stale",

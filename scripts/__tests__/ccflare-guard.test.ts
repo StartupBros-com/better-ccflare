@@ -40,6 +40,7 @@ import {
 	MAX_GUARD_RECOVERY_SILENCE_MS,
 	MAX_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
 	MIN_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
+	UNIFIED_OVERAGE_IN_USE_HEADER,
 	createGuard,
 	createGuardAbortOwner,
 	drainRequest,
@@ -1085,6 +1086,36 @@ describe("source-controlled guard", () => {
 		expect(response.headers.get(GUARD_CORRELATION_SECRET_HEADER)).toBeNull();
 		expect(response.headers.get("x-better-ccflare-request-id")).toBeNull();
 		expect(fetchCalls).toBe(1);
+	});
+
+	test("drops overage-in-use from the client response and keeps the other unified headers", async () => {
+		const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
+			fetchImpl: async () =>
+				new Response("ok", {
+					status: 200,
+					headers: {
+						"content-type": "text/plain",
+						"Anthropic-Ratelimit-Unified-Overage-In-Use": "true",
+						"anthropic-ratelimit-unified-overage-status": "rejected",
+						"anthropic-ratelimit-unified-7d_oi-utilization": "1.0",
+					},
+				}),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("ok");
+		expect(response.headers.get(UNIFIED_OVERAGE_IN_USE_HEADER)).toBeNull();
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-overage-status"),
+		).toBe("rejected");
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-7d_oi-utilization"),
+		).toBe("1.0");
 	});
 
 	test("aborts a stalled response body and releases its active lease", async () => {

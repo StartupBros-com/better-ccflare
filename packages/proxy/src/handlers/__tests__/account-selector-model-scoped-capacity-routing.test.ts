@@ -12,7 +12,6 @@ const {
 	getComboSlotInfo,
 	getNativeQuotaContext,
 	getRoutingCapacityContext,
-	isNativeQuotaRouteAllowed,
 	selectAccountsForRequest,
 } = await import("../account-selector");
 
@@ -86,7 +85,6 @@ function makeCtx(input: {
 	accounts: Account[];
 	mode?: CapacityMode;
 	combo?: ComboWithSlots | null;
-	caps?: Record<string, Record<string, number>>;
 }): ProxyContext {
 	return {
 		strategy: {
@@ -100,9 +98,6 @@ function makeCtx(input: {
 		asyncWriter: { enqueue: mock(() => {}) },
 		config: {
 			getCombosEnabled: () => true,
-			...(input.caps === undefined
-				? {}
-				: { getAccountWindowCaps: () => input.caps }),
 			...(input.mode === undefined
 				? {}
 				: { getModelScopedCapacityRouting: () => input.mode }),
@@ -569,243 +564,5 @@ describe("native quota wait combo isolation", () => {
 			after.routingCandidates?.map((candidate) => candidate.modelOverride),
 		).toEqual(["claude-fable-5"]);
 		expect(after.routingCandidateCatalog).toHaveLength(2);
-	});
-});
-
-/**
- * Live raw shape: flat five_hour/seven_day, Fable only as a weekly_scoped
- * limits[] row that is inactive below 100% and flips active once spent.
- */
-function liveUsage(fable: number, sevenDay = 40): Record<string, unknown> {
-	const resetsAt = new Date(Date.now() + 3_600_000).toISOString();
-	return {
-		five_hour: { utilization: 10, resets_at: resetsAt },
-		seven_day: { utilization: sevenDay, resets_at: resetsAt },
-		spend: { enabled: false },
-		limits: [
-			{
-				kind: "weekly_scoped",
-				percent: fable,
-				resets_at: resetsAt,
-				is_active: fable >= 100,
-				scope: { model: { id: null, display_name: "Fable" }, surface: null },
-			},
-		],
-	};
-}
-
-describe("per-account window cap in candidate selection", () => {
-	const fableCap = (id: string) => ({ [id]: { seven_day_fable: 80 } });
-
-	for (const mode of ["off", "exhausted"] as const) {
-		it(`excludes a Fable request over cap but admits Opus on the same account (mode ${mode})`, async () => {
-			const account = makeAccount({ id: `cap-ordinary-${mode}` });
-			cacheUsage(account.id, liveUsage(85));
-			const ctx = makeCtx({
-				accounts: [account],
-				mode,
-				caps: fableCap(account.id),
-			});
-			const meta = makeRequestMeta();
-			expect(
-				await selectAccountsForRequest(meta, ctx, "claude-fable-5"),
-			).toEqual([]);
-			expect(getRoutingCapacityContext(meta)?.exclusions).toMatchObject([
-				{
-					accountId: account.id,
-					exclusions: [
-						{
-							source: "window_cap",
-							window: "seven_day_fable",
-							utilization: 85,
-						},
-					],
-				},
-			]);
-			expect(
-				await selectAccountsForRequest(
-					makeRequestMeta(),
-					ctx,
-					"claude-opus-4-8",
-				),
-			).toEqual([account]);
-		});
-	}
-
-	it("rejects a forced route to the capped account without falling back", async () => {
-		const protectedAccount = makeAccount({ id: "cap-force-protected" });
-		const other = makeAccount({ id: "cap-force-other" });
-		cacheUsage(protectedAccount.id, liveUsage(85));
-		cacheUsage(other.id, liveUsage(10));
-		await expect(
-			selectAccountsForRequest(
-				makeRequestMeta({
-					headers: new Headers({
-						"x-better-ccflare-account-id": protectedAccount.id,
-					}),
-				}),
-				makeCtx({
-					accounts: [protectedAccount, other],
-					mode: "off",
-					caps: fableCap(protectedAccount.id),
-				}),
-				"claude-fable-5",
-			),
-		).rejects.toMatchObject({ accountId: protectedAccount.id });
-	});
-
-	it("skips a legacy combo slot whose account is over cap", async () => {
-		const account = makeAccount({ id: "cap-legacy-combo" });
-		cacheUsage(account.id, liveUsage(85));
-		const meta = makeRequestMeta();
-		const result = await selectAccountsForRequest(
-			meta,
-			makeCtx({
-				accounts: [account],
-				mode: "off",
-				combo: makeCombo(account.id),
-				caps: fableCap(account.id),
-			}),
-			"claude-fable-5",
-		);
-		expect(result).toEqual([]);
-		expect(getRoutingCapacityContext(meta)?.exclusions).toMatchObject([
-			{ accountId: account.id, exclusions: [{ source: "window_cap" }] },
-		]);
-	});
-
-	it("fails closed for a capped account with no snapshot and serves an uncapped one", async () => {
-		const capped = makeAccount({ id: "cap-nosnap-capped" });
-		const uncapped = makeAccount({ id: "cap-nosnap-uncapped" });
-		const meta = makeRequestMeta();
-		const result = await selectAccountsForRequest(
-			meta,
-			makeCtx({
-				accounts: [capped, uncapped],
-				mode: "off",
-				caps: fableCap(capped.id),
-			}),
-			"claude-fable-5",
-		);
-		expect(result).toEqual([uncapped]);
-		expect(getRoutingCapacityContext(meta)?.exclusions).toMatchObject([
-			{
-				accountId: capped.id,
-				exclusions: [{ source: "window_cap", utilization: null }],
-			},
-		]);
-	});
-});
-
-describe("per-account window cap on the native quota wait combo", () => {
-	function nativeCapSetup(
-		accounts: Account[],
-		caps: Record<string, Record<string, number>>,
-	) {
-		const combo = makeCombo(accounts[0]?.id ?? "missing");
-		combo.slots = accounts.flatMap((account, index) => [
-			{
-				id: `native-primary-${index}`,
-				combo_id: combo.id,
-				account_id: account.id,
-				model: "claude-fable-5",
-				priority: 0,
-				enabled: true,
-			},
-			{
-				id: `native-backup-${index}`,
-				combo_id: combo.id,
-				account_id: account.id,
-				model: "claude-opus-4-8",
-				priority: 10,
-				enabled: true,
-			},
-		]);
-		const ctx = makeCtx({ accounts, combo, mode: "exhausted", caps });
-		ctx.config.getComboSessionFallback = () => true;
-		ctx.dbOps.getComboRoutingPolicy = mock(async () => ({
-			assignment: {
-				family: "fable",
-				combo_id: combo.id,
-				enabled: true,
-				membership_mode: "manual",
-				managed_model: null,
-				exhaustion_policy: "native_quota_wait",
-			},
-			combo,
-			slots: combo.slots,
-			rules: [],
-			exclusions: [],
-		}));
-		return ctx;
-	}
-
-	it("records the capped Fable slot as a cap exclusion, serves the others, and admits no Opus backup", async () => {
-		const protectedAccount = makeAccount({ id: "ncap-protected" });
-		const other = makeAccount({ id: "ncap-other" });
-		cacheUsage(protectedAccount.id, liveUsage(85));
-		cacheUsage(other.id, liveUsage(30));
-		const ctx = nativeCapSetup([protectedAccount, other], {
-			[protectedAccount.id]: { seven_day_fable: 80 },
-		});
-		const meta = makeRequestMeta();
-		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
-			[other],
-		);
-		expect(
-			meta.routingCandidates?.map((candidate) => [
-				candidate.accountId,
-				candidate.modelOverride,
-			]),
-		).toEqual([[other.id, "claude-fable-5"]]);
-		const excluded = getRoutingCapacityContext(meta)?.exclusions.find(
-			(exclusion) => exclusion.accountId === protectedAccount.id,
-		);
-		expect(excluded).toMatchObject({
-			model: "claude-fable-5",
-			source: "combo",
-			exclusions: [{ source: "window_cap", window: "seven_day_fable" }],
-		});
-	});
-
-	it("refuses the capped account's Opus backup at the dispatch gate when the policy admits it", async () => {
-		const protectedAccount = makeAccount({ id: "ncap-gate-protected" });
-		const other = makeAccount({ id: "ncap-gate-other" });
-		// Protected account: Fable allowance spent (so the policy proves family
-		// exhaustion and admits its Opus backup) and seven_day over the cap.
-		cacheUsage(protectedAccount.id, liveUsage(100, 85));
-		cacheUsage(other.id, liveUsage(100, 40));
-		const ctx = nativeCapSetup([protectedAccount, other], {
-			[protectedAccount.id]: { seven_day: 80 },
-		});
-		const meta = makeRequestMeta();
-		const selected = await selectAccountsForRequest(
-			meta,
-			ctx,
-			"claude-fable-5",
-		);
-		expect(selected).toEqual([other]);
-		const backupId = (accountId: string) =>
-			getNativeQuotaContext(meta)?.members.find(
-				(member) =>
-					member.account_id === accountId &&
-					member.logical_model === "claude-opus-4-8",
-			)?.id ?? "missing";
-		expect(
-			isNativeQuotaRouteAllowed(
-				meta,
-				other,
-				"claude-opus-4-8",
-				backupId(other.id),
-			),
-		).toBe(true);
-		expect(
-			isNativeQuotaRouteAllowed(
-				meta,
-				protectedAccount,
-				"claude-opus-4-8",
-				backupId(protectedAccount.id),
-			),
-		).toBe(false);
 	});
 });

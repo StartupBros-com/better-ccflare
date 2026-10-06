@@ -512,9 +512,6 @@ export class APIRouter {
 		this.handlers.set("POST:/api/config/model-capacity-routing", (req) =>
 			configHandlers.setModelCapacityRouting(req),
 		);
-		this.handlers.set("GET:/api/config/account-window-caps", () =>
-			configHandlers.getAccountWindowCaps(),
-		);
 		this.handlers.set("GET:/api/config/combos-enabled", () =>
 			configHandlers.getCombosEnabled(),
 		);

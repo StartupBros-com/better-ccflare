@@ -60,9 +60,6 @@ mock.module("@better-ccflare/providers/bedrock", () => ({
 	parseBedrockConfig: () => null,
 	translateModelName: (model: string) => model,
 }));
-mock.module("@better-ccflare/proxy/usage-throttling", () => ({
-	getWindowCapStates: () => [],
-}));
 mock.module("@better-ccflare/proxy", () => {
 	class Scheduler {
 		stop() {}
