@@ -170,7 +170,8 @@ export function compileQualityCandidates(
 		intent.kind === "main"
 			? policy.mainLadders[intent.preference]
 			: policy.workerLanes[intent.role];
-	if (lanes.length > 3 || new Set(lanes).size !== lanes.length)
+	const maxLanes = intent.kind === "main" ? 3 : 4;
+	if (lanes.length > maxLanes || new Set(lanes).size !== lanes.length)
 		throw new TypeError("Invalid quality lane ladder");
 	const candidates: QualityRouteCandidate[] = [];
 	const rejected = new Map<

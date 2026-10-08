@@ -1303,7 +1303,11 @@ describe("prewarmed native catalogs", () => {
 		]);
 		expect((await home())?.physicalModel).toBe("claude-fable-5-1");
 	});
-	it("rejects unknown quality IDs and hard-route conflicts without provider sends or accepted intent", async () => {
+	it.each([
+		false,
+		true,
+	])("rejects unknown quality IDs and hard-route conflicts without provider sends or accepted intent (worker fallback %s)", async (enabled) => {
+		setWorkerFlagshipFallback(enabled);
 		expect((await send(request("claude-bccf-quality-unknown"))).status).toBe(
 			400,
 		);
@@ -1563,9 +1567,17 @@ describe("prewarmed native catalogs", () => {
 		expect(sends).toHaveLength(1);
 	});
 	it.each([
-		"eof",
-		"error",
-	])("%s after stream output never replays or installs a home", async (kind) => {
+		["eof", false],
+		["error", false],
+		["eof", true],
+		["error", true],
+	] as const)("%s after stream output never replays or installs a home (enabled worker %s)", async (kind, worker) => {
+		if (worker) {
+			setWorkerFlagshipFallback();
+			await (await send()).text();
+			await flush();
+		}
+		const rootHome = await home();
 		upstream = () =>
 			sse([
 				startEvent,
@@ -1580,10 +1592,30 @@ describe("prewarmed native catalogs", () => {
 						]
 					: []),
 			]);
-		await (await send(request(undefined, {}, { stream: true }))).text();
+		await (
+			await send(
+				request(
+					worker ? "claude-sonnet-5-5" : undefined,
+					worker ? { "x-claude-code-agent-id": "partial-worker" } : {},
+					{ stream: true },
+				),
+			)
+		).text();
 		await flush();
-		expect(sends).toHaveLength(1);
-		expect(await home()).toBeUndefined();
+		expect(sends).toEqual(
+			worker
+				? [
+						{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+						{ model: "claude-sonnet-5-5", authorization: "synthetic-a" },
+					]
+				: [{ model: "claude-fable-5-1", authorization: "synthetic-a" }],
+		);
+		expect(await home()).toEqual(rootHome);
+		expect(
+			(await service.status(scope))?.conversations.find(
+				(c) => c.key !== "$root",
+			)?.home,
+		).toBe(worker ? null : undefined);
 	});
 	it("downstream cancellation cannot install a home", async () => {
 		upstream = () =>
@@ -1859,15 +1891,33 @@ describe("prewarmed native catalogs", () => {
 		]);
 		expect((await home())?.lane).toBe("opus");
 	});
-	it("missing capabilities, output overflow, and removed enrollment produce zero sends", async () => {
-		expect(
-			(await send(request(undefined, {}, { max_tokens: 1001 }))).status,
-		).toBe(503);
-		expect(sends).toHaveLength(0);
+	it.each([
+		false,
+		true,
+	])("missing capabilities and output overflow produce no additional sends (enabled worker %s)", async (worker) => {
+		if (worker) {
+			setWorkerFlagshipFallback();
+			await (await send()).text();
+			await flush();
+		}
+		const before = sends.slice();
+		const target = (body: Record<string, unknown> = {}) =>
+			request(
+				worker ? "claude-sonnet-5-5" : undefined,
+				worker ? { "x-claude-code-agent-id": "vetoed-worker" } : {},
+				body,
+			);
+		expect((await send(target({ max_tokens: 1001 }))).status).toBe(503);
+		expect(sends).toEqual(before);
 		resetModelCatalogForTest();
 		failCatalogAcquisition();
-		expect((await send()).status).toBe(503);
-		expect(sends).toHaveLength(0);
+		expect((await send(target())).status).toBe(503);
+		expect(sends).toEqual(before);
+		expect(
+			(await service.status(scope))?.conversations.find(
+				(c) => c.key !== "$root",
+			)?.home,
+		).toBe(worker ? null : undefined);
 	});
 	it("persistent settlement failure retains a restart-visible fence without replay", async () => {
 		const fail = spyOn(service, "settleDispatch").mockRejectedValue(
@@ -3103,7 +3153,16 @@ describe("prewarmed native catalogs", () => {
 			true,
 		);
 	});
-	it("ambiguous send failure never replays against a second account", async () => {
+	it.each([
+		false,
+		true,
+	])("ambiguous send failure never replays against a second account (enabled worker %s)", async (worker) => {
+		if (worker) {
+			setWorkerFlagshipFallback();
+			await (await send()).text();
+			await flush();
+		}
+		const rootHome = await home();
 		service = new QualityRouteService(
 			new QualityRouteRepository(new BunSqlAdapter(db)),
 			Date.now,
@@ -3113,10 +3172,30 @@ describe("prewarmed native catalogs", () => {
 		upstream = () => {
 			throw new Error("synthetic connection loss after write");
 		};
-		await (await send()).text();
+		await (
+			await send(
+				worker
+					? request("claude-sonnet-5-5", {
+							"x-claude-code-agent-id": "uncertain-worker",
+						})
+					: request(),
+			)
+		).text();
 		await flush();
-		expect(sends).toHaveLength(1);
-		expect(await home()).toBeUndefined();
+		expect(sends).toEqual(
+			worker
+				? [
+						{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+						{ model: "claude-sonnet-5-5", authorization: "synthetic-a" },
+					]
+				: [{ model: "claude-fable-5-1", authorization: "synthetic-a" }],
+		);
+		expect(await home()).toEqual(rootHome);
+		expect(
+			(await service.status(scope))?.conversations.find(
+				(c) => c.key !== "$root",
+			)?.home,
+		).toBe(worker ? null : undefined);
 		expect((await service.status(scope))?.unresolved).toHaveLength(1);
 		// An ambiguous send cannot withdraw ownership of a possible late callback.
 		expect(service.reserveObservedSettlement()).toBeNull();
@@ -3239,6 +3318,584 @@ describe("prewarmed native catalogs", () => {
 		expect(worker.status).toBe(503);
 		expect(sends).toHaveLength(1);
 		expect((await home())?.physicalModel).toBe("claude-fable-5-1");
+	});
+
+	function setWorkerFlagshipFallback(enabled = true) {
+		const base = ctx.config.getQualityRoutingPolicy();
+		if (!base) throw new Error("missing policy fixture");
+		const policy = compileQualityRoutingPolicy({
+			version: base.version,
+			workerFlagshipFallback: enabled,
+			assignments: base.assignments,
+			accounts: base.accounts,
+			fallbacks: base.fallbacks,
+			spendGrants: base.spendGrants,
+		});
+		ctx.config.getQualityRoutingPolicy = () => policy;
+		return policy;
+	}
+
+	function exhaustNativeModels(...models: string[]) {
+		for (const a of accounts.filter((a) => a.provider === "anthropic"))
+			usageCache.set(a.id, {
+				limits: [
+					{ kind: "weekly_all", percent: 10, resets_at: Date.now() + 60000 },
+					...models.map((model) => ({
+						kind: "weekly_scoped",
+						percent: 100,
+						resets_at: Date.now() + 60000,
+						scope: { model: { display_name: model } },
+					})),
+				],
+				spend: { enabled: false },
+			} as never);
+	}
+	const workerRoles = [
+		["standard", "claude-sonnet-5-5", "Sonnet"],
+		["lightweight", "claude-haiku-4-5", "Haiku"],
+	] as const;
+
+	it.each(
+		workerRoles,
+	)("enabled %s worker exhaustion selects a flagship without changing root home", async (role, model, family) => {
+		setWorkerFlagshipFallback();
+		const root = await send();
+		expect(root.status).toBe(200);
+		await root.text();
+		await flush();
+		const before = (await service.status(scope))?.conversations.find(
+			(c) => c.key === "$root",
+		);
+		exhaustNativeModels(family);
+		const childRequest = () =>
+			request(model, {
+				"x-better-ccflare-agent-id": "fallback-worker",
+				"x-claude-code-agent-id": "fallback-worker",
+			});
+		const worker = await send(childRequest());
+		expect(worker.status).toBe(200);
+		await worker.text();
+		await flush();
+		expect(sends).toEqual([
+			{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+			{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+		]);
+		const status = await service.status(scope);
+		expect(status?.conversations.find((c) => c.key === "$root")).toEqual(
+			before,
+		);
+		expect(status?.conversations.find((c) => c.key !== "$root")).toMatchObject({
+			home: {
+				target: {
+					accountId: "a",
+					lane: "fable",
+					physicalModel: "claude-fable-5-1",
+				},
+			},
+			lastSuccessfulDecision: {
+				value: {
+					requested: { kind: "worker", role },
+					skippedLanes: [
+						{ lane: role, reasons: { "subscription-exhausted": 2 } },
+					],
+				},
+			},
+		});
+		const child = status?.conversations.find((c) => c.key !== "$root");
+		exhaustNativeModels();
+		const continuation = await send(childRequest());
+		expect(continuation.status).toBe(200);
+		await continuation.text();
+		await flush();
+		expect(sends[2]).toEqual({
+			model: "claude-fable-5-1",
+			authorization: "synthetic-a",
+		});
+		const continued = await service.status(scope);
+		expect(
+			continued?.conversations.find((c) => c.key !== "$root")?.home,
+		).toEqual({
+			...child?.home,
+			version: (child?.home?.version ?? 0) + 1,
+		});
+		expect(continued?.conversations.find((c) => c.key === "$root")).toEqual(
+			before,
+		);
+		expect(continued?.unresolved).toHaveLength(0);
+	});
+
+	async function enrollWorkerAstra() {
+		const base = ctx.config.getQualityRoutingPolicy();
+		if (!base) throw new Error("missing policy fixture");
+		const codex = {
+			...account("c"),
+			provider: "codex",
+			api_key: null,
+			access_token: "synthetic-c",
+			expires_at: Date.now() + 3600000,
+		};
+		accounts.push(codex);
+		const policy = compileQualityRoutingPolicy({
+			version: base.version,
+			workerFlagshipFallback: true,
+			assignments: [
+				...base.assignments,
+				{
+					line: "gpt-astra",
+					lane: "astra",
+					priority: 0,
+					upgrade: "same-line-supported",
+				},
+			],
+			accounts: [
+				...base.accounts,
+				{
+					accountId: "c",
+					provider: "codex",
+					lines: ["gpt-astra"],
+					priority: 0,
+				},
+			],
+			fallbacks: base.fallbacks,
+			spendGrants: [],
+		});
+		ctx.config.getQualityRoutingPolicy = () => policy;
+		const transport = globalThis.fetch;
+		globalThis.fetch = Object.assign(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const req = input instanceof Request ? input : new Request(input, init);
+				if (
+					req.method === "GET" &&
+					new URL(req.url).pathname.endsWith("/wham/usage")
+				)
+					return Response.json({
+						rate_limit: {
+							allowed: true,
+							limit_reached: false,
+							primary_window: null,
+							secondary_window: {
+								used_percent: 10,
+								reset_at: Math.floor(Date.now() / 1000) + 3600,
+							},
+						},
+						credits: { has_credits: false, unlimited: false, balance: "0" },
+					});
+				if (req.method === "GET" && new URL(req.url).pathname !== "/v1/models")
+					return Response.json({
+						models: [
+							{
+								slug: "gpt-6-astra",
+								context_window: 100000,
+								max_context_window: 100000,
+								max_output_tokens: 1000,
+								input_modalities: ["text"],
+							},
+						],
+					});
+				if (
+					req.method === "POST" &&
+					req.headers.get("authorization") === "Bearer synthetic-c"
+				) {
+					const body = (await req.json()) as { model: string };
+					sends.push({
+						model: body.model,
+						authorization: req.headers.get("authorization"),
+					});
+					return sse([
+						{
+							type: "response.created",
+							response: { id: "resp-synthetic", model: body.model },
+						},
+						{ type: "response.output_text.delta", delta: "ok" },
+						{
+							type: "response.completed",
+							response: {
+								id: "resp-synthetic",
+								model: body.model,
+								status: "completed",
+								usage: { input_tokens: 1, output_tokens: 1 },
+							},
+						},
+					]);
+				}
+				return transport(input, init);
+			},
+			{ preconnect: () => {} },
+		) as typeof fetch;
+		await getCodexModels(codex.id, ctx);
+		await new Promise<void>((resolve) => {
+			usageCache.startPolling(
+				codex.id,
+				"synthetic-c",
+				"codex",
+				60_000,
+				undefined,
+				undefined,
+				undefined,
+				() => resolve(),
+			);
+		});
+		return policy;
+	}
+
+	describe.each(
+		workerRoles,
+	)("enabled %s fallback ladder", (role, model, family) => {
+		beforeEach(() => enrollWorkerAstra());
+		const identifiedWorker = () =>
+			request(model, { "x-claude-code-agent-id": "ordered-worker" });
+		const skips = [
+			{ lane: role, reasons: { "subscription-exhausted": 2 } },
+			{ lane: "fable", reasons: { "subscription-exhausted": 2 } },
+			{ lane: "astra", reasons: { "provider-capacity-exhausted": 1 } },
+			{ lane: "opus", reasons: { "subscription-exhausted": 2 } },
+		];
+		it.each([
+			[0, role, model, "synthetic-a"],
+			[1, "fable", "claude-fable-5-1", "synthetic-a"],
+			[2, "astra", "gpt-6-astra", "Bearer synthetic-c"],
+			[3, "opus", "claude-opus-5-5", "synthetic-a"],
+		] as const)("exhausts %s preceding lanes before selecting %s", async (rung, lane, physicalModel, authorization) => {
+			await (await send()).text();
+			await flush();
+			const root = (await service.status(scope))?.conversations.find(
+				(c) => c.key === "$root",
+			);
+			exhaustNativeModels(
+				...(rung === 0 ? [] : rung === 1 ? [family] : [family, "Fable"]),
+			);
+			if (rung === 3)
+				usageCache.set("c", {
+					limits: [
+						{ kind: "weekly_all", percent: 100, resets_at: Date.now() + 60000 },
+					],
+					spend: { enabled: false },
+				} as never);
+			const response = await send(identifiedWorker());
+			expect(response.status).toBe(200);
+			await response.text();
+			await flush();
+			expect(sends).toEqual([
+				{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+				{ model: physicalModel, authorization },
+			]);
+			const status = await service.status(scope);
+			expect(status?.conversations.find((c) => c.key === "$root")).toEqual(
+				root,
+			);
+			expect(
+				status?.conversations.find((c) => c.key !== "$root"),
+			).toMatchObject({
+				home: {
+					target: {
+						accountId: lane === "astra" ? "c" : "a",
+						lane,
+						physicalModel,
+					},
+				},
+				lastSuccessfulDecision: {
+					value: {
+						requested: { kind: "worker", role },
+						skippedLanes: skips.slice(0, rung),
+					},
+				},
+			});
+		});
+
+		it("all four exhausted lanes return and persist ordered diagnostics without extra sends", async () => {
+			await withRealQualityHistory(async (operations, collector) => {
+				await (await send()).text();
+				await flush();
+				const root = (await service.status(scope))?.conversations.find(
+					(c) => c.key === "$root",
+				);
+				exhaustNativeModels(family, "Fable", "Opus");
+				usageCache.set("c", {
+					limits: [
+						{ kind: "weekly_all", percent: 100, resets_at: Date.now() + 60000 },
+					],
+					spend: { enabled: false },
+				} as never);
+				const response = await send(identifiedWorker());
+				expect(response.status).toBe(503);
+				expect(await response.json()).toMatchObject({
+					error: {
+						code: "quality_route_unavailable",
+						reason: "subscription-exhausted",
+						lanes: skips,
+					},
+				});
+				await flush();
+				await collector.drain();
+				expect(sends).toEqual([
+					{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+				]);
+				const history = await (
+					await createRequestsSummaryHandler(operations.getAdapter())()
+				).json();
+				expect(history).toHaveLength(2);
+				const rejection = history.find(
+					(row: { statusCode: number }) => row.statusCode === 503,
+				);
+				expect(rejection.qualityDecision).toMatchObject({
+					requested: { kind: "worker", role },
+					selected: null,
+					skippedLanes: skips,
+				});
+				const status = await service.status(scope);
+				expect(
+					status?.conversations.find((c) => c.key !== "$root"),
+				).toMatchObject({
+					home: null,
+					decision: { requestId: rejection.id, value: { skippedLanes: skips } },
+				});
+				expect(status?.conversations.find((c) => c.key === "$root")).toEqual(
+					root,
+				);
+				expect(status?.unresolved).toHaveLength(0);
+			});
+		});
+
+		it.each([
+			"native-overage",
+			"unowned-codex",
+		])("available paid or unowned capacity never grants worker spend: %s", async (mode) => {
+			await (await send()).text();
+			await flush();
+			exhaustNativeModels(family, "Fable", "Opus");
+			if (mode === "native-overage") {
+				for (const a of accounts.filter((a) => a.provider === "anthropic"))
+					usageCache.set(a.id, {
+						...usageCache.getSnapshot(a.id)?.data,
+						spend: { enabled: true, percent: 10 },
+					} as never);
+				usageCache.set("c", {
+					limits: [
+						{ kind: "weekly_all", percent: 100, resets_at: Date.now() + 60000 },
+					],
+				} as never);
+			} else {
+				// Passive plan/headroom/billing fields cannot mint source-owned no-credit proof.
+				usageCache.set("c", {
+					limits: [
+						{ kind: "weekly_all", percent: 10, resets_at: Date.now() + 60000 },
+					],
+					spend: { enabled: false },
+				} as never);
+			}
+			const response = await send(identifiedWorker());
+			expect(response.status).toBe(503);
+			const body = await response.json();
+			expect(body.error.lanes).toEqual(
+				mode === "native-overage"
+					? [
+							{ lane: role, reasons: { "spend-not-authorized": 2 } },
+							{ lane: "fable", reasons: { "spend-not-authorized": 2 } },
+							{ lane: "astra", reasons: { "provider-capacity-exhausted": 1 } },
+							{ lane: "opus", reasons: { "spend-not-authorized": 2 } },
+						]
+					: [
+							skips[0],
+							skips[1],
+							{ lane: "astra", reasons: { "spend-not-authorized": 1 } },
+							skips[3],
+						],
+			);
+			expect(ctx.config.getQualityRoutingPolicy()?.spendGrants).toEqual([]);
+			expect(sends).toEqual([
+				{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+			]);
+			expect(
+				(await service.status(scope))?.conversations.find(
+					(c) => c.key !== "$root",
+				)?.home,
+			).toBeNull();
+		});
+
+		it("explicitly disabled policy retains the own-lane-only refusal", async () => {
+			setWorkerFlagshipFallback(false);
+			await (await send()).text();
+			await flush();
+			exhaustNativeModels(family);
+			const response = await send(identifiedWorker());
+			expect(response.status).toBe(503);
+			expect(await response.json()).toMatchObject({
+				error: { reason: "subscription-exhausted", lanes: skips.slice(0, 1) },
+			});
+			expect(sends).toEqual([
+				{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+			]);
+		});
+	});
+
+	it.each(
+		workerRoles,
+	)("enabled marker-only %s fallback stays request-only after own-lane recovery", async (_role, model, family) => {
+		setWorkerFlagshipFallback();
+		await (await send()).text();
+		await flush();
+		const before = (await service.status(scope))?.conversations;
+		const worker = () =>
+			request(model, { "x-anthropic-billing-header": "cc_is_subagent=true" });
+		exhaustNativeModels(family);
+		const fallback = await send(worker());
+		expect(fallback.status).toBe(200);
+		await fallback.text();
+		await flush();
+		exhaustNativeModels();
+		const recovered = await send(worker());
+		expect(recovered.status).toBe(200);
+		await recovered.text();
+		await flush();
+		expect(sends).toEqual([
+			{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+			{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+			{ model, authorization: "synthetic-a" },
+		]);
+		expect((await service.status(scope))?.conversations).toEqual(before);
+		expect((await service.status(scope))?.unresolved).toHaveLength(0);
+	});
+
+	it.each([
+		"model",
+		"account",
+		"profile",
+	])("enabled worker fallback does not override an explicit root %s route", async (mode) => {
+		setWorkerFlagshipFallback();
+		await (await send()).text();
+		await flush();
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry([
+			{
+				id: "explicit-standard",
+				publicModelId: "claude-bccf-route-explicit-standard",
+				discoveryModelId: "claude-bccf-route-explicit-standard",
+				displayName: "Explicit Standard",
+				accountId: "b",
+				logicalModel: "claude-sonnet-5-5",
+			},
+		]);
+		const response = await send(
+			request(
+				mode === "profile"
+					? "claude-bccf-route-explicit-standard"
+					: "claude-sonnet-5-5",
+				mode === "account" ? { "x-better-ccflare-account-id": "b" } : {},
+			),
+		);
+		expect(response.status).toBe(200);
+		await response.text();
+		await flush();
+		expect(sends).toEqual([
+			{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+			{
+				model: "claude-sonnet-5-5",
+				authorization: mode === "model" ? "synthetic-a" : "synthetic-b",
+			},
+		]);
+		expect((await service.status(scope))?.preference).toBeNull();
+		expect((await home())?.physicalModel).toBe("claude-fable-5-1");
+	});
+
+	it.each([
+		"account",
+		"profile",
+	])("enabled worker fallback rejects a conflicting exact %s override without changing root", async (mode) => {
+		setWorkerFlagshipFallback();
+		await (await send()).text();
+		await flush();
+		const before = await service.status(scope);
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry([
+			{
+				id: "explicit-worker",
+				publicModelId: "claude-bccf-route-explicit-worker",
+				discoveryModelId: "claude-bccf-route-explicit-worker",
+				displayName: "Explicit Worker",
+				accountId: "b",
+				logicalModel: "claude-opus-5-5",
+			},
+		]);
+		const response = await send(
+			request(
+				mode === "profile"
+					? "claude-bccf-route-explicit-worker"
+					: "claude-sonnet-5-5",
+				{
+					"x-claude-code-agent-id": "hard-worker",
+					...(mode === "account" ? { "x-better-ccflare-account-id": "b" } : {}),
+				},
+			),
+		);
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({
+			error: { reason: "conflicting-hard-route" },
+		});
+		expect(sends).toEqual([
+			{ model: "claude-fable-5-1", authorization: "synthetic-a" },
+		]);
+		expect(await service.status(scope)).toEqual(before);
+	});
+
+	it.each([
+		"principal",
+		"session",
+		"other-principal",
+		"other-session",
+		"unenrolled",
+	])("enabled worker fallback requires verified identity and enrolled root: %s", async (mode) => {
+		setWorkerFlagshipFallback();
+		if (mode !== "unenrolled") {
+			await (await send()).text();
+			await flush();
+		}
+		const before = await service.status(scope);
+		const headers: Record<string, string> = {
+			"x-claude-code-agent-id": "unverified-worker",
+		};
+		if (mode === "other-session")
+			headers["x-claude-code-session-id"] = "other-session";
+		const req = request("claude-bccf-quality-auto", headers);
+		if (mode === "session") req.headers.delete("x-claude-code-session-id");
+		const response = await send(
+			req,
+			mode === "principal"
+				? null
+				: mode === "other-principal"
+					? "other-principal"
+					: scope.principalId,
+		);
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({
+			error: {
+				reason:
+					mode === "principal" || mode === "session"
+						? "verified-session-required"
+						: "parent-not-enrolled",
+			},
+		});
+		expect(sends).toEqual(
+			mode === "unenrolled"
+				? []
+				: [{ model: "claude-fable-5-1", authorization: "synthetic-a" }],
+		);
+		expect(await service.status(scope)).toEqual(before);
+	});
+
+	it("worker ladder keeps duplicate rejection and the four-lane upper bound", () => {
+		const policy = setWorkerFlagshipFallback();
+		for (const standard of [
+			["standard", "fable", "astra", "opus", "lightweight"],
+			["standard", "fable", "astra", "fable"],
+		])
+			expect(() =>
+				compileQualityCandidates(
+					{
+						...policy,
+						workerLanes: { ...policy.workerLanes, standard },
+					} as never,
+					{ kind: "worker", role: "standard" },
+					accounts,
+				),
+			).toThrow("Invalid quality lane ladder");
 	});
 
 	it.each([

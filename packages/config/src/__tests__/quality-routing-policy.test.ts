@@ -80,6 +80,58 @@ describe("quality routing config", () => {
 		}
 	});
 
+	it.each([
+		true,
+		false,
+	])("parses worker flagship fallback %j from file objects, file JSON and environment JSON", (workerFlagshipFallback) => {
+		const input = { ...approvedInput(), workerFlagshipFallback };
+		const expected = workerFlagshipFallback
+			? ["standard", "fable", "astra", "opus"]
+			: ["standard"];
+		for (const value of [input, JSON.stringify(input)]) {
+			const config = new Config(configPath({ quality_routing_policy: value }));
+			expect(config.getQualityRoutingPolicy()?.workerLanes.standard).toEqual(
+				expected,
+			);
+		}
+		process.env[ENV] = JSON.stringify(input);
+		const config = new Config(
+			configPath({
+				quality_routing_policy: {
+					...approvedInput(),
+					workerFlagshipFallback: !workerFlagshipFallback,
+				},
+			}),
+		);
+		expect(config.getQualityRoutingPolicy()?.workerLanes.standard).toEqual(
+			expected,
+		);
+	});
+
+	it("omitted and false JSON opt-in compile to the same legacy policy", () => {
+		const legacy = parseQualityRoutingPolicy(JSON.stringify(approvedInput()));
+		const disabled = parseQualityRoutingPolicy(
+			JSON.stringify({ ...approvedInput(), workerFlagshipFallback: false }),
+		);
+		expect(JSON.stringify(disabled)).toBe(JSON.stringify(legacy));
+		expect(disabled).not.toHaveProperty("workerFlagshipFallback");
+	});
+
+	it.each(
+		[null, 0, 1, "true", "false", {}, []].map((value) => [value]),
+	)("rejects malformed worker flagship fallback %j in file and environment policies", (workerFlagshipFallback) => {
+		const input = { ...approvedInput(), workerFlagshipFallback };
+		for (const value of [input, JSON.stringify(input)]) {
+			expect(
+				() => new Config(configPath({ quality_routing_policy: value })),
+			).toThrow("workerFlagshipFallback: must be a boolean");
+		}
+		process.env[ENV] = JSON.stringify(input);
+		expect(
+			() => new Config(configPath({ quality_routing_policy: approvedInput() })),
+		).toThrow("workerFlagshipFallback: must be a boolean");
+	});
+
 	it("gives even empty environment JSON precedence over the file", () => {
 		const path = configPath({
 			quality_routing_policy: approvedInput("from-file"),
@@ -148,6 +200,11 @@ describe("quality routing config", () => {
 		expect(() =>
 			parseQualityRoutingPolicy('{"version":1,"\\u0076ersion":1}'),
 		).toThrow("quality_routing_policy");
+		expect(() =>
+			parseQualityRoutingPolicy(
+				`${JSON.stringify(approvedInput()).slice(0, -1)},"workerFlagshipFallback":true,"workerFlagshipFallback":false}`,
+			),
+		).toThrow("strict JSON");
 		expect(() =>
 			parseQualityRoutingPolicy("[".repeat(70) + "]".repeat(70)),
 		).toThrow("quality_routing_policy");

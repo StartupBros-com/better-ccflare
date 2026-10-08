@@ -56,7 +56,7 @@ export interface QualitySpendGrant {
 /**
  * V1 accepts only the six initially approved named line/lane pairs. New lines
  * or cross-role assignments need a separately approved policy schema change.
- * Every field is explicit: no account discovery or implicit spend enrollment.
+ * Enrollment and spend are explicit: no account discovery or implicit grants.
  */
 export interface QualityRoutingPolicyConfig {
 	readonly version: 1;
@@ -64,6 +64,8 @@ export interface QualityRoutingPolicyConfig {
 	readonly accounts: readonly QualityAccountEnrollment[];
 	readonly fallbacks: readonly QualityPermittedFallback[];
 	readonly spendGrants: readonly QualitySpendGrant[];
+	/** Opt standard/lightweight workers into flagship fallback; never grants spend. */
+	readonly workerFlagshipFallback?: boolean;
 }
 
 export interface QualityRouteChoice {
@@ -167,12 +169,18 @@ export interface QualitySkippedLaneSummary {
 	readonly reasons: Readonly<Partial<Record<QualityAdmissionReason, number>>>;
 }
 
-/** Ordered in attempted ladder order; at most the three main lanes. */
+/** Ordered in attempted ladder order; at most three main or four worker lanes. */
 export type QualitySkippedLanes =
 	| readonly []
 	| readonly [QualitySkippedLaneSummary]
 	| readonly [QualitySkippedLaneSummary, QualitySkippedLaneSummary]
 	| readonly [
+			QualitySkippedLaneSummary,
+			QualitySkippedLaneSummary,
+			QualitySkippedLaneSummary,
+	  ]
+	| readonly [
+			QualitySkippedLaneSummary,
 			QualitySkippedLaneSummary,
 			QualitySkippedLaneSummary,
 			QualitySkippedLaneSummary,
@@ -260,7 +268,7 @@ function qualityId(value: unknown): value is string {
 		/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(value)
 	);
 }
-/** 8KiB JSON, 3 ordered lanes, 19 enumerated reasons/lane, counts <= 1e6.
+/** 8KiB JSON, 3 main or 4 worker lanes, 19 enumerated reasons/lane, counts <= 1e6.
  * Reject unknown fields/enums and invalid scalars; return a fresh allowlisted value.
  * References on an internal target are accepted only to discard them. Never route on this data.
  */
@@ -335,7 +343,11 @@ export function sanitizeQualityDecision(
 				line: target.line as QualityApprovedLine,
 			};
 		}
-		if (!Array.isArray(value.skippedLanes) || value.skippedLanes.length > 3)
+		const maxSkippedLanes = requested.kind === "worker" ? 4 : 3;
+		if (
+			!Array.isArray(value.skippedLanes) ||
+			value.skippedLanes.length > maxSkippedLanes
+		)
 			return null;
 		const skipped: QualitySkippedLaneSummary[] = [];
 		for (const entry of value.skippedLanes) {
