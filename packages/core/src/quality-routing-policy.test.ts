@@ -186,6 +186,13 @@ describe("approved quality policy", () => {
 			expect(() =>
 				compileQualityRoutingPolicy({ ...approvedInput(), fallbacks }),
 			).toThrow("fallback");
+			expect(() =>
+				compileQualityRoutingPolicy({
+					...approvedInput(),
+					workerFlagshipFallback: true,
+					fallbacks,
+				}),
+			).toThrow("fallback");
 		}
 	});
 
@@ -235,8 +242,11 @@ describe("approved quality policy", () => {
 			const input: Record<string, unknown> = approvedInput();
 			delete input[key];
 			expect(() => compileQualityRoutingPolicy(input)).toThrow(
-				"quality_routing_policy",
+				`missing field ${key}`,
 			);
+			expect(() =>
+				compileQualityRoutingPolicy({ ...input, workerFlagshipFallback: true }),
+			).toThrow(`missing field ${key}`);
 		}
 		for (const key of ["assignments", "accounts", "fallbacks", "spendGrants"]) {
 			for (const value of [null, {}, false, "", [null], [true], [1]]) {
@@ -292,6 +302,72 @@ describe("approved quality policy", () => {
 			true,
 			true,
 		]);
+	});
+
+	it("omitted and false worker fallback preserve legacy bytes and approval revision", () => {
+		const input = approvedInput();
+		const legacy = compileQualityRoutingPolicy(input);
+		const disabled = compileQualityRoutingPolicy({
+			...input,
+			workerFlagshipFallback: false,
+		});
+		expect(legacy?.revision).toBe(
+			"quality-policy-v1:2ee4dc159ebc559e5d8eb5937457286cfc6fabcff503d4a8948cc2ae8daf0eaf",
+		);
+		expect(JSON.stringify(disabled)).toBe(JSON.stringify(legacy));
+		expect(legacy).not.toHaveProperty("workerFlagshipFallback");
+		expect(disabled).not.toHaveProperty("workerFlagshipFallback");
+	});
+
+	it.each(
+		[undefined, null, 0, 1, "true", "false", {}, []].map((value) => [value]),
+	)("rejects malformed worker fallback opt-in %j", (workerFlagshipFallback) => {
+		expect(() =>
+			compileQualityRoutingPolicy({
+				...approvedInput(),
+				workerFlagshipFallback,
+			}),
+		).toThrow(
+			"quality_routing_policy.workerFlagshipFallback: must be a boolean",
+		);
+	});
+
+	it("still rejects unknown policy fields with worker fallback enabled", () => {
+		expect(() =>
+			compileQualityRoutingPolicy({
+				...approvedInput(),
+				workerFlagshipFallback: true,
+				workerFallback: true,
+			}),
+		).toThrow("unknown field workerFallback");
+	});
+
+	it("opts standard and lightweight workers into the flagship fallback ladder", () => {
+		const input = approvedInput();
+		const legacy = compileQualityRoutingPolicy(input);
+		const policy = compileQualityRoutingPolicy({
+			...input,
+			workerFlagshipFallback: true,
+		});
+		expect(policy?.workerFlagshipFallback).toBe(true);
+		expect(policy?.revision).not.toBe(legacy?.revision);
+		expect(policy?.mainLadders).toEqual(legacy?.mainLadders);
+		expect(policy?.choices).toEqual(legacy?.choices);
+		expect(policy?.lanes).toEqual(legacy?.lanes);
+		expect(policy?.fallbacks).toEqual([
+			{ from: "astra", to: "opus" },
+			{ from: "fable", to: "astra" },
+		]);
+		expect(policy?.spendGrants).toEqual([]);
+		expect(Object.isFrozen(policy?.workerLanes.standard)).toBe(true);
+		expect(Object.isFrozen(policy?.workerLanes.lightweight)).toBe(true);
+		expect(policy?.workerLanes).toEqual({
+			standard: ["standard", "fable", "astra", "opus"],
+			lightweight: ["lightweight", "fable", "astra", "opus"],
+			fable: ["fable"],
+			astra: ["astra"],
+			opus: ["opus"],
+		});
 	});
 
 	describe("picker flow descriptions", () => {

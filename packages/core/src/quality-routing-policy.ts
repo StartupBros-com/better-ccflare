@@ -92,9 +92,11 @@ function fields(
 	value: Record<string, unknown>,
 	names: readonly string[],
 	path: string,
+	optional: readonly string[] = [],
 ): void {
 	for (const key of Object.keys(value)) {
-		if (!names.includes(key)) invalid(path, `unknown field ${key}`);
+		if (!names.includes(key) && !optional.includes(key))
+			invalid(path, `unknown field ${key}`);
 	}
 	for (const name of names) {
 		if (!Object.hasOwn(value, name)) invalid(path, `missing field ${name}`);
@@ -255,8 +257,8 @@ function parseFallbacks(value: unknown): QualityPermittedFallback[] {
 		visited.add(current);
 	}
 	for (const current of LANES) visit(current);
-	// These exact edges preserve every main preference's approved suffix and
-	// prevent workers from silently escalating, dropping roles or using a parent.
+	// These exact edges preserve every main preference's approved suffix.
+	// The worker opt-in is compiled separately without adding graph edges.
 	if (edges.length !== 2 || !seen.has("fable:astra") || !seen.has("astra:opus"))
 		invalid("fallbacks", "must be exactly fable -> astra and astra -> opus");
 	return edges.sort((a, b) => compare(a.from, b.from));
@@ -320,8 +322,15 @@ export function compileQualityRoutingPolicy(
 		input,
 		["version", "assignments", "accounts", "fallbacks", "spendGrants"],
 		"",
+		["workerFlagshipFallback"],
 	);
 	if (input.version !== 1) invalid("version", "must be 1");
+	if (
+		Object.hasOwn(input, "workerFlagshipFallback") &&
+		typeof input.workerFlagshipFallback !== "boolean"
+	)
+		invalid("workerFlagshipFallback", "must be a boolean");
+	const workerFlagshipFallback = input.workerFlagshipFallback === true;
 	const assignments = parseAssignments(input.assignments);
 	const accounts = parseAccounts(input.accounts, assignments);
 	const fallbacks = parseFallbacks(input.fallbacks);
@@ -332,6 +341,7 @@ export function compileQualityRoutingPolicy(
 		accounts,
 		fallbacks,
 		spendGrants,
+		...(workerFlagshipFallback ? { workerFlagshipFallback: true } : {}),
 	};
 	const revision: QualityPolicyRevision = `quality-policy-v1:${createHash("sha256").update(JSON.stringify(effective)).digest("hex")}`;
 	const lanes: Record<QualityLane, QualityApprovedLine[]> = {
@@ -387,8 +397,12 @@ export function compileQualityRoutingPolicy(
 		lanes,
 		mainLadders: MAIN_LADDERS,
 		workerLanes: {
-			standard: ["standard"],
-			lightweight: ["lightweight"],
+			standard: workerFlagshipFallback
+				? ["standard", "fable", "astra", "opus"]
+				: ["standard"],
+			lightweight: workerFlagshipFallback
+				? ["lightweight", "fable", "astra", "opus"]
+				: ["lightweight"],
 			fable: ["fable"],
 			astra: ["astra"],
 			opus: ["opus"],

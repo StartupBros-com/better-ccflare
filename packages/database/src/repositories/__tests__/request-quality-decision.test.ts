@@ -151,6 +151,95 @@ test.each([
 	}
 });
 
+test.each([
+	"standard",
+	"lightweight",
+] as const)("four %s worker lane summaries survive sanitation and history mapping", async (role) => {
+	const workerDecision = {
+		...decision,
+		requested: { kind: "worker", role },
+		selected: null,
+		skippedLanes: [
+			{ lane: role, reasons: { "lane-unavailable": 1 } },
+			{ lane: "fable", reasons: { "subscription-exhausted": 2 } },
+			{ lane: "astra", reasons: { "context-unsupported": 1 } },
+			{ lane: "opus", reasons: { "spend-not-authorized": 1 } },
+		],
+	} as const;
+	expect(sanitizeQualityDecision(workerDecision)).toEqual(workerDecision);
+	expect(sanitizeQualityDecision(JSON.stringify(workerDecision))).toEqual(
+		workerDecision,
+	);
+	const db = new Database(":memory:");
+	try {
+		runMigrations(db);
+		const repo = new RequestRepository(new BunSqlAdapter(db));
+		await repo.save({
+			id: "worker-terminal",
+			method: "POST",
+			path: "/v1/messages",
+			accountUsed: null,
+			statusCode: 503,
+			success: false,
+			errorMessage: null,
+			responseTime: 10,
+			failoverAttempts: 0,
+			qualityDecision: workerDecision,
+		});
+		const row = db
+			.query("SELECT * FROM requests WHERE id = ?")
+			.get("worker-terminal") as RequestRow;
+		expect(toRequestResponse(toRequest(row)).qualityDecision).toEqual(
+			workerDecision,
+		);
+	} finally {
+		db.close();
+	}
+});
+
+test("four-worker diagnostics retain five-lane, byte and reason-count limits", () => {
+	const workerDecision = {
+		...decision,
+		requested: { kind: "worker", role: "standard" },
+		skippedLanes: ["standard", "fable", "astra", "opus"].map((lane) => ({
+			lane,
+			reasons: { "lane-unavailable": 1_000_000 },
+		})),
+	};
+	expect(sanitizeQualityDecision(workerDecision)?.skippedLanes).toEqual(
+		workerDecision.skippedLanes,
+	);
+	expect(
+		sanitizeQualityDecision({
+			...workerDecision,
+			skippedLanes: [
+				...workerDecision.skippedLanes,
+				{ lane: "lightweight", reasons: {} },
+			],
+		}),
+	).toBeNull();
+	for (const count of [0, -1, 1.5, 1_000_001, "1", Infinity]) {
+		expect(
+			sanitizeQualityDecision({
+				...workerDecision,
+				skippedLanes: [
+					...workerDecision.skippedLanes.slice(0, 3),
+					{ lane: "opus", reasons: { "lane-unavailable": count } },
+				],
+			}),
+		).toBeNull();
+	}
+	const json = JSON.stringify(workerDecision);
+	expect(sanitizeQualityDecision(`${json}${" ".repeat(8192)}`)).toBeNull();
+	const multibyte = JSON.stringify({
+		...workerDecision,
+		selected: { ...decision.selected, evidenceRef: "é".repeat(4096) },
+	});
+	expect(multibyte.length).toBeLessThan(8192);
+	expect(new TextEncoder().encode(multibyte).length).toBeGreaterThan(8192);
+	expect(sanitizeQualityDecision(multibyte)).toBeNull();
+});
+
 test("output-limit disclosure is bounded, discriminated and rejects arbitrary nested data", () => {
 	for (const outputLimit of [
 		null,
