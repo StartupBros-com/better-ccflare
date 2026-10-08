@@ -4,7 +4,7 @@ Repository instructions for any agent working on better-ccflare, a load balancer
 
 ## ⚠️ CRITICAL: Testing Restrictions
 
-**Use Anthropic-backed accounts only through real Claude Code CLI sessions.** Interactive sessions remain permitted. The operator-approved exception (2026-10-07) also permits managed gateway-routed headless Claude Code sessions, including bounded tiny tool-free CLI acceptance checks. This exception does not authorize paid overages or a switch to Codex CLI.
+**Anthropic-backed accounts, including the `claude` account, must only be used through a real interactive Claude Code CLI session, except for the managed gateway-routed headless Claude Code CLI sessions covered by the operator-approved exception below.** Interactive sessions remain permitted. The operator-approved exception (2026-10-07) also permits managed gateway-routed headless Claude Code sessions, including bounded tiny tool-free CLI acceptance checks. This exception does not authorize paid overages or a switch to Codex CLI.
 
 **Raw scripted Anthropic inference remains prohibited** — directly and through the proxy: no curl, test harness, or diagnostic-script probes, whether or not you would call them "testing". Real Anthropic accounts can get banned for automated/scripted usage. For scripted API requests, use a non-Anthropic account (ollama, litellm, omniroute, etc.) and force-route with `x-better-ccflare-account-id`.
 

@@ -398,10 +398,10 @@ export function compileQualityRoutingPolicy(
 		mainLadders: MAIN_LADDERS,
 		workerLanes: {
 			standard: workerFlagshipFallback
-				? ["standard", "fable", "astra", "opus"]
+				? ["standard", ...MAIN_LADDERS.auto]
 				: ["standard"],
 			lightweight: workerFlagshipFallback
-				? ["lightweight", "fable", "astra", "opus"]
+				? ["lightweight", ...MAIN_LADDERS.auto]
 				: ["lightweight"],
 			fable: ["fable"],
 			astra: ["astra"],
