@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { compileQualityRoutingPolicy } from "@better-ccflare/core";
 import type { Account, QualityRoutingPolicy } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers/proxy-types";
 import * as modelCatalog from "../model-catalog";
@@ -232,6 +233,101 @@ describe("native quality catalog preparation (metadata mocks only)", () => {
 			options(),
 		);
 		expect(calls).toHaveLength(0);
+	});
+	test.each([
+		"standard",
+		"lightweight",
+	] as const)("compiled enabled %s policy prepares its approved native fallback lanes without broadening discovery", async (role) => {
+		const p = compileQualityRoutingPolicy({
+			version: 1,
+			workerFlagshipFallback: true,
+			assignments: [
+				{
+					line: "claude-sonnet",
+					lane: "standard",
+					priority: 0,
+					upgrade: "exact-only",
+				},
+				{
+					line: "claude-haiku",
+					lane: "lightweight",
+					priority: 0,
+					upgrade: "exact-only",
+				},
+				{
+					line: "claude-fable",
+					lane: "fable",
+					priority: 0,
+					upgrade: "exact-only",
+				},
+				{
+					line: "gpt-astra",
+					lane: "astra",
+					priority: 0,
+					upgrade: "exact-only",
+				},
+				{
+					line: "claude-opus",
+					lane: "opus",
+					priority: 0,
+					upgrade: "exact-only",
+				},
+			],
+			accounts: [
+				{
+					accountId: "standard",
+					provider: "anthropic",
+					lines: ["claude-sonnet"],
+					priority: 0,
+				},
+				{
+					accountId: "lightweight",
+					provider: "anthropic",
+					lines: ["claude-haiku"],
+					priority: 0,
+				},
+				{
+					accountId: "fable",
+					provider: "anthropic",
+					lines: ["claude-fable"],
+					priority: 0,
+				},
+				{
+					accountId: "astra",
+					provider: "codex",
+					lines: ["gpt-astra"],
+					priority: 0,
+				},
+				{
+					accountId: "opus",
+					provider: "anthropic",
+					lines: ["claude-opus"],
+					priority: 0,
+				},
+			],
+			fallbacks: [
+				{ from: "fable", to: "astra" },
+				{ from: "astra", to: "opus" },
+			],
+			spendGrants: [],
+		});
+		await prepareNativeQualityCatalogs(
+			context(p),
+			p,
+			{ kind: "worker", role },
+			[
+				account("standard"),
+				account("lightweight"),
+				account("fable"),
+				account("astra", { provider: "codex" }),
+				account("opus"),
+				account("unenrolled"),
+			],
+			{ ...options(), allowOAuth: true },
+		);
+		expect(p.workerLanes[role]).toEqual([role, "fable", "astra", "opus"]);
+		expect(calls.map((c) => c.accountId)).toEqual([role, "fable", "opus"]);
+		expect(calls.every((c) => c.allowOAuth === true)).toBe(true);
 	});
 	test("fresh evidence and empty ladders are noops; cold evidence is fetched", async () => {
 		const p = policy(["fresh", "cold"]);
