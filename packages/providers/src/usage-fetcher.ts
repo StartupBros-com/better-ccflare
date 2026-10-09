@@ -1828,6 +1828,18 @@ class UsageCache {
 		);
 		const windows = new Set<string>();
 		let valid = true;
+		for (const field of ["has-credits", "unlimited"]) {
+			const value = headers.get(`x-codex-credits-${field}`);
+			if (value !== null && value.toLowerCase() !== "false" && value !== "0")
+				valid = false;
+		}
+		const balance = headers.get("x-codex-credits-balance");
+		// Lexical zero avoids coercing empty strings or underflowing positive balances.
+		if (
+			balance !== null &&
+			!/^[+-]?(?:0+(?:\.0*)?|\.0+)(?:[eE][+-]?\d+)?$/.test(balance.trim())
+		)
+			valid = false;
 		for (const prefix of ["primary", "secondary"]) {
 			const fields = [
 				"window-minutes",

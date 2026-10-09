@@ -255,6 +255,110 @@ describe("Codex subscription-only source evidence (fake metadata transport)", ()
 			"admit",
 		);
 	});
+	// Wire contract: https://github.com/openai/codex/blob/2f761ae8210082c21cdd471131fa2118680a6059/codex-rs/codex-api/src/rate_limits.rs#L219-L257
+	it.each([
+		["hasCredits", "true", "0", "0"],
+		["unlimited", "FALSE", "1", "0"],
+		["balance", "0", "FALSE", "25"],
+		["unknown-hasCredits", "unknown", "0", "0"],
+		["unknown-unlimited", "false", "unknown", "0"],
+		["nonnumeric-balance", "false", "0", "garbage"],
+		["empty-balance", "false", "0", ""],
+		["nonfinite-balance", "false", "0", "Infinity"],
+		["underflow-balance", "false", "0", "1e-999"],
+		["decimal-underflow-balance", "false", "0", `0.${"0".repeat(400)}1`],
+	])("live credit contradiction %s revokes admission until a fresh owned poll", async (_kind, hasCredits, unlimited, balance) => {
+		const owned = await poll(payload());
+		expect(decision(owned, { accessToken: token }).status).toBe("admit");
+
+		const benign = weeklyHeaders();
+		benign.set("x-codex-credits-has-credits", "FALSE");
+		benign.set("x-codex-credits-unlimited", "0");
+		benign.set("x-codex-credits-balance", "0");
+		expect(
+			decision(await processLiveHeaders(benign), { accessToken: token }).status,
+		).toBe("admit");
+
+		const contradictory = new Headers(benign);
+		contradictory.set("x-codex-credits-has-credits", hasCredits);
+		contradictory.set("x-codex-credits-unlimited", unlimited);
+		contradictory.set("x-codex-credits-balance", balance);
+		expect(
+			decision(await processLiveHeaders(contradictory), {
+				accessToken: token,
+			}).status,
+		).not.toBe("admit");
+		expect(
+			decision(await processLiveHeaders(benign), { accessToken: token }).status,
+		).not.toBe("admit");
+
+		expect(await usageCache.refreshNow(accountId)).toBe(true);
+		expect(
+			decision(usageCache.getSnapshot(accountId), { accessToken: token })
+				.status,
+		).toBe("admit");
+		expect(
+			decision(await processLiveHeaders(benign), { accessToken: token }).status,
+		).toBe("admit");
+	});
+	it.each([
+		["has-credits", "TRUE"],
+		["unlimited", "1"],
+		["balance", "25"],
+		["has-credits", "unknown"],
+		["unlimited", "unknown"],
+		["balance", "garbage"],
+		["balance", ""],
+		["balance", "1e-999"],
+	])("credit-only %s=%s revokes direct poll ownership", async (field, value) => {
+		const owned = await poll(payload());
+		expect(decision(owned, { accessToken: token }).status).toBe("admit");
+		const current = await processLiveHeaders(
+			new Headers({ [`x-codex-credits-${field}`]: value }),
+		);
+		expect(current.data).toBe(owned.data);
+		expect(
+			getCodexSubscriptionFacts(
+				owned.data,
+				accountId,
+				Date.now(),
+				180_000,
+				token,
+			),
+		).toBeNull();
+		expect(decision(current, { accessToken: token }).status).not.toBe("admit");
+		expect(
+			decision(await processLiveHeaders(weeklyHeaders()), {
+				accessToken: token,
+			}).status,
+		).not.toBe("admit");
+		expect(await usageCache.refreshNow(accountId)).toBe(true);
+		expect(
+			decision(usageCache.getSnapshot(accountId), { accessToken: token })
+				.status,
+		).toBe("admit");
+	});
+	it.each([
+		"0",
+		"0.00",
+		"-0",
+		".0",
+		"0e-999",
+	])("benign credit-only zero %s neither mints nor contradicts poll proof", async (balance) => {
+		const headers = new Headers({
+			"x-codex-credits-has-credits": "fAlSe",
+			"x-codex-credits-unlimited": "0",
+			"x-codex-credits-balance": balance,
+		});
+		expect(usageCache.setCodexPassiveUsage(accountId, headers)).toBeNull();
+		expect(decision(usageCache.getSnapshot(accountId)).status).not.toBe(
+			"admit",
+		);
+		const owned = await poll(payload());
+		const current = await processLiveHeaders(headers);
+		expect(current.data).toBe(owned.data);
+		expect(decision(current, { accessToken: token }).status).toBe("admit");
+	});
 	it("an out-of-range passive reset cannot recover through benign headers", async () => {
 		await poll(payload());
 		const headers = weeklyHeaders();
