@@ -1,4 +1,12 @@
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { ANTHROPIC_DEGRADED_MODE_DEFAULTS } from "@better-ccflare/config";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import {
@@ -10,7 +18,10 @@ import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers/proxy-types";
 
 const usageCollectorModule = await import("../usage-collector");
-spyOn(usageCollectorModule, "getUsageCollector").mockReturnValue({
+const usageCollectorSpy = spyOn(
+	usageCollectorModule,
+	"getUsageCollector",
+).mockReturnValue({
 	handleStart: mock(() => undefined),
 	handleChunk: mock(() => undefined),
 	handleEnd: mock(async () => undefined),
@@ -161,6 +172,11 @@ afterEach(() => {
 	} else {
 		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = originalPassthrough;
 	}
+});
+
+afterAll(() => {
+	usageCollectorSpy.mockRestore();
+	estimateAdmissionTokens.mockRestore();
 });
 
 describe("Anthropic degraded-mode isolation", () => {

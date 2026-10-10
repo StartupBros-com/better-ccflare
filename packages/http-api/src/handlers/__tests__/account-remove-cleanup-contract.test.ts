@@ -1,4 +1,12 @@
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { usageCache } from "@better-ccflare/providers";
 
 const removeAccountById = mock(async () => ({
@@ -62,6 +70,11 @@ afterEach(() => {
 	clearNativeAutoCatalogEvidence.mockClear();
 	clearOpenAICompatibleModelCacheForAccount.mockClear();
 	clearPendingRotationForDeletedAccount.mockClear();
+});
+
+afterAll(() => {
+	stopPolling.mockRestore();
+	deleteUsageCache.mockRestore();
 });
 
 describe("createAccountRemoveHandler cleanup contract", () => {

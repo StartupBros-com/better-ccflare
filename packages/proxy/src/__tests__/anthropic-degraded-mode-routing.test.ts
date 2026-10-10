@@ -1,4 +1,5 @@
 import {
+	afterAll,
 	afterEach,
 	beforeEach,
 	describe,
@@ -55,6 +56,11 @@ const tryUsageCollectorSpy = spyOn(
 	usageCollectorModule,
 	"tryGetUsageCollector",
 ).mockReturnValue(defaultUsageCollector);
+
+afterAll(() => {
+	usageCollectorSpy.mockRestore();
+	tryUsageCollectorSpy.mockRestore();
+});
 
 const { isAnthropicDegradedSendDenied, proxyWithAccount } = await import(
 	"../handlers/proxy-operations"
