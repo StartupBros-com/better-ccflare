@@ -58,7 +58,7 @@ import { RoutingAttemptLedger } from "./handlers/routing-attempt-ledger";
 import { evaluateAutoCapacity } from "./handlers/usage-throttling";
 import { getNativeAutoCatalogEvidence } from "./model-catalog";
 import { opaqueRuntimeId } from "./opaque-runtime-id";
-import { prepareNativeQualityCatalogs } from "./quality-route-catalog-preparation";
+import { prepareQualityCatalogs } from "./quality-route-catalog-preparation";
 import type { RequestBodyContext } from "./request-body-context";
 import { recordRoutingTerminalRequest } from "./routing-terminal-recorder";
 import { bindRequestPrivateServerToolReplay } from "./server-tool-replay-runtime";
@@ -565,7 +565,7 @@ export async function routeQualityRequest(input: {
 		// Only an authenticated, accepted Auto request reaches this permission
 		// boundary. Discovery/control/manual routes never authorize OAuth lookups.
 		if (process.env.BETTER_CCFLARE_MODELS_OFFLINE !== "1") {
-			await prepareNativeQualityCatalogs(ctx, policy, intent, accounts, {
+			await prepareQualityCatalogs(ctx, policy, intent, accounts, {
 				signal: req.signal,
 				allowOAuth: true,
 				conversation,
