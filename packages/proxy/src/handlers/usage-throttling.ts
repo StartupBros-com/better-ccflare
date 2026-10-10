@@ -47,8 +47,19 @@ export function evaluateAutoCapacity(
 	) {
 		return { status: "unknown", reason: "capacity-evidence-unknown" };
 	}
-	const codex =
+	const retained =
 		options.provider === "codex"
+			? usageCache.getCodexAdmissionEvidence(
+					options.accountId,
+					data,
+					now,
+					DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS,
+					options.accessToken,
+				)
+			: null;
+	const codex =
+		retained?.facts ??
+		(options.provider === "codex"
 			? getCodexSubscriptionFacts(
 					data,
 					options.accountId,
@@ -56,7 +67,7 @@ export function evaluateAutoCapacity(
 					DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS,
 					options.accessToken,
 				)
-			: null;
+			: null);
 	// Serializable projection may veto even with a grant, but cannot establish
 	// billing safety or omit a legacy row without private source ownership.
 	const codexCapacity =
@@ -95,25 +106,35 @@ export function evaluateAutoCapacity(
 			return { status: "unknown", reason: "capacity-evidence-unknown" };
 	}
 	const family = getModelFamily(options.requestModel);
-	const rows = collectAutoCapacityEvidence(data, options.provider)
-		.filter(
-			// Only source-proven synthesized empty mirrors may be omitted. Generic
-			// limits rows (including invalid/exhausted ones) always remain authoritative.
-			(row) =>
-				!(
-					codex &&
-					row.source === "flat" &&
-					codex.omittedLegacyWindows.includes(row.window)
-				),
-		)
-		.filter(
-			(row) =>
-				row.scope === "account" ||
-				row.scope === "unknown" ||
-				(row.scope === "model"
-					? row.model === options.requestModel
-					: row.model === family),
-		);
+	const originalRows = collectAutoCapacityEvidence(
+		retained?.data ?? data,
+		options.provider,
+	).filter(
+		// Only source-proven synthesized empty mirrors may be omitted. Generic
+		// limits rows (including invalid/exhausted ones) always remain authoritative.
+		(row) =>
+			!(
+				codex &&
+				row.source === "flat" &&
+				codex.omittedLegacyWindows.includes(row.window)
+			),
+	);
+	// Omission in the original poll cannot hide a newly reported passive window.
+	const passiveRows = retained?.passiveWindows
+		? collectAutoCapacityEvidence(data, options.provider).filter(
+				(row) =>
+					row.source !== "flat" ||
+					retained.passiveWindows?.includes(row.window),
+			)
+		: [];
+	const rows = [...originalRows, ...passiveRows].filter(
+		(row) =>
+			row.scope === "account" ||
+			row.scope === "unknown" ||
+			(row.scope === "model"
+				? row.model === options.requestModel
+				: row.model === family),
+	);
 	let unknown = false;
 	let accountEvidence = false;
 	let allowanceExhausted = false;

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	CLAUDE_CLI_VERSION,
 	getModelFamily,
@@ -34,9 +35,12 @@ import {
 } from "./nanogpt-usage-fetcher";
 import {
 	bindCodexUsageObservation,
+	type CodexSubscriptionFacts,
 	fetchCodexUsageData,
+	getCodexSubscriptionFacts,
 	readCodexCreditEvidence,
 } from "./providers/codex/api-usage";
+import { parseCodexUsageHeaders } from "./providers/codex/usage";
 import {
 	fetchXaiUsageData,
 	getRepresentativeXaiUtilization,
@@ -898,6 +902,18 @@ class UsageCache {
 	 */
 	private registrations = new Map<string, PollRegistration>();
 	private nextEpoch = 0;
+	#codexAdmissionEvidence = new Map<
+		string,
+		{
+			registration: PollRegistration;
+			currentData: AnyUsageData;
+			originalData: AnyUsageData;
+			facts: CodexSubscriptionFacts;
+			acquiredAt: number;
+			fingerprint: string;
+			passiveWindows: readonly string[] | null;
+		}
+	>();
 	/**
 	 * Poll-verified Codex credit evidence, written only from a freshly bound
 	 * owned observation. Passive header writes (set/setAuthoritative) replace the
@@ -937,6 +953,7 @@ class UsageCache {
 	private deleteCacheEntry(accountId: string): void {
 		this.invalidateCodexAcquisition(accountId);
 		this.cache.delete(accountId);
+		this.#codexAdmissionEvidence.delete(accountId);
 	}
 
 	/** True only while this exact registration still owns its account. */
@@ -985,6 +1002,7 @@ class UsageCache {
 	private setRegistrationCache(
 		registration: PollRegistration,
 		data: AnyUsageData,
+		accessToken?: string,
 	): void {
 		if (!this.isCurrent(registration)) return;
 		if (registration.provider === "codex") {
@@ -1009,6 +1027,25 @@ class UsageCache {
 				this.codexCreditEvidence.set(registration.accountId, {
 					registration,
 					...evidence,
+				});
+			}
+			this.#codexAdmissionEvidence.delete(registration.accountId);
+			const facts = getCodexSubscriptionFacts(
+				entry.data,
+				registration.accountId,
+				Date.now(),
+				180_000,
+				accessToken,
+			);
+			if (facts && evidence && accessToken) {
+				this.#codexAdmissionEvidence.set(registration.accountId, {
+					registration,
+					currentData: entry.data,
+					originalData: entry.data,
+					facts,
+					acquiredAt: evidence.acquiredAt,
+					fingerprint: createHash("sha256").update(accessToken).digest("hex"),
+					passiveWindows: null,
 				});
 			}
 			return;
@@ -1409,7 +1446,7 @@ class UsageCache {
 					if (!canPublishCodex()) {
 						return { success: false, retryAfterMs: null };
 					}
-					this.setRegistrationCache(registration, result.data);
+					this.setRegistrationCache(registration, result.data, token);
 					this.notifySnapshot(registration, result.data);
 					const utilization = getRepresentativeUtilization(
 						result.data as UsageData,
@@ -1764,6 +1801,7 @@ class UsageCache {
 	 * registered but never invoked for them (pro-gate finding).
 	 */
 	private setAuthoritative(accountId: string, data: AnyUsageData): void {
+		this.#codexAdmissionEvidence.delete(accountId);
 		this.invalidateCodexAcquisition(accountId);
 		this.cache.set(accountId, { data, timestamp: Date.now() });
 		// Ordinary usage snapshots do not prove a recent model+client-beta-specific
@@ -1772,6 +1810,167 @@ class UsageCache {
 		// their short TTL; account deletion, polling teardown, or explicit cache
 		// clearing removes them sooner. The provider's mandatory OAuth beta is
 		// intentionally excluded because it is constant across these candidates.
+	}
+
+	/** Live headers may veto an owned poll, never renew or manufacture one. */
+	setCodexPassiveUsage(
+		accountId: string,
+		headers: Headers,
+		options: Parameters<typeof parseCodexUsageHeaders>[1] = {},
+	): UsageData | null {
+		const now = Date.now();
+		const previous = this.get(accountId);
+		const retained = this.getCodexAdmissionEvidence(
+			accountId,
+			previous,
+			now,
+			180_000,
+		);
+		const windows = new Set<string>();
+		let valid = true;
+		for (const field of ["has-credits", "unlimited"]) {
+			const value = headers.get(`x-codex-credits-${field}`);
+			if (value !== null && value.toLowerCase() !== "false" && value !== "0")
+				valid = false;
+		}
+		const balance = headers.get("x-codex-credits-balance");
+		// Lexical zero avoids coercing empty strings or underflowing positive balances.
+		if (
+			balance !== null &&
+			!/^[+-]?(?:0+(?:\.0*)?|\.0+)(?:[eE][+-]?\d+)?$/.test(balance.trim())
+		)
+			valid = false;
+		for (const prefix of ["primary", "secondary"]) {
+			const fields = [
+				"window-minutes",
+				"used-percent",
+				"reset-at",
+				"reset-after-seconds",
+			];
+			const values = fields.map((field) =>
+				headers.get(`x-codex-${prefix}-${field}`),
+			);
+			if (values.every((value) => value === null)) continue;
+			if (
+				values.some(
+					(value) =>
+						value !== null &&
+						(value.trim() === "" ||
+							!Number.isFinite(Number(value)) ||
+							Number(value) < 0),
+				)
+			)
+				valid = false;
+			const [minutes, used, reset, after] = values.map((value) =>
+				value === null ? null : Number(value),
+			);
+			if (minutes === 0 && used === 0 && reset === null && after === null)
+				continue;
+			const slot =
+				minutes != null && minutes > 0 && minutes <= 300
+					? "five_hour"
+					: minutes != null && minutes >= 10080
+						? "seven_day"
+						: null;
+			const resetsAt =
+				reset != null
+					? reset * 1000
+					: after != null && options.allowRelativeResetAfter !== false
+						? (options.baseTimeMs ?? now) + after * 1000
+						: null;
+			if (
+				!slot ||
+				used == null ||
+				used >= 100 ||
+				resetsAt == null ||
+				!Number.isFinite(new Date(resetsAt).getTime()) ||
+				resetsAt <= now
+			)
+				valid = false;
+			if (slot) windows.add(slot);
+		}
+		for (const [header, slot] of [
+			["x-codex-5h-reset-at", "five_hour"],
+			["x-codex-7d-reset-at", "seven_day"],
+		] as const) {
+			const value = headers.get(header);
+			if (value === null) continue;
+			if (
+				!Number.isFinite(new Date(Number(value) * 1000).getTime()) ||
+				Number(value) * 1000 <= now ||
+				(options.defaultUtilization ?? 0) >= 100
+			)
+				valid = false;
+			windows.add(slot);
+		}
+		if (!valid) {
+			this.#codexAdmissionEvidence.delete(accountId);
+			this.invalidateCodexAcquisition(accountId);
+			// Even an unparseable response supersedes direct poll ownership.
+			const entry = this.cache.get(accountId);
+			if (entry) this.cache.set(accountId, { ...entry });
+		}
+		const data = parseCodexUsageHeaders(headers, options);
+		if (!data) return null;
+		// Preserve only the existing polling-only display extras.
+		if (previous) {
+			const prev = previous as Record<string, unknown>;
+			const merged = data as Record<string, unknown>;
+			for (const key of [
+				"plan_type",
+				"credits_balance",
+				"code_review_used_percent",
+				"code_review_resets_at",
+			]) {
+				if (prev[key] !== undefined && merged[key] === undefined)
+					merged[key] = prev[key];
+			}
+		}
+		this.invalidateCodexAcquisition(accountId);
+		this.cache.set(accountId, { data, timestamp: now });
+		const evidence = this.#codexAdmissionEvidence.get(accountId);
+		if (retained && valid && evidence && windows.size > 0) {
+			evidence.currentData = data;
+			evidence.passiveWindows = Object.freeze([...windows]);
+		} else {
+			this.#codexAdmissionEvidence.delete(accountId);
+		}
+		return data;
+	}
+
+	getCodexAdmissionEvidence(
+		accountId: string,
+		currentData: unknown,
+		now: number,
+		maxAgeMs: number,
+		accessToken?: string | null,
+	): {
+		data: AnyUsageData;
+		facts: CodexSubscriptionFacts;
+		passiveWindows: readonly string[] | null;
+	} | null {
+		const evidence = this.#codexAdmissionEvidence.get(accountId);
+		if (
+			!evidence ||
+			!this.isCurrent(evidence.registration) ||
+			this.cache.get(accountId)?.data !== currentData ||
+			evidence.currentData !== currentData ||
+			!Number.isFinite(now) ||
+			!Number.isFinite(evidence.acquiredAt) ||
+			evidence.acquiredAt < 0 ||
+			evidence.acquiredAt > now ||
+			now - evidence.acquiredAt >= Math.min(maxAgeMs, 180_000) ||
+			(accessToken !== undefined &&
+				(!accessToken ||
+					createHash("sha256").update(accessToken).digest("hex") !==
+						evidence.fingerprint))
+		)
+			return null;
+		return Object.freeze({
+			data: evidence.originalData,
+			facts: evidence.facts,
+			passiveWindows: evidence.passiveWindows,
+		});
 	}
 
 	/** Set authoritative cached usage data for an account. */
@@ -1892,6 +2091,7 @@ class UsageCache {
 			this.stopPolling(accountId);
 		}
 		this.cache.clear();
+		this.#codexAdmissionEvidence.clear();
 		this.codexCreditEvidence.clear();
 		this.usageRateLimitedUntil.clear();
 		this.modelScopedDepletions.clear();
