@@ -749,7 +749,7 @@ The historical product requirements, design decisions and verification obligatio
 
 ## Reconciliation — 2026-10-10 UTC
 
-**DOCS RECONCILIATION / HEALTHY ANTHROPIC ROOT + WORKER TURN OBSERVED / CROSS-PROVIDER FAILOVER AND U8 ACCEPTANCE STILL OPEN**
+**DOCS RECONCILIATION / HEALTHY HEADLESS ANTHROPIC ROOT + WORKER TURN OBSERVED / CROSS-PROVIDER FAILOVER, INTERACTIVE ACCEPTANCE AND U8 STILL OPEN**
 
 This dated section reconciles the 2026-10-03 status with what has shipped, deployed and been observed since. It changes no requirement, decision, unit, gate or acceptance example above; the 2026-10-03 block and its checklist are preserved as written, and the list under "Remaining U8 acceptance — as of 2026-10-10" supersedes that checklist only where it says so. It is a documentation change: nothing here was produced by running tests, sending inference traffic, deploying, restarting or mutating any account, quota or credential. [Issue #398](https://github.com/StartupBros-com/better-ccflare/issues/398) remains the living acceptance list and remains open.
 
@@ -772,7 +772,7 @@ This is dated evidence of one already-completed, separately approved deployment 
 
 ### Observed healthy Anthropic root and worker turn
 
-One native Claude Code `2.1.296` print-mode session (`stream-json` trace, `permissionMode` `dontAsk`, the `Agent` tool as its only enabled tool) ran as session `9abf5cd3-949d-4d36-b6de-9bf472b9ab96` with root model `claude-bccf-quality-auto[1m]`, two turns, one `Explore` worker (`a88af7159d32b15f2`; spawned 1, completed 1, failed 0) and an empty `permission_denials` list. Its extraction record (`root-worker-acceptance.json` and `root-worker.stream.jsonl` under `/tmp/ccflare-main-deploy.10ztj5/`, a non-durable scratch location outside this repository) reports `passed: true`, `enrolled: 1`, `unresolved: 0`, and two settled proxy conversations at runtime `git_sha` `82df4202` with guard source `a6341d04…` and backend source `82df4202…`:
+One native Claude Code `2.1.296` headless print-mode session (`stream-json` trace, `permissionMode` `dontAsk`, the `Agent` tool as its only enabled tool; a managed gateway-routed headless session of the kind the 2026-10-07 operator exception in `AGENTS.md` permits, not raw scripted inference and not an interactive session) ran as session `9abf5cd3-949d-4d36-b6de-9bf472b9ab96` with root model `claude-bccf-quality-auto[1m]`, two turns, one `Explore` worker (`a88af7159d32b15f2`; spawned 1, completed 1, failed 0) and an empty `permission_denials` list. Its extraction record (`root-worker-acceptance.json` and `root-worker.stream.jsonl` under `/tmp/ccflare-main-deploy.10ztj5/`, a non-durable scratch location outside this repository) reports `passed: true`, `enrolled: 1`, `unresolved: 0`, and two settled proxy conversations at runtime `git_sha` `82df4202` with guard source `a6341d04…` and backend source `82df4202…`:
 
 | Conversation | Requested | Selected | Served | Outcome |
 |---|---|---|---|---|
@@ -781,13 +781,13 @@ One native Claude Code `2.1.296` print-mode session (`stream-json` trace, `permi
 
 Both conversations carry the same policy revision, `quality-policy-v1:f903f0d9a5233dfa5cc659b6a4bebde6df947ca19d1e187e4deda39e0543f62d`, so the policy did not change between root and worker. The record's own `no_claim` field governs its reading: one actual healthy Anthropic Auto root/standard-worker path; not live forced exhaustion, not a cross-provider switch, not all future capacity, not actual billed dollars; and inspecting the same trace and state is not independent reproduction. The native stderr also logged a `[claude-code:unrecognized_model]` line for the Auto alias; that observation is recorded here, not diagnosed.
 
-What this retires: the 2026-10-03 clause "no real interactive Auto turn has been supplied for this check" is obsolete. A real native Auto turn has now been served and settled on the healthy path, with the root on the preferred Fable lane and the worker on an independent Sonnet-level lane rather than inheriting the parent's model. That is consistent with the healthy-path "Then" clauses of AE1 and AE7; it is one observation, not the recorded acceptance of either example.
+What this adds: a healthy native headless Auto root/worker turn has now been served and settled, with the root on the preferred Fable lane and the worker on an independent Sonnet-level lane rather than inheriting the parent's model. That is consistent with the healthy-path "Then" clauses of AE1 and AE7; it is one observation, not the recorded acceptance of either example. It is scoped progress only: a bounded headless print-mode run is not a real interactive run, so the 2026-10-03 clause "no real interactive Auto turn has been supplied for this check" is **not** retired and still stands.
 
 What this does **not** retire — read the following as binding limits, not caveats:
 
 - It is **not** cross-provider failover acceptance. No unavailable-Anthropic → approved non-Anthropic serving with provider/model provenance has been observed (AE2, AE8 and R14 remain open), and dotfiles [issue #1691](https://github.com/StartupBros-com/dotfiles/issues/1691) remains open on exactly that requirement.
 - It is **not** selected-account eligibility or subscription/capability evidence. One account served two requests; the eligibility item below is untouched.
-- It is **not** the real interactive, tool-rich main-agent acceptance. It was a bounded two-turn print-mode run with a single enabled tool.
+- It is **not** the real interactive, tool-rich main-agent acceptance, and it does not retire the 2026-10-03 "no real interactive Auto turn" clause. It was a bounded two-turn headless print-mode run with a single enabled tool.
 - It is **not** authenticated retry acceptance (R12, R21, AE6) and shows no fallback edge being taken.
 - It does **not** close U8, [#398](https://github.com/StartupBros-com/better-ccflare/issues/398) or [#457](https://github.com/StartupBros-com/better-ccflare/issues/457).
 
@@ -803,13 +803,13 @@ The 2026-10-03 open item "actual affected-client GPT-5.6 picker provenance and a
 This list supersedes the 2026-10-03 checklist's open items; the 2026-10-03 text itself is unchanged.
 
 - [ ] Selected-account eligibility and applicable subscription/capability evidence.
-- [ ] Real interactive, tool-rich main-agent routing acceptance. Scripted Anthropic-backed traffic remains prohibited; the observed turn above was a native Claude Code session, not scripted traffic, and it does not satisfy this item.
+- [ ] Real interactive, tool-rich main-agent routing acceptance. Raw scripted Anthropic-backed traffic remains prohibited; the observed turn above was a managed headless print-mode Claude Code session, not raw scripted traffic and not an interactive session. It does not satisfy this item, and the 2026-10-03 clause "no real interactive Auto turn has been supplied for this check" still stands.
 - [ ] Cross-provider failover with provenance (AE2, AE8, R14): an unavailable Anthropic lane served by an approved non-Anthropic candidate, observed live, with the selected line/lane/physical model and skip reason recorded. Not observed. Tracked by dotfiles #1691 for managed headless agents.
 - [ ] Authenticated retry and fallback-edge acceptance (R12, R21, AE6, AE16) on the live path.
-- [x] A real native Auto root turn and an independent standard worker, served and settled on the healthy Anthropic path at `82df4202` (session `9abf5cd3…`, above). Retires only the "no real interactive Auto turn has been supplied" clause.
+- [x] A healthy native headless print-mode Auto root turn and an independent standard worker, served and settled on the healthy Anthropic path at `82df4202` (session `9abf5cd3…`, above). Scoped progress only: it does not retire the 2026-10-03 "no real interactive Auto turn has been supplied" clause, and the interactive, tool-rich item above stays open.
 - [x] GPT-5.6 picker **symptom** accepted by the reporter in #398 (2026-10-03).
 - [ ] GPT-5.6 picker **source/root-cause provenance** and any justified targeted correction (R18, AE10). Blocked, per U8 scenario 3.
-- [x] Carried unchanged from 2026-10-03: compiled CLI credential/transport isolation and dotenv fallback at `312ff63d` (17/17 tests, 149 assertions; 22/22 historical checks) and the compiled CLI retry-redelivery smoke. Not re-run at `82df4202`.
+- Carried from the 2026-10-03 list, where it is checked at `312ff63d`: compiled CLI credential/transport isolation and dotenv fallback (17/17 tests, 149 assertions; 22/22 historical checks) and the compiled CLI retry-redelivery smoke. Not re-run at `82df4202`, so it is not ticked here as current-build acceptance.
 - [ ] Reporter confirmation of the required behavior on #398 and #457 before either issue is closed or this plan is marked complete.
 
 ### Issue and tracking state, independently re-read on 2026-10-10
