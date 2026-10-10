@@ -785,7 +785,7 @@ What this adds: a healthy native headless Auto root/worker turn has now been ser
 
 What this does **not** retire — read the following as binding limits, not caveats:
 
-- It is **not** cross-provider failover acceptance. No unavailable-Anthropic → approved non-Anthropic serving with provider/model provenance has been observed (AE2, AE8 and R14 remain open), and dotfiles [issue #1691](https://github.com/StartupBros-com/dotfiles/issues/1691) remains open on exactly that requirement.
+- It is **not** cross-provider failover acceptance. No unavailable-Anthropic → approved non-Anthropic serving with provider/model provenance has been observed (the served-fallback examples AE2 and AE16 remain open, as does the complementary clear-unavailability outcome of AE8 and R14), and dotfiles [issue #1691](https://github.com/StartupBros-com/dotfiles/issues/1691) remains open on exactly that requirement.
 - It is **not** selected-account eligibility or subscription/capability evidence. One account served two requests; the eligibility item below is untouched.
 - It is **not** the real interactive, tool-rich main-agent acceptance, and it does not retire the 2026-10-03 "no real interactive Auto turn" clause. It was a bounded two-turn headless print-mode run with a single enabled tool.
 - It is **not** authenticated retry acceptance (R12, R21, AE6) and shows no fallback edge being taken.
@@ -803,10 +803,10 @@ The 2026-10-03 open item "actual affected-client GPT-5.6 picker provenance and a
 This list supersedes the 2026-10-03 checklist's open items; the 2026-10-03 text itself is unchanged.
 
 - [ ] Selected-account eligibility and applicable subscription/capability evidence.
-- [ ] Real interactive, tool-rich main-agent routing acceptance. Raw scripted Anthropic-backed traffic remains prohibited; the observed turn above was a managed headless print-mode Claude Code session, not raw scripted traffic and not an interactive session. It does not satisfy this item, and the 2026-10-03 clause "no real interactive Auto turn has been supplied for this check" still stands.
-- [ ] Cross-provider failover with provenance (AE2, AE8, R14): an unavailable Anthropic lane served by an approved non-Anthropic candidate, observed live, with the selected line/lane/physical model and skip reason recorded. Not observed. Tracked by dotfiles #1691 for managed headless agents.
+- [ ] Real interactive, tool-rich main/home/worker/fallback routing acceptance. Raw scripted Anthropic-backed traffic remains prohibited; the observed turn above was a managed headless print-mode Claude Code session, not raw scripted traffic and not an interactive session. It does not satisfy this item, and the 2026-10-03 clause "no real interactive Auto turn has been supplied for this check" still stands.
+- [ ] Cross-provider failover with provenance (AE2, AE16): an unavailable Anthropic lane served by an approved non-Anthropic candidate, observed live, with the selected line/lane/physical model and skip reason recorded. Not observed; the complementary clear-unavailability outcome (AE8, R14), due only when every fallback is unusable, is also unobserved. Tracked by dotfiles #1691 for managed headless agents.
 - [ ] Authenticated retry and fallback-edge acceptance (R12, R21, AE6, AE16) on the live path.
-- [x] A healthy native headless print-mode Auto root turn and an independent standard worker, served and settled on the healthy Anthropic path at `82df4202` (session `9abf5cd3…`, above). Scoped progress only: it does not retire the 2026-10-03 "no real interactive Auto turn has been supplied" clause, and the interactive, tool-rich item above stays open.
+- Observed, not an acceptance item: a healthy native headless print-mode Auto root turn and an independent standard worker, served and settled on the healthy Anthropic path at `82df4202` (session `9abf5cd3…`, above). Scoped progress only: it does not retire the 2026-10-03 "no real interactive Auto turn has been supplied" clause, and the interactive, tool-rich item above stays open.
 - [x] GPT-5.6 picker **symptom** accepted by the reporter in #398 (2026-10-03).
 - [ ] GPT-5.6 picker **source/root-cause provenance** and any justified targeted correction (R18, AE10). Blocked, per U8 scenario 3.
 - Carried from the 2026-10-03 list, where it is checked at `312ff63d`: compiled CLI credential/transport isolation and dotenv fallback (17/17 tests, 149 assertions; 22/22 historical checks) and the compiled CLI retry-redelivery smoke. Not re-run at `82df4202`, so it is not ticked here as current-build acceptance.
