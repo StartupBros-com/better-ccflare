@@ -25,6 +25,7 @@ import {
 	setDerivedProviderModelDefaults,
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
+import { getPendingRotation } from "./handlers/pending-rotation-registry";
 import type { ProxyContext } from "./handlers/proxy-types";
 import { getValidAccessToken } from "./handlers/token-manager";
 
@@ -436,6 +437,82 @@ function normalize(body: CodexModelsResponse): CodexModelEntry[] {
 		.map(({ priority: _priority, ...entry }) => entry);
 }
 
+/** Request-owned acquisition bounds; never applied to a refresh we only join. */
+interface CodexCatalogRequestOptions {
+	signal: AbortSignal;
+	deadlineAt: number;
+	accountEligible: (account: Account) => boolean;
+}
+
+function checkCatalogRequest(options?: CodexCatalogRequestOptions): void {
+	if (!options) return;
+	options.signal.throwIfAborted();
+	if (!Number.isFinite(options.deadlineAt) || Date.now() >= options.deadlineAt)
+		throw new Error("Codex catalog preparation deadline expired");
+}
+
+/** Reload after asynchronous work; an old row/credential is not new authority. */
+async function revalidateCatalogRequest(
+	account: Account,
+	ctx: ProxyContext,
+	invalidationGeneration: number,
+	options: CodexCatalogRequestOptions,
+	accessToken?: string,
+): Promise<void> {
+	const createdAt = account.created_at;
+	const endpoint = account.custom_endpoint ?? null;
+	const currentAccount = (current: Account | null) =>
+		isCurrentInvalidationGeneration(account.id, invalidationGeneration) &&
+		current !== null &&
+		current.id === account.id &&
+		current.provider === "codex" &&
+		current.created_at === createdAt &&
+		(current.custom_endpoint ?? null) === endpoint &&
+		options.accountEligible(current);
+	checkCatalogRequest(options);
+	const current = await ctx.dbOps.getAccount(account.id);
+	checkCatalogRequest(options);
+	if (!current || !currentAccount(current))
+		throw new Error("obsolete or ineligible Codex catalog account");
+	if (accessToken !== undefined) {
+		const durable = {
+			accessToken: current.access_token,
+			refreshToken: current.refresh_token,
+			expiresAt: current.expires_at,
+			issuedAt: current.refresh_token_issued_at,
+		};
+		const currentToken = await getValidAccessToken({ ...current }, ctx);
+		checkCatalogRequest(options);
+		// The token await may outlive a pause, re-auth or same-ID replacement.
+		// Re-read without another token await, then check and dispatch/publish in
+		// the same turn. Only the token still selected by that row is authority.
+		const latest = await ctx.dbOps.getAccount(account.id);
+		checkCatalogRequest(options);
+		// A successfully rotated token may still be in the existing outbox while
+		// persistence is unavailable. Keep that server-resolved authority only for
+		// its exact incarnation and unchanged, still-consumed durable credential.
+		const pending = getPendingRotation(account.id, createdAt);
+		const ownsPending =
+			latest &&
+			pending &&
+			pending.createdAt === createdAt &&
+			pending.accessToken === currentToken &&
+			pending.attemptedRefreshToken === (latest.refresh_token ?? "") &&
+			pending.expiresAt > Date.now() &&
+			latest.access_token === durable.accessToken &&
+			latest.refresh_token === durable.refreshToken &&
+			latest.expires_at === durable.expiresAt &&
+			latest.refresh_token_issued_at === durable.issuedAt;
+		if (
+			!latest ||
+			!currentAccount(latest) ||
+			currentToken !== accessToken ||
+			(latest.access_token !== currentToken && !ownsPending)
+		)
+			throw new Error("obsolete Codex catalog credentials");
+	}
+}
+
 /**
  * One live call for one account. The token comes from the normal refresh path,
  * because a stored access token is routinely stale — measured: two of three
@@ -446,9 +523,21 @@ async function fetchLive(
 	ctx: ProxyContext,
 	generation: number,
 	invalidationGeneration: number,
+	options?: CodexCatalogRequestOptions,
 ): Promise<{ models: CodexModelEntry[]; fingerprint: string }> {
 	const identity = resolveCodexClientIdentity();
+	checkCatalogRequest(options);
 	const accessToken = await getValidAccessToken(account, ctx);
+	checkCatalogRequest(options);
+	if (options)
+		await revalidateCatalogRequest(
+			account,
+			ctx,
+			invalidationGeneration,
+			options,
+			accessToken,
+		);
+	checkCatalogRequest(options);
 	if (!accessToken) throw new Error("no access token for this account");
 	const fingerprint = tokenFingerprint(accessToken);
 	const previousToken = selectedTokenGeneration.get(account.id);
@@ -481,16 +570,27 @@ async function fetchLive(
 				originator: "codex_cli_rs",
 				"user-agent": identity.catalogUserAgent,
 			},
-			signal: controller.signal,
+			signal: options
+				? AbortSignal.any([options.signal, controller.signal])
+				: controller.signal,
 		});
+		checkCatalogRequest(options);
 
 		if (!response.ok) {
 			throw new Error(`HTTP ${response.status}`);
 		}
-		return {
-			models: normalize((await response.json()) as CodexModelsResponse),
-			fingerprint,
-		};
+		const body = (await response.json()) as CodexModelsResponse;
+		checkCatalogRequest(options);
+		if (options)
+			await revalidateCatalogRequest(
+				account,
+				ctx,
+				invalidationGeneration,
+				options,
+				accessToken,
+			);
+		checkCatalogRequest(options);
+		return { models: normalize(body), fingerprint };
 	} finally {
 		clearTimeout(timeout);
 	}
@@ -511,7 +611,6 @@ export function ensureCodexModelDefaults(
 	forceRevalidation = false,
 ): Promise<void> {
 	if (account?.provider !== "codex") return Promise.resolve();
-	const invalidationGeneration = invalidationGenerationFor(account.id);
 	const ownListing = lastGood.get(account.id)?.listing;
 	if (
 		ownListing &&
@@ -531,10 +630,34 @@ export function ensureCodexModelDefaults(
 	const retry = ensureRetryByAccount.get(account.id);
 	if (retry && now() < retry.nextAttemptAt) return Promise.resolve();
 
+	const attempt = startCodexCatalogEnsure(account, ctx, now);
+	return ownListing ? Promise.resolve() : attempt;
+}
+
+/** Shared ensure lifecycle; Auto can await warm renewals without changing callers. */
+function startCodexCatalogEnsure(
+	account: Account,
+	ctx: ProxyContext,
+	now: () => number,
+	options?: CodexCatalogRequestOptions,
+): Promise<void> {
+	const invalidationGeneration = invalidationGenerationFor(account.id);
+	let onAbort = () => {};
+	const cancelled =
+		options &&
+		new Promise<null>((resolve) => {
+			onAbort = () => resolve(null);
+			options.signal.addEventListener("abort", onAbort, { once: true });
+			if (options.signal.aborted) onAbort();
+		});
 	let attempt: Promise<void>;
 	attempt = (async () => {
 		try {
-			const listing = await getCodexModels(account.id, ctx);
+			const acquisition = getCodexModels(account.id, ctx, options);
+			const listing = await (cancelled
+				? Promise.race([acquisition, cancelled])
+				: acquisition);
+			checkCatalogRequest(options);
 			if (
 				listing?.source === "live" &&
 				hasDerivedProviderModelDefaults("codex", account.id)
@@ -548,12 +671,17 @@ export function ensureCodexModelDefaults(
 		} catch (err) {
 			// Never blocks the request: without a map the family falls through and
 			// the provider gets to say what it thinks, which the record then learns.
-			if (isCurrentInvalidationGeneration(account.id, invalidationGeneration)) {
+			if (
+				!options?.signal.aborted &&
+				(!options || Date.now() < options.deadlineAt) &&
+				isCurrentInvalidationGeneration(account.id, invalidationGeneration)
+			) {
 				scheduleEnsureRetry(account.id, now());
 			}
 			log.debug(`Could not load the model list for ${account.name}: ${err}`);
 		}
 	})().finally(() => {
+		options?.signal.removeEventListener("abort", onAbort);
 		// The test reset can forget a still-running attempt without cancelling it,
 		// then let a new one start. Only the promise currently registered may clear
 		// itself; the older completion may still record its best-effort outcome.
@@ -562,7 +690,56 @@ export function ensureCodexModelDefaults(
 		}
 	});
 	ensureInFlight.set(account.id, attempt);
-	return ownListing ? Promise.resolve() : attempt;
+	return attempt;
+}
+
+/**
+ * Auto needs fresh, credential-owned evidence before compilation. Ordinary warm
+ * ensure calls remain nonblocking. A shared refresh is only a wait signal: its
+ * caller owns cancellation, and its result must match our freshly resolved token.
+ */
+export async function prepareCodexAutoCatalog(
+	accountId: string,
+	ctx: ProxyContext,
+	options: CodexCatalogRequestOptions,
+): Promise<void> {
+	const epoch = invalidationGenerationFor(accountId);
+	for (let attempt = 0; attempt < 3; attempt++) {
+		checkCatalogRequest(options);
+		const row = await ctx.dbOps.getAccount(accountId);
+		checkCatalogRequest(options);
+		if (
+			!row ||
+			row.id !== accountId ||
+			row.provider !== "codex" ||
+			!options.accountEligible(row) ||
+			!isCurrentInvalidationGeneration(accountId, epoch)
+		)
+			return;
+		const account = { ...row };
+		const accessToken = await getValidAccessToken(account, ctx);
+		checkCatalogRequest(options);
+		await revalidateCatalogRequest(account, ctx, epoch, options, accessToken);
+		checkCatalogRequest(options);
+		if (!isCurrentInvalidationGeneration(accountId, epoch)) return;
+		if (
+			validateCodexAutoCatalogCredentials(
+				getCodexAutoCatalogEvidence(accountId),
+				{ account, accessToken },
+			)
+		)
+			return;
+		// Never cancel or replace a refresh independently owned by another caller.
+		const pending = ensureInFlight.get(accountId);
+		if (pending) {
+			await pending;
+			continue;
+		}
+		const retry = ensureRetryByAccount.get(accountId);
+		if (retry && Date.now() < retry.nextAttemptAt) return;
+		await startCodexCatalogEnsure(account, ctx, Date.now, options);
+		// The next pass rechecks eligibility, incarnation and credential ownership.
+	}
 }
 
 /** One account-scoped revalidation per cooldown, shared with regular refresh. */
@@ -714,11 +891,21 @@ export function lowestTierCodexModel(
 export async function getCodexModels(
 	accountId: string,
 	ctx: ProxyContext,
+	options?: CodexCatalogRequestOptions,
 ): Promise<CodexModelListing | null> {
+	checkCatalogRequest(options);
 	const invalidationGeneration = invalidationGenerationFor(accountId);
 	const fetchGeneration = ++nextCatalogFetchGeneration;
 	const resolvedAccount = await ctx.dbOps.getAccount(accountId);
-	if (!resolvedAccount || resolvedAccount.provider !== "codex") return null;
+	checkCatalogRequest(options);
+	if (
+		!resolvedAccount ||
+		resolvedAccount.provider !== "codex" ||
+		(options &&
+			(resolvedAccount.id !== accountId ||
+				!options.accountEligible(resolvedAccount)))
+	)
+		return null;
 	const account = { ...resolvedAccount };
 
 	try {
@@ -727,7 +914,9 @@ export async function getCodexModels(
 			ctx,
 			fetchGeneration,
 			invalidationGeneration,
+			options,
 		);
+		checkCatalogRequest(options);
 		// An answer with nothing usable in it is not an answer. Recording it
 		// would mark the account as resolved and stop every later attempt, so a
 		// single odd response would freeze the account with no defaults at all.
@@ -792,6 +981,8 @@ export async function getCodexModels(
 		}
 		return listing;
 	} catch (error) {
+		// A timed-out request cannot publish even advisory fallback projections.
+		checkCatalogRequest(options);
 		const cached = readCache(accountId);
 		if (isCurrentInvalidationGeneration(accountId, invalidationGeneration)) {
 			lastRefreshFailedAt.set(accountId, Date.now());
