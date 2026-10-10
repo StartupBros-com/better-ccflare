@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LogEvent } from "@better-ccflare/types";
@@ -18,8 +25,8 @@ describe("LogFileWriter.write — non-serializable payloads", () => {
 		writer = new LogFileWriter();
 	});
 
-	afterEach(() => {
-		writer.close();
+	afterEach(async () => {
+		await writer.closeAndWait();
 		if (savedLogDir === undefined) delete process.env.BETTER_CCFLARE_LOG_DIR;
 		else process.env.BETTER_CCFLARE_LOG_DIR = savedLogDir;
 		rmSync(logDir, { recursive: true, force: true });
@@ -128,6 +135,60 @@ describe("LogFileWriter.write — non-serializable payloads", () => {
 		const content = readFileSync(join(logDir, "app.log"), "utf-8");
 		const lines = content.trim().split("\n").filter(Boolean);
 		expect(lines[lines.length - 1]).toBe(JSON.stringify(event));
+	});
+
+	it("drains an import-only open and permits repeated closes", async () => {
+		await Promise.all([writer.closeAndWait(), writer.closeAndWait()]);
+		await writer.closeAndWait();
+		expect(readFileSync(join(logDir, "app.log"), "utf8")).toBe("");
+	});
+
+	it("drains queued writes even after a synchronous close", async () => {
+		const events: LogEvent[] = [
+			{ ts: 1, level: "INFO", msg: "first" },
+			{ ts: 2, level: "ERROR", msg: "last" },
+		];
+		for (const event of events) writer.write(event);
+		writer.close();
+		await writer.closeAndWait();
+		expect(readFileSync(join(logDir, "app.log"), "utf8")).toBe(
+			events.map((event) => `${JSON.stringify(event)}\n`).join(""),
+		);
+	});
+
+	it("can reopen after an awaited close without losing existing logs", async () => {
+		const event: LogEvent = { ts: 1, level: "INFO", msg: "first" };
+		writer.write(event);
+		await writer.closeAndWait();
+		writer.write(event);
+		await writer.closeAndWait();
+		expect(readFileSync(join(logDir, "app.log"), "utf8")).toBe(
+			`${JSON.stringify(event)}\n`.repeat(2),
+		);
+	});
+
+	it("waits for streams retired by a mid-stream rotation", async () => {
+		const event: LogEvent = { ts: 1, level: "INFO", msg: "before rotation" };
+		writer.write(event);
+		await readLastLine();
+		const file = join(logDir, "app.log");
+		writeFileSync(file, Buffer.alloc(10 * 1024 * 1024 + 1));
+		for (let index = 1; index < 99; index++) writer.write(event);
+		const final: LogEvent = { ts: 2, level: "INFO", msg: "after rotation" };
+		writer.write(final);
+		await writer.closeAndWait();
+		expect(readFileSync(file, "utf8")).toBe(`${JSON.stringify(final)}\n`);
+	});
+
+	it("rejects an open failure instead of silently dropping queued logs", async () => {
+		await writer.closeAndWait();
+		const file = join(logDir, "app.log");
+		rmSync(file);
+		mkdirSync(file);
+		writer.write({ ts: 1, level: "ERROR", msg: "cannot open a directory" });
+		await expect(writer.closeAndWait()).rejects.toMatchObject({
+			code: "EISDIR",
+		});
 	});
 });
 

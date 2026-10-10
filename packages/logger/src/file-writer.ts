@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { finished } from "node:stream/promises";
 import type { LogEvent } from "@better-ccflare/types";
 
 // Local constants to avoid circular dependency with core
@@ -47,6 +48,7 @@ export class LogFileWriter implements Disposable {
 	private logDir: string;
 	private logFile: string;
 	private stream: ReturnType<typeof createWriteStream> | null = null;
+	private streams = new Set<ReturnType<typeof createWriteStream>>();
 	private maxFileSize = BUFFER_SIZES.LOG_FILE_MAX_SIZE;
 	private writeCount = 0;
 	private static readonly SIZE_CHECK_INTERVAL = 100;
@@ -80,7 +82,10 @@ export class LogFileWriter implements Disposable {
 		}
 
 		// Create write stream with append mode
-		this.stream = createWriteStream(this.logFile, { flags: "a" });
+		const stream = createWriteStream(this.logFile, { flags: "a" });
+		this.stream = stream;
+		this.streams.add(stream);
+		stream.once("close", () => this.streams.delete(stream));
 	}
 
 	private rotateLog(): void {
@@ -187,6 +192,15 @@ export class LogFileWriter implements Disposable {
 			this.stream.end();
 			this.stream = null;
 		}
+	}
+
+	/** Wait for queued writes and file opens, including streams closed by rotation. */
+	async closeAndWait(): Promise<void> {
+		const closed = [...this.streams].map((stream) =>
+			finished(stream, { cleanup: true }),
+		);
+		this.close();
+		await Promise.all(closed);
 	}
 
 	dispose(): void {
