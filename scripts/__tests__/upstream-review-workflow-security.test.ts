@@ -77,6 +77,17 @@ jobs:
 		expect(workflow).toContain("persist-credentials: false");
 	});
 
+	test("routes only canonical main pushes and dispatches to trusted ARC", async () => {
+		const workflow = Bun.YAML.parse(
+			await Bun.file(join(workflowsDir, "managed-routing-postgres.yml")).text(),
+		) as { jobs: Record<string, { "runs-on": unknown }> };
+
+		// Configuration contract, not proof of the server-side runner-group restriction.
+		expect(workflow.jobs["managed-routing-foundation"]["runs-on"]).toBe(
+			"${{ github.repository == 'StartupBros-com/better-ccflare' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'linux-x64-bccf-main' || 'ubuntu-latest' }}",
+		);
+	});
+
 	test("preserves the managed-routing PostgreSQL gate and exact Bun pin", async () => {
 		const workflow = await Bun.file(
 			join(workflowsDir, "managed-routing-postgres.yml"),
