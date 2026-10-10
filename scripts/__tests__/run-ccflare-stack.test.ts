@@ -1,15 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
 	chmodSync,
 	closeSync,
 	existsSync,
+	constants as fsConstants,
 	mkdirSync,
 	mkdtempSync,
 	openSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -178,6 +180,28 @@ function writeStableFixturePrograms(dir: string): {
 			"});",
 			"server.listen(Number(process.env.GUARD_PORT), '127.0.0.1');",
 			"process.on('SIGTERM', () => server.close(() => process.exit(0)));",
+		].join("\n"),
+	);
+	chmodSync(programs.guard, 0o755);
+	return programs;
+}
+
+function writeGatedGuardFixturePrograms(dir: string): {
+	upstream: string;
+	guard: string;
+} {
+	const programs = writeFixturePrograms(dir);
+	writeFileSync(
+		programs.guard,
+		[
+			'import { existsSync } from "node:fs";',
+			'import http from "node:http";',
+			"const server = http.createServer((_req, res) => {",
+			"  res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}');",
+			"});",
+			// Hold readiness until the test has finished rearranging fixture state.
+			"const gate = setInterval(() => { if (existsSync(`${process.env.CAPTURE_DIR}/guard-go`)) { clearInterval(gate); server.listen(Number(process.env.GUARD_PORT), '127.0.0.1'); } }, 5);",
+			"process.on('SIGTERM', () => process.exit(0));",
 		].join("\n"),
 	);
 	chmodSync(programs.guard, 0o755);
@@ -721,6 +745,64 @@ describe("run-ccflare-stack RSS containment behavior", () => {
 		}
 	}, 10_000);
 
+	test("captures the watchdog's start-time identity before announcing the stack ready", async () => {
+		const fixtureDir = tempDir("ccflare-stack-rss-identity-order-");
+		const runner = await spawnRunner(
+			writeGatedGuardFixturePrograms(fixtureDir),
+			{
+				// A long poll keeps the watchdog's own samples off the FIFO below.
+				...rssPolicy({ RUNNER_RSS_POLL_INTERVAL_MS: "600000" }),
+				RUNNER_HEALTH_MAX_ATTEMPTS: "1000",
+			},
+		);
+		let writer: number | undefined;
+		try {
+			await waitForGenerationCount(runner, 1);
+			const record = JSON.parse(
+				readFileSync(join(runner.captureDir, "upstream.json"), "utf8").trim(),
+			);
+			const stat = join(runner.captureDir, "proc", String(record.pid), "stat");
+			const identity = readFileSync(stat, "utf8");
+			// Turn stat into a FIFO so the runner's baseline read blocks until this
+			// test serves it, then let the guard become ready.
+			rmSync(stat);
+			expect(spawnSync("mkfifo", [stat]).status).toBe(0);
+			writeFileSync(join(runner.captureDir, "guard-go"), "");
+			const started = Date.now();
+			while (writer === undefined && Date.now() - started < 5_000) {
+				try {
+					writer = openSync(
+						stat,
+						fsConstants.O_WRONLY | fsConstants.O_NONBLOCK,
+					);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENXIO") throw error;
+					await Bun.sleep(10);
+				}
+			}
+			if (writer === undefined) {
+				throw new Error(
+					`runner never read the upstream identity: ${JSON.stringify(runner.getOutput())}`,
+				);
+			}
+			// The runner is blocked reading its baseline. Any test write to stat
+			// after "ready" must not be able to become that baseline, so the
+			// announcement cannot precede this read.
+			await Bun.sleep(100);
+			expect(runner.getOutput().stdout).not.toContain("ccflare stack ready");
+			writeSync(writer, identity);
+			closeSync(writer);
+			writer = undefined;
+			await waitForOutput(runner, "ccflare stack ready");
+			rmSync(stat);
+			writeFileSync(stat, identity);
+		} finally {
+			// Under the old ordering this EOF releases the runner's blocked read.
+			if (writer !== undefined) closeSync(writer);
+			await stopRunner(runner);
+		}
+	}, 10_000);
+
 	test("never triggers from a stale PID whose exact proc start-time identity changed", async () => {
 		const fixtureDir = tempDir("ccflare-stack-rss-identity-");
 		const programs = writeFixturePrograms(fixtureDir);
@@ -731,14 +813,21 @@ describe("run-ccflare-stack RSS containment behavior", () => {
 			const record = JSON.parse(
 				readFileSync(join(runner.captureDir, "upstream.json"), "utf8").trim(),
 			);
+			const stat = join(runner.captureDir, "proc", String(record.pid), "stat");
+			const identity = readFileSync(stat, "utf8");
 			writeFileSync(
-				join(runner.captureDir, "proc", String(record.pid), "stat"),
+				stat,
 				`${record.pid} (stale) S ${Array(18).fill("0").join(" ")} 999999 0\n`,
 			);
 			setRssKiB(runner, 20);
 			await Bun.sleep(80);
 			expect(generationCount(runner)).toBe(1);
 			expect(runner.getOutput().stdout).not.toContain("RSS recycle trigger");
+			// Positive control: the same over-threshold memory recycles once the
+			// identity matches again, so the silence above is not a dead watchdog.
+			writeFileSync(stat, identity);
+			await waitForOutput(runner, "RSS recycle trigger");
+			await waitForGenerationCount(runner, 2);
 		} finally {
 			await stopRunner(runner);
 		}
@@ -1197,6 +1286,11 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 		extra: Record<string, string> = {},
 		guardStartupDelayMs = 0,
 	) {
+		// Real Node startup hashes executable artifacts before it listens. Loaded
+		// CI runners have needed more than the 3.5 s a fixed 5 s window left after
+		// a 1.5 s injected delay, so headroom is added on top of the delay. The
+		// callers' 30 s test timeouts cover this window, the handoff, and the reap.
+		const readyTimeoutMs = guardStartupDelayMs + 10_000;
 		const nodeExecutable = resolveNodeExecutable();
 		const dir = tempDir("ccflare-persistent-fixture-");
 		const programs = writeFixturePrograms(dir);
@@ -1227,9 +1321,10 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 				...rssPolicy({ RUNNER_RSS_POLL_INTERVAL_MS: "20" }),
 				RUNNER_PERSISTENT_GUARD: "1",
 				NODE_BIN: nodeExecutable,
-				// Native identity inspection hashes the real executable before listen;
-				// the lightweight mock fixture's one-second readiness budget is too short.
-				RUNNER_HEALTH_MAX_ATTEMPTS: "500",
+				// At the fixture's 10 ms health poll, the runner's attempt budget must
+				// outlast readyTimeoutMs. Otherwise it gives up first and restarts the
+				// stack under the test, which then fails on generation counts instead.
+				RUNNER_HEALTH_MAX_ATTEMPTS: String(Math.ceil(readyTimeoutMs / 10)),
 				...(guardStartupDelayMs > 0
 					? { NODE_OPTIONS: `--import=${startupDelayModule}` }
 					: {}),
@@ -1246,7 +1341,7 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 			await waitForOutput(
 				runner,
 				"ccflare stack ready",
-				Number(extra.FIXTURE_READY_TIMEOUT_MS ?? 5000),
+				Number(extra.FIXTURE_READY_TIMEOUT_MS ?? readyTimeoutMs),
 			);
 		} catch (error) {
 			// start() has not returned its owner yet; callers cannot reach their
@@ -1352,7 +1447,7 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 		} finally {
 			await stopRunner(runner);
 		}
-	}, 15000);
+	}, 30_000);
 	test("failed replacement remains fenced and retries the same generation within the circuit", async () => {
 		const { runner, base } = await start({
 			RUNNER_RESTART_BACKOFF_BASE_MS: "500",
@@ -1379,7 +1474,7 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 		} finally {
 			await stopRunner(runner);
 		}
-	}, 15000);
+	}, 30_000);
 	test("external TERM during a pending drain preserves terminal shutdown and starts no replacement", async () => {
 		const { runner, base } = await start();
 		const response = await fetch(`${base}/hold`);
@@ -1391,5 +1486,5 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 		expect((await exit).code).toBe(143);
 		await body;
 		expect(generationCount(runner)).toBe(1);
-	}, 15000);
+	}, 30_000);
 });
