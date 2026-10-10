@@ -745,4 +745,91 @@ Separate later approval authorized Auto activation at **2026-10-03 04:42:21Z**, 
 
 The historical product requirements, design decisions and verification obligations above are preserved byte-for-byte. Read their historical future-tense and blanket output-limit language with this dated amendment. Neither shipped code nor fixture checks close the outstanding live-acceptance gates.
 
+---
+
+## Reconciliation — 2026-10-10 UTC
+
+**DOCS RECONCILIATION / HEALTHY ANTHROPIC ROOT + WORKER TURN OBSERVED / CROSS-PROVIDER FAILOVER AND U8 ACCEPTANCE STILL OPEN**
+
+This dated section reconciles the 2026-10-03 status with what has shipped, deployed and been observed since. It changes no requirement, decision, unit, gate or acceptance example above; the 2026-10-03 block and its checklist are preserved as written, and the list under "Remaining U8 acceptance — as of 2026-10-10" supersedes that checklist only where it says so. It is a documentation change: nothing here was produced by running tests, sending inference traffic, deploying, restarting or mutating any account, quota or credential. [Issue #398](https://github.com/StartupBros-com/better-ccflare/issues/398) remains the living acceptance list and remains open.
+
+### Shipped since 2026-10-03
+
+- [PR #459](https://github.com/StartupBros-com/better-ccflare/pull/459) (`feat(quality): opt in headless workers to approved flagship fallback`), merged as `19fa6a9932075892554741e0cf66394b0e0f31e5`. Its body says `Refs #457`; it does not close that issue.
+- [PR #462](https://github.com/StartupBros-com/better-ccflare/pull/462) (`fix(codex): retain age-bound poll proof after live headers`), reviewed head `42f5efbf9cde626e8a471e559fbf473d0db0cff4`, merged 2026-10-10T00:50:54Z as `82df4202b10389e4c40156267a773632ac45afac`; the Managed Routing Foundation Gate run [38009111874](https://github.com/StartupBros-com/better-ccflare/actions/runs/38009111874) completed with conclusion `success` at that head.
+- [PR #451](https://github.com/StartupBros-com/better-ccflare/pull/451) (`fix(guard): drop proxied overage-in-use so Claude Code never latches Fable usage credits; revert the #445 account cap`), merged as `a6341d04e4d817f6c4c1554e130e7b3b7f4cf9b8`, is the guard source pinned below.
+- [PR #465](https://github.com/StartupBros-com/better-ccflare/pull/465) (`ci-public-arc`) is the `origin/main` tip, `c96808ea645d7aeb85546f4184de11362c973cb6`, at the time of this reconciliation. It touched no plan or solution documents and is **not** deployed by anything recorded here.
+
+### Deployment identity at the time of writing
+
+Read on 2026-10-10 at about 20:17Z, not re-derived from any earlier record:
+
+- Both production health ports (`:8788` guard, `:8789` backend) returned `status` `ok`, `version` `3.5.78`, `git_sha` `82df4202`, `git_ref` `refs/heads/main`.
+- The systemd pin (`/etc/systemd/system/ccflare-stack.service.d/50-pinned-build.conf`) names `CCFLARE_GIT_SHA=82df4202b10389e4c40156267a773632ac45afac`, `GUARD_SOURCE_ID=a6341d04e4d817f6c4c1554e130e7b3b7f4cf9b8` and `GUARD_POLICY_ID=pool-exhaustion-finite-recovery-v1`.
+- `ccflare-stack.service` was `active` with `NRestarts=0`; its main (guard) process started 2026-10-08 19:46:38 EDT, so the `82df4202` backend was swapped under a retained guard rather than by a service restart.
+
+This is dated evidence of one already-completed, separately approved deployment of `82df4202`. It was not repeated for this reconciliation, no binary checksum was re-verified (the last independently checksummed installation remains `312ff63d` above), and the later `origin/main` tip `c96808ea` is not claimed to be running. As the 2026-10-03 block says, the installed revision is read from the health endpoint, not from this record.
+
+### Observed healthy Anthropic root and worker turn
+
+One native Claude Code `2.1.296` print-mode session (`stream-json` trace, `permissionMode` `dontAsk`, the `Agent` tool as its only enabled tool) ran as session `9abf5cd3-949d-4d36-b6de-9bf472b9ab96` with root model `claude-bccf-quality-auto[1m]`, two turns, one `Explore` worker (`a88af7159d32b15f2`; spawned 1, completed 1, failed 0) and an empty `permission_denials` list. Its extraction record (`root-worker-acceptance.json` and `root-worker.stream.jsonl` under `/tmp/ccflare-main-deploy.10ztj5/`, a non-durable scratch location outside this repository) reports `passed: true`, `enrolled: 1`, `unresolved: 0`, and two settled proxy conversations at runtime `git_sha` `82df4202` with guard source `a6341d04…` and backend source `82df4202…`:
+
+| Conversation | Requested | Selected | Served | Outcome |
+|---|---|---|---|---|
+| `fb6e81c9-7a47-4f5c-9665-a3d8a5373868` (`$root`, role `main`) | `main`, preference `auto` | provider `anthropic`, line `claude-fable`, lane `fable` | `claude-fable-5-1`, HTTP 200, stream `complete`, billing `plan`, OAuth-registered | `validated-success`, not pending |
+| `982c312f-6934-4fd8-8082-02bdafeebf42` (child, role `standard`) | `worker`, role `standard` | provider `anthropic`, line `claude-sonnet`, lane `standard` | `claude-sonnet-5-5`, HTTP 200, stream `complete`, billing `plan`, OAuth-registered | `validated-success`, not pending |
+
+Both conversations carry the same policy revision, `quality-policy-v1:f903f0d9a5233dfa5cc659b6a4bebde6df947ca19d1e187e4deda39e0543f62d`, so the policy did not change between root and worker. The record's own `no_claim` field governs its reading: one actual healthy Anthropic Auto root/standard-worker path; not live forced exhaustion, not a cross-provider switch, not all future capacity, not actual billed dollars; and inspecting the same trace and state is not independent reproduction. The native stderr also logged a `[claude-code:unrecognized_model]` line for the Auto alias; that observation is recorded here, not diagnosed.
+
+What this retires: the 2026-10-03 clause "no real interactive Auto turn has been supplied for this check" is obsolete. A real native Auto turn has now been served and settled on the healthy path, with the root on the preferred Fable lane and the worker on an independent Sonnet-level lane rather than inheriting the parent's model. That is consistent with the healthy-path "Then" clauses of AE1 and AE7; it is one observation, not the recorded acceptance of either example.
+
+What this does **not** retire — read the following as binding limits, not caveats:
+
+- It is **not** cross-provider failover acceptance. No unavailable-Anthropic → approved non-Anthropic serving with provider/model provenance has been observed (AE2, AE8 and R14 remain open), and dotfiles [issue #1691](https://github.com/StartupBros-com/dotfiles/issues/1691) remains open on exactly that requirement.
+- It is **not** selected-account eligibility or subscription/capability evidence. One account served two requests; the eligibility item below is untouched.
+- It is **not** the real interactive, tool-rich main-agent acceptance. It was a bounded two-turn print-mode run with a single enabled tool.
+- It is **not** authenticated retry acceptance (R12, R21, AE6) and shows no fallback edge being taken.
+- It does **not** close U8, [#398](https://github.com/StartupBros-com/better-ccflare/issues/398) or [#457](https://github.com/StartupBros-com/better-ccflare/issues/457).
+
+### GPT-5.6 picker residue (R18, AE10)
+
+The 2026-10-03 open item "actual affected-client GPT-5.6 picker provenance and any justified targeted correction" is split, not closed:
+
+- **Symptom — accepted by the reporter.** The #398 task list records, dated 2026-10-03, that the reporter confirmed "gpt 5.6 no longer shows", and the UI symptom is accepted as resolved on that observation (restated in [comment 5966693786](https://github.com/StartupBros-com/better-ccflare/issues/398#issuecomment-5966693786)). That acceptance is the reporter's observation, not a measurement made here; every #398 comment is by the issue author.
+- **Root cause — not established.** #398 states that the actual source/root-cause provenance was not independently established and that no model catalog change was made for this confirmation. R18's "only after identifying its source" and U8 scenario 3's "if no source can be observed, report this part as blocked rather than complete" still apply. No root-cause fix is claimed.
+
+### Remaining U8 acceptance — as of 2026-10-10
+
+This list supersedes the 2026-10-03 checklist's open items; the 2026-10-03 text itself is unchanged.
+
+- [ ] Selected-account eligibility and applicable subscription/capability evidence.
+- [ ] Real interactive, tool-rich main-agent routing acceptance. Scripted Anthropic-backed traffic remains prohibited; the observed turn above was a native Claude Code session, not scripted traffic, and it does not satisfy this item.
+- [ ] Cross-provider failover with provenance (AE2, AE8, R14): an unavailable Anthropic lane served by an approved non-Anthropic candidate, observed live, with the selected line/lane/physical model and skip reason recorded. Not observed. Tracked by dotfiles #1691 for managed headless agents.
+- [ ] Authenticated retry and fallback-edge acceptance (R12, R21, AE6, AE16) on the live path.
+- [x] A real native Auto root turn and an independent standard worker, served and settled on the healthy Anthropic path at `82df4202` (session `9abf5cd3…`, above). Retires only the "no real interactive Auto turn has been supplied" clause.
+- [x] GPT-5.6 picker **symptom** accepted by the reporter in #398 (2026-10-03).
+- [ ] GPT-5.6 picker **source/root-cause provenance** and any justified targeted correction (R18, AE10). Blocked, per U8 scenario 3.
+- [x] Carried unchanged from 2026-10-03: compiled CLI credential/transport isolation and dotenv fallback at `312ff63d` (17/17 tests, 149 assertions; 22/22 historical checks) and the compiled CLI retry-redelivery smoke. Not re-run at `82df4202`.
+- [ ] Reporter confirmation of the required behavior on #398 and #457 before either issue is closed or this plan is marked complete.
+
+### Issue and tracking state, independently re-read on 2026-10-10
+
+- better-ccflare [#398](https://github.com/StartupBros-com/better-ccflare/issues/398): **OPEN** (it was closed at 2026-10-03T04:45:55Z and reopened at 2026-10-03T04:58:37Z; `closedAt` is null now).
+- better-ccflare [#457](https://github.com/StartupBros-com/better-ccflare/issues/457) (`fix: gateway Auto worker failover to approved flagship lanes`): **OPEN**, no close event. [Comment 6092679688](https://github.com/StartupBros-com/better-ccflare/issues/457#issuecomment-6092679688) (2026-10-10T02:22:53Z) is a deployment and acceptance status report by the issue author, not an outside reporter's confirmation; it records the same healthy root/worker run and states that forced exhaustion and cross-provider fallback were not observed.
+- dotfiles [#1691](https://github.com/StartupBros-com/dotfiles/issues/1691) (`fix: automatic gateway failover for managed headless Claude agents`): **OPEN**. [PR #1696](https://github.com/StartupBros-com/dotfiles/pull/1696) (head `2440234a9eb871b62c079433dc5f6f4acecc0a47`, merged as `3afa0cee75f19b64a02dcc9181098bfec8aa675b`, Harness Tests run 38019387368 `success`) routes default managed roots through gateway Auto; it does not supply the live cross-provider provenance #1691 asks for.
+- Native compaction is a separate scope and is not claimed here: dotfiles [#1715](https://github.com/StartupBros-com/dotfiles/issues/1715) is **CLOSED** (2026-10-10T01:07:55Z) on [PR #1716](https://github.com/StartupBros-com/dotfiles/pull/1716) (head `a06bf66f53d6f9598d80d0a57a05f8241f18cb84`, merged as `935d5f7b861165de1ef7f3a8334421cdafe25f03`) with accepted runtime evidence (`preTokens` 433387 → `postTokens` 41926, then an 85385-token turn) that its own closing comment says does not prove the fallback alone caused the boundary or an exact 267K trigger. The follow-up learning refresh, [PR #1719](https://github.com/StartupBros-com/dotfiles/pull/1719), merged 2026-10-10T20:14:10Z (reviewed head `21a3e50818254c204d902ce05630f5ac23d4f133`, merge `42a78cdd39739d03e9ce9ec524d8306cdb4ab617`, Harness Tests run 38082834451 `success` at that head).
+
+No issue is closed by this reconciliation; closure waits for reporter confirmation under the repository rule.
+
+### Not verified, not claimed
+
+- Only documentation changed. No application test, type check, build, inference request, deployment, restart, account/quota/credential mutation or new canary was performed for this section.
+- Relative link anchors (`../troubleshooting.md#auto-quality-routing`) and the GitHub references above were checked as paths and API facts, not as rendered pages.
+- The `82df4202` binary checksum was not re-verified; runtime identity rests on the health endpoint and the systemd pin as read at the time above.
+- The canary extraction files live under `/tmp` and may not survive; their quoted fields were read from the files on 2026-10-10, not reproduced.
+- The extraction's `native_estimated_cost_usd_not_actual_invoice` field is an estimate and is not cited as spend; no DB sweep, cost measurement or fleet-savings figure was produced.
+- Nothing here establishes an exact 267K compaction trigger, independent reproduction of any observation, or a new capability.
+
+The historical product requirements, design decisions, implementation units, verification contract, acceptance coverage and Definition of Done above remain byte-for-byte as written. Cross-provider failover and the rest of U8 remain open.
+
 Reviewed plan, updated in place: https://claude.ai/artifact/MhARSo63DsqhdzD1BJAa2b
