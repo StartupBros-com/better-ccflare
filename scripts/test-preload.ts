@@ -29,4 +29,13 @@ function cleanup(): void {
 
 // bun test can exit without emitting "exit", so also clean up after the file.
 process.on("exit", cleanup);
-afterAll(cleanup);
+afterAll(async () => {
+	// The singleton opens app.log asynchronously. Drain it before removing
+	// its directory, even when a synchronous test only imported the logger.
+	// Bun exposes imported ESM modules here too; avoid creating a logger in
+	// test processes that never used one.
+	const cached =
+		require.cache[require.resolve("../packages/logger/src/file-writer")];
+	await cached?.exports.logFileWriter?.closeAndWait();
+	cleanup();
+});
