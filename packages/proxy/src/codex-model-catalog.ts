@@ -231,6 +231,64 @@ const lastCatalogRoleRouteReportAt = new Map<string, number>();
 
 /** One best-effort listing request per account at a time. */
 const ensureInFlight = new Map<string, Promise<void>>();
+
+/**
+ * The account's running ensure attempt, if any: a wait signal only. Its
+ * completion proves nothing about ownership, which the caller rechecks against
+ * its own resolved credential. Warm callers of ensureCodexModelDefaults return
+ * before the refresh finishes; this lets a bounded caller wait for it instead.
+ */
+export function getPendingCodexCatalogAcquisition(
+	accountId: string,
+): Promise<void> | undefined {
+	return ensureInFlight.get(accountId);
+}
+
+/**
+ * A bounded caller's own restrictions on the acquisition it starts (Auto
+ * catalog preparation). The caller checks them before calling ensure, but the
+ * attempt then awaits its own account reload and token resolution; they are
+ * rechecked after each, against the freshly loaded row, immediately before any
+ * GET. Callers without restrictions (stock routing, the heartbeat, manual
+ * revalidation) pass none and keep their behavior.
+ */
+export interface CodexCatalogAcquisitionScope {
+	/** The request ended (abort, policy change, budget): start no new traffic. */
+	stopped(): boolean;
+	/** Whether the freshly reloaded row may still receive metadata traffic. */
+	accountEligible(account: Account): boolean;
+}
+
+/**
+ * The attempt started no traffic because its scope ended, or its account
+ * stopped being eligible, before the GET. A control outcome, not a failure: it
+ * records no refresh failure and schedules no retry backoff, so a later
+ * eligible caller acquires at once under its own restrictions. It never
+ * cancels a GET already started, nor another caller's running attempt.
+ */
+export class CodexCatalogAcquisitionNotAttemptedError extends Error {
+	readonly reason: "request-stopped" | "account-ineligible";
+	constructor(reason: "request-stopped" | "account-ineligible") {
+		super(`Codex catalog acquisition not attempted: ${reason}`);
+		this.name = "CodexCatalogAcquisitionNotAttemptedError";
+		this.reason = reason;
+	}
+}
+
+/** Rechecks a scope against the row just reloaded; a no-op without a scope. */
+function throwIfOutOfScope(
+	scope: CodexCatalogAcquisitionScope | undefined,
+	accountId: string,
+	fresh: Account | null | undefined,
+): void {
+	if (!scope) return;
+	if (scope.stopped()) {
+		throw new CodexCatalogAcquisitionNotAttemptedError("request-stopped");
+	}
+	if (!fresh || fresh.id !== accountId || !scope.accountEligible(fresh)) {
+		throw new CodexCatalogAcquisitionNotAttemptedError("account-ineligible");
+	}
+}
 const unknownRevalidationAt = new Map<string, number>();
 const UNKNOWN_REVALIDATION_COOLDOWN_MS = 60_000;
 
@@ -446,9 +504,22 @@ async function fetchLive(
 	ctx: ProxyContext,
 	generation: number,
 	invalidationGeneration: number,
+	scope?: CodexCatalogAcquisitionScope,
 ): Promise<{ models: CodexModelEntry[]; fingerprint: string }> {
 	const identity = resolveCodexClientIdentity();
 	const accessToken = await getValidAccessToken(account, ctx);
+	if (scope) {
+		// Token resolution was awaited: a stop or an account change that landed
+		// meanwhile must prevent the GET, before any credential bookkeeping.
+		if (scope.stopped()) {
+			throw new CodexCatalogAcquisitionNotAttemptedError("request-stopped");
+		}
+		throwIfOutOfScope(
+			scope,
+			account.id,
+			await ctx.dbOps.getAccount(account.id),
+		);
+	}
 	if (!accessToken) throw new Error("no access token for this account");
 	const fingerprint = tokenFingerprint(accessToken);
 	const previousToken = selectedTokenGeneration.get(account.id);
@@ -509,6 +580,7 @@ export function ensureCodexModelDefaults(
 	ctx: ProxyContext,
 	now: () => number = Date.now,
 	forceRevalidation = false,
+	scope?: CodexCatalogAcquisitionScope,
 ): Promise<void> {
 	if (account?.provider !== "codex") return Promise.resolve();
 	const invalidationGeneration = invalidationGenerationFor(account.id);
@@ -534,7 +606,7 @@ export function ensureCodexModelDefaults(
 	let attempt: Promise<void>;
 	attempt = (async () => {
 		try {
-			const listing = await getCodexModels(account.id, ctx);
+			const listing = await getCodexModels(account.id, ctx, scope);
 			if (
 				listing?.source === "live" &&
 				hasDerivedProviderModelDefaults("codex", account.id)
@@ -546,6 +618,12 @@ export function ensureCodexModelDefaults(
 				scheduleEnsureRetry(account.id, now());
 			}
 		} catch (err) {
+			// Nothing was attempted, so nothing failed: no backoff, a later eligible
+			// caller acquires at once.
+			if (err instanceof CodexCatalogAcquisitionNotAttemptedError) {
+				log.debug(`Skipped the model list for ${account.name}: ${err.reason}`);
+				return;
+			}
 			// Never blocks the request: without a map the family falls through and
 			// the provider gets to say what it thinks, which the record then learns.
 			if (isCurrentInvalidationGeneration(account.id, invalidationGeneration)) {
@@ -714,10 +792,14 @@ export function lowestTierCodexModel(
 export async function getCodexModels(
 	accountId: string,
 	ctx: ProxyContext,
+	scope?: CodexCatalogAcquisitionScope,
 ): Promise<CodexModelListing | null> {
 	const invalidationGeneration = invalidationGenerationFor(accountId);
 	const fetchGeneration = ++nextCatalogFetchGeneration;
 	const resolvedAccount = await ctx.dbOps.getAccount(accountId);
+	// A scoped caller's stop or eligibility loss during this reload is a typed
+	// not-attempted outcome, never the null that would count as a failed read.
+	throwIfOutOfScope(scope, accountId, resolvedAccount);
 	if (!resolvedAccount || resolvedAccount.provider !== "codex") return null;
 	const account = { ...resolvedAccount };
 
@@ -727,6 +809,7 @@ export async function getCodexModels(
 			ctx,
 			fetchGeneration,
 			invalidationGeneration,
+			scope,
 		);
 		// An answer with nothing usable in it is not an answer. Recording it
 		// would mark the account as resolved and stop every later attempt, so a
@@ -792,6 +875,8 @@ export async function getCodexModels(
 		}
 		return listing;
 	} catch (error) {
+		// Not a failed read: no traffic was started, so no failure is recorded.
+		if (error instanceof CodexCatalogAcquisitionNotAttemptedError) throw error;
 		const cached = readCache(accountId);
 		if (isCurrentInvalidationGeneration(accountId, invalidationGeneration)) {
 			lastRefreshFailedAt.set(accountId, Date.now());

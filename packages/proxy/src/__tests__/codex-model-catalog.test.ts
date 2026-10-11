@@ -14,6 +14,7 @@ import {
 	setDerivedProviderModelDefaults,
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
+import type { CodexCatalogAcquisitionScope } from "../codex-model-catalog";
 import {
 	CODEX_CATALOG_STALE_ALERT_MS,
 	clearCodexModelCacheForAccount,
@@ -1493,6 +1494,135 @@ describe("ensureCodexModelDefaults", () => {
 		clearCodexModelCacheForTests();
 		await ensureCodexModelDefaults(account, makeCtx(account), () => 50_000);
 		expect(fetches).toBe(2);
+	});
+
+	// A request-scoped caller (Auto catalog preparation) passes its own
+	// continuation and eligibility restrictions. They are rechecked after the
+	// attempt's own account reload and token resolution, immediately before the
+	// GET; a stop there is a typed not-attempted outcome, not an account failure.
+	describe("request-scoped restrictions at the pre-GET boundary", () => {
+		const warnless = () =>
+			spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+
+		it("a stop landing in the attempt's own reload issues no GET and records no backoff", async () => {
+			let fetches = 0;
+			const account = makeAccount({ id: "acc-scope-stop" });
+			globalThis.fetch = (async () => {
+				fetches++;
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			let stopped = false;
+			const ctx = {
+				dbOps: {
+					getAccount: async () => {
+						// The outer stop check passed; the request ends during the reload.
+						stopped = true;
+						return account;
+					},
+				},
+				refreshInFlight: new Map(),
+			} as unknown as ProxyContext;
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => stopped,
+				accountEligible: () => true,
+			};
+			const warnSpy = warnless();
+			try {
+				await ensureCodexModelDefaults(
+					account,
+					ctx,
+					() => 70_000,
+					false,
+					scope,
+				);
+				expect(fetches).toBe(0);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(
+					false,
+				);
+				expect(warnSpy).not.toHaveBeenCalled();
+				// An unrestricted ensure right after acquires at once: the stopped
+				// attempt scheduled no retry delay against the account.
+				await ensureCodexModelDefaults(account, makeCtx(account), () => 70_000);
+				expect(fetches).toBe(1);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(true);
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
+
+		it("an account change landing in the attempt's own token resolution issues no GET and records no backoff", async () => {
+			let fetches = 0;
+			const account = makeAccount({ id: "acc-scope-paused" });
+			globalThis.fetch = (async () => {
+				fetches++;
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			let reloads = 0;
+			const ctx = {
+				dbOps: {
+					// The attempt's first reload is eligible; the fresh row read after
+					// token resolution, immediately before the GET, is paused.
+					getAccount: async () =>
+						++reloads === 1 ? account : { ...account, paused: true },
+				},
+				refreshInFlight: new Map(),
+			} as unknown as ProxyContext;
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => false,
+				accountEligible: (fresh) => !fresh.paused,
+			};
+			const warnSpy = warnless();
+			try {
+				await ensureCodexModelDefaults(
+					account,
+					ctx,
+					() => 80_000,
+					false,
+					scope,
+				);
+				expect(fetches).toBe(0);
+				expect(reloads).toBeGreaterThanOrEqual(2);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(
+					false,
+				);
+				expect(warnSpy).not.toHaveBeenCalled();
+				await ensureCodexModelDefaults(account, makeCtx(account), () => 80_000);
+				expect(fetches).toBe(1);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(true);
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
+
+		it("the direct read surfaces the typed not-attempted outcome instead of a cached fallback", async () => {
+			let fetches = 0;
+			const account = makeAccount({ id: "acc-scope-typed" });
+			globalThis.fetch = (async () => {
+				fetches++;
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => true,
+				accountEligible: () => true,
+			};
+			const warnSpy = warnless();
+			try {
+				await expect(
+					getCodexModels(account.id, makeCtx(account), scope),
+				).rejects.toMatchObject({
+					name: "CodexCatalogAcquisitionNotAttemptedError",
+					reason: "request-stopped",
+				});
+				expect(fetches).toBe(0);
+				expect(warnSpy).not.toHaveBeenCalled();
+				// Without restrictions the same read proceeds.
+				const listing = await getCodexModels(account.id, makeCtx(account));
+				expect(listing?.source).toBe("live");
+				expect(fetches).toBe(1);
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
 	});
 });
 
