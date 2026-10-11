@@ -232,6 +232,8 @@ const lastCatalogRoleRouteReportAt = new Map<string, number>();
 
 /** One best-effort listing request per account at a time. */
 const ensureInFlight = new Map<string, Promise<void>>();
+/** A scoped stop is a wait signal, not an answer for a cold ordinary caller. */
+const requestOwnedEnsures = new WeakMap<Promise<void>, { stopped: boolean }>();
 const unknownRevalidationAt = new Map<string, number>();
 const UNKNOWN_REVALIDATION_COOLDOWN_MS = 60_000;
 
@@ -444,11 +446,17 @@ interface CodexCatalogRequestOptions {
 	accountEligible: (account: Account) => boolean;
 }
 
+/** Request control must not poison provider failure/backoff bookkeeping. */
+class CodexCatalogRequestStopped extends Error {}
+
 function checkCatalogRequest(options?: CodexCatalogRequestOptions): void {
 	if (!options) return;
-	options.signal.throwIfAborted();
+	if (options.signal.aborted)
+		throw new CodexCatalogRequestStopped("Codex catalog preparation aborted");
 	if (!Number.isFinite(options.deadlineAt) || Date.now() >= options.deadlineAt)
-		throw new Error("Codex catalog preparation deadline expired");
+		throw new CodexCatalogRequestStopped(
+			"Codex catalog preparation deadline expired",
+		);
 }
 
 /** Reload after asynchronous work; an old row/credential is not new authority. */
@@ -473,7 +481,9 @@ async function revalidateCatalogRequest(
 	const current = await ctx.dbOps.getAccount(account.id);
 	checkCatalogRequest(options);
 	if (!current || !currentAccount(current))
-		throw new Error("obsolete or ineligible Codex catalog account");
+		throw new CodexCatalogRequestStopped(
+			"obsolete or ineligible Codex catalog account",
+		);
 	if (accessToken !== undefined) {
 		const durable = {
 			accessToken: current.access_token,
@@ -509,7 +519,9 @@ async function revalidateCatalogRequest(
 			currentToken !== accessToken ||
 			(latest.access_token !== currentToken && !ownsPending)
 		)
-			throw new Error("obsolete Codex catalog credentials");
+			throw new CodexCatalogRequestStopped(
+				"obsolete Codex catalog credentials",
+			);
 	}
 }
 
@@ -547,7 +559,9 @@ async function fetchLive(
 			previousToken.generation > generation &&
 			previousToken.fingerprint !== fingerprint)
 	) {
-		throw new Error("obsolete catalog credential generation");
+		throw options
+			? new CodexCatalogRequestStopped("obsolete catalog credential generation")
+			: new Error("obsolete catalog credential generation");
 	}
 	if (previousToken?.fingerprint !== fingerprint) retireOwnCatalog(account.id);
 	if (!previousToken || generation >= previousToken.generation)
@@ -625,7 +639,28 @@ export function ensureCodexModelDefaults(
 	const current = ensureInFlight.get(account.id);
 	// First-hand evidence makes refresh advisory: never hold a warm request on
 	// a stalled credential refresh or catalog fetch. Cold accounts still wait.
-	if (current) return ownListing ? Promise.resolve() : current;
+	if (current) {
+		if (ownListing) return Promise.resolve();
+		const request = requestOwnedEnsures.get(current);
+		if (!request) return current;
+		const generation = invalidationGenerationFor(account.id);
+		return current.then(() => {
+			if (
+				!request.stopped ||
+				!isCurrentInvalidationGeneration(account.id, generation) ||
+				lastGood.has(account.id) ||
+				hasDerivedProviderModelDefaults("codex", account.id)
+			)
+				return;
+			// Reacquire once under ordinary ownership, coalescing all cold waiters.
+			// Do not recursively retry a replacement that itself stops or fails.
+			const replacement = ensureInFlight.get(account.id);
+			if (replacement) return replacement;
+			const retry = ensureRetryByAccount.get(account.id);
+			if (retry && now() < retry.nextAttemptAt) return;
+			return startCodexCatalogEnsure(account, ctx, now);
+		});
+	}
 
 	const retry = ensureRetryByAccount.get(account.id);
 	if (retry && now() < retry.nextAttemptAt) return Promise.resolve();
@@ -642,6 +677,7 @@ function startCodexCatalogEnsure(
 	options?: CodexCatalogRequestOptions,
 ): Promise<void> {
 	const invalidationGeneration = invalidationGenerationFor(account.id);
+	const request = options ? { stopped: false } : undefined;
 	let onAbort = () => {};
 	const cancelled =
 		options &&
@@ -669,13 +705,17 @@ function startCodexCatalogEnsure(
 				scheduleEnsureRetry(account.id, now());
 			}
 		} catch (err) {
+			if (
+				err instanceof CodexCatalogRequestStopped ||
+				options?.signal.aborted ||
+				(options && Date.now() >= options.deadlineAt)
+			) {
+				if (request) request.stopped = true;
+				return;
+			}
 			// Never blocks the request: without a map the family falls through and
 			// the provider gets to say what it thinks, which the record then learns.
-			if (
-				!options?.signal.aborted &&
-				(!options || Date.now() < options.deadlineAt) &&
-				isCurrentInvalidationGeneration(account.id, invalidationGeneration)
-			) {
+			if (isCurrentInvalidationGeneration(account.id, invalidationGeneration)) {
 				scheduleEnsureRetry(account.id, now());
 			}
 			log.debug(`Could not load the model list for ${account.name}: ${err}`);
@@ -690,6 +730,7 @@ function startCodexCatalogEnsure(
 		}
 	});
 	ensureInFlight.set(account.id, attempt);
+	if (request) requestOwnedEnsures.set(attempt, request);
 	return attempt;
 }
 
@@ -737,7 +778,11 @@ export async function prepareCodexAutoCatalog(
 		}
 		const retry = ensureRetryByAccount.get(accountId);
 		if (retry && Date.now() < retry.nextAttemptAt) return;
-		await startCodexCatalogEnsure(account, ctx, Date.now, options);
+		const owned = startCodexCatalogEnsure(account, ctx, Date.now, options);
+		await owned;
+		// A control stop ends this owner's acquisition. Only an independent
+		// ordinary waiter may reacquire; this request must not restart on a new row.
+		if (requestOwnedEnsures.get(owned)?.stopped) return;
 		// The next pass rechecks eligibility, incarnation and credential ownership.
 	}
 }
@@ -904,8 +949,13 @@ export async function getCodexModels(
 		(options &&
 			(resolvedAccount.id !== accountId ||
 				!options.accountEligible(resolvedAccount)))
-	)
+	) {
+		if (options)
+			throw new CodexCatalogRequestStopped(
+				"obsolete or ineligible Codex catalog account",
+			);
 		return null;
+	}
 	const account = { ...resolvedAccount };
 
 	try {
@@ -983,6 +1033,7 @@ export async function getCodexModels(
 	} catch (error) {
 		// A timed-out request cannot publish even advisory fallback projections.
 		checkCatalogRequest(options);
+		if (error instanceof CodexCatalogRequestStopped) throw error;
 		const cached = readCache(accountId);
 		if (isCurrentInvalidationGeneration(accountId, invalidationGeneration)) {
 			lastRefreshFailedAt.set(accountId, Date.now());
