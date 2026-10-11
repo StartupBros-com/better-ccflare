@@ -250,7 +250,11 @@ export function getPendingCodexCatalogAcquisition(
  * attempt then awaits its own account reload and token resolution; they are
  * rechecked after each, against the freshly loaded row, immediately before any
  * GET. Callers without restrictions (stock routing, the heartbeat, manual
- * revalidation) pass none and keep their behavior.
+ * revalidation) pass none and keep their behavior, except that a cold one which
+ * joined a scoped attempt that ended without a GET acquires once on its own
+ * afterwards (see ensureDefaults). The restrictions bound catalog GETs only:
+ * token resolution performs its normal refresh and persistence, and a GET
+ * already started completes under its own timeout and the publication fences.
  */
 export interface CodexCatalogAcquisitionScope {
 	/** The request ended (abort, policy change, budget): start no new traffic. */
@@ -582,6 +586,29 @@ export function ensureCodexModelDefaults(
 	forceRevalidation = false,
 	scope?: CodexCatalogAcquisitionScope,
 ): Promise<void> {
+	return ensureDefaults(account, ctx, now, forceRevalidation, scope, true);
+}
+
+/**
+ * `recoverOnce`: whether a cold caller without restrictions that joins the
+ * account's running attempt may make one acquisition of its own after it. A
+ * request-scoped attempt can end without a GET (its request stopped, or its
+ * account became ineligible, before the GET); that typed outcome is the
+ * scoped caller's alone, so an unrestricted joiner rechecks once after the
+ * shared attempt settles and acquires only if the account is still cold with
+ * no retry pending. The recheck passes no restrictions and no further
+ * recovery, so it returns at once when the attempt hydrated the account or
+ * recorded a failure, and joins a newer attempt plainly. Scoped joiners never
+ * take it: their preparation waits on the attempt and rechecks ownership.
+ */
+function ensureDefaults(
+	account: Account | null | undefined,
+	ctx: ProxyContext,
+	now: () => number,
+	forceRevalidation: boolean,
+	scope: CodexCatalogAcquisitionScope | undefined,
+	recoverOnce: boolean,
+): Promise<void> {
 	if (account?.provider !== "codex") return Promise.resolve();
 	const invalidationGeneration = invalidationGenerationFor(account.id);
 	const ownListing = lastGood.get(account.id)?.listing;
@@ -598,7 +625,18 @@ export function ensureCodexModelDefaults(
 	const current = ensureInFlight.get(account.id);
 	// First-hand evidence makes refresh advisory: never hold a warm request on
 	// a stalled credential refresh or catalog fetch. Cold accounts still wait.
-	if (current) return ownListing ? Promise.resolve() : current;
+	if (current) {
+		if (ownListing) return Promise.resolve();
+		if (scope || !recoverOnce) return current;
+		// The running attempt is never cancelled; its outcome stands for its own
+		// caller. `current` is the registered promise, so the recheck runs after
+		// the attempt has cleared itself from the registry: joiners rechecking
+		// together start one recovery and share it. Bounded: one recheck, itself
+		// without recovery.
+		return current.then(() =>
+			ensureDefaults(account, ctx, now, forceRevalidation, undefined, false),
+		);
+	}
 
 	const retry = ensureRetryByAccount.get(account.id);
 	if (retry && now() < retry.nextAttemptAt) return Promise.resolve();

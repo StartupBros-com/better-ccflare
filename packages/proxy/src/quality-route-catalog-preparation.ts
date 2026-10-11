@@ -25,9 +25,10 @@ import {
 } from "./model-catalog";
 
 /**
- * The single request-eligibility rule for Auto catalog preparation: the queue
- * snapshot filter, the ownership shortcut and every discovery fetch share it, so
- * an account that stops being eligible while queued receives no metadata traffic.
+ * The native request-eligibility rule for Auto catalog preparation (Codex
+ * accounts have their own, below): the queue snapshot filter, the ownership
+ * shortcut and every discovery fetch share it, so an account that stops being
+ * eligible while queued is sent no new catalog GET.
  */
 export function isQualityCatalogRequestEligible(account: Account): boolean {
 	return (
@@ -298,7 +299,7 @@ async function prepareCodexAccount(
 	stopped: () => boolean,
 ): Promise<void> {
 	// The live row is reloaded at every step: deletion, a pause or a reauth
-	// flag set while queued ends preparation without metadata traffic.
+	// flag set while queued ends preparation before any new catalog GET.
 	const eligibleAccount = async (): Promise<Account | null> => {
 		const account = await ctx.dbOps.getAccount(accountId);
 		return !stopped() &&
@@ -326,7 +327,10 @@ async function prepareCodexAccount(
 	// Ensure's own reload and token resolution are awaits this request cannot
 	// see; the scope lets ensure apply the request's stop signal and the queue's
 	// eligibility rule to the row it reloads itself, before any GET. A stopped or
-	// ineligible lookup is reported as not attempted and records no failure.
+	// ineligible lookup is reported as not attempted and records no failure. The
+	// scope bounds catalog GETs only: token resolution still refreshes and
+	// persists as it normally does, and a GET already started completes under its
+	// own timeout and ensure's publication fences, for the next eligible request.
 	const scope: CodexCatalogAcquisitionScope = {
 		stopped,
 		accountEligible: isCodexCatalogRequestEligible,
@@ -466,7 +470,9 @@ export async function prepareCodexQualityCatalogs(
  * ten-second budget covering queued work for either provider, so a stalled
  * lookup on one provider neither holds the other's accounts past the budget
  * nor earns them a budget of their own. Each provider keeps its own helper's
- * contract and fences unchanged.
+ * contract and fences unchanged. `allowOAuth` is native discovery's permission
+ * only; Codex renewal resolves the account's token through its ensure path
+ * either way.
  */
 export async function prepareQualityCatalogs(
 	ctx: ProxyContext,
