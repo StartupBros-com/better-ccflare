@@ -5,6 +5,10 @@ import type {
 	QualityRequestIntent,
 	QualityRoutingPolicy,
 } from "@better-ccflare/types";
+import {
+	isCodexCatalogRefreshEligible,
+	prepareCodexAutoCatalog,
+} from "./codex-model-catalog";
 import type { ProxyContext } from "./handlers/proxy-types";
 import { getValidAccessToken } from "./handlers/token-manager";
 import {
@@ -16,7 +20,7 @@ import {
 } from "./model-catalog";
 
 /**
- * The single request-eligibility rule for Auto catalog preparation: the queue
+ * The native request-eligibility rule for Auto catalog preparation: the queue
  * snapshot filter, the ownership shortcut and every discovery fetch share it, so
  * an account that stops being eligible while queued receives no metadata traffic.
  */
@@ -35,22 +39,49 @@ export function isQualityCatalogRequestEligible(account: Account): boolean {
  * this helper, before compiling/admitting a request. OAuth remains denied unless
  * the caller explicitly opts in; enrollment itself never grants that permission.
  *
- * Deduplication is request-local. A global promise cache would conflate contexts,
- * credential epochs and callers' cancellation/permission. Discovery retains its
- * existing fresh-account, generation and ownership fences; this helper never
- * manufactures evidence or serializes ownership. Failure/timeout leaves normal
- * compilation to report its existing bounded evidence reasons.
+ * Queue deduplication is request-local. Native discovery retains its existing
+ * ownership fences; Codex joins its existing shared ensure only as a wait signal
+ * and revalidates credentials afterward. This helper never manufactures evidence
+ * or serializes ownership. Failure/timeout leaves normal compilation to report
+ * its existing bounded evidence reasons.
  */
-export async function prepareNativeQualityCatalogs(
+interface QualityCatalogPreparationOptions {
+	signal: AbortSignal;
+	allowOAuth?: boolean;
+	conversation?: QualityConversation | null;
+}
+
+/** Preserve native-only discovery for existing callers. */
+export function prepareNativeQualityCatalogs(
 	ctx: ProxyContext,
 	policy: QualityRoutingPolicy,
 	intent: QualityRequestIntent,
 	accounts: readonly Account[],
-	options: {
-		signal: AbortSignal;
-		allowOAuth?: boolean;
-		conversation?: QualityConversation | null;
-	},
+	options: QualityCatalogPreparationOptions,
+): Promise<void> {
+	return prepareCatalogs(ctx, policy, intent, accounts, options, false);
+}
+
+/** One lane-ordered, queue-inclusive budget for accepted Auto requests. */
+export function prepareQualityCatalogs(
+	ctx: ProxyContext,
+	policy: QualityRoutingPolicy,
+	intent: QualityRequestIntent,
+	accounts: readonly Account[],
+	options: QualityCatalogPreparationOptions,
+): Promise<void> {
+	if (process.env.BETTER_CCFLARE_MODELS_OFFLINE === "1")
+		return Promise.resolve();
+	return prepareCatalogs(ctx, policy, intent, accounts, options, true);
+}
+
+async function prepareCatalogs(
+	ctx: ProxyContext,
+	policy: QualityRoutingPolicy,
+	intent: QualityRequestIntent,
+	accounts: readonly Account[],
+	options: QualityCatalogPreparationOptions,
+	includeCodex: boolean,
 ): Promise<void> {
 	const policyCurrent = () =>
 		ctx.config.getQualityRoutingPolicy?.()?.revision === policy.revision;
@@ -76,6 +107,29 @@ export async function prepareNativeQualityCatalogs(
 			intent.kind === "main"
 				? policy.mainLadders[intent.preference]
 				: policy.workerLanes[intent.role];
+		const codexEligible = (account: Account) =>
+			includeCodex &&
+			options.allowOAuth === true &&
+			policyCurrent() &&
+			isCodexCatalogRefreshEligible(account) &&
+			isAccountAvailable(account) &&
+			policy.accounts.some(
+				(enrollment) =>
+					enrollment.accountId === account.id &&
+					enrollment.provider === "codex" &&
+					lanes.some((lane) =>
+						policy.lanes[lane].some(
+							(line) =>
+								line.startsWith("gpt-") &&
+								enrollment.lines.includes(line) &&
+								policy.assignments.some(
+									(a) => a.line === line && a.lane === lane,
+								),
+						),
+					),
+			);
+		const eligible = (account: Account) =>
+			isQualityCatalogRequestEligible(account) || codexEligible(account);
 		const seen = new Set<string>();
 		const queue: string[] = [];
 		// A valid persisted home is compiled first, so reacquire it first: owned
@@ -89,7 +143,7 @@ export async function prepareNativeQualityCatalogs(
 			);
 			if (
 				homeAccount &&
-				isQualityCatalogRequestEligible(homeAccount) &&
+				eligible(homeAccount) &&
 				lanes.includes(home.target.lane) &&
 				policy.lanes[home.target.lane].includes(home.target.line) &&
 				policy.accounts.some(
@@ -107,19 +161,21 @@ export async function prepareNativeQualityCatalogs(
 		for (const lane of lanes) {
 			for (const line of policy.lanes[lane]) {
 				if (
-					!line.startsWith("claude-") ||
+					(!line.startsWith("claude-") &&
+						!(includeCodex && line.startsWith("gpt-"))) ||
 					!policy.assignments.some((a) => a.line === line && a.lane === lane)
 				)
 					continue;
+				const provider = line.startsWith("claude-") ? "anthropic" : "codex";
 				const enrolled = policy.accounts
-					.filter((e) => e.provider === "anthropic" && e.lines.includes(line))
+					.filter((e) => e.provider === provider && e.lines.includes(line))
 					.flatMap((enrollment) => {
 						const account = accounts.find(
 							(a) =>
 								a.id === enrollment.accountId &&
 								a.provider === enrollment.provider,
 						);
-						return account && isQualityCatalogRequestEligible(account)
+						return account && eligible(account)
 							? [{ account, enrollment }]
 							: [];
 					})
@@ -182,6 +238,17 @@ export async function prepareNativeQualityCatalogs(
 		// A newer lookup for the same account superseded ours: wait for it and
 		// recheck ownership instead of giving up. Bounded; other errors are final.
 		const prepare = async (accountId: string) => {
+			if (
+				accounts.find((account) => account.id === accountId)?.provider ===
+				"codex"
+			) {
+				await prepareCodexAutoCatalog(accountId, ctx, {
+					signal: controller.signal,
+					deadlineAt: deadline,
+					accountEligible: codexEligible,
+				});
+				return;
+			}
 			for (let attempt = 0; attempt < 3 && !stopped(); attempt++) {
 				try {
 					await prepareOnce(accountId);
