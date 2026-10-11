@@ -231,6 +231,18 @@ const lastCatalogRoleRouteReportAt = new Map<string, number>();
 
 /** One best-effort listing request per account at a time. */
 const ensureInFlight = new Map<string, Promise<void>>();
+
+/**
+ * The account's running ensure attempt, if any: a wait signal only. Its
+ * completion proves nothing about ownership, which the caller rechecks against
+ * its own resolved credential. Warm callers of ensureCodexModelDefaults return
+ * before the refresh finishes; this lets a bounded caller wait for it instead.
+ */
+export function getPendingCodexCatalogAcquisition(
+	accountId: string,
+): Promise<void> | undefined {
+	return ensureInFlight.get(accountId);
+}
 const unknownRevalidationAt = new Map<string, number>();
 const UNKNOWN_REVALIDATION_COOLDOWN_MS = 60_000;
 
