@@ -252,19 +252,20 @@ export function getPendingCodexCatalogAcquisition(
  * GET. Callers without restrictions (stock routing, the heartbeat, manual
  * revalidation) pass none and keep their behavior, except that a cold one which
  * joined a scoped attempt that ended without a GET acquires once on its own
- * afterwards (see ensureDefaults). The restrictions bound catalog GETs only:
+ * afterwards, under eligibility-only restrictions of its own (see
+ * ensureDefaults). The restrictions bound catalog GETs only:
  * token resolution performs its normal refresh and persistence, and a GET
  * already started completes under its own timeout and the publication fences.
  */
 export interface CodexCatalogAcquisitionScope {
-	/** The request ended (abort, policy change, budget): start no new traffic. */
+	/** The request ended (abort, policy change, budget): start no new catalog GET. */
 	stopped(): boolean;
-	/** Whether the freshly reloaded row may still receive metadata traffic. */
+	/** Whether the freshly reloaded row may still receive a catalog GET. */
 	accountEligible(account: Account): boolean;
 }
 
 /**
- * The attempt started no traffic because its scope ended, or its account
+ * The attempt sent no catalog GET because its scope ended, or its account
  * stopped being eligible, before the GET. A control outcome, not a failure: it
  * records no refresh failure and schedules no retry backoff, so a later
  * eligible caller acquires at once under its own restrictions. It never
@@ -596,10 +597,14 @@ export function ensureCodexModelDefaults(
  * account became ineligible, before the GET); that typed outcome is the
  * scoped caller's alone, so an unrestricted joiner rechecks once after the
  * shared attempt settles and acquires only if the account is still cold with
- * no retry pending. The recheck passes no restrictions and no further
- * recovery, so it returns at once when the attempt hydrated the account or
- * recorded a failure, and joins a newer attempt plainly. Scoped joiners never
- * take it: their preparation waits on the attempt and rechecks ownership.
+ * no retry pending. The recheck is not forced and makes no further recovery;
+ * it carries eligibility-only restrictions (the joiner's account incarnation
+ * and the refresh-eligibility rule), never the starter's request stop. So it
+ * returns at once when the attempt hydrated the account or recorded a failure,
+ * joins a newer attempt plainly, and sends no GET to an account that was
+ * paused, flagged for reauth, moved to a custom endpoint or another provider,
+ * deleted or replaced meanwhile. Scoped joiners never take it: their
+ * preparation waits on the attempt and rechecks ownership.
  */
 function ensureDefaults(
 	account: Account | null | undefined,
@@ -631,11 +636,28 @@ function ensureDefaults(
 		// The running attempt is never cancelled; its outcome stands for its own
 		// caller. `current` is the registered promise, so the recheck runs after
 		// the attempt has cleared itself from the registry: joiners rechecking
-		// together start one recovery and share it. Bounded: one recheck, itself
-		// without recovery.
-		return current.then(() =>
-			ensureDefaults(account, ctx, now, forceRevalidation, undefined, false),
-		);
+		// together start one recovery and share it. The recovery is bounded (one
+		// recheck, no further recovery) and not forced, and it inherits no
+		// request stop. It carries restrictions of its own that only bound
+		// eligibility: this joiner's account incarnation (deletion generation
+		// and created_at) and the refresh-eligibility rule, rechecked like any
+		// scope after its reload and its token resolution, before any GET. A
+		// deleted or replaced account is skipped outright.
+		const recovery: CodexCatalogAcquisitionScope = {
+			stopped: () => false,
+			accountEligible: (fresh) =>
+				isCurrentInvalidationGeneration(account.id, invalidationGeneration) &&
+				fresh.created_at === account.created_at &&
+				isCodexCatalogRefreshEligible(fresh),
+		};
+		return current.then(() => {
+			if (
+				!isCurrentInvalidationGeneration(account.id, invalidationGeneration)
+			) {
+				return Promise.resolve();
+			}
+			return ensureDefaults(account, ctx, now, false, recovery, false);
+		});
 	}
 
 	const retry = ensureRetryByAccount.get(account.id);
