@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { compileQualityRoutingPolicy } from "@better-ccflare/core";
 import type { Account, QualityRoutingPolicy } from "@better-ccflare/types";
+import type { CodexCatalogAcquisitionScope } from "../codex-model-catalog";
 import * as codexCatalog from "../codex-model-catalog";
 import type { ProxyContext } from "../handlers/proxy-types";
 import * as modelCatalog from "../model-catalog";
@@ -18,6 +19,9 @@ const pendingFor = new Map<string, Promise<void>>();
 // their force flag, the ensure behavior, and in-flight acquisitions.
 const codexFresh = new Map<string, { apiKey: string; createdAt: number }>();
 const ensures: { accountId: string; force: boolean }[] = [];
+// The request-scoped restrictions each ensure call carried (undefined when the
+// caller passed none), in call order.
+const scopes: (CodexCatalogAcquisitionScope | undefined)[] = [];
 let ensureRun: (accountId: string) => Promise<void>;
 const codexPendingFor = new Map<string, Promise<void>>();
 // Scoped spies, not mock.module: a module mock has no per-file isolation, so a
@@ -46,8 +50,10 @@ const spies = [
 		_ctx: unknown,
 		_now: unknown,
 		force: boolean,
+		scope: CodexCatalogAcquisitionScope | undefined,
 	) => {
 		ensures.push({ accountId: account.id, force });
+		scopes.push(scope);
 		return ensureRun(account.id);
 	}) as never),
 	spyOn(modelCatalog, "getNativeAutoCatalogEvidence").mockImplementation(
@@ -282,6 +288,7 @@ beforeEach(() => {
 	discover = async () => {};
 	codexFresh.clear();
 	ensures.length = 0;
+	scopes.length = 0;
 	codexPendingFor.clear();
 	ensureRun = async () => {};
 });
@@ -1223,6 +1230,82 @@ describe("Codex quality catalog preparation (metadata mocks only)", () => {
 			await run;
 			expect(ensures).toHaveLength(0);
 		});
+		test("an acquisition started during the request's own reload is waited on and rechecked, not duplicated", async () => {
+			const p = codexPolicy(["a"]);
+			const ctx = codexContext(p);
+			let started = false;
+			let release = () => {};
+			// Another caller's acquisition lands while this request's eligibility
+			// reload is in flight: the reload resolves to an eligible row, but the
+			// pending wait signal now exists and must be honoured before any ensure.
+			ctx.dbOps.getAccount = async (id: string) => {
+				if (!started) {
+					started = true;
+					release = inFlight("a", true);
+				}
+				return codexAccount(id);
+			};
+			let done = false;
+			const run = prepareCodexQualityCatalogs(
+				ctx,
+				p,
+				intent,
+				[codexAccount("a")],
+				options(),
+			).then(() => {
+				done = true;
+			});
+			await settle(10);
+			expect(started).toBe(true);
+			expect(done).toBe(false);
+			expect(ensures).toHaveLength(0);
+			release();
+			await run;
+			expect(ensures).toHaveLength(0);
+		});
+	});
+	test("ensure receives the request's own scope: fresh-row eligibility and the shared stop signal", async () => {
+		const p = codexPolicy(["a"]);
+		let current = p;
+		const ctx = {
+			config: { getQualityRoutingPolicy: () => current },
+			dbOps: { getAccount: async (id: string) => codexAccount(id) },
+		} as unknown as ProxyContext;
+		const controller = new AbortController();
+		ensureRun = () => new Promise(() => {});
+		const pending = prepareCodexQualityCatalogs(
+			ctx,
+			p,
+			intent,
+			[codexAccount("a")],
+			{ signal: controller.signal },
+		);
+		await settle();
+		expect(ensures).toEqual([{ accountId: "a", force: false }]);
+		const scope = scopes[0];
+		expect(scope).toBeDefined();
+		if (!scope) throw new Error("ensure was called without a request scope");
+		// The eligibility rule is the queue's own: the same flags that exclude an
+		// account from the queue exclude it at the pre-GET boundary.
+		expect(scope.accountEligible(codexAccount("a"))).toBe(true);
+		for (const extra of [
+			{ paused: true },
+			{ requires_reauth: true },
+			{ rate_limited_until: Date.now() + 60_000 },
+			{ custom_endpoint: "https://invalid.example" },
+			{ provider: "anthropic" },
+		] as const) {
+			expect(scope.accountEligible(codexAccount("a", extra))).toBe(false);
+		}
+		// The stop signal is the runner's: policy change and caller abort both end it.
+		expect(scope.stopped()).toBe(false);
+		current = { ...p, revision: "quality-policy-v1:changed" };
+		expect(scope.stopped()).toBe(true);
+		current = p;
+		expect(scope.stopped()).toBe(false);
+		controller.abort();
+		expect(scope.stopped()).toBe(true);
+		await pending;
 	});
 	test.each([
 		["deleted", null],

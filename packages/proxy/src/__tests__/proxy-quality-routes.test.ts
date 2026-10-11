@@ -30,8 +30,10 @@ import {
 	clearCodexModelCacheForTests,
 	getCodexAutoCatalogEvidence,
 	getCodexModels,
+	getPendingCodexCatalogAcquisition,
 } from "../codex-model-catalog";
 import type { ProxyContext } from "../handlers/proxy-types";
+import * as tokenManager from "../handlers/token-manager";
 import {
 	clearNativeAutoCatalogEvidence,
 	fetchLiveModels,
@@ -4501,6 +4503,355 @@ describe("prewarmed native catalogs", () => {
 			expect(gets.count).toBe(0);
 			expect(sends).toHaveLength(0);
 			expect(getCodexAutoCatalogEvidence("c", true)).toBe(expired);
+		});
+
+		it("renewal cannot authorize paid usage: without an operator spend grant the renewed catalog is still refused as spend-not-authorized", async () => {
+			enrollCodex("gpt-astra", "astra");
+			// Derived from the evaluator (handlers/usage-throttling.ts): a Codex lane
+			// is admitted only on an operator-approved outside-subscription grant for
+			// this account and line, or on owned no-credit proof; the passive
+			// spend/extra_usage fields are read for anthropic only. Same enrollment,
+			// grant withdrawn.
+			const granted = ctx.config.getQualityRoutingPolicy();
+			if (!granted) throw new Error("Missing policy fixture");
+			const ungranted = compileQualityRoutingPolicy({
+				version: granted.version,
+				fallbacks: granted.fallbacks,
+				assignments: granted.assignments,
+				accounts: granted.accounts,
+				spendGrants: [],
+			});
+			ctx.config.getQualityRoutingPolicy = () => ungranted;
+			capacity((id) => (id === "c" ? 10 : 100));
+			upstream = codexCompletion;
+			const expired = await acquireExpiredCodexEvidence();
+			const snapshot = structuredClone(usageCache.getSnapshot("c")?.data);
+			const gets = codexCatalogGets();
+			await unavailable(await send());
+			await flush();
+			// The catalog was renewed (metadata only) and bought nothing.
+			expect(gets.count).toBe(1);
+			expect(sends).toHaveLength(0);
+			const renewed = getCodexAutoCatalogEvidence("c");
+			expect(renewed).not.toBeNull();
+			expect(renewed).not.toBe(expired);
+			expect(await skippedLanes()).toEqual([
+				nativeExhausted,
+				{ lane: "astra", reasons: { "spend-not-authorized": 1 } },
+				opusExhausted,
+			]);
+			expect(ctx.config.getQualityRoutingPolicy()?.spendGrants).toEqual([]);
+			expect(usageCache.getSnapshot("c")?.data).toEqual(snapshot);
+		});
+
+		describe("one bounded preparation across native and Codex accounts", () => {
+			/** Records each catalog GET's start (credential, or "codex") and the overlap peak. */
+			function overlappingCatalogGets(holdMs: number) {
+				const transport = globalThis.fetch;
+				const record = { starts: [] as string[], inFlight: 0, peak: 0 };
+				globalThis.fetch = Object.assign(
+					async (input: RequestInfo | URL, init?: RequestInit) => {
+						const req =
+							input instanceof Request ? input : new Request(input, init);
+						if (req.method !== "GET") return transport(input, init);
+						record.starts.push(
+							new URL(req.url).pathname === codexCatalogPath
+								? "codex"
+								: (req.headers.get("x-api-key") ?? ""),
+						);
+						record.inFlight += 1;
+						record.peak = Math.max(record.peak, record.inFlight);
+						try {
+							await new Promise((resolve) => setTimeout(resolve, holdMs));
+							return await transport(input, init);
+						} finally {
+							record.inFlight -= 1;
+						}
+					},
+					{ preconnect: () => {} },
+				) as typeof fetch;
+				return record;
+			}
+
+			it("prepares native and Codex catalogs through one queue of two workers in ladder order", async () => {
+				enrollCodex("gpt-astra", "astra");
+				capacity((id) => (id === "c" ? 10 : 100));
+				upstream = codexCompletion;
+				const expired = await acquireExpiredCodexEvidence();
+				// Three accounts owe metadata: a and b (fable, first in the ladder) and
+				// c (astra). Two helpers with two workers each would start all three.
+				clearNativeAutoCatalogEvidence("a");
+				clearNativeAutoCatalogEvidence("b");
+				const gets = overlappingCatalogGets(20);
+				const response = await send();
+				expect({
+					status: response.status,
+					error: response.ok ? null : await response.clone().text(),
+				}).toMatchObject({ status: 200 });
+				await response.text();
+				await flush();
+				expect(gets.starts).toHaveLength(3);
+				expect(gets.starts.slice(0, 2).sort()).toEqual([
+					"synthetic-a",
+					"synthetic-b",
+				]);
+				expect(gets.starts[2]).toBe("codex");
+				expect(gets.peak).toBe(2);
+				expect(sends.map((s) => s.model)).toEqual(["gpt-6-astra"]);
+				expect(getCodexAutoCatalogEvidence("c")?.revision).toBe(
+					expired.revision,
+				);
+			});
+		});
+
+		// The outer eligibility and stop checks pass, then ensure's own account
+		// reload and token resolution are awaited before the GET. A stop or an
+		// account change landing in that window must still prevent new metadata
+		// traffic, without recording a failure that would back off the next
+		// eligible request; a GET already started is never cancelled.
+		describe("request-scoped stop before new Codex metadata traffic", () => {
+			/**
+			 * Holds ensure's own account reload: the first lookup of "c" issued under
+			 * the request's pending acquisition. ensure registers that attempt right
+			 * after issuing the reload, hence the initial yield.
+			 */
+			function holdAcquisitionReload() {
+				const getAccount = ctx.dbOps.getAccount;
+				let held = false;
+				let release!: () => void;
+				let onHeld!: () => void;
+				const heldPromise = new Promise<void>((resolve) => {
+					onHeld = resolve;
+				});
+				const released = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				ctx.dbOps.getAccount = async (id: string) => {
+					await undefined;
+					if (id === "c" && !held && getPendingCodexCatalogAcquisition("c")) {
+						held = true;
+						onHeld();
+						await released;
+					}
+					return getAccount(id);
+				};
+				return { heldPromise, release, wasHeld: () => held };
+			}
+			/** Same for the acquisition's own token resolution, after that reload. */
+			function holdAcquisitionToken() {
+				const original = tokenManager.getValidAccessToken;
+				let held = false;
+				let release!: () => void;
+				let onHeld!: () => void;
+				const heldPromise = new Promise<void>((resolve) => {
+					onHeld = resolve;
+				});
+				const released = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				const spy = spyOn(
+					tokenManager,
+					"getValidAccessToken",
+				).mockImplementation(async (account, context) => {
+					if (
+						account.id === "c" &&
+						!held &&
+						getPendingCodexCatalogAcquisition("c")
+					) {
+						held = true;
+						onHeld();
+						await released;
+					}
+					return original(account, context);
+				});
+				restores.push(() => spy.mockRestore());
+				return { heldPromise, release, wasHeld: () => held };
+			}
+			/** A later unrestricted request acquires at once: no backoff was recorded. */
+			async function expectEligibleRenewal(gets: { count: number }) {
+				const before = gets.count;
+				const response = await send();
+				expect({
+					status: response.status,
+					error: response.ok ? null : await response.clone().text(),
+				}).toMatchObject({ status: 200 });
+				await response.text();
+				await flush();
+				expect(gets.count).toBe(before + 1);
+				expect(sends.at(-1)?.model).toBe("gpt-6-astra");
+				expect(getCodexAutoCatalogEvidence("c")).not.toBeNull();
+			}
+
+			it.each([
+				["request abort", "request-aborted"],
+				["policy change", "changed-admission"],
+				["budget deadline", "catalog-evidence-stale"],
+			])("%s after the acquisition's own reload: no GET, old evidence kept, no backoff", async (cause, reason) => {
+				enrollCodex("gpt-astra", "astra");
+				const policy = ctx.config.getQualityRoutingPolicy();
+				if (!policy) throw new Error("Missing policy fixture");
+				capacity((id) => (id === "c" ? 10 : 100));
+				upstream = codexCompletion;
+				const expired = await acquireExpiredCodexEvidence();
+				const gets = codexCatalogGets();
+				const hold = holdAcquisitionReload();
+				const abort = new AbortController();
+				const pending = send(new Request(request(), { signal: abort.signal }));
+				await hold.heldPromise;
+				let revert = () => {};
+				let observed: string;
+				try {
+					if (cause === "request abort") abort.abort();
+					else if (cause === "policy change") {
+						ctx.config.getQualityRoutingPolicy = () => ({
+							...policy,
+							revision: `${policy.revision}:changed`,
+						});
+						revert = () => {
+							ctx.config.getQualityRoutingPolicy = () => policy;
+						};
+					} else {
+						const clock = spyOn(Date, "now").mockReturnValue(
+							Date.now() + 11_000,
+						);
+						revert = () => clock.mockRestore();
+					}
+					hold.release();
+					observed = await unavailable(await pending);
+					await flush();
+				} finally {
+					revert();
+				}
+				expect(observed).toBe(reason);
+				expect(hold.wasHeld()).toBe(true);
+				expect(gets.count).toBe(0);
+				expect(sends).toHaveLength(0);
+				expect(getCodexAutoCatalogEvidence("c", true)).toBe(expired);
+				await expectEligibleRenewal(gets);
+			});
+
+			it.each([
+				["paused", { paused: true }],
+				["requires_reauth", { requires_reauth: true }],
+				["custom_endpoint", { custom_endpoint: "https://invalid.example" }],
+				["provider", { provider: "anthropic" }],
+			] as const)("%s change landing in the acquisition's own reload: no GET, evidence untouched, no backoff", async (_label, change) => {
+				enrollCodex("gpt-astra", "astra");
+				capacity((id) => (id === "c" ? 10 : 100));
+				upstream = codexCompletion;
+				const expired = await acquireExpiredCodexEvidence();
+				const before = accounts;
+				const gets = codexCatalogGets();
+				const hold = holdAcquisitionReload();
+				const pending = send();
+				await hold.heldPromise;
+				accounts = before.map((a) => (a.id === "c" ? { ...a, ...change } : a));
+				hold.release();
+				await unavailable(await pending);
+				await flush();
+				expect(hold.wasHeld()).toBe(true);
+				expect(gets.count).toBe(0);
+				expect(sends).toHaveLength(0);
+				expect(getCodexAutoCatalogEvidence("c", true)).toBe(expired);
+				accounts = before;
+				await expectEligibleRenewal(gets);
+			});
+
+			it("requires_reauth landing in the acquisition's own token resolution: no GET, evidence untouched, no backoff", async () => {
+				enrollCodex("gpt-astra", "astra");
+				capacity((id) => (id === "c" ? 10 : 100));
+				upstream = codexCompletion;
+				const expired = await acquireExpiredCodexEvidence();
+				const before = accounts;
+				const gets = codexCatalogGets();
+				const hold = holdAcquisitionToken();
+				const pending = send();
+				await hold.heldPromise;
+				accounts = before.map((a) =>
+					a.id === "c" ? { ...a, requires_reauth: true } : a,
+				);
+				hold.release();
+				await unavailable(await pending);
+				await flush();
+				expect(hold.wasHeld()).toBe(true);
+				expect(gets.count).toBe(0);
+				expect(sends).toHaveLength(0);
+				expect(getCodexAutoCatalogEvidence("c", true)).toBe(expired);
+				accounts = before;
+				await expectEligibleRenewal(gets);
+			});
+
+			it("a waiter's abort never cancels another request's running acquisition", async () => {
+				enrollCodex("gpt-astra", "astra");
+				capacity((id) => (id === "c" ? 10 : 100));
+				upstream = codexCompletion;
+				const expired = await acquireExpiredCodexEvidence();
+				const gets = codexCatalogGets({ holdMs: 80 });
+				const first = send(
+					request("claude-bccf-quality-auto", {
+						"x-claude-code-session-id": "s1",
+					}),
+				);
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				expect(gets.count).toBe(1);
+				const abort = new AbortController();
+				const second = send(
+					new Request(
+						request("claude-bccf-quality-auto", {
+							"x-claude-code-session-id": "s2",
+						}),
+						{ signal: abort.signal },
+					),
+				);
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				abort.abort();
+				expect(await unavailable(await second)).toBe("request-aborted");
+				const response = await first;
+				expect(response.status).toBe(200);
+				await response.text();
+				await flush();
+				expect(gets.count).toBe(1);
+				expect(sends.map((s) => s.model)).toEqual(["gpt-6-astra"]);
+				const renewed = getCodexAutoCatalogEvidence("c");
+				expect(renewed).not.toBeNull();
+				expect(renewed?.revision).toBe(expired.revision);
+				const third = await send(
+					request("claude-bccf-quality-auto", {
+						"x-claude-code-session-id": "s3",
+					}),
+				);
+				expect(third.status).toBe(200);
+				await third.text();
+				await flush();
+				expect(gets.count).toBe(1);
+				expect(getCodexAutoCatalogEvidence("c")).toBe(renewed);
+			});
+
+			it("an abort after the request's own GET started does not cancel it; the listing lands for the next request", async () => {
+				enrollCodex("gpt-astra", "astra");
+				capacity((id) => (id === "c" ? 10 : 100));
+				upstream = codexCompletion;
+				const expired = await acquireExpiredCodexEvidence();
+				const gets = codexCatalogGets({ holdMs: 80 });
+				const abort = new AbortController();
+				const first = send(new Request(request(), { signal: abort.signal }));
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				expect(gets.count).toBe(1);
+				abort.abort();
+				expect(await unavailable(await first)).toBe("request-aborted");
+				expect(sends).toHaveLength(0);
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				await flush();
+				const renewed = getCodexAutoCatalogEvidence("c");
+				expect(renewed).not.toBeNull();
+				expect(renewed?.revision).toBe(expired.revision);
+				const response = await send();
+				expect(response.status).toBe(200);
+				await response.text();
+				await flush();
+				expect(gets.count).toBe(1);
+				expect(sends.map((s) => s.model)).toEqual(["gpt-6-astra"]);
+			});
 		});
 	});
 
