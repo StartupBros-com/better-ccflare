@@ -20,7 +20,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { Config } from "@better-ccflare/config";
-import { authFailureEvents } from "@better-ccflare/core";
+import { alertEvents, authFailureEvents } from "@better-ccflare/core";
 import { BunSqlAdapter, ensureSchema } from "@better-ccflare/database";
 import { logBus } from "@better-ccflare/logger";
 import type { AlertEvent, AlertType, LogEvent } from "@better-ccflare/types";
@@ -29,6 +29,7 @@ import {
 	buildDiscordAlertContent,
 	buildDiscordWebhookBody,
 	deliverAlertWebhook,
+	isAlertAllowedForWebhook,
 	isAlertTypeAllowedForWebhook,
 	isDiscordWebhookUrl,
 	truncateToCodepoints,
@@ -108,18 +109,41 @@ describe("isDiscordWebhookUrl", () => {
 });
 
 describe("buildDiscordAlertContent / buildDiscordWebhookBody", () => {
-	it("renders severity + type + title bold on the first line, then message, then details", () => {
+	it("renders affected thing, observation, unknown impact, action and evidence without raw numerical details", () => {
 		const content = buildDiscordAlertContent(BASE_ALERT);
 		const lines = content.split("\n");
 		expect(lines[0]).toContain("**");
 		expect(lines[0]).toContain("WARNING");
-		expect(lines[0]).toContain("usage_window_threshold");
-		expect(lines[0]).toContain("Usage window nearing capacity");
-		expect(content).toContain(BASE_ALERT.message);
+		expect(lines[0]).toContain("capacity");
+		expect(content).not.toContain(BASE_ALERT.message);
 		expect(content).toContain("acct-1");
 		expect(content).toContain("claude-opus-4-8");
-		expect(content).toContain("92");
-		expect(content).toContain("80");
+		expect(content).toContain("Impact:");
+		expect(content).toContain("unknown");
+		expect(content).toContain("Action:");
+		expect(content).toContain("Evidence:");
+		expect(content).not.toContain("92");
+		expect(content).not.toContain("80");
+	});
+
+	it("regression #471: confirmed exhausted capacity is not rendered as a projection", () => {
+		const content = buildDiscordAlertContent({
+			...BASE_ALERT,
+			type: "usage_window_exhaustion_projected",
+			value: 100,
+			severity: "critical",
+		});
+		expect(content).toContain("fully exhausted");
+		expect(content).not.toContain("projected");
+		expect(content).toContain("fallback");
+	});
+
+	it("regression #471: bounded account labels never split Unicode surrogate pairs", () => {
+		const content = buildDiscordAlertContent({
+			...BASE_ALERT,
+			account: `${"a".repeat(159)}\u{1F600}suffix`,
+		});
+		expect(hasUnpairedSurrogate(content)).toBe(false);
 	});
 
 	it("omits account/model/value lines when the alert doesn't carry them", () => {
@@ -201,6 +225,117 @@ describe("isAlertTypeAllowedForWebhook", () => {
 	});
 });
 
+describe("human webhook admission", () => {
+	const discord = "https://discord.com/api/webhooks/1/test";
+	it("preserves exact explicit opt-in and generic legacy admission for observations", () => {
+		for (const type of [
+			"cache_efficiency_low",
+			"cache_efficiency_critical",
+			"cache_efficiency_recovered",
+			"model_routing_drift",
+		] as const) {
+			const alert: AlertEvent = {
+				...BASE_ALERT,
+				type,
+				id: "model_routing_drift:unknown_model:opus:1",
+			};
+			expect(isAlertAllowedForWebhook(alert, discord, [type])).toBe(true);
+			expect(isAlertAllowedForWebhook(alert, discord, ["auth_failure"])).toBe(
+				false,
+			);
+			expect(
+				isAlertAllowedForWebhook(alert, "https://example.com/hook", []),
+			).toBe(true);
+		}
+	});
+	it("classifies independent telemetry recovery from metadata and the legacy structured ID, never from titles", () => {
+		const recovered: AlertEvent = {
+			...BASE_ALERT,
+			type: "cache_efficiency_recovered",
+			title: "Unknown model requested",
+			id: JSON.stringify([
+				"cache-health",
+				"scope",
+				"telemetry",
+				1,
+				"recovered",
+				1,
+			]),
+		};
+		expect(isAlertAllowedForWebhook(recovered, discord, [])).toBe(true);
+		expect(
+			isAlertAllowedForWebhook(
+				{
+					...recovered,
+					id: "new-id",
+					classification: { reason: "cache_telemetry", phase: "recovered" },
+				},
+				discord,
+				[],
+			),
+		).toBe(true);
+		expect(
+			isAlertAllowedForWebhook(
+				{
+					...recovered,
+					classification: { reason: "cache_efficiency", phase: "recovered" },
+				},
+				discord,
+				[],
+			),
+		).toBe(false);
+		expect(
+			isAlertAllowedForWebhook(
+				{
+					...BASE_ALERT,
+					type: "model_routing_drift",
+					title: "Unknown model requested",
+					id: "model_routing_drift:stale_policy:opus:1",
+				},
+				discord,
+				[],
+			),
+		).toBe(true);
+		expect(
+			isAlertAllowedForWebhook(
+				{
+					...BASE_ALERT,
+					type: "model_routing_drift",
+					id: "new-observation-id",
+					classification: { reason: "unknown_model" },
+				},
+				discord,
+				[],
+			),
+		).toBe(false);
+		expect(
+			isAlertAllowedForWebhook(
+				{
+					...BASE_ALERT,
+					type: "model_routing_drift",
+					id: "unclassified-legacy",
+				},
+				discord,
+				[],
+			),
+		).toBe(true);
+	});
+	it("keeps UUIDs, floats, raw token tables and accidental mentions out of human content", () => {
+		const body = buildDiscordWebhookBody({
+			...BASE_ALERT,
+			account: "550e8400-e29b-41d4-a716-446655440000 @everyone @here",
+			message: "input_tokens: 123456; reuse 0.123456789",
+			value: 0.123456789,
+		});
+		expect(body.content).not.toContain("550e8400");
+		expect(body.content).not.toContain("0.123456789");
+		expect(body.content).not.toContain("input_tokens");
+		expect(body.content).not.toContain("@everyone");
+		expect(body.content).not.toContain("@here");
+		expect(body.allowed_mentions).toEqual({ parse: [] });
+	});
+});
+
 describe("deliverAlertWebhook", () => {
 	let originalFetch: typeof globalThis.fetch;
 
@@ -248,6 +383,22 @@ describe("deliverAlertWebhook", () => {
 		expect(headers.get("User-Agent")).toBe("better-ccflare-alerts/1.0");
 		const parsed = JSON.parse(String(init.body));
 		expect(parsed).toEqual({ type: "alert", alert: BASE_ALERT });
+	});
+
+	it("publication classification never changes the generic webhook body", async () => {
+		const fetchMock = mock(
+			async () => new Response(null, { status: 204 }),
+		) as unknown as typeof fetch;
+		globalThis.fetch = fetchMock;
+		await deliverAlertWebhook("https://example.com/hook", {
+			...BASE_ALERT,
+			classification: { reason: "unknown_model" },
+		});
+		const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+		expect(JSON.parse(String(init.body))).toEqual({
+			type: "alert",
+			alert: BASE_ALERT,
+		});
 	});
 
 	it("logs a warning with the status code on a non-2xx response, without leaking the URL, and never throws", async () => {
@@ -376,6 +527,164 @@ describe("AlertService webhook wiring (end-to-end)", () => {
 		sqlite.close();
 	});
 
+	it("regression #471: replayed cache efficiency and unknown catalog chatter stays in history and SSE without default Discord delivery", async () => {
+		const fetchMock = mock(
+			async () => new Response(null, { status: 204 }),
+		) as unknown as typeof fetch;
+		globalThis.fetch = fetchMock;
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		const published: AlertEvent[] = [];
+		const listener = (event: { payload: AlertEvent }) =>
+			published.push(event.payload);
+		alertEvents.on("event", listener);
+		try {
+			const observations: AlertEvent[] = [
+				...(
+					[
+						"cache_efficiency_low",
+						"cache_efficiency_critical",
+						"cache_efficiency_recovered",
+					] as const
+				).map((type) => ({
+					...BASE_ALERT,
+					type,
+					id: `${type}:efficiency:observation-1`,
+				})),
+				{
+					...BASE_ALERT,
+					type: "model_routing_drift",
+					id: "model_routing_drift:unknown_model:opus:1",
+				},
+			];
+			for (const observation of observations) {
+				for (const id of [
+					observation.id,
+					observation.id,
+					`${observation.id}:new-run`,
+					`${observation.id}:next-cooldown`,
+				]) {
+					await (
+						service as unknown as {
+							persistAndEmit: (alert: AlertEvent, url: string) => Promise<void>;
+						}
+					).persistAndEmit(
+						{ ...observation, id },
+						makeConfig().getAlertWebhookUrl(),
+					);
+				}
+			}
+			expect((await service.listAlerts()).length).toBe(12);
+			expect(published.length).toBe(12);
+			expect(fetchMock).toHaveBeenCalledTimes(0);
+		} finally {
+			alertEvents.off("event", listener);
+		}
+	});
+
+	it("still delivers auth, capacity, stale rewrites and independent monitoring gaps and recovery", async () => {
+		const fetchMock = mock(
+			async () => new Response(null, { status: 204 }),
+		) as unknown as typeof fetch;
+		globalThis.fetch = fetchMock;
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		const alerts: AlertEvent[] = [
+			...(
+				[
+					"auth_failure",
+					"usage_window_threshold",
+					"usage_window_exhaustion_projected",
+					"cache_telemetry_gap",
+				] as const
+			).map((type) => ({ ...BASE_ALERT, type, id: type })),
+			{
+				...BASE_ALERT,
+				type: "model_routing_drift",
+				id: "model_routing_drift:stale_policy:opus:1",
+			},
+			{
+				...BASE_ALERT,
+				type: "cache_efficiency_recovered",
+				id: "telemetry-recovery",
+				classification: { reason: "cache_telemetry", phase: "recovered" },
+			},
+		];
+		for (const alert of alerts)
+			await (
+				service as unknown as {
+					persistAndEmit: (alert: AlertEvent, url: string) => Promise<void>;
+				}
+			).persistAndEmit(alert, makeConfig().getAlertWebhookUrl());
+		expect(fetchMock).toHaveBeenCalledTimes(6);
+		expect((await service.listAlerts()).length).toBe(6);
+	});
+
+	it("explicit opt-in delivers the quiet observation while generic transport keeps its original body", async () => {
+		const fetchMock = mock(
+			async () => new Response(null, { status: 204 }),
+		) as unknown as typeof fetch;
+		globalThis.fetch = fetchMock;
+		service = new AlertService(
+			new BunSqlAdapter(sqlite),
+			makeConfig({ webhookTypes: ["cache_efficiency_low"] }),
+		);
+		const alert: AlertEvent = {
+			...BASE_ALERT,
+			type: "cache_efficiency_low",
+			id: "opt-in",
+			message: "Raw evidence 0.123456 and input tokens 789",
+		};
+		const publish = (value: AlertEvent, url: string) =>
+			(
+				service as unknown as {
+					persistAndEmit: (alert: AlertEvent, url: string) => Promise<void>;
+				}
+			).persistAndEmit(value, url);
+		await publish(alert, makeConfig().getAlertWebhookUrl());
+		await publish({ ...alert, id: "generic" }, "https://example.com/hook");
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+		expect(JSON.parse(String(init.body))).toEqual({
+			type: "alert",
+			alert: { ...alert, id: "generic" },
+		});
+		expect((await service.listAlerts())[0]?.message).toBe(alert.message);
+	});
+
+	it("documents existing delivery gap: a failed opening persists, replay does not retry, and telemetry recovery can still send", async () => {
+		const fetchMock = mock(
+			async () => new Response(null, { status: 503 }),
+		) as unknown as typeof fetch;
+		globalThis.fetch = fetchMock;
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		const publish = (value: AlertEvent) =>
+			(
+				service as unknown as {
+					persistAndEmit: (alert: AlertEvent, url: string) => Promise<void>;
+				}
+			).persistAndEmit(value, makeConfig().getAlertWebhookUrl());
+		const opening: AlertEvent = {
+			...BASE_ALERT,
+			type: "cache_telemetry_gap",
+			id: "telemetry-opening",
+		};
+		const { logs, stop } = collectWarnLogs();
+		try {
+			await publish(opening);
+			await publish(opening);
+			await publish({
+				...opening,
+				type: "cache_efficiency_recovered",
+				id: "telemetry-recovered",
+				classification: { reason: "cache_telemetry", phase: "recovered" },
+			});
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect((await service.listAlerts()).length).toBe(2);
+			expect(logs.some((event) => event.msg.includes("503"))).toBe(true);
+		} finally {
+			stop();
+		}
+	});
+
 	it("delivers the Discord body when the type allowlist is empty (deliver all)", async () => {
 		const fetchMock = mock(
 			async () => new Response(null, { status: 204 }),
@@ -395,7 +704,7 @@ describe("AlertService webhook wiring (end-to-end)", () => {
 		const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
 		const parsed = JSON.parse(String(init.body));
 		expect(parsed.allowed_mentions).toEqual({ parse: [] });
-		expect(parsed.content).toContain("auth_failure");
+		expect(parsed.content).toContain("authentication failed");
 	});
 
 	it("suppresses delivery for a type not on the allowlist, without affecting persistence", async () => {

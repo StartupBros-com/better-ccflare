@@ -487,6 +487,7 @@ export function buildStalePolicyDriftAlert(
 		type: "model_routing_drift",
 		severity: "warning",
 		title: "Model routing policy may be stale",
+		classification: { reason: "stale_policy" },
 		message: `${family} routing policy rewrites ${from} -> ${to}, and ${from} is the current latest ${family} model. If this combo is meant to track the latest model, update it or switch it to the '${family}' alias; if the older model is a deliberate pin, no action is needed.`,
 		value: null,
 		threshold: null,
@@ -550,6 +551,7 @@ export function buildUnknownModelDriftAlert(
 		type: "model_routing_drift",
 		severity: "warning",
 		title: "Unknown model requested",
+		classification: { reason: "unknown_model" },
 		message,
 		value: null,
 		threshold: null,
@@ -939,28 +941,181 @@ export function truncateToCodepoints(
 	return { text: codepoints.slice(0, keep).join("") + marker, omittedCount };
 }
 
-/**
- * Concise markdown rendering of an alert for Discord: severity + type +
- * title in bold on the first line, then the message, then account / model /
- * value-vs-threshold when present — bounded to Discord's 2000-codepoint
- * `content` limit.
- */
+/** Discord presents the decision; raw numerical evidence remains in history. */
 export function buildDiscordAlertContent(alert: AlertEvent): string {
-	const lines: string[] = [
-		`**${alert.severity.toUpperCase()} · ${alert.type}: ${alert.title}**`,
-		alert.message,
+	const classification = alertClassification(alert);
+	let condition: string;
+	let action: string;
+	let impact =
+		"Service impact is unknown; this observation does not prove an outage.";
+	if (classification?.reason === "cache_telemetry") {
+		const recovered = alert.type === "cache_efficiency_recovered";
+		condition = recovered
+			? "Cache usage monitoring is available again."
+			: "Request records are missing cache usage measurements.";
+		impact = recovered
+			? "Monitoring coverage has recovered; cache service health is still unknown."
+			: "Monitoring is impaired; cache service health is unknown.";
+		action = recovered
+			? "Check the dashboard for any gaps that still need investigation."
+			: "Check usage collection and provider response fields; restore monitoring coverage.";
+	} else if (classification?.reason === "cache_efficiency") {
+		condition =
+			alert.type === "cache_efficiency_recovered"
+				? "Recorded cache reuse returned to its expected range."
+				: "Recorded cache reuse is below its expected range.";
+		action =
+			"Inspect request patterns in the dashboard before deciding whether cache changes are needed.";
+	} else if (alert.type === "model_routing_drift") {
+		condition =
+			classification?.reason === "unknown_model"
+				? "A requested model is missing from the bundled catalog."
+				: "Routing policy rewrote a request for the latest model to an older model.";
+		impact =
+			classification?.reason === "unknown_model"
+				? "Service impact is unknown; catalog absence alone does not establish a routing failure."
+				: "A model rewrite was observed; whether the older model is a deliberate pin is unknown.";
+		action =
+			classification?.reason === "unknown_model"
+				? "Check catalog freshness and the actual routed model in the dashboard."
+				: "Confirm the intended model. Update the combo or use the family alias if it should follow the latest model.";
+		if (!classification) {
+			condition = "A model routing observation needs investigation.";
+			impact =
+				"Service impact is unknown; the observation does not identify a confirmed rewrite.";
+			action =
+				"Check the requested and routed models in the dashboard and confirm the intended routing policy.";
+		}
+	} else {
+		const guidance: Record<
+			Exclude<
+				AlertType,
+				| "model_routing_drift"
+				| "cache_efficiency_low"
+				| "cache_efficiency_critical"
+				| "cache_efficiency_recovered"
+				| "cache_telemetry_gap"
+			>,
+			[string, string]
+		> = {
+			auth_failure: [
+				"Account authentication failed.",
+				"Reauthenticate the affected account and check that another account can serve requests.",
+			],
+			usage_window_threshold: [
+				"An account usage window is nearing or at capacity.",
+				"Check remaining capacity and available fallback accounts before continuing heavy usage.",
+			],
+			usage_window_exhaustion_projected: [
+				"Current usage is projected to exhaust an account before its window resets.",
+				"Reduce usage or arrange fallback capacity; check the projection in the dashboard.",
+			],
+			usage_window_value_drop: [
+				"A completed usage window delivered less value than recent windows.",
+				"Compare the completed windows in the dashboard before changing routing or subscriptions.",
+			],
+			daily_spend: [
+				"Daily spending reached the configured limit.",
+				"Check spending in the dashboard and reduce or pause unnecessary work.",
+			],
+			tokens_per_hour: [
+				"Hourly token usage reached the configured limit.",
+				"Check active workloads and stop unnecessary requests.",
+			],
+			request_tokens: [
+				"A request reached the configured token limit.",
+				"Inspect the request in the dashboard and reduce its workload if unintended.",
+			],
+			anomaly_token_outlier: [
+				"A request used unusually many tokens compared with recent requests.",
+				"Inspect the request and its workload in the dashboard.",
+			],
+			anomaly_output_blowup: [
+				"A request produced unusually much output.",
+				"Inspect the request and limit unintended output.",
+			],
+			anomaly_runaway_loop: [
+				"Repeated near-identical requests suggest a runaway loop.",
+				"Inspect the active agent and stop repeated work if unintended.",
+			],
+			anomaly_model_misrouting: [
+				"Short requests used an expensive model.",
+				"Check whether the workload needs this model before changing routing.",
+			],
+			codex_role_target_changed: [
+				"The catalog changed an automatic model target.",
+				"Check the new target in the dashboard if this workload requires a specific model.",
+			],
+			codex_pin_superseded: [
+				"A pinned model is still available but has a newer catalog target.",
+				"Confirm whether to keep the pin or follow the newer target.",
+			],
+			codex_pin_unavailable: [
+				"A pinned model is missing from the account's fresh catalog.",
+				"Choose an available model or refresh the account catalog before using this pin.",
+			],
+			codex_catalog_stale: [
+				"Catalog refresh failed; routing is using the last known catalog.",
+				"Check account access and restore catalog refresh.",
+			],
+			codex_route_role_unavailable: [
+				"A catalog-based route could not select an available model.",
+				"Check the route profile and account catalog; provide an available model.",
+			],
+			codex_identity_record_stale: [
+				"The managed CLI identity record is stale or unreadable.",
+				"Check the managed updater and restore a verified CLI identity record.",
+			],
+		};
+		[condition, action] = guidance[alert.type as keyof typeof guidance] ?? [
+			"An alert needs investigation.",
+			"Inspect the alert in the dashboard.",
+		];
+		if (
+			(alert.type === "usage_window_exhaustion_projected" ||
+				alert.type === "usage_window_threshold") &&
+			alert.value !== null &&
+			alert.value >= 100
+		) {
+			condition = "An account usage window is fully exhausted.";
+			impact =
+				"This account has no capacity left in that window; overall service impact depends on fallback capacity.";
+			action =
+				"Use an available fallback account or wait for the window reset shown in the dashboard.";
+		}
+		if (alert.type === "auth_failure")
+			impact =
+				"Authentication is unavailable for this account; overall service impact depends on fallback capacity.";
+		if (alert.type === "codex_route_role_unavailable")
+			impact =
+				"This route could not serve the requested model; other routes may still be available.";
+	}
+	const display = (value: string) =>
+		Array.from(
+			value
+				.replace(
+					/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
+					"account",
+				)
+				.replace(/@(everyone|here)/gi, "[mention removed]")
+				.replace(/\s+/g, " "),
+		)
+			.slice(0, 160)
+			.join("");
+	const affected =
+		[
+			alert.account && `account ${display(alert.account)}`,
+			alert.model && `model ${display(alert.model)}`,
+		]
+			.filter(Boolean)
+			.join("; ") || "request routing and usage";
+	const lines = [
+		`**${alert.severity.toUpperCase()}: ${condition}**`,
+		`Affected: ${affected}.`,
+		`Impact: ${impact}`,
+		`Action: ${action}`,
+		"Evidence: open Alerts in the dashboard for the original observation and request details; check server logs for delivery or monitoring errors.",
 	];
-	const details: string[] = [];
-	if (alert.account) details.push(`Account: ${alert.account}`);
-	if (alert.model) details.push(`Model: ${alert.model}`);
-	if (alert.value !== null && alert.threshold !== null) {
-		details.push(`Value: ${alert.value} / Threshold: ${alert.threshold}`);
-	} else if (alert.value !== null) {
-		details.push(`Value: ${alert.value}`);
-	}
-	if (details.length > 0) {
-		lines.push(details.join(" · "));
-	}
 	return truncateToCodepoints(lines.join("\n"), DISCORD_CONTENT_MAX_CODEPOINTS)
 		.text;
 }
@@ -990,6 +1145,50 @@ export function isAlertTypeAllowedForWebhook(
 ): boolean {
 	if (allowedTypes.length === 0) return !isWebhookOptInAlertType(type);
 	return allowedTypes.includes(type);
+}
+
+function alertClassification(alert: AlertEvent): AlertEvent["classification"] {
+	if (alert.classification) return alert.classification;
+	if (alert.type === "model_routing_drift") {
+		const reason = alert.id.split(":")[1];
+		if (reason === "unknown_model" || reason === "stale_policy")
+			return { reason };
+	}
+	if (alert.type === "cache_telemetry_gap")
+		return { reason: "cache_telemetry" };
+	if (alert.type === "cache_efficiency_recovered") {
+		try {
+			const id: unknown = JSON.parse(alert.id);
+			if (Array.isArray(id) && id[2] === "telemetry")
+				return { reason: "cache_telemetry", phase: "recovered" };
+		} catch {
+			/* Older producers may not use the cache decision tuple. */
+		}
+	}
+	if (alert.type.startsWith("cache_efficiency_"))
+		return {
+			reason: "cache_efficiency",
+			phase:
+				alert.type === "cache_efficiency_recovered" ? "recovered" : undefined,
+		};
+	return undefined;
+}
+
+/** Human admission belongs at publication, after history and SSE have won. */
+export function isAlertAllowedForWebhook(
+	alert: AlertEvent,
+	webhookUrl: string,
+	allowedTypes: readonly AlertType[],
+): boolean {
+	if (!isAlertTypeAllowedForWebhook(alert.type, allowedTypes)) return false;
+	if (allowedTypes.length > 0) return true;
+	try {
+		if (!isDiscordWebhookUrl(new URL(webhookUrl))) return true;
+	} catch {
+		return true; /* Delivery owns malformed-URL logging. */
+	}
+	const reason = alertClassification(alert)?.reason;
+	return reason !== "cache_efficiency" && reason !== "unknown_model";
 }
 
 /**
@@ -1026,9 +1225,11 @@ export async function deliverAlertWebhook(
 		log.warn("Alert webhook delivery skipped: configured URL failed to parse");
 		return;
 	}
+	// Classification is publication metadata, not a new generic wire field.
+	const { classification: _classification, ...legacyAlert } = alert;
 	const body = isDiscordWebhookUrl(parsed)
 		? buildDiscordWebhookBody(alert)
-		: { type: "alert" as const, alert };
+		: { type: "alert" as const, alert: legacyAlert };
 	try {
 		if (signal?.aborted) return;
 		const response = await fetch(webhookUrl, {
@@ -1101,6 +1302,10 @@ function cacheHealthAlertEvent(
 		type: decision.type,
 		severity: decision.severity,
 		title: `${symptom} (${decision.phase})`,
+		classification: {
+			reason: telemetry ? "cache_telemetry" : "cache_efficiency",
+			phase: decision.phase,
+		},
 		message: [
 			`${symptom}. Provider: ${scope.provider}; model: ${scope.model}; ${account === null ? `accounts: ${contributors.join(", ")}` : `account: ${account}`}.`,
 			`UTC evidence: ${new Date(evidence.startMs).toISOString()} to ${new Date(evidence.endMs).toISOString()} (end exclusive).`,
@@ -2270,8 +2475,9 @@ export class AlertService {
 		if (
 			!signal?.aborted &&
 			webhookUrl &&
-			isAlertTypeAllowedForWebhook(
-				alert.type,
+			isAlertAllowedForWebhook(
+				alert,
+				webhookUrl,
 				allowedTypes ?? this.config.getAlertWebhookTypes(),
 			)
 		) {
