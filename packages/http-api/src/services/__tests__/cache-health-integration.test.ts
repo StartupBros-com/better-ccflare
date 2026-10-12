@@ -133,7 +133,7 @@ describe("cache health persisted alert pipeline", () => {
 		service.evaluateCacheHealth(START + completed * BUCKET + SETTLE);
 	const history = () => service.listAlerts(100);
 
-	it("requires distinct settled buckets, persists cold streaks, resumes after restart and publishes actual SSE/Discord once", async () => {
+	it("requires distinct settled buckets, persists cold streaks, resumes after restart and publishes actual SSE without default Discord", async () => {
 		const stream = createAlertsStreamHandler()(
 			new Request("http://fixture/stream"),
 		);
@@ -184,12 +184,16 @@ describe("cache health persisted alert pipeline", () => {
 			expect(
 				JSON.parse(new TextDecoder().decode(frame.value).slice(6)).payload.id,
 			).toBe(alerts[0].id);
-			expect(deliveries).toHaveLength(1);
-			expect(deliveries[0].body.allowed_mentions).toEqual({ parse: [] });
-			expect(deliveries[0].body.content).toContain("RECORDED");
-			expect(Array.from(deliveries[0].body.content).length).toBeLessThanOrEqual(
-				2000,
-			);
+			expect(deliveries).toHaveLength(0);
+			await sample(3, 95);
+			await sample(4, 95);
+			await tick(5);
+			expect((await history()).map((alert) => alert.type).sort()).toEqual([
+				"cache_efficiency_low",
+				"cache_efficiency_recovered",
+			]);
+			expect(events).toHaveLength(2);
+			expect(deliveries).toHaveLength(0); // quiet opening cannot orphan a recovery
 		} finally {
 			await reader.cancel();
 		}
@@ -478,9 +482,15 @@ describe("cache health persisted alert pipeline", () => {
 		).find((s) => s.scope.kind === "account");
 		expect(account?.reuse.incident).not.toBeNull();
 		expect(account?.telemetry.incident).toBeNull();
+		expect(deliveries).toHaveLength(2);
+		expect(deliveries[0].body.content).toContain("Monitoring is impaired");
+		expect(deliveries[1].body.content).toContain(
+			"Monitoring coverage has recovered",
+		);
 	});
 
 	it("only the atomic CAS winner emits; a losing scope reloads on a later tick", async () => {
+		config.setAlertWebhookTypes("cache_efficiency_low");
 		for (let bucket = 0; bucket < 3; bucket++) await sample(bucket);
 		const rival = new AlertService(db, config);
 		services.push(rival);
@@ -526,6 +536,7 @@ describe("cache health persisted alert pipeline", () => {
 		503,
 		"network",
 	])("contains delivery failure %s without exposing a URL or replaying history", async (failure) => {
+		config.setAlertWebhookTypes("cache_efficiency_low");
 		const logs: LogEvent[] = [];
 		const capture = (event: LogEvent) => logs.push(event);
 		logBus.on("log", capture);
@@ -544,6 +555,43 @@ describe("cache health persisted alert pipeline", () => {
 		} finally {
 			logBus.off("log", capture);
 		}
+	});
+
+	it("records the concrete existing gap: failed telemetry opening is not retried before a later recovery sends", async () => {
+		let attempts = 0;
+		globalThis.fetch = mock(async (_input, init) => {
+			attempts++;
+			deliveries.push({
+				url: DESTINATION,
+				body: JSON.parse(String(init?.body)),
+			});
+			return new Response(null, { status: attempts === 1 ? 503 : 204 });
+		}) as unknown as typeof fetch;
+		await sample(0, 95);
+		await tick(1);
+		for (let bucket = 1; bucket < 4; bucket++) {
+			await sample(bucket, 0, 10, {
+				input_tokens: null,
+				cache_read_input_tokens: null,
+				prompt_tokens: null,
+			});
+			await tick(bucket + 1);
+		}
+		expect(attempts).toBe(1);
+		await tick(4);
+		expect(attempts).toBe(1); // persisted opening is not a retry queue
+		for (let bucket = 4; bucket < 6; bucket++) {
+			await sample(bucket, 95);
+			await tick(bucket + 1);
+		}
+		expect(attempts).toBe(2);
+		expect(deliveries[1].body.content).toContain(
+			"Monitoring coverage has recovered",
+		);
+		expect((await history()).map((alert) => alert.type).sort()).toEqual([
+			"cache_efficiency_recovered",
+			"cache_telemetry_gap",
+		]);
 	});
 
 	it.each([
@@ -792,6 +840,7 @@ describe("cache health persisted alert pipeline", () => {
 	});
 
 	it("cancels a pending webhook on reconfiguration without resending to the new destination", async () => {
+		config.setAlertWebhookTypes("cache_efficiency_low");
 		const entered = deferred();
 		let aborted = false;
 		globalThis.fetch = mock(async (_input, init) => {
