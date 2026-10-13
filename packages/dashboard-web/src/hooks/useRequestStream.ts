@@ -1,7 +1,12 @@
 import type { AgentAttributionSource } from "@better-ccflare/types";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect } from "react";
-import type { Account, RequestPayload, RequestResponse } from "../api";
+import {
+	type Account,
+	api,
+	type RequestPayload,
+	type RequestResponse,
+} from "../api";
 import { queryKeys } from "../lib/query-keys";
 
 interface RequestsData {
@@ -117,6 +122,7 @@ function createPooledConnection(key: string, limit: number): PooledConnection {
 	let retryTimer: ReturnType<typeof setTimeout> | null = null;
 	let disposed = false;
 	let attempt = 0;
+	let generation = 0;
 	let hiddenAt: number | null =
 		document.visibilityState === "hidden" ? Date.now() : null;
 
@@ -143,37 +149,54 @@ function createPooledConnection(key: string, limit: number): PooledConnection {
 		connection = null;
 		previous?.close();
 	};
+	const scheduleRetry = () => {
+		clearRetry();
+		closeConnection();
+		const base = Math.min(1000 * 2 ** attempt, RECONNECT_MAX_DELAY);
+		attempt++;
+		retryTimer = setTimeout(
+			() => {
+				retryTimer = null;
+				connect();
+			},
+			Math.round(base + Math.random() * base * 0.25),
+		);
+	};
 	const connect = () => {
 		if (disposed || subscribers.size === 0) return;
 		clearRetry();
 		closeConnection();
-		const es = new EventSource("/api/requests/stream");
-		connection = es;
-		const isCurrent = () => !disposed && connection === es;
-		es.addEventListener("open", () => {
-			if (!isCurrent()) return;
-			// A fresh pool can still have Infinity-stale history retained in cache.
-			invalidate();
-			attempt = 0;
-		});
-		es.addEventListener("message", (event) => {
-			if (isCurrent())
-				forEachClient(({ handleMessage }) => handleMessage(event));
-		});
-		es.addEventListener("error", () => {
-			if (!isCurrent()) return;
-			// Disable browser retries; this entry owns exactly one retry timer.
-			closeConnection();
-			const base = Math.min(1000 * 2 ** attempt, RECONNECT_MAX_DELAY);
-			attempt++;
-			retryTimer = setTimeout(
-				() => {
-					retryTimer = null;
-					connect();
-				},
-				Math.round(base + Math.random() * base * 0.25),
-			);
-		});
+		const currentGeneration = ++generation;
+		const isAttemptCurrent = () =>
+			!disposed && generation === currentGeneration;
+		void api.createEventSource("requests").then(
+			(es) => {
+				if (!isAttemptCurrent()) {
+					es.close();
+					return;
+				}
+				connection = es;
+				const isCurrent = () => isAttemptCurrent() && connection === es;
+				es.addEventListener("open", () => {
+					if (!isCurrent()) return;
+					// A fresh pool can still have Infinity-stale history retained in cache.
+					invalidate();
+					attempt = 0;
+				});
+				es.addEventListener("message", (event) => {
+					if (isCurrent())
+						forEachClient(({ handleMessage }) => handleMessage(event));
+				});
+				es.addEventListener("error", () => {
+					if (!isCurrent()) return;
+					// Disable browser retries; each new attempt must mint a fresh token.
+					scheduleRetry();
+				});
+			},
+			() => {
+				if (isAttemptCurrent()) scheduleRetry();
+			},
+		);
 	};
 	const recover = (hiddenMs: number, online: boolean) => {
 		if (disposed) return;

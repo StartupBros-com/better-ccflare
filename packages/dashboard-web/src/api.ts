@@ -978,8 +978,7 @@ class API extends HttpClient {
 		}
 	}
 
-	// SSE streaming requires special handling, keep as-is
-	async streamLogs(onLog: (log: LogEntry) => void): Promise<EventSource> {
+	async createEventSource(audience: "logs" | "requests"): Promise<EventSource> {
 		// The native EventSource API cannot set custom headers, so instead of
 		// passing the durable API key via query string (which risks leaking
 		// it via browser history, Referer headers, or access logs), a
@@ -987,14 +986,16 @@ class API extends HttpClient {
 		// authenticated POST request, then passed in the EventSource URL
 		// (#216, #379).
 		const apiKey = this.getApiKey();
-		let url = "/api/logs/stream";
+		let url = `/api/${audience}/stream`;
 		if (apiKey) {
-			const { token } = await this.post<{ token: string }>(
-				"/api/logs/stream/token",
-			);
-			url = `/api/logs/stream?stream_token=${encodeURIComponent(token)}`;
+			const { token } = await this.post<{ token: string }>(`${url}/token`);
+			url = `${url}?stream_token=${encodeURIComponent(token)}`;
 		}
-		const eventSource = new EventSource(url);
+		return new EventSource(url);
+	}
+
+	async streamLogs(onLog: (log: LogEntry) => void): Promise<EventSource> {
+		const eventSource = await this.createEventSource("logs");
 		eventSource.addEventListener("message", (event) => {
 			try {
 				const data = JSON.parse(event.data);
