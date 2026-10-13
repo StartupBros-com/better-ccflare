@@ -510,6 +510,9 @@ describe.skipIf(!livePgAvailable)(
 			await adapter.unsafe(
 				`TRUNCATE TABLE ${ALL_TABLES.map((t) => `"${t}"`).join(", ")} RESTART IDENTITY CASCADE`,
 			);
+			// The shared dbOps also owns stats-cache invalidation; raw fixture
+			// TRUNCATE alone intentionally cannot notify in-process observers.
+			await dbOps.resetStatistics();
 		});
 
 		liveIt(

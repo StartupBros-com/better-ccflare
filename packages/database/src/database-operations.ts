@@ -364,6 +364,14 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 	private originalAutoVacuumMode?: number;
 	/** Prevents concurrent compact() calls from spawning multiple vacuum workers */
 	private compacting = false;
+	private readonly requestsDeletedListeners = new Set<() => void>();
+	private tableRowCounts?: {
+		rows: Array<{ name: string; rowCount: number; dataBytes?: number }>;
+		expiresAt: number;
+	};
+	private tableRowCountsPending?: Promise<
+		Array<{ name: string; rowCount: number; dataBytes?: number }>
+	>;
 	/** Stop function returned by the multi-instance guard's heartbeat loop. */
 	private heartbeatStop: (() => Promise<void>) | null = null;
 	/**
@@ -1601,6 +1609,28 @@ OAuth tokens will need to be re-authenticated.
 		return this.routingAttempts.getSummary(input.window, input.now);
 	}
 
+	onRequestsDeleted(listener: () => void): () => void {
+		if (!this.closing) this.requestsDeletedListeners.add(listener);
+		return () => {
+			this.requestsDeletedListeners.delete(listener);
+		};
+	}
+
+	private invalidateTableRowCounts(): void {
+		this.tableRowCounts = undefined;
+		this.tableRowCountsPending = undefined;
+	}
+
+	private notifyRequestsDeleted(): void {
+		for (const listener of this.requestsDeletedListeners) {
+			try {
+				listener();
+			} catch (error) {
+				console.warn("[onRequestsDeleted] listener failed:", error);
+			}
+		}
+	}
+
 	async resetStatistics(): Promise<void> {
 		await this.adapter.runBatchWithChanges([
 			{ sql: "DELETE FROM requests" },
@@ -1609,6 +1639,8 @@ OAuth tokens will need to be re-authenticated.
 				sql: "UPDATE accounts SET request_count = 0, session_request_count = 0",
 			},
 		]);
+		this.invalidateTableRowCounts();
+		this.notifyRequestsDeleted();
 	}
 
 	async updateRequestUsage(
@@ -1801,71 +1833,100 @@ OAuth tokens will need to be re-authenticated.
 		removedRoutingAttempts: number;
 	}> {
 		const now = Date.now();
+		try {
+			// Pass 1 — payloads
+			const payloadCutoff = now - payloadRetentionMs;
+			const removedPayloadsByAge =
+				await this.requests.deletePayloadsOlderThan(payloadCutoff);
+			const removedOrphans = await this.requests.deleteOrphanedPayloads();
 
-		// Pass 1 — payloads
-		const payloadCutoff = now - payloadRetentionMs;
-		const removedPayloadsByAge =
-			await this.requests.deletePayloadsOlderThan(payloadCutoff);
-		const removedOrphans = await this.requests.deleteOrphanedPayloads();
-
-		// Pass 2 — request metadata
-		let removedRequests = 0;
-		let removedRoutingAttempts = 0;
-		if (
-			typeof requestRetentionMs === "number" &&
-			Number.isFinite(requestRetentionMs)
-		) {
-			const requestCutoff = now - requestRetentionMs;
-			removedRequests = await this.requests.deleteOlderThan(requestCutoff);
-			removedRoutingAttempts =
-				await this.routingAttempts.deleteOlderThan(requestCutoff);
+			// Pass 2 — request metadata
+			let removedRequests = 0;
+			let removedRoutingAttempts = 0;
+			if (
+				typeof requestRetentionMs === "number" &&
+				Number.isFinite(requestRetentionMs)
+			) {
+				const requestCutoff = now - requestRetentionMs;
+				try {
+					removedRequests = await this.requests.deleteOlderThan(requestCutoff);
+				} catch (error) {
+					// Earlier deletion batches may already have committed.
+					this.notifyRequestsDeleted();
+					throw error;
+				}
+				if (removedRequests > 0) this.notifyRequestsDeleted();
+				removedRoutingAttempts =
+					await this.routingAttempts.deleteOlderThan(requestCutoff);
+			}
+			return {
+				removedRequests,
+				removedPayloads: removedPayloadsByAge + removedOrphans,
+				removedRoutingAttempts,
+			};
+		} finally {
+			// Payload and routing-attempt batches can also partially commit.
+			this.invalidateTableRowCounts();
 		}
-
-		return {
-			removedRequests,
-			removedPayloads: removedPayloadsByAge + removedOrphans,
-			removedRoutingAttempts,
-		};
 	}
 
 	async getTableRowCounts(): Promise<
 		Array<{ name: string; rowCount: number; dataBytes?: number }>
 	> {
-		if (!this.adapter.isSQLite) {
-			return [];
+		if (!this.adapter.isSQLite) return [];
+		if (this.tableRowCounts && this.tableRowCounts.expiresAt > Date.now()) {
+			return this.tableRowCounts.rows;
 		}
-		try {
-			const tables = await this.adapter.query<{ name: string }>(
-				"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-			);
-			const rows = await Promise.all(
-				tables.map(async ({ name }) => {
-					const countRow = await this.adapter.get<{ rowCount: number }>(
-						`SELECT COUNT(*) AS rowCount FROM "${name}"`,
-					);
-					const rowCount = countRow?.rowCount ?? 0;
-					// Measure actual data bytes for tables with known large text/blob columns
-					if (name === "request_payloads") {
-						const sizeRow = await this.adapter.get<{ dataBytes: number }>(
-							`SELECT SUM(LENGTH(json)) AS dataBytes FROM "${name}"`,
-						);
-						return { name, rowCount, dataBytes: sizeRow?.dataBytes ?? 0 };
-					}
-					return { name, rowCount };
-				}),
-			);
-			// Sort: tables with dataBytes first (largest first), then by rowCount
-			return rows.sort((a, b) => {
-				if (a.dataBytes !== undefined && b.dataBytes !== undefined)
-					return b.dataBytes - a.dataBytes;
-				if (a.dataBytes !== undefined) return -1;
-				if (b.dataBytes !== undefined) return 1;
-				return b.rowCount - a.rowCount;
+		if (this.tableRowCountsPending) return this.tableRowCountsPending;
+		const pending = this.scanTableRowCounts()
+			.then((rows) => {
+				if (this.tableRowCountsPending === pending) {
+					this.tableRowCounts = { rows, expiresAt: Date.now() + 60_000 };
+				}
+				return rows;
+			})
+			.catch((error) => {
+				console.debug("[getTableRowCounts] query failed:", error);
+				return [];
+			})
+			.finally(() => {
+				if (this.tableRowCountsPending === pending)
+					this.tableRowCountsPending = undefined;
 			});
-		} catch (err) {
-			console.debug("[getTableRowCounts] query failed:", err);
-			return [];
-		}
+		this.tableRowCountsPending = pending;
+		return pending;
+	}
+
+	private async scanTableRowCounts(): Promise<
+		Array<{ name: string; rowCount: number; dataBytes?: number }>
+	> {
+		const tables = await this.adapter.query<{ name: string }>(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+		);
+		const rows = await Promise.all(
+			tables.map(async ({ name }) => {
+				const countRow = await this.adapter.get<{ rowCount: number }>(
+					`SELECT COUNT(*) AS rowCount FROM "${name}"`,
+				);
+				const rowCount = countRow?.rowCount ?? 0;
+				// Measure actual data bytes for tables with known large text/blob columns
+				if (name === "request_payloads") {
+					const sizeRow = await this.adapter.get<{ dataBytes: number }>(
+						`SELECT SUM(LENGTH(json)) AS dataBytes FROM "${name}"`,
+					);
+					return { name, rowCount, dataBytes: sizeRow?.dataBytes ?? 0 };
+				}
+				return { name, rowCount };
+			}),
+		);
+		// Sort: tables with dataBytes first (largest first), then by rowCount
+		return rows.sort((a, b) => {
+			if (a.dataBytes !== undefined && b.dataBytes !== undefined)
+				return b.dataBytes - a.dataBytes;
+			if (a.dataBytes !== undefined) return -1;
+			if (b.dataBytes !== undefined) return 1;
+			return b.rowCount - a.rowCount;
+		});
 	}
 
 	async getDbSizeBytes(): Promise<number> {
@@ -1924,6 +1985,8 @@ OAuth tokens will need to be re-authenticated.
 	close(): Promise<void> {
 		if (this.closePromise) return this.closePromise;
 		this.closing = true;
+		this.requestsDeletedListeners.clear();
+		this.invalidateTableRowCounts();
 		this.closePromise = this.closeOwnedResources();
 		return this.closePromise;
 	}
