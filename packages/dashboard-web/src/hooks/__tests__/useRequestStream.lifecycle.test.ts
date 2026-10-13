@@ -66,6 +66,14 @@ class FakeEventSource extends EventTarget {
 	}
 }
 
+const createEventSource = mock(
+	async (_audience: string): Promise<EventSource> =>
+		new FakeEventSource("/api/requests/stream") as unknown as EventSource,
+);
+mock.module("../../api", () => ({ api: { createEventSource } }));
+async function flush() {
+	for (let tick = 0; tick < 20; tick++) await Promise.resolve();
+}
 const { cleanupRequestStream, getRequestsSseSeq, useRequestStream } =
 	await import("../useRequestStream");
 
@@ -74,7 +82,7 @@ function RequestStreamTestComponent(limit: number) {
 	return null;
 }
 
-function mount(limit = 200): () => void {
+function mountSync(limit = 200): () => void {
 	effects.length = 0;
 	RequestStreamTestComponent(limit);
 	const cleanups = effects
@@ -84,14 +92,20 @@ function mount(limit = 200): () => void {
 		for (const cleanup of cleanups) cleanup();
 	};
 }
+async function mount(limit = 200) {
+	const stop = mountSync(limit);
+	await flush();
+	return stop;
+}
 function currentSource() {
 	return FakeEventSource.instances[FakeEventSource.instances.length - 1];
 }
-function retry() {
+async function retry() {
 	expect(timeouts.size).toBe(1);
 	const [id, timer] = [...timeouts][0];
 	timeouts.delete(id);
 	timer.callback();
+	await flush();
 }
 function heartbeat() {
 	for (const timer of [...intervals.values()])
@@ -112,6 +126,11 @@ function start(id: string) {
 }
 
 beforeEach(() => {
+	createEventSource.mockReset();
+	createEventSource.mockImplementation(
+		async () =>
+			new FakeEventSource("/api/requests/stream") as unknown as EventSource,
+	);
 	now = 0;
 	nextTimer = 0;
 	documentTarget = Object.assign(new EventTarget(), {
@@ -161,20 +180,20 @@ afterEach(() => {
 });
 
 describe("useRequestStream lifecycle", () => {
-	it("closes the last source and clears every timer on final unmount", () => {
-		const unmount = mount();
+	it("closes the last source and clears every timer on final unmount", async () => {
+		const unmount = await mount();
 		const source = currentSource();
 		expect(source.url).toBe("/api/requests/stream");
 		unmount();
 		expect(source.close).toHaveBeenCalledTimes(1);
 		expect(intervals.size).toBe(0);
 		expect(timeouts.size).toBe(0);
-		const again = mount();
+		const again = await mount();
 		expect(FakeEventSource.instances).toHaveLength(2);
 		again();
 	});
-	it("closes errored sources and still reconnects after more than ten failures", () => {
-		const unmount = mount();
+	it("closes errored sources and still reconnects after more than ten failures", async () => {
+		const unmount = await mount();
 		for (let attempt = 0; attempt < 12; attempt++) {
 			const source = currentSource();
 			source.fail();
@@ -182,60 +201,67 @@ describe("useRequestStream lifecycle", () => {
 			const delay = [...timeouts.values()][0]?.delay;
 			expect(delay).toBeGreaterThanOrEqual(1000);
 			expect(delay).toBeLessThanOrEqual(37500);
-			retry();
+			await retry();
 		}
 		expect(FakeEventSource.instances).toHaveLength(13);
 		currentSource().open();
 		expect(invalidations).toHaveBeenCalled();
 		unmount();
 	});
-	it("cancels pending retries and browser recovery after final unmount", () => {
-		const unmount = mount();
+	it("cancels pending retries and browser recovery after final unmount", async () => {
+		const unmount = await mount();
 		currentSource().fail();
 		expect(timeouts.size).toBe(1);
 		unmount();
 		expect(timeouts.size).toBe(0);
 		expect(intervals.size).toBe(0);
 		windowTarget.dispatchEvent(new Event("online"));
+		await flush();
 		documentTarget.dispatchEvent(new Event("visibilitychange"));
+		await flush();
 		expect(FakeEventSource.instances).toHaveLength(1);
 	});
-	it("leaves CONNECTING alone but reconnects a silently CLOSED source", () => {
-		const unmount = mount();
+	it("leaves CONNECTING alone but reconnects a silently CLOSED source", async () => {
+		const unmount = await mount();
 		const source = currentSource();
 		heartbeat();
+		await flush();
 		expect(source.close).not.toHaveBeenCalled();
 		expect(FakeEventSource.instances).toHaveLength(1);
 		source.readyState = FakeEventSource.CLOSED;
 		heartbeat();
+		await flush();
 		expect(FakeEventSource.instances).toHaveLength(2);
 		unmount();
 	});
-	it("recovers a long-hidden tab and forces recovery on online", () => {
-		const unmount = mount();
+	it("recovers a long-hidden tab and forces recovery on online", async () => {
+		const unmount = await mount();
 		currentSource().open();
 		documentTarget.visibilityState = "hidden";
 		documentTarget.dispatchEvent(new Event("visibilitychange"));
+		await flush();
 		now = 31000;
 		documentTarget.visibilityState = "visible";
 		documentTarget.dispatchEvent(new Event("visibilitychange"));
+		await flush();
 		expect(FakeEventSource.instances).toHaveLength(2);
 		currentSource().open();
 		windowTarget.dispatchEvent(new Event("online"));
+		await flush();
 		expect(FakeEventSource.instances).toHaveLength(3);
 		expect(invalidations).toHaveBeenCalledWith({
 			queryKey: queryKeys.requests(200),
 		});
 		unmount();
 	});
-	it("shares CONNECTING sources and retains recovery when the first subscriber unmounts", () => {
-		const first = mount();
-		const second = mount();
+	it("shares CONNECTING sources and retains recovery when the first subscriber unmounts", async () => {
+		const first = await mount();
+		const second = await mount();
 		expect(FakeEventSource.instances).toHaveLength(1);
 		first();
 		expect(currentSource().close).not.toHaveBeenCalled();
 		currentSource().fail();
-		retry();
+		await retry();
 		currentSource().open();
 		queryClient.setQueryData(queryKeys.requests(200), {
 			requests: [],
@@ -251,41 +277,43 @@ describe("useRequestStream lifecycle", () => {
 		expect(intervals.size).toBe(0);
 		expect(timeouts.size).toBe(0);
 	});
-	it("keeps shared subscriber counts through reconnect and runs only one online recovery", () => {
-		const first = mount();
+	it("keeps shared subscriber counts through reconnect and runs only one online recovery", async () => {
+		const first = await mount();
 		currentSource().open();
-		const second = mount();
+		const second = await mount();
 		currentSource().fail();
-		retry();
+		await retry();
 		currentSource().open();
 		windowTarget.dispatchEvent(new Event("online"));
+		await flush();
 		expect(FakeEventSource.instances).toHaveLength(3);
 		first();
 		expect(currentSource().close).not.toHaveBeenCalled();
 		second();
 		expect(currentSource().close).toHaveBeenCalledTimes(1);
 	});
-	it("ignores late error events from a replaced source", () => {
-		const unmount = mount();
+	it("ignores late error events from a replaced source", async () => {
+		const unmount = await mount();
 		const old = currentSource();
 		old.fail();
-		retry();
+		await retry();
 		old.fail();
 		expect(timeouts.size).toBe(0);
 		expect(currentSource().close).not.toHaveBeenCalled();
 		unmount();
 	});
-	it("shutdown cancels pending retries as well as open connections", () => {
-		mount();
+	it("shutdown cancels pending retries as well as open connections", async () => {
+		await mount();
 		currentSource().fail();
 		cleanupRequestStream();
 		expect(timeouts.size).toBe(0);
 		expect(intervals.size).toBe(0);
 		windowTarget.dispatchEvent(new Event("online"));
+		await flush();
 		expect(FakeEventSource.instances).toHaveLength(1);
 	});
-	it("keeps cache identity for a late evicted summary while advancing the SSE sequence", () => {
-		const unmount = mount(1);
+	it("keeps cache identity for a late evicted summary while advancing the SSE sequence", async () => {
+		const unmount = await mount(1);
 		currentSource().open();
 		queryClient.setQueryData(queryKeys.requests(1), {
 			requests: [{ id: "live" }],
@@ -302,8 +330,8 @@ describe("useRequestStream lifecycle", () => {
 		unmount();
 	});
 	for (const shape of ["array", "stale-array", "stale-map"] as const) {
-		it(`normalizes and prunes ${shape} details on a late evicted summary`, () => {
-			const unmount = mount(1);
+		it(`normalizes and prunes ${shape} details on a late evicted summary`, async () => {
+			const unmount = await mount(1);
 			currentSource().open();
 			const live = { id: "live", statusCode: 200 };
 			const summaries =
@@ -331,8 +359,8 @@ describe("useRequestStream lifecycle", () => {
 			unmount();
 		});
 	}
-	it("prunes evicted details and keeps attribution, lazy-body and final status fields", () => {
-		const unmount = mount(1);
+	it("prunes evicted details and keeps attribution, lazy-body and final status fields", async () => {
+		const unmount = await mount(1);
 		currentSource().open();
 		queryClient.setQueryData(queryKeys.requests(1), {
 			requests: [],
@@ -381,5 +409,89 @@ describe("useRequestStream lifecycle", () => {
 			rateLimited: true,
 		});
 		unmount();
+	});
+});
+
+describe("asynchronous Requests connection attempts", () => {
+	function defer() {
+		let resolve!: (source: EventSource) => void;
+		let reject!: (error: Error) => void;
+		const promise = new Promise<EventSource>((yes, no) => {
+			resolve = yes;
+			reject = no;
+		});
+		return { promise, resolve, reject };
+	}
+	it("shares a pending mint and closes its late source after final unmount", async () => {
+		const pending = defer();
+		createEventSource.mockImplementation(() => pending.promise);
+		const first = mountSync();
+		const second = mountSync();
+		expect(createEventSource).toHaveBeenCalledTimes(1);
+		expect(createEventSource).toHaveBeenCalledWith("requests");
+		first();
+		second();
+		const late = new FakeEventSource("late");
+		pending.resolve(late as unknown as EventSource);
+		await flush();
+		expect(late.close).toHaveBeenCalledTimes(1);
+		expect(timeouts.size).toBe(0);
+		expect(intervals.size).toBe(0);
+	});
+	for (const outcome of ["resolve", "reject"] as const) {
+		it(`ignores a stale ${outcome} after online replaces a pending attempt`, async () => {
+			const old = defer();
+			createEventSource.mockImplementationOnce(() => old.promise);
+			const unmount = mountSync();
+			windowTarget.dispatchEvent(new Event("online"));
+			await flush();
+			const replacement = currentSource();
+			replacement.open();
+			if (outcome === "resolve") {
+				const late = new FakeEventSource("late");
+				old.resolve(late as unknown as EventSource);
+				await flush();
+				expect(late.close).toHaveBeenCalledTimes(1);
+				late.open();
+				late.fail();
+				late.message(start("stale"));
+			} else {
+				old.reject(new Error("stale mint failed"));
+				await flush();
+			}
+			expect(replacement.close).not.toHaveBeenCalled();
+			expect(timeouts.size).toBe(0);
+			expect(invalidations).toHaveBeenCalledTimes(2);
+			unmount();
+		});
+	}
+	it("retries mint failures with fresh attempts and cancels rejection after shutdown", async () => {
+		createEventSource.mockRejectedValueOnce(new Error("mint failed"));
+		const unmount = await mount();
+		expect(FakeEventSource.instances).toHaveLength(0);
+		expect(timeouts.size).toBe(1);
+		await retry();
+		expect(createEventSource).toHaveBeenCalledTimes(2);
+		currentSource().fail();
+		const pending = defer();
+		createEventSource.mockImplementationOnce(() => pending.promise);
+		await retry();
+		unmount();
+		pending.reject(new Error("unmounted"));
+		await flush();
+		expect(timeouts.size).toBe(0);
+	});
+	it("keeps pools separate by limit and deduplicates a query client's messages", async () => {
+		const first = await mount(1);
+		const shared = await mount(1);
+		const other = await mount(2);
+		expect(createEventSource).toHaveBeenCalledTimes(2);
+		const sequence = getRequestsSseSeq();
+		FakeEventSource.instances[0].message(start("one"));
+		expect(getRequestsSseSeq()).toBe(sequence + 1);
+		first();
+		shared();
+		expect(currentSource().close).not.toHaveBeenCalled();
+		other();
 	});
 });

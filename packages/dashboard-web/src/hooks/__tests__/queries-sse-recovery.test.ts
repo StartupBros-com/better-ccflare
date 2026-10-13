@@ -68,7 +68,7 @@ function RequestsTestComponent(limit: number) {
 	useRequestStream(limit);
 	return null;
 }
-function mountStream(limit: number) {
+async function mountStream(limit: number) {
 	effects.length = 0;
 	RequestsTestComponent(limit);
 	const stops = effects.map((effect) => effect());
@@ -76,6 +76,7 @@ function mountStream(limit: number) {
 		for (const cleanup of stops) cleanup?.();
 	};
 	cleanups.push(stop);
+	await flush();
 	const source = FakeEventSource.instances.at(-1);
 	if (!source) throw new Error("Stream was not created");
 	source.open();
@@ -156,6 +157,7 @@ function pendingSnapshots() {
 	};
 }
 beforeEach(() => {
+	spyOn(api, "getApiKey").mockReturnValue(null);
 	queryClient = new QueryClient({
 		defaultOptions: { queries: { gcTime: Infinity, retry: false } },
 	});
@@ -188,7 +190,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 		]);
 		seed(10, [summary("before")]);
 		const firstObserver = observe(10);
-		const firstStream = mountStream(10);
+		const firstStream = await mountStream(10);
 		await flush();
 		firstObserver.stop();
 		firstStream.stop();
@@ -196,7 +198,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 		fetch.mockResolvedValue([summary("missed-while-unmounted")]);
 		const secondObserver = observe(10);
 		expect(fetch).toHaveBeenCalledTimes(callsBeforeRemount);
-		mountStream(10);
+		await mountStream(10);
 		await flush();
 		expect(fetch).toHaveBeenCalledTimes(callsBeforeRemount + 1);
 		expect(cached(10).requests[0].id).toBe("missed-while-unmounted");
@@ -206,7 +208,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 	it("retains a request pending before refetch and accepts its later summary", async () => {
 		const fetch = spyOn(api, "getRequestsSummary").mockResolvedValue([]);
 		seed(10, [summary("old-completed")]);
-		const { source } = mountStream(10);
+		const { source } = await mountStream(10);
 		source.message(start("already-running", 20));
 		const { observer } = observe(10);
 		await observer.refetch();
@@ -238,7 +240,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 		const fetch = spyOn(api, "getRequestsSummary").mockResolvedValue([
 			summary("already-running", 20, 429),
 		]);
-		const { source } = mountStream(10);
+		const { source } = await mountStream(10);
 		source.message(start("already-running", 20));
 		const { observer } = observe(10);
 		await observer.refetch();
@@ -251,7 +253,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 		const fetch = spyOn(api, "getRequestsSummary").mockResolvedValue([
 			summary("new-completed", 40),
 		]);
-		const { source } = mountStream(2);
+		const { source } = await mountStream(2);
 		source.message(start("older-pending", 20));
 		source.message(start("newer-pending", 30));
 		const { observer } = observe(2);
@@ -268,7 +270,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 		it(`preserves starts and summaries when all three snapshots race SSE (${initialCache} cache)`, async () => {
 			const pending = pendingSnapshots();
 			if (initialCache === "retained") seed(10, [summary("existing")]);
-			const { source } = mountStream(10);
+			const { source } = await mountStream(10);
 			const { observer } = observe(10);
 			const result = observer.refetch({ cancelRefetch: false });
 			source.message(start("turn-1", 20));
@@ -333,7 +335,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 	for (const state of ["pending", "completed"] as const) {
 		it(`retains an attempt-one ${state} request absent from every later snapshot`, async () => {
 			const pending = pendingSnapshots();
-			const { source } = mountStream(10);
+			const { source } = await mountStream(10);
 			const { observer } = observe(10);
 			const result = observer.refetch({ cancelRefetch: false });
 			source.message(start("not-yet-persisted", 20));
@@ -366,7 +368,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 	}
 	it("does not replay an obsolete start over a later terminal snapshot", async () => {
 		const pending = pendingSnapshots();
-		const { source } = mountStream(10);
+		const { source } = await mountStream(10);
 		const { observer } = observe(10);
 		const result = observer.refetch({ cancelRefetch: false });
 		source.message(start("completed-by-snapshot", 20));
@@ -391,7 +393,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 	});
 	it("preserves an SSE event between query resolution and QueryClient's cache commit", async () => {
 		const pending = pendingSnapshots();
-		const { source } = mountStream(10);
+		const { source } = await mountStream(10);
 		const { observer } = observe(10);
 		const result = observer.refetch({ cancelRefetch: false });
 		const resolving = pending.resolve(1, [summary("snapshot-only")]);
@@ -410,7 +412,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 	});
 	it("replays equal-timestamp starts in event order rather than snapshot order", async () => {
 		const pending = pendingSnapshots();
-		const { source } = mountStream(1);
+		const { source } = await mountStream(1);
 		const { observer } = observe(1);
 		const result = observer.refetch({ cancelRefetch: false });
 		for (let attempt = 1; attempt <= 3; attempt++) {
@@ -427,7 +429,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 	it("does not let a canceled fetch's late completion detach its replacement capture", async () => {
 		const pending = pendingSnapshots();
 		seed(10, [summary("existing")]);
-		const { source } = mountStream(10);
+		const { source } = await mountStream(10);
 		const { observer } = observe(10);
 		const result = observer.refetch();
 		source.message(start("replacement-1", 20));
@@ -457,8 +459,8 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 		).toBe(false);
 		expect(pending.fetch).toHaveBeenCalledTimes(4);
 	});
-	it("bounds capture state by the request limit and isolates clients and limits", () => {
-		const { source } = mountStream(2);
+	it("bounds capture state by the request limit and isolates clients and limits", async () => {
+		const { source } = await mountStream(2);
 		const own = captureRequestUpdates(queryClient, 2);
 		const otherLimit = captureRequestUpdates(queryClient, 10);
 		const otherClient = captureRequestUpdates(new QueryClient(), 2);
@@ -469,8 +471,8 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 		expect(otherLimit.updates.size).toBe(0);
 		expect(otherClient.updates.size).toBe(0);
 	});
-	it("makes capture disposal idempotent when a newer fetch has started", () => {
-		const { source } = mountStream(10);
+	it("makes capture disposal idempotent when a newer fetch has started", async () => {
+		const { source } = await mountStream(10);
 		const previous = captureRequestUpdates(queryClient, 10);
 		previous.dispose();
 		const next = captureRequestUpdates(queryClient, 10);
@@ -481,7 +483,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 	});
 	it("keeps the latest bounded history despite a burst of late old summaries", async () => {
 		const pending = pendingSnapshots();
-		const { source } = mountStream(2);
+		const { source } = await mountStream(2);
 		const { observer } = observe(2);
 		const result = observer.refetch({ cancelRefetch: false });
 		source.message(start("first", 40));

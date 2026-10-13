@@ -714,16 +714,20 @@ export class APIRouter {
 			)(req, url);
 		}
 
-		// Logs-stream token minting (#379): needs the authenticated caller's
+		// Stream token minting (#379, #479): needs the authenticated caller's
 		// identity (apiKeyId/role) to bind into the minted token, which the
 		// static handlers map (keyed only by method+path) has no way to pass
 		// through — so it's handled here, after the normal auth/authz checks
 		// above already ran for this path like any other /api/* endpoint.
-		if (path === "/api/logs/stream/token" && method === "POST") {
+		if (
+			method === "POST" &&
+			(path === "/api/logs/stream/token" ||
+				path === "/api/requests/stream/token")
+		) {
 			return await this.wrapHandler(() => {
-				const token = this.authService.mintLogsStreamToken(
+				const token = this.authService.mintStreamToken(
+					path === "/api/logs/stream/token" ? "logs" : "requests",
 					authResult.apiKeyId,
-					authResult.role,
 				);
 				return jsonResponse({ token });
 			})(req, url);
