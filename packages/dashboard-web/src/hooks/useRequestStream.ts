@@ -1,88 +1,234 @@
 import type { AgentAttributionSource } from "@better-ccflare/types";
-import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef } from "react";
+import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect } from "react";
 import type { Account, RequestPayload, RequestResponse } from "../api";
 import { queryKeys } from "../lib/query-keys";
 
-// Connection pool management
-const CONNECTION_POOL = new Map<
-	string,
-	{
-		connection: EventSource;
-		refCount: number;
-		lastUsed: number;
-		heartbeat: NodeJS.Timeout;
-	}
+interface RequestsData {
+	requests: RequestPayload[];
+	detailsMap: Map<string, RequestResponse> | RequestResponse[];
+}
+
+interface StreamSubscriber {
+	queryClient: QueryClient;
+	handleMessage: (event: MessageEvent) => void;
+}
+
+interface PooledConnection {
+	subscribers: Set<StreamSubscriber>;
+	connect: () => void;
+	dispose: () => void;
+}
+
+interface RequestSnapshotUpdate {
+	id: string;
+	timestamp: number;
+	sequence: number;
+	request?: RequestPayload;
+	summary?: RequestResponse;
+}
+
+const SNAPSHOT_LISTENERS = new WeakMap<
+	QueryClient,
+	Map<number, Set<(update: RequestSnapshotUpdate) => void>>
 >();
 
-// Cleanup inactive connections periodically
-const CLEANUP_INTERVAL = 30000; // 30 seconds
-const CONNECTION_TIMEOUT = 60000; // 1 minute
-const MAX_RETRIES = 10;
-const HEARTBEAT_INTERVAL = 15000; // 15 seconds
-
-// Global cleanup for connection pool
-let globalCleanupInterval: Timer | null = null;
-
-const startCleanupInterval = () => {
-	if (!globalCleanupInterval) {
-		globalCleanupInterval = setInterval(() => {
-			const now = Date.now();
-			for (const [key, conn] of CONNECTION_POOL.entries()) {
-				if (now - conn.lastUsed > CONNECTION_TIMEOUT && conn.refCount === 0) {
-					console.log(`Cleaning up inactive SSE connection: ${key}`);
-					conn.connection.close();
-					clearInterval(conn.heartbeat);
-					CONNECTION_POOL.delete(key);
-				}
-			}
-		}, CLEANUP_INTERVAL);
+// Keep only the newest visible requests while a snapshot is in flight. Summaries
+// are captured even without a cached row (including the initial empty cache).
+export function captureRequestUpdates(queryClient: QueryClient, limit: number) {
+	let byLimit = SNAPSHOT_LISTENERS.get(queryClient);
+	if (!byLimit) {
+		byLimit = new Map();
+		SNAPSHOT_LISTENERS.set(queryClient, byLimit);
 	}
-};
-
-const stopCleanupInterval = () => {
-	if (globalCleanupInterval) {
-		clearInterval(globalCleanupInterval);
-		globalCleanupInterval = null;
+	let listeners = byLimit.get(limit);
+	if (!listeners) {
+		listeners = new Set();
+		byLimit.set(limit, listeners);
 	}
-};
-
-// Start cleanup interval when first connection is created
-const getOrCreateCleanupInterval = () => {
-	if (!globalCleanupInterval) {
-		startCleanupInterval();
+	const updates = new Map<string, RequestSnapshotUpdate>();
+	let disposed = false;
+	const capture = (update: RequestSnapshotUpdate) => {
+		const previous = updates.get(update.id);
+		updates.set(update.id, {
+			...update,
+			request: update.request ?? previous?.request,
+			summary: update.summary ?? previous?.summary,
+		});
+		if (updates.size > limit) {
+			const oldest = [...updates.values()].reduce((left, right) =>
+				left.timestamp <= right.timestamp ? left : right,
+			);
+			updates.delete(oldest.id);
+		}
+	};
+	// Pending rows predate persistence and can already exist before this fetch.
+	// Seed only those rows; a snapshot must still be able to remove old history.
+	const cached = queryClient.getQueryData<RequestsData>(
+		queryKeys.requests(limit),
+	);
+	for (const request of cached?.requests ?? []) {
+		if (request.meta?.pending)
+			capture({
+				id: request.id,
+				timestamp: request.meta.timestamp,
+				sequence: requestsSseSeq,
+				request,
+			});
 	}
-	return globalCleanupInterval;
-};
+	listeners.add(capture);
+	return {
+		updates,
+		dispose: () => {
+			if (disposed) return;
+			disposed = true;
+			listeners.delete(capture);
+			if (listeners.size === 0) byLimit.delete(limit);
+			if (byLimit.size === 0) SNAPSHOT_LISTENERS.delete(queryClient);
+			updates.clear();
+		},
+	};
+}
+
+const CONNECTION_POOL = new Map<string, PooledConnection>();
+const HEARTBEAT_INTERVAL = 15_000;
+const RECONNECT_MAX_DELAY = 30_000;
+const HIDDEN_RECONNECT_THRESHOLD = 30_000;
+let requestsSseSeq = 0;
+
+export function getRequestsSseSeq(): number {
+	return requestsSseSeq;
+}
+
+function pruneDetailsMap(
+	map: Map<string, RequestResponse>,
+	requests: RequestPayload[],
+): Map<string, RequestResponse> {
+	const ids = new Set(requests.map((request) => request.id));
+	if ([...map.keys()].every((id) => ids.has(id))) return map;
+	return new Map([...map].filter(([id]) => ids.has(id)));
+}
+
+// The pool owns recovery, not the component that happened to connect first.
+// Keep subscribers while reconnecting so one unmount cannot orphan the others.
+function createPooledConnection(key: string, limit: number): PooledConnection {
+	const subscribers = new Set<StreamSubscriber>();
+	let connection: EventSource | null = null;
+	let retryTimer: ReturnType<typeof setTimeout> | null = null;
+	let disposed = false;
+	let attempt = 0;
+	let hiddenAt: number | null =
+		document.visibilityState === "hidden" ? Date.now() : null;
+
+	const forEachClient = (visit: (subscriber: StreamSubscriber) => void) => {
+		const seen = new Set<QueryClient>();
+		for (const subscriber of subscribers) {
+			if (seen.has(subscriber.queryClient)) continue;
+			seen.add(subscriber.queryClient);
+			visit(subscriber);
+		}
+	};
+	const invalidate = () =>
+		forEachClient(({ queryClient }) => {
+			void queryClient.invalidateQueries({
+				queryKey: queryKeys.requests(limit),
+			});
+		});
+	const clearRetry = () => {
+		if (retryTimer !== null) clearTimeout(retryTimer);
+		retryTimer = null;
+	};
+	const closeConnection = () => {
+		const previous = connection;
+		connection = null;
+		previous?.close();
+	};
+	const connect = () => {
+		if (disposed || subscribers.size === 0) return;
+		clearRetry();
+		closeConnection();
+		const es = new EventSource("/api/requests/stream");
+		connection = es;
+		const isCurrent = () => !disposed && connection === es;
+		es.addEventListener("open", () => {
+			if (!isCurrent()) return;
+			// A fresh pool can still have Infinity-stale history retained in cache.
+			invalidate();
+			attempt = 0;
+		});
+		es.addEventListener("message", (event) => {
+			if (isCurrent())
+				forEachClient(({ handleMessage }) => handleMessage(event));
+		});
+		es.addEventListener("error", () => {
+			if (!isCurrent()) return;
+			// Disable browser retries; this entry owns exactly one retry timer.
+			closeConnection();
+			const base = Math.min(1000 * 2 ** attempt, RECONNECT_MAX_DELAY);
+			attempt++;
+			retryTimer = setTimeout(
+				() => {
+					retryTimer = null;
+					connect();
+				},
+				Math.round(base + Math.random() * base * 0.25),
+			);
+		});
+	};
+	const recover = (hiddenMs: number, online: boolean) => {
+		if (disposed) return;
+		invalidate();
+		if (
+			connection?.readyState !== EventSource.OPEN ||
+			online ||
+			hiddenMs > HIDDEN_RECONNECT_THRESHOLD
+		) {
+			attempt = 0;
+			connect();
+		}
+	};
+	const onVisibilityChange = () => {
+		if (document.visibilityState === "hidden") {
+			hiddenAt = Date.now();
+			return;
+		}
+		const hiddenMs = hiddenAt === null ? 0 : Date.now() - hiddenAt;
+		hiddenAt = null;
+		recover(hiddenMs, false);
+	};
+	const onOnline = () => recover(0, true);
+	document.addEventListener("visibilitychange", onVisibilityChange);
+	window.addEventListener("online", onOnline);
+	const heartbeat = setInterval(() => {
+		// CONNECTING belongs to the current handshake, not a dead connection.
+		if (connection?.readyState === EventSource.CLOSED) connect();
+	}, HEARTBEAT_INTERVAL);
+
+	const pooled: PooledConnection = {
+		subscribers,
+		connect: () => connect(),
+		dispose: () => {
+			if (disposed) return;
+			disposed = true;
+			clearRetry();
+			clearInterval(heartbeat);
+			document.removeEventListener("visibilitychange", onVisibilityChange);
+			window.removeEventListener("online", onOnline);
+			closeConnection();
+			subscribers.clear();
+			if (CONNECTION_POOL.get(key) === pooled) CONNECTION_POOL.delete(key);
+		},
+	};
+	return pooled;
+}
 
 export function useRequestStream(limit = 200) {
 	const queryClient = useQueryClient();
 	const connectionKey = `requests-stream-${limit}`;
-	const isMountedRef = useRef(true);
-
-	// Heartbeat to keep connection alive and detect dead connections
-	const setupHeartbeat = useCallback((es: EventSource, key: string) => {
-		return setInterval(() => {
-			if (
-				es.readyState === EventSource.CLOSED ||
-				es.readyState === EventSource.CONNECTING
-			) {
-				console.log(`Connection ${key} is not ready, cleaning up`);
-				const pooled = CONNECTION_POOL.get(key);
-				if (pooled) {
-					clearInterval(pooled.heartbeat);
-					CONNECTION_POOL.delete(key);
-				}
-				es.close();
-			}
-		}, HEARTBEAT_INTERVAL);
-	}, []);
 
 	// Safe message handler with try-catch that directly updates React Query cache
 	const handleMessage = useCallback(
 		(ev: MessageEvent) => {
-			if (!isMountedRef.current) return;
-
 			try {
 				const evt = JSON.parse(ev.data) as
 					| {
@@ -98,28 +244,20 @@ export function useRequestStream(limit = 200) {
 					  }
 					| { type: "summary"; payload: RequestResponse };
 
-				queryClient.setQueryData(
+				requestsSseSeq++;
+				const data = queryClient.setQueryData<RequestsData>(
 					queryKeys.requests(limit),
-					(
-						current:
-							| {
-									requests: RequestPayload[];
-									detailsMap: Map<string, RequestResponse> | RequestResponse[];
-							  }
-							| undefined,
-					) => {
-						if (!current) return current;
+					(current) => {
+						if (!current) {
+							if (evt.type !== "start") return current;
+							current = { requests: [], detailsMap: new Map() };
+						}
 
 						// Ensure detailsMap is a Map
 						const currentDetailsMap =
 							current.detailsMap instanceof Map
 								? current.detailsMap
-								: new Map(
-										(current.detailsMap as RequestResponse[]).map((s) => [
-											s.id,
-											s,
-										]),
-									);
+								: new Map(current.detailsMap.map((s) => [s.id, s]));
 
 						if (evt.type === "start") {
 							// Look up account name from cache
@@ -182,62 +320,90 @@ export function useRequestStream(limit = 200) {
 								};
 							}
 
-							// Add new placeholder at the beginning
+							// Add new placeholder at the beginning.
+							const nextRequests = [placeholder, ...current.requests].slice(
+								0,
+								limit,
+							);
 							return {
 								...current,
-								requests: [placeholder, ...current.requests].slice(0, limit),
-								detailsMap: currentDetailsMap,
+								requests: nextRequests,
+								detailsMap: pruneDetailsMap(currentDetailsMap, nextRequests),
 							};
 						}
-						// Update details map with summary
-						const map = new Map(currentDetailsMap);
-						map.set(evt.payload.id, evt.payload);
-
-						// Update the request if it exists
 						const requestIndex = current.requests.findIndex(
 							(r) => r.id === evt.payload.id,
 						);
-						if (requestIndex >= 0) {
-							const newRequests = [...current.requests];
-							// Update meta to remove pending status. Preserve
-							// `bodiesOmitted: true` so consumers continue to lazy-
-							// load bodies, and refresh `rateLimited` from the final
-							// statusCode (the placeholder set it from `evt.statusCode`
-							// which is 0 until the response lands).
-							if (newRequests[requestIndex].meta) {
-								newRequests[requestIndex] = {
-									...newRequests[requestIndex],
-									// Refresh response.status from the final summary —
-									// the start placeholder set it to 0 before the HTTP
-									// response landed, and the new header-row chip uses
-									// a `statusCode != null` guard (0 is not null), so
-									// without this every SSE-completed request would
-									// permanently display a grey "0" chip.
-									response:
-										evt.payload.statusCode != null
-											? {
-													...(newRequests[requestIndex].response ?? {
-														headers: {},
-														body: null,
-													}),
-													status: evt.payload.statusCode,
-												}
-											: null,
-									meta: {
-										...newRequests[requestIndex].meta,
-										pending: false,
-										success: evt.payload.success,
-										rateLimited: evt.payload.rateLimited,
-										bodiesOmitted: true,
-									},
-								};
-							}
-							return { ...current, requests: newRequests, detailsMap: map };
+						if (requestIndex < 0) {
+							const detailsMap = pruneDetailsMap(
+								currentDetailsMap,
+								current.requests,
+							);
+							return detailsMap === current.detailsMap
+								? current
+								: { ...current, detailsMap };
 						}
 
-						return { ...current, detailsMap: map };
+						const map = new Map(currentDetailsMap);
+						map.set(evt.payload.id, evt.payload);
+						const newRequests = [...current.requests];
+						// Update meta to remove pending status. Preserve
+						// `bodiesOmitted: true` so consumers continue to lazy-
+						// load bodies, and refresh `rateLimited` from the final
+						// statusCode (the placeholder set it from `evt.statusCode`
+						// which is 0 until the response lands).
+						if (newRequests[requestIndex].meta) {
+							newRequests[requestIndex] = {
+								...newRequests[requestIndex],
+								// Refresh response.status from the final summary —
+								// the start placeholder set it to 0 before the HTTP
+								// response landed, and the new header-row chip uses
+								// a `statusCode != null` guard (0 is not null), so
+								// without this every SSE-completed request would
+								// permanently display a grey "0" chip.
+								response:
+									evt.payload.statusCode != null
+										? {
+												...(newRequests[requestIndex].response ?? {
+													headers: {},
+													body: null,
+												}),
+												status: evt.payload.statusCode,
+											}
+										: null,
+								meta: {
+									...newRequests[requestIndex].meta,
+									pending: false,
+									success: evt.payload.success,
+									rateLimited: evt.payload.rateLimited,
+									bodiesOmitted: true,
+								},
+							};
+						}
+						return {
+							...current,
+							requests: newRequests,
+							detailsMap: pruneDetailsMap(map, newRequests),
+						};
 					},
 				);
+				const listeners = SNAPSHOT_LISTENERS.get(queryClient)?.get(limit);
+				if (listeners?.size) {
+					const id = evt.type === "start" ? evt.id : evt.payload.id;
+					const request = data?.requests.find((item) => item.id === id);
+					const timestamp =
+						evt.type === "start"
+							? evt.timestamp
+							: new Date(evt.payload.timestamp).getTime();
+					for (const listener of listeners)
+						listener({
+							id,
+							sequence: requestsSseSeq,
+							timestamp: Number.isFinite(timestamp) ? timestamp : 0,
+							request,
+							summary: evt.type === "summary" ? evt.payload : undefined,
+						});
+				}
 			} catch (error) {
 				console.error("Error parsing SSE message:", error);
 			}
@@ -245,134 +411,25 @@ export function useRequestStream(limit = 200) {
 		[queryClient, limit],
 	);
 
-	// Connect with connection pooling
-	const connect = useCallback(
-		(retryCount = 0): EventSource => {
-			// Ensure cleanup interval is running
-			getOrCreateCleanupInterval();
-
-			// Check if we have a healthy connection in the pool
-			const pooled = CONNECTION_POOL.get(connectionKey);
-			if (pooled && pooled.connection.readyState === EventSource.OPEN) {
-				pooled.refCount++;
-				pooled.lastUsed = Date.now();
-				console.log(
-					`Reusing pooled SSE connection: ${connectionKey} (refCount: ${pooled.refCount})`,
-				);
-				return pooled.connection;
-			}
-
-			// Close any existing connection for this key
-			if (pooled) {
-				pooled.connection.close();
-				clearInterval(pooled.heartbeat);
-				CONNECTION_POOL.delete(connectionKey);
-			}
-
-			console.log(`Creating new SSE connection: ${connectionKey}`);
-			const es = new EventSource("/api/requests/stream");
-
-			// Setup event handlers
-			es.addEventListener("open", () => {
-				if (!isMountedRef.current) {
-					es.close();
-					return;
-				}
-				console.log(`SSE connection established: ${connectionKey}`);
-			});
-
-			es.addEventListener("message", handleMessage);
-
-			es.addEventListener("error", (error) => {
-				console.error(`SSE connection error (${connectionKey}):`, error);
-
-				// Remove from pool
-				const pooled = CONNECTION_POOL.get(connectionKey);
-				if (pooled) {
-					clearInterval(pooled.heartbeat);
-					CONNECTION_POOL.delete(connectionKey);
-				}
-
-				// Only reconnect if component is still mounted and we haven't exceeded max retries
-				if (isMountedRef.current && retryCount < MAX_RETRIES) {
-					const delay = Math.min(1000 * 2 ** retryCount, 30000);
-					console.log(
-						`Reconnecting ${connectionKey} in ${delay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`,
-					);
-
-					setTimeout(() => {
-						if (isMountedRef.current) {
-							connect(retryCount + 1);
-						}
-					}, delay);
-				} else if (retryCount >= MAX_RETRIES) {
-					console.error(`Max retries reached for ${connectionKey}, giving up`);
-				}
-			});
-
-			// Add to pool with heartbeat
-			const heartbeat = setupHeartbeat(es, connectionKey);
-			CONNECTION_POOL.set(connectionKey, {
-				connection: es,
-				refCount: 1,
-				lastUsed: Date.now(),
-				heartbeat,
-			});
-
-			return es;
-		},
-		[connectionKey, handleMessage, setupHeartbeat],
-	);
-
 	useEffect(() => {
-		isMountedRef.current = true;
-		const es = connect();
+		let pooled = CONNECTION_POOL.get(connectionKey);
+		const isNew = !pooled;
+		if (!pooled) {
+			pooled = createPooledConnection(connectionKey, limit);
+			CONNECTION_POOL.set(connectionKey, pooled);
+		}
+		const subscriber = { queryClient, handleMessage };
+		pooled.subscribers.add(subscriber);
+		if (isNew) pooled.connect();
 
-		// Cleanup function
 		return () => {
-			isMountedRef.current = false;
-
-			const pooled = CONNECTION_POOL.get(connectionKey);
-			if (pooled) {
-				pooled.refCount--;
-				pooled.lastUsed = Date.now();
-
-				// Close connection immediately if no more references
-				if (pooled.refCount <= 0) {
-					console.log(`No more references for ${connectionKey}, closing`);
-					pooled.connection.close();
-					clearInterval(pooled.heartbeat);
-					CONNECTION_POOL.delete(connectionKey);
-				}
-			} else if (es) {
-				es.close();
-			}
+			pooled.subscribers.delete(subscriber);
+			if (pooled.subscribers.size === 0) pooled.dispose();
 		};
-	}, [connect, connectionKey]);
-
-	// Global cleanup on unmount
-	useEffect(() => {
-		return () => {
-			isMountedRef.current = false;
-
-			// Stop global cleanup interval if no more connections
-			if (CONNECTION_POOL.size === 0) {
-				stopCleanupInterval();
-			}
-		};
-	}, []);
+	}, [connectionKey, limit, queryClient, handleMessage]);
 }
 
-// Export global cleanup function for app shutdown
+// Export global cleanup function for app shutdown, including pending retries.
 export const cleanupRequestStream = () => {
-	// Stop the global cleanup interval
-	stopCleanupInterval();
-
-	// Close all pooled connections
-	for (const [key, conn] of CONNECTION_POOL.entries()) {
-		console.log(`Cleaning up SSE connection on shutdown: ${key}`);
-		conn.connection.close();
-		clearInterval(conn.heartbeat);
-	}
-	CONNECTION_POOL.clear();
+	for (const pooled of CONNECTION_POOL.values()) pooled.dispose();
 };
