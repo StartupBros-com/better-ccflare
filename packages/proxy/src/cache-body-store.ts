@@ -16,8 +16,8 @@ const log = new Logger("CacheBodyStore");
  *     replays the body through the proxy.
  *
  * Memory bounds:
- *  - stagingMap: one entry per in-flight request, cleared on completion → bounded
- *    by concurrent request count.
+ *  - stagingMap: at most 200 in-flight entries and 64 MiB of bodies,
+ *    cleared on completion or expiry.
  *  - lastCachedRequest: one entry per account → bounded by account count.
  *
  * Note: client headers ARE stored because some providers (e.g. Anthropic) copy
@@ -35,6 +35,7 @@ const CACHEABLE_PATH = "/v1/messages";
 
 /** Maximum number of in-flight staging entries. Oldest is evicted when exceeded. */
 const MAX_STAGING_ENTRIES = 200;
+const MAX_STAGING_BYTES = 64 * 1024 * 1024;
 
 /** Maximum age for a staging entry before it is swept out. */
 const STAGING_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
@@ -43,28 +44,14 @@ const STAGING_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
  * Byte patterns to search for in the request body to detect cache_control hints.
  * Both quoted forms cover JSON key serialization styles.
  */
-const CACHE_CONTROL_HINTS: Uint8Array[] = [
-	new TextEncoder().encode('"cache_control"'),
-	new TextEncoder().encode('"cache-control"'),
+const CACHE_CONTROL_HINTS = [
+	Buffer.from('"cache_control"'),
+	Buffer.from('"cache-control"'),
 ];
 
-function containsBytes(haystack: Uint8Array, needle: Uint8Array): boolean {
-	const hLen = haystack.length;
-	const nLen = needle.length;
-	if (nLen === 0) return true;
-	if (nLen > hLen) return false;
-	outer: for (let i = 0; i <= hLen - nLen; i++) {
-		for (let j = 0; j < nLen; j++) {
-			if (haystack[i + j] !== needle[j]) continue outer;
-		}
-		return true;
-	}
-	return false;
-}
-
 export function hasCacheControlHint(body: ArrayBuffer): boolean {
-	const bytes = new Uint8Array(body);
-	return CACHE_CONTROL_HINTS.some((hint) => containsBytes(bytes, hint));
+	const bytes = Buffer.from(body);
+	return CACHE_CONTROL_HINTS.some((hint) => bytes.indexOf(hint) !== -1);
 }
 
 export interface CachedRequestEntry {
@@ -120,6 +107,8 @@ class CacheBodyStore {
 		}
 	>();
 
+	private stagingBytes = 0;
+
 	/** accountId → last request that created or read a cache entry. */
 	private lastCachedRequest = new Map<string, CachedRequestEntry>();
 
@@ -141,6 +130,7 @@ class CacheBodyStore {
 		this.enabled = enabled;
 		if (!enabled) {
 			this.staging.clear();
+			this.stagingBytes = 0;
 			this.lastCachedRequest.clear();
 			this.stagingEligibility = null;
 		}
@@ -193,7 +183,7 @@ class CacheBodyStore {
 		// cost. Still clear any prior staging for this request id so a later
 		// summary cannot promote a stale projection.
 		if (this.stagingEligibility && !this.stagingEligibility(providerName)) {
-			this.staging.delete(requestId);
+			this.removeStaged(requestId);
 			return;
 		}
 
@@ -201,9 +191,12 @@ class CacheBodyStore {
 		// model fallback, or account failover. Each new attempt replaces the prior
 		// projection, even when the new transport is not cacheable, so a later
 		// response summary can never promote stale residue from a failed route.
-		this.staging.delete(requestId);
+		this.removeStaged(requestId);
 
 		if (!accountId || !body || body.byteLength === 0) return;
+		// Reject before evicting useful bodies, but after retiring this id's
+		// previous attempt so an oversized retry cannot promote stale content.
+		if (body.byteLength > MAX_STAGING_BYTES) return;
 
 		// Only cache prompt-cache-relevant endpoint.
 		if (path !== CACHEABLE_PATH) return;
@@ -245,8 +238,13 @@ class CacheBodyStore {
 			},
 		});
 
-		// Enforce size cap: evict oldest entry if over limit.
-		if (this.staging.size > MAX_STAGING_ENTRIES) {
+		this.stagingBytes += body.byteLength;
+
+		// Enforce both caps, including when several smaller bodies must go.
+		while (
+			this.staging.size > MAX_STAGING_ENTRIES ||
+			this.stagingBytes > MAX_STAGING_BYTES
+		) {
 			let oldestId: string | null = null;
 			let oldestTimestamp = Infinity;
 			for (const [id, staged] of this.staging) {
@@ -255,12 +253,11 @@ class CacheBodyStore {
 					oldestId = id;
 				}
 			}
-			if (oldestId !== null) {
-				this.staging.delete(oldestId);
-				log.warn(
-					`Staging cap (${MAX_STAGING_ENTRIES}) exceeded — evicted oldest entry (requestId=${oldestId})`,
-				);
-			}
+			if (oldestId === null) break;
+			this.removeStaged(oldestId);
+			log.warn(
+				`Staging cap (${MAX_STAGING_ENTRIES} entries / ${MAX_STAGING_BYTES} bytes) exceeded — evicted oldest entry (requestId=${oldestId})`,
+			);
 		}
 
 		// Sweep stale entries on every stage call.
@@ -273,6 +270,13 @@ class CacheBodyStore {
 	 * the staging map from leaking memory.
 	 */
 	discardStaged(requestId: string): void {
+		this.removeStaged(requestId);
+	}
+
+	private removeStaged(requestId: string): void {
+		const staged = this.staging.get(requestId);
+		if (!staged) return;
+		this.stagingBytes -= staged.entry.body.byteLength;
 		this.staging.delete(requestId);
 	}
 
@@ -285,7 +289,7 @@ class CacheBodyStore {
 		let swept = 0;
 		for (const [id, staged] of this.staging) {
 			if (staged.entry.timestamp < cutoff) {
-				this.staging.delete(id);
+				this.removeStaged(id);
 				swept++;
 			}
 		}
@@ -312,7 +316,7 @@ class CacheBodyStore {
 		},
 	): void {
 		const staged = this.staging.get(requestId);
-		this.staging.delete(requestId);
+		this.removeStaged(requestId);
 
 		if (!staged) return;
 

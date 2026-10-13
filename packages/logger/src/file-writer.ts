@@ -162,8 +162,7 @@ export class LogFileWriter implements Disposable {
 		}
 
 		try {
-			const content = await Bun.file(this.logFile).text();
-			const lines = content.trim().split("\n").filter(Boolean);
+			const lines = await this.readTailLines(limit);
 
 			// Return the last N logs
 			return lines
@@ -179,6 +178,43 @@ export class LogFileWriter implements Disposable {
 		} catch (_e) {
 			console.error("Failed to read logs:", _e);
 			return [];
+		}
+	}
+
+	private async readTailLines(limit: number): Promise<string[]> {
+		const file = Bun.file(this.logFile);
+		const count = Math.trunc(limit);
+		// slice(-0), fractional limits below 1, negative and non-finite limits
+		// have existing whole-file semantics; don't narrow that compatibility.
+		if (!Number.isFinite(count) || count <= 0) {
+			return (await file.text()).trim().split("\n").filter(Boolean);
+		}
+		const size = file.size;
+		let windowBytes = 256 * 1024;
+		while (true) {
+			const start = Math.max(0, size - windowBytes);
+			const bytes = await file.slice(start, size).arrayBuffer();
+			if (bytes.byteLength !== size - start) {
+				// Rotation/truncation raced the size snapshot. Read the current file
+				// rather than treating an incomplete tail as complete history.
+				return (await Bun.file(this.logFile).text())
+					.trim()
+					.split("\n")
+					.filter(Boolean);
+			}
+			let text = new TextDecoder().decode(bytes);
+			if (start > 0) {
+				const newline = text.indexOf("\n");
+				// Drop the partial first line, including any split UTF-8 character.
+				text = newline < 0 ? "" : text.slice(newline + 1).trimEnd();
+			} else {
+				text = text.trim();
+			}
+			// Interior whitespace/malformed lines count toward the limit, just
+			// as before; parsing happens only after slicing in readLogs().
+			const lines = text.split("\n").filter(Boolean);
+			if (start === 0 || lines.length >= count) return lines;
+			windowBytes *= 2;
 		}
 	}
 
