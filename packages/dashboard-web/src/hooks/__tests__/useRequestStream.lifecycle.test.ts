@@ -9,12 +9,62 @@ const queryClient = new QueryClient({
 const invalidations = mock(() => Promise.resolve());
 queryClient.invalidateQueries = invalidations;
 
+interface HookSlot {
+	dependencies?: readonly unknown[];
+	value?: unknown;
+	cleanup?: () => void;
+}
+let rerenderSlots: HookSlot[] | undefined;
+let hookCursor = 0;
+function sameDependencies(
+	left?: readonly unknown[],
+	right?: readonly unknown[],
+) {
+	return Boolean(
+		left &&
+			right &&
+			left.length === right.length &&
+			left.every((value, index) => Object.is(value, right[index])),
+	);
+}
+
 mock.module("react", () => ({
-	useCallback: <T>(callback: T) => callback,
-	useEffect: (effect: () => undefined | (() => void)) => {
-		effects.push(effect);
+	useCallback: <T>(callback: T, dependencies?: readonly unknown[]) => {
+		if (!rerenderSlots) return callback;
+		const index = hookCursor++;
+		const slot = rerenderSlots[index];
+		if (slot && sameDependencies(slot.dependencies, dependencies))
+			return slot.value as T;
+		rerenderSlots[index] = { dependencies, value: callback };
+		return callback;
 	},
-	useRef: <T>(value: T) => ({ current: value }),
+	useEffect: (
+		effect: () => undefined | (() => void),
+		dependencies?: readonly unknown[],
+	) => {
+		if (!rerenderSlots) {
+			effects.push(effect);
+			return;
+		}
+		const index = hookCursor++;
+		const previous = rerenderSlots[index];
+		if (previous && sameDependencies(previous.dependencies, dependencies))
+			return;
+		const slot: HookSlot = { dependencies };
+		rerenderSlots[index] = slot;
+		effects.push(() => {
+			previous?.cleanup?.();
+			slot.cleanup = effect() ?? undefined;
+			return slot.cleanup;
+		});
+	},
+	useRef: <T>(value: T) => {
+		if (!rerenderSlots) return { current: value };
+		const index = hookCursor++;
+		rerenderSlots[index] ??= { value: { current: value } };
+		const slot = rerenderSlots[index];
+		return slot.value as { current: T };
+	},
 }));
 mock.module("@tanstack/react-query", () => ({
 	useQueryClient: () => queryClient,
@@ -69,14 +119,23 @@ class FakeEventSource extends EventTarget {
 const { cleanupRequestStream, getRequestsSseSeq, useRequestStream } =
 	await import("../useRequestStream");
 
-function RequestStreamTestComponent(limit: number) {
-	useRequestStream(limit);
+function RequestStreamTestComponent({
+	limit,
+	onSummary,
+}: {
+	limit: number;
+	onSummary?: (summary: unknown) => void;
+}) {
+	useRequestStream(limit, onSummary);
 	return null;
 }
 
-function mount(limit = 200): () => void {
+function mount(
+	limit = 200,
+	onSummary?: (summary: unknown) => void,
+): () => void {
 	effects.length = 0;
-	RequestStreamTestComponent(limit);
+	RequestStreamTestComponent({ limit, onSummary });
 	const cleanups = effects
 		.map((effect) => effect())
 		.filter((cleanup): cleanup is () => void => Boolean(cleanup));
@@ -107,7 +166,7 @@ function start(id: string) {
 		accountId: null,
 		statusCode: 0,
 		agentUsed: "reviewer",
-		agentAttributionSource: "header",
+		agentAttributionSource: "header_agent",
 	};
 }
 
@@ -143,6 +202,8 @@ beforeEach(() => {
 	Date.now = () => now;
 });
 afterEach(() => {
+	rerenderSlots = undefined;
+	hookCursor = 0;
 	cleanupRequestStream();
 	queryClient.clear();
 	invalidations.mockClear();
@@ -161,6 +222,77 @@ afterEach(() => {
 });
 
 describe("useRequestStream lifecycle", () => {
+	it("uses the latest selection callback without reconnecting or adding timers on rerender", () => {
+		rerenderSlots = [];
+		const render = (onSummary?: (summary: unknown) => void) => {
+			hookCursor = 0;
+			effects.length = 0;
+			RequestStreamTestComponent({ limit: 1, onSummary });
+			for (const effect of effects) effect();
+		};
+		const firstSummary = mock(() => {});
+		const secondSummary = mock(() => {});
+		render(firstSummary);
+		const source = currentSource();
+		source.open();
+		render(secondSummary);
+		const payload = {
+			id: "selected",
+			timestamp: new Date(1).toISOString(),
+			statusCode: 429,
+			success: false,
+		};
+		source.message({ type: "summary", payload });
+		expect(firstSummary).not.toHaveBeenCalled();
+		expect(secondSummary).toHaveBeenCalledTimes(1);
+		expect(FakeEventSource.instances).toHaveLength(1);
+		expect(source.close).not.toHaveBeenCalled();
+		expect(intervals.size).toBe(1);
+		expect(timeouts.size).toBe(0);
+		render(undefined);
+		source.message({ type: "summary", payload });
+		expect(secondSummary).toHaveBeenCalledTimes(1);
+		for (const slot of rerenderSlots) slot.cleanup?.();
+		expect(source.close).toHaveBeenCalledTimes(1);
+		expect(intervals.size).toBe(0);
+		expect(timeouts.size).toBe(0);
+		source.message({ type: "summary", payload });
+		expect(secondSummary).toHaveBeenCalledTimes(1);
+	});
+	it("notifies every subscriber of an evicted summary while writing shared cache once", () => {
+		const firstSummary = mock(() => {});
+		const secondSummary = mock(() => {});
+		const first = mount(1, firstSummary);
+		const second = mount(1, secondSummary);
+		currentSource().open();
+		now = 100;
+		currentSource().message(start("newer"));
+		const before = queryClient.getQueryData(queryKeys.requests(1));
+		const sequence = getRequestsSseSeq();
+		const payload = {
+			id: "evicted",
+			timestamp: new Date(1).toISOString(),
+			statusCode: 429,
+			rateLimited: true,
+			success: false,
+		};
+		currentSource().message({ type: "summary", payload });
+		expect(queryClient.getQueryData<unknown>(queryKeys.requests(1))).toBe(
+			before,
+		);
+		expect(getRequestsSseSeq()).toBe(sequence + 1);
+		expect(firstSummary).toHaveBeenCalledTimes(1);
+		expect(secondSummary).toHaveBeenCalledTimes(1);
+		expect(secondSummary).toHaveBeenCalledWith(payload);
+		first();
+		currentSource().message({ type: "summary", payload });
+		expect(firstSummary).toHaveBeenCalledTimes(1);
+		expect(secondSummary).toHaveBeenCalledTimes(2);
+		const source = currentSource();
+		second();
+		source.message({ type: "summary", payload });
+		expect(secondSummary).toHaveBeenCalledTimes(2);
+	});
 	it("closes the last source and clears every timer on final unmount", () => {
 		const unmount = mount();
 		const source = currentSource();
@@ -288,16 +420,23 @@ describe("useRequestStream lifecycle", () => {
 		const unmount = mount(1);
 		currentSource().open();
 		queryClient.setQueryData(queryKeys.requests(1), {
-			requests: [{ id: "live" }],
+			requests: [{ id: "live", meta: { timestamp: 100 } }],
 			detailsMap: new Map([["live", { id: "live", statusCode: 200 }]]),
 		});
 		const before = queryClient.getQueryData(queryKeys.requests(1));
 		const sequence = getRequestsSseSeq();
 		currentSource().message({
 			type: "summary",
-			payload: { id: "evicted", statusCode: 200, success: true },
+			payload: {
+				id: "evicted",
+				timestamp: new Date(1).toISOString(),
+				statusCode: 200,
+				success: true,
+			},
 		});
-		expect(queryClient.getQueryData(queryKeys.requests(1))).toBe(before);
+		expect(queryClient.getQueryData<unknown>(queryKeys.requests(1))).toBe(
+			before,
+		);
 		expect(getRequestsSseSeq()).toBe(sequence + 1);
 		unmount();
 	});
@@ -309,7 +448,7 @@ describe("useRequestStream lifecycle", () => {
 			const summaries =
 				shape === "array" ? [live] : [live, { id: "stale", statusCode: 500 }];
 			queryClient.setQueryData(queryKeys.requests(1), {
-				requests: [{ id: "live" }],
+				requests: [{ id: "live", meta: { timestamp: 100 } }],
 				detailsMap:
 					shape === "stale-map"
 						? new Map(summaries.map((summary) => [summary.id, summary]))
@@ -318,7 +457,12 @@ describe("useRequestStream lifecycle", () => {
 			const before = queryClient.getQueryData(queryKeys.requests(1));
 			currentSource().message({
 				type: "summary",
-				payload: { id: "evicted", statusCode: 200, success: true },
+				payload: {
+					id: "evicted",
+					timestamp: new Date(1).toISOString(),
+					statusCode: 200,
+					success: true,
+				},
 			});
 			const after = queryClient.getQueryData<{
 				detailsMap: Map<string, unknown>;
@@ -375,7 +519,7 @@ describe("useRequestStream lifecycle", () => {
 		expect(data.requests[0].response.status).toBe(429);
 		expect(data.requests[0].meta).toMatchObject({
 			agentUsed: "reviewer",
-			agentAttributionSource: "header",
+			agentAttributionSource: "header_agent",
 			bodiesOmitted: true,
 			pending: false,
 			rateLimited: true,

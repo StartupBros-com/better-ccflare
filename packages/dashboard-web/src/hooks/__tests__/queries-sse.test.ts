@@ -1,9 +1,25 @@
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	jest,
+	mock,
+	spyOn,
+} from "bun:test";
 import * as reactQuery from "@tanstack/react-query";
 import { api } from "../../api";
+import { REFRESH_INTERVALS } from "../../constants";
 import { captureRequestUpdates } from "../useRequestStream";
 
-const queryClient = new reactQuery.QueryClient();
+const queryClient = new reactQuery.QueryClient({
+	defaultOptions: {
+		queries: { retry: false, refetchInterval: REFRESH_INTERVALS.default },
+	},
+});
+const cleanups: Array<() => void> = [];
+const originalIsServer = reactQuery.environmentManager.isServer();
 
 let sequence = 0;
 mock.module("@tanstack/react-query", () => ({
@@ -15,13 +31,10 @@ mock.module("../useRequestStream", () => ({
 	captureRequestUpdates,
 }));
 const { useRequests, useLogHistory } = await import("../queries");
-type Options = reactQuery.FetchQueryOptions<{
+type Options = reactQuery.QueryObserverOptions<{
 	requests: { id: string }[];
 	detailsMap: Map<string, unknown>;
-}> & {
-	refetchInterval?: false | number;
-	refetchOnWindowFocus?: boolean;
-};
+}>;
 const summary = (id: string) =>
 	({
 		id,
@@ -31,15 +44,31 @@ const summary = (id: string) =>
 		inputTokens: 0,
 		outputTokens: 0,
 	}) as Awaited<ReturnType<typeof api.getRequestsSummary>>[number];
+beforeEach(() => {
+	spyOn(api, "hasApiKey").mockReturnValue(false);
+});
 afterEach(() => {
+	for (const cleanup of cleanups.splice(0)) cleanup();
 	sequence = 0;
 	queryClient.clear();
+	jest.useRealTimers();
+	reactQuery.environmentManager.setIsServer(() => originalIsServer);
+	reactQuery.focusManager.setFocused(undefined);
 	mock.restore();
 });
 
 describe("SSE-backed query configuration", () => {
-	it("explicitly disables global request/log polling and log focus refetches", () => {
+	it("disables global request polling without a key and preserves the log policy", () => {
 		expect((useRequests(10) as unknown as Options).refetchInterval).toBe(false);
+		const logs = useLogHistory() as unknown as Options;
+		expect(logs.refetchInterval).toBe(false);
+		expect(logs.refetchOnWindowFocus).toBe(false);
+	});
+	it("uses the shared polling fallback only when an API key is present", () => {
+		spyOn(api, "hasApiKey").mockReturnValue(true);
+		const requests = useRequests(10) as unknown as Options;
+		expect(requests.refetchInterval).toBe(REFRESH_INTERVALS.default);
+		expect(requests.staleTime).toBe(Infinity);
 		const logs = useLogHistory() as unknown as Options;
 		expect(logs.refetchInterval).toBe(false);
 		expect(logs.refetchOnWindowFocus).toBe(false);
@@ -94,5 +123,83 @@ describe("SSE-backed query configuration", () => {
 				retry: false,
 			}),
 		).rejects.toThrow("offline");
+	});
+});
+
+async function flush() {
+	for (let tick = 0; tick < 20; tick++) await Promise.resolve();
+}
+async function advance(milliseconds: number) {
+	jest.advanceTimersByTime(milliseconds);
+	await flush();
+}
+function RequestsQueryTestComponent() {
+	return useRequests(10) as unknown as Options;
+}
+function observeRequests() {
+	const observer = new reactQuery.QueryObserver(
+		queryClient,
+		RequestsQueryTestComponent(),
+	);
+	const unsubscribe = observer.subscribe(() => {});
+	cleanups.push(unsubscribe);
+	return observer;
+}
+
+describe("Requests polling fallback with real QueryObserver", () => {
+	beforeEach(() => {
+		jest.useFakeTimers();
+		// QueryObserver intentionally skips interval timers in a server runtime.
+		reactQuery.environmentManager.setIsServer(() => false);
+		reactQuery.focusManager.setFocused(true);
+	});
+
+	it("repeatedly fetches fresh authenticated snapshots while SSE delivers nothing", async () => {
+		spyOn(api, "hasApiKey").mockReturnValue(true);
+		let calls = 0;
+		const fetch = spyOn(api, "getRequestsSummary").mockImplementation(
+			async () => [summary(`snapshot-${++calls}`)],
+		);
+		const observer = observeRequests();
+		await flush();
+		expect(fetch).toHaveBeenCalledTimes(1);
+		await advance(REFRESH_INTERVALS.default - 1);
+		expect(fetch).toHaveBeenCalledTimes(1);
+		await advance(1);
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(observer.getCurrentResult().data?.requests[0].id).toBe("snapshot-2");
+		await advance(REFRESH_INTERVALS.default);
+		expect(fetch).toHaveBeenCalledTimes(3);
+		expect(observer.getCurrentResult().data?.requests[0].id).toBe("snapshot-3");
+		expect(sequence).toBe(0);
+	});
+
+	it("keeps no-key requests off global polling over multiple intervals", async () => {
+		const fetch = spyOn(api, "getRequestsSummary").mockResolvedValue([
+			summary("sse-only"),
+		]);
+		observeRequests();
+		await flush();
+		await advance(REFRESH_INTERVALS.default);
+		await advance(REFRESH_INTERVALS.default);
+		expect(fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("starts and stops fallback polling after credential-presence rerenders", async () => {
+		const hasApiKey = spyOn(api, "hasApiKey").mockReturnValue(false);
+		const fetch = spyOn(api, "getRequestsSummary").mockResolvedValue([]);
+		const observer = observeRequests();
+		await flush();
+		await advance(REFRESH_INTERVALS.default);
+		expect(fetch).toHaveBeenCalledTimes(1);
+		hasApiKey.mockReturnValue(true);
+		observer.setOptions(useRequests(10) as unknown as Options);
+		await advance(REFRESH_INTERVALS.default);
+		expect(fetch).toHaveBeenCalledTimes(2);
+		hasApiKey.mockReturnValue(false);
+		observer.setOptions(useRequests(10) as unknown as Options);
+		await advance(REFRESH_INTERVALS.default);
+		await advance(REFRESH_INTERVALS.default);
+		expect(fetch).toHaveBeenCalledTimes(2);
 	});
 });
