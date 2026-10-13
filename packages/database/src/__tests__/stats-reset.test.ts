@@ -22,6 +22,7 @@ const RESET_STATEMENTS = [
 function operationsWithAdapter(adapter: BunSqlAdapter): DatabaseOperationsType {
 	return Object.assign(Object.create(DatabaseOperations.prototype), {
 		adapter,
+		requestsDeletedListeners: new Set<() => void>(),
 	}) as DatabaseOperationsType;
 }
 
