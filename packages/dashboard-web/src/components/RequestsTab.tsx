@@ -17,7 +17,7 @@ import {
 	User,
 	X,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { api, type RequestPayload, type RequestSummary } from "../api";
 import { API_LIMITS } from "../constants";
 import { useAccounts, useApiKeys, useRequests } from "../hooks/queries";
@@ -57,6 +57,11 @@ export function RequestsTab() {
 		new Set(),
 	);
 	const [modalRequest, setModalRequest] = useState<RequestPayload | null>(null);
+	const modalSnapshotRef = useRef<{
+		id: string;
+		request: RequestPayload;
+		summary: RequestSummary | undefined;
+	} | null>(null);
 	const [accountFilter, setAccountFilter] = useState<string>("all");
 	const [agentFilter, setAgentFilter] = useState<string>("all");
 	const [apiKeyFilter, setApiKeyFilter] = useState<string>("all");
@@ -105,6 +110,24 @@ export function RequestsTab() {
 						),
 		};
 	}, [requestsData]);
+
+	// Retain only the open modal's last live payload and summary after SSE eviction.
+	const retainedModal =
+		modalSnapshotRef.current?.id === modalRequest?.id
+			? modalSnapshotRef.current
+			: null;
+	const liveModalRequest = modalRequest
+		? data?.requests.find((request) => request.id === modalRequest.id)
+		: undefined;
+	const modalPayload =
+		liveModalRequest ?? retainedModal?.request ?? modalRequest;
+	const modalSummary =
+		(modalRequest ? data?.summaries.get(modalRequest.id) : undefined) ??
+		retainedModal?.summary;
+	modalSnapshotRef.current =
+		modalRequest && modalPayload
+			? { id: modalRequest.id, request: modalPayload, summary: modalSummary }
+			: null;
 
 	// Filter dropdown options come from dedicated endpoints (not from the loaded
 	// requests slice) so every configured account/API key is selectable, even
@@ -987,13 +1010,13 @@ export function RequestsTab() {
 
 			{modalRequest && (
 				<RequestDetailsModal
-					request={
-						data?.requests.find((request) => request.id === modalRequest.id) ??
-						modalRequest
-					}
-					summary={data?.summaries.get(modalRequest.id)}
+					request={modalPayload ?? modalRequest}
+					summary={modalSummary}
 					isOpen={true}
-					onClose={() => setModalRequest(null)}
+					onClose={() => {
+						modalSnapshotRef.current = null;
+						setModalRequest(null);
+					}}
 				/>
 			)}
 		</Card>

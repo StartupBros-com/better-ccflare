@@ -1,6 +1,7 @@
 import { sseResponse } from "@better-ccflare/http-common";
 import { logBus } from "@better-ccflare/logger";
 import type { LogEvent } from "@better-ccflare/types";
+import { startSseKeepalive } from "./sse-keepalive";
 
 /**
  * Create a logs stream handler using Server-Sent Events
@@ -19,12 +20,15 @@ export function createLogsStreamHandler() {
 
 		let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
 		let handleLogEvent: ((event: LogEvent) => void) | null = null;
+		let stopKeepalive: (() => void) | null = null;
 		let cleanedUp = false;
 		const handleAbort = () => cleanup();
 
 		const cleanup = () => {
 			if (cleanedUp) return;
 			cleanedUp = true;
+			stopKeepalive?.();
+			stopKeepalive = null;
 
 			if (handleLogEvent) {
 				logBus.off("log", handleLogEvent);
@@ -65,6 +69,7 @@ export function createLogsStreamHandler() {
 					return;
 				}
 				logBus.on("log", handleLogEvent);
+				stopKeepalive = startSseKeepalive(streamController, cleanup);
 			},
 			cancel() {
 				cleanup();

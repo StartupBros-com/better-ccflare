@@ -8,6 +8,7 @@ import { Logger } from "@better-ccflare/logger";
 import type { AlertsConfigPayload } from "@better-ccflare/types";
 import { getAlertsConfig, setAlertsConfig } from "../services/alerts";
 import type { APIContext } from "../types";
+import { startSseKeepalive } from "./sse-keepalive";
 
 const log = new Logger("AlertsHandler");
 
@@ -136,43 +137,57 @@ export function createAlertsAcknowledgeAllHandler(context: APIContext) {
 export function createAlertsStreamHandler() {
 	return (req: Request): Response => {
 		let writeHandler: ((data: AlertEvt) => void) | null = null;
+		let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+		let stopKeepalive: (() => void) | null = null;
 		let isClosed = false;
-		const stream = new ReadableStream({
-			start(controller) {
+		const handleAbort = () => cleanup();
+		const cleanup = () => {
+			if (isClosed) return;
+			isClosed = true;
+			stopKeepalive?.();
+			stopKeepalive = null;
+			if (writeHandler) {
+				alertEvents.off("event", writeHandler);
+				writeHandler = null;
+			}
+			req.signal.removeEventListener("abort", handleAbort);
+			try {
+				controller?.close();
+			} catch {
+				// The consumer may already have cancelled the stream.
+			}
+		};
+		const stream = new ReadableStream<Uint8Array>({
+			start(streamController) {
+				controller = streamController;
+				if (req.signal.aborted) {
+					cleanup();
+					return;
+				}
+				req.signal.addEventListener("abort", handleAbort);
 				const encoder = new TextEncoder();
 				writeHandler = (data: AlertEvt) => {
 					if (isClosed) return;
 					try {
-						controller.enqueue(
+						streamController.enqueue(
 							encoder.encode(`data: ${JSON.stringify(data)}\n\n`),
 						);
-					} catch (_error) {
-						isClosed = true;
-						if (writeHandler) {
-							alertEvents.off("event", writeHandler);
-							writeHandler = null;
-						}
+					} catch {
+						cleanup();
 					}
 				};
-				controller.enqueue(encoder.encode("event: connected\ndata: ok\n\n"));
+				try {
+					streamController.enqueue(
+						encoder.encode("event: connected\ndata: ok\n\n"),
+					);
+				} catch {
+					cleanup();
+					return;
+				}
 				alertEvents.on("event", writeHandler);
+				stopKeepalive = startSseKeepalive(streamController, cleanup);
 			},
-			cancel() {
-				isClosed = true;
-				if (writeHandler) {
-					alertEvents.off("event", writeHandler);
-					writeHandler = null;
-				}
-			},
-		});
-		req.signal?.addEventListener("abort", () => {
-			if (!isClosed) {
-				isClosed = true;
-				if (writeHandler) {
-					alertEvents.off("event", writeHandler);
-					writeHandler = null;
-				}
-			}
+			cancel: cleanup,
 		});
 		return new Response(stream, {
 			headers: {
