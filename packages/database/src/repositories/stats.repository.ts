@@ -114,6 +114,10 @@ export class StatsRepository {
 		limit = 10,
 		includeUnauthenticated = true,
 	): Promise<AccountStats[]> {
+		if (includeUnauthenticated && this.adapter.isSQLite) {
+			return this.getSQLiteLifetimeAccountStats(limit);
+		}
+
 		// Get account request counts
 		let accountStats: Array<{
 			id: string;
@@ -224,6 +228,73 @@ export class StatsRepository {
 			requestCount: Number(acc.requestCount),
 			successRate: successRateMap.get(acc.id) || 0,
 			totalRequests: Number(acc.totalRequests),
+		}));
+	}
+
+	/** Aggregate SQLite lifetime counts and rates in one covering request scan. */
+	private async getSQLiteLifetimeAccountStats(
+		limit: number,
+	): Promise<AccountStats[]> {
+		// Resolve ids against the accounts primary-key index before grouping.
+		// This collapses missing historical ids into one fallback group without
+		// fetching account names/totals for every request. Join that metadata
+		// only after aggregation. With the existing SQLite indexes, the request scan
+		// and primary-key lookups are covering; no named-index hint or migration is required.
+		//
+		// Missing ids count in the fallback bucket but not its success rate.
+		// Preserve the batch query's shared NULL/literal no_account rate when
+		// a real account has that id and a different name. Sum rates by id before
+		// filtering/limiting display groups: a hidden group containing only
+		// legacy NULL request ids can still contribute to the shared rate.
+		const rows = await this.adapter.query<{
+			name: string;
+			requestCount: unknown;
+			totalRequests: unknown;
+			rateTotal: unknown;
+			rateSuccessful: unknown;
+		}>(
+			`WITH raw AS (
+				SELECT a.id AS account_used, COUNT(r.id) AS request_count,
+					SUM(CASE WHEN a.id IS NOT NULL OR r.account_used IS NULL OR r.account_used = ?
+						THEN 1 ELSE 0 END) AS total,
+					SUM(CASE WHEN (a.id IS NOT NULL OR r.account_used IS NULL OR r.account_used = ?)
+						AND r.success = TRUE THEN 1 ELSE 0 END) AS successful
+				FROM requests r
+				LEFT JOIN accounts a ON a.id = r.account_used
+				GROUP BY a.id
+			), grouped AS (
+				SELECT COALESCE(a.id, ?) AS id, COALESCE(a.name, ?) AS name,
+					SUM(r.request_count) AS request_count,
+					COALESCE(MAX(a.total_requests), 0) AS total_requests,
+					SUM(r.total) AS rate_total,
+					SUM(r.successful) AS rate_successful
+				FROM raw r
+				LEFT JOIN accounts a ON a.id = r.account_used
+				GROUP BY 1, 2
+			), rated AS (
+				SELECT name, request_count, total_requests,
+					SUM(rate_total) OVER (PARTITION BY id) AS rate_total,
+					SUM(rate_successful) OVER (PARTITION BY id) AS rate_successful
+				FROM grouped
+			)
+			SELECT name, request_count AS "requestCount", total_requests AS "totalRequests",
+				rate_total AS "rateTotal", rate_successful AS "rateSuccessful"
+			FROM rated
+			WHERE request_count > 0
+			ORDER BY request_count DESC
+			LIMIT ?`,
+			[NO_ACCOUNT_ID, NO_ACCOUNT_ID, NO_ACCOUNT_ID, NO_ACCOUNT_ID, limit],
+		);
+		return rows.map((row) => ({
+			name: row.name,
+			requestCount: Number(row.requestCount),
+			successRate:
+				Number(row.rateTotal) > 0
+					? Math.round(
+							(Number(row.rateSuccessful) / Number(row.rateTotal)) * 100,
+						)
+					: 0,
+			totalRequests: Number(row.totalRequests),
 		}));
 	}
 

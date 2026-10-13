@@ -61,7 +61,7 @@ describe("stats query optimizations", () => {
 			),
 		).toEqual(["a", "b"]);
 	});
-	it("preserves NULL/legacy account success rates with an indexable predicate", async () => {
+	it("preserves NULL/legacy account success rates in one lifetime aggregation", async () => {
 		request("null-success", 10, null);
 		// Foreign keys enforce new writes; legacy rows predate that enforcement.
 		db.exec("PRAGMA foreign_keys = OFF");
@@ -75,8 +75,8 @@ describe("stats query optimizations", () => {
 				totalRequests: 0,
 			},
 		]);
-		expect(query.mock.calls[1]?.[0]).toContain("account_used IN (");
-		expect(query.mock.calls[1]?.[0]).not.toContain("WHERE COALESCE");
+		expect(query).toHaveBeenCalledTimes(1);
+		expect(query.mock.calls[0]?.[0]).toContain("GROUP BY a.id");
 	});
 	it("combines unattributed errors but keeps attributed groups separate", async () => {
 		db.run(
