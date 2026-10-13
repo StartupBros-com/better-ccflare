@@ -20,6 +20,7 @@ const cleanups: Array<() => void> = [];
 mock.module("react", () => ({
 	...react,
 	useCallback: <T>(callback: T) => callback,
+	useRef: <T>(value: T) => ({ current: value }),
 	useEffect: (effect: () => undefined | (() => void)) => effects.push(effect),
 }));
 mock.module("@tanstack/react-query", () => ({
@@ -118,7 +119,7 @@ function start(id: string, timestamp: number) {
 		accountId: null,
 		statusCode: 0,
 		agentUsed: "reviewer",
-		agentAttributionSource: "header",
+		agentAttributionSource: "header_agent",
 	};
 }
 function seed(limit: number, summaries: RequestSummary[]) {
@@ -156,6 +157,7 @@ function pendingSnapshots() {
 	};
 }
 beforeEach(() => {
+	spyOn(api, "hasApiKey").mockReturnValue(false);
 	queryClient = new QueryClient({
 		defaultOptions: { queries: { gcTime: Infinity, retry: false } },
 	});
@@ -182,6 +184,72 @@ afterEach(() => {
 });
 
 describe("SSE snapshot cache recovery with real QueryObserver", () => {
+	it("keeps existing rows ahead of an unknown completion with a tied timestamp", () => {
+		seed(1, [summary("existing", 100)]);
+		const { source } = mountStream(1);
+		const before = cached(1);
+		source.message({ type: "summary", payload: summary("tied", 100) });
+		expect(cached(1)).toBe(before);
+		expect(cached(1).requests.map((request) => request.id)).toEqual([
+			"existing",
+		]);
+		expect([...cached(1).detailsMap.keys()]).toEqual(["existing"]);
+	});
+	it("inserts an unseen completion after the reconnect snapshot has committed", async () => {
+		spyOn(api, "getRequestsSummary").mockResolvedValue([
+			summary("history", 10),
+		]);
+		const { source } = mountStream(2);
+		const { observer } = observe(2);
+		await observer.refetch();
+		expect(cached(2).requests.map((request) => request.id)).toEqual([
+			"history",
+		]);
+		const missed = summary("started-offline", 20, 429);
+		source.message({ type: "summary", payload: missed });
+		expect(cached(2).requests.map((request) => request.id)).toEqual([
+			"started-offline",
+			"history",
+		]);
+		expect(cached(2).requests[0]).toMatchObject({
+			response: { status: 429 },
+			meta: { pending: false, rateLimited: true, bodiesOmitted: true },
+		});
+		expect(cached(2).detailsMap.get(missed.id)).toEqual(missed);
+		expect(observer.getCurrentResult().data).toBe(cached(2));
+	});
+	it("orders and deduplicates unseen completions without resurrecting older history", () => {
+		seed(2, [summary("newest", 100), summary("oldest", 20)]);
+		const { source } = mountStream(2);
+		for (const item of [summary("middle", 50), summary("middle", 50, 429)])
+			source.message({ type: "summary", payload: item });
+		const before = cached(2);
+		for (let index = 0; index < 50; index++)
+			source.message({
+				type: "summary",
+				payload: summary(`late-${index}`, index),
+			});
+		expect(cached(2)).toBe(before);
+		expect(cached(2).requests.map((request) => request.id)).toEqual([
+			"newest",
+			"middle",
+		]);
+		expect([...cached(2).detailsMap.keys()].sort()).toEqual([
+			"middle",
+			"newest",
+		]);
+		expect(cached(2).detailsMap.get("middle")?.statusCode).toBe(429);
+	});
+	it("accepts a summary before the first snapshot without fetching bodies", () => {
+		const { source } = mountStream(2);
+		source.message({ type: "summary", payload: summary("first-event", 20) });
+		expect(cached(2).requests[0]).toMatchObject({
+			id: "first-event",
+			request: { body: null },
+			response: { body: null, status: 200 },
+			meta: { bodiesOmitted: true, pending: false },
+		});
+	});
 	it("refreshes retained Infinity history on a new pool's first open after remount", async () => {
 		const fetch = spyOn(api, "getRequestsSummary").mockResolvedValue([
 			summary("before"),
@@ -310,7 +378,7 @@ describe("SSE snapshot cache recovery with real QueryObserver", () => {
 					rateLimited: true,
 					bodiesOmitted: true,
 					agentUsed: "reviewer",
-					agentAttributionSource: "header",
+					agentAttributionSource: "header_agent",
 				},
 			});
 			expect(data.requests[0]).toMatchObject({

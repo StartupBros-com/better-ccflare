@@ -21,7 +21,12 @@ import {
 } from "@tanstack/react-query";
 import { useCallback } from "react";
 import { api, type RequestPayload, type RequestSummary } from "../api";
+import { REFRESH_INTERVALS } from "../constants";
 import { queryKeys } from "../lib/query-keys";
+import { summaryToPlaceholder } from "../lib/request-summary";
+
+export { summaryToPlaceholder } from "../lib/request-summary";
+
 import { captureRequestUpdates, getRequestsSseSeq } from "./useRequestStream";
 
 interface RequestSnapshot {
@@ -236,41 +241,6 @@ export const useManagedRoutingInvalidation = () => {
 		[queryClient],
 	);
 };
-
-/**
- * Build a lightweight RequestPayload from a RequestSummary.
- *
- * The list view only needs metadata; full bodies (which can be ~256KB each)
- * are lazy-loaded by RequestDetailsModal and CopyButton via /api/requests/payload/:id.
- * `meta.bodiesOmitted` signals to consumers that the bodies must be hydrated.
- */
-export function summaryToPlaceholder(summary: RequestSummary): RequestPayload {
-	// `accountUsed` is the resolved account name when the JOIN succeeds, else
-	// the raw account ID. We put it in accountName so the row renders the
-	// friendly name; the ID-only fallback is rare (only after account deletion).
-	const accountName = summary.accountUsed ?? undefined;
-	return {
-		id: summary.id,
-		request: { headers: {}, body: null },
-		response:
-			summary.statusCode != null
-				? { status: summary.statusCode, headers: {}, body: null }
-				: null,
-		error: summary.errorMessage ?? undefined,
-		meta: {
-			accountName,
-			timestamp: new Date(summary.timestamp).getTime(),
-			success: summary.success,
-			path: summary.path,
-			method: summary.method,
-			agentUsed: summary.agentUsed,
-			// Server derives this from statusCode === 429 so the list view can
-			// render the Rate Limited badge without lazy-loading the body.
-			rateLimited: summary.rateLimited,
-			bodiesOmitted: true,
-		},
-	};
-}
 
 export const useStorageInfo = (refetchInterval?: number) => {
 	return useQuery({
@@ -751,7 +721,9 @@ export const useRequests = (limit: number, _refetchInterval?: number) => {
 		structuralSharing: reconcileRequestSnapshot,
 		staleTime: Infinity, // Consider data fresh until manually refetched
 		gcTime: 10 * 60 * 1000, // Keep in cache for 10 minutes
-		refetchInterval: false, // Override global polling; SSE/reconnect owns updates.
+		// EventSource cannot send the stored API key header. Keep authenticated
+		// dashboards fresh via polling; no-key dashboards remain SSE-only.
+		refetchInterval: api.hasApiKey() ? REFRESH_INTERVALS.default : false,
 	});
 };
 

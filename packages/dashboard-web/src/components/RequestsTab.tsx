@@ -23,6 +23,7 @@ import { API_LIMITS } from "../constants";
 import { useAccounts, useApiKeys, useRequests } from "../hooks/queries";
 import { useRequestStream } from "../hooks/useRequestStream";
 import { attributionSourceLabel } from "../lib/attribution";
+import { applyRequestSummary } from "../lib/request-summary";
 import { isAnthropicPeakHour, isZaiPeakHour } from "../utils/provider-utils";
 import { CopyButton } from "./CopyButton";
 import { RequestCostBadge } from "./RequestCostBadge";
@@ -80,7 +81,13 @@ export function RequestsTab() {
 	} = useRequests(API_LIMITS.requestsDetail);
 
 	// Enable real-time updates
-	useRequestStream(API_LIMITS.requestsDetail);
+	useRequestStream(API_LIMITS.requestsDetail, (summary) => {
+		const selected = modalSnapshotRef.current;
+		if (!selected || selected.id !== summary.id) return;
+		const request = applyRequestSummary(selected.request, summary);
+		modalSnapshotRef.current = { id: summary.id, request, summary };
+		setModalRequest(request);
+	});
 
 	const { data: accounts } = useAccounts();
 	const { data: configuredApiKeys } = useApiKeys();
@@ -128,6 +135,15 @@ export function RequestsTab() {
 		modalRequest && modalPayload
 			? { id: modalRequest.id, request: modalPayload, summary: modalSummary }
 			: null;
+
+	const openRequestDetails = (request: RequestPayload) => {
+		modalSnapshotRef.current = {
+			id: request.id,
+			request,
+			summary: data?.summaries.get(request.id),
+		};
+		setModalRequest(request);
+	};
 
 	// Filter dropdown options come from dedicated endpoints (not from the loaded
 	// requests slice) so every configured account/API key is selectable, even
@@ -829,7 +845,7 @@ export function RequestsTab() {
 											<Button
 												variant="ghost"
 												size="icon"
-												onClick={() => setModalRequest(request)}
+												onClick={() => openRequestDetails(request)}
 												title="View Details"
 											>
 												<Eye className="h-4 w-4" />
@@ -993,7 +1009,7 @@ export function RequestsTab() {
 											<Button
 												variant="outline"
 												size="sm"
-												onClick={() => setModalRequest(request)}
+												onClick={() => openRequestDetails(request)}
 												className="w-full"
 											>
 												<Eye className="h-4 w-4 mr-2" />

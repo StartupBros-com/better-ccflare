@@ -1,8 +1,12 @@
 import type { AgentAttributionSource } from "@better-ccflare/types";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import type { Account, RequestPayload, RequestResponse } from "../api";
 import { queryKeys } from "../lib/query-keys";
+import {
+	applyRequestSummary,
+	summaryToPlaceholder,
+} from "../lib/request-summary";
 
 interface RequestsData {
 	requests: RequestPayload[];
@@ -11,7 +15,8 @@ interface RequestsData {
 
 interface StreamSubscriber {
 	queryClient: QueryClient;
-	handleMessage: (event: MessageEvent) => void;
+	handleMessage: (event: MessageEvent) => RequestResponse | undefined;
+	onSummary: (summary: RequestResponse) => void;
 }
 
 interface PooledConnection {
@@ -157,8 +162,15 @@ function createPooledConnection(key: string, limit: number): PooledConnection {
 			attempt = 0;
 		});
 		es.addEventListener("message", (event) => {
-			if (isCurrent())
-				forEachClient(({ handleMessage }) => handleMessage(event));
+			if (!isCurrent()) return;
+			let summary: RequestResponse | undefined;
+			forEachClient(({ handleMessage }) => {
+				summary = handleMessage(event) ?? summary;
+			});
+			// Cache writes are deduplicated per client, but every selected modal
+			// must hear a completion even when its row is outside the list window.
+			if (summary)
+				for (const subscriber of subscribers) subscriber.onSummary(summary);
 		});
 		es.addEventListener("error", () => {
 			if (!isCurrent()) return;
@@ -222,9 +234,15 @@ function createPooledConnection(key: string, limit: number): PooledConnection {
 	return pooled;
 }
 
-export function useRequestStream(limit = 200) {
+export function useRequestStream(
+	limit = 200,
+	onSummary?: (summary: RequestResponse) => void,
+) {
 	const queryClient = useQueryClient();
 	const connectionKey = `requests-stream-${limit}`;
+	// Selection changes update this callback without reconnecting the shared stream.
+	const onSummaryRef = useRef(onSummary);
+	onSummaryRef.current = onSummary;
 
 	// Safe message handler with try-catch that directly updates React Query cache
 	const handleMessage = useCallback(
@@ -249,7 +267,6 @@ export function useRequestStream(limit = 200) {
 					queryKeys.requests(limit),
 					(current) => {
 						if (!current) {
-							if (evt.type !== "start") return current;
 							current = { requests: [], detailsMap: new Map() };
 						}
 
@@ -335,6 +352,29 @@ export function useRequestStream(limit = 200) {
 							(r) => r.id === evt.payload.id,
 						);
 						if (requestIndex < 0) {
+							// A request started while disconnected may complete only after
+							// the recovery snapshot commits. Insert it by start timestamp,
+							// never by arrival order; older history must not displace newer rows.
+							const timestamp = new Date(evt.payload.timestamp).getTime();
+							const nextRequests = Number.isFinite(timestamp)
+								? [...current.requests, summaryToPlaceholder(evt.payload)]
+										.sort(
+											(left, right) =>
+												right.meta.timestamp - left.meta.timestamp,
+										)
+										.slice(0, limit)
+								: current.requests;
+							if (
+								nextRequests.some((request) => request.id === evt.payload.id)
+							) {
+								const map = new Map(currentDetailsMap);
+								map.set(evt.payload.id, evt.payload);
+								return {
+									...current,
+									requests: nextRequests,
+									detailsMap: pruneDetailsMap(map, nextRequests),
+								};
+							}
 							const detailsMap = pruneDetailsMap(
 								currentDetailsMap,
 								current.requests,
@@ -347,39 +387,10 @@ export function useRequestStream(limit = 200) {
 						const map = new Map(currentDetailsMap);
 						map.set(evt.payload.id, evt.payload);
 						const newRequests = [...current.requests];
-						// Update meta to remove pending status. Preserve
-						// `bodiesOmitted: true` so consumers continue to lazy-
-						// load bodies, and refresh `rateLimited` from the final
-						// statusCode (the placeholder set it from `evt.statusCode`
-						// which is 0 until the response lands).
-						if (newRequests[requestIndex].meta) {
-							newRequests[requestIndex] = {
-								...newRequests[requestIndex],
-								// Refresh response.status from the final summary —
-								// the start placeholder set it to 0 before the HTTP
-								// response landed, and the new header-row chip uses
-								// a `statusCode != null` guard (0 is not null), so
-								// without this every SSE-completed request would
-								// permanently display a grey "0" chip.
-								response:
-									evt.payload.statusCode != null
-										? {
-												...(newRequests[requestIndex].response ?? {
-													headers: {},
-													body: null,
-												}),
-												status: evt.payload.statusCode,
-											}
-										: null,
-								meta: {
-									...newRequests[requestIndex].meta,
-									pending: false,
-									success: evt.payload.success,
-									rateLimited: evt.payload.rateLimited,
-									bodiesOmitted: true,
-								},
-							};
-						}
+						newRequests[requestIndex] = applyRequestSummary(
+							newRequests[requestIndex],
+							evt.payload,
+						);
 						return {
 							...current,
 							requests: newRequests,
@@ -404,6 +415,7 @@ export function useRequestStream(limit = 200) {
 							summary: evt.type === "summary" ? evt.payload : undefined,
 						});
 				}
+				return evt.type === "summary" ? evt.payload : undefined;
 			} catch (error) {
 				console.error("Error parsing SSE message:", error);
 			}
@@ -418,7 +430,11 @@ export function useRequestStream(limit = 200) {
 			pooled = createPooledConnection(connectionKey, limit);
 			CONNECTION_POOL.set(connectionKey, pooled);
 		}
-		const subscriber = { queryClient, handleMessage };
+		const subscriber = {
+			queryClient,
+			handleMessage,
+			onSummary: (summary: RequestResponse) => onSummaryRef.current?.(summary),
+		};
 		pooled.subscribers.add(subscriber);
 		if (isNew) pooled.connect();
 

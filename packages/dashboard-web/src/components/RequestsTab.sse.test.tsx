@@ -5,6 +5,7 @@ import * as queries from "../hooks/queries";
 
 let hooks: unknown[] = [];
 let cursor = 0;
+let onSummary: ((summary: RequestSummary) => void) | undefined;
 let data: {
 	requests: RequestPayload[];
 	detailsMap: Map<string, RequestSummary>;
@@ -40,7 +41,12 @@ mock.module("../hooks/queries", () => ({
 	useApiKeys: () => ({ data: [] }),
 }));
 mock.module("../hooks/useRequestStream", () => ({
-	useRequestStream: () => {},
+	useRequestStream: (
+		_limit: number,
+		listener?: (summary: RequestSummary) => void,
+	) => {
+		onSummary = listener;
+	},
 }));
 function Modal() {
 	return null;
@@ -85,7 +91,7 @@ function request(id: string): RequestPayload {
 function summary(id: string, statusCode: number): RequestSummary {
 	return {
 		id,
-		timestamp: 1,
+		timestamp: new Date(1).toISOString(),
 		model: "test-model",
 		statusCode,
 		success: statusCode === 200,
@@ -118,6 +124,55 @@ beforeEach(() => {
 });
 
 describe("RequestsTab SSE modal retention", () => {
+	it("completes an open pending modal after 50 newer starts evict its row", () => {
+		select();
+		modal();
+		data = {
+			requests: Array.from({ length: 50 }, (_, index) =>
+				request(`newer-${index}`),
+			),
+			detailsMap: new Map(),
+		};
+		expect((modal().props.request as RequestPayload).meta.pending).toBe(true);
+		const latest = {
+			...summary("first", 429),
+			rateLimited: true,
+			errorMessage: "rate limited",
+			agentUsed: "reviewer",
+			agentAttributionSource: "header_agent" as const,
+			inputTokens: 21,
+			outputTokens: 13,
+			costUsd: 0.04,
+		};
+		onSummary?.(latest);
+		expect(modal().props.summary).toBe(latest);
+		expect(modal().props.request).toMatchObject({
+			id: "first",
+			response: { status: 429 },
+			error: "rate limited",
+			meta: {
+				pending: false,
+				rateLimited: true,
+				bodiesOmitted: true,
+				agentUsed: "reviewer",
+				agentAttributionSource: "header_agent",
+			},
+		});
+		expect(data.requests).toHaveLength(50);
+		expect(data.detailsMap.size).toBe(0);
+	});
+	it("ignores late completions immediately after close and selection change", () => {
+		select();
+		const selected = modal();
+		(selected.props.onClose as () => void)();
+		onSummary?.(summary("first", 429));
+		expect(find(render(), (element) => element.type === Modal)).toBeUndefined();
+		data = { requests: [request("second")], detailsMap: new Map() };
+		select();
+		onSummary?.(summary("first", 500));
+		expect((modal().props.request as RequestPayload).id).toBe("second");
+		expect(modal().props.summary).toBeUndefined();
+	});
 	it("retains the last live payload and summary after bounded-list eviction", () => {
 		select();
 		expect((modal().props.summary as RequestSummary).id).toBe("first");
