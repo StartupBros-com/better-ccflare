@@ -193,6 +193,15 @@ export function isDownstreamAnthropicMessagesSse({
 }
 
 /** Native-provider refinement for raw-response header/cooldown policy only. */
+/**
+ * Upstream keepalives do not survive LiteLLM plus SSE translation, so protocol
+ * idleness is not evidence of a dead upstream on this provider; only the
+ * commitment deadline bounds a slow prefill.
+ */
+export function isProtocolIdleExemptProvider(provider: string): boolean {
+	return provider === "openai-compatible";
+}
+
 export function isNativeAnthropicMessagesSse(
 	input: NativeAnthropicMessagesSseInput,
 ): boolean {
