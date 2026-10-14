@@ -24,6 +24,7 @@ import { Logger } from "@better-ccflare/logger";
 import { stripCacheControlFromOpenAIRequest } from "@better-ccflare/openai-formats";
 import type {
 	CodexModelContextSnapshot,
+	CodexProvider,
 	Provider,
 	ProviderAttemptPlan,
 } from "@better-ccflare/providers";
@@ -8206,20 +8207,10 @@ export async function proxyWithAccount(
 			(response.headers.get("content-type") ?? "").includes("text/event-stream")
 		) {
 			const emulationDecision = requestMeta.advisorEmulation;
-			const emulationProvider = provider as unknown as {
-				transformRequestBody(
-					request: Request,
-					account?: Account,
-					beforePhysicalTransport?: () => void,
-					options?: { hosted?: boolean },
-				): Promise<Request>;
-				processResponse(
-					response: Response,
-					account: Account | null,
-					requestHeaders?: Headers,
-					options?: { hosted?: boolean },
-				): Promise<Response>;
-			};
+			// Admission only reaches here for a Codex OAuth account, so the
+			// resolved provider is CodexProvider; its real signatures (hosted
+			// options included) are checked at both internal calls below.
+			const emulationProvider = provider as CodexProvider;
 			// One Anthropic body through the SAME provider and account. No attempt
 			// loop, failover, affinity write, turn-state or stampCodexAttempt: the
 			// hosted options keep the provider from registering any of that.
