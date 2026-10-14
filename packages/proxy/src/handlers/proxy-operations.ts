@@ -8521,6 +8521,30 @@ export async function proxyWithAccount(
 			log.info(
 				`Client disconnected during request to ${account.name} — ending instead of failing over`,
 			);
+			// Observability only (#506): prod runs LOG_LEVEL=warn, so the info line
+			// above is invisible. A committed rescue means the outer HTTP-200
+			// response (headers) already reached the client.
+			const abortedAt = Date.now();
+			const rescueCommitted = preCommitRescue?.isRescueCommitted() ?? false;
+			const rescueActivatedAt = preCommitRescue?.activatedAt ?? null;
+			log.warn("anthropic_precommit_client_abort", {
+				requestId: requestMeta.id,
+				accountName: account.name,
+				provider: account.provider,
+				elapsedMs: Math.max(
+					0,
+					abortedAt -
+						(preCommitRescue?.requestStartedAt ?? requestMeta.timestamp),
+				),
+				rescueArmed: preCommitRescue !== undefined,
+				rescueActivated: preCommitRescue?.isRescueActivated() ?? false,
+				rescueActivatedAtMs:
+					preCommitRescue && rescueActivatedAt !== null
+						? Math.max(0, rescueActivatedAt - preCommitRescue.requestStartedAt)
+						: null,
+				rescueCommitted,
+				responseHeadersReturned: rescueCommitted,
+			});
 			return new Response(null, { status: 499 });
 		}
 		if (

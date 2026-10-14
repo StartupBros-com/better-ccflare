@@ -98,6 +98,12 @@ export interface AnthropicPreCommitRescueRouteContext {
 	isRescueCommitted(): boolean;
 	/** Marks the outer rescue as the response owner before it is exposed. */
 	markRescueCommitted(): void;
+	/** Read-only: whether the routing layer has called `activate()`. */
+	isRescueActivated(): boolean;
+	/** Read-only: epoch ms of the first `activate()` call, or null. */
+	readonly activatedAt: number | null;
+	/** Read-only: epoch ms the request-wide rescue clock started from. */
+	readonly requestStartedAt: number;
 	/** Absolute request-wide boundary measured from handleProxy entry. */
 	readonly commitmentDeadlineAt: number;
 	/** Reserve fallback capacity only for a route known not to be final. */
@@ -258,6 +264,7 @@ export function createAnthropicPreCommitRescueRouteContext(options: {
 	let requestLifecycle: AnthropicPreCommitRescueRequestLifecycle | undefined;
 	let responseLifecycleReleased = false;
 	let rescueCommitted = false;
+	let activatedAt: number | null = null;
 	const deliverPendingTerminal = (): void => {
 		if (terminalReported || !terminalRecorder || !pendingTerminal) return;
 		terminalReported = true;
@@ -269,7 +276,19 @@ export function createAnthropicPreCommitRescueRouteContext(options: {
 	};
 
 	return {
-		activate: options.activate,
+		activate() {
+			// Observability only: remember when activation first fired, then
+			// delegate unchanged.
+			activatedAt ??= Date.now();
+			options.activate();
+		},
+		get activatedAt() {
+			return activatedAt;
+		},
+		requestStartedAt: options.requestStartedAt,
+		isRescueActivated() {
+			return activatedAt !== null;
+		},
 		signal: options.signal,
 		isRescueCommitted() {
 			return rescueCommitted;
