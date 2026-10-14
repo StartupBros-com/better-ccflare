@@ -164,6 +164,14 @@ export interface TransformStreamContext {
 	 * toolCallBlockIndices and stay open until the stream ends.
 	 */
 	openBlock: { kind: "thinking" | "text"; index: number } | null;
+	/**
+	 * Thinking/text that arrived after a tool_use block started, in arrival
+	 * order with same-kind runs merged. Tool blocks stay open until their
+	 * buffered arguments are emitted at stream end, and an Anthropic stream
+	 * completes each block before the next starts, so these are replayed as
+	 * fresh blocks once the tool blocks have closed.
+	 */
+	deferredBlocks: Array<{ kind: "thinking" | "text"; content: string }>;
 	promptTokens?: number;
 	completionTokens: number;
 	cacheReadInputTokens?: number;

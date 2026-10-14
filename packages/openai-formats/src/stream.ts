@@ -79,10 +79,10 @@ function emitToolCallJson(
  * Emit content_block_stop, message_delta, and message_stop events.
  * Shared between [DONE] handler and flush handler.
  *
- * @param toolCallBlockIndices - Maps OpenAI tool_call delta index → Anthropic block index.
- *   Pass null when stopReason is "end_turn" (text-only response).
  * @param endTurnBlockIndex - Anthropic block index to close when stopReason is "end_turn".
  *   May be a text block or a thinking block depending on the stream pattern.
+ *   Tool-call responses close every block (see emitToolCallBlocks and
+ *   replayDeferredBlocks) before calling this, so nothing is closed here.
  */
 function emitStreamEnd(
 	controller: TransformStreamDefaultController,
@@ -91,7 +91,6 @@ function emitStreamEnd(
 	stopReason: "tool_use" | "end_turn",
 	promptTokens: number | undefined,
 	completionTokens: number,
-	toolCallBlockIndices: Record<number, number> | null,
 	cacheReadInputTokens: number | undefined,
 	cacheCreationInputTokens: number | undefined,
 	endTurnBlockIndex = 0,
@@ -102,25 +101,7 @@ function emitStreamEnd(
 		cacheCreationInputTokens,
 	);
 
-	// Send content_block_stop for all blocks
-	if (toolCallBlockIndices) {
-		// Tool call blocks — use Anthropic block indices (not OpenAI tool_call indices)
-		for (const anthropicIdx of Object.values(toolCallBlockIndices)) {
-			const contentBlockStop = {
-				type: "content_block_stop",
-				index: anthropicIdx,
-			};
-			controller.enqueue(
-				encoder.encode(`event: content_block_stop
-`),
-			);
-			controller.enqueue(
-				encoder.encode(`data: ${JSON.stringify(contentBlockStop)}
-
-`),
-			);
-		}
-	} else if (stopReason === "end_turn") {
+	if (stopReason === "end_turn") {
 		// Text or thinking block — use the assigned Anthropic block index
 		const contentBlockStop = {
 			type: "content_block_stop",
@@ -250,41 +231,36 @@ function closeOpenBlock(
 	context.openBlock = null;
 }
 
-/**
- * Emit a thinking or text delta, opening a fresh block at the next monotonic
- * index whenever the open block is of the other kind (or none is open).
- * Reasoning providers can switch back and forth within one response (e.g. a
- * leading "\n" of content, then reasoning, then the answer). A delta must never
- * target a block that was already stopped: Claude Code aborts the stream on it.
- */
-function emitContentDelta(
+function emitContentBlockStart(
 	controller: TransformStreamDefaultController,
 	encoder: TextEncoder,
-	context: TransformStreamContext,
+	index: number,
+	kind: "thinking" | "text",
+): void {
+	const contentBlockStart = {
+		type: "content_block_start",
+		index,
+		content_block:
+			kind === "thinking"
+				? { type: "thinking", thinking: "" }
+				: { type: "text", text: "" },
+	};
+	controller.enqueue(encoder.encode(`event: content_block_start\n`));
+	controller.enqueue(
+		encoder.encode(`data: ${JSON.stringify(contentBlockStart)}\n\n`),
+	);
+}
+
+function emitContentBlockDelta(
+	controller: TransformStreamDefaultController,
+	encoder: TextEncoder,
+	index: number,
 	kind: "thinking" | "text",
 	value: string,
 ): void {
-	if (context.openBlock?.kind !== kind) {
-		closeOpenBlock(controller, encoder, context);
-		const index = context.nextBlockIndex++;
-		context.openBlock = { kind, index };
-		const contentBlockStart = {
-			type: "content_block_start",
-			index,
-			content_block:
-				kind === "thinking"
-					? { type: "thinking", thinking: "" }
-					: { type: "text", text: "" },
-		};
-		controller.enqueue(encoder.encode(`event: content_block_start\n`));
-		controller.enqueue(
-			encoder.encode(`data: ${JSON.stringify(contentBlockStart)}\n\n`),
-		);
-	}
-
 	const contentBlockDelta = {
 		type: "content_block_delta",
-		index: context.openBlock.index,
+		index,
 		delta:
 			kind === "thinking"
 				? { type: "thinking_delta", thinking: value }
@@ -296,6 +272,103 @@ function emitContentDelta(
 	);
 }
 
+/**
+ * Emit a thinking or text delta, opening a fresh block at the next monotonic
+ * index whenever the open block is of the other kind (or none is open).
+ * Reasoning providers can switch back and forth within one response (e.g. a
+ * leading "\n" of content, then reasoning, then the answer). A delta must never
+ * target a block that was already stopped: Claude Code aborts the stream on it.
+ *
+ * Once a tool_use block has started it stays open until its buffered arguments
+ * are emitted at stream end, and an Anthropic stream completes each block
+ * before the next one starts, so thinking/text arriving after that point is
+ * deferred and replayed by replayDeferredBlocks after the tool blocks close.
+ */
+function emitContentDelta(
+	controller: TransformStreamDefaultController,
+	encoder: TextEncoder,
+	context: TransformStreamContext,
+	kind: "thinking" | "text",
+	value: string,
+): void {
+	if (Object.keys(context.toolCallBlockIndices).length > 0) {
+		const last = context.deferredBlocks.at(-1);
+		if (last?.kind === kind) {
+			last.content += value;
+		} else {
+			context.deferredBlocks.push({ kind, content: value });
+		}
+		return;
+	}
+
+	if (context.openBlock?.kind !== kind) {
+		closeOpenBlock(controller, encoder, context);
+		const index = context.nextBlockIndex++;
+		context.openBlock = { kind, index };
+		emitContentBlockStart(controller, encoder, index, kind);
+	}
+
+	emitContentBlockDelta(
+		controller,
+		encoder,
+		context.openBlock.index,
+		kind,
+		value,
+	);
+}
+
+/**
+ * tool_use blocks as [openaiIdx, anthropicIdx] pairs in Anthropic block order.
+ * Object iteration order is OpenAI tool_call index order, which only matches
+ * block (arrival) order when the provider numbers its tool calls ascending.
+ */
+function toolCallBlocksInOrder(
+	context: TransformStreamContext,
+): Array<[number, number]> {
+	return Object.entries(context.toolCallBlockIndices)
+		.map(([openaiIdx, anthropicIdx]): [number, number] => [
+			Number.parseInt(openaiIdx, 10),
+			anthropicIdx,
+		])
+		.sort((a, b) => a[1] - b[1]);
+}
+
+/**
+ * Emit each tool_use block's buffered JSON and close it, in block order. Uses
+ * Anthropic block indices (from toolCallBlockIndices), not OpenAI tool_call
+ * indices.
+ */
+function emitToolCallBlocks(
+	controller: TransformStreamDefaultController,
+	encoder: TextEncoder,
+	context: TransformStreamContext,
+): void {
+	for (const [openaiIdx, anthropicIdx] of toolCallBlocksInOrder(context)) {
+		const accumulated = context.toolCallAccumulators[openaiIdx] || "";
+		emitToolCallJson(controller, encoder, anthropicIdx, accumulated);
+		emitContentBlockStop(controller, encoder, anthropicIdx);
+	}
+}
+
+/**
+ * Replay thinking/text deferred behind open tool_use blocks as fresh,
+ * sequential blocks (start, one delta, stop each). Call only after every
+ * tool_use block has been closed.
+ */
+function replayDeferredBlocks(
+	controller: TransformStreamDefaultController,
+	encoder: TextEncoder,
+	context: TransformStreamContext,
+): void {
+	for (const { kind, content } of context.deferredBlocks) {
+		const index = context.nextBlockIndex++;
+		emitContentBlockStart(controller, encoder, index, kind);
+		emitContentBlockDelta(controller, encoder, index, kind, content);
+		emitContentBlockStop(controller, encoder, index);
+	}
+	context.deferredBlocks = [];
+}
+
 function emitStreamError(
 	controller: TransformStreamDefaultController,
 	encoder: TextEncoder,
@@ -305,12 +378,15 @@ function emitStreamError(
 	if (context.terminalErrorSeen) return;
 	emitMessageStart(controller, encoder, context);
 
-	// Close any blocks that were opened before the provider reported the error;
-	// never follow the error with a synthetic message_delta/message_stop pair.
+	// Close any blocks that were opened before the provider reported the error
+	// and replay content held behind them, so every block is complete before
+	// the error; never follow the error with a synthetic message_delta/
+	// message_stop pair.
 	closeOpenBlock(controller, encoder, context);
-	for (const anthropicIndex of Object.values(context.toolCallBlockIndices)) {
+	for (const [, anthropicIndex] of toolCallBlocksInOrder(context)) {
 		emitContentBlockStop(controller, encoder, anthropicIndex);
 	}
+	replayDeferredBlocks(controller, encoder, context);
 
 	const error =
 		typeof errorValue === "object" && errorValue !== null
@@ -371,6 +447,7 @@ export function transformStreamingResponse(
 					contextWindowSize: undefined,
 					hasSentStart: false,
 					openBlock: null,
+					deferredBlocks: [],
 					promptTokens: undefined,
 					completionTokens: 0,
 					encounteredToolCall: false,
@@ -413,24 +490,13 @@ export function transformStreamingResponse(
 								continue;
 							}
 							if (context.encounteredToolCall) {
-								// Close a thinking/text block opened after the tool call
-								// started, then emit buffered JSON for all tool calls and
-								// their stop events. Use Anthropic block indices (from
-								// toolCallBlockIndices), not OpenAI tool_call indices.
+								// Close a live thinking/text block (only possible when no
+								// tool block was actually opened), emit buffered JSON and
+								// stop for each tool block, then replay thinking/text that
+								// was deferred behind the tool blocks.
 								closeOpenBlock(controller, encoder, context);
-								for (const [openaiIdx, anthropicIdx] of Object.entries(
-									context.toolCallBlockIndices,
-								)) {
-									const numIdx = Number.parseInt(openaiIdx, 10);
-									const accumulated =
-										context.toolCallAccumulators[numIdx] || "";
-									emitToolCallJson(
-										controller,
-										encoder,
-										anthropicIdx,
-										accumulated,
-									);
-								}
+								emitToolCallBlocks(controller, encoder, context);
+								replayDeferredBlocks(controller, encoder, context);
 								emitStreamEnd(
 									controller,
 									encoder,
@@ -438,7 +504,6 @@ export function transformStreamingResponse(
 									"tool_use",
 									context.promptTokens,
 									context.completionTokens,
-									context.toolCallBlockIndices,
 									context.cacheReadInputTokens,
 									context.cacheCreationInputTokens,
 								);
@@ -452,7 +517,6 @@ export function transformStreamingResponse(
 									"end_turn",
 									context.promptTokens,
 									context.completionTokens,
-									null,
 									context.cacheReadInputTokens,
 									context.cacheCreationInputTokens,
 									context.openBlock.index,
@@ -631,13 +695,8 @@ export function transformStreamingResponse(
 						"Stream terminated without [DONE] — emitting buffered tool calls + stop events",
 					);
 					closeOpenBlock(controller, encoder, context);
-					for (const [openaiIdx, anthropicIdx] of Object.entries(
-						context.toolCallBlockIndices,
-					)) {
-						const numIdx = Number.parseInt(openaiIdx, 10);
-						const accumulated = context.toolCallAccumulators[numIdx] || "";
-						emitToolCallJson(controller, encoder, anthropicIdx, accumulated);
-					}
+					emitToolCallBlocks(controller, encoder, context);
+					replayDeferredBlocks(controller, encoder, context);
 					emitStreamEnd(
 						controller,
 						encoder,
@@ -645,7 +704,6 @@ export function transformStreamingResponse(
 						"tool_use",
 						context.promptTokens,
 						context.completionTokens,
-						context.toolCallBlockIndices,
 						context.cacheReadInputTokens,
 						context.cacheCreationInputTokens,
 					);
@@ -661,7 +719,6 @@ export function transformStreamingResponse(
 						"end_turn",
 						context.promptTokens,
 						context.completionTokens,
-						null,
 						context.cacheReadInputTokens,
 						context.cacheCreationInputTokens,
 						context.openBlock.index,
