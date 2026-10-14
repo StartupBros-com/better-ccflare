@@ -863,32 +863,81 @@ describe("errors", () => {
 });
 
 describe("pings", () => {
-	it("emits pings while awaiting a slow advisor and a slow continuation", async () => {
+	// Event positions that bracket the two held waits of one round: the advisor
+	// wait sits between the server_tool_use stop and the advisor_tool_result
+	// start, the continuation wait between that result's stop and the next block.
+	function roundMarks(events: Ev[]) {
+		const startOf = (type: string) =>
+			events.findIndex(
+				(e) =>
+					e.json.type === "content_block_start" &&
+					e.json.content_block?.type === type,
+			);
+		const stopAfter = (i: number) =>
+			events.findIndex(
+				(e, j) =>
+					j > i &&
+					e.json.type === "content_block_stop" &&
+					e.json.index === events[i].json.index,
+			);
+		const useStart = startOf("server_tool_use");
+		const resultStart = startOf("advisor_tool_result");
+		const resultStop = stopAfter(resultStart);
+		const nextStart = events.findIndex(
+			(e, j) => j > resultStop && e.json.type === "content_block_start",
+		);
+		const marks = {
+			useStop: stopAfter(useStart),
+			resultStart,
+			resultStop,
+			nextStart,
+		};
+		for (const at of Object.values(marks)) expect(at).toBeGreaterThan(-1);
+		return marks;
+	}
+
+	function pingsBetween(events: Ev[], from: number, to: number): number {
+		return events.slice(from + 1, to).filter((e) => e.json.type === "ping")
+			.length;
+	}
+
+	const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+	const continuation = () =>
+		sseResponse(worker({ blocks: [{ kind: "text", text: "z" }] }));
+
+	it("emits pings while the advisor sub-call is held", async () => {
+		const w1 = worker({ blocks: [advisorCall()], stop: "tool_use" });
+		const h = harness([async () => continuation()], {
+			pingIntervalMs: 5,
+			advisor: async () => {
+				await sleep(80);
+				return ADVISOR_OK;
+			},
+		});
+		const { events } = await run(w1, h);
+		const m = roundMarks(events);
+		expect(
+			pingsBetween(events, m.useStop, m.resultStart),
+		).toBeGreaterThanOrEqual(3);
+		expect(count(events, "message_start")).toBe(1);
+	});
+
+	it("emits pings while the continuation is held", async () => {
 		const w1 = worker({ blocks: [advisorCall()], stop: "tool_use" });
 		const h = harness(
 			[
 				async () => {
-					await new Promise((r) => setTimeout(r, 60));
-					return sseResponse(worker({ blocks: [{ kind: "text", text: "z" }] }));
+					await sleep(80);
+					return continuation();
 				},
 			],
-			{
-				pingIntervalMs: 10,
-				advisor: async () => {
-					await new Promise((r) => setTimeout(r, 60));
-					return ADVISOR_OK;
-				},
-			},
+			{ pingIntervalMs: 5 },
 		);
 		const { events } = await run(w1, h);
-		expect(count(events, "ping")).toBeGreaterThanOrEqual(4);
-		// pings sit between server_tool_use stop and advisor_tool_result start
-		const t = types(events);
-		const iStop = t.indexOf(
-			"content_block_stop",
-			t.indexOf("content_block_start"),
-		);
-		expect(iStop).toBeGreaterThan(-1);
+		const m = roundMarks(events);
+		expect(
+			pingsBetween(events, m.resultStop, m.nextStart),
+		).toBeGreaterThanOrEqual(3);
 		expect(count(events, "message_start")).toBe(1);
 	});
 });
