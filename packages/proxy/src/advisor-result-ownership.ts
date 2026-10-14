@@ -1,4 +1,5 @@
 import { Logger } from "@better-ccflare/logger";
+import { isEmulatedAdvisorId } from "./advisor-emulation/types";
 
 const log = new Logger("AdvisorResultOwnership");
 
@@ -134,15 +135,26 @@ function isThinkingLike(block: unknown): boolean {
 	return isThinking(block) || isBlankText(block);
 }
 
-export function stripAdvisorResults(
+function isAdvisorCall(block: unknown): block is Record<string, unknown> {
+	return (
+		isRecord(block) &&
+		block.type === "server_tool_use" &&
+		block.name === "advisor"
+	);
+}
+
+function stripAdvisorBlocks(
 	body: Readonly<Record<string, unknown>>,
-	shouldStrip: (ownerKey: string | null) => boolean,
+	shouldStripBlock: (block: Record<string, unknown>) => boolean,
+	// Strips a matching advisor call even when no result follows it.
+	shouldStripCall?: (block: Record<string, unknown>) => boolean,
 ): AdvisorResultStrip | null {
 	const messages = body.messages;
 	if (!Array.isArray(messages)) return null;
 
 	const strippedBlocks = new Set<unknown>();
 	const strippedIds = new Set<string>();
+	let strippedResults = 0;
 	for (const message of messages) {
 		if (
 			!isRecord(message) ||
@@ -152,9 +164,14 @@ export function stripAdvisorResults(
 			continue;
 		}
 		for (const block of message.content) {
-			if (!isRedactedResult(block)) continue;
-			if (!shouldStrip(advisorResultOwnerKeyFromBlock(block))) continue;
+			if (shouldStripCall && isAdvisorCall(block) && shouldStripCall(block)) {
+				strippedBlocks.add(block);
+				continue;
+			}
+			if (!isRecord(block) || block.type !== "advisor_tool_result") continue;
+			if (!shouldStripBlock(block)) continue;
 			strippedBlocks.add(block);
+			strippedResults++;
 			if (typeof block.tool_use_id === "string") {
 				strippedIds.add(block.tool_use_id);
 			}
@@ -177,9 +194,7 @@ export function stripAdvisorResults(
 			(block: unknown) =>
 				!strippedBlocks.has(block) &&
 				!(
-					isRecord(block) &&
-					block.type === "server_tool_use" &&
-					block.name === "advisor" &&
+					isAdvisorCall(block) &&
 					typeof block.id === "string" &&
 					strippedIds.has(block.id)
 				),
@@ -221,9 +236,36 @@ export function stripAdvisorResults(
 
 	return {
 		body: { ...body, messages: newMessages },
-		strippedResults: strippedBlocks.size,
+		strippedResults,
 		thinkingStrippedMessages,
 	};
+}
+
+export function stripAdvisorResults(
+	body: Readonly<Record<string, unknown>>,
+	shouldStrip: (ownerKey: string | null) => boolean,
+): AdvisorResultStrip | null {
+	return stripAdvisorBlocks(
+		body,
+		(block) =>
+			isRedactedResult(block) &&
+			shouldStrip(advisorResultOwnerKeyFromBlock(block)),
+	);
+}
+
+/**
+ * Strip every emulated advisor pair (id prefix match, any result shape) for
+ * first-party Anthropic attempts, plus any emulated call left without its
+ * result by a client abort. Native pairs are left alone.
+ */
+export function stripEmulatedAdvisorResults(
+	body: Readonly<Record<string, unknown>>,
+): AdvisorResultStrip | null {
+	return stripAdvisorBlocks(
+		body,
+		(block) => isEmulatedAdvisorId(block.tool_use_id),
+		(block) => isEmulatedAdvisorId(block.id),
+	);
 }
 
 // A target whose key is not learned yet still loses results learned from other
