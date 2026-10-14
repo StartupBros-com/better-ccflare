@@ -51,6 +51,8 @@ export interface OpenAIRequest {
 	tools?: OpenAITool[];
 	tool_choice?: OpenAIToolChoice;
 	reasoning?: { effort?: string };
+	/** Request-level chat-template kwargs (oMLX/vLLM-style servers). */
+	chat_template_kwargs?: Record<string, unknown>;
 }
 
 export interface AnthropicTextContent {

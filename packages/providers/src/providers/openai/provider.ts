@@ -1,3 +1,4 @@
+import { getChatTemplateReasoningAccountIds } from "@better-ccflare/config";
 import {
 	AuthError,
 	resolveCompatibleEndpoint,
@@ -30,6 +31,15 @@ import {
 } from "../../utils/stream-drain";
 
 const log = new Logger("OpenAICompatibleProvider");
+
+/** Rounds up onto the chat template's off/low/high/max ladder. */
+const CHAT_TEMPLATE_EFFORT_MAP: Readonly<Record<string, string>> = {
+	low: "low",
+	medium: "high",
+	high: "high",
+	xhigh: "max",
+	max: "max",
+};
 
 export class OpenAICompatibleProvider extends BaseProvider {
 	name = "openai-compatible";
@@ -284,6 +294,9 @@ export class OpenAICompatibleProvider extends BaseProvider {
 
 			// Inject enable_thinking for reasoning models on DashScope
 			this.injectDashScopeReasoning(openaiBody, body, endpoint, physicalModel);
+
+			// Opt-in: route effort through the chat template for allowlisted accounts
+			this.injectChatTemplateReasoning(openaiBody, account);
 
 			const newHeaders = new Headers(request.headers);
 			newHeaders.set("content-type", "application/json");
@@ -545,6 +558,44 @@ export class OpenAICompatibleProvider extends BaseProvider {
 
 		log.debug(
 			`Injected cache_control for ${messagesToCache.length} messages on DashScope endpoint`,
+		);
+	}
+
+	/**
+	 * For allowlisted accounts only, move the resolved reasoning effort from the
+	 * nested OpenAI `reasoning.effort` to request-level
+	 * `chat_template_kwargs.reasoning_effort`. oMLX/vLLM-style servers (e.g.
+	 * GLM behind LiteLLM) ignore nested `reasoning` and honour only the
+	 * chat-template kwarg, whose template accepts off/low/high/max. Efforts are
+	 * rounded UP to that ladder (never lowered). This is opt-in via
+	 * CCFLARE_CHAT_TEMPLATE_REASONING_ACCOUNTS (account IDs) because real OpenAI
+	 * endpoints 400 on unknown request parameters.
+	 */
+	private injectChatTemplateReasoning(
+		openaiBody: OpenAIRequest,
+		account?: Account,
+	): void {
+		if (!account || !getChatTemplateReasoningAccountIds().has(account.id)) {
+			return;
+		}
+		const from = openaiBody.reasoning?.effort;
+		if (from === undefined) return;
+		const to = Object.hasOwn(CHAT_TEMPLATE_EFFORT_MAP, from)
+			? CHAT_TEMPLATE_EFFORT_MAP[from]
+			: undefined;
+		if (to === undefined) {
+			log.debug(
+				`Chat-template reasoning: unmapped effort "${from}" for account ${account.id}; body left unchanged`,
+			);
+			return;
+		}
+		openaiBody.chat_template_kwargs = {
+			...openaiBody.chat_template_kwargs,
+			reasoning_effort: to,
+		};
+		delete openaiBody.reasoning;
+		log.debug(
+			`Chat-template reasoning for account ${account.id}: ${from} -> ${to}`,
 		);
 	}
 
