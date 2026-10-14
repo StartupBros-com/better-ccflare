@@ -6446,6 +6446,154 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(fetchedAccounts).toEqual([forced.id]);
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 	});
+
+	describe("openai-compatible slow prefill (issue #504)", () => {
+		// LiteLLM drops oMLX keepalives, so after the translated message_start +
+		// ping a slow prefill is protocol-silent until its first content token.
+		const stallEvents: Array<{ reason: unknown }> = [];
+		const captureStall = (event: { msg: string; data?: unknown }) => {
+			if (event.msg === "anthropic_precommit_stall") {
+				stallEvents.push({
+					reason: (event.data as { reason?: unknown } | undefined)?.reason,
+				});
+			}
+		};
+		beforeEach(() => {
+			stallEvents.length = 0;
+			logBus.on("log", captureStall);
+		});
+		afterEach(() => {
+			logBus.off("log", captureStall);
+		});
+
+		function makeOpenAiCompatibleAccount(id: string): Account {
+			return {
+				...makeAccount(id),
+				provider: "openai-compatible",
+				custom_endpoint: "https://compat.test/v1",
+			};
+		}
+
+		// Emits `first` immediately, stays silent for `silenceMs`, then emits
+		// `rest`. A null `rest` keeps the upstream silent until cancelled.
+		function silentThenStream(
+			first: string,
+			silenceMs: number,
+			rest: string | null,
+			onCancel: () => void,
+		): ReadableStream<Uint8Array> {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			return new ReadableStream({
+				start(controller) {
+					controller.enqueue(encoder.encode(first));
+					if (rest === null) return;
+					timer = setTimeout(() => {
+						try {
+							controller.enqueue(encoder.encode(rest));
+							controller.close();
+						} catch {
+							// Already cancelled by the gate.
+						}
+					}, silenceMs);
+				},
+				cancel() {
+					if (timer !== undefined) clearTimeout(timer);
+					onCancel();
+				},
+			});
+		}
+
+		const OPENAI_TAIL = `data: ${openAiContentChunk("slow prefill done")}\n\ndata: [DONE]\n\n`;
+
+		it("lets a silent prefill longer than the idle timeout reach its first content token", async () => {
+			process.env[TIMEOUT_ENV] = "20";
+			process.env[MEANINGFUL_PROGRESS_ENV] = "2000";
+			const account = makeOpenAiCompatibleAccount("compat-slow-prefill");
+			const { ctx } = makeContext([account]);
+			let cancelCount = 0;
+			globalThis.fetch = mock(async () =>
+				sseResponse(
+					silentThenStream(
+						`data: ${OPENAI_STRUCTURAL_CHUNK}\n\n`,
+						150,
+						OPENAI_TAIL,
+						() => cancelCount++,
+					),
+				),
+			) as unknown as typeof fetch;
+
+			const request = makeRequest(undefined, account.id);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			const body = await response.text();
+
+			expect(stallEvents).toEqual([]);
+			expect(response.status).toBe(200);
+			expect(body).toContain('"text":"slow prefill done"');
+			expect(cancelCount).toBe(0);
+		});
+
+		it("still times out the same silent shape on a native anthropic account", async () => {
+			process.env[TIMEOUT_ENV] = "20";
+			process.env[MEANINGFUL_PROGRESS_ENV] = "2000";
+			const account = makeAccount("native-slow-prefill");
+			const { ctx } = makeContext([account]);
+			let cancelCount = 0;
+			globalThis.fetch = mock(async () =>
+				sseResponse(
+					silentThenStream(PRELUDE, 150, SUCCESS, () => cancelCount++),
+				),
+			) as unknown as typeof fetch;
+
+			const request = makeRequest(undefined, account.id);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			await response.text();
+
+			expect(response.status).toBe(503);
+			expect(stallEvents).toEqual([{ reason: "semantic_timeout" }]);
+			expect(cancelCount).toBe(1);
+		});
+
+		it("bounds a contentless openai-compatible stream at the commitment deadline", async () => {
+			process.env[TIMEOUT_ENV] = "20";
+			process.env[MEANINGFUL_PROGRESS_ENV] = "200";
+			const account = makeOpenAiCompatibleAccount("compat-never-content");
+			const { ctx } = makeContext([account]);
+			let cancelCount = 0;
+			globalThis.fetch = mock(async () =>
+				sseResponse(
+					silentThenStream(
+						`data: ${OPENAI_STRUCTURAL_CHUNK}\n\n`,
+						0,
+						null,
+						() => cancelCount++,
+					),
+				),
+			) as unknown as typeof fetch;
+
+			const startedAt = Date.now();
+			const request = makeRequest(undefined, account.id);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			const body = await response.text();
+			const elapsedMs = Date.now() - startedAt;
+
+			// The tiny shared deadline activates rescue, so the commitment-deadline
+			// failure surfaces as an in-band terminal error rather than a 503.
+			expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+			// The commitment deadline owns this failure, not the idle timer. The
+			// gate and the private attempt deadline race at the same instant, so
+			// the gate may or may not log first; it must never log an idle stall.
+			expect(
+				stallEvents.filter(
+					(event) => event.reason !== "meaningful_progress_timeout",
+				),
+			).toEqual([]);
+			expect(cancelCount).toBe(1);
+			// Past the 20ms idle window, so the idle timer really was disabled,
+			// yet well short of an unbounded hang.
+			expect(elapsedMs).toBeGreaterThanOrEqual(150);
+			expect(elapsedMs).toBeLessThan(1500);
+		});
+	});
 });
 
 describe("Anthropic stream runtime configuration", () => {

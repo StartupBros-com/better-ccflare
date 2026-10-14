@@ -108,6 +108,7 @@ import {
 	getAnthropicStreamRuntimeConfig,
 	isDownstreamAnthropicMessagesSse,
 	isNativeAnthropicMessagesSse,
+	isProtocolIdleExemptProvider,
 } from "../anthropic-semantic-preflight";
 import {
 	CACHE_REPLAY_MODEL_HEADER,
@@ -7708,7 +7709,9 @@ export async function proxyWithAccount(
 						observe: (evidence) =>
 							routingAttemptLedger?.observePhysicalStream(evidence),
 						semanticTimeoutMs: streamConfig.semanticTimeoutMs,
-						disableProtocolIdleTimeout: hasIrreversibleCodexWebSocketWrite,
+						disableProtocolIdleTimeout:
+							hasIrreversibleCodexWebSocketWrite ||
+							isProtocolIdleExemptProvider(account.provider),
 						meaningfulProgressTimeoutMs:
 							streamConfig.meaningfulProgressTimeoutMs,
 						commitmentDeadlineAt: semanticCommitmentDeadlineAt,
