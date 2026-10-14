@@ -6842,7 +6842,6 @@ describe("anthropic_precommit_client_abort observability (#506)", () => {
 		expect(data.rescueArmed).toBe(true);
 		expect(data.rescueActivated).toBe(true);
 		expect(data.rescueCommitted).toBe(false);
-		expect(data.responseHeadersReturned).toBe(false);
 		expect(data.elapsedMs).toBeGreaterThanOrEqual(30);
 		expect(data.elapsedMs).toBeLessThan(1000);
 		expect(data.rescueActivatedAtMs).toBeGreaterThanOrEqual(0);
@@ -6851,11 +6850,18 @@ describe("anthropic_precommit_client_abort observability (#506)", () => {
 		);
 	});
 
-	it("records committed rescue with headers already returned when the client aborts after the grace", async () => {
+	/**
+	 * Drive a streaming request past the rescue grace so the outer SSE rescue
+	 * commits, then abort the client while routing is still pending upstream.
+	 * Returns the single captured event's data.
+	 */
+	async function abortAfterCommittedRescue(
+		accountId: string,
+	): Promise<Record<string, unknown>> {
 		process.env[RESCUE_ACTIVATION_ENV] = "20";
 		process.env[RESCUE_PING_ENV] = "5";
 		process.env[RESCUE_DEADLINE_ENV] = "5000";
-		const account = makeAccount("client-abort-after-grace");
+		const account = makeAccount(accountId);
 		const { ctx } = makeContext([account]);
 		let signalStarted!: () => void;
 		const started = new Promise<void>((resolve) => {
@@ -6876,11 +6882,48 @@ describe("anthropic_precommit_client_abort observability (#506)", () => {
 		await reader?.cancel("done").catch(() => undefined);
 
 		expect(events).toHaveLength(1);
-		const data = events[0].data as Record<string, unknown>;
+		return events[0].data as Record<string, unknown>;
+	}
+
+	it("records committed rescue when the client aborts after the grace", async () => {
+		const data = await abortAfterCommittedRescue("client-abort-after-grace");
 		expect(data.rescueArmed).toBe(true);
 		expect(data.rescueActivated).toBe(true);
 		expect(data.rescueCommitted).toBe(true);
-		expect(data.responseHeadersReturned).toBe(true);
+	});
+
+	it("pro-gate r1 P2-2: the committed-rescue abort event carries rescueCommitted and makes no header-delivery claim", async () => {
+		// markRescueCommitted() fires before the rescue Response is even returned
+		// to the server, so the handler never observes whether headers reached
+		// the client. The event must not dress ownership up as delivery.
+		const data = await abortAfterCommittedRescue(
+			"client-abort-after-grace-no-delivery-claim",
+		);
+		expect(data.rescueCommitted).toBe(true);
+		expect("responseHeadersReturned" in data).toBe(false);
+	});
+
+	it("pro-gate r1 P2-1: a client abort on a route without an armed rescue emits no anthropic_precommit_client_abort", async () => {
+		// stream:false never arms the pre-commit rescue, so proxyWithAccount sees
+		// preCommitRescue === undefined. The 499 exit is still taken (ordinary
+		// client cancellation), but the Anthropic rescue event must stay silent.
+		const account = makeAccount("client-abort-no-rescue-route");
+		const { ctx } = makeContext([account]);
+		let signalStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			signalStarted = resolve;
+		});
+		globalThis.fetch = slowUpstream({ resolve: signalStarted });
+		const clientAbort = new AbortController();
+		const request = makeRequest(clientAbort.signal, undefined, false);
+		const routed = handleProxy(request, new URL(request.url), ctx);
+		await started;
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		clientAbort.abort("client gave up on a non-streaming request");
+		const response = await routed;
+		expect(response.status).toBe(499);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(events).toHaveLength(0);
 	});
 
 	it("emits nothing for a request that completes normally", async () => {
