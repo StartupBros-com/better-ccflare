@@ -116,9 +116,13 @@ export async function prepareRequestBody(req: Request): Promise<{
  * reused keep-alive socket it counts from when the socket returned to the pool,
  * so a slow model was dropped at 260-300 s — long before
  * PROXY_REQUEST_TIMEOUT_MS or the precommit rescue's commitment window (#489).
- * Disabling it leaves those ccflare deadlines in charge. The option goes in
- * fetch()'s init argument, where Bun reads it, not on the derived Request; and
- * bun-types does not declare it, hence the local type.
+ * Disabling it leaves those ccflare deadlines in charge of the header wait.
+ * On 1.3.11 the same timer also reaped a body that went silent after headers,
+ * including one whose reader was only cancelled; without it, that upstream is
+ * held until it closes. Bun 1.4.2 cuts neither phase and closes the socket on
+ * cancel, so the toolchain pin tracked in #489 closes that gap. The option
+ * goes in fetch()'s init argument, where Bun reads it, not on the derived
+ * Request; and bun-types does not declare it, hence the local type.
  */
 const BUN_FETCH_TIMEOUT_DISABLED: RequestInit & { timeout: false } =
 	Object.freeze({ timeout: false });
@@ -141,10 +145,11 @@ export async function makeProxyRequest(
 	signal?: AbortSignal,
 ): Promise<Response> {
 	// The header-phase timeout is always armed, independent of any caller
-	// signal, so it can abort the fetch even after headers arrive — a client
-	// that disconnects mid-stream (Claude Code's idle watchdog, Ctrl-C, a
-	// dropped network) would otherwise leak the upstream connection, since
-	// reader.cancel() doesn't close the socket in Bun, only abort() does.
+	// signal, but it bounds only the wait for headers: the finally below
+	// clears it once fetch() resolves. After headers the upstream is released
+	// only by an abort of the caller signal (client disconnect, routing and
+	// commitment deadlines) or of the drain controller below. On Bun 1.3.11
+	// reader.cancel() does not close the socket, only abort() does (#489).
 	const headerTimeoutController = new AbortController();
 	const timeoutId = setTimeout(
 		() => headerTimeoutController.abort(),
