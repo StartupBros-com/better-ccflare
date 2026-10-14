@@ -446,7 +446,7 @@ export function createAdvisorEmulationStream(
 			const stop = delta.delta?.stop_reason;
 			if (advisors.length === 0) {
 				flushRecs(order, acc);
-			} else if (toolUses.length > 1 || stop !== "tool_use") {
+			} else if (toolUses.length !== advisors.length || stop !== "tool_use") {
 				deps.onEvent?.({
 					kind: "advisor_dropped_with_siblings",
 					round: rounds + 1,
@@ -613,8 +613,13 @@ export function createAdvisorEmulationStream(
 			const round = rounds;
 			const idx = recs.indexOf(advisor);
 			// Blocks before the advisor call reach the client now, so the
-			// advisor round sees exactly what the client has been sent.
-			flushRecs(recs.slice(0, idx), result.acc);
+			// advisor round sees exactly what the client has been sent. The
+			// advisor takes no input, so any further advisor calls in the same
+			// message are duplicates of this one and are dropped.
+			flushRecs(
+				recs.slice(0, idx).filter((r) => !r.isAdvisor),
+				result.acc,
+			);
 			const inflightBefore = [...sent];
 			const callId =
 				typeof advisor.start?.id === "string" ? advisor.start.id : "";
@@ -658,7 +663,10 @@ export function createAdvisorEmulationStream(
 			}
 			// Blocks the worker emitted after the advisor call (rare) follow
 			// the pair so the message stays in worker order around it.
-			flushRecs(recs.slice(idx + 1), result.acc);
+			flushRecs(
+				recs.slice(idx + 1).filter((r) => !r.isAdvisor),
+				result.acc,
+			);
 
 			if (workerCapReached) {
 				emitTerminal("end_turn");

@@ -473,6 +473,42 @@ describe("AE2: advisor with siblings", () => {
 		expect(h.advisorCalls).toHaveLength(0);
 		expect(h.events[0]?.kind).toBe("advisor_dropped_with_siblings");
 	});
+
+	it("runs one round when every tool call is an advisor call", async () => {
+		const up = worker({
+			blocks: [
+				{ kind: "text", text: "go" },
+				advisorCall("call_a"),
+				advisorCall("call_b"),
+			],
+			stop: "tool_use",
+		});
+		const cont = worker({
+			blocks: [{ kind: "text", text: "done" }],
+			stop: "end_turn",
+		});
+		const h = harness([cont]);
+		const { events } = await run(up, h);
+		expectContiguous(events);
+		const s = starts(events).map((e) => e.json.content_block);
+		expect(s.map((b) => b.type)).toEqual([
+			"text",
+			"server_tool_use",
+			"advisor_tool_result",
+			"text",
+		]);
+		expect(s[1].id).toBe(emulatedAdvisorIdFromCallId("call_a"));
+		expect(h.advisorCalls).toHaveLength(1);
+		expect(h.contCalls).toHaveLength(1);
+		expect(h.contCalls[0]?.inflightAssistantContent.map((b) => b.type)).toEqual(
+			["text", "server_tool_use", "advisor_tool_result"],
+		);
+		expect(s.some((b) => b.type === "tool_use")).toBe(false);
+		expect(
+			events.find((e) => e.json.type === "message_delta")?.json.delta
+				.stop_reason,
+		).toBe("end_turn");
+	});
 });
 
 describe("AE3: advisor failure outcome", () => {
