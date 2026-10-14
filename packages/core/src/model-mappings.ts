@@ -524,6 +524,26 @@ export function getEndpointUrl(
 }
 
 /**
+ * True only for a Codex ChatGPT-subscription OAuth account: no API key, no
+ * custom endpoint, and an access token present. Advisor emulation runs only
+ * on these accounts.
+ */
+export function isCodexOAuthAccount(
+	account: Pick<
+		Account,
+		"provider" | "api_key" | "custom_endpoint" | "access_token"
+	>,
+): boolean {
+	return (
+		account.provider === "codex" &&
+		!account.api_key &&
+		!account.custom_endpoint &&
+		typeof account.access_token === "string" &&
+		account.access_token.trim().length > 0
+	);
+}
+
+/**
  * True only for an Anthropic account whose resolved endpoint is the
  * first-party API (https://api.anthropic.com, no port or credentials).
  * OAuth and API-key accounts both qualify. Fails closed on unparsable URLs.
