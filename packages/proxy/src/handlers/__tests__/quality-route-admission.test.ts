@@ -23,6 +23,7 @@ import {
 	evaluateQualityRouteAdmission,
 	type QualityRouteAdmissionInput,
 } from "../quality-route-admission";
+import { processProxyResponse } from "../response-processor";
 
 function fixture(): QualityRouteAdmissionInput {
 	const now = Date.now();
@@ -325,6 +326,28 @@ it.each([
 		if (rotation) {
 			// Keep this baseline independent of the new output-limit accounting.
 			expect(evaluateQualityRouteAdmission(input).status).toBe("admit");
+			usageCache.setCodexPassiveUsage(
+				account.id,
+				new Headers({
+					"x-codex-secondary-window-minutes": "10080",
+					"x-codex-secondary-used-percent": "55",
+					"x-codex-secondary-reset-at": String(
+						Math.floor(Date.now() / 1000) + 3600,
+					),
+				}),
+			);
+			const retainedSnapshot = usageCache.getSnapshot(account.id);
+			if (!retainedSnapshot) throw new Error("missing retained usage");
+			expect(
+				evaluateQualityRouteAdmission({
+					...input,
+					usage: {
+						...retainedSnapshot,
+						accountId: account.id,
+						provider: "codex",
+					},
+				}).status,
+			).toBe("admit");
 			// Catalog and dispatch own token B, while usage still owns token A.
 			// A matching fresh catalog must not mask lost dispatch-token forwarding.
 			account.access_token = "rotated";
@@ -338,6 +361,11 @@ it.each([
 				throw new Error("missing rotated catalog");
 			const rotated: QualityRouteAdmissionInput = {
 				...input,
+				usage: {
+					...retainedSnapshot,
+					accountId: account.id,
+					provider: "codex",
+				},
 				selectedCredentials: { account, accessToken: "rotated" },
 				request: {
 					...input.request,
@@ -505,6 +533,74 @@ it.each([
 					},
 				}).status,
 			).not.toBe("admit");
+		}
+		if (!withGrant && ceiling === 20) {
+			const headers = new Headers({
+				"x-codex-secondary-window-minutes": "10080",
+				"x-codex-secondary-used-percent": "55",
+				"x-codex-secondary-reset-at": String(
+					Math.floor(Date.now() / 1000) + 3600,
+				),
+			});
+			const responseContext = {
+				provider: {
+					name: "codex",
+					parseRateLimit: () => ({ isRateLimited: false }),
+				},
+				config: { getCodexFiveHourWindowEnabled: () => false },
+				asyncWriter: { enqueue: () => {} },
+				dbOps: { resetAccountSession: async () => {} },
+			} as unknown as ProxyContext;
+			await processProxyResponse(
+				new Response(null, { headers }),
+				account,
+				responseContext,
+			);
+			const passive = usageCache.getSnapshot(account.id);
+			if (!passive) throw new Error("missing passive snapshot");
+			const retained = {
+				...input,
+				usage: { ...passive, accountId: account.id, provider: "codex" },
+			};
+			expect(evaluateQualityRouteAdmission(retained)).toMatchObject({
+				status: "admit",
+				accounting: { requestedOutput: 0 },
+			});
+			for (const accessToken of [null, "", "rotated"]) {
+				expect(
+					evaluateQualityRouteAdmission({
+						...retained,
+						selectedCredentials: { account, accessToken },
+					}).status,
+				).not.toBe("admit");
+			}
+			expect(
+				evaluateQualityRouteAdmission({
+					...retained,
+					selectedCredentials: undefined,
+				}).status,
+			).not.toBe("admit");
+			expect(
+				evaluateQualityRouteAdmission({
+					...retained,
+					account: { ...account, id: "other" },
+				}).status,
+			).not.toBe("admit");
+			headers.set("x-codex-secondary-used-percent", "100");
+			await processProxyResponse(
+				new Response(null, { headers }),
+				account,
+				responseContext,
+			);
+			const exhausted = usageCache.getSnapshot(account.id);
+			if (!exhausted) throw new Error("missing exhausted snapshot");
+			expect(
+				evaluateQualityRouteAdmission({
+					...retained,
+					usage: { ...exhausted, accountId: account.id, provider: "codex" },
+				}).status,
+			).not.toBe("admit");
+			expect(evaluateQualityRouteAdmission(retained).status).not.toBe("admit");
 		}
 	} finally {
 		usageCache.stopPolling(account.id);

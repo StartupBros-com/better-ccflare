@@ -51,6 +51,8 @@ export interface OpenAIRequest {
 	tools?: OpenAITool[];
 	tool_choice?: OpenAIToolChoice;
 	reasoning?: { effort?: string };
+	/** Request-level chat-template kwargs (oMLX/vLLM-style servers). */
+	chat_template_kwargs?: Record<string, unknown>;
 }
 
 export interface AnthropicTextContent {
@@ -155,14 +157,21 @@ export interface TransformStreamContext {
 	extractedModel: string;
 	contextWindowSize?: number;
 	hasSentStart: boolean;
-	hasSentContentBlockStart: boolean;
-	hasSentThinkingBlockStart: boolean;
-	thinkingBlockClosed: boolean;
-	textBlockClosed: boolean;
-	/** Anthropic block index for the thinking block (assigned by nextBlockIndex). */
-	thinkingBlockIndex: number;
-	/** Index of the text content block in the Anthropic stream (assigned by nextBlockIndex). */
-	textBlockIndex: number;
+	/**
+	 * The thinking or text block currently open, if any. A delta of the other
+	 * kind closes it and opens a fresh block at the next index; a stopped block
+	 * is never written to again. tool_use blocks are tracked separately in
+	 * toolCallBlockIndices and stay open until the stream ends.
+	 */
+	openBlock: { kind: "thinking" | "text"; index: number } | null;
+	/**
+	 * Thinking/text that arrived after a tool_use block started, in arrival
+	 * order with same-kind runs merged. Tool blocks stay open until their
+	 * buffered arguments are emitted at stream end, and an Anthropic stream
+	 * completes each block before the next starts, so these are replayed as
+	 * fresh blocks once the tool blocks have closed.
+	 */
+	deferredBlocks: Array<{ kind: "thinking" | "text"; content: string }>;
 	promptTokens?: number;
 	completionTokens: number;
 	cacheReadInputTokens?: number;

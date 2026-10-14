@@ -1091,6 +1091,23 @@ function validateDatabaseConfig(
 	}
 }
 
+/**
+ * Account IDs opted in to chat-template reasoning (see
+ * OpenAICompatibleProvider.injectChatTemplateReasoning). Comma-separated list
+ * in CCFLARE_CHAT_TEMPLATE_REASONING_ACCOUNTS, read live on every call so the
+ * allowlist can change without caching. IDs only: names can be renamed.
+ */
+export function getChatTemplateReasoningAccountIds(): ReadonlySet<string> {
+	const raw = process.env.CCFLARE_CHAT_TEMPLATE_REASONING_ACCOUNTS;
+	if (!raw) return new Set();
+	return new Set(
+		raw
+			.split(",")
+			.map((id) => id.trim())
+			.filter((id) => id.length > 0),
+	);
+}
+
 export function getCodexReasoningRetention(): boolean {
 	const fromEnv = process.env.CCFLARE_CODEX_REASONING_RETENTION;
 	if (fromEnv) {

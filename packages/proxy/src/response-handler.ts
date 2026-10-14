@@ -1458,7 +1458,7 @@ export async function forwardToClient(
 			}
 		};
 
-		const onClose = (_buffered: Uint8Array[]): void => {
+		const onClose = (): void => {
 			finishStream({ kind: "close" });
 		};
 
@@ -1483,6 +1483,7 @@ export async function forwardToClient(
 		};
 
 		const passthroughBody = teeStream(responseBody, {
+			collect: false,
 			onChunk,
 			onClose,
 			onError,

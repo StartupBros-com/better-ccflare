@@ -1,58 +1,61 @@
 import { type RequestEvt, requestEvents } from "@better-ccflare/core";
+import { startSseKeepalive } from "./sse-keepalive";
 
 export function createRequestsStreamHandler() {
 	return (req: Request): Response => {
-		// Store the write handler outside to access it in cancel
 		let writeHandler: ((data: RequestEvt) => void) | null = null;
+		let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+		let stopKeepalive: (() => void) | null = null;
 		let isClosed = false;
+		const handleAbort = () => cleanup();
+		const cleanup = () => {
+			if (isClosed) return;
+			isClosed = true;
+			stopKeepalive?.();
+			stopKeepalive = null;
+			if (writeHandler) {
+				requestEvents.off("event", writeHandler);
+				writeHandler = null;
+			}
+			req.signal.removeEventListener("abort", handleAbort);
+			try {
+				controller?.close();
+			} catch {
+				// The consumer may already have cancelled the stream.
+			}
+		};
 
-		const stream = new ReadableStream({
-			start(controller) {
+		const stream = new ReadableStream<Uint8Array>({
+			start(streamController) {
+				controller = streamController;
+				if (req.signal.aborted) {
+					cleanup();
+					return;
+				}
+				req.signal.addEventListener("abort", handleAbort);
 				const encoder = new TextEncoder();
-
-				// Helper to send SSE formatted data with error handling
 				writeHandler = (data: RequestEvt) => {
 					if (isClosed) return;
-
 					try {
-						const message = `data: ${JSON.stringify(data)}\n\n`;
-						controller.enqueue(encoder.encode(message));
-					} catch (_error) {
-						// Stream is closed or errored
-						isClosed = true;
-						if (writeHandler) {
-							requestEvents.off("event", writeHandler);
-							writeHandler = null;
-						}
+						streamController.enqueue(
+							encoder.encode(`data: ${JSON.stringify(data)}\n\n`),
+						);
+					} catch {
+						cleanup();
 					}
 				};
-
-				// Send initial connection message
-				const connectMsg = `event: connected\ndata: ok\n\n`;
-				controller.enqueue(encoder.encode(connectMsg));
-
-				// Listen for events
+				try {
+					streamController.enqueue(
+						encoder.encode("event: connected\ndata: ok\n\n"),
+					);
+				} catch {
+					cleanup();
+					return;
+				}
 				requestEvents.on("event", writeHandler);
+				stopKeepalive = startSseKeepalive(streamController, cleanup);
 			},
-			cancel() {
-				// Cleanup only this specific listener
-				isClosed = true;
-				if (writeHandler) {
-					requestEvents.off("event", writeHandler);
-					writeHandler = null;
-				}
-			},
-		});
-
-		// Clean up on abort signal
-		req.signal?.addEventListener("abort", () => {
-			if (!isClosed) {
-				isClosed = true;
-				if (writeHandler) {
-					requestEvents.off("event", writeHandler);
-					writeHandler = null;
-				}
-			}
+			cancel: cleanup,
 		});
 
 		return new Response(stream, {

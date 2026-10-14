@@ -14,6 +14,7 @@ import type {
 import { COMMON_MODELS } from "@better-ccflare/types";
 import {
 	type QueryClient,
+	replaceEqualDeep,
 	useMutation,
 	useQuery,
 	useQueryClient,
@@ -21,6 +22,117 @@ import {
 import { useCallback } from "react";
 import { api, type RequestPayload, type RequestSummary } from "../api";
 import { queryKeys } from "../lib/query-keys";
+import { captureRequestUpdates, getRequestsSseSeq } from "./useRequestStream";
+
+interface RequestSnapshot {
+	requests: RequestPayload[];
+	detailsMap: Map<string, RequestSummary>;
+}
+
+const PENDING_SNAPSHOTS = new WeakMap<
+	RequestSnapshot,
+	{
+		captured: ReturnType<typeof captureRequestUpdates>;
+		limit: number;
+		sequence: number;
+		dispose: () => void;
+	}
+>();
+
+// Retry overtaken snapshots at most three times. Capture remains active through
+// QueryClient's cache commit, not just until the query function resolves.
+async function fetchRequestSnapshot(
+	queryClient: QueryClient,
+	limit: number,
+	signal: AbortSignal,
+): Promise<RequestSnapshot> {
+	const captured = captureRequestUpdates(queryClient, limit);
+	let snapshot: RequestSnapshot | undefined;
+	const dispose = () => {
+		signal.removeEventListener("abort", dispose);
+		captured.dispose();
+		if (snapshot) PENDING_SNAPSHOTS.delete(snapshot);
+	};
+	signal.addEventListener("abort", dispose, { once: true });
+	try {
+		let summaries: RequestSummary[] = [];
+		let sequence = getRequestsSseSeq();
+		for (let attempt = 0; attempt < 3; attempt++) {
+			signal.throwIfAborted();
+			sequence = getRequestsSseSeq();
+			summaries = await api.getRequestsSummary(limit);
+			signal.throwIfAborted();
+			if (sequence === getRequestsSseSeq()) break;
+		}
+		snapshot = {
+			requests: summaries.map(summaryToPlaceholder),
+			detailsMap: new Map(summaries.map((summary) => [summary.id, summary])),
+		};
+		PENDING_SNAPSHOTS.set(snapshot, { captured, limit, sequence, dispose });
+		return snapshot;
+	} catch (error) {
+		dispose();
+		throw error;
+	}
+}
+
+// structuralSharing is the synchronous cache-write boundary. Applying the
+// overlay here also covers events arriving after queryFn resolves.
+function reconcileRequestSnapshot(previous: unknown, next: unknown): unknown {
+	const snapshot = next as RequestSnapshot | undefined;
+	const pending = snapshot && PENDING_SNAPSHOTS.get(snapshot);
+	if (!snapshot || !pending) return replaceEqualDeep(previous, next);
+	try {
+		const detailsMap = new Map(snapshot.detailsMap);
+		const byId = new Map(
+			snapshot.requests.map((request) => [request.id, request]),
+		);
+		const inserted = new Map<string, number>();
+		for (const update of pending.captured.updates.values()) {
+			const existing = byId.get(update.id);
+			// Persistence happens at completion, so a request can be missing from
+			// every retry. Retain such events across attempts, but trust a later
+			// snapshot for rows it does contain. A start cannot undo a terminal row.
+			if (existing && (update.sequence <= pending.sequence || !update.summary))
+				continue;
+			if (!existing) inserted.set(update.id, update.sequence);
+			const request = update.request ?? existing;
+			if (update.summary) {
+				const completed = summaryToPlaceholder(update.summary);
+				byId.set(update.id, {
+					...completed,
+					...request,
+					response: completed.response,
+					error: completed.error,
+					meta: {
+						...completed.meta,
+						...request?.meta,
+						pending: false,
+						success: update.summary.success,
+						rateLimited: update.summary.rateLimited,
+						bodiesOmitted: true,
+					},
+				});
+				detailsMap.set(update.id, update.summary);
+			} else if (request) {
+				byId.set(update.id, request);
+				detailsMap.delete(update.id);
+			}
+		}
+		const requests = [...byId.values()]
+			.sort(
+				(left, right) =>
+					right.meta.timestamp - left.meta.timestamp ||
+					(inserted.get(right.id) ?? 0) - (inserted.get(left.id) ?? 0),
+			)
+			.slice(0, pending.limit);
+		const ids = new Set(requests.map((request) => request.id));
+		for (const id of detailsMap.keys()) if (!ids.has(id)) detailsMap.delete(id);
+		return replaceEqualDeep(previous, { requests, detailsMap });
+	} finally {
+		pending.dispose();
+	}
+}
 
 export interface ManagedRoutingInvalidationOptions {
 	accounts?: boolean;
@@ -633,21 +745,13 @@ export const useAnomalyInsights = (timeRange: string) => {
 export const useRequests = (limit: number, _refetchInterval?: number) => {
 	return useQuery({
 		queryKey: queryKeys.requests(limit),
-		queryFn: async () => {
-			// Fetch only the summary endpoint - it has everything the list view needs.
-			// Full request/response bodies are lazy-loaded per row when needed
-			// (modal open, copy-as-JSON) via /api/requests/payload/:id.
-			const requestsSummary = await api.getRequestsSummary(limit);
-			const detailsMap = new Map(
-				requestsSummary.map((summary) => [summary.id, summary]),
-			);
-			const requests: RequestPayload[] =
-				requestsSummary.map(summaryToPlaceholder);
-			return { requests, detailsMap };
-		},
+		// Full bodies remain lazy-loaded per row via /api/requests/payload/:id.
+		queryFn: ({ client, signal }) =>
+			fetchRequestSnapshot(client, limit, signal),
+		structuralSharing: reconcileRequestSnapshot,
 		staleTime: Infinity, // Consider data fresh until manually refetched
 		gcTime: 10 * 60 * 1000, // Keep in cache for 10 minutes
-		// Remove refetchInterval - SSE stream handles real-time updates
+		refetchInterval: false, // Override global polling; SSE/reconnect owns updates.
 	});
 };
 
@@ -655,6 +759,8 @@ export const useLogHistory = () => {
 	return useQuery({
 		queryKey: queryKeys.logHistory(),
 		queryFn: () => api.getLogHistory(),
+		refetchInterval: false,
+		refetchOnWindowFocus: false,
 	});
 };
 

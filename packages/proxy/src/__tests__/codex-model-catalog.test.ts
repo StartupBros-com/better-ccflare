@@ -13,7 +13,8 @@ import {
 	resolveProviderModelDefault,
 	setDerivedProviderModelDefaults,
 } from "@better-ccflare/providers";
-import type { Account } from "@better-ccflare/types";
+import type { Account, QualityRoutingPolicy } from "@better-ccflare/types";
+import type { CodexCatalogAcquisitionScope } from "../codex-model-catalog";
 import {
 	CODEX_CATALOG_STALE_ALERT_MS,
 	clearCodexModelCacheForAccount,
@@ -24,14 +25,24 @@ import {
 	getCodexAutoCatalogEvidence,
 	getCodexModels,
 	getKnownCodexModels,
+	getPendingCodexCatalogAcquisition,
 	initCodexModelCatalogRefresh,
+	isCodexCatalogRefreshEligible,
 	lowestTierCodexModel,
 	CATALOG_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS,
 	reportCatalogRoleRouteFailClosed,
 	revalidateUnknownCodexModel,
 	validateCodexAutoCatalogCredentials,
 } from "../codex-model-catalog";
+import {
+	clearPendingRotation,
+	getPendingRotation,
+	recordPendingRotation,
+} from "../handlers/pending-rotation-registry";
 import type { ProxyContext } from "../handlers/proxy-types";
+import * as tokenManager from "../handlers/token-manager";
+import { compileQualityCandidates } from "../quality-route-candidates";
+import { prepareCodexQualityCatalogs } from "../quality-route-catalog-preparation";
 
 /**
  * The per-subscription model list, and what happens when OpenAI stops
@@ -1494,6 +1505,842 @@ describe("ensureCodexModelDefaults", () => {
 		await ensureCodexModelDefaults(account, makeCtx(account), () => 50_000);
 		expect(fetches).toBe(2);
 	});
+
+	// A request-scoped caller (Auto catalog preparation) passes its own
+	// continuation and eligibility restrictions. They are rechecked after the
+	// attempt's own account reload and token resolution, immediately before the
+	// GET; a stop there is a typed not-attempted outcome, not an account failure.
+	describe("request-scoped restrictions at the pre-GET boundary", () => {
+		const warnless = () =>
+			spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+
+		it("a stop landing in the attempt's own reload issues no GET and records no backoff", async () => {
+			let fetches = 0;
+			const account = makeAccount({ id: "acc-scope-stop" });
+			globalThis.fetch = (async () => {
+				fetches++;
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			let stopped = false;
+			const ctx = {
+				dbOps: {
+					getAccount: async () => {
+						// The outer stop check passed; the request ends during the reload.
+						stopped = true;
+						return account;
+					},
+				},
+				refreshInFlight: new Map(),
+			} as unknown as ProxyContext;
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => stopped,
+				accountEligible: () => true,
+			};
+			const warnSpy = warnless();
+			try {
+				await ensureCodexModelDefaults(
+					account,
+					ctx,
+					() => 70_000,
+					false,
+					scope,
+				);
+				expect(fetches).toBe(0);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(
+					false,
+				);
+				expect(warnSpy).not.toHaveBeenCalled();
+				// An unrestricted ensure right after acquires at once: the stopped
+				// attempt scheduled no retry delay against the account.
+				await ensureCodexModelDefaults(account, makeCtx(account), () => 70_000);
+				expect(fetches).toBe(1);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(true);
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
+
+		it("an account change landing in the attempt's own token resolution issues no GET and records no backoff", async () => {
+			let fetches = 0;
+			const account = makeAccount({ id: "acc-scope-paused" });
+			globalThis.fetch = (async () => {
+				fetches++;
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			let reloads = 0;
+			const ctx = {
+				dbOps: {
+					// The attempt's first reload is eligible; the fresh row read after
+					// token resolution, immediately before the GET, is paused.
+					getAccount: async () =>
+						++reloads === 1 ? account : { ...account, paused: true },
+				},
+				refreshInFlight: new Map(),
+			} as unknown as ProxyContext;
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => false,
+				accountEligible: (fresh) => !fresh.paused,
+			};
+			const warnSpy = warnless();
+			try {
+				await ensureCodexModelDefaults(
+					account,
+					ctx,
+					() => 80_000,
+					false,
+					scope,
+				);
+				expect(fetches).toBe(0);
+				expect(reloads).toBeGreaterThanOrEqual(2);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(
+					false,
+				);
+				expect(warnSpy).not.toHaveBeenCalled();
+				await ensureCodexModelDefaults(account, makeCtx(account), () => 80_000);
+				expect(fetches).toBe(1);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(true);
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
+
+		it("the direct read surfaces the typed not-attempted outcome instead of a cached fallback", async () => {
+			let fetches = 0;
+			const account = makeAccount({ id: "acc-scope-typed" });
+			globalThis.fetch = (async () => {
+				fetches++;
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => true,
+				accountEligible: () => true,
+			};
+			const warnSpy = warnless();
+			try {
+				await expect(
+					getCodexModels(account.id, makeCtx(account), scope),
+				).rejects.toMatchObject({
+					name: "CodexCatalogAcquisitionNotAttemptedError",
+					reason: "request-stopped",
+				});
+				expect(fetches).toBe(0);
+				expect(warnSpy).not.toHaveBeenCalled();
+				// Without restrictions the same read proceeds.
+				const listing = await getCodexModels(account.id, makeCtx(account));
+				expect(listing?.source).toBe("live");
+				expect(fetches).toBe(1);
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
+	});
+
+	// A scoped attempt's typed not-attempted outcome is the scoped caller's
+	// alone. A cold caller without restrictions (stock routing, the heartbeat)
+	// that joined it must not treat that outcome as its own acquisition: it
+	// rechecks once after the shared attempt settles and, if the account is
+	// still cold with no retry pending, acquires once under its own restrictions.
+	describe("unrestricted callers joining a request-scoped attempt", () => {
+		const warnless = () =>
+			spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+
+		/**
+		 * A context whose first account reload (the scoped attempt's own) is held
+		 * until released, so a joiner can arrive before the stop lands. Later
+		 * reloads pass through; the reload count at each GET attributes it.
+		 */
+		function heldReloadCtx(account: Account) {
+			let reloads = 0;
+			let release!: () => void;
+			let onHeld!: () => void;
+			const heldPromise = new Promise<void>((resolve) => {
+				onHeld = resolve;
+			});
+			const released = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const ctx = {
+				dbOps: {
+					getAccount: async () => {
+						if (++reloads === 1) {
+							onHeld();
+							await released;
+						}
+						return account;
+					},
+				},
+				refreshInFlight: new Map(),
+			} as unknown as ProxyContext;
+			return { ctx, heldPromise, release, reloads: () => reloads };
+		}
+
+		/**
+		 * heldReloadCtx whose reloads answer with a row the test can change: each
+		 * reload returns the row as it stands when that reload resumes, so a pause,
+		 * a replacement or a deletion (null) lands between any two reloads.
+		 */
+		function mutableRowCtx(initial: Account | null) {
+			let row = initial;
+			let reloads = 0;
+			let release!: () => void;
+			let onHeld!: () => void;
+			const heldPromise = new Promise<void>((resolve) => {
+				onHeld = resolve;
+			});
+			const released = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const ctx = {
+				dbOps: {
+					getAccount: async () => {
+						if (++reloads === 1) {
+							onHeld();
+							await released;
+						}
+						return row;
+					},
+				},
+				refreshInFlight: new Map(),
+			} as unknown as ProxyContext;
+			return {
+				ctx,
+				heldPromise,
+				release,
+				reloads: () => reloads,
+				setRow: (next: Account | null) => {
+					row = next;
+				},
+			};
+		}
+
+		it("a cold unrestricted joiner of a scoped attempt stopped in its reload acquires once after it, without backoff", async () => {
+			let fetches = 0;
+			const reloadsAtFetch: number[] = [];
+			const account = makeAccount({ id: "acc-join-reload" });
+			const hold = heldReloadCtx(account);
+			globalThis.fetch = (async () => {
+				fetches++;
+				reloadsAtFetch.push(hold.reloads());
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			let stopped = false;
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => stopped,
+				accountEligible: () => true,
+			};
+			const warnSpy = warnless();
+			try {
+				const scoped = ensureCodexModelDefaults(
+					account,
+					hold.ctx,
+					() => 90_000,
+					false,
+					scope,
+				);
+				await hold.heldPromise;
+				expect(getPendingCodexCatalogAcquisition(account.id)).toBeDefined();
+				const joiner = ensureCodexModelDefaults(
+					account,
+					hold.ctx,
+					() => 90_000,
+				);
+				stopped = true;
+				hold.release();
+				await scoped;
+				await joiner;
+				// The stopped owner issued no GET; the one GET belongs to the
+				// joiner's own attempt, which reloads before and after its token
+				// resolution, so the GET follows the third reload. It happened at
+				// once inside the joiner's wait: no retry delay stood against the
+				// account.
+				expect(fetches).toBe(1);
+				expect(reloadsAtFetch).toEqual([3]);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(true);
+				// First-hand: the account's own listing, which reads back as "cached".
+				expect(getKnownCodexModels(account.id)?.accountId).toBe(account.id);
+				expect(getPendingCodexCatalogAcquisition(account.id)).toBeUndefined();
+				expect(warnSpy).not.toHaveBeenCalled();
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
+
+		it("a cold unrestricted joiner of a scoped attempt stopped in its token resolution acquires once after it", async () => {
+			let fetches = 0;
+			let tokenCalls = 0;
+			const tokenCallsAtFetch: number[] = [];
+			const account = makeAccount({ id: "acc-join-token" });
+			globalThis.fetch = (async () => {
+				fetches++;
+				tokenCallsAtFetch.push(tokenCalls);
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			let stopped = false;
+			let release!: () => void;
+			let onHeld!: () => void;
+			const heldPromise = new Promise<void>((resolve) => {
+				onHeld = resolve;
+			});
+			const released = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const original = tokenManager.getValidAccessToken;
+			// The scoped attempt's own token resolution, after its reload, is held.
+			const tokenSpy = spyOn(
+				tokenManager,
+				"getValidAccessToken",
+			).mockImplementation(async (resolving, context) => {
+				if (resolving.id === account.id && ++tokenCalls === 1) {
+					onHeld();
+					await released;
+				}
+				return original(resolving, context);
+			});
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => stopped,
+				accountEligible: () => true,
+			};
+			const warnSpy = warnless();
+			try {
+				const scoped = ensureCodexModelDefaults(
+					account,
+					makeCtx(account),
+					() => 91_000,
+					false,
+					scope,
+				);
+				await heldPromise;
+				const joiner = ensureCodexModelDefaults(
+					account,
+					makeCtx(account),
+					() => 91_000,
+				);
+				stopped = true;
+				release();
+				await scoped;
+				await joiner;
+				expect(fetches).toBe(1);
+				expect(tokenCallsAtFetch).toEqual([2]);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(true);
+				expect(warnSpy).not.toHaveBeenCalled();
+			} finally {
+				tokenSpy.mockRestore();
+				warnSpy.mockRestore();
+			}
+		});
+
+		it("unrestricted joiners share one recovery acquisition, and a joiner of that recovery starts none", async () => {
+			let fetches = 0;
+			const account = makeAccount({ id: "acc-join-many" });
+			const hold = heldReloadCtx(account);
+			let resolveFetch!: (response: Response) => void;
+			globalThis.fetch = (() => {
+				fetches++;
+				return new Promise<Response>((resolve) => {
+					resolveFetch = resolve;
+				});
+			}) as typeof globalThis.fetch;
+			let stopped = false;
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => stopped,
+				accountEligible: () => true,
+			};
+			const scoped = ensureCodexModelDefaults(
+				account,
+				hold.ctx,
+				() => 95_000,
+				false,
+				scope,
+			);
+			await hold.heldPromise;
+			const joiners = [
+				ensureCodexModelDefaults(account, hold.ctx, () => 95_000),
+				ensureCodexModelDefaults(account, hold.ctx, () => 95_000),
+				ensureCodexModelDefaults(account, hold.ctx, () => 95_000),
+			];
+			stopped = true;
+			hold.release();
+			await scoped;
+			await waitForFetchCount(() => fetches, 1);
+			// A cold caller arriving during the recovery joins it as usual.
+			const late = ensureCodexModelDefaults(account, hold.ctx, () => 95_000);
+			resolveFetch(Response.json(LIVE_BODY));
+			await Promise.all([...joiners, late]);
+			expect(fetches).toBe(1);
+			expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(true);
+			expect(getPendingCodexCatalogAcquisition(account.id)).toBeUndefined();
+		});
+
+		it("the heartbeat joining a stopped scoped attempt recovers the cold account within the same tick", async () => {
+			let fetches = 0;
+			let listed = 0;
+			const reloadsAtFetch: number[] = [];
+			const account = makeAccount({ id: "acc-join-heartbeat" });
+			const hold = heldReloadCtx(account);
+			hold.ctx.dbOps.getAllAccounts = async () => {
+				listed++;
+				return [account];
+			};
+			globalThis.fetch = (async () => {
+				fetches++;
+				reloadsAtFetch.push(hold.reloads());
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			let stopped = false;
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => stopped,
+				accountEligible: () => true,
+			};
+			const scoped = ensureCodexModelDefaults(
+				account,
+				hold.ctx,
+				() => 96_000,
+				false,
+				scope,
+			);
+			await hold.heldPromise;
+			const stop = initCodexModelCatalogRefresh(hold.ctx, {
+				initialDelayMs: 1,
+				tickSeconds: 1,
+			});
+			try {
+				// The tick lists accounts, then its worker joins the held attempt in
+				// the same microtask run; a later macrotask observing the listing
+				// therefore observes the join.
+				for (let i = 0; i < 200 && listed === 0; i++) {
+					await new Promise((resolve) => setTimeout(resolve, 2));
+				}
+				expect(listed).toBe(1);
+				stopped = true;
+				hold.release();
+				await scoped;
+				// The tick's own wait on the shared attempt covers the recovery; a
+				// cold account is not left for the next cycle fifteen minutes out.
+				await waitForFetchCount(() => fetches, 1);
+				expect(reloadsAtFetch).toEqual([3]);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(true);
+				await waitRealMs(20);
+			} finally {
+				stop();
+			}
+			expect(fetches).toBe(1);
+		});
+
+		it("a joined scoped attempt's HTTP failure keeps its backoff: the joiner gains no second acquisition", async () => {
+			let fetches = 0;
+			const account = makeAccount({ id: "acc-join-http-failure" });
+			const hold = heldReloadCtx(account);
+			globalThis.fetch = (async () => {
+				fetches++;
+				return new Response("nope", { status: 401 });
+			}) as typeof globalThis.fetch;
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => false,
+				accountEligible: () => true,
+			};
+			const warnSpy = warnless();
+			try {
+				const scoped = ensureCodexModelDefaults(
+					account,
+					hold.ctx,
+					() => 97_000,
+					false,
+					scope,
+				);
+				await hold.heldPromise;
+				const joiner = ensureCodexModelDefaults(
+					account,
+					hold.ctx,
+					() => 97_000,
+				);
+				hold.release();
+				await scoped;
+				await joiner;
+				expect(fetches).toBe(1);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(
+					false,
+				);
+				// The recorded failure gates every later caller until its delay elapses.
+				await ensureCodexModelDefaults(
+					account,
+					hold.ctx,
+					() => 97_000 + 59_999,
+				);
+				expect(fetches).toBe(1);
+				await ensureCodexModelDefaults(
+					account,
+					hold.ctx,
+					() => 97_000 + 60_000,
+				);
+				expect(fetches).toBe(2);
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
+
+		it("a warm unrestricted caller returns at once while a scoped refresh is held, and the stop retires nothing", async () => {
+			let fetches = 0;
+			const account = makeAccount({ id: "acc-join-warm" });
+			globalThis.fetch = (async () => {
+				fetches++;
+				return Response.json(LIVE_BODY);
+			}) as typeof globalThis.fetch;
+			await getCodexModels(account.id, makeCtx(account));
+			expect(fetches).toBe(1);
+			const hold = heldReloadCtx(account);
+			let stopped = false;
+			const scope: CodexCatalogAcquisitionScope = {
+				stopped: () => stopped,
+				accountEligible: () => true,
+			};
+			const due = () => Date.now() + 16 * 60_000;
+			const scoped = ensureCodexModelDefaults(
+				account,
+				hold.ctx,
+				due,
+				false,
+				scope,
+			);
+			await hold.heldPromise;
+			let settled = false;
+			void ensureCodexModelDefaults(account, hold.ctx, due).then(() => {
+				settled = true;
+			});
+			await Promise.resolve();
+			expect(settled).toBe(true);
+			stopped = true;
+			hold.release();
+			await scoped;
+			await getPendingCodexCatalogAcquisition(account.id);
+			expect(fetches).toBe(1);
+			expect(getKnownCodexModels(account.id)?.models[0].id).toBe("gpt-5.6-sol");
+		});
+
+		describe("the joiner's own recovery", () => {
+			interface SupersededAccountCase {
+				name: string;
+				/** Lands the change while the scoped attempt is held; returns the row reloads then see. */
+				land(account: Account, stop: () => void): Account | null;
+				/** The row the independent later caller runs with. */
+				later(account: Account, landed: Account | null): Account;
+			}
+			const restored = (account: Account) => account;
+			const supersededAccountCases: SupersededAccountCase[] = [
+				{
+					name: "paused",
+					land: (account) => ({ ...account, paused: true }),
+					later: restored,
+				},
+				{
+					name: "flagged requires_reauth",
+					land: (account) => ({ ...account, requires_reauth: true }),
+					later: restored,
+				},
+				{
+					name: "moved to a custom endpoint",
+					land: (account) => ({
+						...account,
+						custom_endpoint: "https://custom.example.invalid",
+					}),
+					later: restored,
+				},
+				{
+					name: "switched to another provider",
+					land: (account) => ({ ...account, provider: "anthropic" }),
+					later: restored,
+				},
+				{
+					name: "deleted",
+					land: (account) => {
+						clearCodexModelCacheForAccount(account.id);
+						return null;
+					},
+					later: restored,
+				},
+				{
+					// Still eligible: only the generation and created_at say it is another
+					// account; the starter ends on its request stop.
+					name: "replaced under the same ID",
+					land: (account, stop) => {
+						clearCodexModelCacheForAccount(account.id);
+						stop();
+						return { ...account, created_at: account.created_at + 1 };
+					},
+					later: (account, landed) => landed ?? account,
+				},
+			];
+
+			// The joined attempt ended without a GET because the account changed under
+			// it. The joiner's follow-up must not read an account that is no longer
+			// the eligible one it joined on, and must not leave a retry delay that
+			// blocks the next eligible caller.
+			for (const [index, variant] of supersededAccountCases.entries()) {
+				it(`after the joined scoped attempt stopped on an account that was ${variant.name}, the joiner's recovery sends no GET and leaves no backoff`, async () => {
+					const now = () => 110_000 + index;
+					let fetches = 0;
+					const account = makeAccount({
+						id: `acc-recover-${variant.name.replace(/\W+/g, "-")}`,
+					});
+					const hold = mutableRowCtx(account);
+					globalThis.fetch = (async () => {
+						fetches++;
+						return Response.json(LIVE_BODY);
+					}) as typeof globalThis.fetch;
+					let stopped = false;
+					const scope: CodexCatalogAcquisitionScope = {
+						stopped: () => stopped,
+						accountEligible: isCodexCatalogRefreshEligible,
+					};
+					const collected = collectCatalogEvents();
+					const warnSpy = warnless();
+					try {
+						const scoped = ensureCodexModelDefaults(
+							account,
+							hold.ctx,
+							now,
+							false,
+							scope,
+						);
+						await hold.heldPromise;
+						const joiner = ensureCodexModelDefaults(account, hold.ctx, now);
+						const landed = variant.land(account, () => {
+							stopped = true;
+						});
+						hold.setRow(landed);
+						hold.release();
+						await scoped;
+						await joiner;
+						expect(fetches).toBe(0);
+						expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(
+							false,
+						);
+						expect(getKnownCodexModels(account.id)).toBeNull();
+						expect(
+							getPendingCodexCatalogAcquisition(account.id),
+						).toBeUndefined();
+						expect(warnSpy).not.toHaveBeenCalled();
+						expect(collected.events).toEqual([]);
+						// No failure or delay stands against the account: an independent
+						// caller at the same instant acquires at once.
+						const laterRow = variant.later(account, landed);
+						hold.setRow(laterRow);
+						await ensureCodexModelDefaults(laterRow, hold.ctx, now);
+						expect(fetches).toBe(1);
+						expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(
+							true,
+						);
+					} finally {
+						collected.stop();
+						warnSpy.mockRestore();
+					}
+				});
+			}
+
+			// The recovery resolves its own credential before its GET; an account
+			// change landing in that await must stop it just as it stops a scoped one.
+			it("an account change landing in the recovery's own token resolution sends no GET", async () => {
+				const now = () => 130_000;
+				let fetches = 0;
+				let tokenCalls = 0;
+				const account = makeAccount({ id: "acc-recover-token" });
+				const hold = mutableRowCtx(account);
+				globalThis.fetch = (async () => {
+					fetches++;
+					return Response.json(LIVE_BODY);
+				}) as typeof globalThis.fetch;
+				let stopped = false;
+				let releaseToken!: () => void;
+				let onTokenHeld!: () => void;
+				const tokenHeld = new Promise<void>((resolve) => {
+					onTokenHeld = resolve;
+				});
+				const tokenReleased = new Promise<void>((resolve) => {
+					releaseToken = resolve;
+				});
+				const original = tokenManager.getValidAccessToken;
+				// The starter stops at its reload, so the first token resolution for
+				// this account is the recovery's own.
+				const tokenSpy = spyOn(
+					tokenManager,
+					"getValidAccessToken",
+				).mockImplementation(async (resolving, context) => {
+					if (resolving.id === account.id && ++tokenCalls === 1) {
+						onTokenHeld();
+						await tokenReleased;
+					}
+					return original(resolving, context);
+				});
+				const scope: CodexCatalogAcquisitionScope = {
+					stopped: () => stopped,
+					accountEligible: () => true,
+				};
+				const warnSpy = warnless();
+				try {
+					const scoped = ensureCodexModelDefaults(
+						account,
+						hold.ctx,
+						now,
+						false,
+						scope,
+					);
+					await hold.heldPromise;
+					const joiner = ensureCodexModelDefaults(account, hold.ctx, now);
+					stopped = true;
+					hold.release();
+					await scoped;
+					await tokenHeld;
+					hold.setRow({ ...account, paused: true });
+					releaseToken();
+					await joiner;
+					expect(fetches).toBe(0);
+					expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(
+						false,
+					);
+					expect(getPendingCodexCatalogAcquisition(account.id)).toBeUndefined();
+					expect(warnSpy).not.toHaveBeenCalled();
+					hold.setRow(account);
+					await ensureCodexModelDefaults(account, hold.ctx, now);
+					expect(fetches).toBe(1);
+					expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(
+						true,
+					);
+				} finally {
+					tokenSpy.mockRestore();
+					warnSpy.mockRestore();
+				}
+			});
+
+			// A scoped attempt that did make its GET answers a forced joiner too: the
+			// recheck is not a second forced refresh. A forced caller that finds no
+			// attempt running still refreshes.
+			it("a forced unrestricted joiner of a scoped attempt that succeeded starts no second GET", async () => {
+				const now = () => 140_000;
+				let fetches = 0;
+				const account = makeAccount({ id: "acc-recover-forced" });
+				const hold = heldReloadCtx(account);
+				globalThis.fetch = (async () => {
+					fetches++;
+					return Response.json(LIVE_BODY);
+				}) as typeof globalThis.fetch;
+				const scope: CodexCatalogAcquisitionScope = {
+					stopped: () => false,
+					accountEligible: () => true,
+				};
+				const scoped = ensureCodexModelDefaults(
+					account,
+					hold.ctx,
+					now,
+					false,
+					scope,
+				);
+				await hold.heldPromise;
+				const joiner = ensureCodexModelDefaults(account, hold.ctx, now, true);
+				hold.release();
+				await scoped;
+				await joiner;
+				// A redundant refresh would be registered by now; wait it out.
+				await getPendingCodexCatalogAcquisition(account.id);
+				expect(fetches).toBe(1);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(true);
+				expect(getPendingCodexCatalogAcquisition(account.id)).toBeUndefined();
+				// Control: with no attempt running, force still refreshes.
+				void ensureCodexModelDefaults(account, hold.ctx, now, true);
+				await getPendingCodexCatalogAcquisition(account.id);
+				expect(fetches).toBe(2);
+			});
+
+			it("a forced unrestricted joiner of a scoped attempt that stopped still recovers exactly once", async () => {
+				const now = () => 150_000;
+				let fetches = 0;
+				const account = makeAccount({ id: "acc-recover-forced-stopped" });
+				const hold = heldReloadCtx(account);
+				globalThis.fetch = (async () => {
+					fetches++;
+					return Response.json(LIVE_BODY);
+				}) as typeof globalThis.fetch;
+				let stopped = false;
+				const scope: CodexCatalogAcquisitionScope = {
+					stopped: () => stopped,
+					accountEligible: () => true,
+				};
+				const scoped = ensureCodexModelDefaults(
+					account,
+					hold.ctx,
+					now,
+					false,
+					scope,
+				);
+				await hold.heldPromise;
+				const joiner = ensureCodexModelDefaults(account, hold.ctx, now, true);
+				stopped = true;
+				hold.release();
+				await scoped;
+				await joiner;
+				expect(fetches).toBe(1);
+				expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(true);
+				expect(getPendingCodexCatalogAcquisition(account.id)).toBeUndefined();
+			});
+
+			// Invariant: the recovery belongs to unrestricted joiners only. A scoped
+			// joiner's preparation waits on the attempt and rechecks ownership itself.
+			it("a scoped joiner of a stopped scoped attempt takes no recovery of its own", async () => {
+				const now = () => 160_000;
+				let fetches = 0;
+				const account = makeAccount({ id: "acc-recover-scoped-joiner" });
+				const hold = heldReloadCtx(account);
+				globalThis.fetch = (async () => {
+					fetches++;
+					return Response.json(LIVE_BODY);
+				}) as typeof globalThis.fetch;
+				let stopped = false;
+				const scope: CodexCatalogAcquisitionScope = {
+					stopped: () => stopped,
+					accountEligible: () => true,
+				};
+				const joinerScope: CodexCatalogAcquisitionScope = {
+					stopped: () => false,
+					accountEligible: () => true,
+				};
+				const collected = collectCatalogEvents();
+				try {
+					const scoped = ensureCodexModelDefaults(
+						account,
+						hold.ctx,
+						now,
+						false,
+						scope,
+					);
+					await hold.heldPromise;
+					const joiner = ensureCodexModelDefaults(
+						account,
+						hold.ctx,
+						now,
+						false,
+						joinerScope,
+					);
+					stopped = true;
+					hold.release();
+					await scoped;
+					await joiner;
+					expect(fetches).toBe(0);
+					expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(
+						false,
+					);
+					expect(getPendingCodexCatalogAcquisition(account.id)).toBeUndefined();
+					expect(collected.events).toEqual([]);
+					// No delay stands against the account: a later unrestricted caller
+					// acquires at once.
+					await ensureCodexModelDefaults(account, hold.ctx, now);
+					expect(fetches).toBe(1);
+					expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(
+						true,
+					);
+				} finally {
+					collected.stop();
+				}
+			});
+		});
+	});
 });
 
 /**
@@ -1725,6 +2572,44 @@ describe("Codex catalog alert events", () => {
 			}
 		});
 
+		it("never counts a request-scoped attempt stopped before its GET as a failed attempt", async () => {
+			let now = BASE_NOW;
+			const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+			try {
+				const account = makeAccount({ expires_at: BASE_NOW + 10 * 3_600_000 });
+				const ctx = makeCtx(account);
+				serve(LIVE_BODY);
+				await getCodexModels(account.id, ctx);
+
+				now = BASE_NOW + REFRESH_INTERVAL_MS + 1;
+				serve("unavailable", 503);
+				const stopped: CodexCatalogAcquisitionScope = {
+					stopped: () => true,
+					accountEligible: () => true,
+				};
+				await expect(
+					getCodexModels(account.id, ctx, stopped),
+				).rejects.toMatchObject({
+					name: "CodexCatalogAcquisitionNotAttemptedError",
+				});
+				evaluateCodexCatalogStaleness(
+					[account],
+					BASE_NOW + 10 * CODEX_CATALOG_STALE_ALERT_MS,
+				);
+				expect(collected.of("catalog_stale")).toEqual([]);
+
+				// The same read without restrictions does fail, and is reported.
+				await getCodexModels(account.id, ctx);
+				evaluateCodexCatalogStaleness(
+					[account],
+					BASE_NOW + 10 * CODEX_CATALOG_STALE_ALERT_MS,
+				);
+				expect(collected.of("catalog_stale")).toHaveLength(1);
+			} finally {
+				nowSpy.mockRestore();
+			}
+		});
+
 		it("never reports an account that has no catalog of its own", async () => {
 			const account = makeAccount({ id: "acc-never-listed" });
 			serve("nope", 401);
@@ -1944,6 +2829,466 @@ describe("Codex catalog alert events", () => {
 				T,
 			);
 			expect(collected.events).toEqual([]);
+		});
+	});
+});
+
+/**
+ * Auto preparation over the real catalog and the real token manager: account
+ * generations, credential epochs and pending rotations decide which token a
+ * renewal uses and which token its evidence admits. Only the network is
+ * intercepted, and only catalog GETs are answered.
+ */
+describe("Codex Auto preparation over real credentials", () => {
+	const intent = { kind: "main", preference: "auto" } as const;
+	let now = 1_000_000;
+	let clock: ReturnType<typeof spyOn>;
+	let rows: Map<string, Account>;
+	let calls: string[];
+	let unexpected: string[];
+	let metadata: () => Promise<Response>;
+	const catalogResponse = () =>
+		Response.json({
+			models: [
+				{
+					slug: "gpt-6-astra",
+					visibility: "list",
+					context_window: 200_000,
+					max_context_window: 200_000,
+				},
+			],
+		});
+
+	function row(id: string, overrides: Partial<Account> = {}): Account {
+		return {
+			id,
+			name: id,
+			provider: "codex",
+			api_key: null,
+			access_token: `synthetic-token-${id}`,
+			refresh_token: `synthetic-refresh-${id}`,
+			expires_at: 100_000_000,
+			created_at: 1,
+			priority: 0,
+			paused: false,
+			requires_reauth: false,
+			rate_limited_until: null,
+			custom_endpoint: null,
+			...overrides,
+		} as Account;
+	}
+	function policy(ids: string[]): QualityRoutingPolicy {
+		return {
+			version: 1,
+			revision: "quality-policy-v1:codex-real-credentials",
+			choices: [],
+			fallbacks: [],
+			spendGrants: [],
+			assignments: [
+				{
+					line: "gpt-astra",
+					lane: "astra",
+					priority: 0,
+					upgrade: "exact-only",
+				},
+			],
+			accounts: ids.map((accountId) => ({
+				accountId,
+				provider: "codex",
+				lines: ["gpt-astra"],
+				priority: 0,
+			})),
+			lanes: {
+				opus: [],
+				standard: [],
+				lightweight: [],
+				astra: ["gpt-astra"],
+				fable: [],
+			},
+			mainLadders: { auto: ["astra"], opus: [], astra: ["astra"], fable: [] },
+			workerLanes: {
+				standard: [],
+				lightweight: [],
+				opus: [],
+				astra: ["astra"],
+				fable: [],
+			},
+		};
+	}
+	/** Rows are returned as copies, like the real database facade. */
+	function install(id: string, overrides: Partial<Account> = {}) {
+		const account = row(id, overrides);
+		rows.set(id, account);
+		const p = policy([id]);
+		const ctx = {
+			config: { getQualityRoutingPolicy: () => p },
+			dbOps: {
+				getAccount: async (accountId: string) => {
+					const current = rows.get(accountId);
+					return current ? { ...current } : null;
+				},
+				updateAccountTokensIfRefreshTokenMatches: async () => false,
+			},
+			refreshInFlight: new Map(),
+		} as unknown as ProxyContext;
+		return { account, p, ctx };
+	}
+	const prepare = (
+		ctx: ProxyContext,
+		p: QualityRoutingPolicy,
+		accounts: Account[],
+	) =>
+		prepareCodexQualityCatalogs(ctx, p, intent, accounts, {
+			signal: new AbortController().signal,
+		});
+	/**
+	 * An expired stored token whose refresh the real token manager resolves from
+	 * a pending rotation: the outbox write persisting it fails, as during a
+	 * database outage, so the rotated token lives only in the registry.
+	 */
+	function installRotation(id: string) {
+		const fixture = install(id, { expires_at: now - 1 });
+		fixture.ctx.dbOps.updateAccountTokensIfRefreshTokenMatches = async () => {
+			throw new Error("synthetic database persist outage");
+		};
+		return fixture;
+	}
+	function recordRotation(
+		account: Account,
+		extra: Partial<Parameters<typeof recordPendingRotation>[1]> = {},
+	) {
+		return recordPendingRotation(account.id, {
+			accessToken: "synthetic-pending-access",
+			refreshToken: "synthetic-pending-refresh",
+			attemptedRefreshToken: account.refresh_token as string,
+			expiresAt: 100_000_000,
+			createdAt: account.created_at,
+			...extra,
+		});
+	}
+	function deferred<T>() {
+		let resolve!: (value: T) => void;
+		const promise = new Promise<T>((done) => {
+			resolve = done;
+		});
+		return { promise, resolve };
+	}
+	async function waitUntil(predicate: () => boolean) {
+		for (let i = 0; i < 200 && !predicate(); i++) {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+		expect(predicate()).toBe(true);
+	}
+	const admits = (evidence: unknown, account: Account, accessToken: string) =>
+		validateCodexAutoCatalogCredentials(
+			evidence as Parameters<typeof validateCodexAutoCatalogCredentials>[0],
+			{ account, accessToken },
+		);
+
+	beforeEach(() => {
+		now = 1_000_000;
+		clock = spyOn(Date, "now").mockImplementation(() => now);
+		rows = new Map();
+		calls = [];
+		unexpected = [];
+		metadata = async () => catalogResponse();
+		// A token refresh or any other request must fail loudly here, never be
+		// answered with a catalog body as though it had succeeded.
+		globalThis.fetch = (async (input, init) => {
+			const url = new URL(input instanceof Request ? input.url : String(input));
+			const method = init?.method ?? "GET";
+			if (
+				url.origin !== "https://chatgpt.com" ||
+				url.pathname !== "/backend-api/codex/models" ||
+				method !== "GET"
+			) {
+				unexpected.push(`${method} ${url}`);
+				throw new Error(`Unexpected network request: ${unexpected.at(-1)}`);
+			}
+			calls.push(new Headers(init?.headers).get("authorization") ?? "");
+			return metadata();
+		}) as typeof globalThis.fetch;
+	});
+	afterEach(() => {
+		clock.mockRestore();
+		expect(unexpected).toEqual([]);
+	});
+
+	it("deletion during acquisition cannot repopulate owned evidence", async () => {
+		const { account, p, ctx } = install("real-deleted");
+		const response = deferred<Response>();
+		metadata = () => response.promise;
+		const work = prepare(ctx, p, [account]);
+		await waitUntil(() => calls.length === 1);
+		rows.delete(account.id);
+		clearCodexModelCacheForAccount(account.id);
+		response.resolve(catalogResponse());
+		await work;
+		await getPendingCodexCatalogAcquisition(account.id);
+		expect(getCodexAutoCatalogEvidence(account.id, true)).toBeNull();
+	});
+
+	it("same-ID recreation retires the old ownership and needs the replacement's own acquisition", async () => {
+		const { account, p, ctx } = install("real-recreated");
+		await prepare(ctx, p, [account]);
+		const original = getCodexAutoCatalogEvidence(account.id);
+		expect(original).not.toBeNull();
+		clearCodexModelCacheForAccount(account.id);
+		const replacement = { ...account, created_at: 2 };
+		rows.set(account.id, replacement);
+		expect(
+			admits(original, replacement, replacement.access_token as string),
+		).toBe(false);
+		await prepare(ctx, p, [replacement]);
+		const renewed = getCodexAutoCatalogEvidence(account.id);
+		expect(renewed).not.toBe(original);
+		expect(
+			admits(renewed, replacement, replacement.access_token as string),
+		).toBe(true);
+		expect(
+			admits(original, replacement, replacement.access_token as string),
+		).toBe(false);
+		expect(calls).toHaveLength(2);
+	});
+
+	it("current evidence owned by a replaced durable token is reacquired with the selected replacement", async () => {
+		const { account, p, ctx } = install("real-rotation");
+		await getCodexModels(account.id, ctx);
+		const original = getCodexAutoCatalogEvidence(account.id);
+		const replacement = { ...account, access_token: "synthetic-replacement" };
+		rows.set(account.id, replacement);
+		await prepare(ctx, p, [replacement]);
+		const renewed = getCodexAutoCatalogEvidence(account.id);
+		expect(calls).toEqual([
+			"Bearer synthetic-token-real-rotation",
+			"Bearer synthetic-replacement",
+		]);
+		expect(admits(original, replacement, "synthetic-replacement")).toBe(false);
+		expect(admits(renewed, replacement, "synthetic-replacement")).toBe(true);
+		// Ownership lives with the published object, never a copy of it.
+		expect(
+			admits(renewed && { ...renewed }, replacement, "synthetic-replacement"),
+		).toBe(false);
+	});
+
+	it("an endpoint change while the GET is pending: the listing lands, but admits no request on the changed row", async () => {
+		const { account, p, ctx } = install("real-endpoint");
+		const response = deferred<Response>();
+		metadata = () => response.promise;
+		const work = prepare(ctx, p, [account]);
+		await waitUntil(() => calls.length === 1);
+		const replacement = {
+			...account,
+			custom_endpoint: "https://custom.invalid/responses",
+		};
+		rows.set(account.id, replacement);
+		response.resolve(catalogResponse());
+		await work;
+		await getPendingCodexCatalogAcquisition(account.id);
+		expect(
+			admits(
+				getCodexAutoCatalogEvidence(account.id),
+				replacement,
+				replacement.access_token as string,
+			),
+		).toBe(false);
+		expect(calls).toHaveLength(1);
+	});
+
+	describe("pending rotations through the real token manager", () => {
+		it("an unpersisted rotation of this generation renews expired evidence bound to the pending token", async () => {
+			const { account, p, ctx } = installRotation("real-pending-renewal");
+			await recordRotation(account);
+			try {
+				await getCodexModels(account.id, ctx);
+				const original = getCodexAutoCatalogEvidence(account.id);
+				expect(original).not.toBeNull();
+				expect(calls).toEqual(["Bearer synthetic-pending-access"]);
+				now += REFRESH_INTERVAL_MS;
+				expect(
+					compileQualityCandidates(p, intent, [account]).candidates,
+				).toHaveLength(0);
+				await prepare(ctx, p, [account]);
+				const renewed = getCodexAutoCatalogEvidence(account.id);
+				expect(calls).toEqual([
+					"Bearer synthetic-pending-access",
+					"Bearer synthetic-pending-access",
+				]);
+				expect(renewed).not.toBeNull();
+				expect(renewed).not.toBe(original);
+				expect(renewed?.revision).toBe(original?.revision);
+				expect(renewed?.fetchedAt).toBe(now);
+				expect(original?.expiresAt).toBe(now);
+				expect(
+					compileQualityCandidates(p, intent, [account]).candidates,
+				).toHaveLength(1);
+				// The failed outbox write left the durable row and the rotation as
+				// they were.
+				expect(rows.get(account.id)?.access_token).toBe(account.access_token);
+				expect(
+					getPendingRotation(account.id, account.created_at)?.accessToken,
+				).toBe("synthetic-pending-access");
+				expect(admits(renewed, account, "synthetic-pending-access")).toBe(true);
+				expect(admits(renewed, account, account.access_token as string)).toBe(
+					false,
+				);
+			} finally {
+				clearPendingRotation(account.id);
+			}
+		});
+
+		it("a rotation recorded for another account generation never replaces valid durable credentials", async () => {
+			const { account, p, ctx } = install("real-pending-wrong-generation");
+			await recordRotation(account, { createdAt: account.created_at - 1 });
+			try {
+				expect(
+					getPendingRotation(account.id, account.created_at),
+				).toBeUndefined();
+				expect(
+					await tokenManager.getValidAccessToken({ ...account }, ctx),
+				).toBe(account.access_token as string);
+				await prepare(ctx, p, [account]);
+				expect(calls).toEqual([`Bearer ${account.access_token}`]);
+				const evidence = getCodexAutoCatalogEvidence(account.id);
+				expect(admits(evidence, account, "synthetic-pending-access")).toBe(
+					false,
+				);
+				expect(admits(evidence, account, account.access_token as string)).toBe(
+					true,
+				);
+			} finally {
+				clearPendingRotation(account.id);
+			}
+		});
+
+		it("a persisted rotation of this generation still supports cold acquisition", async () => {
+			const { account, p, ctx } = installRotation("real-pending-persisted");
+			await recordRotation(account);
+			ctx.dbOps.updateAccountTokensIfRefreshTokenMatches = async (
+				id,
+				expected,
+				accessToken,
+				expiresAt,
+				refreshToken,
+				createdAt,
+			) => {
+				const current = rows.get(id);
+				if (
+					!current ||
+					current.refresh_token !== expected ||
+					current.created_at !== createdAt
+				)
+					return false;
+				rows.set(id, {
+					...current,
+					access_token: accessToken,
+					expires_at: expiresAt,
+					refresh_token: refreshToken ?? current.refresh_token,
+				});
+				return true;
+			};
+			try {
+				await prepare(ctx, p, [account]);
+				expect(calls).toEqual(["Bearer synthetic-pending-access"]);
+				expect(getCodexAutoCatalogEvidence(account.id)).not.toBeNull();
+				expect(
+					getPendingRotation(account.id, account.created_at),
+				).toBeUndefined();
+				expect(rows.get(account.id)?.access_token).toBe(
+					"synthetic-pending-access",
+				);
+			} finally {
+				clearPendingRotation(account.id);
+			}
+		});
+
+		// Which token a renewal uses is the token manager's selection, the same
+		// one dispatch makes: the catalog adds no credential policy of its own. An
+		// unflushed rotation is adopted after a failed outbox write even when the
+		// durable row moved on meanwhile, so the GET carries the pending token.
+		// What the catalog guarantees is consumption: the evidence admits only
+		// the token it was read with, and a request selecting a different one is
+		// reacquired under that token rather than admitted.
+		it("an obsolete pending refresh-token anchor: the renewal carries the token manager's pending selection and its evidence admits only that token", async () => {
+			const { account, p, ctx } = installRotation("real-pending-obsolete");
+			await recordRotation(account);
+			rows.set(account.id, {
+				...(rows.get(account.id) as Account),
+				refresh_token: "synthetic-new-durable-refresh",
+			});
+			try {
+				await prepare(ctx, p, [account]);
+				expect(calls).toEqual(["Bearer synthetic-pending-access"]);
+				const evidence = getCodexAutoCatalogEvidence(account.id);
+				expect(admits(evidence, account, "synthetic-pending-access")).toBe(
+					true,
+				);
+				expect(admits(evidence, account, account.access_token as string)).toBe(
+					false,
+				);
+				// The selection is the token manager's alone, made the same way for
+				// any caller with no catalog involved.
+				expect(
+					await tokenManager.getValidAccessToken(
+						{ ...(rows.get(account.id) as Account) },
+						ctx,
+					),
+				).toBe("synthetic-pending-access");
+				expect(calls).toHaveLength(1);
+			} finally {
+				clearPendingRotation(account.id);
+			}
+		});
+
+		it("a durable access-token replacement during a failed outbox write: evidence read with the pending token never admits the replacement, which reacquires under its own", async () => {
+			const { account, p, ctx } = installRotation("real-pending-durable-race");
+			await recordRotation(account);
+			const persist = deferred<void>();
+			let held = false;
+			ctx.dbOps.updateAccountTokensIfRefreshTokenMatches = async () => {
+				if (!held && getPendingCodexCatalogAcquisition(account.id)) {
+					held = true;
+					await persist.promise;
+				}
+				throw new Error("synthetic database persist outage");
+			};
+			const work = prepare(ctx, p, [account]);
+			try {
+				await waitUntil(() => held);
+				const replacement = {
+					...(rows.get(account.id) as Account),
+					access_token: "synthetic-new-durable-access",
+					expires_at: 100_000_000,
+				};
+				rows.set(account.id, replacement);
+				persist.resolve();
+				await work;
+				await getPendingCodexCatalogAcquisition(account.id);
+				expect(calls).toEqual(["Bearer synthetic-pending-access"]);
+				const stale = getCodexAutoCatalogEvidence(account.id);
+				expect(admits(stale, replacement, "synthetic-new-durable-access")).toBe(
+					false,
+				);
+				// The next request resolves the durable replacement, finds the
+				// evidence another credential owns, and reacquires under its own.
+				await prepare(ctx, p, [replacement]);
+				expect(calls).toEqual([
+					"Bearer synthetic-pending-access",
+					"Bearer synthetic-new-durable-access",
+				]);
+				const renewed = getCodexAutoCatalogEvidence(account.id);
+				expect(renewed).not.toBe(stale);
+				expect(
+					admits(renewed, replacement, "synthetic-new-durable-access"),
+				).toBe(true);
+				expect(admits(renewed, replacement, "synthetic-pending-access")).toBe(
+					false,
+				);
+			} finally {
+				persist.resolve();
+				await work;
+				clearPendingRotation(account.id);
+			}
 		});
 	});
 });

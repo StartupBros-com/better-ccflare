@@ -150,6 +150,11 @@ export type ModelRoutingDriftReason = "stale_policy" | "unknown_model";
 
 /** A single alert raised by the alert engine. */
 export interface AlertEvent {
+	/** Publication-time classification; legacy persisted rows use the structured ID reason. */
+	classification?: {
+		reason: "cache_efficiency" | "cache_telemetry" | ModelRoutingDriftReason;
+		phase?: "opened" | "escalated" | "reminder" | "recovered";
+	};
 	id: string;
 	/** ms epoch */
 	timestamp: number;

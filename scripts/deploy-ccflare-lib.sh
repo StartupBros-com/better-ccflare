@@ -1496,6 +1496,33 @@ sha256_file() {
 	fi
 }
 
+# Refuse an executable whose Bun runtime differs from .bun-version. It checks
+# both `bun` on PATH and a `bun build --compile` binary, whose embedded runtime
+# answers as the bun CLI only under BUN_BE_BUN=1 (plain `bun` ignores the
+# variable). bun.lock kept the npm `bun` package, which every `bun run` script
+# resolves first, at 1.3.11 through each .bun-version bump, so prod shipped a
+# runtime CI never tested (#489, #491).
+validate_bun_runtime_version() {
+	if [[ "$#" -ne 3 ]]; then
+		echo "validate_bun_runtime_version requires: label executable bun-version-file" >&2
+		return 2
+	fi
+	local label="$1" executable="$2" version_file="$3" expected="" actual=""
+	if [[ -r "$version_file" ]]; then
+		expected="$(tr -d '[:space:]' <"$version_file")"
+	fi
+	if [[ ! "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+		echo "refusing to deploy: $version_file does not hold one exact Bun version" >&2
+		return 1
+	fi
+	actual="$(BUN_BE_BUN=1 "$executable" --version 2>/dev/null)" || actual=""
+	if [[ "$actual" != "$expected" ]]; then
+		echo "refusing to deploy: $label runs Bun '${actual:-unknown}', but .bun-version pins $expected" >&2
+		return 1
+	fi
+	echo "OK: $label runs Bun $actual, matching .bun-version."
+}
+
 immutable_binary_name() {
  if [[ "$#" -ne 3 || ! "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ || ! "$2" =~ ^[0-9a-f]{7,40}$ || ! "$3" =~ ^[0-9a-f]{64}$ ]]; then
   echo "immutable_binary_name requires: version source-id sha256" >&2

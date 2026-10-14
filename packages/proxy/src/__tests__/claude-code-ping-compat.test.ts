@@ -176,6 +176,66 @@ describe("Claude Code custom-base ping compatibility", () => {
 		}
 	});
 
+	it("never reads a stale delimiter byte left past the live buffer by a longer earlier frame", async () => {
+		// The openai-formats translator enqueues each SSE line separately. A
+		// content_block_delta event line is one byte longer than the
+		// content_block_stop event line that follows it, so once the delta frame
+		// drains, the byte just past the lone stop line is that older line's
+		// terminator. Reading it as the second half of a frame delimiter split
+		// the stop frame from its data and drove the parser length negative.
+		for (const eol of ["\n", "\r\n"]) {
+			const frames: Array<[string, unknown]> = [
+				[
+					"message_start",
+					{
+						type: "message_start",
+						message: { id: "msg_1", type: "message", role: "assistant" },
+					},
+				],
+				["ping", { type: "ping" }],
+				[
+					"content_block_start",
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: { type: "thinking", thinking: "" },
+					},
+				],
+				[
+					"content_block_delta",
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "thinking_delta", thinking: "\n" },
+					},
+				],
+				["content_block_stop", { type: "content_block_stop", index: 0 }],
+				[
+					"content_block_start",
+					{
+						type: "content_block_start",
+						index: 1,
+						content_block: { type: "tool_use", id: "call_1", name: "Edit" },
+					},
+				],
+				["message_stop", { type: "message_stop" }],
+			];
+			const lines = frames.flatMap(([event, data]) => [
+				`event: ${event}${eol}`,
+				`data: ${JSON.stringify(data)}${eol}${eol}`,
+			]);
+			const response = adaptAnthropicSsePingsForClaudeCode(
+				claudeRequest(),
+				new URL("http://localhost:8788/v1/messages"),
+				sseResponse(chunkedStream(lines.map((line) => encoder.encode(line)))),
+			);
+
+			expect(await response.text()).toBe(
+				lines.join("").replace(`event: ping${eol}`, `event: message${eol}`),
+			);
+		}
+	});
+
 	it("keeps every non-ping byte identical, including malformed and incomplete frames", async () => {
 		const chunks = [
 			encoder.encode(

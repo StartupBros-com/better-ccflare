@@ -31,15 +31,145 @@ async function makeDbOpsWithHashedKey(): Promise<DatabaseOperations> {
 		hashedKey,
 		prefixLast8: RAW_KEY.slice(-8),
 		role: "admin" as const,
+		isActive: true,
 	};
 	return {
 		countActiveApiKeys: async () => 1,
 		getActiveApiKeys: async () => [keyRecord],
+		getApiKey: async (id: string) => (id === keyRecord.id ? keyRecord : null),
 		updateApiKeyUsage: () => {},
 	} as unknown as DatabaseOperations;
 }
 
+describe("audience-bound stream tokens", () => {
+	for (const [audience, path] of [
+		["logs", "/api/logs/stream"],
+		["requests", "/api/requests/stream"],
+		["alerts", "/api/insights/alerts/stream"],
+	] as const) {
+		for (const target of [
+			"/api/logs/stream",
+			"/api/requests/stream",
+			"/api/insights/alerts/stream",
+		]) {
+			if (target === path) continue;
+			it(`${audience}: rejects and burns a token presented to ${target}`, async () => {
+				const auth = new AuthService(await makeDbOpsWithHashedKey());
+				const token = auth.mintStreamToken(audience, "key-1");
+				for (const destination of [target, path]) {
+					const req = new Request(
+						`http://localhost${destination}?stream_token=${token}`,
+					);
+					expect(
+						(await auth.authenticateRequest(req, destination, "GET"))
+							.isAuthenticated,
+					).toBe(false);
+				}
+			});
+		}
+		it(`${audience}: returns the current issuer and prevents concurrent replay`, async () => {
+			const db = await makeDbOpsWithHashedKey();
+			const auth = new AuthService(db);
+			const token = auth.mintStreamToken(audience, "key-1");
+			const request = () =>
+				new Request(`http://localhost${path}?stream_token=${token}`);
+			const results = await Promise.all([
+				auth.authenticateRequest(request(), path, "GET"),
+				auth.authenticateRequest(request(), path, "GET"),
+			]);
+			expect(results.filter((result) => result.isAuthenticated)).toHaveLength(
+				1,
+			);
+			expect(results.find((result) => result.isAuthenticated)?.apiKey).toBe(
+				(await db.getActiveApiKeys())[0],
+			);
+		});
+		it(`${audience}: burns before database awaits, expires at 60s and prunes`, async () => {
+			const db = await makeDbOpsWithHashedKey();
+			const auth = new AuthService(db);
+			const tokens = (
+				auth as unknown as { streamTokens: Map<string, { expiresAt: number }> }
+			).streamTokens;
+			const originalNow = Date.now;
+			try {
+				Date.now = () => 1000;
+				const expired = auth.mintStreamToken(audience, "key-1");
+				const pruned = auth.mintStreamToken(audience, "key-1");
+				expect(tokens.get(expired)?.expiresAt).toBe(61000);
+				Date.now = () => 61000;
+				const request = new Request(
+					`http://localhost${path}?stream_token=${expired}`,
+				);
+				db.countActiveApiKeys = async () => {
+					expect(tokens.has(expired)).toBe(false);
+					return 1;
+				};
+				expect(
+					(await auth.authenticateRequest(request, path, "GET"))
+						.isAuthenticated,
+				).toBe(false);
+				auth.mintStreamToken(audience, "key-1");
+				expect(tokens.has(pruned)).toBe(false);
+			} finally {
+				Date.now = originalNow;
+			}
+		});
+		it(`${audience}: cannot authorize other routes, prefixes, methods or durable query keys`, async () => {
+			const auth = new AuthService(await makeDbOpsWithHashedKey());
+			for (const [target, method] of [
+				[`${path}/extra`, "GET"],
+				[path, "POST"],
+				["/api/accounts", "GET"],
+				["/v1/messages", "POST"],
+				["/arbitrary", "GET"],
+			]) {
+				const token = auth.mintStreamToken(audience, "key-1");
+				const req = new Request(
+					`http://localhost${target}?stream_token=${token}`,
+					{ method },
+				);
+				expect(
+					(await auth.authenticateRequest(req, target, method)).isAuthenticated,
+				).toBe(false);
+			}
+			const req = new Request(`http://localhost${path}?api_key=${RAW_KEY}`);
+			expect(
+				(await auth.authenticateRequest(req, path, "GET")).isAuthenticated,
+			).toBe(false);
+		});
+		it(`${audience}: preserves Bearer fallback and rejects issuerless tokens once auth is enabled`, async () => {
+			const auth = new AuthService(await makeDbOpsWithHashedKey());
+			const token = auth.mintStreamToken(audience);
+			const req = new Request(`http://localhost${path}?stream_token=${token}`);
+			expect(
+				(await auth.authenticateRequest(req, path, "GET")).isAuthenticated,
+			).toBe(false);
+			const fallback = new Request(req.url, {
+				headers: { Authorization: `Bearer ${RAW_KEY}` },
+			});
+			expect(
+				(await auth.authenticateRequest(fallback, path, "GET")).isAuthenticated,
+			).toBe(true);
+		});
+	}
+});
+
 describe("AuthService — /api/logs/stream token (#379)", () => {
+	it("rechecks the issuer's current role instead of trusting the minted role", async () => {
+		const dbOps = await makeDbOpsWithHashedKey();
+		const auth = new AuthService(dbOps);
+		const token = auth.mintLogsStreamToken("key-1", "admin");
+		const keys = await dbOps.getActiveApiKeys();
+		keys[0].role = "api-only";
+		const req = new Request(
+			`http://localhost/api/logs/stream?stream_token=${token}`,
+		);
+		expect(
+			(await auth.authenticateRequest(req, "/api/logs/stream", "GET"))
+				.isAuthenticated,
+		).toBe(false);
+	});
+
 	it("authenticates a GET /api/logs/stream request with a valid ?stream_token= once", async () => {
 		const dbOps = await makeDbOpsWithHashedKey();
 		const auth = new AuthService(dbOps);

@@ -3,7 +3,10 @@ import {
 	getCodexSubscriptionFacts,
 	usageCache,
 } from "@better-ccflare/providers";
+import type { Account } from "@better-ccflare/types";
 import { mapWhamUsageResponse } from "../../../../providers/src/providers/codex/api-usage";
+import type { ProxyContext } from "../proxy-types";
+import { processProxyResponse } from "../response-processor";
 import { evaluateAutoCapacity } from "../usage-throttling";
 
 const originalFetch = globalThis.fetch;
@@ -43,6 +46,42 @@ async function poll(body: unknown) {
 	});
 	const snapshot = usageCache.getSnapshot(accountId);
 	if (!snapshot) throw new Error("poll did not publish a snapshot");
+	return snapshot;
+}
+function weeklyHeaders() {
+	return new Headers({
+		"x-codex-secondary-window-minutes": "10080",
+		"x-codex-secondary-used-percent": "55",
+		"x-codex-secondary-reset-at": String(
+			payload().rate_limit.secondary_window.reset_at,
+		),
+	});
+}
+async function processLiveHeaders(headers: Headers) {
+	const account = {
+		id: accountId,
+		name: "synthetic-codex-account",
+		provider: "codex",
+		access_token: token,
+		rate_limited_until: null,
+		rate_limited_at: null,
+	} as Account;
+	const ctx = {
+		provider: {
+			name: "codex",
+			parseRateLimit: () => ({ isRateLimited: false }),
+		},
+		config: { getCodexFiveHourWindowEnabled: () => false },
+		// Persistence jobs are outside this seam. Cache ingestion happens in
+		// the real response processor, synchronously before these queued jobs.
+		asyncWriter: { enqueue: () => {} },
+		dbOps: { resetAccountSession: async () => {} },
+	} as unknown as ProxyContext;
+	expect(
+		await processProxyResponse(new Response(null, { headers }), account, ctx),
+	).toBe(false);
+	const snapshot = usageCache.getSnapshot(accountId);
+	if (!snapshot) throw new Error("response headers did not publish a snapshot");
 	return snapshot;
 }
 function decision(
@@ -90,6 +129,404 @@ describe("Codex subscription-only source evidence (fake metadata transport)", ()
 		expect(json).not.toContain(token);
 		expect(json).not.toContain("fingerprint");
 		expect(json).not.toContain("isCurrent");
+	});
+	it("retains subscription admission after identical live weekly-only response headers", async () => {
+		const owned = await poll(payload());
+		expect(decision(owned)).toEqual({ status: "admit" });
+
+		const current = await processLiveHeaders(weeklyHeaders());
+		expect(current.data).not.toBe(owned.data);
+		expect(current.data.seven_day).toEqual({
+			utilization: 55,
+			resets_at: new Date(
+				payload().rate_limit.secondary_window.reset_at * 1000,
+			).toISOString(),
+		});
+		// Retention must not grant raw ownership to a replaced or passive object.
+		expect(
+			getCodexSubscriptionFacts(
+				owned.data,
+				accountId,
+				Date.now(),
+				180_000,
+				token,
+			),
+		).toBeNull();
+		expect(
+			getCodexSubscriptionFacts(
+				current.data,
+				accountId,
+				Date.now(),
+				180_000,
+				token,
+			),
+		).toBeNull();
+		expect(decision(current)).toEqual({ status: "admit" });
+	});
+	it("live headers preserve all four polling-only display extras without exporting authority", async () => {
+		const owned = await poll({
+			...payload(),
+			plan_type: "pro",
+			code_review_rate_limit: {
+				primary_window: {
+					used_percent: 7,
+					reset_at: payload().rate_limit.secondary_window.reset_at,
+				},
+			},
+		});
+		const current = await processLiveHeaders(weeklyHeaders());
+		for (const key of [
+			"plan_type",
+			"credits_balance",
+			"code_review_used_percent",
+			"code_review_resets_at",
+		] as const) {
+			expect(owned.data[key]).toBeDefined();
+			expect(current.data[key]).toEqual(owned.data[key]);
+		}
+		expect(current.data.codex_subscription).toBeUndefined();
+		expect(decision(current).status).toBe("admit");
+	});
+	it("passive timestamps never renew the original 179999/180000ms boundary", async () => {
+		const realNow = Date.now;
+		let clock = now;
+		Date.now = () => clock;
+		try {
+			await poll(payload());
+			clock += 179_999;
+			const fresh = await processLiveHeaders(weeklyHeaders());
+			expect(decision(fresh).status).toBe("admit");
+			clock += 1;
+			const expired = await processLiveHeaders(weeklyHeaders());
+			expect(expired.observedAt).toBe(clock);
+			expect(decision(expired).status).not.toBe("admit");
+		} finally {
+			Date.now = realNow;
+		}
+	});
+	it("later passive resets cannot extend the original poll window", async () => {
+		const realNow = Date.now;
+		let clock = now;
+		Date.now = () => clock;
+		try {
+			const body = payload();
+			body.rate_limit.secondary_window.reset_at = Math.floor(now / 1000) + 30;
+			await poll(body);
+			clock += 31_000;
+			expect(
+				decision(await processLiveHeaders(weeklyHeaders())).status,
+			).not.toBe("admit");
+		} finally {
+			Date.now = realNow;
+		}
+	});
+	it.each([
+		"exhausted",
+		"malformed",
+		"unsupported",
+		"new-five-hour",
+	])("%s passive contradiction stays revoked until another poll", async (kind) => {
+		await poll(payload());
+		const headers = weeklyHeaders();
+		if (kind === "exhausted" || kind === "malformed") {
+			headers.set(
+				"x-codex-secondary-used-percent",
+				kind === "exhausted" ? "100" : "garbage",
+			);
+		} else {
+			headers.set(
+				"x-codex-primary-window-minutes",
+				kind === "unsupported" ? "1440" : "300",
+			);
+			headers.set("x-codex-primary-used-percent", "100");
+			headers.set(
+				"x-codex-primary-reset-at",
+				String(payload().rate_limit.secondary_window.reset_at),
+			);
+		}
+		expect(decision(await processLiveHeaders(headers)).status).not.toBe(
+			"admit",
+		);
+		expect(decision(await processLiveHeaders(weeklyHeaders())).status).not.toBe(
+			"admit",
+		);
+		expect(await usageCache.refreshNow(accountId)).toBe(true);
+		expect(decision(await processLiveHeaders(weeklyHeaders())).status).toBe(
+			"admit",
+		);
+	});
+	// Wire contract: https://github.com/openai/codex/blob/2f761ae8210082c21cdd471131fa2118680a6059/codex-rs/codex-api/src/rate_limits.rs#L219-L257
+	it.each([
+		["hasCredits", "true", "0", "0"],
+		["unlimited", "FALSE", "1", "0"],
+		["balance", "0", "FALSE", "25"],
+		["unknown-hasCredits", "unknown", "0", "0"],
+		["unknown-unlimited", "false", "unknown", "0"],
+		["nonnumeric-balance", "false", "0", "garbage"],
+		["empty-balance", "false", "0", ""],
+		["nonfinite-balance", "false", "0", "Infinity"],
+		["underflow-balance", "false", "0", "1e-999"],
+		["decimal-underflow-balance", "false", "0", `0.${"0".repeat(400)}1`],
+	])("live credit contradiction %s revokes admission until a fresh owned poll", async (_kind, hasCredits, unlimited, balance) => {
+		const owned = await poll(payload());
+		expect(decision(owned, { accessToken: token }).status).toBe("admit");
+
+		const benign = weeklyHeaders();
+		benign.set("x-codex-credits-has-credits", "FALSE");
+		benign.set("x-codex-credits-unlimited", "0");
+		benign.set("x-codex-credits-balance", "0");
+		expect(
+			decision(await processLiveHeaders(benign), { accessToken: token }).status,
+		).toBe("admit");
+
+		const contradictory = new Headers(benign);
+		contradictory.set("x-codex-credits-has-credits", hasCredits);
+		contradictory.set("x-codex-credits-unlimited", unlimited);
+		contradictory.set("x-codex-credits-balance", balance);
+		expect(
+			decision(await processLiveHeaders(contradictory), {
+				accessToken: token,
+			}).status,
+		).not.toBe("admit");
+		expect(
+			decision(await processLiveHeaders(benign), { accessToken: token }).status,
+		).not.toBe("admit");
+
+		expect(await usageCache.refreshNow(accountId)).toBe(true);
+		expect(
+			decision(usageCache.getSnapshot(accountId), { accessToken: token })
+				.status,
+		).toBe("admit");
+		expect(
+			decision(await processLiveHeaders(benign), { accessToken: token }).status,
+		).toBe("admit");
+	});
+	it.each([
+		["has-credits", "TRUE"],
+		["unlimited", "1"],
+		["balance", "25"],
+		["has-credits", "unknown"],
+		["unlimited", "unknown"],
+		["balance", "garbage"],
+		["balance", ""],
+		["balance", "1e-999"],
+	])("credit-only %s=%s revokes direct poll ownership", async (field, value) => {
+		const owned = await poll(payload());
+		expect(decision(owned, { accessToken: token }).status).toBe("admit");
+		const current = await processLiveHeaders(
+			new Headers({ [`x-codex-credits-${field}`]: value }),
+		);
+		expect(current.data).toBe(owned.data);
+		expect(
+			getCodexSubscriptionFacts(
+				owned.data,
+				accountId,
+				Date.now(),
+				180_000,
+				token,
+			),
+		).toBeNull();
+		expect(decision(current, { accessToken: token }).status).not.toBe("admit");
+		expect(
+			decision(await processLiveHeaders(weeklyHeaders()), {
+				accessToken: token,
+			}).status,
+		).not.toBe("admit");
+		expect(await usageCache.refreshNow(accountId)).toBe(true);
+		expect(
+			decision(usageCache.getSnapshot(accountId), { accessToken: token })
+				.status,
+		).toBe("admit");
+	});
+	it.each([
+		"0",
+		"0.00",
+		"-0",
+		".0",
+		"0e-999",
+	])("benign credit-only zero %s neither mints nor contradicts poll proof", async (balance) => {
+		const headers = new Headers({
+			"x-codex-credits-has-credits": "fAlSe",
+			"x-codex-credits-unlimited": "0",
+			"x-codex-credits-balance": balance,
+		});
+		expect(usageCache.setCodexPassiveUsage(accountId, headers)).toBeNull();
+		expect(decision(usageCache.getSnapshot(accountId)).status).not.toBe(
+			"admit",
+		);
+		const owned = await poll(payload());
+		const current = await processLiveHeaders(headers);
+		expect(current.data).toBe(owned.data);
+		expect(decision(current, { accessToken: token }).status).toBe("admit");
+	});
+	it("an out-of-range passive reset cannot recover through benign headers", async () => {
+		await poll(payload());
+		const headers = weeklyHeaders();
+		headers.set("x-codex-secondary-reset-at", "1e100");
+		expect(decision(await processLiveHeaders(headers)).status).not.toBe(
+			"admit",
+		);
+		expect(decision(await processLiveHeaders(weeklyHeaders())).status).not.toBe(
+			"admit",
+		);
+	});
+	it("retained evidence binds account and actual token but selection may omit it", async () => {
+		const owned = await poll(payload());
+		const current = await processLiveHeaders(weeklyHeaders());
+		expect(decision(current).status).toBe("admit");
+		expect(decision(current, { accessToken: token }).status).toBe("admit");
+		for (const accessToken of [null, "", "wrong"]) {
+			expect(decision(current, { accessToken }).status).not.toBe("admit");
+		}
+		expect(decision(current, { accountId: "wrong" }).status).not.toBe("admit");
+		expect(decision(owned).status).not.toBe("admit");
+		expect(
+			decision({ ...current, data: structuredClone(current.data) }).status,
+		).not.toBe("admit");
+		const evidence = usageCache.getCodexAdmissionEvidence(
+			accountId,
+			current.data,
+			Date.now(),
+			180_000,
+			token,
+		);
+		expect(Object.isFrozen(evidence?.data)).toBe(true);
+		expect(Object.isFrozen(evidence?.facts.secondary)).toBe(true);
+		expect(JSON.stringify(evidence)).not.toContain(token);
+		expect(JSON.stringify(evidence)).not.toContain("fingerprint");
+	});
+	it.each([
+		"clone",
+		"original",
+		"delete",
+		"clear",
+		"stop",
+		"restart",
+		"expiry",
+	])("%s revokes retained passive authority", async (kind) => {
+		const owned = await poll(payload());
+		const current = await processLiveHeaders(weeklyHeaders());
+		expect(decision(current).status).toBe("admit");
+		if (kind === "clone")
+			usageCache.set(accountId, structuredClone(current.data));
+		if (kind === "original") usageCache.set(accountId, owned.data);
+		if (kind === "delete") usageCache.delete(accountId);
+		if (kind === "clear") usageCache.clear();
+		if (kind === "stop") usageCache.stopPolling(accountId);
+		if (kind === "expiry") usageCache.cleanupStaleEntries(-1);
+		if (kind === "restart") {
+			usageCache.startPolling(accountId, "new-token", "codex", 60_000);
+			await usageCache.refreshNow(accountId);
+			expect(
+				decision(usageCache.getSnapshot(accountId), { accessToken: token })
+					.status,
+			).not.toBe("admit");
+		}
+		expect(decision(current).status).not.toBe("admit");
+		if (kind !== "restart")
+			expect(
+				decision(await processLiveHeaders(weeklyHeaders())).status,
+			).not.toBe("admit");
+	});
+	it("a live passive update fences late refresh publication and callbacks", async () => {
+		let snapshots = 0;
+		let resets = 0;
+		let restored = 0;
+		globalThis.fetch = (async () => Response.json(payload())) as typeof fetch;
+		usageCache.startPolling(
+			accountId,
+			token,
+			"codex",
+			60_000,
+			undefined,
+			() => resets++,
+			() => restored++,
+			() => snapshots++,
+		);
+		expect(await usageCache.refreshNow(accountId)).toBe(true);
+		expect(snapshots).toBe(1);
+		const started = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<Response>();
+		globalThis.fetch = (async () => {
+			started.resolve();
+			return response.promise;
+		}) as typeof fetch;
+		const pending = usageCache.refreshNow(accountId);
+		await started.promise;
+		const current = await processLiveHeaders(weeklyHeaders());
+		response.resolve(
+			Response.json({
+				...payload(),
+				credits: { has_credits: true, unlimited: false, balance: 50 },
+			}),
+		);
+		expect(await pending).toBe(false);
+		expect(snapshots).toBe(1);
+		expect(resets).toBe(0);
+		expect(restored).toBe(0);
+		expect(usageCache.getSnapshot(accountId)?.data).toBe(current.data);
+		expect(decision(current, { accessToken: token }).status).toBe("admit");
+	});
+	it("unsupported-only headers revoke proof even when display parsing returns null", async () => {
+		await poll(payload());
+		await processLiveHeaders(
+			new Headers({
+				"x-codex-primary-window-minutes": "1440",
+				"x-codex-primary-used-percent": "100",
+				"x-codex-primary-reset-at": String(
+					payload().rate_limit.secondary_window.reset_at,
+				),
+			}),
+		);
+		expect(decision(usageCache.getSnapshot(accountId)).status).not.toBe(
+			"admit",
+		);
+		expect(decision(await processLiveHeaders(weeklyHeaders())).status).not.toBe(
+			"admit",
+		);
+	});
+	it("live passive headers alone cannot mint subscription ownership", async () => {
+		globalThis.fetch = (async () => {
+			throw new Error("passive response processing must not fetch metadata");
+		}) as typeof fetch;
+		expect(usageCache.getSnapshot(accountId)).toBeNull();
+		const current = await processLiveHeaders(weeklyHeaders());
+		expect(current.data.seven_day?.utilization).toBe(55);
+		expect(
+			getCodexSubscriptionFacts(
+				current.data,
+				accountId,
+				Date.now(),
+				180_000,
+				token,
+			),
+		).toBeNull();
+		expect(decision(current).status).not.toBe("admit");
+	});
+	it.each([
+		"malformed weekly percentage",
+		"unsupported exhausted daily window",
+		"newly explicit exhausted five-hour window",
+	])("live headers with %s cannot benefit from retained proof", async (kind) => {
+		const owned = await poll(payload());
+		expect(decision(owned)).toEqual({ status: "admit" });
+		const headers = weeklyHeaders();
+		if (kind === "malformed weekly percentage") {
+			headers.set("x-codex-secondary-used-percent", "garbage");
+		} else {
+			headers.set(
+				"x-codex-primary-window-minutes",
+				kind === "unsupported exhausted daily window" ? "1440" : "300",
+			);
+			headers.set("x-codex-primary-used-percent", "100");
+			headers.set(
+				"x-codex-primary-reset-at",
+				String(payload().rate_limit.secondary_window.reset_at),
+			);
+		}
+		const current = await processLiveHeaders(headers);
+		expect(current.data).not.toBe(owned.data);
+		expect(decision(current).status).not.toBe("admit");
 	});
 	it("decoding and manually caching real-shaped JSON cannot mint source proof", () => {
 		const body = payload();

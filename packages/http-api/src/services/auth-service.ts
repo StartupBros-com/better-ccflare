@@ -82,15 +82,17 @@ function isLocalControlNotifyPath(path: string, method: string): boolean {
 	);
 }
 
-/** How long a minted logs-stream token remains valid if never consumed. Short
+/** How long a minted stream token remains valid if never consumed. Short
  * because the token is only ever used immediately after being minted (the
  * dashboard fetches it and opens the EventSource in the same tick). */
 const STREAM_TOKEN_TTL_MS = 60_000;
 
+type StreamAudience = "logs" | "requests" | "alerts";
+
 interface StreamTokenRecord {
+	audience: StreamAudience;
 	expiresAt: number;
 	apiKeyId?: string;
-	role?: ApiKeyRole;
 }
 
 export class AuthService {
@@ -98,8 +100,8 @@ export class AuthService {
 	private dbOps: DatabaseOperations;
 	private internalProbeSecret?: string;
 	private localControlSecret?: string;
-	/** In-memory, single-use tokens minted by mintLogsStreamToken() and
-	 * consumed by validateAndConsumeLogsStreamToken(). No DB persistence —
+	/** In-memory, single-use tokens minted by mintStreamToken() and
+	 * consumed by validateAndConsumeStreamToken(). No DB persistence —
 	 * these are ephemeral (60s TTL) and only ever needed within the same
 	 * server process that minted them. */
 	private streamTokens = new Map<string, StreamTokenRecord>();
@@ -252,65 +254,50 @@ export class AuthService {
 		return extractApiKey(req);
 	}
 
-	/**
-	 * Mint a short-lived, single-use token for the one endpoint where a
-	 * header genuinely cannot be sent: the dashboard's live log tail uses the
-	 * browser's native EventSource, which has no header-injection API (#216).
-	 * Requires the caller to already be authenticated via the normal
-	 * header/Bearer path (enforced by the "/api/logs/stream/token" route
-	 * requiring auth like any other /api/* endpoint) — this method itself
-	 * does not authenticate, it just records who the token is for.
-	 *
-	 * Deliberately NOT the durable API key: putting the long-lived key in a
-	 * URL risks leaking it via browser history, Referer headers, or
-	 * reverse-proxy/access logs. The minted token is random, expires quickly,
-	 * and is consumed on first use, so even if it leaks via those channels
-	 * the exposure window and blast radius are both minimal.
-	 */
-	mintLogsStreamToken(apiKeyId?: string, role?: ApiKeyRole): string {
-		// Opportunistically sweep expired tokens so the map doesn't grow
-		// unbounded across a long-lived server process.
+	/** Mint only after the router's normal header/Bearer authentication and
+	 * authorization. The audience restricts this ephemeral credential to one
+	 * exact GET stream route; durable API keys must never enter stream URLs. */
+	mintStreamToken(audience: StreamAudience, apiKeyId?: string): string {
 		this.pruneExpiredStreamTokens();
-
 		const token = randomBytes(32).toString("hex");
 		this.streamTokens.set(token, {
+			audience,
 			expiresAt: Date.now() + STREAM_TOKEN_TTL_MS,
 			apiKeyId,
-			role,
 		});
 		return token;
 	}
 
-	/**
-	 * Validate and consume (single-use) a logs-stream token minted by
-	 * mintLogsStreamToken(). Returns the associated role/apiKeyId on success,
-	 * or null if the token is missing, unknown, expired, or already used.
-	 */
-	private validateAndConsumeLogsStreamToken(
+	// Preserve the public Logs mint interface; issuer role is re-read on use.
+	mintLogsStreamToken(apiKeyId?: string, _role?: ApiKeyRole): string {
+		return this.mintStreamToken("logs", apiKeyId);
+	}
+
+	private validateAndConsumeStreamToken(
 		token: string,
+		audience: StreamAudience,
 	): StreamTokenRecord | null {
 		const record = this.streamTokens.get(token);
-		// Single-use: delete on first lookup regardless of outcome, so a
-		// leaked/replayed token can't be tried again.
+		// Burn synchronously, before any database await (including auth-enabled
+		// checks), so overlapping connections cannot share a credential.
 		this.streamTokens.delete(token);
-		if (!record) return null;
-		if (Date.now() > record.expiresAt) return null;
+		if (!record || record.audience !== audience) return null;
+		if (Date.now() >= record.expiresAt) return null;
 		return record;
 	}
 
 	private pruneExpiredStreamTokens(): void {
 		const now = Date.now();
 		for (const [token, record] of this.streamTokens) {
-			if (now > record.expiresAt) {
+			if (now >= record.expiresAt) {
 				this.streamTokens.delete(token);
 			}
 		}
 	}
 
 	/**
-	 * Extract a logs-stream token from the query string. Scoped the same way
-	 * the raw-api-key query fallback used to be: only consulted for
-	 * GET /api/logs/stream.
+	 * Extract an ephemeral stream credential, consulted only for the exact
+	 * GET stream routes. Never accept a durable API key from the URL.
 	 */
 	private extractStreamTokenFromQuery(req: Request): string | null {
 		try {
@@ -472,6 +459,22 @@ export class AuthService {
 		path: string,
 		method: string,
 	): Promise<AuthenticationResult> {
+		const audience =
+			method === "GET"
+				? path === "/api/logs/stream"
+					? "logs"
+					: path === "/api/requests/stream"
+						? "requests"
+						: path === "/api/insights/alerts/stream"
+							? "alerts"
+							: null
+				: null;
+		const token = audience ? this.extractStreamTokenFromQuery(req) : null;
+		const record =
+			token && audience
+				? this.validateAndConsumeStreamToken(token, audience)
+				: null;
+
 		// If path is exempt, allow without authentication
 		if (await this.isPathExempt(path, method, req.headers)) {
 			return {
@@ -486,28 +489,21 @@ export class AuthService {
 			};
 		}
 
-		// The logs SSE stream is special-cased: the browser's native
-		// EventSource cannot set custom headers, so instead of accepting the
-		// durable API key via query string (which risks leaking it via
-		// browser history / Referer / access logs), it accepts a short-lived,
-		// single-use token minted by a separate, normally-authenticated
-		// endpoint (POST /api/logs/stream/token). Every other endpoint still
-		// requires the key via header/Bearer form, unchanged.
-		if (path === "/api/logs/stream" && method === "GET") {
-			const token = this.extractStreamTokenFromQuery(req);
-			if (token) {
-				const record = this.validateAndConsumeLogsStreamToken(token);
-				if (record) {
-					return {
-						isAuthenticated: true,
-						apiKeyId: record.apiKeyId,
-						role: record.role,
-					};
-				}
-			}
-			// Fall through to the normal header/Bearer check below in case a
-			// client sends the real key via header instead of a token.
+		if (record?.apiKeyId) {
+			// A minted role is not authority: revocation/deletion/downgrade must
+			// take effect before a connection opens. Return the current key so
+			// the router also applies its normal endpoint authorization.
+			const issuer = await this.dbOps.getApiKey(record.apiKeyId);
+			if (issuer?.isActive && issuer.role === "admin")
+				return {
+					isAuthenticated: true,
+					apiKey: issuer,
+					apiKeyId: issuer.id,
+					apiKeyName: issuer.name,
+					role: issuer.role,
+				};
 		}
+		// Invalid tokens still allow normal header/Bearer authentication.
 
 		const apiKey = this.extractApiKey(req);
 		if (!apiKey) {
