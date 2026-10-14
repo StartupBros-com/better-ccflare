@@ -42,8 +42,31 @@ async function makeDbOpsWithHashedKey(): Promise<DatabaseOperations> {
 }
 
 describe("audience-bound stream tokens", () => {
-	for (const audience of ["logs", "requests"] as const) {
-		const path = `/api/${audience}/stream`;
+	for (const [audience, path] of [
+		["logs", "/api/logs/stream"],
+		["requests", "/api/requests/stream"],
+		["alerts", "/api/insights/alerts/stream"],
+	] as const) {
+		for (const target of [
+			"/api/logs/stream",
+			"/api/requests/stream",
+			"/api/insights/alerts/stream",
+		]) {
+			if (target === path) continue;
+			it(`${audience}: rejects and burns a token presented to ${target}`, async () => {
+				const auth = new AuthService(await makeDbOpsWithHashedKey());
+				const token = auth.mintStreamToken(audience, "key-1");
+				for (const destination of [target, path]) {
+					const req = new Request(
+						`http://localhost${destination}?stream_token=${token}`,
+					);
+					expect(
+						(await auth.authenticateRequest(req, destination, "GET"))
+							.isAuthenticated,
+					).toBe(false);
+				}
+			});
+		}
 		it(`${audience}: returns the current issuer and prevents concurrent replay`, async () => {
 			const db = await makeDbOpsWithHashedKey();
 			const auth = new AuthService(db);
