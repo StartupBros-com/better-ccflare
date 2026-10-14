@@ -2385,3 +2385,88 @@ describe("transformStreamingResponse — block lifecycle across kind switches", 
 		expect(events.some((e) => e.event === "message_stop")).toBe(false);
 	});
 });
+
+describe("transformStreamingResponse — text sharing a delta with tool_calls", () => {
+	it("emits the text of a delta that also starts a tool call, before the tool block", async () => {
+		// One OpenAI delta can carry both content and tool_calls. The text must
+		// not be dropped, and it goes first, matching the non-streaming
+		// converter's thinking, text, tool_use order for the same message.
+		const events = await transformChunks([
+			glmChunk({
+				content: "Calling",
+				tool_calls: [
+					{
+						index: 0,
+						id: "c",
+						type: "function",
+						function: { name: "f", arguments: "{}" },
+					},
+				],
+			}),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "text", content: "Calling" },
+			{ type: "tool_use", content: "{}" },
+		]);
+		const messageDelta = events.find((e) => e.event === "message_delta");
+		expect(parseEventData(messageDelta ?? {}).delta.stop_reason).toBe(
+			"tool_use",
+		);
+	});
+
+	it("emits reasoning and text that share a delta with a tool start as thinking, text, tool_use", async () => {
+		const events = await transformChunks([
+			glmChunk({
+				reasoning_content: "Need a lookup.",
+				content: "Looking it up.",
+				tool_calls: [
+					{
+						index: 0,
+						id: "call_1",
+						type: "function",
+						function: { name: "lookup", arguments: '{"q":"x"}' },
+					},
+				],
+			}),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "thinking", content: "Need a lookup." },
+			{ type: "text", content: "Looking it up." },
+			{ type: "tool_use", content: '{"q":"x"}' },
+		]);
+	});
+
+	it("defers text that shares a delta with a tool-argument continuation and replays it after the tool block", async () => {
+		// Once a tool block is open, same-delta text takes the existing deferral
+		// path instead of opening a block over it.
+		const events = await transformChunks([
+			glmChunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: "call_1",
+						type: "function",
+						function: { name: "lookup", arguments: '{"q":' },
+					},
+				],
+			}),
+			glmChunk({
+				content: "Still calling.",
+				tool_calls: [{ index: 0, function: { arguments: '"x"}' } }],
+			}),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "tool_use", content: '{"q":"x"}' },
+			{ type: "text", content: "Still calling." },
+		]);
+	});
+});

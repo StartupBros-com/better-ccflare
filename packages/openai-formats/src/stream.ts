@@ -580,6 +580,29 @@ export function transformStreamingResponse(
 
 							const delta = data.choices?.[0]?.delta;
 
+							// reasoning_content, content and tool_calls can all share one
+							// delta. Handle thinking and text first so a combined delta
+							// yields thinking, text, tool_use, the non-streaming
+							// converter's order for the same message.
+							if (delta?.reasoning_content) {
+								emitContentDelta(
+									controller,
+									encoder,
+									context,
+									"thinking",
+									delta.reasoning_content,
+								);
+							}
+							if (delta?.content) {
+								emitContentDelta(
+									controller,
+									encoder,
+									context,
+									"text",
+									delta.content,
+								);
+							}
+
 							// Handle tool call deltas — always buffer, never emit
 							if (delta?.tool_calls) {
 								for (const toolCall of delta.tool_calls) {
@@ -645,26 +668,6 @@ export function transformStreamingResponse(
 									}
 									context.toolCallAccumulators[idx] =
 										(context.toolCallAccumulators[idx] || "") + newArgs;
-								}
-							} else {
-								// reasoning_content and content can coexist in one delta — handle both
-								if (delta?.reasoning_content) {
-									emitContentDelta(
-										controller,
-										encoder,
-										context,
-										"thinking",
-										delta.reasoning_content,
-									);
-								}
-								if (delta?.content) {
-									emitContentDelta(
-										controller,
-										encoder,
-										context,
-										"text",
-										delta.content,
-									);
 								}
 							}
 						} catch (_parseError) {
