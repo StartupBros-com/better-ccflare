@@ -159,6 +159,30 @@ async function startProductionNodeGuard(
 	};
 }
 
+// Upstream fixture bodies for the idle-watchdog transport scenarios. Each one
+// hands the guard the response headers and a decodable first body byte in a
+// single synchronous write, so the only latency racing the idle watchdog is at
+// most the guard's own decode hop. The compressed body is a sync-flushed gzip
+// block with no trailer: it decodes to "prefix" and then the stream stays open,
+// which is what lets the watchdog fire.
+const IDLE_SCENARIO_FIXTURES = {
+	idle: `res.writeHead(200, {"content-type": "text/plain"}); res.write("prefix");`,
+	"idle-compressed": `res.writeHead(200, {"content-type": "text/plain", "content-encoding": "gzip"}); res.write(zlib.gzipSync("prefix", {finishFlush: zlib.constants.Z_SYNC_FLUSH}));`,
+} as const;
+
+function productionFixturePrelude(handlerBody: string) {
+	return `const http = await import("node:http");
+	const zlib = await import("node:zlib");
+	const fixture = http.createServer((req, res) => {
+		req.resume();
+		console.log(JSON.stringify({event: "fixture_received"}));
+		res.on("close", () => console.log(JSON.stringify({event: "fixture_closed"})));
+		${handlerBody}
+	});
+	await new Promise(resolve => fixture.listen(0, "127.0.0.1", resolve));
+	process.env.CCFLARE_UPSTREAM = "http://127.0.0.1:" + fixture.address().port;`;
+}
+
 async function waitForChildExit(
 	child: ChildProcess,
 	timeoutMs = 2_000,
@@ -3657,19 +3681,19 @@ describe("source-controlled guard", () => {
 			"http://127.0.0.1:1",
 			{
 				GUARD_TOTAL_DEADLINE_MS: scenario === "deadline" ? "80" : "1000",
-				GUARD_RESPONSE_IDLE_TIMEOUT_MS: "50",
+				// Node buffers writeHead until the first body write, so a watchdog
+				// that fires before the first forwarded byte closes the client with
+				// zero bytes (fetch rejects). Leave the gunzip hop real headroom on a
+				// loaded CI runner; the contract under test is that it fires at all.
+				GUARD_RESPONSE_IDLE_TIMEOUT_MS: "200",
 			},
-			`const http = await import("node:http");
-		const zlib = await import("node:zlib");
-		const fixture = http.createServer((req, res) => {
-			req.resume();
-			console.log(JSON.stringify({event: "fixture_received"}));
-			res.on("close", () => console.log(JSON.stringify({event: "fixture_closed"})));
-			if (${JSON.stringify(scenario)} === "idle") {res.writeHead(200, {"content-type": "text/plain"}); res.write("prefix");}
-			if (${JSON.stringify(scenario)} === "idle-compressed") {res.writeHead(200, {"content-type": "text/plain", "content-encoding": "gzip"}); const compressed = zlib.createGzip(); compressed.pipe(res); compressed.write("prefix"); compressed.flush();}
-		});
-		await new Promise(resolve => fixture.listen(0, "127.0.0.1", resolve));
-		process.env.CCFLARE_UPSTREAM = "http://127.0.0.1:" + fixture.address().port;`,
+			productionFixturePrelude(
+				scenario in IDLE_SCENARIO_FIXTURES
+					? IDLE_SCENARIO_FIXTURES[
+							scenario as keyof typeof IDLE_SCENARIO_FIXTURES
+						]
+					: "",
+			),
 		);
 		const controller = new AbortController();
 		const pending = fetch(`${baseUrl}/v1/messages`, {
@@ -3700,6 +3724,42 @@ describe("source-controlled guard", () => {
 		);
 		expect(health.counters.total).toBe(1);
 		expect(health.counters.retried).toBe(0);
+	});
+
+	test("round 1 ci:managed-routing-foundation: the idle-compressed fixture's first body write already decodes to its prefix", async () => {
+		// Pins the fixture shape behind the red check. Streaming the body through
+		// createGzip().flush() made the first write the bare 10-byte gzip header,
+		// which carries the response headers to the guard (whose watchdog arms as
+		// soon as it forwards them) while the decodable block still trails by two
+		// zlib threadpool hops. On a loaded runner those hops outran the watchdog,
+		// the guard destroyed the response before any byte reached the client, and
+		// the scenario above saw fetch reject (null). The first write must already
+		// decode to the prefix.
+		const { baseUrl, waitForEvent } = await startProductionNodeGuard(
+			"http://127.0.0.1:1",
+			{ GUARD_RESPONSE_IDLE_TIMEOUT_MS: "200" },
+			productionFixturePrelude(`const write = res.write.bind(res);
+			let reported = false;
+			res.write = (chunk, ...rest) => {
+				if (!reported) {
+					reported = true;
+					const decoded = zlib.gunzipSync(chunk, {finishFlush: zlib.constants.Z_SYNC_FLUSH}).toString();
+					console.log(JSON.stringify({event: "fixture_first_write", decoded}));
+				}
+				return write(chunk, ...rest);
+			};
+			${IDLE_SCENARIO_FIXTURES["idle-compressed"]}`),
+		);
+		const pending = fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		}).catch(() => null);
+		const firstWrite = await waitForEvent("fixture_first_write");
+		expect(firstWrite.decoded).toBe("prefix");
+		await waitForEvent("response_body_idle_timeout");
+		await waitForEvent("fixture_closed");
+		const response = await pending;
+		await response?.text().catch(() => undefined);
 	});
 
 	test("production transport decodes supported wire bodies, fixes headers, and preserves manual redirects", async () => {
