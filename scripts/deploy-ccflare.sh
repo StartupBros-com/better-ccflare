@@ -31,7 +31,8 @@
 #      its deploy-owned markers, then create a detached worktree at the
 #      verified SHA, install its locked dependencies, and build there. The
 #      shared checkout is never a build or runtime-artifact source after
-#      verification.
+#      verification. Refuse a `bun` on PATH, or a built binary's embedded
+#      runtime, that differs from the snapshot's .bun-version.
 #   3. Copy the binary to
 #      /home/will/.config/better-ccflare/better-ccflare-v<version>-<short-sha>
 #      and install the source-controlled guard + policy as an immutable pair
@@ -204,7 +205,7 @@ CHECK_ONLY=0
 for arg in "$@"; do
 	case "$arg" in
 		--check) CHECK_ONLY=1 ;;
-		-h|--help) sed -n '2,42p' "$0"; exit 0 ;;
+		-h|--help) sed -n '2,43p' "$0"; exit 0 ;;
 		*) echo "Unknown arg: $arg" >&2; exit 2 ;;
 	esac
 done
@@ -343,6 +344,8 @@ SOURCE_RUNNER="$BUILD_SOURCE_ROOT/scripts/run-ccflare-stack.sh"
 SOURCE_TRANSACTION="$BUILD_SOURCE_ROOT/scripts/ccflare-deployment-transaction.mjs"
 
 echo "==> Building better-ccflare v${VERSION} (${SHORT}) from verified source snapshot…"
+# The same toolchain gate CI applies after setup-bun.
+validate_bun_runtime_version "build toolchain" bun "$BUILD_SOURCE_ROOT/.bun-version"
 (
 	cd "$BUILD_SOURCE_ROOT"
 	bun install --frozen-lockfile
@@ -354,6 +357,10 @@ if [[ ! -f "$BUILT_BIN" ]]; then
 	echo "ERROR: build did not produce $BUILT_BIN" >&2
 	exit 1
 fi
+# `bun run build` compiles with the `bun` that node_modules/.bin resolves, not
+# the one checked above, and the binary embeds that runtime. Refuse to ship a
+# runtime other than the one CI tests.
+validate_bun_runtime_version "built binary" "$BUILT_BIN" "$BUILD_SOURCE_ROOT/.bun-version"
 
 # ---------------------------------------------------------------------------
 # 3) Install the binary

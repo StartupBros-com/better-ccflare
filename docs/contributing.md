@@ -163,10 +163,28 @@ bun run format
 ### Bumping the Bun toolchain
 
 `.bun-version` is the single source of truth: every CI workflow that installs Bun reads it via
-`bun-version-file` and asserts the installed `bun --version` matches (#321). To bump it, edit
-`.bun-version` to the exact new version, run `bun test tests/bun-toolchain-pin.test.ts`, and open a
-PR; the merge gate on that PR is the proof the new version passes. Never restore
-`bun-version: latest` in a workflow: the pin test fails the gate if it comes back.
+`bun-version-file` and asserts the installed `bun --version` matches (#321).
+
+`.bun-version` alone does not decide which Bun builds a binary. `bun-plugin-tailwind`
+peer-depends on `bun`, so `bun install` links the npm `bun` package into `node_modules/.bin`,
+and `bun run` puts that first on `PATH`. Every nested `bun` in a package script therefore runs
+it, including the `bun build --compile` that embeds a runtime in every binary we ship. The root
+`package.json` pins it with an exact `devDependencies.bun`. It must be a devDependency:
+`overrides` does not reach an auto-installed peer, which is how `bun.lock` sat at 1.3.11 through
+earlier bumps (#491).
+
+To bump, in one PR:
+
+1. Edit `.bun-version` to the exact new version.
+2. Set `devDependencies.bun` in the root `package.json` to the same version.
+3. Run `bun install` to move `bun.lock`'s `bun@` and `@oven/bun-*` entries. Review the lock
+   diff, since a non-frozen install also re-resolves `latest` specifiers such as `@types/bun`.
+4. Run `bun test tests/bun-toolchain-pin.test.ts`. It fails unless all three agree.
+
+The merge gate on that PR is the proof the new version passes. `scripts/deploy-ccflare.sh` then
+refuses any build whose toolchain or embedded runtime (`BUN_BE_BUN=1 <binary> --version`)
+differs from `.bun-version`. Never restore `bun-version: latest` in a workflow: the pin test
+fails the gate if it comes back.
 
 ### Repository Agent Instructions
 
