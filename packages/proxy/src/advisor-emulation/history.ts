@@ -1,3 +1,4 @@
+import { ADVISOR_SERVER_TOOL_NAME } from "@better-ccflare/providers/server-tool-capabilities";
 import { isEmulatedAdvisorId } from "./types";
 
 const PLACEHOLDER = "[Advisor response]";
@@ -29,7 +30,7 @@ function isAdvisorCall(block: unknown): block is Record<string, unknown> {
 	return (
 		isRecord(block) &&
 		block.type === "server_tool_use" &&
-		block.name === "advisor"
+		block.name === ADVISOR_SERVER_TOOL_NAME
 	);
 }
 
@@ -102,7 +103,12 @@ export function projectAdvisorHistoryForCodex(
 					...message,
 					content: [
 						...segment,
-						{ type: "tool_use", id: call.id, name: "advisor", input: {} },
+						{
+							type: "tool_use",
+							id: call.id,
+							name: ADVISOR_SERVER_TOOL_NAME,
+							input: {},
+						},
 					],
 				});
 				out.push({

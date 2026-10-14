@@ -41,9 +41,11 @@ export type {
 
 const EXACT_WEB_SEARCH_TYPE = "web_search_20250305" as const;
 const REQUIREMENT_REVISION = 2 as const;
+/** Declared type of Claude Code's advisor server tool. */
+export const ADVISOR_TOOL_TYPE = "advisor_20260301" as const;
 /** Typed tools that only native Anthropic accounts serve; never proxy-owned. */
 export const NATIVE_ANTHROPIC_PASSTHROUGH_TOOL_TYPES: readonly string[] =
-	Object.freeze(["advisor_20260301"]);
+	Object.freeze([ADVISOR_TOOL_TYPE]);
 /** Server-tool name used by advisor server_tool_use history blocks. */
 export const ADVISOR_SERVER_TOOL_NAME = "advisor" as const;
 const ADVISOR_TOOL_TYPE_PREFIX = "advisor_" as const;

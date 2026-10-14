@@ -28,6 +28,7 @@
  *   last message_delta, so it is the newest usage payload (not stale).
  */
 
+import { ADVISOR_SERVER_TOOL_NAME } from "@better-ccflare/providers/server-tool-capabilities";
 import type { SseFrame } from "./sse";
 import {
 	AnthropicBlockAccumulator,
@@ -375,7 +376,7 @@ export function createAdvisorEmulationStream(
 						up,
 						frames: [frame],
 						start: block,
-						isAdvisor: isTool && block.name === "advisor",
+						isAdvisor: isTool && block.name === ADVISOR_SERVER_TOOL_NAME,
 						buffered: true,
 					};
 					recs.set(up, rec);
@@ -627,7 +628,7 @@ export function createAdvisorEmulationStream(
 			const serverToolUse: AnthropicBlock = {
 				type: "server_tool_use",
 				id: emulatedId,
-				name: "advisor",
+				name: ADVISOR_SERVER_TOOL_NAME,
 				input: {},
 			};
 			emitBlock(serverToolUse, "{}");

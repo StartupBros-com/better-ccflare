@@ -1,4 +1,8 @@
 import { isCodexOAuthAccount } from "@better-ccflare/core";
+import {
+	ADVISOR_SERVER_TOOL_NAME,
+	ADVISOR_TOOL_TYPE,
+} from "@better-ccflare/providers/server-tool-capabilities";
 import type {
 	Account,
 	NativeAnthropicToolRequirement,
@@ -6,7 +10,6 @@ import type {
 import type { ModelRouteProfile } from "../model-route-profiles";
 import type { AdvisorEmulationDecision } from "./types";
 
-const ADVISOR_TOOL_TYPE = "advisor_20260301";
 const KILL_SWITCH_ENV = "BCCF_ADVISOR_EMULATION";
 
 export type AdvisorEmulationIneligibleReason =
@@ -91,7 +94,11 @@ export function deriveAdvisorEmulation(
 	) {
 		return { ineligible: "sole_structured_output" };
 	}
-	if (others.some((tool) => isRecord(tool) && tool.name === "advisor")) {
+	if (
+		others.some(
+			(tool) => isRecord(tool) && tool.name === ADVISOR_SERVER_TOOL_NAME,
+		)
+	) {
 		return { ineligible: "advisor_name_collision" };
 	}
 	const advisorModel = resolveAdvisorEmulationModel(declaration.model);

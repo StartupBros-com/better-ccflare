@@ -4,7 +4,10 @@
  * Codex transform already understands.
  */
 
-const ADVISOR_TOOL_TYPE = "advisor_20260301";
+import {
+	ADVISOR_SERVER_TOOL_NAME,
+	ADVISOR_TOOL_TYPE,
+} from "@better-ccflare/providers/server-tool-capabilities";
 
 export const ADVISOR_FUNCTION_DESCRIPTION =
 	"Consult a stronger reviewer model that sees the whole conversation so far, including every tool call and result. Takes no parameters. Call it alone, never in the same turn as other tool calls.";
@@ -28,7 +31,7 @@ export function rewriteAdvisorDeclaration(body: unknown): unknown | null {
 	const rewritten = tools.map((tool) => {
 		if (!isRecord(tool) || tool.type !== ADVISOR_TOOL_TYPE) return tool;
 		const replacement: Record<string, unknown> = {
-			name: "advisor",
+			name: ADVISOR_SERVER_TOOL_NAME,
 			description: ADVISOR_FUNCTION_DESCRIPTION,
 			input_schema: {
 				type: "object",

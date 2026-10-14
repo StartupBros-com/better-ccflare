@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { ADVISOR_SERVER_TOOL_NAME } from "@better-ccflare/providers/server-tool-capabilities";
 import type {
 	AdvisorEmulationErrorCode,
 	AdvisorTokenUsage,
@@ -100,7 +101,7 @@ function renderBlock(
 			return `[tool_result ${prefix}${truncate(text, maxResult)}]`;
 		}
 		case "server_tool_use":
-			return block.name === "advisor"
+			return block.name === ADVISOR_SERVER_TOOL_NAME
 				? "[advisor consulted]"
 				: "[server_tool_use]";
 		case "advisor_tool_result": {
