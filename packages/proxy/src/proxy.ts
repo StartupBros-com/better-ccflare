@@ -2967,6 +2967,7 @@ async function handleProxyCoreImpl(
 				),
 				req.headers,
 				requestMeta.nativeAnthropicToolRequirement != null,
+				requestMeta,
 			);
 		} catch (error) {
 			log.error("Failed to load terminal account state", error);
@@ -5106,6 +5107,7 @@ async function handleProxyCoreImpl(
 			await loadRoutingInventory(requestMeta, () => ctx.dbOps.getAllAccounts()),
 			req.headers,
 			requestMeta.nativeAnthropicToolRequirement != null,
+			requestMeta,
 		);
 		terminalAccounts = mergeTerminalAccountState(
 			refreshedTerminalAccounts,

@@ -1,5 +1,8 @@
 import { Logger } from "@better-ccflare/logger";
-import { isEmulatedAdvisorId } from "./advisor-emulation/types";
+import {
+	EMULATED_ADVISOR_ID_PREFIX,
+	isEmulatedAdvisorId,
+} from "./advisor-emulation/types";
 
 const log = new Logger("AdvisorResultOwnership");
 
@@ -111,6 +114,13 @@ export function resetAdvisorResultOwnershipForTests(): void {
 export function mayContainAdvisorResult(buffer: ArrayBuffer | null): boolean {
 	if (!buffer) return false;
 	return Buffer.from(buffer).includes("advisor_tool_result");
+}
+
+export function mayContainEmulatedAdvisorBlock(
+	buffer: ArrayBuffer | null,
+): boolean {
+	if (!buffer) return false;
+	return Buffer.from(buffer).includes(EMULATED_ADVISOR_ID_PREFIX);
 }
 
 export type AdvisorResultStrip = Readonly<{

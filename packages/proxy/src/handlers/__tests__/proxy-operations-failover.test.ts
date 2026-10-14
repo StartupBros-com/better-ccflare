@@ -1350,6 +1350,96 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 		errors.mockRestore();
 	});
 
+	describe("advisor emulation backstop admission", () => {
+		async function dispatch(
+			accountOverrides: Partial<Account>,
+			metaOverrides: Partial<RequestMeta>,
+		): Promise<{ caught: unknown; fetchCalls: number }> {
+			const account = makeAccount({
+				id: "codex-acc",
+				name: "codex-acc",
+				provider: "codex",
+				custom_endpoint: null,
+				model_mappings: null,
+				api_key: null,
+				access_token: "codex-token",
+				expires_at: Date.now() + 60 * 60_000,
+				...accountOverrides,
+			});
+			const meta = makeRequestMeta({
+				nativeAnthropicToolRequirement: {
+					declaredToolTypes: ["advisor_20260301"],
+					unknownDeclaredTypes: [],
+					hasHistory: false,
+				},
+				...metaOverrides,
+			});
+			const bodyBuffer = makeRequestBody("claude-sonnet-4-5");
+			const ctx = makeProxyContext();
+			const fakeFetch = mock(async () =>
+				jsonResponse({ unexpected: true }, 200),
+			);
+			globalThis.fetch = fakeFetch;
+			const errors = spyOn(Logger.prototype, "error").mockImplementation(
+				() => {},
+			);
+			let caught: unknown;
+			try {
+				await proxyWithAccount(
+					makeRequest(bodyBuffer),
+					new URL("https://proxy.local/v1/messages"),
+					account,
+					meta,
+					bodyBuffer,
+					() => undefined,
+					0,
+					ctx,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					false,
+					undefined,
+					undefined,
+					{ routeCandidateId: "account:codex-acc" },
+				);
+			} catch (error) {
+				caught = error;
+			} finally {
+				errors.mockRestore();
+			}
+			return { caught, fetchCalls: fakeFetch.mock.calls.length };
+		}
+
+		const EMULATION = {
+			advisorModel: "gpt-6.1-sol",
+			declarationModel: "claude-opus-5",
+		} as const;
+
+		it("does not trip the backstop for a Codex OAuth account carrying emulation meta", async () => {
+			const { caught } = await dispatch({}, { advisorEmulation: EMULATION });
+
+			expect(caught).not.toBeInstanceOf(ServerToolCandidateCapabilityError);
+		});
+
+		it("still trips the backstop for the same account without emulation meta", async () => {
+			const { caught, fetchCalls } = await dispatch({}, {});
+
+			expect(caught).toBeInstanceOf(ServerToolCandidateCapabilityError);
+			expect(fetchCalls).toBe(0);
+		});
+
+		it("still trips the backstop for a Codex api_key account even with emulation meta", async () => {
+			const { caught, fetchCalls } = await dispatch(
+				{ api_key: "sk-codex", access_token: null, refresh_token: null },
+				{ advisorEmulation: EMULATION },
+			);
+
+			expect(caught).toBeInstanceOf(ServerToolCandidateCapabilityError);
+			expect(fetchCalls).toBe(0);
+		});
+	});
+
 	it("terminates a hosted request before any physical-model fallback can plan or send", async () => {
 		const plans: Array<{
 			model: string | null;
