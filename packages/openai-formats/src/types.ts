@@ -157,14 +157,13 @@ export interface TransformStreamContext {
 	extractedModel: string;
 	contextWindowSize?: number;
 	hasSentStart: boolean;
-	hasSentContentBlockStart: boolean;
-	hasSentThinkingBlockStart: boolean;
-	thinkingBlockClosed: boolean;
-	textBlockClosed: boolean;
-	/** Anthropic block index for the thinking block (assigned by nextBlockIndex). */
-	thinkingBlockIndex: number;
-	/** Index of the text content block in the Anthropic stream (assigned by nextBlockIndex). */
-	textBlockIndex: number;
+	/**
+	 * The thinking or text block currently open, if any. A delta of the other
+	 * kind closes it and opens a fresh block at the next index; a stopped block
+	 * is never written to again. tool_use blocks are tracked separately in
+	 * toolCallBlockIndices and stay open until the stream ends.
+	 */
+	openBlock: { kind: "thinking" | "text"; index: number } | null;
 	promptTokens?: number;
 	completionTokens: number;
 	cacheReadInputTokens?: number;

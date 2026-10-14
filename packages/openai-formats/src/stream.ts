@@ -240,6 +240,62 @@ function emitContentBlockStop(
 	);
 }
 
+function closeOpenBlock(
+	controller: TransformStreamDefaultController,
+	encoder: TextEncoder,
+	context: TransformStreamContext,
+): void {
+	if (!context.openBlock) return;
+	emitContentBlockStop(controller, encoder, context.openBlock.index);
+	context.openBlock = null;
+}
+
+/**
+ * Emit a thinking or text delta, opening a fresh block at the next monotonic
+ * index whenever the open block is of the other kind (or none is open).
+ * Reasoning providers can switch back and forth within one response (e.g. a
+ * leading "\n" of content, then reasoning, then the answer). A delta must never
+ * target a block that was already stopped: Claude Code aborts the stream on it.
+ */
+function emitContentDelta(
+	controller: TransformStreamDefaultController,
+	encoder: TextEncoder,
+	context: TransformStreamContext,
+	kind: "thinking" | "text",
+	value: string,
+): void {
+	if (context.openBlock?.kind !== kind) {
+		closeOpenBlock(controller, encoder, context);
+		const index = context.nextBlockIndex++;
+		context.openBlock = { kind, index };
+		const contentBlockStart = {
+			type: "content_block_start",
+			index,
+			content_block:
+				kind === "thinking"
+					? { type: "thinking", thinking: "" }
+					: { type: "text", text: "" },
+		};
+		controller.enqueue(encoder.encode(`event: content_block_start\n`));
+		controller.enqueue(
+			encoder.encode(`data: ${JSON.stringify(contentBlockStart)}\n\n`),
+		);
+	}
+
+	const contentBlockDelta = {
+		type: "content_block_delta",
+		index: context.openBlock.index,
+		delta:
+			kind === "thinking"
+				? { type: "thinking_delta", thinking: value }
+				: { type: "text_delta", text: value },
+	};
+	controller.enqueue(encoder.encode(`event: content_block_delta\n`));
+	controller.enqueue(
+		encoder.encode(`data: ${JSON.stringify(contentBlockDelta)}\n\n`),
+	);
+}
+
 function emitStreamError(
 	controller: TransformStreamDefaultController,
 	encoder: TextEncoder,
@@ -251,14 +307,7 @@ function emitStreamError(
 
 	// Close any blocks that were opened before the provider reported the error;
 	// never follow the error with a synthetic message_delta/message_stop pair.
-	if (context.hasSentThinkingBlockStart && !context.thinkingBlockClosed) {
-		emitContentBlockStop(controller, encoder, context.thinkingBlockIndex);
-		context.thinkingBlockClosed = true;
-	}
-	if (context.hasSentContentBlockStart && !context.textBlockClosed) {
-		emitContentBlockStop(controller, encoder, context.textBlockIndex);
-		context.textBlockClosed = true;
-	}
+	closeOpenBlock(controller, encoder, context);
 	for (const anthropicIndex of Object.values(context.toolCallBlockIndices)) {
 		emitContentBlockStop(controller, encoder, anthropicIndex);
 	}
@@ -321,12 +370,7 @@ export function transformStreamingResponse(
 					extractedModel: "unknown",
 					contextWindowSize: undefined,
 					hasSentStart: false,
-					hasSentContentBlockStart: false,
-					hasSentThinkingBlockStart: false,
-					thinkingBlockClosed: false,
-					textBlockClosed: false,
-					thinkingBlockIndex: 0,
-					textBlockIndex: 0,
+					openBlock: null,
 					promptTokens: undefined,
 					completionTokens: 0,
 					encounteredToolCall: false,
@@ -369,8 +413,11 @@ export function transformStreamingResponse(
 								continue;
 							}
 							if (context.encounteredToolCall) {
-								// Emit buffered JSON for all tool calls, then stop events.
-								// Use Anthropic block indices (from toolCallBlockIndices), not OpenAI tool_call indices.
+								// Close a thinking/text block opened after the tool call
+								// started, then emit buffered JSON for all tool calls and
+								// their stop events. Use Anthropic block indices (from
+								// toolCallBlockIndices), not OpenAI tool_call indices.
+								closeOpenBlock(controller, encoder, context);
 								for (const [openaiIdx, anthropicIdx] of Object.entries(
 									context.toolCallBlockIndices,
 								)) {
@@ -395,12 +442,9 @@ export function transformStreamingResponse(
 									context.cacheReadInputTokens,
 									context.cacheCreationInputTokens,
 								);
-							} else if (context.hasSentContentBlockStart) {
-								// If text block was closed mid-stream (content→thinking transition),
-								// close the thinking block instead
-								const lastBlockIndex = context.textBlockClosed
-									? context.thinkingBlockIndex
-									: context.textBlockIndex;
+							} else if (context.openBlock) {
+								// emitStreamEnd closes the open thinking/text block via its
+								// end_turn branch; every earlier block was closed on switch.
 								emitStreamEnd(
 									controller,
 									encoder,
@@ -411,22 +455,9 @@ export function transformStreamingResponse(
 									null,
 									context.cacheReadInputTokens,
 									context.cacheCreationInputTokens,
-									lastBlockIndex,
+									context.openBlock.index,
 								);
-							} else if (context.hasSentThinkingBlockStart) {
-								// Reasoning-only stream: emitStreamEnd closes block via end_turn branch
-								emitStreamEnd(
-									controller,
-									encoder,
-									context.contextWindowSize,
-									"end_turn",
-									context.promptTokens,
-									context.completionTokens,
-									null,
-									context.cacheReadInputTokens,
-									context.cacheCreationInputTokens,
-									context.thinkingBlockIndex,
-								);
+								context.openBlock = null;
 							}
 
 							// Cleanup entire context after stream completion
@@ -514,42 +545,8 @@ export function transformStreamingResponse(
 											);
 											continue;
 										}
-										// Close thinking block before first tool block if not already closed
-										if (
-											context.hasSentThinkingBlockStart &&
-											!context.thinkingBlockClosed
-										) {
-											context.thinkingBlockClosed = true;
-											const thinkingStop = {
-												type: "content_block_stop",
-												index: context.thinkingBlockIndex,
-											};
-											controller.enqueue(
-												encoder.encode(`event: content_block_stop\n`),
-											);
-											controller.enqueue(
-												encoder.encode(
-													`data: ${JSON.stringify(thinkingStop)}\n\n`,
-												),
-											);
-										}
-										// Close text block before first tool block if not already closed
-										if (
-											context.hasSentContentBlockStart &&
-											!context.textBlockClosed
-										) {
-											context.textBlockClosed = true;
-											const textStop = {
-												type: "content_block_stop",
-												index: context.textBlockIndex,
-											};
-											controller.enqueue(
-												encoder.encode(`event: content_block_stop\n`),
-											);
-											controller.enqueue(
-												encoder.encode(`data: ${JSON.stringify(textStop)}\n\n`),
-											);
-										}
+										// Close the open thinking/text block before the tool block
+										closeOpenBlock(controller, encoder, context);
 										context.toolCallAccumulators[idx] = "";
 										const anthropicBlockIdx = context.nextBlockIndex++;
 										context.toolCallBlockIndices[idx] = anthropicBlockIdx;
@@ -588,125 +585,21 @@ export function transformStreamingResponse(
 							} else {
 								// reasoning_content and content can coexist in one delta — handle both
 								if (delta?.reasoning_content) {
-									// DeepSeek/reasoning providers emit reasoning_content before text.
-									// Map to Anthropic thinking block using monotonic nextBlockIndex.
-									if (!context.hasSentThinkingBlockStart) {
-										context.hasSentThinkingBlockStart = true;
-										// Close text block first if one was already emitted
-										if (
-											context.hasSentContentBlockStart &&
-											!context.textBlockClosed
-										) {
-											context.textBlockClosed = true;
-											const textStop = {
-												type: "content_block_stop",
-												index: context.textBlockIndex,
-											};
-											controller.enqueue(
-												encoder.encode(`event: content_block_stop\n`),
-											);
-											controller.enqueue(
-												encoder.encode(`data: ${JSON.stringify(textStop)}\n\n`),
-											);
-										}
-										context.thinkingBlockIndex = context.nextBlockIndex++;
-										const thinkingBlockStart = {
-											type: "content_block_start",
-											index: context.thinkingBlockIndex,
-											content_block: {
-												type: "thinking",
-												thinking: "",
-											},
-										};
-										controller.enqueue(
-											encoder.encode(`event: content_block_start\n`),
-										);
-										controller.enqueue(
-											encoder.encode(
-												`data: ${JSON.stringify(thinkingBlockStart)}\n\n`,
-											),
-										);
-									}
-
-									const thinkingDelta = {
-										type: "content_block_delta",
-										index: context.thinkingBlockIndex,
-										delta: {
-											type: "thinking_delta",
-											thinking: delta.reasoning_content,
-										},
-									};
-									controller.enqueue(
-										encoder.encode(`event: content_block_delta\n`),
-									);
-									controller.enqueue(
-										encoder.encode(
-											`data: ${JSON.stringify(thinkingDelta)}\n\n`,
-										),
+									emitContentDelta(
+										controller,
+										encoder,
+										context,
+										"thinking",
+										delta.reasoning_content,
 									);
 								}
 								if (delta?.content) {
-									// Send content_block_start on first content.
-									// Use the monotonic nextBlockIndex so the text block index
-									// never collides with any tool_use blocks.
-									if (!context.hasSentContentBlockStart) {
-										context.hasSentContentBlockStart = true;
-										context.textBlockIndex = context.nextBlockIndex++;
-
-										// Close thinking block first if one was emitted
-										if (
-											context.hasSentThinkingBlockStart &&
-											!context.thinkingBlockClosed
-										) {
-											context.thinkingBlockClosed = true;
-											const thinkingStop = {
-												type: "content_block_stop",
-												index: context.thinkingBlockIndex,
-											};
-											controller.enqueue(
-												encoder.encode(`event: content_block_stop\n`),
-											);
-											controller.enqueue(
-												encoder.encode(
-													`data: ${JSON.stringify(thinkingStop)}\n\n`,
-												),
-											);
-										}
-
-										const contentBlockStart = {
-											type: "content_block_start",
-											index: context.textBlockIndex,
-											content_block: {
-												type: "text",
-												text: "",
-											},
-										};
-										controller.enqueue(
-											encoder.encode(`event: content_block_start\n`),
-										);
-										controller.enqueue(
-											encoder.encode(
-												`data: ${JSON.stringify(contentBlockStart)}\n\n`,
-											),
-										);
-									}
-
-									// Send content delta
-									const contentBlockDelta = {
-										type: "content_block_delta",
-										index: context.textBlockIndex,
-										delta: {
-											type: "text_delta",
-											text: delta.content,
-										},
-									};
-									controller.enqueue(
-										encoder.encode(`event: content_block_delta\n`),
-									);
-									controller.enqueue(
-										encoder.encode(
-											`data: ${JSON.stringify(contentBlockDelta)}\n\n`,
-										),
+									emitContentDelta(
+										controller,
+										encoder,
+										context,
+										"text",
+										delta.content,
 									);
 								}
 							}
@@ -737,6 +630,7 @@ export function transformStreamingResponse(
 					log.warn(
 						"Stream terminated without [DONE] — emitting buffered tool calls + stop events",
 					);
+					closeOpenBlock(controller, encoder, context);
 					for (const [openaiIdx, anthropicIdx] of Object.entries(
 						context.toolCallBlockIndices,
 					)) {
@@ -755,31 +649,9 @@ export function transformStreamingResponse(
 						context.cacheReadInputTokens,
 						context.cacheCreationInputTokens,
 					);
-				} else if (
-					context.hasSentContentBlockStart &&
-					!context.encounteredToolCall
-				) {
+				} else if (context.openBlock) {
 					log.warn(
 						"Stream terminated without [DONE] — closing last open block",
-					);
-					const lastBlockIndex = context.textBlockClosed
-						? context.thinkingBlockIndex
-						: context.textBlockIndex;
-					emitStreamEnd(
-						controller,
-						encoder,
-						context.contextWindowSize,
-						"end_turn",
-						context.promptTokens,
-						context.completionTokens,
-						null,
-						context.cacheReadInputTokens,
-						context.cacheCreationInputTokens,
-						lastBlockIndex,
-					);
-				} else if (context.hasSentThinkingBlockStart) {
-					log.warn(
-						"Stream terminated without [DONE] — closing reasoning-only thinking block",
 					);
 					// emitStreamEnd closes the block via end_turn branch — no manual emit needed
 					emitStreamEnd(
@@ -792,8 +664,9 @@ export function transformStreamingResponse(
 						null,
 						context.cacheReadInputTokens,
 						context.cacheCreationInputTokens,
-						context.thinkingBlockIndex,
+						context.openBlock.index,
 					);
+					context.openBlock = null;
 				}
 
 				streamContext = null;

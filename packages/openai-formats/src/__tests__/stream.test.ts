@@ -1909,3 +1909,244 @@ describe("U5 canary: AE3 streamed xhigh reasoning + function tool turn (construc
 		expect(stops.map((e) => parseEventData(e).index).sort()).toEqual([0, 1]);
 	});
 });
+
+// ── transformStreamingResponse — block lifecycle across kind switches ────────
+
+/**
+ * Check the content-block lifecycle Claude Code enforces while consuming an
+ * Anthropic stream: blocks start at contiguous indices in order, every delta
+ * targets a started, not-yet-stopped block of the matching kind, and every
+ * started block is stopped exactly once before the terminal event.
+ */
+function blockLifecycleViolations(
+	events: Array<{ event?: string; data?: string }>,
+): string[] {
+	const violations: string[] = [];
+	const kinds = new Map<number, string>();
+	const stopped = new Set<number>();
+	const deltaKind: Record<string, string> = {
+		thinking_delta: "thinking",
+		text_delta: "text",
+		input_json_delta: "tool_use",
+	};
+	let terminal: string | undefined;
+	for (const ev of events) {
+		if (terminal) {
+			violations.push(`${ev.event} after ${terminal}`);
+			continue;
+		}
+		if (ev.event === "message_stop" || ev.event === "error") {
+			terminal = ev.event;
+			for (const index of kinds.keys()) {
+				if (!stopped.has(index))
+					violations.push(`block ${index} never stopped`);
+			}
+			continue;
+		}
+		if (
+			ev.event !== "content_block_start" &&
+			ev.event !== "content_block_delta" &&
+			ev.event !== "content_block_stop"
+		) {
+			continue;
+		}
+		const data = parseEventData(ev);
+		const index: number = data.index;
+		if (ev.event === "content_block_start") {
+			if (index !== kinds.size) {
+				violations.push(
+					`block ${index} started out of order (expected ${kinds.size})`,
+				);
+			}
+			kinds.set(index, data.content_block?.type);
+		} else if (!kinds.has(index)) {
+			violations.push(`${ev.event} for unstarted block ${index}`);
+		} else if (stopped.has(index)) {
+			violations.push(`${ev.event} for already-stopped block ${index}`);
+		} else if (ev.event === "content_block_stop") {
+			stopped.add(index);
+		} else if (deltaKind[data.delta?.type] !== kinds.get(index)) {
+			violations.push(
+				`${data.delta?.type} on ${kinds.get(index)} block ${index}`,
+			);
+		}
+	}
+	if (!terminal) violations.push("stream ended without message_stop or error");
+	return violations;
+}
+
+/** Blocks in start order, each with its concatenated delta payload. */
+function collectBlocks(
+	events: Array<{ event?: string; data?: string }>,
+): Array<{ type: string; content: string }> {
+	const blocks: Array<{ type: string; content: string }> = [];
+	for (const ev of events) {
+		if (ev.event === "content_block_start") {
+			blocks[parseEventData(ev).index] = {
+				type: parseEventData(ev).content_block?.type,
+				content: "",
+			};
+		} else if (ev.event === "content_block_delta") {
+			const data = parseEventData(ev);
+			const block = blocks[data.index];
+			if (block) {
+				block.content +=
+					data.delta?.thinking ??
+					data.delta?.text ??
+					data.delta?.partial_json ??
+					"";
+			}
+		}
+	}
+	return blocks;
+}
+
+function glmChunk(delta: Record<string, unknown>): string {
+	return JSON.stringify({
+		id: "c1",
+		model: "glm-5.3-flash",
+		choices: [{ index: 0, delta, finish_reason: null }],
+	});
+}
+
+async function transformChunks(chunks: string[]) {
+	const transformed = transformStreamingResponse(makeOpenAIStream(chunks));
+	return parseSSEEvents(await readStream(transformed.body));
+}
+
+describe("transformStreamingResponse — block lifecycle across kind switches", () => {
+	it("opens a fresh text block for the answer after leading content then reasoning", async () => {
+		// A reasoning model can emit a stray newline of content before its
+		// reasoning. The answer that follows must not reuse the text block that
+		// the reasoning closed.
+		const events = await transformChunks([
+			glmChunk({ content: "\n" }),
+			glmChunk({ reasoning_content: "Let me think." }),
+			glmChunk({ reasoning_content: " More." }),
+			glmChunk({ content: "Answer." }),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "text", content: "\n" },
+			{ type: "thinking", content: "Let me think. More." },
+			{ type: "text", content: "Answer." },
+		]);
+		const messageDelta = events.find((e) => e.event === "message_delta");
+		expect(parseEventData(messageDelta ?? {}).delta.stop_reason).toBe(
+			"end_turn",
+		);
+	});
+
+	it("opens fresh blocks when reasoning and text alternate", async () => {
+		const events = await transformChunks([
+			glmChunk({ reasoning_content: "First thought." }),
+			glmChunk({ content: "Partial answer." }),
+			glmChunk({ reasoning_content: "Second thought." }),
+			glmChunk({ content: "Final answer." }),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "thinking", content: "First thought." },
+			{ type: "text", content: "Partial answer." },
+			{ type: "thinking", content: "Second thought." },
+			{ type: "text", content: "Final answer." },
+		]);
+	});
+
+	it("opens fresh blocks for reasoning and text that arrive after a tool call started", async () => {
+		const events = await transformChunks([
+			glmChunk({ reasoning_content: "Need a tool." }),
+			glmChunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: "call_1",
+						type: "function",
+						function: { name: "lookup", arguments: '{"q":' },
+					},
+				],
+			}),
+			glmChunk({ tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] }),
+			glmChunk({ reasoning_content: "Thinking after the call." }),
+			glmChunk({ content: "Calling it now." }),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "thinking", content: "Need a tool." },
+			{ type: "tool_use", content: '{"q":"x"}' },
+			{ type: "thinking", content: "Thinking after the call." },
+			{ type: "text", content: "Calling it now." },
+		]);
+		const messageDelta = events.find((e) => e.event === "message_delta");
+		expect(parseEventData(messageDelta ?? {}).delta.stop_reason).toBe(
+			"tool_use",
+		);
+	});
+
+	it("opens a fresh thinking block for reasoning flushed after content, before a complete tool call", async () => {
+		// oMLX holds back a reasoning suffix while tools are present and flushes it
+		// at stream end, after content has already streamed; its tool calls then
+		// arrive last as complete chunks.
+		const events = await transformChunks([
+			glmChunk({ reasoning_content: "Plan the call" }),
+			glmChunk({ content: "\n\n" }),
+			glmChunk({ content: "Checking the seed." }),
+			glmChunk({ reasoning_content: " <" }),
+			glmChunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: "call_1",
+						type: "function",
+						function: { name: "Bash", arguments: '{"command":"ls"}' },
+					},
+				],
+			}),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "thinking", content: "Plan the call" },
+			{ type: "text", content: "\n\nChecking the seed." },
+			{ type: "thinking", content: " <" },
+			{ type: "tool_use", content: '{"command":"ls"}' },
+		]);
+	});
+
+	it("closes a reopened block on the flush path when the stream ends without [DONE]", async () => {
+		const events = await transformChunks([
+			glmChunk({ content: "\n" }),
+			glmChunk({ reasoning_content: "Thinking." }),
+			glmChunk({ content: "Answer." }),
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events).map((b) => b.type)).toEqual([
+			"text",
+			"thinking",
+			"text",
+		]);
+		expect(events.at(-1)?.event).toBe("message_stop");
+	});
+
+	it("closes the open block before a provider error that follows a kind switch", async () => {
+		const events = await transformChunks([
+			glmChunk({ reasoning_content: "Thinking." }),
+			glmChunk({ content: "Partial." }),
+			glmChunk({ reasoning_content: "More thinking." }),
+			JSON.stringify({ error: { type: "api_error", message: "boom" } }),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(events.at(-1)?.event).toBe("error");
+		expect(events.some((e) => e.event === "message_stop")).toBe(false);
+	});
+});
