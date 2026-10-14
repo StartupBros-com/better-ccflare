@@ -111,6 +111,19 @@ export async function prepareRequestBody(req: Request): Promise<{
 }
 
 /**
+ * Bun's fetch arms its own 300 s idle timer unless `timeout: false` is passed.
+ * On Bun 1.3.11 that timer cut a header-silent upstream at 300 s, and on a
+ * reused keep-alive socket it counts from when the socket returned to the pool,
+ * so a slow model was dropped at 260-300 s — long before
+ * PROXY_REQUEST_TIMEOUT_MS or the precommit rescue's commitment window (#489).
+ * Disabling it leaves those ccflare deadlines in charge. The option goes in
+ * fetch()'s init argument, where Bun reads it, not on the derived Request; and
+ * bun-types does not declare it, hence the local type.
+ */
+const BUN_FETCH_TIMEOUT_DISABLED: RequestInit & { timeout: false } =
+	Object.freeze({ timeout: false });
+
+/**
  * Makes the actual HTTP request to the provider
  * @param targetUrl - The target URL to fetch
  * @param method - HTTP method
@@ -170,6 +183,7 @@ export async function makeProxyRequest(
 					headers: mutableHeaders,
 					signal: effectiveSignal,
 				}),
+				BUN_FETCH_TIMEOUT_DISABLED,
 			);
 			chatGptCloudflareCookieJar.captureFromResponse(targetUrl, response);
 			registerResponseDrainTransport(response, responseDrainController);
@@ -184,6 +198,7 @@ export async function makeProxyRequest(
 		chatGptCloudflareCookieJar.applyCookieHeader(target, mutableHeaders);
 
 		const response = await fetch(target, {
+			...BUN_FETCH_TIMEOUT_DISABLED,
 			method,
 			headers: mutableHeaders,
 			body: createBodyStream ? createBodyStream() : undefined,
