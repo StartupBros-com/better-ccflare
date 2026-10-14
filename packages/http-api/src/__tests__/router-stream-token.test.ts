@@ -6,6 +6,12 @@ import type { APIContext } from "../types";
 
 const ADMIN = "test-stream-admin";
 const API_ONLY = "test-stream-api-only";
+const streamPaths = {
+	logs: "/api/logs/stream",
+	requests: "/api/requests/stream",
+	alerts: "/api/insights/alerts/stream",
+} as const;
+type Audience = keyof typeof streamPaths;
 let keys: ApiKey[];
 let router: APIRouter;
 
@@ -49,8 +55,8 @@ async function request(path: string, method = "GET", key?: string) {
 	if (!response) throw new Error(`No route for ${path}`);
 	return response;
 }
-async function mint(audience: string, key = ADMIN) {
-	const response = await request(`/api/${audience}/stream/token`, "POST", key);
+async function mint(audience: Audience, key = ADMIN) {
+	const response = await request(`${streamPaths[audience]}/token`, "POST", key);
 	expect(response.status).toBe(200);
 	return (await response.json()).token as string;
 }
@@ -65,42 +71,48 @@ async function expectStream(path: string, key?: string) {
 }
 
 describe("router stream-token authentication and authorization", () => {
-	for (const audience of ["logs", "requests"]) {
+	for (const audience of ["logs", "requests", "alerts"] as const) {
 		it(`${audience}: admin mints an ephemeral token and opens exactly one stream`, async () => {
 			const token = await mint(audience);
 			expect(token).toMatch(/^[a-f0-9]{64}$/);
-			const path = `/api/${audience}/stream?stream_token=${token}`;
+			const path = `${streamPaths[audience]}?stream_token=${token}`;
 			await expectStream(path);
 			expect((await request(path)).status).toBe(401);
 		});
 		it(`${audience}: anonymous and API-only keys cannot mint or stream`, async () => {
 			for (const key of [undefined, API_ONLY]) {
 				expect(
-					(await request(`/api/${audience}/stream/token`, "POST", key)).status,
+					(await request(`${streamPaths[audience]}/token`, "POST", key)).status,
 				).toBe(401);
-				expect(
-					(await request(`/api/${audience}/stream`, "GET", key)).status,
-				).toBe(401);
+				expect((await request(streamPaths[audience], "GET", key)).status).toBe(
+					401,
+				);
 			}
 		});
 		it(`${audience}: header fallback and no-auth bootstrap still work`, async () => {
-			await expectStream(`/api/${audience}/stream?stream_token=invalid`, ADMIN);
+			await expectStream(
+				`${streamPaths[audience]}?stream_token=invalid`,
+				ADMIN,
+			);
 			keys = [];
-			await expectStream(`/api/${audience}/stream`);
+			await expectStream(streamPaths[audience]);
 			expect(
-				(await request(`/api/${audience}/stream/token`, "POST")).status,
+				(await request(`${streamPaths[audience]}/token`, "POST")).status,
 			).toBe(200);
 		});
-		it(`${audience}: rejects wrong audience and burns the token`, async () => {
-			const token = await mint(audience);
-			const other = audience === "logs" ? "requests" : "logs";
-			expect(
-				(await request(`/api/${other}/stream?stream_token=${token}`)).status,
-			).toBe(401);
-			expect(
-				(await request(`/api/${audience}/stream?stream_token=${token}`)).status,
-			).toBe(401);
-		});
+		for (const other of ["logs", "requests", "alerts"] as const) {
+			if (other === audience) continue;
+			it(`${audience}: rejects ${other} audience and burns the token`, async () => {
+				const token = await mint(audience);
+				expect(
+					(await request(`${streamPaths[other]}?stream_token=${token}`)).status,
+				).toBe(401);
+				expect(
+					(await request(`${streamPaths[audience]}?stream_token=${token}`))
+						.status,
+				).toBe(401);
+			});
+		}
 		for (const change of ["downgrade", "revoke", "delete"] as const) {
 			it(`${audience}: rejects an issuer after ${change} with another key still active`, async () => {
 				const token = await mint(audience);
@@ -108,7 +120,7 @@ describe("router stream-token authentication and authorization", () => {
 				if (change === "revoke") keys[0].isActive = false;
 				if (change === "delete") keys.shift();
 				expect(
-					(await request(`/api/${audience}/stream?stream_token=${token}`))
+					(await request(`${streamPaths[audience]}?stream_token=${token}`))
 						.status,
 				).toBe(401);
 			});

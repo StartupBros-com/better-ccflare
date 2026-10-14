@@ -722,11 +722,16 @@ export class APIRouter {
 		if (
 			method === "POST" &&
 			(path === "/api/logs/stream/token" ||
-				path === "/api/requests/stream/token")
+				path === "/api/requests/stream/token" ||
+				path === "/api/insights/alerts/stream/token")
 		) {
 			return await this.wrapHandler(() => {
 				const token = this.authService.mintStreamToken(
-					path === "/api/logs/stream/token" ? "logs" : "requests",
+					path === "/api/logs/stream/token"
+						? "logs"
+						: path === "/api/requests/stream/token"
+							? "requests"
+							: "alerts",
 					authResult.apiKeyId,
 				);
 				return jsonResponse({ token });

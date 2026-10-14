@@ -978,7 +978,9 @@ class API extends HttpClient {
 		}
 	}
 
-	async createEventSource(audience: "logs" | "requests"): Promise<EventSource> {
+	async createEventSource(
+		audience: "logs" | "requests" | "alerts",
+	): Promise<EventSource> {
 		// The native EventSource API cannot set custom headers, so instead of
 		// passing the durable API key via query string (which risks leaking
 		// it via browser history, Referer headers, or access logs), a
@@ -986,7 +988,11 @@ class API extends HttpClient {
 		// authenticated POST request, then passed in the EventSource URL
 		// (#216, #379).
 		const apiKey = this.getApiKey();
-		let url = `/api/${audience}/stream`;
+		let url = {
+			logs: "/api/logs/stream",
+			requests: "/api/requests/stream",
+			alerts: "/api/insights/alerts/stream",
+		}[audience];
 		if (apiKey) {
 			const { token } = await this.post<{ token: string }>(`${url}/token`);
 			url = `${url}?stream_token=${encodeURIComponent(token)}`;

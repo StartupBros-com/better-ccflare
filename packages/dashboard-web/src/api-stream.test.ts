@@ -48,24 +48,40 @@ afterEach(() => {
 	}
 });
 describe("authenticated EventSource factory", () => {
-	for (const audience of ["logs", "requests"] as const) {
+	for (const [audience, path] of [
+		["logs", "/api/logs/stream"],
+		["requests", "/api/requests/stream"],
+		["alerts", "/api/insights/alerts/stream"],
+	] as const) {
 		it(`${audience}: sends the durable key only in the mint header`, async () => {
 			api.setApiKey("durable-secret");
 			const source = await api.createEventSource(audience);
 			expect(fetchMock).toHaveBeenCalledTimes(1);
 			const [url, init] = fetchMock.mock.calls[0];
-			expect(url).toBe(`/api/${audience}/stream/token`);
+			expect(url).toBe(`${path}/token`);
 			expect(init?.method).toBe("POST");
 			expect(new Headers(init?.headers).get("x-api-key")).toBe(
 				"durable-secret",
 			);
 			expect((source as unknown as Source).url).toBe(
-				`/api/${audience}/stream?stream_token=ephemeral%2Ftoken%2B`,
+				`${path}?stream_token=ephemeral%2Ftoken%2B`,
 			);
+		});
+		it(`${audience}: mints a different credential for every connection attempt`, async () => {
+			api.setApiKey("durable-secret");
+			fetchMock.mockResolvedValueOnce(Response.json({ token: "first" }));
+			fetchMock.mockResolvedValueOnce(Response.json({ token: "second" }));
+			await api.createEventSource(audience);
+			await api.createEventSource(audience);
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect(Source.instances.map((source) => source.url)).toEqual([
+				`${path}?stream_token=first`,
+				`${path}?stream_token=second`,
+			]);
 		});
 		it(`${audience}: opens a bare endpoint without a stored key`, async () => {
 			await api.createEventSource(audience);
-			expect(Source.instances[0].url).toBe(`/api/${audience}/stream`);
+			expect(Source.instances[0].url).toBe(path);
 			expect(fetchMock).not.toHaveBeenCalled();
 		});
 		it(`${audience}: rejects mint failure without opening an unauthenticated source`, async () => {

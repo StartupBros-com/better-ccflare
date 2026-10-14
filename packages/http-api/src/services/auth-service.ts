@@ -87,7 +87,7 @@ function isLocalControlNotifyPath(path: string, method: string): boolean {
  * dashboard fetches it and opens the EventSource in the same tick). */
 const STREAM_TOKEN_TTL_MS = 60_000;
 
-type StreamAudience = "logs" | "requests";
+type StreamAudience = "logs" | "requests" | "alerts";
 
 interface StreamTokenRecord {
 	audience: StreamAudience;
@@ -296,7 +296,7 @@ export class AuthService {
 	}
 
 	/**
-	 * Extract an ephemeral stream credential, consulted only for the two exact
+	 * Extract an ephemeral stream credential, consulted only for the exact
 	 * GET stream routes. Never accept a durable API key from the URL.
 	 */
 	private extractStreamTokenFromQuery(req: Request): string | null {
@@ -465,7 +465,9 @@ export class AuthService {
 					? "logs"
 					: path === "/api/requests/stream"
 						? "requests"
-						: null
+						: path === "/api/insights/alerts/stream"
+							? "alerts"
+							: null
 				: null;
 		const token = audience ? this.extractStreamTokenFromQuery(req) : null;
 		const record =
