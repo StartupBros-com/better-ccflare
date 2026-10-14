@@ -31,6 +31,21 @@ function isSetupBun(step: Step): boolean {
 	return typeof step.uses === "string" && step.uses.startsWith("oven-sh/setup-bun@");
 }
 
+function pinnedBunVersion(): string {
+	return readFileSync(join(repositoryRoot, ".bun-version"), "utf8").trim();
+}
+
+// bun.lock is JSONC (trailing commas), so JSON.parse rejects it. Match the npm
+// `bun` package's resolution and its @oven/bun-* platform binaries, both their
+// own resolutions and the versions `bun` asks for, by text.
+function lockedBunVersions(): string[] {
+	const lock = readFileSync(join(repositoryRoot, "bun.lock"), "utf8");
+	return [
+		...lock.matchAll(/"bun@(\d+\.\d+\.\d+)"/g),
+		...lock.matchAll(/"@oven\/bun-[a-z0-9-]+(?:@|": ")(\d+\.\d+\.\d+)"/g),
+	].map((match) => match[1] ?? "");
+}
+
 describe("Bun toolchain pin (#321)", () => {
 	test(".bun-version holds one exact version", () => {
 		const pinned = readFileSync(join(repositoryRoot, ".bun-version"), "utf8");
@@ -65,5 +80,30 @@ describe("Bun toolchain pin (#321)", () => {
 
 		const installing = files.filter((file) => workflowSteps(file).some(isSetupBun));
 		expect(installing.sort()).toEqual([...PINNED_WORKFLOWS].sort());
+	});
+});
+
+// setup-bun's version is not the one that builds what we ship. bun-plugin-tailwind
+// peer-depends on `bun`, so `bun install` links the npm `bun` package into
+// node_modules/.bin, and `bun run` puts that first on PATH. Every nested `bun` in
+// a package script (`build:cli`, `build:multi`, ...) runs it, and
+// `bun build --compile` embeds that runtime in every binary, prod and release
+// artifacts alike. It sat at 1.3.11 from bun.lock through every .bun-version bump
+// (#489, #491).
+describe("nested bun resolves to .bun-version (#491)", () => {
+	test("the root package.json pins the npm bun package to exactly .bun-version", () => {
+		const manifest = JSON.parse(
+			readFileSync(join(repositoryRoot, "package.json"), "utf8"),
+		) as { devDependencies?: Record<string, string> };
+		// An exact root devDependency, not `overrides`: Bun does not apply overrides
+		// to an auto-installed peer, so an override leaves bun.lock on the peer's
+		// old resolution.
+		expect(manifest.devDependencies?.bun).toBe(pinnedBunVersion());
+	});
+
+	test("bun.lock resolves the npm bun package and its platform binaries to .bun-version", () => {
+		const versions = lockedBunVersions();
+		expect(versions.length).toBeGreaterThan(0);
+		expect([...new Set(versions)]).toEqual([pinnedBunVersion()]);
 	});
 });

@@ -1912,6 +1912,93 @@ describe("validate_deploy_health", () => {
 	});
 });
 
+describe("validate_bun_runtime_version", () => {
+	// Stands in for a `bun build --compile` binary: only BUN_BE_BUN=1 makes it
+	// answer as the bun CLI it embeds.
+	function fakeBunExecutable(dir: string, name: string, output: string): string {
+		const path = join(dir, name);
+		writeFileSync(
+			path,
+			[
+				"#!/usr/bin/env bash",
+				'[[ "${BUN_BE_BUN:-}" == 1 && "$*" == --version ]] || exit 64',
+				`printf '%s' ${shellQuote(output)}`,
+				"",
+			].join("\n"),
+		);
+		chmodSync(path, 0o755);
+		return path;
+	}
+
+	function check(executable: string, versionFile: string) {
+		return bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`validate_bun_runtime_version "built binary" ${shellQuote(shellPath(executable))} ${shellQuote(shellPath(versionFile))}`,
+			].join("\n"),
+		);
+	}
+
+	test("accepts only the runtime .bun-version pins", () => {
+		const dir = tempDir();
+		const versionFile = join(dir, ".bun-version");
+		writeFileSync(versionFile, "1.4.2\n");
+
+		expect(
+			check(fakeBunExecutable(dir, "pinned", "1.4.2\n"), versionFile).exitCode,
+		).toBe(0);
+
+		// The runtime every binary embedded while bun.lock held bun@1.3.11 (#491).
+		const stale = check(fakeBunExecutable(dir, "stale", "1.3.11\n"), versionFile);
+		expect(stale.exitCode).toBe(1);
+		const staleError = capturedOutput(stale.stderr, "stderr");
+		expect(staleError).toContain("built binary");
+		expect(staleError).toContain("1.3.11");
+		expect(staleError).toContain("1.4.2");
+
+		for (const output of ["", "1.4.2-canary.1\n", "1.4.2\n1.4.2\n"]) {
+			expect(
+				check(fakeBunExecutable(dir, "odd", output), versionFile).exitCode,
+			).toBe(1);
+		}
+		expect(check(join(dir, "missing"), versionFile).exitCode).toBe(1);
+	});
+
+	test("refuses a .bun-version that is not one exact version", () => {
+		const dir = tempDir();
+		const executable = fakeBunExecutable(dir, "bun", "1.4.2\n");
+		for (const contents of ["latest\n", "1.4\n", ""]) {
+			const versionFile = join(dir, ".bun-version");
+			writeFileSync(versionFile, contents);
+			expect(check(executable, versionFile).exitCode).toBe(1);
+		}
+		expect(check(executable, join(dir, "absent")).exitCode).toBe(1);
+	});
+
+	test("rejects the wrong argument count", () => {
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				"validate_bun_runtime_version bun .bun-version",
+			].join("\n"),
+		);
+		expect(result.exitCode).toBe(2);
+	});
+
+	test("deploy checks the toolchain before installing and the built binary before shipping it", () => {
+		const deploySource = readFileSync(deployScript, "utf8");
+		const steps = [
+			'validate_bun_runtime_version "build toolchain" bun "$BUILD_SOURCE_ROOT/.bun-version"',
+			"bun install --frozen-lockfile",
+			'validate_bun_runtime_version "built binary" "$BUILT_BIN" "$BUILD_SOURCE_ROOT/.bun-version"',
+			'BUILT_BIN_SHA256="$(sha256_file "$BUILT_BIN")"',
+		];
+		const positions = steps.map((step) => deploySource.indexOf(step));
+		for (const position of positions) expect(position).toBeGreaterThan(-1);
+		expect(positions).toEqual([...positions].sort((a, b) => a - b));
+	});
+});
+
 describe("rollback identity proof", () => {
 	test("accepts a legacy rollback identity without aggregate body-policy fields and rejects missing identity", () => {
 		const proxy = '{"git_sha":"old"}';
