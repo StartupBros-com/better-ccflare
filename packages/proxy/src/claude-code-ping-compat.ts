@@ -40,6 +40,9 @@ function findFrameDelimiter(
 		} else {
 			continue;
 		}
+		// The buffer is reused across frames, so bytes at or past `length` are
+		// stale leftovers of earlier, longer frames — never delimiter evidence.
+		if (afterFirstLine >= length) continue;
 
 		if (bytes[afterFirstLine] === 0x0a) {
 			return { start: index, end: afterFirstLine + 1 };
