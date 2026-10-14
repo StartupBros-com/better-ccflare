@@ -1197,6 +1197,11 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 		extra: Record<string, string> = {},
 		guardStartupDelayMs = 0,
 	) {
+		// Real Node startup hashes executable artifacts before it listens. Loaded
+		// CI runners have needed more than the 3.5 s a fixed 5 s window left after
+		// a 1.5 s injected delay, so headroom is added on top of the delay. The
+		// callers' 30 s test timeouts cover this window, the handoff, and the reap.
+		const readyTimeoutMs = guardStartupDelayMs + 10_000;
 		const nodeExecutable = resolveNodeExecutable();
 		const dir = tempDir("ccflare-persistent-fixture-");
 		const programs = writeFixturePrograms(dir);
@@ -1227,9 +1232,10 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 				...rssPolicy({ RUNNER_RSS_POLL_INTERVAL_MS: "20" }),
 				RUNNER_PERSISTENT_GUARD: "1",
 				NODE_BIN: nodeExecutable,
-				// Native identity inspection hashes the real executable before listen;
-				// the lightweight mock fixture's one-second readiness budget is too short.
-				RUNNER_HEALTH_MAX_ATTEMPTS: "500",
+				// At the fixture's 10 ms health poll, the runner's attempt budget must
+				// outlast readyTimeoutMs. Otherwise it gives up first and restarts the
+				// stack under the test, which then fails on generation counts instead.
+				RUNNER_HEALTH_MAX_ATTEMPTS: String(Math.ceil(readyTimeoutMs / 10)),
 				...(guardStartupDelayMs > 0
 					? { NODE_OPTIONS: `--import=${startupDelayModule}` }
 					: {}),
@@ -1246,7 +1252,7 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 			await waitForOutput(
 				runner,
 				"ccflare stack ready",
-				Number(extra.FIXTURE_READY_TIMEOUT_MS ?? 5000),
+				Number(extra.FIXTURE_READY_TIMEOUT_MS ?? readyTimeoutMs),
 			);
 		} catch (error) {
 			// start() has not returned its owner yet; callers cannot reach their
@@ -1268,6 +1274,17 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 			start({ FIXTURE_READY_TIMEOUT_MS: "200" }, 1500),
 		).rejects.toThrow("did not emit");
 	});
+	test("pro-gate round 1 CI (#449): readiness budget outlasts a cold start longer than the old fixed 5 s window", async () => {
+		// A 5.1 s injected delay exceeds the former fixed 5000 ms wait on its own,
+		// before the guard hashes its executable; the budget must scale with it.
+		const { runner } = await start({}, 5100);
+		try {
+			expect(generationCount(runner)).toBe(1);
+			expect(runner.getOutput().stdout).not.toContain("did not become ready");
+		} finally {
+			await stopRunner(runner);
+		}
+	}, 30_000);
 	test("retains guard pid, drains old work, rotates credentials and reaps old owner before replacement", async () => {
 		// Real Node startup hashes executable artifacts before opening the listener.
 		// Exercise a cold start longer than the old mock-only one-second budget.
@@ -1352,7 +1369,7 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 		} finally {
 			await stopRunner(runner);
 		}
-	}, 15000);
+	}, 30_000);
 	test("failed replacement remains fenced and retries the same generation within the circuit", async () => {
 		const { runner, base } = await start({
 			RUNNER_RESTART_BACKOFF_BASE_MS: "500",
@@ -1379,7 +1396,7 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 		} finally {
 			await stopRunner(runner);
 		}
-	}, 15000);
+	}, 30_000);
 	test("external TERM during a pending drain preserves terminal shutdown and starts no replacement", async () => {
 		const { runner, base } = await start();
 		const response = await fetch(`${base}/hold`);
@@ -1391,5 +1408,5 @@ describe("persistent guard memory replacement (real Node guard, mock upstream on
 		expect((await exit).code).toBe(143);
 		await body;
 		expect(generationCount(runner)).toBe(1);
-	}, 15000);
+	}, 30_000);
 });

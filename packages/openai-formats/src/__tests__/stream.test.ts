@@ -1909,3 +1909,479 @@ describe("U5 canary: AE3 streamed xhigh reasoning + function tool turn (construc
 		expect(stops.map((e) => parseEventData(e).index).sort()).toEqual([0, 1]);
 	});
 });
+
+// ── transformStreamingResponse — block lifecycle across kind switches ────────
+
+/**
+ * Check the content-block lifecycle of an Anthropic stream: blocks start at
+ * contiguous indices in order, each block completes before the next one
+ * starts, every delta targets a started, not-yet-stopped block of the
+ * matching kind, blocks stop in index order, and every started block is
+ * stopped exactly once before the terminal event. Claude Code assembles one
+ * assistant message per block as it stops, so out-of-order stops reorder the
+ * reply even where a client tolerates the overlap.
+ *
+ * One overlap is allowed: tool_use blocks over tool_use blocks. The translator
+ * opens each parallel tool call on its first chunk and closes them together at
+ * stream end (pre-existing design, tracked in #498); their stops still arrive
+ * in index order.
+ */
+function blockLifecycleViolations(
+	events: Array<{ event?: string; data?: string }>,
+): string[] {
+	const violations: string[] = [];
+	const kinds = new Map<number, string>();
+	const stopped = new Set<number>();
+	const deltaKind: Record<string, string> = {
+		thinking_delta: "thinking",
+		text_delta: "text",
+		input_json_delta: "tool_use",
+	};
+	const openBlocks = () =>
+		[...kinds.keys()].filter((index) => !stopped.has(index));
+	let terminal: string | undefined;
+	for (const ev of events) {
+		if (terminal) {
+			violations.push(`${ev.event} after ${terminal}`);
+			continue;
+		}
+		if (ev.event === "message_stop" || ev.event === "error") {
+			terminal = ev.event;
+			for (const index of kinds.keys()) {
+				if (!stopped.has(index))
+					violations.push(`block ${index} never stopped`);
+			}
+			continue;
+		}
+		if (
+			ev.event !== "content_block_start" &&
+			ev.event !== "content_block_delta" &&
+			ev.event !== "content_block_stop"
+		) {
+			continue;
+		}
+		const data = parseEventData(ev);
+		const index: number = data.index;
+		if (ev.event === "content_block_start") {
+			if (index !== kinds.size) {
+				violations.push(
+					`block ${index} started out of order (expected ${kinds.size})`,
+				);
+			}
+			const kind: string = data.content_block?.type;
+			for (const open of openBlocks()) {
+				if (kind === "tool_use" && kinds.get(open) === "tool_use") continue;
+				violations.push(
+					`${kind} block ${index} started while ${kinds.get(open)} block ${open} is still open`,
+				);
+			}
+			kinds.set(index, kind);
+		} else if (!kinds.has(index)) {
+			violations.push(`${ev.event} for unstarted block ${index}`);
+		} else if (stopped.has(index)) {
+			violations.push(`${ev.event} for already-stopped block ${index}`);
+		} else if (ev.event === "content_block_stop") {
+			const lowestOpen = openBlocks()[0];
+			if (index !== lowestOpen) {
+				violations.push(
+					`block ${index} stopped before open block ${lowestOpen}`,
+				);
+			}
+			stopped.add(index);
+		} else if (deltaKind[data.delta?.type] !== kinds.get(index)) {
+			violations.push(
+				`${data.delta?.type} on ${kinds.get(index)} block ${index}`,
+			);
+		}
+	}
+	if (!terminal) violations.push("stream ended without message_stop or error");
+	return violations;
+}
+
+/** Blocks in start order, each with its concatenated delta payload. */
+function collectBlocks(
+	events: Array<{ event?: string; data?: string }>,
+): Array<{ type: string; content: string }> {
+	const blocks: Array<{ type: string; content: string }> = [];
+	for (const ev of events) {
+		if (ev.event === "content_block_start") {
+			blocks[parseEventData(ev).index] = {
+				type: parseEventData(ev).content_block?.type,
+				content: "",
+			};
+		} else if (ev.event === "content_block_delta") {
+			const data = parseEventData(ev);
+			const block = blocks[data.index];
+			if (block) {
+				block.content +=
+					data.delta?.thinking ??
+					data.delta?.text ??
+					data.delta?.partial_json ??
+					"";
+			}
+		}
+	}
+	return blocks;
+}
+
+function glmChunk(delta: Record<string, unknown>): string {
+	return JSON.stringify({
+		id: "c1",
+		model: "glm-5.3-flash",
+		choices: [{ index: 0, delta, finish_reason: null }],
+	});
+}
+
+async function transformChunks(chunks: string[]) {
+	const transformed = transformStreamingResponse(makeOpenAIStream(chunks));
+	return parseSSEEvents(await readStream(transformed.body));
+}
+
+/** Hand-built Anthropic SSE events, so the checker itself can be exercised. */
+function sseEvents(
+	payloads: Array<Record<string, unknown>>,
+): Array<{ event?: string; data?: string }> {
+	return payloads.map((payload) => ({
+		event: String(payload.type),
+		data: JSON.stringify(payload),
+	}));
+}
+
+describe("blockLifecycleViolations (pro-gate round 2 P1 checker)", () => {
+	const start = (index: number, type: string) => ({
+		type: "content_block_start",
+		index,
+		content_block:
+			type === "tool_use" ? { type, id: `t${index}`, name: "fn" } : { type },
+	});
+	const stop = (index: number) => ({ type: "content_block_stop", index });
+	const done = { type: "message_stop" };
+
+	it("rejects a thinking block that starts while a tool_use block is still open", () => {
+		const events = sseEvents([
+			start(0, "tool_use"),
+			start(1, "thinking"),
+			stop(1),
+			stop(0),
+			done,
+		]);
+		expect(blockLifecycleViolations(events)).toEqual([
+			"thinking block 1 started while tool_use block 0 is still open",
+			"block 1 stopped before open block 0",
+		]);
+	});
+
+	it("rejects stops that arrive out of block order", () => {
+		const events = sseEvents([
+			start(0, "tool_use"),
+			start(1, "tool_use"),
+			stop(1),
+			stop(0),
+			done,
+		]);
+		expect(blockLifecycleViolations(events)).toEqual([
+			"block 1 stopped before open block 0",
+		]);
+	});
+
+	it("allows parallel tool_use blocks that stop in index order", () => {
+		const events = sseEvents([
+			start(0, "tool_use"),
+			start(1, "tool_use"),
+			stop(0),
+			stop(1),
+			done,
+		]);
+		expect(blockLifecycleViolations(events)).toEqual([]);
+	});
+
+	it("rejects a text block that starts while a thinking block is still open", () => {
+		const events = sseEvents([
+			start(0, "thinking"),
+			start(1, "text"),
+			stop(0),
+			stop(1),
+			done,
+		]);
+		expect(blockLifecycleViolations(events)).toEqual([
+			"text block 1 started while thinking block 0 is still open",
+		]);
+	});
+});
+
+describe("transformStreamingResponse — block lifecycle across kind switches", () => {
+	it("opens a fresh text block for the answer after leading content then reasoning", async () => {
+		// A reasoning model can emit a stray newline of content before its
+		// reasoning. The answer that follows must not reuse the text block that
+		// the reasoning closed.
+		const events = await transformChunks([
+			glmChunk({ content: "\n" }),
+			glmChunk({ reasoning_content: "Let me think." }),
+			glmChunk({ reasoning_content: " More." }),
+			glmChunk({ content: "Answer." }),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "text", content: "\n" },
+			{ type: "thinking", content: "Let me think. More." },
+			{ type: "text", content: "Answer." },
+		]);
+		const messageDelta = events.find((e) => e.event === "message_delta");
+		expect(parseEventData(messageDelta ?? {}).delta.stop_reason).toBe(
+			"end_turn",
+		);
+	});
+
+	it("opens fresh blocks when reasoning and text alternate", async () => {
+		const events = await transformChunks([
+			glmChunk({ reasoning_content: "First thought." }),
+			glmChunk({ content: "Partial answer." }),
+			glmChunk({ reasoning_content: "Second thought." }),
+			glmChunk({ content: "Final answer." }),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "thinking", content: "First thought." },
+			{ type: "text", content: "Partial answer." },
+			{ type: "thinking", content: "Second thought." },
+			{ type: "text", content: "Final answer." },
+		]);
+	});
+
+	it("pro-gate round 2 P1: replays reasoning and text that arrive after a tool call started as sequential blocks once the tool block closes", async () => {
+		// Tool arguments are buffered until stream end, so the tool block stays
+		// open; post-tool reasoning/text must not open blocks over it. They are
+		// deferred and replayed after the tool block stops, keeping the single
+		// active block the Anthropic stream format defines.
+		const events = await transformChunks([
+			glmChunk({ reasoning_content: "Need a tool." }),
+			glmChunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: "call_1",
+						type: "function",
+						function: { name: "lookup", arguments: '{"q":' },
+					},
+				],
+			}),
+			glmChunk({ tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] }),
+			glmChunk({ reasoning_content: "Thinking after" }),
+			glmChunk({ reasoning_content: " the call." }),
+			glmChunk({ content: "Calling it now." }),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "thinking", content: "Need a tool." },
+			{ type: "tool_use", content: '{"q":"x"}' },
+			{ type: "thinking", content: "Thinking after the call." },
+			{ type: "text", content: "Calling it now." },
+		]);
+		const types = events.map((e) => e.event);
+		const toolStop = events.findIndex(
+			(e) => e.event === "content_block_stop" && parseEventData(e).index === 1,
+		);
+		const replayStart = events.findIndex(
+			(e) => e.event === "content_block_start" && parseEventData(e).index === 2,
+		);
+		expect(toolStop).toBeGreaterThan(-1);
+		expect(replayStart).toBeGreaterThan(toolStop);
+		expect(types.indexOf("message_delta")).toBeGreaterThan(
+			types.lastIndexOf("content_block_stop"),
+		);
+		const messageDelta = events.find((e) => e.event === "message_delta");
+		expect(parseEventData(messageDelta ?? {}).delta.stop_reason).toBe(
+			"tool_use",
+		);
+	});
+
+	it("pro-gate round 2 P1: replays post-tool text after parallel tool blocks close, stops in index order", async () => {
+		const events = await transformChunks([
+			glmChunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: "call_a",
+						type: "function",
+						function: { name: "search", arguments: '{"q":"a"}' },
+					},
+					{
+						index: 1,
+						id: "call_b",
+						type: "function",
+						function: { name: "lookup", arguments: '{"id":"1"}' },
+					},
+				],
+			}),
+			glmChunk({ content: "Running both." }),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "tool_use", content: '{"q":"a"}' },
+			{ type: "tool_use", content: '{"id":"1"}' },
+			{ type: "text", content: "Running both." },
+		]);
+		const stopOrder = events
+			.filter((e) => e.event === "content_block_stop")
+			.map((e) => parseEventData(e).index);
+		expect(stopOrder).toEqual([0, 1, 2]);
+	});
+
+	it("pro-gate round 2 P1: stops tool blocks in Anthropic block order when OpenAI tool_call indices arrive out of order", async () => {
+		// OpenAI index 1 arrives first and takes Anthropic block 0; index 0 then
+		// takes block 1. Stops must follow block order, not OpenAI index order.
+		const events = await transformChunks([
+			glmChunk({
+				tool_calls: [
+					{
+						index: 1,
+						id: "call_b",
+						type: "function",
+						function: { name: "lookup", arguments: '{"id":"1"}' },
+					},
+				],
+			}),
+			glmChunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: "call_a",
+						type: "function",
+						function: { name: "search", arguments: '{"q":"a"}' },
+					},
+				],
+			}),
+			glmChunk({ content: "Done." }),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "tool_use", content: '{"id":"1"}' },
+			{ type: "tool_use", content: '{"q":"a"}' },
+			{ type: "text", content: "Done." },
+		]);
+		const stopOrder = events
+			.filter((e) => e.event === "content_block_stop")
+			.map((e) => parseEventData(e).index);
+		expect(stopOrder).toEqual([0, 1, 2]);
+	});
+
+	it("pro-gate round 2 P1: replays deferred post-tool text on the flush path when the stream ends without [DONE]", async () => {
+		const events = await transformChunks([
+			glmChunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: "call_1",
+						type: "function",
+						function: { name: "lookup", arguments: '{"q":"x"}' },
+					},
+				],
+			}),
+			glmChunk({ content: "Partial note." }),
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "tool_use", content: '{"q":"x"}' },
+			{ type: "text", content: "Partial note." },
+		]);
+		expect(events.at(-1)?.event).toBe("message_stop");
+	});
+
+	it("pro-gate round 2 P1: closes the tool block and replays deferred text before a provider error", async () => {
+		const events = await transformChunks([
+			glmChunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: "call_1",
+						type: "function",
+						function: { name: "lookup", arguments: '{"q":"x"}' },
+					},
+				],
+			}),
+			glmChunk({ content: "Partial note." }),
+			JSON.stringify({ error: { type: "api_error", message: "boom" } }),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events).map((b) => b.type)).toEqual([
+			"tool_use",
+			"text",
+		]);
+		expect(events.at(-1)?.event).toBe("error");
+		expect(events.some((e) => e.event === "message_stop")).toBe(false);
+	});
+
+	it("opens a fresh thinking block for reasoning flushed after content, before a complete tool call", async () => {
+		// oMLX holds back a reasoning suffix while tools are present and flushes it
+		// at stream end, after content has already streamed; its tool calls then
+		// arrive last as complete chunks.
+		const events = await transformChunks([
+			glmChunk({ reasoning_content: "Plan the call" }),
+			glmChunk({ content: "\n\n" }),
+			glmChunk({ content: "Checking the seed." }),
+			glmChunk({ reasoning_content: " <" }),
+			glmChunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: "call_1",
+						type: "function",
+						function: { name: "Bash", arguments: '{"command":"ls"}' },
+					},
+				],
+			}),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events)).toEqual([
+			{ type: "thinking", content: "Plan the call" },
+			{ type: "text", content: "\n\nChecking the seed." },
+			{ type: "thinking", content: " <" },
+			{ type: "tool_use", content: '{"command":"ls"}' },
+		]);
+	});
+
+	it("closes a reopened block on the flush path when the stream ends without [DONE]", async () => {
+		const events = await transformChunks([
+			glmChunk({ content: "\n" }),
+			glmChunk({ reasoning_content: "Thinking." }),
+			glmChunk({ content: "Answer." }),
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(collectBlocks(events).map((b) => b.type)).toEqual([
+			"text",
+			"thinking",
+			"text",
+		]);
+		expect(events.at(-1)?.event).toBe("message_stop");
+	});
+
+	it("closes the open block before a provider error that follows a kind switch", async () => {
+		const events = await transformChunks([
+			glmChunk({ reasoning_content: "Thinking." }),
+			glmChunk({ content: "Partial." }),
+			glmChunk({ reasoning_content: "More thinking." }),
+			JSON.stringify({ error: { type: "api_error", message: "boom" } }),
+			"[DONE]",
+		]);
+
+		expect(blockLifecycleViolations(events)).toEqual([]);
+		expect(events.at(-1)?.event).toBe("error");
+		expect(events.some((e) => e.event === "message_stop")).toBe(false);
+	});
+});
