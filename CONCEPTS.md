@@ -150,6 +150,38 @@ are refused once a plan window reads full even while the provider still reports 
 allowed: the provider's allowed flag can lag its usage percentage, and the request that
 crosses the line is billed to credits.
 
+### Drain-soonest
+
+An account order that spends first the multi-day allowance most at risk of expiring unused:
+candidates rank by weekly pace band, and the soonest reset only breaks ties within a band.
+
+Structural route class (fallback rung and account priority tier) still outranks the band.
+The order decides fresh assignments and failovers. In sticky mode, whether an established
+session owner moves to a higher-band account depends on the provider: a Codex owner stays
+until it becomes unavailable, while an Anthropic owner moves after a warm-owner hold.
+
+### Weekly pace band
+
+The urgency class of an account's multi-day window: the percentage still unused divided by
+the hours until that window resets, bucketed so an account that must burn faster to use its
+allowance ranks above one that can burn slowly.
+*Avoid:* quota pressure band
+
+Bands compare only candidates of the same provider, billing class, window kind, and model
+family. When the request's model family has its own multi-day window, that window sets the
+band instead of the account-wide one.
+
+### Warm-owner hold
+
+A bounded delay in which an Anthropic session owner, outclassed only by a higher weekly pace
+band within the same route class, keeps serving while its prompt cache is certainly warm, so
+the drain waits instead of paying a full cache rewrite.
+
+The hold applies only while the owner served the session's previous turn recently enough
+that the cache cannot have expired, and each hold episode is capped from its first held turn.
+It delays a drain but never blocks it; an unavailable owner, tier or fallback-rung recovery,
+and strict mode are never held.
+
 ### First-party Anthropic account
 
 An account with provider `anthropic` whose endpoint is the default or exactly
@@ -195,6 +227,18 @@ attempt made while serving it.
 
 Retries and failovers can produce several physical attempts for one logical request, so
 logical-final usage and physical-attempt usage are not interchangeable populations.
+
+### Session remap
+
+A sequential change of the account serving one client session and model, made without a
+failover and after the session's earlier requests have finished; the next request on the new
+account must rewrite the whole cached prompt prefix.
+
+A remap is distinct from a failover remap (a move made on purpose after an attempt failed)
+and from concurrent spread (parallel requests of one session landing on different accounts at
+the same moment). A raw count of same-session account changes is mostly concurrent spread,
+so remap cost is measured on the sequential population only, against a baseline drawn from
+same-account sequential requests after the same idle gap.
 
 ### Physical-attempt usage
 
@@ -353,9 +397,10 @@ The dispatch fence durably distinguishes a possibly sent inference from work tha
   automatic family.
 - *Utilization* is always a 0–100 percentage once past normalization, never a 0–1 fraction,
   even though several providers report it as a fraction natively.
-- *Drain* names two unrelated things: *Guard-first drain* lets in-flight requests settle before
-  a process stops, while *Credit drain* spends an account's purchased credits once its plan
-  windows are spent.
+- *Drain* names three unrelated things: *Guard-first drain* lets in-flight requests settle
+  before a process stops, *Credit drain* spends an account's purchased credits once its plan
+  windows are spent, and *Drain-soonest* orders accounts so the multi-day allowance most at
+  risk of expiring unused is spent first.
 
 ## Retained ingress and cold backend handoff
 
