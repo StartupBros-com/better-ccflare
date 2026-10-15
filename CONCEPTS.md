@@ -234,7 +234,7 @@ A sequential change of the account serving one client session and model, made wi
 failover and after the session's earlier requests have finished; the next request on the new
 account must rewrite the whole cached prompt prefix.
 
-A remap is distinct from a failover remap (a move made on purpose after an attempt failed)
+A remap is distinct from a failover (a move forced by a failed attempt)
 and from concurrent spread (parallel requests of one session landing on different accounts at
 the same moment). A raw count of same-session account changes is mostly concurrent spread,
 so remap cost is measured on the sequential population only, against a baseline drawn from

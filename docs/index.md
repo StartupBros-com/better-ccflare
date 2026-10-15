@@ -26,7 +26,7 @@ When working with Claude API at scale, rate limits can become a significant bott
 ### 🎯 Intelligent Load Balancing
 - **Four supported strategies**: `session` (the default), `least-used`, `session-affinity`, and the opt-in `session-drain-soonest`
 - **OAuth stickiness**: `session` keeps an account-level session for providers with session windows (including Anthropic OAuth and Codex OAuth); `session-affinity` keeps each client or lane on its own account for prompt-cache locality
-- **Drain-soonest is opt-in**: `session-drain-soonest` orders fresh assignments and failover by weekly pace band, then the earliest known future all-model weekly reset; besides normal failover, an existing affinity owner also moves when a same-tier account reaches a higher pace band, and missing or stale telemetry falls back to ordinary affinity ordering ([Drain ordering](./load-balancing.md#drain-ordering))
+- **Drain-soonest is opt-in**: `session-drain-soonest` orders fresh assignments and failover by weekly pace band, then the earliest known future all-model weekly reset; besides normal failover, an existing affinity owner also moves when a same-tier account reaches a higher pace band (Codex owners stay; Anthropic owners get a bounded warm-cache hold), and missing or stale telemetry falls back to ordinary affinity ordering ([Drain ordering](./load-balancing.md#drain-ordering))
 - **Provider-aware safety**: `least-used` spreads requests by utilization and does not preserve OAuth stickiness, so reserve it for providers and credentials where per-request spreading is safe
 
 ### 📈 Real-Time Monitoring & Analytics
