@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { SessionDrainSoonestStrategy } from "@better-ccflare/load-balancer";
 import type {
 	Account,
@@ -399,7 +399,8 @@ describe("SessionDrainSoonestStrategy", () => {
 
 		it.each([
 			["strict Codex", "codex", "strict"],
-			["sticky Anthropic", "anthropic", "sticky"],
+			["strict Anthropic", "anthropic", "strict"],
+			["sticky Z.ai", "zai", "sticky"],
 		] as const)("preserves %s pressure remapping", async (_name, provider, mode) => {
 			const legacy = new SessionDrainSoonestStrategy(undefined, mode);
 			legacy.initialize(store);
@@ -687,6 +688,244 @@ describe("SessionDrainSoonestStrategy", () => {
 			expect(
 				strategy.snapshotAffinityOwner(meta("warm-client"))?.accountId,
 			).toBe(urgent.id);
+		});
+	});
+
+	describe("warm Anthropic pressure hold", () => {
+		const MINUTE = 60 * 1000;
+		let now: number;
+		let clock: ReturnType<typeof spyOn>;
+		let held: SessionDrainSoonestStrategy;
+
+		const pressureMeta = (
+			clientSessionId = "warm-client",
+			bands: Record<string, "cold" | "critical"> = {
+				owner: "cold",
+				urgent: "critical",
+			},
+		): RequestMeta => ({
+			...meta(clientSessionId),
+			quotaPressureByAccountId: new Map(
+				Object.entries(bands).map(([id, band]) => [
+					id,
+					{ band, comparisonKey: "weekly" },
+				]),
+			),
+		});
+		const sameTierRemaps = () =>
+			held.getRoutingHealth().transitions.outclassRemaps.sameTier;
+
+		beforeEach(() => {
+			now = Date.now();
+			clock = spyOn(Date, "now").mockImplementation(() => now);
+			// The strategy captures Date.now at construction, so build it after
+			// the clock is mocked.
+			held = new SessionDrainSoonestStrategy();
+			held.initialize(store);
+		});
+
+		afterEach(() => {
+			clock.mockRestore();
+		});
+
+		it("holds a warm owner across a same-tier burn band while new sessions drain", async () => {
+			const owner = makeAccount({ id: "owner" });
+			const urgent = makeAccount({ id: "urgent" });
+			await held.select([owner], meta("warm-client"));
+
+			now += MINUTE;
+			expect((await held.select([urgent, owner], pressureMeta()))[0]).toBe(
+				owner,
+			);
+			expect(
+				(await held.select([owner, urgent], pressureMeta("new-client")))[0],
+			).toBe(urgent);
+			expect(held.snapshotAffinityOwner(meta("warm-client"))?.accountId).toBe(
+				owner.id,
+			);
+			expect(sameTierRemaps()).toBe(0);
+		});
+
+		it("releases the hold once the session idles for the warm-cache window", async () => {
+			const owner = makeAccount({ id: "owner" });
+			const urgent = makeAccount({ id: "urgent" });
+			await held.select([owner], meta("warm-client"));
+
+			now += 5 * MINUTE - 1;
+			expect((await held.select([owner, urgent], pressureMeta()))[0]).toBe(
+				owner,
+			);
+			now += 5 * MINUTE;
+			expect((await held.select([owner, urgent], pressureMeta()))[0]).toBe(
+				urgent,
+			);
+			expect(held.snapshotAffinityOwner(meta("warm-client"))?.accountId).toBe(
+				urgent.id,
+			);
+			expect(sameTierRemaps()).toBe(1);
+		});
+
+		it("caps one continuous hold at 30 minutes, then remaps once", async () => {
+			const owner = makeAccount({ id: "owner" });
+			const urgent = makeAccount({ id: "urgent" });
+			await held.select([owner], meta("warm-client"));
+
+			now += MINUTE;
+			const holdStart = now;
+			for (let elapsed = 0; elapsed <= 28; elapsed += 4) {
+				now = holdStart + elapsed * MINUTE;
+				expect((await held.select([owner, urgent], pressureMeta()))[0]).toBe(
+					owner,
+				);
+			}
+			now = holdStart + 29 * MINUTE;
+			expect((await held.select([owner, urgent], pressureMeta()))[0]).toBe(
+				owner,
+			);
+			now = holdStart + 30 * MINUTE;
+			expect((await held.select([owner, urgent], pressureMeta()))[0]).toBe(
+				urgent,
+			);
+			expect(sameTierRemaps()).toBe(1);
+
+			// The remap ended that episode: when the bands flip on the very next
+			// turn, the new owner gets its own full hold instead of inheriting the
+			// expired one.
+			now += MINUTE;
+			expect(
+				(
+					await held.select(
+						[owner, urgent],
+						pressureMeta("warm-client", {
+							owner: "critical",
+							urgent: "cold",
+						}),
+					)
+				)[0],
+			).toBe(urgent);
+			expect(sameTierRemaps()).toBe(1);
+		});
+
+		it("restarts the hold cap after the owner returns to its band", async () => {
+			const owner = makeAccount({ id: "owner" });
+			const urgent = makeAccount({ id: "urgent" });
+			await held.select([owner], meta("warm-client"));
+			const start = now;
+
+			for (let elapsed = 1; elapsed <= 25; elapsed += 4) {
+				now = start + elapsed * MINUTE;
+				expect((await held.select([owner, urgent], pressureMeta()))[0]).toBe(
+					owner,
+				);
+			}
+			// Same band again: an ordinary sticky hit ends the hold episode.
+			now = start + 27 * MINUTE;
+			expect(
+				(
+					await held.select(
+						[owner, urgent],
+						pressureMeta("warm-client", { owner: "cold", urgent: "cold" }),
+					)
+				)[0],
+			).toBe(owner);
+			for (let elapsed = 28; elapsed <= 56; elapsed += 4) {
+				now = start + elapsed * MINUTE;
+				expect((await held.select([owner, urgent], pressureMeta()))[0]).toBe(
+					owner,
+				);
+			}
+			expect(sameTierRemaps()).toBe(0);
+		});
+
+		it("does not treat an owner as warm when a fallback served the last turn", async () => {
+			const primary = makeAccount({ id: "owner", priority: 0 });
+			const urgent = makeAccount({ id: "urgent", priority: 0 });
+			const backup = makeAccount({ id: "backup", priority: 1 });
+			await held.select([primary, backup], meta("warm-client"));
+
+			now += MINUTE;
+			const primaryDown = { ...primary, rate_limited_until: now + MINUTE };
+			const urgentDown = { ...urgent, rate_limited_until: now + MINUTE };
+			expect(
+				(
+					await held.select(
+						[primaryDown, urgentDown, backup],
+						meta("warm-client"),
+					)
+				)[0],
+			).toBe(backup);
+
+			now += MINUTE;
+			expect(
+				(await held.select([primary, urgent, backup], pressureMeta()))[0],
+			).toBe(urgent);
+		});
+
+		it("never holds a displaced owner against its recovered better tier", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const owner = makeAccount({ id: "owner", priority: 1 });
+			const primaryDown = {
+				...primary,
+				rate_limited_until: now + MINUTE,
+			};
+			expect(
+				(await held.select([primaryDown, owner], meta("warm-client")))[0],
+			).toBe(owner);
+
+			now += MINUTE;
+			expect(
+				(await held.select([primary, owner], meta("warm-client")))[0],
+			).toBe(primary);
+		});
+
+		it("never holds a warm owner against a recovered better fallback rung", async () => {
+			const shared = makeAccount({ id: "shared" });
+			const requested = {
+				candidateId: "shared:requested",
+				accountId: shared.id,
+				tier: 0,
+				ordinal: 0,
+				comboSlotId: null,
+				modelOverride: "claude-opus-5-5",
+				quotaPressure: null,
+				routeFallbackRung: "profile_requested_model" as const,
+			};
+			const fallback = {
+				...requested,
+				candidateId: "shared:root",
+				ordinal: 1,
+				modelOverride: "claude-sonnet-5-5",
+				routeFallbackRung: "profile_root_model" as const,
+			};
+			await held.select([shared], {
+				...meta("warm-client"),
+				routingCandidates: [fallback],
+			});
+
+			now += MINUTE;
+			const recovered = {
+				...meta("warm-client"),
+				routingCandidates: [fallback, requested],
+			};
+			await held.select([shared, shared], recovered);
+			expect(recovered.routingCandidates[0]?.candidateId).toBe(
+				requested.candidateId,
+			);
+		});
+
+		it("still fails over from an unavailable warm owner", async () => {
+			const owner = makeAccount({ id: "owner" });
+			const urgent = makeAccount({ id: "urgent" });
+			await held.select([owner], meta("warm-client"));
+
+			now += MINUTE;
+			owner.rate_limited_until = now + MINUTE;
+			expect((await held.select([owner, urgent], pressureMeta()))[0]).toBe(
+				urgent,
+			);
+			expect(held.snapshotAffinityOwner(meta("warm-client"))?.accountId).toBe(
+				urgent.id,
+			);
 		});
 	});
 
