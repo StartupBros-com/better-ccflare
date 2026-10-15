@@ -1042,12 +1042,15 @@ describe("SessionDrainSoonestStrategy", () => {
 	});
 
 	// Characterization for #523: which strategies implement child route homes.
-	// Strict mode neither installs nor honors descendant homes, and those are two
-	// halves that must move together. select() skips the descendant block because
-	// selectionAffinityKey() is null in strict, so routeHomeExpectedCandidateId
-	// stays undefined (not null); commitDescendantAffinityOwner then refuses to
-	// install because `undefined !== null`. Normalizing that field to null would
-	// make strict install homes that select() ignores.
+	// Without a retain-owner directive, strict mode neither installs nor honors
+	// descendant homes, and those are two halves that must move together.
+	// select() skips the descendant block because selectionAffinityKey() is null
+	// in strict, so routeHomeExpectedCandidateId stays undefined (not null);
+	// commitDescendantAffinityOwner then refuses to install because
+	// `undefined !== null`. Normalizing that field to null would make strict
+	// install homes that select() ignores. A retain-owner directive, which only
+	// the enforcing Anthropic degraded mode publishes for a native Anthropic
+	// OAuth owner, restores the key and so opens the descendant path.
 	describe("descendant child homes", () => {
 		const descendantMeta = (
 			lane: string,
@@ -1143,6 +1146,28 @@ describe("SessionDrainSoonestStrategy", () => {
 				expect(next.routeRepinReason ?? null).toBeNull();
 				expect(next.routeHomeExpectedCandidateId).toBeUndefined();
 				expect(next.routeHomeAction).not.toBe("repinned");
+			});
+
+			it("a retain-owner directive opens the descendant path, so a home installs", async () => {
+				const home = makeAccount({
+					id: "acct-home",
+					name: "acct-home",
+					provider: "anthropic",
+				});
+				const owner = {
+					candidateId: `candidate:${home.id}`,
+					accountId: home.id,
+				};
+				const m = {
+					...descendantMeta("strict-directive", [{ id: home.id }]),
+					affinityOwnerDirective: { kind: "retain-owner", owner },
+				} as RequestMeta;
+				await strict.select([home], m);
+				expect(m.routeHomeExpectedCandidateId).toBeNull();
+				expect(strict.commitDescendantAffinityOwner(m, owner)).toBe(
+					"initial_commit",
+				);
+				expect(strict.getRoutingHealth().affinityEntries).toBe(1);
 			});
 		});
 
