@@ -4,17 +4,12 @@ import "@better-ccflare/core";
 import type { BunSqlAdapter } from "../adapters/bun-sql-adapter";
 import { ensureSchema, runMigrations } from "../migrations";
 import { ensureSchemaPg, runMigrationsPg } from "../migrations-pg";
+import {
+	isRouteProvenanceColumn,
+	ROUTE_PROVENANCE_COLUMNS,
+} from "./route-provenance.fixture";
 
-const ROUTE_COLUMNS = [
-	"route_profile_id",
-	"requested_route_model",
-	"routed_provider",
-	"routed_model",
-	"route_fallback_rung",
-	"route_home_action",
-	"route_repin_reason",
-	"route_candidate_id",
-];
+const SORTED = [...ROUTE_PROVENANCE_COLUMNS].sort();
 
 function requestColumns(db: Database): string[] {
 	return db
@@ -23,39 +18,43 @@ function requestColumns(db: Database): string[] {
 		.map((r) => r.name);
 }
 
-function routeColumns(columns: string[]): string[] {
-	return columns.filter((c) => ROUTE_COLUMNS.includes(c)).sort();
+// Every provenance column a schema path produces, found by name rather than by
+// the pinned list, so a column added on one path only shows up as a difference.
+function provenanceColumns(columns: Iterable<string>): string[] {
+	return [...new Set(columns)].filter(isRouteProvenanceColumn).sort();
 }
 
-const SORTED = [...ROUTE_COLUMNS].sort();
-
-test("SQLite fresh ensureSchema creates all 8 route provenance columns", () => {
+function sqliteFresh(): string[] {
 	const db = new Database(":memory:");
 	try {
 		ensureSchema(db);
-		expect(routeColumns(requestColumns(db))).toEqual(SORTED);
+		return provenanceColumns(requestColumns(db));
 	} finally {
 		db.close();
 	}
+}
+
+test("SQLite fresh ensureSchema creates exactly the 8 route provenance columns", () => {
+	expect(sqliteFresh()).toEqual(SORTED);
 });
 
-test("SQLite upgrade adds missing route provenance columns and is idempotent", () => {
+test("SQLite upgrade adds exactly the 8 route provenance columns and is idempotent", () => {
 	const db = new Database(":memory:");
 	try {
 		ensureSchema(db);
 		runMigrations(db);
-		// Rebuild an old-shape table: copy of requests minus the 8 columns.
-		const keep = requestColumns(db).filter((c) => !ROUTE_COLUMNS.includes(c));
+		// Rebuild an old-shape table: requests minus every provenance column.
+		const keep = requestColumns(db).filter((c) => !isRouteProvenanceColumn(c));
 		db.run(
 			`CREATE TABLE requests_old AS SELECT ${keep.join(", ")} FROM requests`,
 		);
 		db.run("DROP TABLE requests");
 		db.run("ALTER TABLE requests_old RENAME TO requests");
-		expect(routeColumns(requestColumns(db))).toEqual([]);
+		expect(provenanceColumns(requestColumns(db))).toEqual([]);
 		runMigrations(db);
-		expect(routeColumns(requestColumns(db))).toEqual(SORTED);
+		expect(provenanceColumns(requestColumns(db))).toEqual(SORTED);
 		runMigrations(db);
-		expect(routeColumns(requestColumns(db))).toEqual(SORTED);
+		expect(provenanceColumns(requestColumns(db))).toEqual(SORTED);
 	} finally {
 		db.close();
 	}
@@ -80,45 +79,50 @@ async function capturePgSql() {
 	return { createSql, alterSql };
 }
 
-function pgRequestsCreate(createSql: string[]): string {
+function pgCreatedColumns(createSql: string[]): string[] {
 	const create = createSql.find((s) =>
 		/CREATE TABLE IF NOT EXISTS requests\s*\(/.test(s),
 	);
 	expect(create).toBeDefined();
-	return create as string;
+	const body = (create as string).slice(
+		(create as string).indexOf("(") + 1,
+		(create as string).lastIndexOf(")"),
+	);
+	// One column definition per line: `<name> <TYPE> ...`.
+	return body
+		.split("\n")
+		.map((line) => /^\s*([a-z_]\w*)\s+[A-Z]/.exec(line)?.[1])
+		.filter((column): column is string => column !== undefined);
 }
 
-test("PostgreSQL create table and upgrade list carry the same 8 route provenance columns", async () => {
-	const { createSql, alterSql } = await capturePgSql();
-	const create = pgRequestsCreate(createSql);
-	const created = ROUTE_COLUMNS.filter((c) =>
-		new RegExp(`\\b${c}\\s+TEXT`).test(create),
-	);
-	expect(created.sort()).toEqual(SORTED);
-	const altered = ROUTE_COLUMNS.filter((c) =>
-		alterSql.includes(`ALTER TABLE requests ADD COLUMN ${c} TEXT`),
-	);
-	expect(altered.sort()).toEqual(SORTED);
+function pgAlteredColumns(alterSql: string[]): string[] {
+	return alterSql
+		.map(
+			(sql) =>
+				/^\s*ALTER TABLE requests ADD COLUMN (?:IF NOT EXISTS )?(\w+)\s/.exec(
+					sql,
+				)?.[1],
+		)
+		.filter((column): column is string => column !== undefined);
+}
+
+test("PostgreSQL create table carries exactly the 8 route provenance columns", async () => {
+	const { createSql } = await capturePgSql();
+	const created = pgCreatedColumns(createSql);
+	// Guards the parser: it must see the whole table, not just a fragment.
+	expect(created).toContain("id");
+	expect(created).toContain("routing_attempt_summary");
+	expect(provenanceColumns(created)).toEqual(SORTED);
+});
+
+test("PostgreSQL upgrade list adds exactly the 8 route provenance columns", async () => {
+	const { alterSql } = await capturePgSql();
+	const altered = pgAlteredColumns(alterSql);
+	expect(altered).toContain("routing_attempt_summary");
+	expect(provenanceColumns(altered)).toEqual(SORTED);
 });
 
 test("SQLite and PostgreSQL route provenance column sets are identical", async () => {
-	const db = new Database(":memory:");
-	let sqliteSet: string[];
-	try {
-		ensureSchema(db);
-		sqliteSet = routeColumns(requestColumns(db));
-	} finally {
-		db.close();
-	}
 	const { createSql } = await capturePgSql();
-	const create = pgRequestsCreate(createSql);
-	const pgSet = [
-		...create.matchAll(
-			/\b(route_\w+|requested_route_model|routed_provider|routed_model)\s+TEXT/g,
-		),
-	]
-		.map((m) => m[1])
-		.sort();
-	expect(pgSet).toEqual(SORTED);
-	expect(sqliteSet).toEqual(pgSet);
+	expect(sqliteFresh()).toEqual(provenanceColumns(pgCreatedColumns(createSql)));
 });

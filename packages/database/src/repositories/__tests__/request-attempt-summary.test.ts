@@ -2,75 +2,23 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import "@better-ccflare/core";
 import {
-	type RequestRoutingAttemptSummary,
 	type RequestRow,
 	toRequest,
 	toRequestResponse,
 } from "@better-ccflare/types";
+import {
+	attemptRequest as base,
+	expectedA,
+	expectedB,
+	provenanceA,
+	provenanceB,
+	ROUTE_PROVENANCE_COLUMNS as ROUTE_COLUMNS,
+	attemptSummary as summary,
+} from "../../__tests__/route-provenance.fixture";
 import { BunSqlAdapter } from "../../adapters/bun-sql-adapter";
 import { ensureSchema, runMigrations } from "../../migrations";
 import { ensureSchemaPg, runMigrationsPg } from "../../migrations-pg";
 import { RequestRepository } from "../request.repository";
-
-const summary: RequestRoutingAttemptSummary = {
-	version: 1,
-	decision: {
-		version: 1,
-		requestedLogicalModel: "test-logical",
-		operation: "messages",
-		origin: "unknown",
-		reason: "route_unavailable",
-		evidence: "inferred",
-		inventory: "complete",
-		constraints: {
-			forcedRoute: false,
-			capabilityProfile: false,
-			routeProfile: false,
-			profileId: null,
-			provider: null,
-			physicalModel: null,
-		},
-		selection: null,
-		stages: [],
-	},
-	decisionGap: null,
-	physicalAttemptCount: 2,
-	routeCount: 1,
-	truncated: false,
-	completeness: "complete",
-	outputOriginOrdinal: null,
-	winnerOrdinal: null,
-	nativeStatus: 503,
-	wireStatus: 200,
-	terminalCause: "meaningful_progress_timeout",
-	cancellationOrigin: null,
-	attempts: [1, 2].map((ordinal) => ({
-		ordinal,
-		accountId: "test-account",
-		provider: "codex",
-		logicalModel: "test-logical",
-		physicalModel: "test-physical",
-		outcome: "failed",
-		cause: "meaningful_progress_timeout",
-		startedAt: null,
-		outcomeObservedAt: null,
-		nativeStatus: 200,
-		protocolFrames: 79,
-		meaningfulProgress: "absent",
-		terminalEvidenceSeen: false,
-	})),
-};
-const base = {
-	id: "attempt-terminal",
-	method: "POST",
-	path: "/v1/messages",
-	accountUsed: null,
-	statusCode: 503,
-	success: false,
-	errorMessage: "meaningful_progress_timeout",
-	responseTime: 100,
-	failoverAttempts: 0,
-};
 
 test("first terminal attribution survives late usage/save and reads through history", async () => {
 	const db = new Database(":memory:");
@@ -223,58 +171,6 @@ test("PostgreSQL fresh/upgrade schema and adapter writes preserve the bounded fi
 		);
 });
 
-const ROUTE_COLUMNS = [
-	"route_profile_id",
-	"requested_route_model",
-	"routed_provider",
-	"routed_model",
-	"route_fallback_rung",
-	"route_home_action",
-	"route_repin_reason",
-	"route_candidate_id",
-] as const;
-
-const provenanceA = {
-	profileId: "profile-a",
-	requestedModel: "requested-a",
-	routedProvider: "provider-a",
-	routedModel: "model-a",
-	fallbackRung: "profile_root_model",
-	homeAction: "repinned",
-	repinReason: "route_circuit_open",
-	candidateId: "candidate-a",
-} as const;
-const provenanceB = {
-	profileId: "profile-b",
-	requestedModel: "requested-b",
-	routedProvider: "provider-b",
-	routedModel: "model-b",
-	fallbackRung: "global_requested_model",
-	homeAction: "initial_commit",
-	repinReason: "hard_exclusion",
-	candidateId: "candidate-b",
-} as const;
-const expectedA = {
-	route_profile_id: "profile-a",
-	requested_route_model: "requested-a",
-	routed_provider: "provider-a",
-	routed_model: "model-a",
-	route_fallback_rung: "profile_root_model",
-	route_home_action: "repinned",
-	route_repin_reason: "route_circuit_open",
-	route_candidate_id: "candidate-a",
-};
-const expectedB = {
-	route_profile_id: "profile-b",
-	requested_route_model: "requested-b",
-	routed_provider: "provider-b",
-	routed_model: "model-b",
-	route_fallback_rung: "global_requested_model",
-	route_home_action: "initial_commit",
-	route_repin_reason: "hard_exclusion",
-	route_candidate_id: "candidate-b",
-};
-
 function readRouteColumns(db: Database, id: string) {
 	return db
 		.query(`SELECT ${ROUTE_COLUMNS.join(", ")} FROM requests WHERE id = ?`)
@@ -337,7 +233,9 @@ test("route provenance is preserved when a re-save omits it", async () => {
 	}
 });
 
-test("PostgreSQL upsert freezes every route provenance column behind the attempt-summary CASE", async () => {
+// Checks the generated statement's shape and binding only; the live
+// PostgreSQL freeze is exercised in managed-routing-postgres.integration.test.ts.
+test("PostgreSQL upsert SQL guards every route provenance column behind the attempt-summary CASE and binds it by position", async () => {
 	let lastWrite: { sql: string; params: unknown[] } | null = null;
 	const adapter = {
 		run: async (sql: string, params: unknown[]) => {
