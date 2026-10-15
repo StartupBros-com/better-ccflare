@@ -99,6 +99,39 @@ describe("AlertService model_routing_drift alerts", () => {
 		sqlite.close();
 	});
 
+	describe("request-derived alert account label", () => {
+		const ACCOUNT_ID = "550e8400-e29b-41d4-a716-446655440000";
+
+		it("persists the account name, not its UUID", async () => {
+			sqlite
+				.prepare("INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)")
+				.run(ACCOUNT_ID, "work-pro", Date.now());
+			service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+			service.start();
+
+			await service.evaluateRequest(
+				baseRequest({ accountUsed: ACCOUNT_ID, model: "claude-haiku-9-9" }),
+			);
+
+			const alerts = await service.listAlerts();
+			expect(alerts).toHaveLength(1);
+			expect((alerts[0] as AlertEvent).account).toBe("work-pro");
+		});
+
+		it("falls back to the raw value when no account row matches", async () => {
+			service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+			service.start();
+
+			await service.evaluateRequest(
+				baseRequest({ accountUsed: ACCOUNT_ID, model: "claude-haiku-9-9" }),
+			);
+
+			const alerts = await service.listAlerts();
+			expect(alerts).toHaveLength(1);
+			expect((alerts[0] as AlertEvent).account).toBe(ACCOUNT_ID);
+		});
+	});
+
 	// Severity is `warning`, not `critical`, and deliberately so: the check
 	// cannot distinguish a stale policy from a deliberate pinned-fallback slot
 	// (a documented feature), so firing critical on supported configuration
