@@ -328,7 +328,7 @@ quota-aware; exclusions, unavailable owners, and existing better-tier/rung
 recovery rules still apply. An existing Anthropic owner gets a bounded hold
 across the same change: it stays while it served the session's previous turn
 less than 5 minutes ago, for at most 30 minutes, then moves to the higher-band
-account. Owners from other providers move at once, and
+account. Owners from providers other than Codex and Anthropic move at once, and
 `session-drain-soonest-strict` is unchanged. The map remains process-local with an idle TTL; restarts and new
 session/lane identities can produce new assignments (see [affinity lifetime
 limits](load-balancing.md#account-and-client-stickiness)).
