@@ -947,7 +947,8 @@ function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
 	};
 }
 
-function createRawResponseTelemetry(attemptStartedAt, now) {
+function createRawResponseTelemetry(attemptStartedAt, now, requestStartedAt) {
+	let headersAt = null;
 	let rawResponseChunkCount = 0;
 	let rawResponseBytes = 0;
 	let firstChunkAt = null;
@@ -958,6 +959,10 @@ function createRawResponseTelemetry(attemptStartedAt, now) {
 	return {
 		enableSseOutcomeObservation(options) {
 			sseOutcomeObserver ??= createSseOutcomeObserver(options);
+		},
+		// Called once upstream response headers are in hand (#506).
+		recordHeaders() {
+			headersAt ??= now();
 		},
 		record(chunk) {
 			const observedAt = now();
@@ -981,6 +986,10 @@ function createRawResponseTelemetry(attemptStartedAt, now) {
 			return {
 				rawResponseChunkCount,
 				rawResponseBytes,
+				responseHeadersMs:
+					headersAt == null
+						? null
+						: Math.max(0, headersAt - (requestStartedAt ?? attemptStartedAt)),
 				firstBodyByteMs:
 					firstChunkAt == null
 						? null
@@ -995,6 +1004,7 @@ function createRawResponseTelemetry(attemptStartedAt, now) {
 }
 
 function withRawResponseTelemetry(response, telemetry, options = {}) {
+	telemetry.recordHeaders();
 	if (isEventStreamResponse(response)) {
 		telemetry.enableSseOutcomeObservation(options);
 	}
@@ -3086,7 +3096,7 @@ export function createGuard(options = {}) {
 						return;
 					}
 					attempt += 1;
-					responseTelemetry = createRawResponseTelemetry(now(), now);
+					responseTelemetry = createRawResponseTelemetry(now(), now, context.acceptedAt);
 					upstreamResponse = withRawResponseTelemetry(
 						await fetchUpstream(
 							req,
@@ -3584,7 +3594,7 @@ export function createGuard(options = {}) {
 		let responseTelemetry = null;
 		try {
 			context.ensureBudget();
-			responseTelemetry = createRawResponseTelemetry(now(), now);
+			responseTelemetry = createRawResponseTelemetry(now(), now, context.acceptedAt);
 			const upstreamResponse = withRawResponseTelemetry(
 				await fetchUpstream(
 					req,

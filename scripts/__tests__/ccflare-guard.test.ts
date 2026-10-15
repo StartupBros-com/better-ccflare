@@ -2282,6 +2282,75 @@ describe("source-controlled guard", () => {
 		expect(fetchCalls).toBe(1);
 	});
 
+	test("reports responseHeadersMs null on client abort when upstream never sent headers (#506)", async () => {
+		let upstreamHit!: () => void;
+		const hit = new Promise<void>((resolve) => {
+			upstreamHit = resolve;
+		});
+		const upstreamBase = await listen(
+			http.createServer(() => {
+				upstreamHit();
+				// Never respond: no headers, no body.
+			}),
+		);
+		const { baseUrl, waitForEvent } =
+			await startProductionNodeGuard(upstreamBase);
+		const guardUrl = new URL(baseUrl);
+		const socket = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Content-Length: 2\r\n\r\n" +
+				"{}",
+		);
+		await hit;
+		await Bun.sleep(50);
+		socket.destroy();
+		const clientAbort = await waitForEvent("client_aborted");
+		expect(clientAbort).toMatchObject({
+			rawResponseBytes: 0,
+			firstBodyByteMs: null,
+			responseHeadersMs: null,
+		});
+	});
+
+	test("reports a numeric responseHeadersMs on client abort when upstream sent headers but no body (#506)", async () => {
+		let headersFlushed!: () => void;
+		const flushed = new Promise<void>((resolve) => {
+			headersFlushed = resolve;
+		});
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				res.writeHead(200, { "content-type": "text/event-stream" });
+				res.flushHeaders();
+				headersFlushed();
+				// Headers only: no body chunk is ever written.
+			}),
+		);
+		const { baseUrl, waitForEvent } =
+			await startProductionNodeGuard(upstreamBase);
+		const guardUrl = new URL(baseUrl);
+		const socket = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Content-Length: 2\r\n\r\n" +
+				"{}",
+		);
+		await flushed;
+		await Bun.sleep(100);
+		socket.destroy();
+		const clientAbort = await waitForEvent("client_aborted");
+		// Assert the raw value first: Bun's toMatchObject with an asymmetric
+		// matcher can overwrite the received property in place.
+		expect(typeof clientAbort.responseHeadersMs).toBe("number");
+		expect(clientAbort.responseHeadersMs as number).toBeGreaterThanOrEqual(0);
+		expect(clientAbort).toMatchObject({
+			rawResponseBytes: 0,
+			firstBodyByteMs: null,
+		});
+	});
+
 	test("logs empty raw body telemetry on an upstream error without replaying", async () => {
 		const events: Array<Record<string, unknown>> = [];
 		let fetchCalls = 0;
