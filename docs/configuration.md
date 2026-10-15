@@ -92,7 +92,7 @@ The configuration file is stored at:
 |----------|-------------|----------|
 | `session` | Maintains client-account affinity for session duration, with automatic alignment to Anthropic OAuth usage window resets | Default and recommended - mimics natural usage patterns and optimizes resource utilization |
 | `session-affinity` | Maintains independent client-to-account affinity while preserving automatic failover and session expiry | Multiple concurrent clients that need sticky routing without sharing one global active account |
-| `session-drain-soonest` | Opt-in session-affinity variant. Structural routing classes remain authoritative; within one authorized class, eligible auto-fallback candidates are considered first, then candidates rank by earliest known future all-model weekly reset, priority, and utilization. Unknown or stale resets fail open; explicit retain-owner and route-circuit decisions remain authoritative | OAuth pools where weekly capacity should be consumed before it expires while preserving per-client/lane stickiness |
+| `session-drain-soonest` | Opt-in session-affinity variant. Structural routing classes remain authoritative; within one authorized class, eligible auto-fallback candidates are considered first, then candidates rank by weekly pace band, earliest known future all-model weekly reset, priority, and utilization (see [Drain ordering](load-balancing.md#drain-ordering)). Unknown or stale resets fail open; explicit retain-owner and route-circuit decisions remain authoritative | OAuth pools where weekly capacity should be consumed before it expires while preserving per-client/lane stickiness |
 | `least-used` | Orders available accounts by utilization rather than maintaining sticky OAuth sessions | API-key and compatible-provider pools where per-request spreading is explicitly acceptable |
 
 ### Logging Configuration (Environment Only)
@@ -977,10 +977,13 @@ Response:
 ```
 
 The `session-drain-soonest` strategy is opt-in. It preserves the current
-session-affinity owner and route/profile class; only a fresh assignment or
-account failover can use a known future `weekly_all`/`seven_day` reset to rank
-candidates. Missing, malformed, or past reset telemetry falls back to the
-ordinary affinity ranking.
+session-affinity owner and route/profile class; a fresh assignment or account
+failover ranks candidates by weekly pace band, then a known future
+`weekly_all`/`seven_day` reset. Besides normal failover, an existing owner also
+moves when a same-tier account reaches a higher pace band (Codex owners stay; Anthropic owners get a
+bounded warm-cache hold). See [Drain ordering](load-balancing.md#drain-ordering).
+Missing, malformed, or past reset telemetry falls back to the ordinary affinity
+ranking.
 
 ### Runtime Update Behavior
 

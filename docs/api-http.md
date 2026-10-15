@@ -818,7 +818,7 @@ Update load balancing strategy.
 - `session` - The default account-level session strategy. For providers with session-window tracking (including Anthropic OAuth and Codex OAuth), it keeps requests on the active account for the configured session duration.
 - `least-used` - Orders available accounts by utilization for per-request spreading. It does not preserve OAuth stickiness; use it only where spreading traffic across credentials is safe.
 - `session-affinity` - Assigns each client or affinity lane a sticky account, with automatic failover and expiry, so concurrent clients can spread across the pool while each client keeps prompt-cache locality.
-- `session-drain-soonest` - Opt-in `session-affinity` variant. It preserves an existing owner and only ranks fresh assignments or account failover by the earliest known future all-model weekly reset, then normal priority/utilization tie-breakers. Unknown, malformed, or stale reset telemetry fails open to ordinary affinity ordering.
+- `session-drain-soonest` - Opt-in `session-affinity` variant. It ranks fresh assignments and account failover by weekly pace band, then the earliest known future all-model weekly reset, then normal priority/utilization tie-breakers. Besides normal failover, an existing owner also moves when a same-tier account reaches a higher pace band (Codex owners stay; Anthropic owners get a bounded warm-cache hold). Unknown, malformed, or stale reset telemetry fails open to ordinary affinity ordering. See [Drain ordering](load-balancing.md#drain-ordering).
 
 For Anthropic OAuth traffic, prefer `session`, `session-affinity`, or the opt-in `session-drain-soonest` because they preserve account stickiness. Per-request spreading with `least-used` can create provider anti-abuse patterns.
 
@@ -1479,7 +1479,7 @@ The following strategies are supported:
 - `session` (default) - Account-level sticky sessions for providers with session-window tracking; Anthropic OAuth sessions also align to the provider's `rate_limit_reset` when available.
 - `least-used` - Utilization-first ordering with no sticky OAuth session; appropriate for API-key or compatible-provider pools where per-request spreading is acceptable.
 - `session-affinity` - Per-client or per-lane sticky ownership with automatic failover and session expiry; useful when several concurrent clients need cache-local routing.
-- `session-drain-soonest` (opt-in) - Keeps the current affinity owner. Only a fresh assignment or account failover uses a known future all-model weekly reset to rank candidates; unknown or stale reset data falls back to ordinary affinity ordering.
+- `session-drain-soonest` (opt-in) - Keeps the current affinity owner except on failover, or when a same-tier account reaches a higher weekly pace band (Codex owners stay; Anthropic owners get a bounded warm-cache hold). A fresh assignment or account failover ranks by pace band, then a known future all-model weekly reset; unknown or stale reset data falls back to ordinary affinity ordering.
 
 For Anthropic OAuth accounts, prefer a session-based strategy (`session`, `session-affinity`, or `session-drain-soonest`) to preserve natural account stickiness. `least-used` may spread requests across accounts and can trigger provider anti-abuse controls.
 
@@ -1495,7 +1495,7 @@ For Anthropic OAuth accounts, prefer a session-based strategy (`session`, `sessi
 
 5. **Account Priority System**: Accounts can have different priority values (0-100) which determine their order in load balancing.
 
-6. **Session Affinity**: `session` maintains one active account-level session for providers that require session tracking; `session-affinity` maintains independent client/lane owners. The opt-in `session-drain-soonest` changes only fresh or failover ordering and never replaces a live owner.
+6. **Session Affinity**: `session` maintains one active account-level session for providers that require session tracking; `session-affinity` maintains independent client/lane owners. The opt-in `session-drain-soonest` changes fresh and failover ordering, and can also replace a live owner when a same-tier account reaches a higher weekly pace band (Codex owners stay; Anthropic owners get a bounded warm-cache hold).
 
 7. **Rate Limit Tracking**: Rate limit information is automatically extracted from responses and stored for each account, including reset times and remaining requests.
 
