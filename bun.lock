@@ -14,7 +14,7 @@
     },
     "apps/cli": {
       "name": "better-ccflare",
-      "version": "3.5.44",
+      "version": "3.5.78",
       "bin": {
         "better-ccflare": "dist/better-ccflare",
       },
@@ -69,6 +69,7 @@
         "@better-ccflare/core": "workspace:*",
         "@better-ccflare/core-di": "workspace:*",
         "@better-ccflare/database": "workspace:*",
+        "@better-ccflare/http-api": "workspace:*",
         "@better-ccflare/oauth-flow": "workspace:*",
         "@better-ccflare/providers": "workspace:*",
         "@better-ccflare/types": "workspace:*",
@@ -82,6 +83,7 @@
         "@better-ccflare/core": "workspace:*",
         "@better-ccflare/logger": "workspace:*",
         "@better-ccflare/security": "workspace:*",
+        "@better-ccflare/types": "workspace:*",
       },
     },
     "packages/core": {
