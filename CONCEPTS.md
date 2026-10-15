@@ -94,6 +94,9 @@ happened.
 The first successful provider, account class, and physical-model lane selected for one child
 conversation. Later turns prefer that home for cache and turn continuity; a genuine
 availability failure may establish a new home without remapping the parent or siblings.
+Only `session-affinity` and sticky `session-drain-soonest` keep child homes; the default
+`session` strategy, `least-used`, and `session-drain-soonest-strict` order every child turn
+afresh.
 
 ### Fallback rung
 
