@@ -1,4 +1,8 @@
-import type { WindowTokenAggregate } from "@better-ccflare/core";
+import {
+	LONG_CONTEXT_PROMPT_TOKENS,
+	type LongContextTokenSubset,
+	type WindowTokenAggregate,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type {
 	AgentAttributionSource,
@@ -224,6 +228,26 @@ function parseAdvisorUsage(raw: string): {
 		entries.push(usage);
 	}
 	return { entries, malformed };
+}
+
+/** An aggregate line as `aggregateTokensByModel` builds it: the long-context
+ * subset is always present (optional only on the public type). */
+type LedgerAggregate = WindowTokenAggregate & {
+	longContext: LongContextTokenSubset;
+};
+
+interface TokenAggregateRow {
+	model: string;
+	request_count: number;
+	input_tokens: number;
+	cache_read_input_tokens: number;
+	cache_creation_input_tokens: number;
+	output_tokens: number;
+	long_context_request_count: number;
+	long_context_input_tokens: number;
+	long_context_cache_read_input_tokens: number;
+	long_context_cache_creation_input_tokens: number;
+	long_context_output_tokens: number;
 }
 
 export class RequestRepository extends BaseRepository<RequestData> {
@@ -760,20 +784,30 @@ export class RequestRepository extends BaseRepository<RequestData> {
 	 * NULL token columns (never populated, e.g. an errored request) are
 	 * treated as 0 via COALESCE rather than excluding the row or poisoning
 	 * the SUM with NULL.
+	 *
+	 * Each line also carries `longContext`: the subset of its totals from
+	 * requests whose prompt (input + cache read + cache creation) exceeded
+	 * LONG_CONTEXT_PROMPT_TOKENS (strictly greater; exactly the threshold is
+	 * base tier), so window valuation can apply a long-context tier without
+	 * per-request rows. Always defined on lines this method returns.
+	 *
+	 * Limitation: an `advisor_usage` entry sums a request's advisor
+	 * iterations per model (usage-collector.ts), so its prompt total is the
+	 * only size available. An entry over the threshold may be several
+	 * sub-threshold calls; preserving per-iteration prompt sizes is tracked
+	 * in issue #519.
 	 */
 	async aggregateTokensByModel(
 		accountId: string,
 		fromMs: number,
 		toMs: number,
-	): Promise<WindowTokenAggregate[]> {
-		const rows = await this.query<{
-			model: string;
-			request_count: number;
-			input_tokens: number;
-			cache_read_input_tokens: number;
-			cache_creation_input_tokens: number;
-			output_tokens: number;
-		}>(
+	): Promise<LedgerAggregate[]> {
+		// Interpolated, not bound: LONG_CONTEXT_PROMPT_TOKENS is a trusted
+		// integer module constant, never user input.
+		const promptTokens =
+			"(COALESCE(input_tokens, 0) + COALESCE(cache_read_input_tokens, 0) + COALESCE(cache_creation_input_tokens, 0))";
+		const overThreshold = `${promptTokens} > ${LONG_CONTEXT_PROMPT_TOKENS}`;
+		const rows = await this.query<TokenAggregateRow>(
 			`
 			SELECT
 				COALESCE(model, '') as model,
@@ -781,7 +815,12 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				SUM(COALESCE(input_tokens, 0)) as input_tokens,
 				SUM(COALESCE(cache_read_input_tokens, 0)) as cache_read_input_tokens,
 				SUM(COALESCE(cache_creation_input_tokens, 0)) as cache_creation_input_tokens,
-				SUM(COALESCE(output_tokens, 0)) as output_tokens
+				SUM(COALESCE(output_tokens, 0)) as output_tokens,
+				SUM(CASE WHEN ${overThreshold} THEN 1 ELSE 0 END) as long_context_request_count,
+				SUM(CASE WHEN ${overThreshold} THEN COALESCE(input_tokens, 0) ELSE 0 END) as long_context_input_tokens,
+				SUM(CASE WHEN ${overThreshold} THEN COALESCE(cache_read_input_tokens, 0) ELSE 0 END) as long_context_cache_read_input_tokens,
+				SUM(CASE WHEN ${overThreshold} THEN COALESCE(cache_creation_input_tokens, 0) ELSE 0 END) as long_context_cache_creation_input_tokens,
+				SUM(CASE WHEN ${overThreshold} THEN COALESCE(output_tokens, 0) ELSE 0 END) as long_context_output_tokens
 			FROM requests
 			WHERE account_used = ?
 			  AND path = '/v1/messages'
@@ -808,7 +847,7 @@ export class RequestRepository extends BaseRepository<RequestData> {
 		`,
 			[accountId, fromMs, toMs],
 		);
-		const aggregates = this.mapTokenAggregateRows(rows);
+		const aggregates: LedgerAggregate[] = this.mapTokenAggregateRows(rows);
 		const malformedAdvisorIds: string[] = [];
 		for (const row of advisorRows) {
 			const { entries, malformed } = parseAdvisorUsage(row.advisor_usage);
@@ -824,6 +863,13 @@ export class RequestRepository extends BaseRepository<RequestData> {
 						cacheReadInputTokens: 0,
 						cacheCreationInputTokens: 0,
 						outputTokens: 0,
+						longContext: {
+							requestCount: 0,
+							inputTokens: 0,
+							cacheReadInputTokens: 0,
+							cacheCreationInputTokens: 0,
+							outputTokens: 0,
+						},
 					};
 					aggregates.push(target);
 				}
@@ -831,6 +877,18 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				target.cacheReadInputTokens += usage.cacheReadInputTokens;
 				target.cacheCreationInputTokens += usage.cacheCreationInputTokens;
 				target.outputTokens += usage.outputTokens;
+				const prompt =
+					usage.inputTokens +
+					usage.cacheReadInputTokens +
+					usage.cacheCreationInputTokens;
+				if (prompt > LONG_CONTEXT_PROMPT_TOKENS) {
+					// Advisor entries add no request count anywhere.
+					target.longContext.inputTokens += usage.inputTokens;
+					target.longContext.cacheReadInputTokens += usage.cacheReadInputTokens;
+					target.longContext.cacheCreationInputTokens +=
+						usage.cacheCreationInputTokens;
+					target.longContext.outputTokens += usage.outputTokens;
+				}
 			}
 		}
 		if (malformedAdvisorIds.length > 0) {
@@ -845,16 +903,7 @@ export class RequestRepository extends BaseRepository<RequestData> {
 		return aggregates;
 	}
 
-	private mapTokenAggregateRows(
-		rows: Array<{
-			model: string;
-			request_count: number;
-			input_tokens: number;
-			cache_read_input_tokens: number;
-			cache_creation_input_tokens: number;
-			output_tokens: number;
-		}>,
-	): WindowTokenAggregate[] {
+	private mapTokenAggregateRows(rows: TokenAggregateRow[]): LedgerAggregate[] {
 		return rows.map((row) => ({
 			// Bun.SQL returns COUNT()/SUM() as JavaScript strings on PostgreSQL
 			// (BIGINT stringified, see Bun#22188) — coerce to Number so this
@@ -865,6 +914,15 @@ export class RequestRepository extends BaseRepository<RequestData> {
 			cacheReadInputTokens: Number(row.cache_read_input_tokens) || 0,
 			cacheCreationInputTokens: Number(row.cache_creation_input_tokens) || 0,
 			outputTokens: Number(row.output_tokens) || 0,
+			longContext: {
+				requestCount: Number(row.long_context_request_count) || 0,
+				inputTokens: Number(row.long_context_input_tokens) || 0,
+				cacheReadInputTokens:
+					Number(row.long_context_cache_read_input_tokens) || 0,
+				cacheCreationInputTokens:
+					Number(row.long_context_cache_creation_input_tokens) || 0,
+				outputTokens: Number(row.long_context_output_tokens) || 0,
+			},
 		}));
 	}
 

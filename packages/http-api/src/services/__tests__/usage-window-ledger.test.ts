@@ -408,6 +408,52 @@ describe("UsageWindowLedger", () => {
 		expect(breakdown["unknown-model-zzz"].valueUsd).toBeNull();
 	});
 
+	it("pro-gate r1 P1: close prices a Haiku 5.5 request over 100k prompt tokens at the long-context tier and persists the subset", async () => {
+		const startedAt = Date.parse("2026-09-01T00:00:00Z");
+		const closedAt = startedAt + 7 * DAY_MS;
+		const opened = await dbOps.openUsageWindow({
+			accountId: ACCOUNT_ID,
+			windowKey: "seven_day",
+			startedAt,
+			resetsAt: closedAt,
+			grantType: "natural",
+		});
+		await seedRequest(dbOps, {
+			id: "haiku-long",
+			timestamp: startedAt + 1_000,
+			model: CLAUDE_MODEL_IDS.HAIKU_5_5,
+			inputTokens: 150_000,
+			outputTokens: 10_000,
+		});
+		await seedRequest(dbOps, {
+			id: "haiku-short",
+			timestamp: startedAt + 2_000,
+			model: CLAUDE_MODEL_IDS.HAIKU_5_5,
+			inputTokens: 10_000,
+			outputTokens: 1_000,
+		});
+
+		expect(await ledger.closeAndValue(opened, closedAt)).toBe(true);
+
+		const [w] = await dbOps.listUsageWindows({ accountId: ACCOUNT_ID });
+		expect(w.valueUsd).toBeCloseTo(
+			0.1 + (10_000 * 0.1 + 1_000 * 0.5) / 1e6,
+			10,
+		);
+		expect(w.unpricedTokens).toBe(0);
+		const breakdown = w.modelBreakdown as Record<
+			string,
+			{ valueUsd: number | null; longContext?: unknown }
+		>;
+		expect(breakdown[CLAUDE_MODEL_IDS.HAIKU_5_5].longContext).toEqual({
+			requestCount: 1,
+			inputTokens: 150_000,
+			cacheReadInputTokens: 0,
+			cacheCreationInputTokens: 0,
+			outputTokens: 10_000,
+		});
+	});
+
 	it("closeAndValue uses newStartedAtMs (not closedAtMs) as the aggregation upper bound when provided", async () => {
 		const startedAt = Date.parse("2026-08-15T00:00:00Z");
 		const newStartedAt = startedAt + DAY_MS;
@@ -793,8 +839,16 @@ describe("UsageWindowLedger.revalueStaleClosedWindows", () => {
 	function entry(
 		tokens: { input?: number; cacheRead?: number; output?: number },
 		valueUsd: number | null,
+		longContext?: {
+			requestCount: number;
+			inputTokens: number;
+			cacheReadInputTokens: number;
+			cacheCreationInputTokens: number;
+			outputTokens: number;
+		},
 	) {
 		return {
+			...(longContext ? { longContext } : {}),
 			requestCount: 2,
 			inputTokens: tokens.input ?? 0,
 			cacheReadInputTokens: tokens.cacheRead ?? 0,
@@ -900,6 +954,84 @@ describe("UsageWindowLedger.revalueStaleClosedWindows", () => {
 		expect(after.unpricedTokens).toBe(0);
 		expect(after.projectionVersion).toBe(VALUE_PRICING_VERSION);
 		expect(after.closedAt).toBe(w.resetsAt);
+	});
+
+	const HAIKU = CLAUDE_MODEL_IDS.HAIKU_5_5;
+	const HAIKU_LONG = {
+		requestCount: 1,
+		inputTokens: 150_000,
+		cacheReadInputTokens: 0,
+		cacheCreationInputTokens: 0,
+		outputTokens: 10_000,
+	};
+
+	it("pro-gate r1 P1: revaluation reproduces the long-context tier from the stored subset", async () => {
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: {
+				[HAIKU]: {
+					...entry({ input: 150_000, output: 10_000 }, 0.02, HAIKU_LONG),
+					requestCount: 1,
+				},
+			},
+			valueUsd: 0.02,
+			version: "old-version",
+		});
+		const summary = await new UsageWindowLedger(
+			dbOps,
+		).revalueStaleClosedWindows();
+		expect(summary).toMatchObject({ stamped: 1, valueChanged: 1, skipped: 0 });
+		const after = await reload(w.id);
+		expect(after.valueUsd).toBeCloseTo(0.1, 10);
+		expect(after.unpricedTokens).toBe(0);
+	});
+
+	it("pro-gate r1 P1: revaluing a breakdown stored before the split prices a tiered model as unpriced, not at the base tier", async () => {
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: {
+				[HAIKU]: {
+					...entry({ input: 150_000, output: 10_000 }, 0.02),
+					requestCount: 1,
+				},
+			},
+			valueUsd: 0.02,
+			version: "old-version",
+		});
+		const summary = await new UsageWindowLedger(
+			dbOps,
+		).revalueStaleClosedWindows();
+		expect(summary).toMatchObject({ stamped: 1, skipped: 0 });
+		const after = await reload(w.id);
+		expect(after.valueUsd).toBe(0);
+		expect(after.unpricedTokens).toBe(160_000);
+		const breakdown = after.modelBreakdown as Record<
+			string,
+			{ valueUsd: number | null }
+		>;
+		expect(breakdown[HAIKU].valueUsd).toBeNull();
+	});
+
+	it("pro-gate r1 P1: revaluation rejects a malformed longContext as a malformed breakdown", async () => {
+		const w = await seedClosed({
+			resetsAt: STARTED_AT + 7 * DAY_MS,
+			breakdown: {
+				[HAIKU]: {
+					...entry({ input: 150_000, output: 10_000 }, 0.02),
+					requestCount: 1,
+					longContext: "x",
+				} as unknown as ReturnType<typeof entry>,
+			},
+			valueUsd: 0.02,
+			version: "old-version",
+		});
+		const summary = await new UsageWindowLedger(
+			dbOps,
+		).revalueStaleClosedWindows();
+		expect(summary).toMatchObject({ scanned: 1, stamped: 0, skipped: 1 });
+		const after = await reload(w.id);
+		expect(after.valueUsd).toBe(0.02);
+		expect(after.projectionVersion).toBe("old-version");
 	});
 
 	it("leaves a window already at the current version untouched", async () => {

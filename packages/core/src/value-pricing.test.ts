@@ -33,6 +33,118 @@ const testEras: ListPriceEra[] = [
 	},
 ];
 
+const HAIKU = CLAUDE_MODEL_IDS.HAIKU_5_5;
+const LC_AT_MS = Date.parse("2026-10-10T00:00:00Z");
+const LC_NO_TIER_MODEL = "test-no-longcontext-model";
+const LC_TIER_MODEL = "test-longcontext-no-write-rate-model";
+
+describe("priceTokensAtListPrice long-context tier", () => {
+	afterEach(() => {
+		delete LIST_PRICE_ERAS[LC_NO_TIER_MODEL];
+		delete LIST_PRICE_ERAS[LC_TIER_MODEL];
+	});
+
+	it("pro-gate r1 P1: the Haiku 5.5 era carries the published long-context rates", () => {
+		expect(LIST_PRICE_ERAS[HAIKU][0].longContext).toEqual({
+			inputPerM: 0.5,
+			cacheReadPerM: 0.05,
+			cacheCreationPerM: 0.625,
+			outputPerM: 2.5,
+		});
+	});
+
+	it("pro-gate r1 P1: prices a Haiku 5.5 request over 100k prompt tokens at the long-context tier", () => {
+		const tokens = { inputTokens: 150_000, outputTokens: 10_000 };
+		expect(priceTokensAtListPrice(HAIKU, LC_AT_MS, tokens, tokens)).toBeCloseTo(
+			0.1,
+			10,
+		);
+	});
+
+	it("pro-gate r1 P1: prices a mixed window as base portion plus long portion", () => {
+		const total = priceTokensAtListPrice(
+			HAIKU,
+			LC_AT_MS,
+			{ inputTokens: 200_000, outputTokens: 20_000 },
+			{ inputTokens: 150_000, outputTokens: 10_000 },
+		);
+		expect(total).toBeCloseTo(0.11, 10);
+	});
+
+	it("pro-gate r1 P1: returns null for a tiered model when the split is unknown", () => {
+		expect(
+			priceTokensAtListPrice(HAIKU, LC_AT_MS, {
+				inputTokens: 150_000,
+				outputTokens: 10_000,
+			}),
+		).toBeNull();
+	});
+
+	it("pro-gate r1 P1: returns null when a long-context subset field exceeds its total", () => {
+		expect(
+			priceTokensAtListPrice(
+				HAIKU,
+				LC_AT_MS,
+				{ inputTokens: 100, outputTokens: 10 },
+				{ inputTokens: 101, outputTokens: 10 },
+			),
+		).toBeNull();
+	});
+
+	it("pro-gate r1 P1: ignores the subset for an era without long-context rates", () => {
+		LIST_PRICE_ERAS[LC_NO_TIER_MODEL] = [
+			{
+				sinceMs: ERA1_SINCE_MS,
+				inputPerM: 1,
+				cacheReadPerM: 0.1,
+				outputPerM: 5,
+			},
+		];
+		const tokens = { inputTokens: 200_000, outputTokens: 20_000 };
+		const expected = (200_000 * 1 + 20_000 * 5) / 1e6;
+		expect(
+			priceTokensAtListPrice(LC_NO_TIER_MODEL, LC_AT_MS, tokens, {
+				inputTokens: 150_000,
+				outputTokens: 10_000,
+			}),
+		).toBeCloseTo(expected, 10);
+		expect(
+			priceTokensAtListPrice(LC_NO_TIER_MODEL, LC_AT_MS, tokens),
+		).toBeCloseTo(expected, 10);
+	});
+
+	it("pro-gate r1 P1: applies the missing-cache-creation-rate rule per portion", () => {
+		LIST_PRICE_ERAS[LC_TIER_MODEL] = [
+			{
+				sinceMs: ERA1_SINCE_MS,
+				inputPerM: 1,
+				cacheReadPerM: 0.1,
+				cacheCreationPerM: 2,
+				outputPerM: 5,
+				longContext: { inputPerM: 4, cacheReadPerM: 0.4, outputPerM: 20 },
+			},
+		];
+		// Long cache-creation tokens, no long rate: loud null.
+		expect(
+			priceTokensAtListPrice(
+				LC_TIER_MODEL,
+				LC_AT_MS,
+				{ inputTokens: 10, cacheCreationInputTokens: 500 },
+				{ cacheCreationInputTokens: 100 },
+			),
+		).toBeNull();
+		// Only base cache-creation tokens (base rate present): priced.
+		expect(
+			priceTokensAtListPrice(
+				LC_TIER_MODEL,
+				LC_AT_MS,
+				{ inputTokens: 110_000, cacheCreationInputTokens: 500 },
+				{ inputTokens: 100_000 },
+			),
+		).toBeCloseTo((10_000 * 1 + 500 * 2 + 100_000 * 4) / 1e6, 10);
+	});
+});
+
 describe("priceTokensAtListPrice", () => {
 	it("advances VALUE_PRICING_VERSION for the Haiku 5.5 price table", () => {
 		expect(VALUE_PRICING_VERSION).toBe("2026-10-15.1");
@@ -44,12 +156,18 @@ describe("priceTokensAtListPrice", () => {
 		const afterFloorMs = Date.parse("2026-06-15T00:00:00Z");
 		const unpriced = Object.values(CLAUDE_MODEL_IDS).filter(
 			(modelId) =>
-				priceTokensAtListPrice(modelId, afterFloorMs, {
-					inputTokens: 1,
-					outputTokens: 1,
-					cacheReadInputTokens: 1,
-					cacheCreationInputTokens: 1,
-				}) === null,
+				priceTokensAtListPrice(
+					modelId,
+					afterFloorMs,
+					{
+						inputTokens: 1,
+						outputTokens: 1,
+						cacheReadInputTokens: 1,
+						cacheCreationInputTokens: 1,
+					},
+					// Empty subset: no request crossed a long-context tier.
+					{},
+				) === null,
 		);
 
 		expect(unpriced).toEqual([]);
@@ -262,6 +380,7 @@ describe("priceTokensAtListPrice", () => {
 					cacheCreationInputTokens: 1_000_000,
 					outputTokens: 1_000_000,
 				},
+				{},
 			);
 			expect(result).toBeCloseTo(0.1 + 0.5 + 0.01 + 0.125, 10);
 		});

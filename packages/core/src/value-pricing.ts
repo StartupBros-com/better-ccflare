@@ -42,6 +42,29 @@ import type { TokenBreakdown } from "./pricing";
 export const VALUE_PRICING_VERSION = "2026-10-15.1";
 
 /**
+ * Prompt-token threshold (input + cache read + cache creation, per request)
+ * above which a model with `longContext` rates bills the WHOLE request at
+ * those rates — Anthropic's published Haiku 5.5 tier.
+ * `RequestRepository.aggregateTokensByModel` splits each model's totals at
+ * this threshold so window valuation can apply a tier without per-request
+ * rows. It is one global threshold: a future model whose tier starts
+ * elsewhere needs the split extended, not a second constant.
+ */
+export const LONG_CONTEXT_PROMPT_TOKENS = 100_000;
+
+/**
+ * Long-context rates, in dollars per 1,000,000 tokens. Same meaning as the
+ * owning era's own fields, including the "undefined `cacheCreationPerM` =
+ * unknown rate" rule.
+ */
+export interface LongContextListPrice {
+	inputPerM: number;
+	cacheReadPerM: number;
+	cacheCreationPerM?: number;
+	outputPerM: number;
+}
+
+/**
  * One dated list-price era for a single model, in dollars per 1,000,000
  * tokens (matching the models.dev / pricing.ts convention).
  */
@@ -62,6 +85,11 @@ export interface ListPriceEra {
 	 */
 	cacheCreationPerM?: number;
 	outputPerM: number;
+	/**
+	 * Rates for requests whose prompt exceeded `LONG_CONTEXT_PROMPT_TOKENS`;
+	 * omitted for models with no published long-context tier.
+	 */
+	longContext?: LongContextListPrice;
 }
 
 /**
@@ -155,11 +183,12 @@ export const LIST_PRICE_ERAS: Record<string, ListPriceEra[]> = {
 			cacheCreationPerM: 0.125,
 			outputPerM: 0.5,
 			// source: https://platform.claude.com/docs/en/about-claude/pricing
-			// Base tier only: prompts over 100,000 tokens bill the whole request at
-			// 0.5 / 0.05 / 0.625 / 2.5. That tier is not representable here because
-			// window valuation prices per-model aggregates (valueWindowAggregates in
-			// window-valuation.ts), so long-context Haiku 5.5 requests are valued at
-			// the base tier (understated).
+			longContext: {
+				inputPerM: 0.5,
+				cacheReadPerM: 0.05,
+				cacheCreationPerM: 0.625,
+				outputPerM: 2.5,
+			},
 		},
 	],
 	[CLAUDE_MODEL_IDS.SONNET_4]: [
@@ -342,14 +371,26 @@ function selectEra(
  * Price a token breakdown at the list price in effect for `model` at
  * `atMs`, in dollars.
  *
+ * `tokens` are the FULL totals. `longContextTokens` is the subset of
+ * `tokens` contributed by requests whose prompt exceeded
+ * `LONG_CONTEXT_PROMPT_TOKENS`; `undefined` means the split is unknown.
+ * When the selected era has no `longContext` rates the subset is ignored
+ * (its tokens are already inside `tokens`). When it does, the subset is
+ * priced at the long-context rates and the remainder at the base rates.
+ *
  * Returns `null` — never `0` — when:
  * - the model has no era table at all (unknown model), or
  * - `atMs` precedes every era's `sinceMs` (unknown era for a known model), or
- * - `tokens.cacheCreationInputTokens` is positive but the selected era has
- *   no `cacheCreationPerM` rate. A partial total that silently drops
- *   cache-creation spend would understate the window's real value; the
- *   caller must record this as unpriced rather than getting a number that
- *   looks complete but isn't.
+ * - cache-creation tokens are positive but the rate that applies to them
+ *   (base for the base portion, `longContext` for the long portion) is
+ *   undefined. A partial total that silently drops cache-creation spend
+ *   would understate the window's real value; the caller must record this
+ *   as unpriced rather than getting a number that looks complete but isn't, or
+ * - the era has `longContext` rates and `longContextTokens` is `undefined`
+ *   (the caller cannot tell which requests crossed the tier, and a
+ *   base-tier number would look complete while understating), or
+ * - the era has `longContext` rates and any `longContextTokens` field
+ *   exceeds its `tokens` counterpart (malformed split).
  *
  * A caller that gets `null` should record the corresponding tokens as
  * `unpriced_tokens` on the window row rather than treating the request as
@@ -359,6 +400,7 @@ export function priceTokensAtListPrice(
 	model: string,
 	atMs: number,
 	tokens: TokenBreakdown,
+	longContextTokens?: TokenBreakdown,
 ): number | null {
 	const eras = LIST_PRICE_ERAS[model];
 	if (!eras || eras.length === 0) return null;
@@ -366,18 +408,42 @@ export function priceTokensAtListPrice(
 	const era = selectEra(eras, atMs);
 	if (!era) return null;
 
-	const cacheCreationTokens = tokens.cacheCreationInputTokens ?? 0;
-	if (cacheCreationTokens > 0 && era.cacheCreationPerM === undefined) {
-		return null;
-	}
+	const longRates = era.longContext;
+	if (longRates && longContextTokens === undefined) return null;
+
+	const longIn = longRates ? (longContextTokens?.inputTokens ?? 0) : 0;
+	const longRead = longRates
+		? (longContextTokens?.cacheReadInputTokens ?? 0)
+		: 0;
+	const longWrite = longRates
+		? (longContextTokens?.cacheCreationInputTokens ?? 0)
+		: 0;
+	const longOut = longRates ? (longContextTokens?.outputTokens ?? 0) : 0;
+
+	const baseIn = (tokens.inputTokens ?? 0) - longIn;
+	const baseRead = (tokens.cacheReadInputTokens ?? 0) - longRead;
+	const baseWrite = (tokens.cacheCreationInputTokens ?? 0) - longWrite;
+	const baseOut = (tokens.outputTokens ?? 0) - longOut;
+	if (baseIn < 0 || baseRead < 0 || baseWrite < 0 || baseOut < 0) return null;
+
+	if (baseWrite > 0 && era.cacheCreationPerM === undefined) return null;
+	if (longWrite > 0 && longRates?.cacheCreationPerM === undefined) return null;
 
 	let total = 0;
-	total += ((tokens.inputTokens ?? 0) * era.inputPerM) / 1_000_000;
-	total += ((tokens.cacheReadInputTokens ?? 0) * era.cacheReadPerM) / 1_000_000;
+	total += (baseIn * era.inputPerM) / 1_000_000;
+	total += (baseRead * era.cacheReadPerM) / 1_000_000;
 	if (era.cacheCreationPerM !== undefined) {
-		total += (cacheCreationTokens * era.cacheCreationPerM) / 1_000_000;
+		total += (baseWrite * era.cacheCreationPerM) / 1_000_000;
 	}
-	total += ((tokens.outputTokens ?? 0) * era.outputPerM) / 1_000_000;
+	total += (baseOut * era.outputPerM) / 1_000_000;
+	if (longRates) {
+		total += (longIn * longRates.inputPerM) / 1_000_000;
+		total += (longRead * longRates.cacheReadPerM) / 1_000_000;
+		if (longRates.cacheCreationPerM !== undefined) {
+			total += (longWrite * longRates.cacheCreationPerM) / 1_000_000;
+		}
+		total += (longOut * longRates.outputPerM) / 1_000_000;
+	}
 
 	return total;
 }

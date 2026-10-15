@@ -25,6 +25,14 @@ interface SeedRow {
 	outputTokens?: number | null;
 }
 
+const NO_LONG_CONTEXT = {
+	requestCount: 0,
+	inputTokens: 0,
+	cacheReadInputTokens: 0,
+	cacheCreationInputTokens: 0,
+	outputTokens: 0,
+};
+
 function seed(db: Database, row: SeedRow): void {
 	db.run(
 		`INSERT INTO requests (
@@ -72,6 +80,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheReadInputTokens: 20,
 				cacheCreationInputTokens: 10,
 				outputTokens: 100,
+				longContext: NO_LONG_CONTEXT,
 			},
 		]);
 	});
@@ -154,8 +163,63 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheReadInputTokens: 0,
 				cacheCreationInputTokens: 0,
 				outputTokens: 0,
+				longContext: NO_LONG_CONTEXT,
 			},
 		]);
+	});
+
+	it("pro-gate r1 P1: splits requests over 100,000 prompt tokens into longContext (exactly 100,000 stays base)", async () => {
+		seed(db, {
+			id: "at-threshold",
+			timestamp: 1000,
+			inputTokens: 60_000,
+			cacheReadInputTokens: 39_000,
+			cacheCreationInputTokens: 1_000,
+			outputTokens: 7,
+		});
+		let rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+		expect(rows[0].longContext).toEqual(NO_LONG_CONTEXT);
+
+		seed(db, {
+			id: "over-threshold",
+			timestamp: 2000,
+			inputTokens: 60_000,
+			cacheReadInputTokens: 39_000,
+			cacheCreationInputTokens: 1_001,
+			outputTokens: 9,
+		});
+		rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+		expect(rows).toEqual([
+			{
+				model: "claude-sonnet-5",
+				requestCount: 2,
+				inputTokens: 120_000,
+				cacheReadInputTokens: 78_000,
+				cacheCreationInputTokens: 2_001,
+				outputTokens: 16,
+				longContext: {
+					requestCount: 1,
+					inputTokens: 60_000,
+					cacheReadInputTokens: 39_000,
+					cacheCreationInputTokens: 1_001,
+					outputTokens: 9,
+				},
+			},
+		]);
+	});
+
+	it("pro-gate r1 P1: NULL token columns count as prompt 0 and stay out of longContext", async () => {
+		seed(db, {
+			id: "nulls",
+			timestamp: 1000,
+			inputTokens: null,
+			cacheReadInputTokens: null,
+			cacheCreationInputTokens: null,
+			outputTokens: 500_000,
+		});
+		const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+		expect(rows[0].outputTokens).toBe(500_000);
+		expect(rows[0].longContext).toEqual(NO_LONG_CONTEXT);
 	});
 
 	it("returns an empty array when nothing matches", async () => {
@@ -203,6 +267,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheReadInputTokens: 10,
 				cacheCreationInputTokens: 5,
 				outputTokens: 50,
+				longContext: NO_LONG_CONTEXT,
 			});
 			expect(byModel["claude-opus-4"]).toEqual({
 				model: "claude-opus-4",
@@ -211,6 +276,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheReadInputTokens: 2,
 				cacheCreationInputTokens: 1,
 				outputTokens: 3,
+				longContext: NO_LONG_CONTEXT,
 			});
 		});
 
@@ -227,6 +293,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheReadInputTokens: 12,
 				cacheCreationInputTokens: 6,
 				outputTokens: 53,
+				longContext: NO_LONG_CONTEXT,
 			});
 		});
 
@@ -252,6 +319,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheReadInputTokens: 4,
 				cacheCreationInputTokens: 2,
 				outputTokens: 6,
+				longContext: NO_LONG_CONTEXT,
 			});
 			expect(byModel["claude-haiku-4"]).toEqual({
 				model: "claude-haiku-4",
@@ -260,6 +328,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheReadInputTokens: 0,
 				cacheCreationInputTokens: 8,
 				outputTokens: 6,
+				longContext: NO_LONG_CONTEXT,
 			});
 		});
 
@@ -274,6 +343,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheReadInputTokens: 2,
 				cacheCreationInputTokens: 1,
 				outputTokens: 3,
+				longContext: NO_LONG_CONTEXT,
 			});
 		});
 
@@ -307,6 +377,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheReadInputTokens: 2 + 2 + 2,
 				cacheCreationInputTokens: 1 + 1 + 1,
 				outputTokens: 3 + 3,
+				longContext: NO_LONG_CONTEXT,
 			});
 			expect(warnings).toHaveLength(1);
 			expect(warnings[0]?.data).toEqual({
@@ -327,8 +398,47 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 					cacheReadInputTokens: 10,
 					cacheCreationInputTokens: 5,
 					outputTokens: 50,
+					longContext: NO_LONG_CONTEXT,
 				},
 			]);
+		});
+
+		it("pro-gate r1 P1: an advisor entry over the prompt threshold joins longContext without a request count; one at the threshold does not", async () => {
+			seedAdvisor("a1", [
+				{
+					model: "claude-haiku-5-5",
+					inputTokens: 90_000,
+					cacheReadInputTokens: 10_000,
+					cacheCreationInputTokens: 1,
+					outputTokens: 4,
+				},
+				{
+					model: "claude-opus-4",
+					inputTokens: 60_000,
+					cacheReadInputTokens: 40_000,
+					cacheCreationInputTokens: 0,
+					outputTokens: 5,
+				},
+			]);
+			const rows = await repo.aggregateTokensByModel("acc1", 0, 5000);
+			const byModel = Object.fromEntries(rows.map((r) => [r.model, r]));
+			expect(byModel["claude-haiku-5-5"]).toEqual({
+				model: "claude-haiku-5-5",
+				requestCount: 0,
+				inputTokens: 90_000,
+				cacheReadInputTokens: 10_000,
+				cacheCreationInputTokens: 1,
+				outputTokens: 4,
+				longContext: {
+					requestCount: 0,
+					inputTokens: 90_000,
+					cacheReadInputTokens: 10_000,
+					cacheCreationInputTokens: 1,
+					outputTokens: 4,
+				},
+			});
+			expect(byModel["claude-opus-4"]?.inputTokens).toBe(60_000);
+			expect(byModel["claude-opus-4"]?.longContext).toEqual(NO_LONG_CONTEXT);
 		});
 
 		it("excludes advisor tokens on non-plan rows", async () => {
@@ -398,6 +508,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheReadInputTokens: 33,
 				cacheCreationInputTokens: 44,
 				outputTokens: 22,
+				longContext: NO_LONG_CONTEXT,
 			});
 			expect(byModel[""]).toEqual({
 				model: "",
@@ -406,6 +517,7 @@ describe("RequestRepository.aggregateTokensByModel", () => {
 				cacheReadInputTokens: 3,
 				cacheCreationInputTokens: 4,
 				outputTokens: 2,
+				longContext: NO_LONG_CONTEXT,
 			});
 		});
 
