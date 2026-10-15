@@ -150,6 +150,16 @@ are refused once a plan window reads full even while the provider still reports 
 allowed: the provider's allowed flag can lag its usage percentage, and the request that
 crosses the line is billed to credits.
 
+### Affinity lane
+
+The unit to which session affinity pins an owner account: one client session's traffic for
+one protocol, request path, model and set of requested beta features, separated further by
+route profile when one applies.
+
+One session and model can run several lanes at once, each with its own owner, so a
+session's successive requests can alternate accounts while no owner moves. It is unrelated to
+the quality lane, the physical-model lane, and the hosted and native web-search lanes.
+
 ### Drain-soonest
 
 An account order that spends first the multi-day allowance most at risk of expiring unused:
@@ -230,15 +240,17 @@ logical-final usage and physical-attempt usage are not interchangeable populatio
 
 ### Session remap
 
-A sequential change of the account serving one client session and model, made without a
-failover and after the session's earlier requests have finished; the next request on the new
-account must rewrite the whole cached prompt prefix.
+A change of the account serving a conversation's next turn, judged against that
+conversation's own previous turn rather than the session's previous request, made without a
+failover; the new account must rewrite the whole cached prompt prefix.
 
-A remap is distinct from a failover (a move forced by a failed attempt)
-and from concurrent spread (parallel requests of one session landing on different accounts at
-the same moment). A raw count of same-session account changes is mostly concurrent spread,
-so remap cost is measured on the sequential population only, against a baseline drawn from
-same-account sequential requests after the same idle gap.
+A remap is distinct from a failover (a move forced by a failed attempt), from concurrent
+spread (parallel requests of one session landing on different accounts at the same moment),
+and from lane interleaving (successive requests of different affinity lanes of one session,
+each served by its own owner). Raw same-session account changes are mostly concurrent spread,
+and sequential changes within one session and model are mostly lane interleaving. So remap
+cost is measured only after matching each request to the conversation turn it continues,
+against a baseline drawn from same-account sequential requests after the same idle gap.
 
 ### Physical-attempt usage
 
