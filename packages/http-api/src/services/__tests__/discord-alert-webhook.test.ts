@@ -126,6 +126,15 @@ describe("buildDiscordAlertContent / buildDiscordWebhookBody", () => {
 		expect(content).not.toContain("80");
 	});
 
+	it("renders a named account as 'account <name>' on the Affected line", () => {
+		const content = buildDiscordAlertContent({
+			...BASE_ALERT,
+			type: "model_routing_drift",
+			account: "work-pro",
+		});
+		expect(content).toContain("account work-pro");
+	});
+
 	it("regression #471: confirmed exhausted capacity is not rendered as a projection", () => {
 		const content = buildDiscordAlertContent({
 			...BASE_ALERT,
