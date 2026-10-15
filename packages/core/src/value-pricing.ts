@@ -39,7 +39,7 @@ import type { TokenBreakdown } from "./pricing";
  * (UsageWindowLedger.revalueStaleClosedWindows), so history follows the
  * current rates instead of keeping the price it was closed at.
  */
-export const VALUE_PRICING_VERSION = "2026-09-29.2";
+export const VALUE_PRICING_VERSION = "2026-10-15.1";
 
 /**
  * One dated list-price era for a single model, in dollars per 1,000,000
@@ -144,6 +144,22 @@ export const LIST_PRICE_ERAS: Record<string, ListPriceEra[]> = {
 			cacheCreationPerM: 1.25,
 			outputPerM: 5,
 			// source: BUNDLED_PRICING[anthropic].models[CLAUDE_MODEL_IDS.HAIKU_4_5].cost in packages/core/src/pricing.ts
+		},
+	],
+	[CLAUDE_MODEL_IDS.HAIKU_5_5]: [
+		{
+			sinceMs: INITIAL_ERA_FLOOR_MS,
+			inputPerM: 0.1,
+			cacheReadPerM: 0.01,
+			// Published 5-minute write rate applied to aggregate cache creation until TTL buckets are preserved end-to-end.
+			cacheCreationPerM: 0.125,
+			outputPerM: 0.5,
+			// source: https://platform.claude.com/docs/en/about-claude/pricing
+			// Base tier only: prompts over 100,000 tokens bill the whole request at
+			// 0.5 / 0.05 / 0.625 / 2.5. That tier is not representable here because
+			// window valuation prices per-model aggregates (valueWindowAggregates in
+			// window-valuation.ts), so long-context Haiku 5.5 requests are valued at
+			// the base tier (understated).
 		},
 	],
 	[CLAUDE_MODEL_IDS.SONNET_4]: [

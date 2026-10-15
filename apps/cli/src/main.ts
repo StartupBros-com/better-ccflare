@@ -1488,6 +1488,7 @@ async function main() {
 				"sonnet-4.6": CLAUDE_MODEL_IDS.SONNET_4_6,
 				"sonnet-5": CLAUDE_MODEL_IDS.SONNET_5,
 				"sonnet-5.5": CLAUDE_MODEL_IDS.SONNET_5_5,
+				"haiku-5.5": CLAUDE_MODEL_IDS.HAIKU_5_5,
 			};
 
 			const fullModel = modelMap[parsed.setModel];

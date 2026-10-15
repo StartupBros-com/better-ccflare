@@ -617,6 +617,53 @@ describe("getModelRates", () => {
 		});
 	});
 
+	it("returns the Haiku 5.5 bundled base rates published at launch", async () => {
+		const rates = await withDiskCache(null, () =>
+			getModelRates("claude-haiku-5-5"),
+		);
+
+		expect(rates).toEqual({
+			input: 0.1,
+			output: 0.5,
+			cacheRead: 0.01,
+			cacheWrite: 0.125,
+		});
+	});
+
+	it("prices Haiku 5.5 at the base rate at exactly 100,000 prompt tokens and the whole request at the tier above it", async () => {
+		const [atThreshold, overThreshold] = await withDiskCache(null, async () => [
+			// prompt = input + cache reads + cache writes = 100,000
+			await estimateCostUSD("claude-haiku-5-5", {
+				inputTokens: 40_000,
+				cacheReadInputTokens: 50_000,
+				cacheCreationInputTokens: 10_000,
+				outputTokens: 1_000,
+			}),
+			// prompt = 100,001
+			await estimateCostUSD("claude-haiku-5-5", {
+				inputTokens: 40_001,
+				cacheReadInputTokens: 50_000,
+				cacheCreationInputTokens: 10_000,
+				outputTokens: 1_000,
+			}),
+		]);
+
+		expect(atThreshold).toBeCloseTo(
+			40_000 * (0.1 / 1_000_000) +
+				50_000 * (0.01 / 1_000_000) +
+				10_000 * (0.125 / 1_000_000) +
+				1_000 * (0.5 / 1_000_000),
+			10,
+		);
+		expect(overThreshold).toBeCloseTo(
+			40_001 * (0.5 / 1_000_000) +
+				50_000 * (0.05 / 1_000_000) +
+				10_000 * (0.625 / 1_000_000) +
+				1_000 * (2.5 / 1_000_000),
+			10,
+		);
+	});
+
 	it("has complete bundled rates for every bundled Claude model id", async () => {
 		// A missing cache_write rate makes estimateCostUSD throw internally and
 		// record the whole request as 0, so every kind must be present.

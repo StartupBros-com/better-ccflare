@@ -34,8 +34,8 @@ const testEras: ListPriceEra[] = [
 ];
 
 describe("priceTokensAtListPrice", () => {
-	it("advances VALUE_PRICING_VERSION for the corrected Sonnet 5 price table", () => {
-		expect(VALUE_PRICING_VERSION).toBe("2026-09-29.2");
+	it("advances VALUE_PRICING_VERSION for the Haiku 5.5 price table", () => {
+		expect(VALUE_PRICING_VERSION).toBe("2026-10-15.1");
 	});
 
 	it("has a list-price era for every bundled Claude model id", () => {
@@ -250,6 +250,20 @@ describe("priceTokensAtListPrice", () => {
 				},
 			);
 			expect(result).toBeCloseTo(2 + 10 + 0.2 + 2.5, 10);
+		});
+
+		it("prices Haiku 5.5 at Anthropic's published launch rates", () => {
+			const result = priceTokensAtListPrice(
+				CLAUDE_MODEL_IDS.HAIKU_5_5,
+				AFTER_FLOOR_MS,
+				{
+					inputTokens: 1_000_000,
+					cacheReadInputTokens: 1_000_000,
+					cacheCreationInputTokens: 1_000_000,
+					outputTokens: 1_000_000,
+				},
+			);
+			expect(result).toBeCloseTo(0.1 + 0.5 + 0.01 + 0.125, 10);
 		});
 
 		it("estimates Fable 5.1 aggregate cache creation at its published 5-minute write rate", () => {

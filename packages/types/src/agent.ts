@@ -84,6 +84,7 @@ export function isAllowedModel(model: string): model is AllowedModel {
 // Export commonly used models for defaults (not for validation)
 export const COMMON_MODELS = [
 	CLAUDE_MODEL_IDS.HAIKU_4_5,
+	CLAUDE_MODEL_IDS.HAIKU_5_5,
 	CLAUDE_MODEL_IDS.OPUS_4,
 	CLAUDE_MODEL_IDS.OPUS_4_1,
 	CLAUDE_MODEL_IDS.OPUS_4_5,
