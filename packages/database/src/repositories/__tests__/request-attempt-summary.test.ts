@@ -222,3 +222,145 @@ test("PostgreSQL fresh/upgrade schema and adapter writes preserve the bounded fi
 			`${field} = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.${field}`,
 		);
 });
+
+const ROUTE_COLUMNS = [
+	"route_profile_id",
+	"requested_route_model",
+	"routed_provider",
+	"routed_model",
+	"route_fallback_rung",
+	"route_home_action",
+	"route_repin_reason",
+	"route_candidate_id",
+] as const;
+
+const provenanceA = {
+	profileId: "profile-a",
+	requestedModel: "requested-a",
+	routedProvider: "provider-a",
+	routedModel: "model-a",
+	fallbackRung: "profile_root_model",
+	homeAction: "repinned",
+	repinReason: "route_circuit_open",
+	candidateId: "candidate-a",
+} as const;
+const provenanceB = {
+	profileId: "profile-b",
+	requestedModel: "requested-b",
+	routedProvider: "provider-b",
+	routedModel: "model-b",
+	fallbackRung: "global_requested_model",
+	homeAction: "initial_commit",
+	repinReason: "hard_exclusion",
+	candidateId: "candidate-b",
+} as const;
+const expectedA = {
+	route_profile_id: "profile-a",
+	requested_route_model: "requested-a",
+	routed_provider: "provider-a",
+	routed_model: "model-a",
+	route_fallback_rung: "profile_root_model",
+	route_home_action: "repinned",
+	route_repin_reason: "route_circuit_open",
+	route_candidate_id: "candidate-a",
+};
+const expectedB = {
+	route_profile_id: "profile-b",
+	requested_route_model: "requested-b",
+	routed_provider: "provider-b",
+	routed_model: "model-b",
+	route_fallback_rung: "global_requested_model",
+	route_home_action: "initial_commit",
+	route_repin_reason: "hard_exclusion",
+	route_candidate_id: "candidate-b",
+};
+
+function readRouteColumns(db: Database, id: string) {
+	return db
+		.query(`SELECT ${ROUTE_COLUMNS.join(", ")} FROM requests WHERE id = ?`)
+		.get(id) as Record<string, string | null>;
+}
+
+test("route provenance freezes on an attempt-summary row: a re-save with different provenance keeps the first", async () => {
+	const db = new Database(":memory:");
+	try {
+		ensureSchema(db);
+		runMigrations(db);
+		const repo = new RequestRepository(new BunSqlAdapter(db));
+		await repo.save({
+			...base,
+			routingAttemptSummary: summary,
+			routeProvenance: provenanceA,
+		});
+		expect(readRouteColumns(db, base.id)).toEqual(expectedA);
+		await repo.save({
+			...base,
+			routingAttemptSummary: summary,
+			routeProvenance: provenanceB,
+		});
+		expect(readRouteColumns(db, base.id)).toEqual(expectedA);
+	} finally {
+		db.close();
+	}
+});
+
+test("route provenance is preserved when a re-save omits it", async () => {
+	const db = new Database(":memory:");
+	try {
+		ensureSchema(db);
+		runMigrations(db);
+		const repo = new RequestRepository(new BunSqlAdapter(db));
+		await repo.save({
+			...base,
+			routingAttemptSummary: summary,
+			routeProvenance: provenanceA,
+		});
+		await repo.save({ ...base, routingAttemptSummary: summary });
+		expect(readRouteColumns(db, base.id)).toEqual(expectedA);
+		// Legacy row (no attempt summary): omitted provenance is still preserved,
+		// and a later non-null provenance replaces it.
+		await repo.save({
+			...base,
+			id: "legacy-route",
+			routeProvenance: provenanceA,
+		});
+		await repo.save({ ...base, id: "legacy-route" });
+		expect(readRouteColumns(db, "legacy-route")).toEqual(expectedA);
+		await repo.save({
+			...base,
+			id: "legacy-route",
+			routeProvenance: provenanceB,
+		});
+		expect(readRouteColumns(db, "legacy-route")).toEqual(expectedB);
+	} finally {
+		db.close();
+	}
+});
+
+test("PostgreSQL upsert freezes every route provenance column behind the attempt-summary CASE", async () => {
+	let lastWrite: { sql: string; params: unknown[] } | null = null;
+	const adapter = {
+		run: async (sql: string, params: unknown[]) => {
+			lastWrite = { sql, params };
+		},
+	} as unknown as BunSqlAdapter;
+	await new RequestRepository(adapter).save({
+		...base,
+		routingAttemptSummary: summary,
+		routeProvenance: provenanceA,
+	});
+	const write = lastWrite as unknown as { sql: string; params: unknown[] };
+	const insertColumns = (
+		write.sql.match(/INSERT INTO requests \(([^)]*)\)/)?.[1] ?? ""
+	)
+		.split(",")
+		.map((column) => column.trim());
+	for (const column of ROUTE_COLUMNS) {
+		expect(write.sql).toContain(
+			`${column} = CASE WHEN requests.routing_attempt_summary IS NOT NULL THEN requests.${column} ELSE COALESCE(EXCLUDED.${column}, requests.${column}) END`,
+		);
+		const index = insertColumns.indexOf(column);
+		expect(index).toBeGreaterThanOrEqual(0);
+		expect(write.params[index]).toBe(expectedA[column]);
+	}
+});

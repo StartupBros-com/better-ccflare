@@ -2390,6 +2390,165 @@ describe("selectAccountsForRequest — catalog-role route profile", () => {
 	});
 });
 
+describe("selectAccountsForRequest — capability descendant candidate compilation", () => {
+	const ROOT_MODEL = "root-logical";
+	const REQUESTED = "req-model";
+
+	function descendantMeta(overrides: Partial<RequestMeta> = {}): RequestMeta {
+		return makeRequestMeta({
+			routeProfileId: "cap-desc",
+			routeProfileSelection: "capability",
+			routeProfileLogicalModel: ROOT_MODEL,
+			routeProfileExpectedPhysicalModel: "gpt-x",
+			routeExpectedPhysicalModel: "gpt-x",
+			routeExpectedProvider: "codex",
+			routeLineage: { kind: "descendant", childHomeKey: null },
+			...overrides,
+		});
+	}
+
+	function poolAccount(id: string, mappings: Record<string, string>): Account {
+		return makeAccount({
+			id,
+			name: id,
+			provider: "codex",
+			model_mappings: JSON.stringify(mappings),
+		});
+	}
+
+	function candidateTuples(meta: RequestMeta) {
+		return (meta.routingCandidates ?? []).map((candidate) => [
+			candidate.accountId,
+			candidate.routeFallbackRung,
+		]);
+	}
+
+	function unrelatedAccount(): Account {
+		// Wrong provider for the profile and a non-identity mapping for the
+		// requested model, so neither the profile pool nor the global pool admits it.
+		return makeAccount({
+			id: "acct-other",
+			name: "acct-other",
+			provider: "anthropic",
+			model_mappings: JSON.stringify({ [REQUESTED]: "other-physical" }),
+		});
+	}
+
+	// These mocks return accounts without updating meta.routingCandidates, so
+	// alignCapabilityCandidates falls back to matching by account id. That keeps
+	// the result authorized and duplicate-free, but the order of one account's
+	// rungs then follows strategy position; built-in strategies commit their
+	// candidate order, so only authorization is asserted here.
+	it("keeps a strategy that returns an unauthorized account first from escaping the rungs", async () => {
+		const home = poolAccount("acct-home", {
+			[REQUESTED]: "gpt-y",
+			[ROOT_MODEL]: "gpt-x",
+		});
+		const other = unrelatedAccount();
+		const ctx = makeCtx({ accounts: [home, other] });
+		ctx.strategy.select = mock((authorized: Account[]) => [
+			other,
+			...authorized,
+		]);
+		const meta = descendantMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, REQUESTED);
+
+		expect(result.every((account) => account.id === "acct-home")).toBe(true);
+		expect(result).toHaveLength(2);
+		const ids = (meta.routingCandidates ?? []).map((c) => c.candidateId);
+		expect(new Set(ids).size).toBe(ids.length);
+		expect([...ids].sort()).toEqual(
+			[
+				`profile:cap-desc:profile_requested_model:acct-home:${REQUESTED}`,
+				`profile:cap-desc:profile_root_model:acct-home:${ROOT_MODEL}`,
+			].sort(),
+		);
+	});
+
+	it("keeps a strategy that returns cloned or duplicated authorized accounts from duplicating candidates", async () => {
+		const home = poolAccount("acct-home", {
+			[REQUESTED]: "gpt-y",
+			[ROOT_MODEL]: "gpt-x",
+		});
+		const other = unrelatedAccount();
+		const ctx = makeCtx({ accounts: [home, other] });
+		ctx.strategy.select = mock((authorized: Account[]) => [
+			other,
+			{ ...(authorized[0] as Account) },
+			...authorized,
+			{ ...(authorized[0] as Account) },
+		]);
+		const meta = descendantMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, REQUESTED);
+
+		expect(result).toHaveLength(2);
+		expect(result.every((account) => account === home)).toBe(true);
+		const ids = (meta.routingCandidates ?? []).map((c) => c.candidateId);
+		expect(new Set(ids).size).toBe(ids.length);
+	});
+
+	it("emits only the requested-model rung when requested and root models share one physical model", async () => {
+		const home = poolAccount("acct-home", {
+			[REQUESTED]: "gpt-x",
+			[ROOT_MODEL]: "gpt-x",
+		});
+		const ctx = makeCtx({ accounts: [home] });
+		const meta = descendantMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, REQUESTED);
+
+		expect(result.map(({ id }) => id)).toEqual(["acct-home"]);
+		expect(candidateTuples(meta)).toEqual([
+			["acct-home", "profile_requested_model"],
+		]);
+	});
+
+	it("keeps the earlier rung when one account sits in both the root and global pools with one physical model", async () => {
+		// Identity mapping admits the account to the global pool; the root rung
+		// maps elsewhere, so only the global rung collides with the requested rung.
+		const home = poolAccount("acct-home", {
+			[REQUESTED]: REQUESTED,
+			[ROOT_MODEL]: "gpt-x",
+		});
+		const ctx = makeCtx({ accounts: [home] });
+		const meta = descendantMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, REQUESTED);
+
+		expect(result).toHaveLength(2);
+		expect(candidateTuples(meta)).toEqual([
+			["acct-home", "profile_requested_model"],
+			["acct-home", "profile_root_model"],
+		]);
+		expect(
+			(meta.routingCandidates ?? []).some(
+				(c) => c.routeFallbackRung === "global_requested_model",
+			),
+		).toBe(false);
+		expect(
+			meta.routingCandidateCatalog?.map((c) => c.routeFallbackRung),
+		).toEqual(["profile_requested_model", "profile_root_model"]);
+	});
+
+	it("compares physical models case-insensitively when deduplicating", async () => {
+		const home = poolAccount("acct-home", {
+			[REQUESTED]: "GPT-X",
+			[ROOT_MODEL]: "gpt-x",
+		});
+		const ctx = makeCtx({ accounts: [home] });
+		const meta = descendantMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, REQUESTED);
+
+		expect(result.map(({ id }) => id)).toEqual(["acct-home"]);
+		expect(candidateTuples(meta)).toEqual([
+			["acct-home", "profile_requested_model"],
+		]);
+	});
+});
+
 describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 	it("keeps the same owner when the configured strategy changes order", async () => {
 		const a = makeAccount({ id: "xai-a", provider: "xai" });

@@ -985,4 +985,14 @@ describe("SessionStrategy", () => {
 			expect(mockStore.resumeCalls).toEqual([]);
 		});
 	});
+
+	// proxy.ts maps a missing commitDescendantAffinityOwner hook to
+	// routeHomeAction "none", so this strategy installs no child homes. Docs
+	// scope child homes to the strategies that implement the hook (#523).
+	it("does not implement commitDescendantAffinityOwner", () => {
+		expect(
+			(new SessionStrategy() as unknown as Record<string, unknown>)
+				.commitDescendantAffinityOwner,
+		).toBeUndefined();
+	});
 });

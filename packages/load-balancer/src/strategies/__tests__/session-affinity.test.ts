@@ -230,6 +230,322 @@ describe("SessionAffinityStrategy", () => {
 		});
 	});
 
+	describe("descendant child-home contract", () => {
+		const TTL = 1_000;
+		const descendantMeta = (
+			lane: string,
+			candidates: Array<{ id: string; priority?: number }>,
+		): RequestMeta =>
+			({
+				...metaFor(`client-${lane}`),
+				affinityLaneKey: lane,
+				routeLineage: { kind: "descendant", childHomeKey: `opaque-${lane}` },
+				routingCandidates: candidates.map(({ id, priority = 0 }, ordinal) => ({
+					candidateId: `candidate:${id}`,
+					accountId: id,
+					tier: priority,
+					ordinal,
+					comboSlotId: null,
+					modelOverride: "claude-sonnet-5",
+					quotaPressure: null,
+					routeFallbackRung: "profile_requested_model",
+				})),
+			}) as RequestMeta;
+		const owner = (id: string) => ({
+			candidateId: `candidate:${id}`,
+			accountId: id,
+		});
+		const clocked = (clock: { now: number }) => {
+			const s = new SessionAffinityStrategy(
+				TTL,
+				undefined,
+				undefined,
+				undefined,
+				() => clock.now,
+			);
+			s.initialize(store);
+			return s;
+		};
+		const commitHome = async (
+			s: SessionAffinityStrategy,
+			lane: string,
+			home: Account,
+		) => {
+			const meta = descendantMeta(lane, [{ id: home.id }]);
+			await s.select([home], meta);
+			expect(s.commitDescendantAffinityOwner(meta, owner(home.id))).toBe(
+				"initial_commit",
+			);
+		};
+
+		describe("re-pin reasons", () => {
+			const expectRepin = async (
+				s: SessionAffinityStrategy,
+				meta: RequestMeta,
+				accounts: Account[],
+				reason: string,
+				oldId: string,
+				newId: string,
+			) => {
+				const ranked = await s.select(accounts, meta);
+				expect(ranked[0]?.id).toBe(newId);
+				expect(meta.routeRepinReason).toBe(reason);
+				expect(meta.routeHomeReplacementAllowed).toBe(true);
+				expect(meta.routeHomeExpectedCandidateId).toBe(`candidate:${oldId}`);
+				expect(s.commitDescendantAffinityOwner(meta, owner(newId))).toBe(
+					"repinned",
+				);
+				expect(s.snapshotAffinityOwner(meta)).toEqual(owner(newId));
+			};
+
+			it("assigns route_circuit_open when the owner's route circuit is open", async () => {
+				const home = makeAccount({ id: "acct-home" });
+				const other = makeAccount({ id: "acct-other" });
+				const lane = "repin-circuit";
+				await commitHome(strategy, lane, home);
+				const both = [{ id: home.id }, { id: other.id }];
+				strategy.reportCandidateFailure(descendantMeta(lane, both), {
+					candidateId: "candidate:acct-home",
+					reason: "overloaded",
+					suppressForMs: 60_000,
+				});
+				await expectRepin(
+					strategy,
+					descendantMeta(lane, both),
+					[home, other],
+					"route_circuit_open",
+					home.id,
+					other.id,
+				);
+			});
+
+			it("assigns hard_exclusion when the owner account is hard-excluded", async () => {
+				const home = makeAccount({ id: "acct-home" });
+				const other = makeAccount({ id: "acct-other" });
+				const lane = "repin-hard";
+				await commitHome(strategy, lane, home);
+				const meta = descendantMeta(lane, [{ id: home.id }, { id: other.id }]);
+				meta.hardExcludedAccountIds = new Set([home.id]);
+				await expectRepin(
+					strategy,
+					meta,
+					[home, other],
+					"hard_exclusion",
+					home.id,
+					other.id,
+				);
+			});
+
+			it("assigns account_unavailable when the configured owner is paused", async () => {
+				const home = makeAccount({ id: "acct-home" });
+				const other = makeAccount({ id: "acct-other" });
+				const lane = "repin-unavailable";
+				await commitHome(strategy, lane, home);
+				const paused = makeAccount({ id: "acct-home", paused: true });
+				await expectRepin(
+					strategy,
+					descendantMeta(lane, [{ id: home.id }, { id: other.id }]),
+					[paused, other],
+					"account_unavailable",
+					home.id,
+					other.id,
+				);
+			});
+
+			it("assigns structural_removal when the owner candidate is no longer configured", async () => {
+				const home = makeAccount({ id: "acct-home" });
+				const other = makeAccount({ id: "acct-other" });
+				const lane = "repin-removed";
+				await commitHome(strategy, lane, home);
+				await expectRepin(
+					strategy,
+					descendantMeta(lane, [{ id: other.id }]),
+					[other],
+					"structural_removal",
+					home.id,
+					other.id,
+				);
+			});
+
+			it("leaves routeRepinReason null for a retained healthy home", async () => {
+				const home = makeAccount({ id: "acct-home" });
+				const other = makeAccount({ id: "acct-other" });
+				const lane = "repin-none";
+				await commitHome(strategy, lane, home);
+				const meta = descendantMeta(lane, [{ id: other.id }, { id: home.id }]);
+				const ranked = await strategy.select([other, home], meta);
+				expect(ranked[0]?.id).toBe(home.id);
+				expect(meta.routeRepinReason).toBeNull();
+				expect(meta.routeHomeAction).toBe("retained");
+				expect(meta.routeHomeReplacementAllowed).toBe(false);
+				expect(meta.routeHomeExpectedCandidateId).toBe("candidate:acct-home");
+			});
+		});
+
+		describe("TTL", () => {
+			it("expires a home after the TTL so the next commit is initial_commit", async () => {
+				const clock = { now: 10_000 };
+				const s = clocked(clock);
+				const home = makeAccount({ id: "acct-home" });
+				const other = makeAccount({ id: "acct-other" });
+				await commitHome(s, "ttl-expire", home);
+				clock.now += TTL;
+				const meta = descendantMeta("ttl-expire", [{ id: other.id }]);
+				await s.select([other], meta);
+				expect(meta.routeHomeExpectedCandidateId).toBeNull();
+				expect(meta.routeHomeAction).toBe("none");
+				expect(meta.routeRepinReason).toBeNull();
+				expect(s.commitDescendantAffinityOwner(meta, owner(other.id))).toBe(
+					"initial_commit",
+				);
+			});
+
+			it("slides the TTL on each retained turn", async () => {
+				const clock = { now: 10_000 };
+				const s = clocked(clock);
+				const home = makeAccount({ id: "acct-home" });
+				await commitHome(s, "ttl-slide", home);
+				const start = clock.now;
+				for (let turn = 0; turn < 3; turn++) {
+					clock.now += 600;
+					const meta = descendantMeta("ttl-slide", [{ id: home.id }]);
+					const ranked = await s.select([home], meta);
+					expect(ranked[0]?.id).toBe(home.id);
+					expect(meta.routeHomeAction).toBe("retained");
+					expect(meta.routeHomeExpectedCandidateId).toBe("candidate:acct-home");
+				}
+				expect(clock.now - start).toBeGreaterThan(TTL);
+				expect(s.affinityEntries).toBe(1);
+			});
+
+			it("treats a commit on an expired entry with a null expectation as initial_commit", async () => {
+				const clock = { now: 10_000 };
+				const s = clocked(clock);
+				const home = makeAccount({ id: "acct-home" });
+				const other = makeAccount({ id: "acct-other" });
+				await commitHome(s, "ttl-commit", home);
+				clock.now += TTL;
+				const meta = descendantMeta("ttl-commit", [{ id: other.id }]);
+				meta.routeHomeExpectedCandidateId = null;
+				expect(s.commitDescendantAffinityOwner(meta, owner(other.id))).toBe(
+					"initial_commit",
+				);
+				expect(meta.routeHomeAction).toBe("initial_commit");
+				expect(s.snapshotAffinityOwner(meta)).toEqual(owner(other.id));
+			});
+		});
+
+		describe("compare-and-set edges", () => {
+			it("returns retained when committing the existing candidate and account", async () => {
+				const home = makeAccount({ id: "acct-home" });
+				await commitHome(strategy, "cas-same", home);
+				const meta = descendantMeta("cas-same", [{ id: home.id }]);
+				meta.routeHomeExpectedCandidateId = "candidate:acct-home";
+				expect(
+					strategy.commitDescendantAffinityOwner(meta, owner(home.id)),
+				).toBe("retained");
+				expect(meta.routeHomeAction).toBe("retained");
+				expect(strategy.affinityEntries).toBe(1);
+			});
+
+			it("refuses replacement when the expected candidate mismatches the existing home", async () => {
+				const home = makeAccount({ id: "acct-home" });
+				const other = makeAccount({ id: "acct-other" });
+				await commitHome(strategy, "cas-mismatch", home);
+				const meta = descendantMeta("cas-mismatch", [{ id: other.id }]);
+				meta.routeHomeReplacementAllowed = true;
+				meta.routeHomeExpectedCandidateId = "candidate:acct-stale";
+				expect(
+					strategy.commitDescendantAffinityOwner(meta, owner(other.id)),
+				).toBe("none");
+				expect(meta.routeHomeAction).toBe("none");
+				expect(strategy.snapshotAffinityOwner(meta)).toEqual(owner(home.id));
+			});
+
+			it("refuses a stale non-null expectation when no entry exists", async () => {
+				const other = makeAccount({ id: "acct-other" });
+				const meta = descendantMeta("cas-stale", [{ id: other.id }]);
+				meta.routeHomeExpectedCandidateId = "candidate:acct-ghost";
+				expect(
+					strategy.commitDescendantAffinityOwner(meta, owner(other.id)),
+				).toBe("none");
+				expect(strategy.affinityEntries).toBe(0);
+
+				const clock = { now: 10_000 };
+				const s = clocked(clock);
+				const home = makeAccount({ id: "acct-home" });
+				await commitHome(s, "cas-expired", home);
+				clock.now += TTL;
+				const expiredMeta = descendantMeta("cas-expired", [{ id: other.id }]);
+				expiredMeta.routeHomeReplacementAllowed = true;
+				expiredMeta.routeHomeExpectedCandidateId = "candidate:acct-home";
+				expect(
+					s.commitDescendantAffinityOwner(expiredMeta, owner(other.id)),
+				).toBe("none");
+				expect(s.affinityEntries).toBe(0);
+			});
+
+			it("returns none for a hard-excluded owner or an empty candidateId or accountId", async () => {
+				const other = makeAccount({ id: "acct-other" });
+				const excluded = descendantMeta("cas-invalid", [{ id: other.id }]);
+				excluded.routeHomeExpectedCandidateId = null;
+				excluded.hardExcludedAccountIds = new Set([other.id]);
+				expect(
+					strategy.commitDescendantAffinityOwner(excluded, owner(other.id)),
+				).toBe("none");
+				expect(excluded.routeHomeAction).toBe("none");
+
+				const emptyCandidate = descendantMeta("cas-invalid", [
+					{ id: other.id },
+				]);
+				emptyCandidate.routeHomeExpectedCandidateId = null;
+				expect(
+					strategy.commitDescendantAffinityOwner(emptyCandidate, {
+						candidateId: "",
+						accountId: other.id,
+					}),
+				).toBe("none");
+
+				const emptyAccount = descendantMeta("cas-invalid", [{ id: other.id }]);
+				emptyAccount.routeHomeExpectedCandidateId = null;
+				expect(
+					strategy.commitDescendantAffinityOwner(emptyAccount, {
+						candidateId: "candidate:acct-other",
+						accountId: "",
+					}),
+				).toBe("none");
+				expect(strategy.affinityEntries).toBe(0);
+			});
+		});
+
+		describe("priority edits", () => {
+			it("retains an available home when its own priority gets worse then better", async () => {
+				const lane = "priority-edit";
+				const homeInitial = makeAccount({ id: "acct-home", priority: 10 });
+				const other = makeAccount({ id: "acct-other", priority: 5 });
+				const initial = descendantMeta(lane, [
+					{ id: homeInitial.id, priority: 10 },
+				]);
+				await strategy.select([homeInitial], initial);
+				strategy.commitDescendantAffinityOwner(initial, owner(homeInitial.id));
+
+				for (const priority of [50, 0]) {
+					const home = makeAccount({ id: "acct-home", priority });
+					const meta = descendantMeta(lane, [
+						{ id: other.id, priority: 5 },
+						{ id: home.id, priority },
+					]);
+					const ranked = await strategy.select([other, home], meta);
+					expect(ranked[0]?.id).toBe("acct-home");
+					expect(meta.routeHomeAction).toBe("retained");
+					expect(meta.routeRepinReason).toBeNull();
+					expect(meta.routeHomeReplacementAllowed).toBe(false);
+					expect(strategy.snapshotAffinityOwner(meta)).toEqual(owner(home.id));
+				}
+			});
+		});
+	});
+
 	describe("routing health", () => {
 		it("preserves transition counters across strategy replacement without sharing gauges", async () => {
 			const recorder = new RoutingTransitionRecorder();
