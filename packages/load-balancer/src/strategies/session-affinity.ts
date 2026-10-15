@@ -134,6 +134,12 @@ interface SessionAffinityEntry {
 	 * spamming info on every request of a long-lived protected session.
 	 */
 	crossTierProtectionLogged: boolean;
+	/**
+	 * When a strategy's warm-owner hold first kept this owner across a
+	 * quota-pressure outclass. Null while the owner is in class and after any
+	 * owner install, so each hold episode is capped from its own first turn.
+	 */
+	pressureHoldSince: number | null;
 }
 
 /** Process-lifetime scalar counters shared across hot strategy replacement. */
@@ -455,6 +461,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			suppressUpgradesUntil: null,
 			installedBelowBestConfiguredTier,
 			crossTierProtectionLogged: false,
+			pressureHoldSince: null,
 		});
 		return true;
 	}
@@ -513,6 +520,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			suppressUpgradesUntil: null,
 			installedBelowBestConfiguredTier: false,
 			crossTierProtectionLogged: false,
+			pressureHoldSince: null,
 		});
 		meta.routeHomeAction = action;
 		return action;
@@ -817,6 +825,21 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		return false;
 	}
 
+	/**
+	 * Opt-in bounded hold for a sticky owner that a challenger outclasses only
+	 * by quota pressure. `ownerIdleMs` is the gap since the owner last served
+	 * this session (Infinity when a fallback served the previous turn);
+	 * `heldForMs` is how long the current hold episode has lasted (0 if none).
+	 */
+	protected holdsWarmOwnerAcrossQuotaPressure(
+		_owner: StrategyCandidate,
+		_challenger: StrategyCandidate,
+		_ownerIdleMs: number,
+		_heldForMs: number,
+	): boolean {
+		return false;
+	}
+
 	/** Strategy variants may invalidate an ordinary sticky owner. */
 	protected canRetainAffinityOwner(
 		_candidate: StrategyCandidate,
@@ -1111,6 +1134,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						installedBelowBestConfiguredTier:
 							retainedOwnerInstalledBelowBestConfiguredTier(),
 						crossTierProtectionLogged: false,
+						pressureHoldSince: null,
 					};
 					this.affinity.set(affinityKey, mapping);
 				} else {
@@ -1124,6 +1148,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						mapping.installedBelowBestConfiguredTier =
 							retainedOwnerInstalledBelowBestConfiguredTier();
 						mapping.crossTierProtectionLogged = false;
+						mapping.pressureHoldSince = null;
 						// Anti-thrash state belongs to the owner it was measured
 						// against. Installing a DIFFERENT owner here without clearing
 						// it lets the replacement inherit a predecessor's upgrade
@@ -1357,35 +1382,55 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 				);
 				const ranked = this.rankByLeastUsed(available, now, meta);
 				const best = ranked[0];
-				if (
-					mapped &&
-					best &&
-					this.canRetainAffinityOwner(mapped, now, meta) &&
-					(isSameStrategyCandidateClass(mapped, best, meta) ||
-						this.preservesAffinityAcrossQuotaPressure(mapped, best))
-				) {
-					// STICKY hit: keep the client on its account (prompt-cache reuse).
-					// Refresh assignedAt so an active session keeps its mapping alive.
-					mapping.assignedAt = now;
-					mapping.fallbackCandidateId = null;
-					// The owner is no longer cross-tier outclassed (if it ever was):
-					// end any in-progress protection episode so the next one logs
-					// at info again.
-					mapping.crossTierProtectionLogged = false;
-					const others = this.rankByLeastUsed(
-						available.filter(
-							(candidate) =>
-								candidate.routing.candidateId !== mapped.routing.candidateId,
-						),
-						now,
-						meta,
-					);
-					this.log.debug("Sticky route selected", {
-						candidateId: mapped.routing.candidateId,
-						fallbackCount: others.length,
-						affinityLanePresent: meta.affinityLaneKey != null,
-					});
-					return commitStrategyCandidateOrder([mapped, ...others], meta);
+				if (mapped && best && this.canRetainAffinityOwner(mapped, now, meta)) {
+					const keepsClass =
+						isSameStrategyCandidateClass(mapped, best, meta) ||
+						this.preservesAffinityAcrossQuotaPressure(mapped, best);
+					// orderWithActiveFallback refreshes assignedAt on fallback turns,
+					// so a pending fallback means the owner's cache did not serve the
+					// previous turn and must not count as warm.
+					const ownerIdleMs =
+						mapping.fallbackCandidateId === null
+							? now - mapping.assignedAt
+							: Number.POSITIVE_INFINITY;
+					const warmPressureHold =
+						!keepsClass &&
+						this.holdsWarmOwnerAcrossQuotaPressure(
+							mapped,
+							best,
+							ownerIdleMs,
+							now - (mapping.pressureHoldSince ?? now),
+						);
+					if (keepsClass || warmPressureHold) {
+						// STICKY hit: keep the client on its account (prompt-cache reuse).
+						// Refresh assignedAt so an active session keeps its mapping alive.
+						mapping.assignedAt = now;
+						mapping.fallbackCandidateId = null;
+						// The owner is no longer cross-tier outclassed (if it ever was):
+						// end any in-progress protection episode so the next one logs
+						// at info again.
+						mapping.crossTierProtectionLogged = false;
+						// A hold is capped from its first outclassed turn; any in-class
+						// turn ends the episode.
+						mapping.pressureHoldSince = warmPressureHold
+							? (mapping.pressureHoldSince ?? now)
+							: null;
+						const others = this.rankByLeastUsed(
+							available.filter(
+								(candidate) =>
+									candidate.routing.candidateId !== mapped.routing.candidateId,
+							),
+							now,
+							meta,
+						);
+						this.log.debug("Sticky route selected", {
+							candidateId: mapped.routing.candidateId,
+							fallbackCount: others.length,
+							warmPressureHold,
+							affinityLanePresent: meta.affinityLaneKey != null,
+						});
+						return commitStrategyCandidateOrder([mapped, ...others], meta);
+					}
 				}
 
 				if (mapped && best) {
@@ -1490,6 +1535,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 								candidates,
 							);
 						mapping.crossTierProtectionLogged = false;
+						mapping.pressureHoldSince = null;
 					}
 					// This line fires for both remaps the at-home guard deliberately
 					// allows: a same-tier pressure-band outclass, and a displaced
@@ -1576,6 +1622,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 									candidates,
 								);
 							mapping.crossTierProtectionLogged = false;
+							mapping.pressureHoldSince = null;
 							this.log.info(
 								"Upgraded route owner failed inside anti-thrash window",
 								{
@@ -1627,6 +1674,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 								candidates,
 							);
 						mapping.crossTierProtectionLogged = false;
+						mapping.pressureHoldSince = null;
 						this.log.info("Unavailable equal/worse route owner remapped", {
 							candidateId: fallback.routing.candidateId,
 							affinityLanePresent: meta.affinityLaneKey != null,
@@ -1663,6 +1711,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						candidates,
 					),
 				crossTierProtectionLogged: false,
+				pressureHoldSince: null,
 			});
 			this.log.debug("Least-used route owner assigned", {
 				candidateId: chosen.routing.candidateId,
