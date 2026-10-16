@@ -53,6 +53,7 @@ import {
 	SelectValue,
 } from "../ui/select";
 import { Switch } from "../ui/switch";
+import { buildModelTimeSeries } from "./model-time-series";
 
 interface ChartData {
 	time: string;
@@ -94,97 +95,22 @@ export function MainMetricsChart({
 	// Process data for multi-model chart if model breakdown is enabled (not in cumulative mode)
 	const processedMultiModelData =
 		rawTimeSeries && modelBreakdown && viewMode !== "cumulative"
-			? (() => {
-					// Group by timestamp and pivot models
-					const grouped: Record<
-						string,
-						{ time: string; [model: string]: string | number }
-					> = {};
-					const models = new Set<string>();
-
-					// First pass: collect all time points and models
-					const timePoints = new Set<string>();
-					const timeToTimestamp = new Map<string, number>();
-
-					rawTimeSeries.forEach((point) => {
-						if (point.model) {
-							models.add(point.model);
-							const time =
-								timeRange === "30d"
-									? new Date(point.ts).toLocaleDateString()
-									: new Date(point.ts).toLocaleTimeString([], {
-											hour: "2-digit",
-											minute: "2-digit",
-										});
-							timePoints.add(time);
-							timeToTimestamp.set(time, point.ts);
-						}
-					});
-
-					// Sort time points chronologically using the original timestamps
-					const sortedTimes = Array.from(timePoints).sort((a, b) => {
-						const tsA = timeToTimestamp.get(a) || 0;
-						const tsB = timeToTimestamp.get(b) || 0;
-						return tsA - tsB;
-					});
-
-					// Initialize data structure
-					const modelArrays = Array.from(models).sort();
-
-					// Process time points in order
-					sortedTimes.forEach((time) => {
-						grouped[time] = { time };
-
-						// Initialize all models for this time point
-						modelArrays.forEach((model) => {
-							// Default to 0 for missing data points
-							grouped[time][model] = 0;
-						});
-					});
-
-					// Fill in actual values
-					rawTimeSeries.forEach((point) => {
-						if (point.model) {
-							const time =
-								timeRange === "30d"
-									? new Date(point.ts).toLocaleDateString()
-									: new Date(point.ts).toLocaleTimeString([], {
-											hour: "2-digit",
-											minute: "2-digit",
-										});
-
-							// Map the metric value
-							let value = 0;
-							switch (selectedMetric) {
-								case "requests":
-									value = point.requests;
-									break;
-								case "tokens":
-									value = point.tokens;
-									break;
-								case "cost":
-									value = point.costUsd;
-									break;
-								case "responseTime":
-									value = point.avgResponseTime;
-									break;
-								case "tokensPerSecond":
-									value = point.avgTokensPerSecond || 0;
-									break;
-							}
-
-							grouped[time][point.model] = value;
-						}
-					});
-
-					// Sort and return the data
-					const finalData = sortedTimes.map((time) => grouped[time]);
-
-					return {
-						data: finalData,
-						models: modelArrays,
-					};
-				})()
+			? buildModelTimeSeries(rawTimeSeries, timeRange, (point) => {
+					switch (selectedMetric) {
+						case "requests":
+							return point.requests;
+						case "tokens":
+							return point.tokens;
+						case "cost":
+							return point.costUsd;
+						case "responseTime":
+							return point.avgResponseTime;
+						case "tokensPerSecond":
+							return point.avgTokensPerSecond || 0;
+						default:
+							return 0;
+					}
+				})
 			: null;
 
 	return (
@@ -430,76 +356,9 @@ export function PerformanceIndicatorsChart({
 	// Process data for multi-model chart if model breakdown is enabled
 	const processedMultiModelData =
 		rawTimeSeries && modelBreakdown
-			? (() => {
-					// Group by timestamp and pivot models
-					const grouped: Record<
-						string,
-						{ time: string; [model: string]: string | number }
-					> = {};
-					const models = new Set<string>();
-					const timeToTimestamp = new Map<string, number>();
-
-					rawTimeSeries.forEach((point) => {
-						if (point.model) {
-							models.add(point.model);
-							const time =
-								timeRange === "30d"
-									? new Date(point.ts).toLocaleDateString()
-									: new Date(point.ts).toLocaleTimeString([], {
-											hour: "2-digit",
-											minute: "2-digit",
-										});
-							timeToTimestamp.set(time, point.ts);
-						}
-					});
-
-					// Sort time points chronologically
-					const sortedTimes = Array.from(new Set(timeToTimestamp.keys())).sort(
-						(a, b) => {
-							const tsA = timeToTimestamp.get(a) || 0;
-							const tsB = timeToTimestamp.get(b) || 0;
-							return tsA - tsB;
-						},
-					);
-
-					const modelArrays = Array.from(models).sort();
-
-					// Initialize all time points with all models
-					sortedTimes.forEach((time) => {
-						grouped[time] = { time };
-						modelArrays.forEach((model) => {
-							grouped[time][model] = 0;
-						});
-					});
-
-					// Fill in actual values
-					rawTimeSeries.forEach((point) => {
-						if (point.model) {
-							const time =
-								timeRange === "30d"
-									? new Date(point.ts).toLocaleDateString()
-									: new Date(point.ts).toLocaleTimeString([], {
-											hour: "2-digit",
-											minute: "2-digit",
-										});
-
-							// Map the metric value
-							const value =
-								currentMetric === "errorRate"
-									? point.errorRate
-									: point.cacheHitRate;
-
-							grouped[time][point.model] = value;
-						}
-					});
-
-					const finalData = sortedTimes.map((time) => grouped[time]);
-
-					return {
-						data: finalData,
-						models: modelArrays,
-					};
-				})()
+			? buildModelTimeSeries(rawTimeSeries, timeRange, (point) =>
+					currentMetric === "errorRate" ? point.errorRate : point.cacheHitRate,
+				)
 			: null;
 
 	return (
