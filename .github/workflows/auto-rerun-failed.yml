@@ -23,7 +23,12 @@ jobs:
           # Workflows that build/sign/publish release artifacts must never be
           # auto-rerun: a rerun could re-trigger a duplicate publish/release
           # or re-run untrusted signing steps without human review.
+          # AI workflows can repeat external model calls and side effects;
+          # retries require an explicit human decision too.
           EXCLUDED_WORKFLOWS=(
+            "Issue Triage Agent"
+            "Claude Code Review"
+            "Claude Code"
             "Build and Publish Docker Images"
             "Manual Release"
             "Release Multi-Architecture Binaries"
@@ -80,7 +85,7 @@ jobs:
               continue
             fi
 
-            # Skip build/sign/publish workflows - these must only be rerun manually
+            # Skip AI and build/sign/publish workflows - rerun only with human review
             IS_EXCLUDED=false
             for excluded in "${EXCLUDED_WORKFLOWS[@]}"; do
               if [[ "$WORKFLOW" == "$excluded" ]]; then
@@ -89,7 +94,7 @@ jobs:
               fi
             done
             if [[ "$IS_EXCLUDED" == "true" ]]; then
-              echo "⏭️  Skipping - build/publish workflow excluded from auto-rerun"
+              echo "⏭️  Skipping - workflow excluded from auto-rerun"
               SKIP_COUNT=$((SKIP_COUNT + 1))
               continue
             fi
