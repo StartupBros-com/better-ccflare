@@ -33,7 +33,7 @@ With the opt-in Claude Code background merge policy enabled, a background job fa
 
 - **Reading it as an Anthropic or Claude Code error.** The wording ("host template", "configured merge policy") sounds like it comes from upstream. It is better-ccflare's own response, `backgroundMergePolicyIncompatibilityResponse()` in `packages/proxy/src/claude-code-background-merge-policy.ts:302`, with error code `claude_code_background_merge_policy_incompatible`. Search the repo for the error code first.
 - **Looking for the failing requests in `requests`.** The policy runs at ingress, and the 409 returns at `packages/proxy/src/proxy.ts:1233`, before account selection and before any usage recording. These requests leave no row, so request-history queries and the dashboard show nothing for the failing turns. Find the session through its Claude Code transcript instead.
-- **Waiting, or nudging the job.** A session keeps sending the same cached system prompt. Every retry carried the same unrecognized section and got the same 409 (session history: four in a row). Per this session's diagnosis, Claude Code also retries a 409 for several minutes before showing it, which is why the first error surfaced about nine minutes after the compaction. The job only recovers once the proxy accepts its render.
+- **Waiting, or nudging the job.** A session keeps sending the same cached system prompt. Every retry carried the same unrecognized section and got the same 409 (session history: four in a row). Claude Code also retries a 409 for several minutes before showing it: each later nudge surfaced its 409 about nine minutes after it was sent (session history), which is also why the first error appeared about nine minutes after the compaction. The job only recovers once the proxy accepts its render.
 
 ## Solution
 
@@ -69,7 +69,7 @@ To recover a stuck job after deploying, send it one more turn. Its next request 
 
 ## Why This Works
 
-The policy has a narrow job. It rewrites one sentence the host wrote and refuses anything it cannot prove the host wrote. An unknown render gets a 409 by design. Forwarding it silently would hide host drift behind the very ban the operator configured the proxy to replace, and editing text it cannot recognize could hand the grant to lookalike text.
+The policy has a narrow job. It rewrites one sentence the host wrote and refuses a Background Session section it cannot prove the host wrote. An unknown render gets a 409 by design. A request with no Background Session heading and no Git-paragraph anchor is not inspected further and passes unchanged (line 255), so a release that renamed both would lose the grant silently rather than fail. Forwarding it silently would hide host drift behind the very ban the operator configured the proxy to replace, and editing text it cannot recognize could hand the grant to lookalike text.
 
 Claude Code builds the section at runtime from parts. It picks the prose set by model and the isolation mode by session, and it rebuilds the section when it rebuilds the system prompt after a compaction. Job 5ec380f4's state recorded `bgIsolation: "none"`. Its rebuilt prompt came out as the work-in-place render, which PR #414's single fixture did not cover (auto memory [claude]). So a job could pass for hours and then fail mid-run with no change on the proxy side. Recognizing the full set, rendered from the binary, closes that gap for 2.1.301 without loosening what counts as host-written text.
 
