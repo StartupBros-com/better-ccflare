@@ -1745,6 +1745,19 @@ export class AlertService {
 		);
 	}
 
+	private async lookupAccountName(accountId: string): Promise<string | null> {
+		try {
+			const row = await this.db.get<{ name: string }>(
+				"SELECT name FROM accounts WHERE id = ?",
+				[accountId],
+			);
+			return row?.name ?? null;
+		} catch (error) {
+			log.warn(`Alert account name lookup failed: ${(error as Error).message}`);
+			return null;
+		}
+	}
+
 	async evaluateRequest(request: RequestResponse): Promise<void> {
 		const config = getAlertsConfig(this.config);
 		const alerts: AlertEvent[] = [];
@@ -1756,6 +1769,21 @@ export class AlertService {
 		// never from the proxy's hot path, so evaluating model-routing drift
 		// here adds no request latency.
 		alerts.push(...buildModelRoutingDriftAlerts(request, config, timestamp));
+		// The pure builders above label the alert with request.accountUsed, which
+		// is the raw account id. Resolve it to the account name once per request
+		// so the stored row, SSE event, dashboard and webhook match every other
+		// alert type. Done here (post-map) to keep the builders pure; on a
+		// missing row or lookup failure the id stays and the Discord renderer
+		// keeps redacting it.
+		if (alerts.length > 0 && request.accountUsed) {
+			const accountName = await this.lookupAccountName(request.accountUsed);
+			if (accountName) {
+				for (const alert of alerts) {
+					if (alert.account === request.accountUsed)
+						alert.account = accountName;
+				}
+			}
+		}
 		alerts.push(
 			...(await this.buildAggregateAlerts(timestamp, request, config)),
 		);

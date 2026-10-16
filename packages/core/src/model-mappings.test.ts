@@ -18,6 +18,7 @@ import {
 	isValidClaudeModel,
 	isWellFormedConcreteClaudeModelId,
 	LATEST_FABLE_MODEL,
+	LATEST_HAIKU_MODEL,
 	LATEST_MODEL_BY_FAMILY,
 	LATEST_OPUS_MODEL,
 	LATEST_SONNET_MODEL,
@@ -48,7 +49,7 @@ describe("Fable 5.1 registry metadata", () => {
 		expect(getModelShortName(CLAUDE_MODEL_IDS.FABLE_5_1)).toBe(
 			"claude-fable-5.1",
 		);
-		expect(BUNDLED_MODELS_AS_OF).toBe("2026-09-29");
+		expect(BUNDLED_MODELS_AS_OF).toBe("2026-10-15");
 	});
 
 	test("advances bare Fable aliases without rewriting concrete legacy pins", () => {
@@ -158,6 +159,49 @@ describe("Sonnet 5.5 registry metadata", () => {
 			"sonnet",
 		);
 		expect(isValidClaudeModel(CLAUDE_MODEL_IDS.SONNET_5_5)).toBe(true);
+	});
+});
+
+describe("Haiku 5.5 registry metadata", () => {
+	test("registers Haiku 5.5 while preserving the explicit Haiku 4.5 legacy pin", () => {
+		expect(CLAUDE_MODEL_IDS.HAIKU_5_5).toBe("claude-haiku-5-5");
+		expect(CLAUDE_MODEL_IDS.HAIKU_4_5).toBe("claude-haiku-4-5-20251001");
+		expect(getModelDisplayName(CLAUDE_MODEL_IDS.HAIKU_5_5)).toBe(
+			"Claude Haiku 5.5",
+		);
+		expect(getModelShortName(CLAUDE_MODEL_IDS.HAIKU_5_5)).toBe(
+			"claude-haiku-5.5",
+		);
+	});
+
+	test("advances bare Haiku aliases without rewriting concrete legacy pins", () => {
+		expect(LATEST_HAIKU_MODEL).toBe(CLAUDE_MODEL_IDS.HAIKU_5_5);
+		expect(LATEST_MODEL_BY_FAMILY.haiku).toBe(CLAUDE_MODEL_IDS.HAIKU_5_5);
+		expect(resolveFamilyAliasModel("haiku", "haiku")).toBe(
+			CLAUDE_MODEL_IDS.HAIKU_5_5,
+		);
+		expect(resolveFamilyAliasModel(CLAUDE_MODEL_IDS.HAIKU_4_5, "haiku")).toBe(
+			CLAUDE_MODEL_IDS.HAIKU_4_5,
+		);
+	});
+
+	test("accepts forced tool choice while the other 5.5-generation models still reject it", () => {
+		expect(supportsForcedToolChoice(CLAUDE_MODEL_IDS.HAIKU_5_5)).toBe(true);
+		for (const modelId of [
+			CLAUDE_MODEL_IDS.SONNET_5_5,
+			CLAUDE_MODEL_IDS.OPUS_5_5,
+			CLAUDE_MODEL_IDS.FABLE_5_1,
+		]) {
+			expect(supportsForcedToolChoice(modelId)).toBe(false);
+		}
+	});
+
+	test("classifies Haiku 5.5 into the haiku family for routing", () => {
+		expect(getModelFamily(CLAUDE_MODEL_IDS.HAIKU_5_5)).toBe("haiku");
+		expect(getStrictClaudeModelFamily(CLAUDE_MODEL_IDS.HAIKU_5_5)).toBe(
+			"haiku",
+		);
+		expect(isValidClaudeModel(CLAUDE_MODEL_IDS.HAIKU_5_5)).toBe(true);
 	});
 });
 

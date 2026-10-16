@@ -172,6 +172,8 @@ export {
 export {
 	LIST_PRICE_ERAS,
 	type ListPriceEra,
+	LONG_CONTEXT_PROMPT_TOKENS,
+	type LongContextListPrice,
 	priceTokensAtListPrice,
 	VALUE_PRICING_VERSION,
 } from "./value-pricing";
@@ -185,6 +187,7 @@ export {
 	trackClientVersion,
 } from "./version";
 export {
+	type LongContextTokenSubset,
 	type ModelValueBreakdownEntry,
 	valueWindowAggregates,
 	type WindowTokenAggregate,

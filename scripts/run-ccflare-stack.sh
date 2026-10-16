@@ -817,6 +817,12 @@ run_stack_once() {
 
 	fi
 	stack_started_ms="$(epoch_ms)"
+	local upstream_identity=""
+	if ((RUNNER_RSS_THRESHOLD_BYTES > 0)); then
+		# Pin the watchdog's start-time identity before announcing readiness, so
+		# nothing that acts on "ready" can race the baseline it is compared to.
+		upstream_identity="$(proc_start_time "$upstream_pid")" || { log "cannot capture upstream proc start-time identity"; fatal_startup=1; return 1; }
+	fi
 	log "ccflare stack ready; upstream_pid=${upstream_pid} guard_pid=${guard_pid}"
 	local -a child_pids=("$upstream_pid" "$guard_pid")
 	if ((transaction_enabled)); then start_deployment_listener; child_pids+=("$deployment_pid"); fi
@@ -830,8 +836,6 @@ run_stack_once() {
 		child_pids+=("$ai_gateway_tunnel_pid")
 	fi
 	if ((RUNNER_RSS_THRESHOLD_BYTES > 0)); then
-		local upstream_identity
-		upstream_identity="$(proc_start_time "$upstream_pid")" || { log "cannot capture upstream proc start-time identity"; fatal_startup=1; return 1; }
 		rss_watchdog "$upstream_pid" "$upstream_identity" "$stack_started_ms" &
 		watchdog_pid=$!
 		child_pids+=("$watchdog_pid")

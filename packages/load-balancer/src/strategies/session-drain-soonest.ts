@@ -18,6 +18,15 @@ import {
 import { codexWindowHasReset } from "./session-window-reset";
 
 /**
+ * Idle gap under which an Anthropic owner's prompt cache is certainly warm
+ * (the default 5-minute cache TTL). Deliberately separate from the
+ * env-tunable anti-thrash window, which happens to share the same default.
+ */
+const ANTHROPIC_WARM_CACHE_MS = 5 * 60 * 1000;
+/** Longest one warm-cache hold may delay a weekly-pressure remap. */
+const ANTHROPIC_PRESSURE_HOLD_CAP_MS = 30 * 60 * 1000;
+
+/**
  * Opt-in SessionAffinity variant that drains the account whose all-model
  * weekly window expires first. The inherited strategy still owns client/lane
  * affinity, route circuits, anti-thrash, and cache-safe sticky-owner logic;
@@ -28,7 +37,10 @@ import { codexWindowHasReset } from "./session-window-reset";
  * same structural class, then account priority, utilization, and the base
  * strategy's bounded recency score provide deterministic tie-breaks. In sticky
  * mode, an eligible existing Codex owner survives same-tier/rung quota-pressure
- * changes and usage-window rollovers to preserve its warmed prompt cache.
+ * changes and usage-window rollovers to preserve its warmed prompt cache. An
+ * Anthropic owner survives the same quota-pressure change only while its cache
+ * is certainly warm and for at most ANTHROPIC_PRESSURE_HOLD_CAP_MS, so drain
+ * is delayed, never blocked.
  */
 export type SessionDrainSoonestMode = "sticky" | "strict";
 
@@ -75,6 +87,24 @@ export class SessionDrainSoonestStrategy extends SessionAffinityStrategy {
 			this.mode === "sticky" &&
 			owner.account.provider === PROVIDER_NAMES.CODEX &&
 			isSameStrategyCandidateRouteClass(owner, challenger)
+		);
+	}
+
+	protected override holdsWarmOwnerAcrossQuotaPressure(
+		owner: StrategyCandidate,
+		challenger: StrategyCandidate,
+		ownerIdleMs: number,
+		heldForMs: number,
+	): boolean {
+		// Moving a mid-conversation Anthropic session rebuilds its whole cached
+		// prefix. Pay that only once the cache has gone cold or the hold has
+		// delayed the drain long enough; tier/rung recovery always wins.
+		return (
+			this.mode === "sticky" &&
+			owner.account.provider === PROVIDER_NAMES.ANTHROPIC &&
+			isSameStrategyCandidateRouteClass(owner, challenger) &&
+			ownerIdleMs < ANTHROPIC_WARM_CACHE_MS &&
+			heldForMs < ANTHROPIC_PRESSURE_HOLD_CAP_MS
 		);
 	}
 

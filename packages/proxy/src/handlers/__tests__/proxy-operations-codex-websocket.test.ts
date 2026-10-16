@@ -220,6 +220,9 @@ function makePolicy(
 			signal: routeAbort.signal,
 			isRescueCommitted: () => false,
 			markRescueCommitted: () => undefined,
+			isRescueActivated: () => false,
+			activatedAt: null,
+			requestStartedAt: startedAt,
 			commitmentDeadlineAt: deadlineAt,
 			getAttemptCommitmentDeadlineAt: (isFinalAttempt) =>
 				isFinalAttempt ? deadlineAt : attemptDeadlineAt,

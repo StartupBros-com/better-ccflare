@@ -11,6 +11,18 @@
  */
 import { priceTokensAtListPrice } from "./value-pricing";
 
+/** The subset of one model's window totals contributed by requests whose
+ * prompt (input + cache read + cache creation) exceeded
+ * LONG_CONTEXT_PROMPT_TOKENS (see ./value-pricing). Same fields and units as
+ * the parent totals; each field is <= the parent's. */
+export interface LongContextTokenSubset {
+	requestCount: number;
+	inputTokens: number;
+	cacheReadInputTokens: number;
+	cacheCreationInputTokens: number;
+	outputTokens: number;
+}
+
 /** One model's token/request totals over some time range — the shape
  * `RequestRepository.aggregateTokensByModel` returns. */
 export interface WindowTokenAggregate {
@@ -20,6 +32,10 @@ export interface WindowTokenAggregate {
 	cacheReadInputTokens: number;
 	cacheCreationInputTokens: number;
 	outputTokens: number;
+	/** Absent only when the split is unknown (a `model_breakdown` stored
+	 * before the split existed); a model with long-context list-price rates
+	 * then prices as `null`. */
+	longContext?: LongContextTokenSubset;
 }
 
 /** Per-model line in a `WindowValuation.modelBreakdown`. `valueUsd` is
@@ -33,6 +49,9 @@ export interface ModelValueBreakdownEntry {
 	cacheCreationInputTokens: number;
 	outputTokens: number;
 	valueUsd: number | null;
+	/** Persisted in `model_breakdown` so re-valuation can re-apply the tier;
+	 * absent on rows written before the split existed. */
+	longContext?: LongContextTokenSubset;
 }
 
 export interface WindowValuation {
@@ -78,6 +97,12 @@ function emptyEntry(): ModelValueBreakdownEntry {
  * `valueUsd` normally. Two aggregate rows for the same model are merged
  * (summed) rather than the later one clobbering the earlier — defensive
  * against a caller that hasn't pre-grouped by model.
+ *
+ * Each row's `longContext` subset (requests over the long-context prompt
+ * threshold) is passed to the pricer so a model with a long-context tier
+ * prices that subset at the tier rates; a row without it prices as `null`
+ * for such a model. Subsets are summed field-wise into the breakdown entry,
+ * which carries `longContext` only if some row for the model had one.
  */
 export function valueWindowAggregates(
 	aggregates: readonly WindowTokenAggregate[],
@@ -99,12 +124,24 @@ export function valueWindowAggregates(
 		outputTokens += item.outputTokens;
 		requestCount += item.requestCount;
 
-		const price = priceTokensAtListPrice(item.model, atMs, {
-			inputTokens: item.inputTokens,
-			cacheReadInputTokens: item.cacheReadInputTokens,
-			cacheCreationInputTokens: item.cacheCreationInputTokens,
-			outputTokens: item.outputTokens,
-		});
+		const price = priceTokensAtListPrice(
+			item.model,
+			atMs,
+			{
+				inputTokens: item.inputTokens,
+				cacheReadInputTokens: item.cacheReadInputTokens,
+				cacheCreationInputTokens: item.cacheCreationInputTokens,
+				outputTokens: item.outputTokens,
+			},
+			item.longContext
+				? {
+						inputTokens: item.longContext.inputTokens,
+						cacheReadInputTokens: item.longContext.cacheReadInputTokens,
+						cacheCreationInputTokens: item.longContext.cacheCreationInputTokens,
+						outputTokens: item.longContext.outputTokens,
+					}
+				: undefined,
+		);
 
 		const entry = modelBreakdown[item.model] ?? emptyEntry();
 		entry.requestCount += item.requestCount;
@@ -112,6 +149,22 @@ export function valueWindowAggregates(
 		entry.cacheReadInputTokens += item.cacheReadInputTokens;
 		entry.cacheCreationInputTokens += item.cacheCreationInputTokens;
 		entry.outputTokens += item.outputTokens;
+		if (item.longContext) {
+			const subset = entry.longContext ?? {
+				requestCount: 0,
+				inputTokens: 0,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0,
+				outputTokens: 0,
+			};
+			subset.requestCount += item.longContext.requestCount;
+			subset.inputTokens += item.longContext.inputTokens;
+			subset.cacheReadInputTokens += item.longContext.cacheReadInputTokens;
+			subset.cacheCreationInputTokens +=
+				item.longContext.cacheCreationInputTokens;
+			subset.outputTokens += item.longContext.outputTokens;
+			entry.longContext = subset;
+		}
 
 		if (price === null) {
 			const modelTotal =

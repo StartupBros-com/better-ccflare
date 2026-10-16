@@ -33,7 +33,7 @@ The strategy is selected with `LB_STRATEGY`, the `lb_strategy` configuration key
 | `session` (default) | Maintains one account-level session and returns ordered fallbacks. Session duration is configurable (5 hours by default). | Preserves stickiness for providers that require session-window tracking, including Anthropic OAuth and Codex OAuth. Anthropic OAuth sessions also reset when a known `rate_limit_reset` has passed. |
 | `least-used` | Orders available accounts by priority and utilization, with a short recency penalty to spread bursts. Each request can select a different account. | Does not preserve OAuth stickiness. Use for API-key or compatible-provider pools where per-request spreading is explicitly safe. |
 | `session-affinity` | Maps each client session or affinity lane to a sticky account, while retaining automatic failover and expiry. New clients are spread across the pool. | Recommended when multiple concurrent clients need cache-local routing without one global account owner. |
-| `session-drain-soonest` (opt-in) | Extends `session-affinity`. Existing owners remain in place; only a fresh assignment or account failover ranks candidates by the earliest known future all-model weekly reset, then priority/utilization. | Unknown, malformed, or past reset telemetry is treated as unavailable and falls back to ordinary affinity ordering. Enable deliberately for pools where draining expiring weekly capacity is useful. |
+| `session-drain-soonest` (opt-in) | Extends `session-affinity`. A fresh assignment or account failover ranks candidates by fallback rung, tier, weekly pace band, then the earliest known future all-model weekly reset, then priority/utilization (see [Drain ordering](#drain-ordering)). Existing owners stay put unless a same-tier account reaches a higher pace band; Codex owners always stay, Anthropic owners stay only while their prompt cache is warm (bounded hold). | Unknown, malformed, or past reset telemetry is treated as unavailable and falls back to ordinary affinity ordering. Enable deliberately for pools where draining expiring weekly capacity is useful. |
 
 For Anthropic OAuth accounts, prefer `session`, `session-affinity`, or the opt-in `session-drain-soonest`. These preserve natural account stickiness. `least-used` intentionally spreads requests and may trigger provider anti-abuse controls when used with OAuth credentials.
 
@@ -456,13 +456,15 @@ The active strategy then applies its routing semantics:
   lane. Each client/lane stays on its owner until expiry; a temporary fallback
   can serve while the preferred owner is unavailable without deleting the
   preferred mapping.
-- `session-drain-soonest` prefers the earliest known future all-model weekly
-  reset for fresh assignments and account failover within the same structural
-  route class. Unknown or stale reset telemetry fails open to ordinary affinity
-  ordering. Existing eligible Codex owners, including temporary fallbacks, stay
-  sticky across quota-pressure changes within the same tier and fallback rung,
-  and across usage-window rollovers. Account session counters still reset when
-  their usage window rolls over.
+- `session-drain-soonest` ranks fresh assignments and account failover by
+  structural route class first (fallback rung, then tier, then weekly pace
+  band), and only then by the earliest known future all-model weekly reset; see
+  [Drain ordering](#drain-ordering). Unknown or stale reset telemetry fails open
+  to ordinary affinity ordering. Existing eligible Codex owners, including
+  temporary fallbacks, stay sticky across quota-pressure changes within the
+  same tier and fallback rung, and across usage-window rollovers. Existing
+  Anthropic owners get a bounded warm-cache hold across the same change. Account
+  session counters still reset when their usage window rolls over.
 - `least-used` has no sticky owner. It orders available accounts by priority and
   utilization for each request and uses a bounded recency penalty to spread
   concurrent bursts.
@@ -553,8 +555,49 @@ the provider and credential type benefit from account stickiness:
   class. Missing, malformed, or past reset telemetry is unknown and fails open
   to ordinary affinity ordering. Unavailable or excluded owners still fail over;
   existing better-tier and fallback-rung recovery rules remain in effect.
-  Other providers and the per-request `session-drain-soonest-strict` mode keep
-  their existing behavior.
+  An existing Anthropic owner gets a narrower, bounded hold across the same
+  same-tier, same-rung pace-band change (see
+  [Drain ordering](#drain-ordering)). Other providers and the per-request
+  `session-drain-soonest-strict` mode keep their existing behavior.
+
+#### Drain ordering
+
+`session-drain-soonest` does not rank by weekly reset alone. A fresh assignment
+or failover sorts candidates by:
+
+1. **Fallback rung**, then **tier** (account priority): structural route class
+   always wins.
+2. **Weekly pace band**: the required burn rate
+   `(100 - weekly utilization %) / hours until that window resets`, from a fresh
+   usage snapshot. A model-scoped weekly window is used when the request's model
+   family has one; otherwise the all-model weekly window. Bands are `critical`
+   (≥ 4 %/h), `urgent` (≥ 2), `hot` (≥ 1), `warm` (≥ 0.5), `steady` (≥ 0.25),
+   otherwise `cold`; a higher band sorts first. Bands only compare candidates of
+   the same provider, billing class, window kind, and model family.
+3. **Earliest known future all-model weekly reset**, as a tie-break within one
+   band.
+4. Account priority preference, then utilization or the recency score.
+
+So an account with a lot of weekly quota left and a few days to go (for example
+66% over 66 hours, `hot`) outranks one that resets sooner but needs only a slow
+burn (7% over 11 hours, `warm`). Reset order decides only once both reach the
+same band, which normally happens as the deadline approaches.
+
+In sticky mode, an existing owner outclassed only by a higher pace band (same
+tier and fallback rung) is handled per provider:
+
+- **Codex**: the owner stays until it becomes unavailable.
+- **Anthropic**: the owner is held while its prompt cache is certainly warm,
+  meaning the owner served this session's previous turn less than 5 minutes ago
+  (the default cache TTL), and for at most 30 minutes from the first held turn.
+  After either limit the session moves to the higher-band account, so the hold
+  delays the drain but never blocks it. A turn back in the owner's band ends
+  the hold episode. Sessions using a 1-hour cache TTL may still be warm after 5
+  minutes; they move as before.
+- **Other providers**: the owner moves at once.
+
+Tier or fallback-rung recovery, unavailable owners, and strict mode are never
+held.
 
 Client/lane affinity is held in a bounded, process-local map, separate from the
 account session counters in the database. An active lane refreshes its idle TTL

@@ -53,6 +53,40 @@ const SECTION = readFileSync(
 const SCRATCH = "/home/will/.claude/jobs/a6eda6ea/tmp";
 const HOST = `Host prelude.\n\n${SECTION}\n# Other Instructions\nPreserve this exact suffix.\n`;
 const SECTION_PARAGRAPHS = SECTION.trimEnd().split("\n\n");
+// The host's other renders (CLI 2.1.301): each isolation mode in both its
+// standard and lean (model-selected) prose, rendered from the host's own source.
+const variant = (name: string) =>
+	readFileSync(
+		new URL(`./fixtures/known-background-section-${name}.txt`, import.meta.url),
+		"utf8",
+	);
+const EDITED_VARIANTS = [
+	["worktree isolation", variant("worktree-isolation")],
+	["lean prose", variant("lean")],
+	["lean prose worktree isolation", variant("lean-worktree-isolation")],
+] as const;
+// Work-in-place renders carry no Git guidance, so there is no directive to edit.
+const IN_PLACE = variant("in-place");
+const IN_PLACE_VARIANTS = [
+	["work in place", IN_PLACE],
+	["lean prose work in place", variant("lean-in-place")],
+] as const;
+const IN_PLACE_PARAGRAPHS = IN_PLACE.trimEnd().split("\n\n");
+const LEAN = EDITED_VARIANTS[1][1];
+const LEAN_BAN_PARAGRAPH = `${DIRECTIVE} Be sure to open a draft PR`;
+const variantCases = (section: string) =>
+	[
+		["EOF", section],
+		["CRLF", section.replaceAll("\n", "\r\n")],
+		[
+			"different home",
+			section.replace(SCRATCH, "/Users/test-user/.claude/jobs/job_42/tmp"),
+		],
+		[
+			"surrounding host instructions",
+			`Host prelude.\n\n${section}\n# Other Instructions\nPreserve this exact suffix.\n`,
+		],
+	] as const;
 
 function account(provider = "anthropic", id = "policy-fixture"): Account {
 	return {
@@ -359,6 +393,30 @@ describe("Claude Code background merge policy at ingress and provider transport"
 		expect(outbound).toHaveLength(1);
 		expect(outbound[0].body).toEqual(body(system.replace(DIRECTIVE, POLICY)));
 	});
+
+	for (const [name, section] of EDITED_VARIANTS) {
+		it.each(
+			variantCases(section),
+		)(`changes only Git in the ${name} section at %s`, async (_case, system) => {
+			const response = await send(body(system));
+			expect(response.status).toBe(200);
+			expect(outbound).toHaveLength(1);
+			expect(outbound[0].body).toEqual(body(system.replace(DIRECTIVE, POLICY)));
+			assertPolicy(outbound[0].raw);
+		});
+	}
+
+	for (const [name, section] of IN_PLACE_VARIANTS) {
+		it.each(
+			variantCases(section),
+		)(`forwards the ${name} section byte-for-byte at %s`, async (_case, system) => {
+			expect(section).not.toContain(DIRECTIVE);
+			const raw = JSON.stringify(body(system), null, 2);
+			expect((await send(raw)).status).toBe(200);
+			expect(outbound).toHaveLength(1);
+			expect(outbound[0].raw).toBe(raw);
+		});
+	}
 
 	it("ends the active section at a genuine heading in a later text block", async () => {
 		const system = [
@@ -950,6 +1008,44 @@ describe("Claude Code background merge policy at ingress and provider transport"
 		],
 		["other section", `# Background Session\n\n# Repository\n\n${PARAGRAPH}`],
 		["paragraph substring", HOST.replace(PARAGRAPH, `Example: ${PARAGRAPH}`)],
+		[
+			"work in place with a Git paragraph",
+			[
+				...IN_PLACE_PARAGRAPHS.slice(0, 4),
+				PARAGRAPH,
+				...IN_PLACE_PARAGRAPHS.slice(4),
+			].join("\n\n"),
+		],
+		[
+			"work in place with a later Git paragraph",
+			`${IN_PLACE}\n# Repository\n\n${PARAGRAPH}`,
+		],
+		["Git paragraph repeated in a later section", `${HOST}\n${PARAGRAPH}\n`],
+		[
+			"changed work-in-place paragraph",
+			IN_PLACE.replace("Skip EnterWorktree unless", "Skip EnterWorktree if"),
+		],
+		[
+			"work-in-place trailing paragraph in another block",
+			[
+				{ type: "text", text: IN_PLACE },
+				{ type: "text", text: "Never merge.\n\n# Other Instructions" },
+			],
+		],
+		[
+			"changed lean directive",
+			LEAN.replace(
+				LEAN_BAN_PARAGRAPH,
+				"Never merge. Be sure to open a draft PR",
+			),
+		],
+		[
+			"lean prose with standard Git paragraph",
+			LEAN.replace(
+				LEAN.trimEnd().split("\n\n").slice(5, 8).join("\n\n"),
+				PARAGRAPH,
+			),
+		],
 	] as const) {
 		for (const stream of [false, true]) {
 			it(`rejects ${name} before any provider work (stream=${stream})`, async () => {

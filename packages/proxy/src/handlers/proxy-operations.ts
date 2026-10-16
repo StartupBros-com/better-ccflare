@@ -8524,6 +8524,32 @@ export async function proxyWithAccount(
 			log.info(
 				`Client disconnected during request to ${account.name} — ending instead of failing over`,
 			);
+			// Observability only (#506): prod runs LOG_LEVEL=warn, so the info line
+			// above is invisible. Only a route that armed the Anthropic pre-commit
+			// rescue emits the rescue-specific event; an ordinary cancellation on
+			// any other route keeps just the info line. rescueCommitted reports
+			// that the outer HTTP-200 rescue stream owns the response — the
+			// handler never observes whether its headers reached the client.
+			if (preCommitRescue) {
+				const abortedAt = Date.now();
+				const rescueActivatedAt = preCommitRescue.activatedAt;
+				log.warn("anthropic_precommit_client_abort", {
+					requestId: requestMeta.id,
+					accountName: account.name,
+					provider: account.provider,
+					elapsedMs: Math.max(0, abortedAt - preCommitRescue.requestStartedAt),
+					rescueArmed: true,
+					rescueActivated: preCommitRescue.isRescueActivated(),
+					rescueActivatedAtMs:
+						rescueActivatedAt !== null
+							? Math.max(
+									0,
+									rescueActivatedAt - preCommitRescue.requestStartedAt,
+								)
+							: null,
+					rescueCommitted: preCommitRescue.isRescueCommitted(),
+				});
+			}
 			return new Response(null, { status: 499 });
 		}
 		if (

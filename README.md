@@ -211,7 +211,12 @@ and `metadata.user_id` cannot enable the setting.
 For native Claude Code `POST /v1/messages` requests, the gateway recognizes one
 complete captured `# Background Session` section in top-level `system`
 instructions, including the introduction, scratch-directory guidance, worktree
-isolation, Git policy and closing report guidance. Only the absolute POSIX
+isolation, Git policy and closing report guidance. Claude Code 2.1.301 renders
+that section in standard or lean prose (chosen per model) and in one of three
+isolation modes: enter a worktree, configured `isolation: worktree`, or work in
+place. All six renders are recognized. Work-in-place renders carry no Git
+guidance and so no merge ban; they are forwarded unchanged, with nothing
+injected. Only the absolute POSIX
 scratch-path slot ending in `.claude/jobs/<job-id>/tmp` may vary, with plain
 ASCII path components and no whitespace, control characters or traversal.
 Other host templates require an explicit compatibility update. The section
@@ -239,8 +244,11 @@ templates split across blocks fail before provider dispatch with HTTP **409**,
 `error.type: "invalid_request_error"`, and
 `error.code: "claude_code_background_merge_policy_incompatible"`. This also applies
 to streaming ingress; the rejection is JSON. The error contains no prompt text
-or credentials, and the policy adds no prompt logging. An operator must review
-the changed host template and update the recognized fixture before re-enabling
+or credentials, and the policy adds no prompt logging. Claude Code shows it as
+`API Error: 409 The Claude Code background template is incompatible with the
+configured merge policy`, and the session keeps failing on every retry until
+the gateway recognizes its template. An operator must review
+the changed host template and update the recognized fixtures before re-enabling
 compatibility; the gateway does not strip instructions or silently fall back to
 the conflicting directive.
 

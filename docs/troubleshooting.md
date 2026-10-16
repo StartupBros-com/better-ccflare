@@ -294,7 +294,7 @@ mix and an idle-vs-traffic RSS comparison on an issue.
 2. Strategy behavior (`packages/core/src/strategy.ts`, `packages/load-balancer/src/strategies/`):
    - `session` (default): One global sticky session per account, duration `SESSION_DURATION_MS` (default 5 hours / 18000000ms, `TIME_CONSTANTS.ANTHROPIC_SESSION_DURATION_DEFAULT`) — not 1 hour.
    - `session-affinity`: Independent per-client sticky affinity instead of one shared global session; see "Parallel sessions causing cache misses" below.
-   - `session-drain-soonest`: Opt-in `session-affinity` variant that additionally drains the account with the soonest all-model weekly reset first.
+   - `session-drain-soonest`: Opt-in `session-affinity` variant that additionally drains by weekly pace band, then the soonest all-model weekly reset; see [Drain ordering](load-balancing.md#drain-ordering).
    - `least-used`: Orders accounts by utilization instead of session stickiness; intended for non-OAuth/API-key pools, not Anthropic OAuth accounts, where per-request spreading risks anti-abuse bans.
    - Full descriptions and use cases: [`docs/configuration.md`](configuration.md#load-balancing-strategy).
 

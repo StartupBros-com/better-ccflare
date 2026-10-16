@@ -6774,3 +6774,192 @@ describe("route candidate identity reconciliation", () => {
 		).toEqual(["combo:c:slot:a0", "combo:c:slot:a1", "combo:c:slot:b"]);
 	});
 });
+
+describe("anthropic_precommit_client_abort observability (#506)", () => {
+	const EVENT = "anthropic_precommit_client_abort";
+	const events: Array<{ msg: string; level?: string; data?: unknown }> = [];
+	const capture = (event: { msg: string; level?: string; data?: unknown }) => {
+		if (event.msg === EVENT) events.push(event);
+	};
+	beforeEach(() => {
+		events.length = 0;
+		logBus.on("log", capture);
+	});
+	afterEach(() => {
+		logBus.off("log", capture);
+	});
+
+	function slowUpstream(
+		started: { resolve: () => void },
+		release?: Promise<void>,
+	): typeof fetch {
+		return mock((input: RequestInfo | URL, init?: RequestInit) => {
+			const signal =
+				init?.signal ?? (input instanceof Request ? input.signal : undefined);
+			started.resolve();
+			return new Promise<Response>((resolve, reject) => {
+				const onAbort = () => reject(new DOMException("aborted", "AbortError"));
+				if (signal?.aborted) return onAbort();
+				signal?.addEventListener("abort", onAbort, { once: true });
+				void release?.then(() => resolve(sseResponse(byteStream(SUCCESS))));
+			});
+		}) as unknown as typeof fetch;
+	}
+
+	async function waitForEvent(): Promise<void> {
+		const deadline = Date.now() + 2000;
+		while (events.length === 0 && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+
+	it("records armed+activated, uncommitted state when the client aborts before the rescue grace", async () => {
+		process.env[RESCUE_ACTIVATION_ENV] = "1000";
+		const account = makeAccount("client-abort-before-grace");
+		const { ctx } = makeContext([account]);
+		let signalStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			signalStarted = resolve;
+		});
+		globalThis.fetch = slowUpstream({ resolve: signalStarted });
+		const clientAbort = new AbortController();
+		const request = makeRequest(clientAbort.signal);
+		const routed = handleProxy(request, new URL(request.url), ctx);
+		routed.catch(() => undefined);
+		await started;
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		clientAbort.abort("client gave up");
+		await waitForEvent();
+
+		expect(events).toHaveLength(1);
+		const event = events[0];
+		expect(event.level).toBe("WARN");
+		const data = event.data as Record<string, unknown>;
+		expect(typeof data.requestId).toBe("string");
+		expect(data.accountName).toBe(account.name);
+		expect(data.provider).toBe("anthropic");
+		expect(data.rescueArmed).toBe(true);
+		expect(data.rescueActivated).toBe(true);
+		expect(data.rescueCommitted).toBe(false);
+		expect(data.elapsedMs).toBeGreaterThanOrEqual(30);
+		expect(data.elapsedMs).toBeLessThan(1000);
+		expect(data.rescueActivatedAtMs).toBeGreaterThanOrEqual(0);
+		expect(data.rescueActivatedAtMs).toBeLessThanOrEqual(
+			data.elapsedMs as number,
+		);
+	});
+
+	/**
+	 * Drive a streaming request past the rescue grace so the outer SSE rescue
+	 * commits, then abort the client while routing is still pending upstream.
+	 * Returns the single captured event's data.
+	 */
+	async function abortAfterCommittedRescue(
+		accountId: string,
+	): Promise<Record<string, unknown>> {
+		process.env[RESCUE_ACTIVATION_ENV] = "20";
+		process.env[RESCUE_PING_ENV] = "5";
+		process.env[RESCUE_DEADLINE_ENV] = "5000";
+		const account = makeAccount(accountId);
+		const { ctx } = makeContext([account]);
+		let signalStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			signalStarted = resolve;
+		});
+		globalThis.fetch = slowUpstream({ resolve: signalStarted });
+		const clientAbort = new AbortController();
+		const request = makeRequest(clientAbort.signal);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		await started;
+		expect(response.headers.get("x-better-ccflare-precommit-rescue")).toBe(
+			"active",
+		);
+		const reader = response.body?.getReader();
+		await reader?.read();
+		clientAbort.abort("client gave up after grace");
+		await waitForEvent();
+		await reader?.cancel("done").catch(() => undefined);
+
+		expect(events).toHaveLength(1);
+		return events[0].data as Record<string, unknown>;
+	}
+
+	it("records committed rescue when the client aborts after the grace", async () => {
+		const data = await abortAfterCommittedRescue("client-abort-after-grace");
+		expect(data.rescueArmed).toBe(true);
+		expect(data.rescueActivated).toBe(true);
+		expect(data.rescueCommitted).toBe(true);
+	});
+
+	it("pro-gate r1 P2-2: the committed-rescue abort event carries rescueCommitted and makes no header-delivery claim", async () => {
+		// markRescueCommitted() fires before the rescue Response is even returned
+		// to the server, so the handler never observes whether headers reached
+		// the client. The event must not dress ownership up as delivery.
+		const data = await abortAfterCommittedRescue(
+			"client-abort-after-grace-no-delivery-claim",
+		);
+		expect(data.rescueCommitted).toBe(true);
+		expect("responseHeadersReturned" in data).toBe(false);
+	});
+
+	it("pro-gate r1 P2-1: a client abort on a route without an armed rescue emits no anthropic_precommit_client_abort", async () => {
+		// stream:false never arms the pre-commit rescue, so proxyWithAccount sees
+		// preCommitRescue === undefined. The 499 exit is still taken (ordinary
+		// client cancellation), but the Anthropic rescue event must stay silent.
+		const account = makeAccount("client-abort-no-rescue-route");
+		const { ctx } = makeContext([account]);
+		let signalStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			signalStarted = resolve;
+		});
+		globalThis.fetch = slowUpstream({ resolve: signalStarted });
+		const clientAbort = new AbortController();
+		const request = makeRequest(clientAbort.signal, undefined, false);
+		const routed = handleProxy(request, new URL(request.url), ctx);
+		await started;
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		clientAbort.abort("client gave up on a non-streaming request");
+		const response = await routed;
+		expect(response.status).toBe(499);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(events).toHaveLength(0);
+	});
+
+	it("emits nothing for a request that completes normally", async () => {
+		const account = makeAccount("client-abort-normal-complete");
+		const { ctx } = makeContext([account]);
+		globalThis.fetch = mock(async () =>
+			sseResponse(byteStream(SUCCESS)),
+		) as unknown as typeof fetch;
+		const request = makeRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		await response.arrayBuffer();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(events).toHaveLength(0);
+	});
+
+	it("emits nothing when the client aborts while a committed response is streaming", async () => {
+		const account = makeAccount("client-abort-mid-stream");
+		const { ctx } = makeContext([account]);
+		const clientAbort = new AbortController();
+		const encoder = new TextEncoder();
+		globalThis.fetch = mock(async () =>
+			sseResponse(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(encoder.encode(SUCCESS.slice(0, 200)));
+					},
+				}),
+			),
+		) as unknown as typeof fetch;
+		const request = makeRequest(clientAbort.signal);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const reader = response.body?.getReader();
+		await reader?.read().catch(() => undefined);
+		clientAbort.abort("client left mid-stream");
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		await reader?.cancel("done").catch(() => undefined);
+		expect(events).toHaveLength(0);
+	});
+});

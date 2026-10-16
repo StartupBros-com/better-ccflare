@@ -287,7 +287,7 @@ describe("family model options", () => {
 			fable: "Claude Fable 5.1",
 			opus: "Claude Opus 5.5",
 			sonnet: "Claude Sonnet 5.5",
-			haiku: "Claude Haiku 4.5",
+			haiku: "Claude Haiku 5.5",
 		};
 
 		for (const family of FAMILIES) {
