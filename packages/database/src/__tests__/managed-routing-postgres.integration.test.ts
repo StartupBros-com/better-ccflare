@@ -10,6 +10,15 @@ import {
 	type RoutingAttemptData,
 	RoutingAttemptRepository,
 } from "../repositories/routing-attempt.repository";
+import {
+	attemptRequest,
+	attemptSummary,
+	expectedA,
+	expectedB,
+	provenanceA,
+	provenanceB,
+	ROUTE_PROVENANCE_COLUMNS,
+} from "./route-provenance.fixture";
 
 const configuredPostgresUrl = process.env.BETTER_CCFLARE_TEST_POSTGRES_URL;
 
@@ -1303,4 +1312,52 @@ describePostgres("managed routing PostgreSQL integration", () => {
 			).rejects.toThrow();
 		});
 	});
+});
+
+describePostgres("route provenance PostgreSQL freeze", () => {
+	for (const upgrade of [false, true]) {
+		it(`keeps the first route provenance on an attempt-summary row on ${upgrade ? "upgraded" : "fresh"} PostgreSQL`, async () => {
+			await withDisposableDatabase(async (adapter) => {
+				await ensureSchemaPg(adapter);
+				if (upgrade) {
+					for (const column of ROUTE_PROVENANCE_COLUMNS)
+						await adapter.unsafe(`ALTER TABLE requests DROP COLUMN ${column}`);
+				}
+				await runMigrationsPg(adapter);
+				const requests = new RequestRepository(adapter);
+				const readRoute = (id: string) =>
+					adapter.get<Record<string, string | null>>(
+						`SELECT ${ROUTE_PROVENANCE_COLUMNS.join(", ")} FROM requests WHERE id = ?`,
+						[id],
+					);
+
+				await requests.save({
+					...attemptRequest,
+					routingAttemptSummary: attemptSummary,
+					routeProvenance: provenanceA,
+				});
+				expect(await readRoute(attemptRequest.id)).toEqual(expectedA);
+				await requests.save({
+					...attemptRequest,
+					routingAttemptSummary: attemptSummary,
+					routeProvenance: provenanceB,
+				});
+				expect(await readRoute(attemptRequest.id)).toEqual(expectedA);
+				await requests.save({
+					...attemptRequest,
+					routingAttemptSummary: attemptSummary,
+				});
+				expect(await readRoute(attemptRequest.id)).toEqual(expectedA);
+
+				// Legacy row (no attempt summary): omitted provenance is preserved,
+				// and a later non-null provenance replaces it.
+				const legacy = { ...attemptRequest, id: "legacy-route" };
+				await requests.save({ ...legacy, routeProvenance: provenanceA });
+				await requests.save(legacy);
+				expect(await readRoute(legacy.id)).toEqual(expectedA);
+				await requests.save({ ...legacy, routeProvenance: provenanceB });
+				expect(await readRoute(legacy.id)).toEqual(expectedB);
+			});
+		});
+	}
 });

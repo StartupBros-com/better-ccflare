@@ -572,6 +572,86 @@ describe("proxyWithAccount — combo override success-conditioning / observabili
 		);
 	});
 
+	it("route metadata headers expose only the documented allowlist and never leak account or candidate ids", async () => {
+		installUsageCollector();
+		globalThis.fetch = mock(async () =>
+			jsonResponse(
+				{
+					id: "msg_route_leak_check",
+					type: "message",
+					role: "assistant",
+					content: [{ type: "text", text: "hi" }],
+					model: "gpt-5.6-terra",
+					stop_reason: "end_turn",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+				200,
+			),
+		);
+		const account = makeTransportMappingAccount();
+		const candidateId = "route-candidate-leakcheck";
+		const bodyBuffer = makeRequestBody("claude-sonnet-5");
+		const requestMeta = makeRequestMeta({
+			routeProfileId: "profile-sol",
+			requestedLogicalModel: "claude-sonnet-5",
+			routingCandidateCatalog: [
+				{
+					candidateId,
+					accountId: account.id,
+					tier: 0,
+					ordinal: 0,
+					comboSlotId: null,
+					modelOverride: "gpt-5.6-terra",
+					quotaPressure: null,
+					routeFallbackRung: "profile_root_model",
+				},
+			],
+		});
+
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			requestMeta,
+			bodyBuffer,
+			() => undefined,
+			3,
+			makeTransportMappingContext("gpt-5.6-terra"),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			undefined,
+			{ routeCandidateId: candidateId },
+		);
+
+		expect(result?.headers.get("x-better-ccflare-route-fallback")).toBe(
+			"profile_root_model",
+		);
+		const routeHeaderNames: string[] = [];
+		const forbidden = [account.id, candidateId];
+		for (const [name, value] of result?.headers.entries() ?? []) {
+			if (/^x-better-ccflare-(route|routed)/.test(name)) {
+				routeHeaderNames.push(name);
+			}
+			for (const secret of forbidden) {
+				expect(name).not.toContain(secret);
+				expect(value).not.toContain(secret);
+			}
+		}
+		expect(routeHeaderNames.sort()).toEqual([
+			"x-better-ccflare-route-fallback",
+			"x-better-ccflare-routed-model",
+		]);
+		const bodyText = (await result?.text()) ?? "";
+		expect(bodyText).toContain("msg_route_leak_check");
+		for (const secret of forbidden) {
+			expect(bodyText).not.toContain(secret);
+		}
+	});
+
 	it("leaves model provenance null when successful physical transport matches the client model", async () => {
 		const handleStart = installUsageCollector();
 		globalThis.fetch = mock(async () =>

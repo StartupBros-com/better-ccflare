@@ -1040,4 +1040,209 @@ describe("SessionDrainSoonestStrategy", () => {
 			expect(active.session_start).toBe(sessionStart);
 		});
 	});
+
+	// Characterization for #523: which strategies implement child route homes.
+	// Without a retain-owner directive, strict mode neither installs nor honors
+	// descendant homes, and those are two halves that must move together.
+	// select() skips the descendant block because selectionAffinityKey() is null
+	// in strict, so routeHomeExpectedCandidateId stays undefined (not null);
+	// commitDescendantAffinityOwner then refuses to install because
+	// `undefined !== null`. Normalizing that field to null would make strict
+	// install homes that select() ignores. A retain-owner directive, which only
+	// the enforcing Anthropic degraded mode publishes for a native Anthropic
+	// OAuth owner, restores the key and so opens the descendant path.
+	describe("descendant child homes", () => {
+		const descendantMeta = (
+			lane: string,
+			candidates: Array<{ id: string; priority?: number }>,
+		): RequestMeta =>
+			({
+				...meta(`client-${lane}`),
+				affinityLaneKey: lane,
+				routeLineage: { kind: "descendant", childHomeKey: `opaque-${lane}` },
+				routingCandidates: candidates.map(({ id, priority = 0 }, ordinal) => ({
+					candidateId: `candidate:${id}`,
+					accountId: id,
+					tier: priority,
+					ordinal,
+					comboSlotId: null,
+					modelOverride: "gpt-synthetic",
+					quotaPressure: null,
+					routeFallbackRung: "profile_requested_model",
+				})),
+			}) as RequestMeta;
+
+		describe("strict", () => {
+			let strict: SessionDrainSoonestStrategy;
+			beforeEach(() => {
+				strict = new SessionDrainSoonestStrategy(undefined, "strict");
+				strict.initialize(store);
+			});
+
+			it("select() skips the descendant block", async () => {
+				const home = makeAccount({
+					id: "acct-home",
+					name: "acct-home",
+					provider: "codex",
+				});
+				const m = descendantMeta("strict-select", [{ id: home.id }]);
+				await strict.select([home], m);
+				expect(m.routeHomeAction).not.toBe("retained");
+				expect(m.routeHomeExpectedCandidateId).toBeUndefined();
+			});
+
+			it("commit installs nothing after a successful turn", async () => {
+				const home = makeAccount({
+					id: "acct-home",
+					name: "acct-home",
+					provider: "codex",
+				});
+				const m = descendantMeta("strict-commit", [{ id: home.id }]);
+				await strict.select([home], m);
+				expect(
+					strict.commitDescendantAffinityOwner(m, {
+						candidateId: `candidate:${home.id}`,
+						accountId: home.id,
+					}),
+				).toBe("none");
+				expect(strict.getRoutingHealth().affinityEntries).toBe(0);
+			});
+
+			it("a Codex window reset neither repins nor reports account_unavailable", async () => {
+				const now = Date.now();
+				const home = makeAccount({
+					id: "acct-home",
+					name: "acct-home",
+					provider: "codex",
+					session_start: now - 2 * 60 * 60 * 1000,
+					session_request_count: 5,
+					rate_limit_reset: now - 60 * 60 * 1000,
+				});
+				const other = makeAccount({
+					id: "acct-other",
+					name: "acct-other",
+					provider: "codex",
+				});
+				const first = descendantMeta("strict-reset", [
+					{ id: home.id },
+					{ id: other.id },
+				]);
+				await strict.select([home, other], first);
+				strict.commitDescendantAffinityOwner(first, {
+					candidateId: `candidate:${home.id}`,
+					accountId: home.id,
+				});
+				// A first turn that picks the home advances its session_start, which
+				// hides the rollover; re-apply it so the second turn sees a reset
+				// Codex window. If strict honored homes, this turn would release the
+				// owner and record account_unavailable.
+				home.session_start = now - 2 * 60 * 60 * 1000;
+				home.rate_limit_reset = now - 60 * 60 * 1000;
+				const next = descendantMeta("strict-reset", [
+					{ id: home.id },
+					{ id: other.id },
+				]);
+				await strict.select([home, other], next);
+				expect(next.routeRepinReason ?? null).toBeNull();
+				expect(next.routeHomeExpectedCandidateId).toBeUndefined();
+				expect(next.routeHomeAction).not.toBe("repinned");
+			});
+
+			it("a retain-owner directive opens the descendant path, so a home installs", async () => {
+				const home = makeAccount({
+					id: "acct-home",
+					name: "acct-home",
+					provider: "anthropic",
+				});
+				const owner = {
+					candidateId: `candidate:${home.id}`,
+					accountId: home.id,
+				};
+				const m = {
+					...descendantMeta("strict-directive", [{ id: home.id }]),
+					affinityOwnerDirective: { kind: "retain-owner", owner },
+				} as RequestMeta;
+				await strict.select([home], m);
+				expect(m.routeHomeExpectedCandidateId).toBeNull();
+				expect(strict.commitDescendantAffinityOwner(m, owner)).toBe(
+					"initial_commit",
+				);
+				expect(strict.getRoutingHealth().affinityEntries).toBe(1);
+			});
+		});
+
+		describe("sticky", () => {
+			it("retains a Codex home across a usage-window reset", async () => {
+				const home = makeAccount({
+					id: "acct-home",
+					name: "acct-home",
+					provider: "codex",
+					priority: 10,
+				});
+				const other = makeAccount({
+					id: "acct-other",
+					name: "acct-other",
+					provider: "codex",
+					priority: 0,
+				});
+				const first = descendantMeta("sticky-reset", [
+					{ id: home.id, priority: 10 },
+					{ id: other.id, priority: 0 },
+				]);
+				await strategy.select([home, other], first);
+				expect(
+					strategy.commitDescendantAffinityOwner(first, {
+						candidateId: `candidate:${home.id}`,
+						accountId: home.id,
+					}),
+				).toBe("initial_commit");
+
+				const now = Date.now();
+				home.session_start = now - 2 * 60 * 60 * 1000;
+				home.rate_limit_reset = now - 60 * 60 * 1000;
+				const next = descendantMeta("sticky-reset", [
+					{ id: home.id, priority: 10 },
+					{ id: other.id, priority: 0 },
+				]);
+				const result = await strategy.select([home, other], next);
+				expect(result[0]?.id).toBe(home.id);
+				expect(next.routeHomeAction).toBe("retained");
+				expect(next.routeRepinReason).toBeNull();
+			});
+
+			it("retains the home when its own priority changes while available", async () => {
+				const home = makeAccount({
+					id: "acct-home",
+					name: "acct-home",
+					provider: "codex",
+					priority: 10,
+				});
+				const other = makeAccount({
+					id: "acct-other",
+					name: "acct-other",
+					provider: "codex",
+					priority: 5,
+				});
+				const first = descendantMeta("sticky-priority", [
+					{ id: home.id, priority: 10 },
+					{ id: other.id, priority: 5 },
+				]);
+				await strategy.select([home, other], first);
+				strategy.commitDescendantAffinityOwner(first, {
+					candidateId: `candidate:${home.id}`,
+					accountId: home.id,
+				});
+
+				home.priority = 20;
+				const next = descendantMeta("sticky-priority", [
+					{ id: home.id, priority: 20 },
+					{ id: other.id, priority: 5 },
+				]);
+				const result = await strategy.select([home, other], next);
+				expect(result[0]?.id).toBe(home.id);
+				expect(next.routeHomeAction).toBe("retained");
+				expect(next.routeRepinReason).toBeNull();
+			});
+		});
+	});
 });
