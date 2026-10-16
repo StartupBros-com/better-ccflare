@@ -380,7 +380,13 @@ export function translateRequestToAnthropic(
 		// literal member of the ResponseItem union has been excluded by the
 		// branches below, `item` itself narrows to `never`, and `never` has no
 		// properties to read from.
-		const itemType = item.type;
+		const itemType: unknown = item.type;
+		if (typeof itemType !== "string") {
+			emitWarn(
+				"Dropping malformed Responses input item — type must be a string",
+			);
+			continue;
+		}
 
 		if (item.type === "message") {
 			const role: unknown = item.role;
