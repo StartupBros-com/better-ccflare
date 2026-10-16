@@ -47,3 +47,4 @@ docs/superpowers/
 docs/plans/
 packages/database/src/inline-integrity-check-worker.ts
 .tmp/
+.context/compound-engineering/

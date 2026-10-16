@@ -128,6 +128,8 @@ affected suites, including any gated behind `DATABASE_URL`. Details:
 
 `docs/solutions/` is the searchable store for documented bugs, practices, and workflow patterns, organized by category and YAML frontmatter (`module`, `tags`, `problem_type`); `CONCEPTS.md` defines shared domain vocabulary. Both are relevant when implementing or debugging in documented areas.
 
+After a solved, verified problem, automatically invoke the `ce-compound` skill with `mode:non-interactive` at the completion checkpoint only when the work produced durable project reasoning that is not readily recoverable from the final code, tests, types, comments, or existing documentation, and losing it would plausibly cause recurrence, material risk, or substantial rediscovery. Apply this counterfactual: if the learning document disappeared, would a future engineer reading the final implementation still be likely to repeat the mistake or redo substantial investigation? If not, do not invoke it. Completion, effort, and diff size alone are not enough. Capture at the checkpoint so a qualifying learning can ship in the PR that produced it, and only where the repository treats captured learnings as tracked, committed knowledge.
+
 ## Git Commits
 - **Before making any changes, run `git status` to check for pre-existing uncommitted changes.** Note which files were already modified so you can distinguish your changes from theirs throughout the session.
 - Use `git add <specific-files>` (not `git add .`) to avoid committing inline-worker.ts
