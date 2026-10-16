@@ -49,6 +49,22 @@ configuration change. A route profile that follows a catalog role admits an acco
 evidence from that account's own catalog, never another account's listing, and refuses an
 account with no current evidence for the role rather than guessing a model.
 
+### Bundled model catalog
+
+The list of Claude model identifiers compiled into the proxy. It is distinct from the live
+catalog a provider reports for an account (see Catalog role).
+
+Offline pricing, list-price eras, model pickers and each family's latest-model alias all read
+the bundled catalog. A model released after the build therefore stays unknown to them until a
+new build ships, even while a provider's live catalog already lists it. The model a request is
+sent with does not depend on bundled-catalog membership, so a well-formed identifier of a known
+family is sent the same way whether or not the catalog lists it (see Same-family pass-through).
+Safeguards that key on known models can still skip it. For example, the optional protection
+that holds back sends during an Anthropic degradation covers only catalogued models and lets
+others through.
+When a request names a model that the bundled catalog lacks, the warning it raises reports
+catalog freshness, not a routing failure.
+
 ### Automatic family
 
 A logical model family on an account that no configuration fixes, so the account serves whatever
@@ -60,6 +76,18 @@ mapping, or a provider-wide override.
 
 Turning a pinned family automatic changes what route-profile checks see even when the served
 model stays the same (see Route profile).
+
+### Same-family pass-through
+
+A combo slot or managed assignment can store only a family name. When it does, this rule sends
+the client's own well-formed model of that family upstream unchanged, instead of rewriting it
+to the family's latest bundled model.
+
+Eligibility is decided by the identifier's shape, not by bundled-catalog membership, so a model
+released after the build passes through from its first request. The rule applies only on the
+live request path and only within one family. A malformed identifier, a cross-family fallback
+slot and a version-pinned account still resolve to the family's latest bundled model. A slot
+that stores a concrete model keeps sending that model.
 
 ### Upstream client identity
 
@@ -320,6 +348,31 @@ thinned — and the response says what was omitted. A budgeted response must be 
 a partial view, because rendering it as a complete one would tell an operator the fleet has
 no data when in fact the read was truncated.
 
+### List-price era
+
+A span of time, starting at a fixed instant, during which one published list price applies to
+a model. The tokens an account used in a closed capacity window (see Canonical usage window) are
+valued at the era in effect, so value history follows rate changes without rewriting earlier
+spans' rates.
+
+A model can have a long-context tier, which bills a whole request at higher rates once its
+prompt passes a threshold. The tier is decided per request, so valuing such a model needs the
+window's tokens split by whether their request crossed the threshold. A per-model total
+without that split is never priced at the base rate. When the era table is revised, closed
+windows are re-priced from the detail they stored when they closed.
+
+### Unpriced tokens
+
+Tokens that a valued window counts but cannot price. This happens when the model has no
+list-price era, the time precedes every era, a needed rate is unknown, or a tiered model's
+long-context split is missing.
+
+They are kept apart from priced value rather than treated as free, so an incomplete window reads
+as incomplete instead of cheap. Re-pricing works only from what a window stored when it closed,
+and nothing rebuilds a closed window from individual requests. As a result, tokens left unpriced
+for lack of a rate or era become priced once one is added, while tokens left unpriced for lack of
+stored detail stay unpriced.
+
 ## Process supervision
 
 ### Memory recycle
@@ -401,6 +454,9 @@ The dispatch fence durably distinguishes a possibly sent inference from work tha
   before a process stops, *Credit drain* spends an account's purchased credits once its plan
   windows are spent, and *Drain-soonest* orders accounts so the multi-day allowance most at
   risk of expiring unused is spent first.
+- *Catalog* names both the bundled model catalog compiled into the proxy and a provider's live
+  catalog for an account, which a catalog role reads. These are distinct: a model can appear in
+  a live catalog while the bundled one still lacks it.
 
 ## Retained ingress and cold backend handoff
 
