@@ -454,6 +454,23 @@ Accepted intent is the durable principal/session preference and revision. A home
 
 The dispatch fence durably distinguishes a possibly sent inference from work that is still safe to select. A storage failure after output retries persistence, never inference. Decision provenance is a bounded sanitized explanation, not a second authority for dispatch: current, pending/in-flight and last successful decisions differ. First-writer request history cannot be overwritten by a late usage update. The historical worker-message naming describes an in-process collector contract, not evidence of an active inference worker thread.
 
+## Ingress policy
+
+### Background merge policy
+
+An opt-in, server-owned policy that rewrites the merge ban in Claude Code's background-session
+instructions into an operator merge grant, and refuses the request when those instructions are
+not a render it recognizes.
+
+Only the complete host-written section counts, and the job's scratch path is its only variable
+part. A recognized render that carries no merge ban is forwarded unchanged and gets no grant.
+When the section's heading or its Git paragraph's opening sentence is present but the section is
+not a recognized render, including a new Claude Code release's wording, the request is refused
+rather than forwarded, so host drift surfaces as an error instead of a silently unedited ban. A
+request carrying neither is forwarded unchanged, so a release that renamed both would pass with
+no grant and no error. The refusal happens before routing and leaves no request history. The
+refusal message calls these instructions the *host template*.
+
 ## Flagged ambiguities
 
 - *Active* on a usage window means "currently binding" only in the shapes that report an
