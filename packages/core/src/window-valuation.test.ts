@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { CLAUDE_MODEL_IDS } from "./models";
 import { LIST_PRICE_ERAS, type ListPriceEra } from "./value-pricing";
 import {
 	valueWindowAggregates,
@@ -199,5 +200,102 @@ describe("valueWindowAggregates", () => {
 		);
 		expect(result.valueUsd).toBeCloseTo(10.2, 10);
 		expect(result.unpricedTokens).toBe(0);
+	});
+});
+
+describe("valueWindowAggregates long-context tier", () => {
+	const HAIKU = CLAUDE_MODEL_IDS.HAIKU_5_5;
+	const HAIKU_AT_MS = Date.parse("2026-10-10T00:00:00Z");
+	const longSubset = {
+		requestCount: 1,
+		inputTokens: 150_000,
+		cacheReadInputTokens: 0,
+		cacheCreationInputTokens: 0,
+		outputTokens: 10_000,
+	};
+
+	beforeEach(() => {
+		LIST_PRICE_ERAS[PRICED_MODEL] = testEra;
+	});
+
+	afterEach(() => {
+		delete LIST_PRICE_ERAS[PRICED_MODEL];
+	});
+
+	it("pro-gate r1 P1: values a 150k-input Haiku 5.5 request at the long-context tier and records the subset", () => {
+		const result = valueWindowAggregates(
+			[
+				agg({
+					model: HAIKU,
+					inputTokens: 150_000,
+					outputTokens: 10_000,
+					longContext: longSubset,
+				}),
+			],
+			HAIKU_AT_MS,
+		);
+		expect(result.valueUsd).toBeCloseTo(0.1, 10);
+		expect(result.unpricedTokens).toBe(0);
+		expect(result.modelBreakdown[HAIKU].longContext).toEqual(longSubset);
+	});
+
+	it("pro-gate r1 P1: merges the subset field-wise across two rows for one model", () => {
+		const result = valueWindowAggregates(
+			[
+				agg({
+					model: HAIKU,
+					inputTokens: 150_000,
+					outputTokens: 10_000,
+					longContext: longSubset,
+				}),
+				agg({
+					model: HAIKU,
+					inputTokens: 120_000,
+					cacheReadInputTokens: 5_000,
+					outputTokens: 2_000,
+					longContext: {
+						requestCount: 2,
+						inputTokens: 120_000,
+						cacheReadInputTokens: 5_000,
+						cacheCreationInputTokens: 0,
+						outputTokens: 2_000,
+					},
+				}),
+			],
+			HAIKU_AT_MS,
+		);
+		expect(result.modelBreakdown[HAIKU].longContext).toEqual({
+			requestCount: 3,
+			inputTokens: 270_000,
+			cacheReadInputTokens: 5_000,
+			cacheCreationInputTokens: 0,
+			outputTokens: 12_000,
+		});
+	});
+
+	it("pro-gate r1 P1: a Haiku 5.5 row without longContext is unpriced, with no longContext key", () => {
+		const result = valueWindowAggregates(
+			[agg({ model: HAIKU, inputTokens: 150_000, outputTokens: 10_000 })],
+			HAIKU_AT_MS,
+		);
+		expect(result.valueUsd).toBe(0);
+		expect(result.unpricedTokens).toBe(160_000);
+		expect(result.modelBreakdown[HAIKU].valueUsd).toBeNull();
+		expect("longContext" in result.modelBreakdown[HAIKU]).toBe(false);
+	});
+
+	it("pro-gate r1 P1: a flat-priced model ignores the subset for pricing but still records it", () => {
+		const result = valueWindowAggregates(
+			[
+				agg({
+					inputTokens: 150_000,
+					outputTokens: 10_000,
+					longContext: longSubset,
+				}),
+			],
+			AT_MS,
+		);
+		expect(result.valueUsd).toBeCloseTo((150_000 * 2 + 10_000 * 10) / 1e6, 10);
+		expect(result.modelBreakdown[PRICED_MODEL].longContext).toEqual(longSubset);
 	});
 });

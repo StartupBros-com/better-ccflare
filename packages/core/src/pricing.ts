@@ -86,6 +86,28 @@ const BUNDLED_PRICING: ApiResponse = {
 					cache_write: 1.25,
 				},
 			},
+			// Haiku 5.5: base rate applies to prompts up to 100,000 tokens; above
+			// that the whole request prices at the tier. Source:
+			// https://platform.claude.com/docs/en/about-claude/pricing
+			[CLAUDE_MODEL_IDS.HAIKU_5_5]: {
+				id: CLAUDE_MODEL_IDS.HAIKU_5_5,
+				name: MODEL_DISPLAY_NAMES[CLAUDE_MODEL_IDS.HAIKU_5_5],
+				cost: {
+					input: 0.1,
+					output: 0.5,
+					cache_read: 0.01,
+					cache_write: 0.125,
+					tiers: [
+						{
+							input: 0.5,
+							output: 2.5,
+							cache_read: 0.05,
+							cache_write: 0.625,
+							tier: { type: "context", size: 100_000 },
+						},
+					],
+				},
+			},
 			[CLAUDE_MODEL_IDS.SONNET_4]: {
 				id: CLAUDE_MODEL_IDS.SONNET_4,
 				name: MODEL_DISPLAY_NAMES[CLAUDE_MODEL_IDS.SONNET_4],

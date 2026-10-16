@@ -1,4 +1,5 @@
 import {
+	type LongContextTokenSubset,
 	VALUE_PRICING_VERSION,
 	valueWindowAggregates,
 	type WindowTokenAggregate,
@@ -34,7 +35,12 @@ const BREAKDOWN_TOKEN_FIELDS = [
 
 /** Rebuilds per-model aggregates, in stored key order, from a stored
  * model_breakdown; null when any entry is not a plain object of finite
- * numbers. Key order matters: it reproduces the original summation order. */
+ * numbers, or carries a `longContext` that is not one. Key order matters: it
+ * reproduces the original summation order. A breakdown stored before the
+ * long-context split exists carries no `longContext`; the aggregate then has
+ * none either, and a model with long-context rates (today Haiku 5.5)
+ * re-prices as unpriced rather than at the base tier (see
+ * `revalueStaleClosedWindows` for why that is permanent). */
 function aggregatesFromBreakdown(
 	breakdown: Record<string, unknown>,
 ): WindowTokenAggregate[] | null {
@@ -47,6 +53,30 @@ function aggregatesFromBreakdown(
 				return null;
 			}
 		}
+		const rawLong = entry.longContext;
+		let longContext: LongContextTokenSubset | undefined;
+		if (rawLong !== undefined) {
+			if (
+				rawLong === null ||
+				typeof rawLong !== "object" ||
+				Array.isArray(rawLong)
+			) {
+				return null;
+			}
+			const sub = rawLong as Record<string, unknown>;
+			for (const field of BREAKDOWN_TOKEN_FIELDS) {
+				if (typeof sub[field] !== "number" || !Number.isFinite(sub[field])) {
+					return null;
+				}
+			}
+			longContext = {
+				requestCount: sub.requestCount as number,
+				inputTokens: sub.inputTokens as number,
+				cacheReadInputTokens: sub.cacheReadInputTokens as number,
+				cacheCreationInputTokens: sub.cacheCreationInputTokens as number,
+				outputTokens: sub.outputTokens as number,
+			};
+		}
 		aggregates.push({
 			model,
 			requestCount: entry.requestCount as number,
@@ -54,6 +84,7 @@ function aggregatesFromBreakdown(
 			cacheReadInputTokens: entry.cacheReadInputTokens as number,
 			cacheCreationInputTokens: entry.cacheCreationInputTokens as number,
 			outputTokens: entry.outputTokens as number,
+			...(longContext ? { longContext } : {}),
 		});
 	}
 	return aggregates;
@@ -289,6 +320,15 @@ export class UsageWindowLedger {
 	 * usage_window_value_drop evaluation waits for the pass to end: mid-pass,
 	 * only the oldest siblings carry the new version, and their median can
 	 * differ from the full re-priced set's.
+	 *
+	 * A breakdown stored before the long-context split exists carries no
+	 * `longContext`; a model with long-context rates (today Haiku 5.5) then
+	 * re-prices as unpriced (`valueUsd: null`, tokens in `unpriced_tokens`)
+	 * rather than at the base tier. Nothing re-derives a closed window from
+	 * the requests table — this pass only re-prices the stored breakdown, and
+	 * `--rebuild-windows` replays snapshots from the open window forward and
+	 * never re-closes a closed row — so such a window stays unpriced (issue
+	 * #520).
 	 */
 	revalueStaleClosedWindows(): Promise<RevalueSummary> {
 		const pass = this.revalueStaleClosedWindowsNow();
