@@ -1342,6 +1342,9 @@ export function resolveImplicitFallbackPolicyConfig(
 export class Config extends EventEmitter {
 	private configPath: string;
 	private data: ConfigData = {};
+	// A failed initial load leaves an incomplete snapshot, even if the file is
+	// later repaired by another process. Only a fresh instance may save it.
+	private initialLoadFailed = false;
 
 	constructor(configPath?: string) {
 		super();
@@ -1364,33 +1367,39 @@ export class Config extends EventEmitter {
 	}
 
 	private loadConfig(): void {
-		if (existsSync(this.configPath)) {
-			try {
-				const content = readFileSync(this.configPath, "utf8");
-				this.data = JSON.parse(content) as ConfigData;
-			} catch (error) {
-				log.error(`Failed to parse config file: ${error}`);
+		try {
+			const content = readFileSync(this.configPath, "utf8");
+			const parsed: unknown = JSON.parse(content);
+			if (!isRecord(parsed)) throw new Error("Config must be an object");
+			this.data = parsed as ConfigData;
+			return;
+		} catch (error) {
+			if (!isRecord(error) || error.code !== "ENOENT") {
+				this.initialLoadFailed = true;
 				this.data = {};
+				// Parser errors can include tokens from the config, including secrets.
+				log.error(
+					"Failed to load config: unreadable or invalid JSON object. Updates are memory-only; the original file is preserved. Repair the file and restart to enable persistence.",
+				);
+				return;
 			}
-		} else {
-			// Create config directory if it doesn't exist
-			const dir = dirname(this.configPath);
-			mkdirSync(dir, { recursive: true });
-
-			// Initialize with default config
-			this.data = {
-				lb_strategy: DEFAULT_STRATEGY,
-			};
-			this.saveConfig();
 		}
+
+		// Only a confirmed missing file gets initialized with defaults.
+		mkdirSync(dirname(this.configPath), { recursive: true });
+		this.data = { lb_strategy: DEFAULT_STRATEGY };
+		this.saveConfig();
 	}
 
-	private saveConfig(): void {
+	private saveConfig(): boolean {
+		if (this.initialLoadFailed) return false;
 		try {
 			const content = JSON.stringify(this.data, null, 2);
 			writeFileSync(this.configPath, content, "utf8");
+			return true;
 		} catch (error) {
 			log.error(`Failed to save config file: ${error}`);
+			return false;
 		}
 	}
 
@@ -1681,16 +1690,22 @@ export class Config extends EventEmitter {
 	}
 
 	/**
-	 * Returns the persisted local-control secret, generating and persisting
-	 * one on first access. Both the server (via AuthService) and the CLI
-	 * (via this same Config, backed by the same on-disk config file) resolve
-	 * to the identical value, so the CLI can authorize its own notify calls
+	 * Returns the local-control secret, generating and persisting one on first
+	 * access. Throws if a failed initial load prevents obtaining a persisted
+	 * secret; a repaired on-disk secret may still be adopted. Both
+	 * the server (via AuthService) and the CLI (via this same Config, backed by
+	 * the same on-disk config file) resolve to the identical value, so the CLI
+	 * can authorize its own notify calls
 	 * to its own locally-running server without ever handling a real API
 	 * key (issue #216).
 	 */
 	getLocalControlSecret(): string {
 		const existing = this.data.local_control_secret;
-		if (typeof existing === "string" && existing.length > 0) {
+		if (
+			!this.initialLoadFailed &&
+			typeof existing === "string" &&
+			existing.length > 0
+		) {
 			return existing;
 		}
 
@@ -1707,18 +1722,32 @@ export class Config extends EventEmitter {
 			return fromDisk;
 		}
 
+		if (this.initialLoadFailed) {
+			throw new Error(
+				"Cannot obtain a persisted local-control secret after config load failure. Repair the config file and restart.",
+			);
+		}
 		const secret = randomUUID();
-		this.set("local_control_secret", secret);
+		this.data.local_control_secret = secret;
+		if (!this.saveConfig()) {
+			// Do not let the cached-secret fast path accept an unsaved key on retry.
+			this.data.local_control_secret = existing;
+			throw new Error("Failed to persist local-control secret.");
+		}
+		this.emit("change", {
+			key: "local_control_secret",
+			oldValue: existing,
+			newValue: secret,
+		});
 		return secret;
 	}
 
 	/**
 	 * Best-effort fresh read of just the local_control_secret field from the
 	 * on-disk config file, bypassing the in-memory `this.data` snapshot.
-	 * Mirrors the existsSync/readFileSync/JSON.parse pattern used by
-	 * loadConfig(), but never mutates `this.data` or writes to disk itself —
-	 * callers decide what to do with the result. Returns undefined on any
-	 * read/parse failure (matching loadConfig()'s log-and-continue behavior).
+	 * Never mutates `this.data`, writes to disk, or changes whether the initial
+	 * snapshot is safe to persist — callers decide what to do with the result.
+	 * Returns undefined on any read/parse failure.
 	 */
 	private readLocalControlSecretFromDisk(): string | undefined {
 		if (!existsSync(this.configPath)) {
@@ -1729,9 +1758,9 @@ export class Config extends EventEmitter {
 			const parsed = JSON.parse(content) as ConfigData;
 			const value = parsed.local_control_secret;
 			return typeof value === "string" && value.length > 0 ? value : undefined;
-		} catch (error) {
+		} catch {
 			log.error(
-				`Failed to re-read config file for local_control_secret: ${error}`,
+				"Failed to re-read config file for local_control_secret: unreadable or invalid JSON.",
 			);
 			return undefined;
 		}
