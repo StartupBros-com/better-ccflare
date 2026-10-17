@@ -389,6 +389,17 @@ and nothing rebuilds a closed window from individual requests. As a result, toke
 for lack of a rate or era become priced once one is added, while tokens left unpriced for lack of
 stored detail stay unpriced.
 
+## Local authentication and recovery
+
+### Local-control secret
+
+A persisted secret shared by an installation's command-line clients and proxy for local
+control requests, also used to derive the encryption key for OAuth rotation recovery records.
+
+Unlike a disposable process-local credential, it must remain available across restarts while
+recovery records depend on it. A newly generated value whose save failed cannot fulfill this
+role, even when ordinary settings are allowed to continue in memory.
+
 ## Process supervision
 
 ### Memory recycle
