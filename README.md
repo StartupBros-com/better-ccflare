@@ -199,6 +199,56 @@ STORE_PAYLOADS=false                   # Disable storing request/response bodies
 - Never commit `.env` files containing sensitive values to version control
 - Use environment-specific configuration for production deployments
 
+#### Optional public subscription value feed
+
+`GET /api/public/subscription-value` is disabled (`404`) unless the server's
+`BETTER_CCFLARE_PUBLIC_SUBSCRIPTIONS` environment variable explicitly enrolls
+accounts. Its value is a JSON array of at most 16 mappings (16 KiB maximum):
+
+```json
+[{"accountId":"<internal-account-id>","accountCreatedAt":1234567890000,"id":"my-weekly-subscription","label":"My weekly subscription"}]
+```
+
+These are placeholders, not enrolled accounts. Set `accountCreatedAt` to the
+account's exact creation timestamp in epoch milliseconds; a replacement account
+with the same ID is unavailable until explicitly enrolled again. Assign `id`
+independently of the internal account ID (never use its hash), and supply an
+explicit plain-text label rather than copying an account name or inferring a plan.
+Invalid, duplicate, or missing-generation mappings fail closed with a generic
+unavailable response. An empty array publishes an empty list.
+
+The fixed version-1 projection contains only `schemaVersion`, `valueBasis`,
+`windowKey`, `generatedAt`, and `subscriptions`. Each subscription exposes its
+public `id` and `label`, `sourceObservedAt`, one `current` window (or null), and up
+to eight newest `completed` windows. Window fields are only `startedAt`,
+`resetsAt`, `closedAt`, `valueUsd`, `pricingCoverage`, and
+`partialFirstObservation`. Timestamps are epoch milliseconds. Account IDs,
+providers, token counts, models, utilization, and credentials are never published.
+Query parameters cannot select accounts or history; admin routes retain their
+authentication requirements.
+
+Values reuse the window ledger's API-equivalent USD pricing, with completed
+values persisted and current values calculated at the window's grant-time prices.
+This is a counterfactual list-price value, not savings, ROI, subscription cost,
+actual bills, or plan capacity. Coverage includes only captured plan-billed
+`/v1/messages` traffic. First-observation windows and unpriced traffic make values
+partial or lower bounds; zero remains meaningful and missing valuation stays null.
+Expired unclosed rows are omitted from `current`, never relabeled completed.
+Because historical ledger rows have no account-generation field, rows starting
+before the enrolled account's creation are conservatively omitted; this can also
+omit a legitimate first-observation window that spans account creation.
+
+`generatedAt` is valuation generation time, not source freshness.
+`sourceObservedAt` is the latest usable persisted quota/window observation, or
+null; observations up to five seconds ahead of the server clock are tolerated.
+Codex observations can arrive through free `wham/usage` introspection polling
+(which consumes no model quota) as well as real traffic. An observation's age
+alone does not establish an ingestion outage. Responses use
+`Cache-Control: no-store`. The server coalesces concurrent reads and caches
+valuations for at most 60 seconds, stopping at the current reset boundary; config,
+generation, observation, and bounded ledger metadata checks invalidate stale
+entries. Revocation is checked on every request, and errors never serve stale data.
+
 #### Claude Code background merge policy
 
 This server-owned policy is **off by default**. An operator can enable it with

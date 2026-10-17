@@ -134,6 +134,7 @@ import {
 	createQwenDeviceFlowStatusHandler,
 	createQwenReauthHandler,
 } from "./handlers/oauth";
+import { createPublicSubscriptionValueHandler } from "./handlers/public-subscription-value";
 import {
 	handleQualityControl,
 	isQualityControlPath,
@@ -272,6 +273,9 @@ export class APIRouter {
 		const analyticsHandler = createAnalyticsHandler(this.context);
 		const usageHistoryHandler = createUsageHistoryHandler(this.context);
 		const usageWindowsHandler = createUsageWindowsHandler(this.context);
+		const publicSubscriptionValueHandler = createPublicSubscriptionValueHandler(
+			this.context,
+		);
 		const cacheInsightsHandler = createCacheInsightsHandler(this.context);
 		const cacheParityHandler = createCacheParityHandler(this.context);
 		const anomalyInsightsHandler = createAnomalyInsightsHandler(this.context);
@@ -544,6 +548,9 @@ export class APIRouter {
 		this.handlers.set("GET:/api/usage-windows", (_req, url) =>
 			usageWindowsHandler(url.searchParams),
 		);
+		this.handlers.set("GET:/api/public/subscription-value", () =>
+			publicSubscriptionValueHandler(),
+		);
 		this.handlers.set("GET:/api/insights/cache", (_req, url) =>
 			cacheInsightsHandler(url.searchParams),
 		);
@@ -742,6 +749,24 @@ export class APIRouter {
 		const handler = this.handlers.get(key);
 		if (handler) {
 			return await this.wrapHandler(handler)(req, url);
+		}
+
+		// Reserve the public namespace terminally. An unmatched method/path
+		// must never reach server.ts's inference proxy fallback, even when
+		// API-key authentication is disabled during local bootstrap.
+		if (path === "/api/public" || path.startsWith("/api/public/")) {
+			return Response.json(
+				{ error: "Not found" },
+				{
+					status: path === "/api/public/subscription-value" ? 405 : 404,
+					headers: {
+						"Cache-Control": "no-store",
+						...(path === "/api/public/subscription-value"
+							? { Allow: "GET" }
+							: {}),
+					},
+				},
+			);
 		}
 
 		// Check for dynamic request payload endpoint

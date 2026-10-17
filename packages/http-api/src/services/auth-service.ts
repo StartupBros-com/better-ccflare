@@ -313,6 +313,12 @@ export class AuthService {
 	 * (does not require async DB check)
 	 */
 	isStaticPathExempt(path: string, method?: string): boolean {
+		// Publication is opt-in inside the handler. Only this exact read is
+		// public; siblings and every other method retain normal authentication.
+		if (path === "/api/public/subscription-value" && method === "GET") {
+			return true;
+		}
+
 		// Health endpoint is always exempt. The shared classifier keeps this exact
 		// so dashboard routing cannot silently claim a broader health prefix.
 		if (classifyAuthPath(path) === "health") {
