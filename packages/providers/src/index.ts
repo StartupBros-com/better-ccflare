@@ -82,6 +82,10 @@ import { ZaiProvider } from "./providers/zai/provider";
 // Auto-register built-in providers
 import { registry } from "./registry";
 
+// Type-only, so callers that need CodexProvider's concrete method signatures
+// (advisor emulation's hosted dispatch) gain no runtime import of the class.
+export type { CodexProvider };
+
 registry.registerProvider(new AlibabaCodingPlanProvider());
 registry.registerProvider(new AnthropicProvider());
 registry.registerProvider(new CodexProvider());

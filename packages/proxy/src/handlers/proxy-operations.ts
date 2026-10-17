@@ -6,6 +6,7 @@ import {
 	getModelFamily,
 	getModelList,
 	getOverloadRetryConfig,
+	isCodexOAuthAccount,
 	isFirstPartyAnthropicAccount,
 	isOfficialXaiEndpoint,
 	isUsageExhausted,
@@ -23,6 +24,7 @@ import { Logger } from "@better-ccflare/logger";
 import { stripCacheControlFromOpenAIRequest } from "@better-ccflare/openai-formats";
 import type {
 	CodexModelContextSnapshot,
+	CodexProvider,
 	Provider,
 	ProviderAttemptPlan,
 } from "@better-ccflare/providers";
@@ -78,9 +80,20 @@ import {
 } from "@better-ccflare/types/routing-recovery";
 import { assertManagedWorkAvailable } from "../../../../scripts/ccflare-managed-timing.mjs";
 import {
+	createAdvisorEmulationDispatch,
+	createAdvisorEmulationStream,
+	deriveInternalRequestId,
+	type InternalDispatchRequest,
+	isAdvisorEmulationAdmitted,
+	projectAdvisorHistoryForCodex,
+	rewriteAdvisorDeclaration,
+} from "../advisor-emulation";
+import {
 	isAdvisorResultUnprocessableMessage,
 	mayContainAdvisorResult,
+	mayContainEmulatedAdvisorBlock,
 	stripAllAdvisorResults,
+	stripEmulatedAdvisorResults,
 	stripForeignAdvisorResults,
 } from "../advisor-result-ownership";
 import { isNativeAnthropicOAuthDegradedModeEligible } from "../anthropic-degraded-eligibility";
@@ -2682,7 +2695,8 @@ export async function proxyWithAccount(
 	// site missed, hence error level. Runs before any refresh, transform or fetch.
 	if (
 		requestMeta.nativeAnthropicToolRequirement &&
-		!isFirstPartyAnthropicAccount(account)
+		!isFirstPartyAnthropicAccount(account) &&
+		!isAdvisorEmulationAdmitted(requestMeta, account)
 	) {
 		log.error(
 			`Advisor dispatch backstop: refusing non-first-party account ${account.id} (${account.provider}) for a native Anthropic tool requirement; a selection site missed it`,
@@ -3224,24 +3238,71 @@ export async function proxyWithAccount(
 		// Advisor results are encrypted and bound to the Anthropic account that
 		// produced them. Replaying another account's results (failover, session
 		// move) is a deterministic upstream 400, so drop foreign ones per attempt.
+		// Emulated pairs (minted by this proxy for Codex routes) were never
+		// produced by Anthropic at all, so they are stripped here unconditionally.
 		if (
 			isFirstPartyAnthropicAccount(account) &&
 			effectiveBodyBuffer &&
-			mayContainAdvisorResult(effectiveBodyBuffer)
+			(mayContainAdvisorResult(effectiveBodyBuffer) ||
+				mayContainEmulatedAdvisorBlock(effectiveBodyBuffer))
 		) {
 			const parsedBody = effectiveBodyContext.getParsedJson();
-			const stripped = parsedBody
-				? stripForeignAdvisorResults(parsedBody, account.id)
+			const emulatedStrip = parsedBody
+				? stripEmulatedAdvisorResults(parsedBody)
 				: null;
+			const afterEmulated = emulatedStrip?.body ?? parsedBody;
+			const stripped = afterEmulated
+				? stripForeignAdvisorResults(afterEmulated, account.id)
+				: null;
+			if (emulatedStrip) {
+				log.info(
+					`Stripped ${emulatedStrip.strippedResults} emulated advisor result(s) for first-party account ${account.name}`,
+				);
+			}
 			if (stripped) {
 				log.info(
 					`Stripped ${stripped.strippedResults} foreign advisor result(s) (${stripped.thinkingStrippedMessages} message(s) had thinking removed) for account ${account.name}`,
 				);
+			}
+			const nextBody = stripped?.body ?? emulatedStrip?.body ?? null;
+			if (nextBody) {
 				effectiveBodyContext = RequestBodyContext.fromParsed(
 					effectiveBodyBuffer,
-					stripped.body,
+					nextBody,
 				);
 				effectiveBodyBuffer = effectiveBodyContext.getBuffer();
+			}
+		}
+
+		// Advisor emulation (hook a): on an admitted Codex OAuth attempt the typed
+		// advisor declaration becomes an ordinary function tool and emulated pairs
+		// in history become ordinary tool_use/tool_result turns, so the provider
+		// transform needs no change. A body without either is forwarded as-is.
+		let advisorEmulationWorkerBody: Record<string, unknown> | null = null;
+		if (
+			requestMeta.advisorEmulation &&
+			isCodexOAuthAccount(account) &&
+			effectiveBodyBuffer
+		) {
+			const parsedBody = effectiveBodyContext.getParsedJson();
+			if (parsedBody) {
+				const rewritten = rewriteAdvisorDeclaration(parsedBody) as Record<
+					string,
+					unknown
+				> | null;
+				const projected = projectAdvisorHistoryForCodex(
+					rewritten ?? parsedBody,
+				);
+				const nextBody = projected ?? rewritten;
+				if (nextBody) {
+					effectiveBodyContext = RequestBodyContext.fromParsed(
+						effectiveBodyBuffer,
+						nextBody,
+					);
+					effectiveBodyBuffer = effectiveBodyContext.getBuffer();
+				}
+				// Only a request that still declares the tool can ask for advice.
+				if (rewritten) advisorEmulationWorkerBody = nextBody ?? rewritten;
 			}
 		}
 
@@ -8135,6 +8196,127 @@ export async function proxyWithAccount(
 				}
 				return null;
 			}
+		}
+
+		// Advisor emulation (hook b): splice advisor rounds into the committed
+		// Anthropic SSE of an admitted Codex attempt. This sits before
+		// processProxyResponse and forwardToClient so the usage collector, the
+		// usage clone and the client all read the same spliced bytes.
+		if (
+			advisorEmulationWorkerBody &&
+			requestMeta.advisorEmulation &&
+			response.ok &&
+			response.body &&
+			(response.headers.get("content-type") ?? "").includes("text/event-stream")
+		) {
+			const emulationDecision = requestMeta.advisorEmulation;
+			// Admission only reaches here for a Codex OAuth account, so the
+			// resolved provider is CodexProvider; its real signatures (hosted
+			// options included) are checked at both internal calls below.
+			const emulationProvider = provider as CodexProvider;
+			// One Anthropic body through the SAME provider and account. No attempt
+			// loop, failover, affinity write, turn-state or stampCodexAttempt: the
+			// hosted options keep the provider from registering any of that.
+			const sendAdvisorInternal = async (
+				internal: InternalDispatchRequest,
+			): Promise<Response> => {
+				const internalRequestId = deriveInternalRequestId(
+					requestMeta.id,
+					internal.kind,
+					internal.ordinal,
+				);
+				const internalHeaders = prepareAttemptHeaders(attemptPlan);
+				internalHeaders.set("x-better-ccflare-request-id", internalRequestId);
+				if (internal.finalModel) {
+					internalHeaders.set(
+						"x-better-ccflare-final-model",
+						internal.finalModel,
+					);
+				} else {
+					internalHeaders.delete("x-better-ccflare-final-model");
+				}
+				internalHeaders.set("content-type", "application/json");
+				internalHeaders.delete("content-length");
+				const internalRequest = await emulationProvider.transformRequestBody(
+					new Request(attemptPlan.targetUrl, {
+						method: "POST",
+						headers: internalHeaders,
+						body: JSON.stringify(internal.body),
+					}),
+					account,
+					undefined,
+					{ hosted: true },
+				);
+				if (isTrustedSyntheticProviderResponse(internalRequest)) {
+					throw new Error("Advisor emulation internal dispatch was refused");
+				}
+				const requestStream = internalRequest.headers.get(
+					"x-better-ccflare-request-stream",
+				);
+				const customTools = internalRequest.headers.get(
+					"x-better-ccflare-codex-custom-tools",
+				);
+				const rawInternal = await makeProxyRequest(
+					sanitizeInternalTransportHeaders(internalRequest),
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					internal.signal,
+				);
+				const taggedHeaders = new Headers(rawInternal.headers);
+				taggedHeaders.set("x-better-ccflare-request-id", internalRequestId);
+				if (internal.finalModel) {
+					taggedHeaders.set(
+						"x-better-ccflare-final-model",
+						internal.finalModel,
+					);
+				}
+				if (requestStream === "true" || requestStream === "false") {
+					taggedHeaders.set("x-better-ccflare-request-stream", requestStream);
+				}
+				if (customTools === "true" || customTools === "false") {
+					taggedHeaders.set("x-better-ccflare-codex-custom-tools", customTools);
+				}
+				taggedHeaders.set("x-better-ccflare-request-path", requestMeta.path);
+				const taggedInternal = new Response(rawInternal.body, {
+					status: rawInternal.status,
+					statusText: rawInternal.statusText,
+					headers: taggedHeaders,
+				});
+				transferResponseDrainTransport(rawInternal, taggedInternal);
+				return emulationProvider.processResponse(
+					taggedInternal,
+					account,
+					req.headers,
+					{ hosted: true },
+				);
+			};
+			const emulationDeps = {
+				...createAdvisorEmulationDispatch({
+					workerBody: advisorEmulationWorkerBody,
+					decision: emulationDecision,
+					cacheKeySeed:
+						requestMeta.clientSessionId ??
+						req.headers.get("x-claude-code-session-id") ??
+						account.id,
+					workerModel: currentTransportModel ?? undefined,
+					send: sendAdvisorInternal,
+				}),
+				signal: req.signal,
+				onEvent: (event: { kind: string }) =>
+					log.debug(`Advisor emulation: ${JSON.stringify(event)}`),
+			};
+			const splicedResponse = new Response(
+				createAdvisorEmulationStream(response.body, emulationDeps),
+				{
+					status: response.status,
+					statusText: response.statusText,
+					headers: response.headers,
+				},
+			);
+			transferResponseDrainTransport(response, splicedResponse);
+			response = splicedResponse;
 		}
 
 		// Check for rate limit using account-specific provider. A terminal response

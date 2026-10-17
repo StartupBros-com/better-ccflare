@@ -30,6 +30,7 @@ const PROFILE_KEYS = new Set([
 	"maxOutputTokens",
 	"clientContextWindowHint",
 	"physicalModelPolicy",
+	"advisorEmulation",
 ]);
 
 const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -69,6 +70,8 @@ export interface ModelRouteProfile {
 	readonly logicalModel: string;
 	readonly defaultEffort?: ModelRouteEffort;
 	readonly expectedProvider?: string;
+	/** Opt in to emulating the Claude Code advisor tool on this Codex route. */
+	readonly advisorEmulation?: boolean;
 	readonly expectedPhysicalModel?: string;
 	/** An account reserved for exact configured route profiles. */
 	readonly exclusiveAccount?: boolean;
@@ -354,6 +357,16 @@ export function parseModelRouteProfiles(
 			index,
 			MAX_PROVIDER_LENGTH,
 		)?.toLowerCase();
+		const advisorEmulation = optionalBoolean(
+			candidate,
+			"advisorEmulation",
+			index,
+		);
+		if (advisorEmulation === true && expectedProvider !== "codex") {
+			throw configError(
+				`profile ${index} advisorEmulation requires expectedProvider ${CATALOG_ROLE_PROVIDER}`,
+			);
+		}
 		const expectedPhysicalModel = optionalString(
 			candidate,
 			"expectedPhysicalModel",
@@ -455,6 +468,7 @@ export function parseModelRouteProfiles(
 			expectedPhysicalModel,
 			// Added only when configured so existing profiles stay byte-identical.
 			...(physicalModelPolicy === undefined ? {} : { physicalModelPolicy }),
+			...(advisorEmulation === undefined ? {} : { advisorEmulation }),
 		};
 		return profile;
 	});
