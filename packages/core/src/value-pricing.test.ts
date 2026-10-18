@@ -146,8 +146,94 @@ describe("priceTokensAtListPrice long-context tier", () => {
 });
 
 describe("priceTokensAtListPrice", () => {
-	it("advances VALUE_PRICING_VERSION for the Haiku 5.5 price table", () => {
-		expect(VALUE_PRICING_VERSION).toBe("2026-10-15.1");
+	it("advances VALUE_PRICING_VERSION for the GPT-6 price table", () => {
+		expect(VALUE_PRICING_VERSION).toBe("2026-10-18.1");
+	});
+
+	describe("OpenAI GPT-6 and GPT-5.6 Sol eras", () => {
+		const D = (s: string) => Date.parse(s);
+		const M = {
+			inputTokens: 1_000_000,
+			cacheReadInputTokens: 1_000_000,
+			cacheCreationInputTokens: 1_000_000,
+			outputTokens: 1_000_000,
+		};
+		const LAUNCH: Record<string, [string, number]> = {
+			"gpt-6-astra": ["2026-09-03T00:00:00Z", 10 + 1 + 12.5 + 50],
+			"gpt-6-sol": ["2026-09-22T00:00:00Z", 2 + 0.2 + 2.5 + 10],
+			"gpt-6-luna": ["2026-09-22T00:00:00Z", 0.1 + 0.01 + 0.125 + 0.5],
+			"gpt-6.1-sol": ["2026-09-29T00:00:00Z", 2 + 0.1 + 2.5 + 10],
+		};
+
+		it("era boundaries: null one ms before launch, priced at launch", () => {
+			for (const [model, [since, total]] of Object.entries(LAUNCH)) {
+				expect(priceTokensAtListPrice(model, D(since) - 1, M)).toBeNull();
+				expect(priceTokensAtListPrice(model, D(since), M)).toBeCloseTo(
+					total,
+					10,
+				);
+			}
+		});
+
+		it("planted negative: gpt-6-sol before 2026-09-22 is unpriced", () => {
+			expect(
+				priceTokensAtListPrice("gpt-6-sol", D("2026-09-21T12:00:00Z"), M),
+			).toBeNull();
+		});
+
+		it("a 200K-prompt gpt-6-sol request prices at standard rates", () => {
+			const req = { inputTokens: 200_000, outputTokens: 10_000 };
+			// even if a stored breakdown carries it as a >100K subset
+			const expected = (200_000 * 2 + 10_000 * 10) / 1_000_000;
+			const at = D("2026-10-01T00:00:00Z");
+			expect(priceTokensAtListPrice("gpt-6-sol", at, req, req)).toBeCloseTo(
+				expected,
+				10,
+			);
+			expect(priceTokensAtListPrice("gpt-6-sol", at, req, {})).toBeCloseTo(
+				expected,
+				10,
+			);
+		});
+
+		it("prices a >272K-prompt OpenAI request at the standard rate (surcharge deliberately not modelled)", () => {
+			// Documented conservative lower bound: see the OpenAI note in value-pricing.ts.
+			expect(
+				priceTokensAtListPrice("gpt-6-astra", D("2026-09-03T00:00:00Z"), {
+					inputTokens: 300_000,
+					outputTokens: 1_000_000,
+				}),
+			).toBeCloseTo((300_000 * 10) / 1e6 + 50, 10);
+		});
+
+		it("OpenAI entries carry no longContext tier", () => {
+			for (const model of [...Object.keys(LAUNCH), "gpt-5.6-sol"]) {
+				for (const era of LIST_PRICE_ERAS[model]) {
+					expect(era.longContext).toBeUndefined();
+				}
+			}
+		});
+
+		it("gpt-5.6-sol: old rate before 2026-08-21, new rate from it", () => {
+			const t = { inputTokens: 1_000_000, outputTokens: 1_000_000 };
+			expect(
+				priceTokensAtListPrice("gpt-5.6-sol", D("2026-08-21T00:00:00Z") - 1, t),
+			).toBeCloseTo(5 + 30, 10);
+			expect(
+				priceTokensAtListPrice("gpt-5.6-sol", D("2026-08-21T00:00:00Z"), t),
+			).toBeCloseTo(4 + 20, 10);
+			expect(
+				priceTokensAtListPrice("gpt-5.6-sol", D("2026-08-21T00:00:00Z"), M),
+			).toBeCloseTo(4 + 0.4 + 5 + 20, 10);
+		});
+
+		it("Anthropic long-context behaviour is unchanged over 100K prompt tokens", () => {
+			const req = { inputTokens: 150_000, outputTokens: 10_000 };
+			expect(priceTokensAtListPrice(HAIKU, LC_AT_MS, req, req)).toBeCloseTo(
+				(150_000 * 0.5 + 10_000 * 2.5) / 1_000_000,
+				10,
+			);
+		});
 	});
 
 	it("has a list-price era for every bundled Claude model id", () => {
