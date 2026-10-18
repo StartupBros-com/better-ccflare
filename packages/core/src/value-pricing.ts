@@ -175,11 +175,12 @@ export const LIST_PRICE_ERAS: Record<string, ListPriceEra[]> = {
 	// global 100K LONG_CONTEXT_PROMPT_TOKENS split, so re-valuation cannot tell a
 	// 100K-272K request (standard rate) from a >272K one. Pricing everything at
 	// standard rates is a conservative lower bound: never overcharge.
-	// Terra/Luna: the pricing page and the 2026-07-30 changelog ("GPT-5.6 Luna
-	// costs 80% less, while GPT-5.6 Terra costs 20% less") agree with the current
-	// eras above; the pre-07-30 rates are not published as figures on the cited
-	// sources, so they are not guessed (the first eras may under-count
-	// 07-09..07-30, never over-count).
+	// Terra/Luna: the current eras above come from models.dev's 'openai' section
+	// and were NOT re-verified against OpenAI's pricing page. The 2026-07-30
+	// changelog ("GPT-5.6 Luna costs 80% less, while GPT-5.6 Terra costs 20%
+	// less") gives no figures, so no pre-07-30 era is recorded (that window may
+	// be mispriced). No cache-write rate is confirmed for either model, so
+	// cache-creation tokens return null (unpriced) rather than a guessed rate.
 	"gpt-6-astra": [
 		{
 			sinceMs: Date.parse("2026-09-03T00:00:00Z"),

@@ -146,7 +146,7 @@ describe("priceTokensAtListPrice long-context tier", () => {
 });
 
 describe("priceTokensAtListPrice", () => {
-	it("advances VALUE_PRICING_VERSION for the Haiku 5.5 price table", () => {
+	it("advances VALUE_PRICING_VERSION for the GPT-6 price table", () => {
 		expect(VALUE_PRICING_VERSION).toBe("2026-10-18.1");
 	});
 
@@ -194,6 +194,16 @@ describe("priceTokensAtListPrice", () => {
 				expected,
 				10,
 			);
+		});
+
+		it("prices a >272K-prompt OpenAI request at the standard rate (surcharge deliberately not modelled)", () => {
+			// Documented conservative lower bound: see the OpenAI note in value-pricing.ts.
+			expect(
+				priceTokensAtListPrice("gpt-6-astra", D("2026-09-03T00:00:00Z"), {
+					inputTokens: 300_000,
+					outputTokens: 1_000_000,
+				}),
+			).toBeCloseTo((300_000 * 10) / 1e6 + 50, 10);
 		});
 
 		it("OpenAI entries carry no longContext tier", () => {
