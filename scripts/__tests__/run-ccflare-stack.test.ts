@@ -1236,25 +1236,29 @@ describe("run-ccflare-stack supervisor lifecycle", () => {
 			RUNNER_RESTART_MAX_FAILURES: "2",
 			RUNNER_RESTART_WINDOW_MS: "1000",
 		});
-		await waitForOutput(
-			runner,
-			"restart circuit open; supervisor paused until operator restart",
-			5_000,
-		);
-		const startsBefore = (
-			runner.getOutput().stdout.match(/starting better-ccflare upstream/g) ?? []
-		).length;
-		expect(startsBefore).toBe(2);
-		expect(runner.child.kill("SIGTERM")).toBe(true);
-		const result = await waitForExit(runner.child, 5_000);
-		await Bun.sleep(50);
-		const output = runner.getOutput();
+		try {
+			await waitForOutput(
+				runner,
+				"restart circuit open; supervisor paused until operator restart",
+				5_000,
+			);
+			const startsBefore = (
+				runner.getOutput().stdout.match(/starting better-ccflare upstream/g) ?? []
+			).length;
+			expect(startsBefore).toBe(2);
+			expect(runner.child.kill("SIGTERM")).toBe(true);
+			const result = await waitForExit(runner.child, 5_000);
+			await Bun.sleep(50);
+			const output = runner.getOutput();
 
-		expect(result.code).toBe(143);
-		expect(
-			(output.stdout.match(/starting better-ccflare upstream/g) ?? []).length,
-		).toBe(startsBefore);
-		expect(output.stdout).toContain("shutdown requested");
+			expect(result.code).toBe(143);
+			expect(
+				(output.stdout.match(/starting better-ccflare upstream/g) ?? []).length,
+			).toBe(startsBefore);
+			expect(output.stdout).toContain("shutdown requested");
+		} finally {
+			await stopRunner(runner);
+		}
 	}, 10_000);
 
 	test("ignores explicit hold under a systemd invocation", async () => {
