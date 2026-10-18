@@ -530,7 +530,7 @@ Publish or unpublish an account on the public subscription value feed (`GET /api
 }
 ```
 
-Errors: `404` unknown account; `400` for malformed JSON or body, a non-boolean `enabled`, a non-string or invalid `label`, a label containing the account name or ID, a missing label on publish, a duplicate label, or a 17th published account (limit 16). A refused request changes nothing. The public `id` is generated server-side and is never returned by admin routes.
+Errors: `404` unknown account; `400` for malformed JSON or body, a non-boolean `enabled`, a non-string or invalid `label`, a label containing the account name or ID, a missing label on publish, a duplicate label, or a 17th published account (limit 16). A refused request changes nothing, including when a concurrent writer takes the last slot or the same label between the check and the write: the database write itself enforces the cap and label uniqueness and the request fails with `400`. An unpublish takes effect on the next feed request in the process that handled the write, and within 5 seconds in any other process sharing the database (which the single-instance-per-database deployment model does not support anyway). The public `id` is generated server-side and is never returned by admin routes.
 
 `GET /api/accounts` returns `publicValueEnabled` and `publicValueLabel` for every account.
 

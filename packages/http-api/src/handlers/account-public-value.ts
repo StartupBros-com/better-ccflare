@@ -19,6 +19,21 @@ import {
 
 const log = new Logger("AccountPublicValueHandler");
 
+const CONFLICT_MESSAGE =
+	"Another published account already uses this label, or the published-account limit was reached";
+
+/** SQLite SQLITE_CONSTRAINT_UNIQUE or PostgreSQL 23505. */
+function isUniqueViolation(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const e = error as { code?: unknown; errno?: unknown; message?: unknown };
+	return (
+		e.code === "SQLITE_CONSTRAINT_UNIQUE" ||
+		e.code === "23505" ||
+		e.errno === "23505" ||
+		(typeof e.message === "string" && /UNIQUE constraint/i.test(e.message))
+	);
+}
+
 /** Opaque, never derived from the account id or name. */
 function generatePublicId(accountId: string, taken: Set<string>): string {
 	const lowerAccountId = accountId.toLowerCase();
@@ -134,15 +149,24 @@ export function createAccountPublicValueHandler(dbOps: DatabaseOperations) {
 				// Invalidate on both sides of the write so a refresh that overlaps it
 				// can neither be cached nor served.
 				bumpPublicRosterGeneration();
+				let changed: boolean;
 				try {
-					await dbOps.setPublicValue(account.id, {
-						enabled,
-						label: effectiveLabel,
-						publicId,
-					});
+					changed = await dbOps.setPublicValue(
+						account.id,
+						{ enabled, label: effectiveLabel, publicId },
+						MAX_PUBLIC_SUBSCRIPTIONS,
+					);
+				} catch (error) {
+					if (isUniqueViolation(error)) changed = false;
+					else throw error;
 				} finally {
 					bumpPublicRosterGeneration();
 				}
+				// The write itself enforces the cap and label uniqueness, so a
+				// refusal means another writer got there first.
+				if (!changed && enabled)
+					return errorResponse(BadRequest(CONFLICT_MESSAGE));
+				if (!changed) return errorResponse(NotFound("Account not found"));
 				return jsonResponse({
 					success: true,
 					publicValueEnabled: enabled,

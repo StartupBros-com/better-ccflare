@@ -336,13 +336,27 @@ describe("public subscription value feed, accounts mode", () => {
 		await addAccount("late", "name-late", 500);
 		await addAccount("early", "name-early", 100);
 		await post("late", { enabled: true, label: "Same" });
+		// The unique index now makes this state unreachable; drop it to model a
+		// legacy database that still holds the duplicate, then restore it.
 		await db
 			.getAdapter()
-			.run(
-				"UPDATE accounts SET public_value_enabled = 1, public_value_label = 'SAME', public_value_id = 'sub-dup0000000000001' WHERE id = 'early'",
-			);
-		// Duplicate labels (case-insensitive) fail the whole feed closed.
-		expect((await feedBody()).status).toBe(503);
+			.run("DROP INDEX idx_accounts_public_value_label_unique");
+		try {
+			await db
+				.getAdapter()
+				.run(
+					"UPDATE accounts SET public_value_enabled = 1, public_value_label = 'SAME', public_value_id = 'sub-dup0000000000001' WHERE id = 'early'",
+				);
+			// Duplicate labels (case-insensitive) fail the whole feed closed.
+			expect((await feedBody()).status).toBe(503);
+		} finally {
+			await db.getAdapter().run("DELETE FROM accounts");
+			await db
+				.getAdapter()
+				.run(
+					"CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_public_value_label_unique ON accounts(lower(public_value_label)) WHERE public_value_enabled = 1",
+				);
+		}
 	});
 
 	it("keeps the public id stable across relabel and republish in the feed", async () => {
@@ -586,5 +600,195 @@ describe("renaming a published account", () => {
 			.run("UPDATE accounts SET name = 'alpha' WHERE id = 'rn-4'");
 		now += 10 * 60 * 1000;
 		expect((await feedBody()).status).toBe(503);
+	});
+});
+
+describe("cross-process roster revalidation", () => {
+	const { ROSTER_RECHECK_MS } = require("../public-subscription-value");
+	function instance(clock: { t: number }) {
+		return createPublicSubscriptionValueHandler(context, {
+			getConfig: () => "accounts",
+			now: () => clock.t,
+			getRosterGeneration: () => 0,
+		});
+	}
+	async function labels(handler: () => Promise<Response>) {
+		const response = await handler();
+		return {
+			status: response.status,
+			labels: ((await response.json()).subscriptions ?? []).map(
+				(s: { label: string }) => s.label,
+			),
+		};
+	}
+
+	it("a second process notices an unpublish within ROSTER_RECHECK_MS, querying at most once per window", async () => {
+		expect(ROSTER_RECHECK_MS).toBe(5000);
+		await addAccount("xp-1", "name-one");
+		expect((await post("xp-1", { enabled: true, label: "Alpha" })).status).toBe(
+			200,
+		);
+		const a = { t: 10_000 };
+		const b = { t: 10_000 };
+		const first = instance(a);
+		const second = instance(b);
+		expect((await labels(first)).labels).toEqual(["Alpha"]);
+		expect((await labels(second)).labels).toEqual(["Alpha"]);
+		// Another process unpublishes: direct write, no generation bump here.
+		await db
+			.getAdapter()
+			.run("UPDATE accounts SET public_value_enabled = 0 WHERE id = 'xp-1'");
+		const read = spyOn(db, "listPublishedPublicValue");
+		try {
+			b.t += 4000;
+			// Documents the bound: inside the window the cache may still be served.
+			expect((await labels(second)).labels).toEqual(["Alpha"]);
+			expect(read).toHaveBeenCalledTimes(0);
+			b.t += 1000;
+			const results = await Promise.all([
+				labels(second),
+				labels(second),
+				labels(second),
+			]);
+			for (const r of results) expect(r.labels).toEqual([]);
+			// One shared recheck, then the refresh's own roster read.
+			expect(read.mock.calls.length).toBeLessThanOrEqual(2);
+			const afterRecheck = read.mock.calls.length;
+			for (let i = 0; i < 5; i++) {
+				b.t += 500;
+				await labels(second);
+			}
+			expect(read.mock.calls.length).toBe(afterRecheck);
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	it("rechecks an unchanged roster at most once per window and keeps serving", async () => {
+		await addAccount("xp-1", "name-one");
+		await post("xp-1", { enabled: true, label: "Alpha" });
+		const clock = { t: 20_000 };
+		const handler = instance(clock);
+		await labels(handler);
+		const read = spyOn(db, "listPublishedPublicValue");
+		try {
+			for (let i = 0; i < 20; i++) {
+				clock.t += 1000;
+				expect((await labels(handler)).labels).toEqual(["Alpha"]);
+			}
+			// 20 s of requests, one recheck per 5 s window.
+			expect(read.mock.calls.length).toBe(4);
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	it("fails closed with 503 when the recheck query throws, never serving the cached body", async () => {
+		await addAccount("xp-1", "name-one");
+		await post("xp-1", { enabled: true, label: "Alpha" });
+		const clock = { t: 30_000 };
+		const handler = instance(clock);
+		expect((await labels(handler)).labels).toEqual(["Alpha"]);
+		const read = spyOn(db, "listPublishedPublicValue").mockRejectedValue(
+			new Error("db down"),
+		);
+		try {
+			clock.t += ROSTER_RECHECK_MS;
+			const response = await handler();
+			expect(response.status).toBe(503);
+			expect(await response.json()).toEqual({ error: "Unavailable" });
+		} finally {
+			read.mockRestore();
+		}
+	});
+});
+
+describe("atomic publish write", () => {
+	async function publishDirect(
+		id: string,
+		label: string,
+		publicId = `sub-${id.padEnd(16, "0")}`,
+	) {
+		return db.setPublicValue(id, { enabled: true, label, publicId });
+	}
+
+	it("refuses a 17th published row and writes nothing", async () => {
+		for (let i = 0; i < 17; i++) await addAccount(`cap-${i}`, `n${i}`);
+		for (let i = 0; i < 16; i++)
+			expect(await publishDirect(`cap-${i}`, `Label ${i}`)).toBe(true);
+		const before = await snapshot();
+		expect(await publishDirect("cap-16", "Label 16")).toBe(false);
+		expect(await snapshot()).toBe(before);
+		// Republishing an already published row is not blocked by the cap.
+		expect(await publishDirect("cap-3", "Relabelled")).toBe(true);
+	});
+
+	it("refuses a case-insensitively duplicate published label and writes nothing", async () => {
+		await addAccount("dup-1", "n1");
+		await addAccount("dup-2", "n2");
+		expect(await publishDirect("dup-1", "Team Alpha")).toBe(true);
+		const before = await snapshot();
+		let outcome: boolean | "threw";
+		try {
+			outcome = await publishDirect("dup-2", "team ALPHA");
+		} catch {
+			outcome = "threw";
+		}
+		expect(outcome === false || outcome === "threw").toBe(true);
+		expect(await snapshot()).toBe(before);
+	});
+
+	it("the database unique index rejects a raw duplicate published label", async () => {
+		await addAccount("dup-1", "n1");
+		await addAccount("dup-2", "n2");
+		const adapter = db.getAdapter();
+		await adapter.run(
+			"UPDATE accounts SET public_value_enabled = 1, public_value_label = 'Same' WHERE id = 'dup-1'",
+		);
+		let threw = false;
+		try {
+			await adapter.run(
+				"UPDATE accounts SET public_value_enabled = 1, public_value_label = 'SAME' WHERE id = 'dup-2'",
+			);
+		} catch {
+			threw = true;
+		}
+		expect(threw).toBe(true);
+	});
+
+	it("returns 400 with nothing written when the pre-check passes but the conditional write refuses", async () => {
+		await addAccount("race-1", "n1");
+		await addAccount("race-2", "n2");
+		expect(
+			(await post("race-1", { enabled: true, label: "Taken" })).status,
+		).toBe(200);
+		const before = await snapshot();
+		// Simulate another process: the pre-check sees an empty roster.
+		const stub = spyOn(db, "listPublishedPublicValue").mockResolvedValue([]);
+		try {
+			const response = await post("race-2", { enabled: true, label: "taken" });
+			expect(response.status).toBe(400);
+			expect(JSON.stringify(await response.json())).toContain(
+				"Another published account already uses this label, or the published-account limit was reached",
+			);
+		} finally {
+			stub.mockRestore();
+		}
+		expect(await snapshot()).toBe(before);
+	});
+
+	it("maps a unique-constraint violation on the write to the same 400", async () => {
+		await addAccount("uv-1", "n1");
+		const stub = spyOn(db, "setPublicValue").mockRejectedValue(
+			Object.assign(new Error("UNIQUE constraint failed: index"), {
+				code: "SQLITE_CONSTRAINT_UNIQUE",
+			}),
+		);
+		try {
+			const response = await post("uv-1", { enabled: true, label: "Any" });
+			expect(response.status).toBe(400);
+		} finally {
+			stub.mockRestore();
+		}
 	});
 });

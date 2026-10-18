@@ -1908,6 +1908,39 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 		}
 	}
 
+	// Mirrors ensurePublicValueLabelUniqueIndex() in migrations.ts: published
+	// labels are unique case-insensitively, enforced by the database. If
+	// duplicates already exist, fail closed (unpublish every row in each
+	// duplicate group, never inherit or merge) and retry once.
+	const createPublicValueLabelIndex = () =>
+		adapter.unsafe(
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_public_value_label_unique
+			 ON accounts (lower(public_value_label)) WHERE public_value_enabled = 1`,
+		);
+	try {
+		await createPublicValueLabelIndex();
+	} catch (error) {
+		const e = error as { code?: string; errno?: string; message?: string };
+		if (
+			e.code !== "23505" &&
+			e.errno !== "23505" &&
+			!/duplicate key|unique/i.test(e.message ?? "")
+		)
+			throw error;
+		const unpublished = await adapter.runWithChanges(
+			`UPDATE accounts SET public_value_enabled = 0
+			 WHERE public_value_enabled = 1 AND lower(public_value_label) IN (
+			   SELECT lower(public_value_label) FROM accounts
+			   WHERE public_value_enabled = 1
+			   GROUP BY lower(public_value_label) HAVING COUNT(*) > 1
+			 )`,
+		);
+		log.warn(
+			`Unpublished ${unpublished} accounts sharing a published public-value label`,
+		);
+		await createPublicValueLabelIndex();
+	}
+
 	// Adding this column with a volatile nextval() DEFAULT forces PostgreSQL to
 	// materialize a distinct value for every legacy row while its DDL lock is
 	// held. It also establishes the atomic generator before another connection

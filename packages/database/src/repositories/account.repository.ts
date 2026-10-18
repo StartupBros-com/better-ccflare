@@ -9,6 +9,9 @@ import { BaseRepository } from "./base.repository";
 
 const log = new Logger("AccountRepository");
 
+/** PostgreSQL advisory-lock key that serializes public-value publishes. */
+const PUBLIC_VALUE_PUBLISH_LOCK_KEY = 536_536;
+
 /**
  * Result of {@link AccountRepository.markAccountRateLimited}. `applied`
  * distinguishes an actually-persisted write from one the 529 forward guard
@@ -630,15 +633,57 @@ export class AccountRepository extends BaseRepository<Account> {
 		);
 	}
 
-	/** Writes the public-value columns together; the caller has validated them. */
+	/**
+	 * Writes the public-value columns together; the caller has validated them.
+	 * Publishing is one conditional UPDATE so the published-account cap and
+	 * case-insensitive label uniqueness are enforced by the database write
+	 * itself, even across processes. Returns false when nothing changed (the
+	 * account is missing or a cap/label condition refused the write).
+	 */
 	async setPublicValue(
 		accountId: string,
 		value: { enabled: boolean; label: string | null; publicId: string | null },
-	): Promise<void> {
-		await this.run(
-			`UPDATE accounts SET public_value_enabled = ?, public_value_label = ?, public_value_id = ? WHERE id = ?`,
-			[value.enabled ? 1 : 0, value.label, value.publicId, accountId],
-		);
+		maxPublished = 16,
+	): Promise<boolean> {
+		if (!value.enabled) {
+			const changes = await this.runWithChanges(
+				`UPDATE accounts SET public_value_enabled = 0, public_value_label = ?, public_value_id = ? WHERE id = ?`,
+				[value.label, value.publicId, accountId],
+			);
+			return changes > 0;
+		}
+		const publish = {
+			sql: `UPDATE accounts SET public_value_enabled = 1, public_value_label = ?, public_value_id = ?
+			 WHERE id = ?
+			 AND (SELECT COUNT(*) FROM accounts WHERE COALESCE(public_value_enabled, 0) = 1 AND id <> ?) < ?
+			 AND NOT EXISTS (SELECT 1 FROM accounts WHERE COALESCE(public_value_enabled, 0) = 1 AND id <> ? AND lower(public_value_label) = lower(?))`,
+			params: [
+				value.label,
+				value.publicId,
+				accountId,
+				accountId,
+				maxPublished,
+				accountId,
+				value.label,
+			],
+		};
+		if (this.adapter.isSQLite) {
+			// SQLite has one writer per database, and a write whose read snapshot
+			// went stale fails with SQLITE_BUSY_SNAPSHOT instead of committing.
+			return (await this.runWithChanges(publish.sql, publish.params)) > 0;
+		}
+		// Under READ COMMITTED two publishes of different rows do not block each
+		// other, so both COUNT subqueries can see the pre-publish roster and the
+		// cap overshoots. The transaction-scoped lock queues every publish on
+		// the same reserved connection as its UPDATE, whose fresh statement
+		// snapshot then sees the previous publish. Released at commit.
+		const [, changes] = await this.adapter.runBatchWithChanges([
+			{
+				sql: `SELECT pg_advisory_xact_lock(${PUBLIC_VALUE_PUBLISH_LOCK_KEY})`,
+			},
+			publish,
+		]);
+		return (changes ?? 0) > 0;
 	}
 
 	async setBillingType(

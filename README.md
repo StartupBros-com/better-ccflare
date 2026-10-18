@@ -279,8 +279,12 @@ action next to a published account changes its label.
   (`503`) if a stored label ever contains the account name.
 - A replaced account (deleted and re-added, even under the same name) starts
   unpublished and must be published again.
-- Changes made in the dashboard reach the feed on the next request; deletes
-  made directly in the database are picked up when the cached response expires.
+- Publishing and unpublishing take effect on the next request in the process
+  that handled the write, and within 5 seconds in any other process sharing the
+  database (which the single-instance-per-database deployment model does not
+  support anyway). The 16-account cap and label uniqueness are enforced by the
+  database write itself. Changes made directly in the database are also picked
+  up within 5 seconds.
 - Zero published accounts returns `200` with an empty list. The feed response
   shape is unchanged.
 

@@ -1504,8 +1504,9 @@ OAuth tokens will need to be re-authenticated.
 	async setPublicValue(
 		accountId: string,
 		value: { enabled: boolean; label: string | null; publicId: string | null },
-	): Promise<void> {
-		await this.accounts.setPublicValue(accountId, value);
+		maxPublished?: number,
+	): Promise<boolean> {
+		return this.accounts.setPublicValue(accountId, value, maxPublished);
 	}
 
 	async setPeakHoursPauseEnabled(

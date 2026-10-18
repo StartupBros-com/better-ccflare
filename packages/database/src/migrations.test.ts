@@ -2349,3 +2349,121 @@ describe("Database Migrations - public_value_* columns", () => {
 		}
 	});
 });
+
+describe("Database Migrations - published label unique index", () => {
+	const INDEX = "idx_accounts_public_value_label_unique";
+	const hasIndex = (db: Database) =>
+		db
+			.prepare(
+				"SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+			)
+			.get(INDEX) as { sql: string } | null;
+
+	it("exists on a fresh DB, is partial and case-insensitive, and is idempotent", () => {
+		const db = new Database(":memory:");
+		try {
+			ensureSchema(db);
+			runMigrations(db);
+			expect(hasIndex(db)?.sql).toContain("lower(public_value_label)");
+			expect(hasIndex(db)?.sql).toContain("public_value_enabled = 1");
+			const insert = db.prepare(
+				"INSERT INTO accounts (id, name, provider, created_at, public_value_enabled, public_value_label) VALUES (?, ?, 'anthropic', 1, ?, ?)",
+			);
+			insert.run("a", "a", 1, "Team");
+			expect(() => insert.run("b", "b", 1, "TEAM")).toThrow(/UNIQUE/);
+			// Unpublished rows may reuse a label.
+			expect(() => insert.run("c", "c", 0, "team")).not.toThrow();
+			expect(() => runMigrations(db)).not.toThrow();
+			expect(hasIndex(db)).not.toBeNull();
+		} finally {
+			db.close();
+		}
+	});
+
+	it("survives the legacy nullable-refresh_token rebuild", () => {
+		const db = new Database(":memory:");
+		try {
+			db.exec(`
+				CREATE TABLE accounts (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					provider TEXT DEFAULT 'anthropic',
+					api_key TEXT,
+					refresh_token TEXT NOT NULL,
+					access_token TEXT,
+					expires_at INTEGER,
+					created_at INTEGER NOT NULL,
+					last_used INTEGER,
+					request_count INTEGER DEFAULT 0,
+					total_requests INTEGER DEFAULT 0
+				)
+			`);
+			db.prepare(
+				"INSERT INTO accounts (id, name, provider, refresh_token, created_at) VALUES ('c1','c1','anthropic','rt',1)",
+			).run();
+			runMigrations(db);
+			expect(hasIndex(db)).not.toBeNull();
+		} finally {
+			db.close();
+		}
+	});
+
+	it("survives the legacy account_tier rebuild", () => {
+		const db = new Database(":memory:");
+		try {
+			db.exec(`
+				CREATE TABLE accounts (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					provider TEXT DEFAULT 'anthropic',
+					api_key TEXT,
+					refresh_token TEXT,
+					access_token TEXT,
+					expires_at INTEGER,
+					created_at INTEGER NOT NULL,
+					last_used INTEGER,
+					request_count INTEGER DEFAULT 0,
+					total_requests INTEGER DEFAULT 0,
+					priority INTEGER DEFAULT 0,
+					billing_type TEXT DEFAULT NULL,
+					account_tier TEXT DEFAULT 'free'
+				)
+			`);
+			db.prepare(
+				"INSERT INTO accounts (id, name, provider, refresh_token, created_at, account_tier) VALUES ('c1','c1','anthropic','',1,'pro')",
+			).run();
+			runMigrations(db);
+			expect(hasIndex(db)).not.toBeNull();
+		} finally {
+			db.close();
+		}
+	});
+
+	it("unpublishes every row of a duplicate published-label group, then builds the index", () => {
+		const db = new Database(":memory:");
+		try {
+			ensureSchema(db);
+			runMigrations(db);
+			db.exec(`DROP INDEX ${INDEX}`);
+			const insert = db.prepare(
+				"INSERT INTO accounts (id, name, provider, created_at, public_value_enabled, public_value_label, public_value_id) VALUES (?, ?, 'anthropic', 1, ?, ?, ?)",
+			);
+			insert.run("d1", "d1", 1, "Same Label", "sub-aaaaaaaaaaaaaaaa");
+			insert.run("d2", "d2", 1, "same label", "sub-bbbbbbbbbbbbbbbb");
+			insert.run("keep", "keep", 1, "Unique", "sub-cccccccccccccccc");
+			insert.run("off", "off", 0, "Same Label", null);
+			runMigrations(db);
+			const state = Object.fromEntries(
+				(
+					db
+						.prepare("SELECT id, public_value_enabled e FROM accounts")
+						.all() as Array<{ id: string; e: number }>
+				).map((r) => [r.id, r.e]),
+			);
+			expect(state).toEqual({ d1: 0, d2: 0, keep: 1, off: 0 });
+			expect(hasIndex(db)).not.toBeNull();
+		} finally {
+			db.close();
+		}
+	});
+});

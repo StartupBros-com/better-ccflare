@@ -38,6 +38,12 @@ interface PublicSubscriptionValue {
 }
 
 const CACHE_MS = 60_000;
+/**
+ * In roster ("accounts") mode a still-valid cached body is revalidated against
+ * the database roster at most once per this interval per process, so a write
+ * made by another process sharing the database is picked up within this bound.
+ */
+export const ROSTER_RECHECK_MS = 5_000;
 /** Source clocks may lead this server by at most five seconds. */
 const CLOCK_SKEW_MS = 5_000;
 const timestamp = (value: number): boolean =>
@@ -112,13 +118,17 @@ export function createPublicSubscriptionValueHandler(
 	const loggedFailures = new Map<string, number>();
 	const refreshes = new Map<
 		string | undefined,
-		Promise<PublicSubscriptionValue>
+		Promise<{ body: PublicSubscriptionValue; signature?: string }>
 	>();
+	let rosterRecheck: Promise<string> | undefined;
 	let cache:
 		| {
 				raw: string | undefined;
 				body: PublicSubscriptionValue;
 				expiresAt: number;
+				/** Roster mode only: identity of the roster this body was built from. */
+				signature?: string;
+				rosterCheckedAt: number;
 		  }
 		| undefined;
 
@@ -151,9 +161,16 @@ export function createPublicSubscriptionValueHandler(
 	 * whole feed closed.
 	 */
 	async function readRoster(): Promise<PublicSubscriptionMapping[]> {
-		const rows = await context.dbOps.listPublishedPublicValue(
-			MAX_PUBLIC_SUBSCRIPTIONS + 1,
+		return validateRosterRows(
+			await context.dbOps.listPublishedPublicValue(
+				MAX_PUBLIC_SUBSCRIPTIONS + 1,
+			),
 		);
+	}
+
+	function validateRosterRows(
+		rows: Awaited<ReturnType<typeof context.dbOps.listPublishedPublicValue>>,
+	): PublicSubscriptionMapping[] {
 		if (rows.length > MAX_PUBLIC_SUBSCRIPTIONS)
 			throw new FeedUnavailable("too_many");
 		const ids = new Set<string>();
@@ -190,12 +207,23 @@ export function createPublicSubscriptionValueHandler(
 		);
 	}
 
+	/** Order-independent identity of a validated roster. */
+	function rosterSignature(mappings: PublicSubscriptionMapping[]): string {
+		return mappings
+			.map((m) =>
+				JSON.stringify([m.accountId, m.id, m.label, m.accountCreatedAt]),
+			)
+			.sort()
+			.join("\n");
+	}
+
 	async function refresh(
 		source: PublicSubscriptionMapping[] | "accounts",
 		at: number,
-	): Promise<PublicSubscriptionValue> {
+	): Promise<{ body: PublicSubscriptionValue; signature?: string }> {
 		const fromRoster = source === "accounts";
 		const mappings = fromRoster ? await readRoster() : source;
+		const signature = fromRoster ? rosterSignature(mappings) : undefined;
 		const subscriptions = await Promise.all(
 			mappings.map(async (mapping) => {
 				const [snapshot, open, closed] = await Promise.all([
@@ -252,11 +280,14 @@ export function createPublicSubscriptionValueHandler(
 			}),
 		);
 		return {
-			schemaVersion: 1,
-			valueBasis: "api_equivalent_usd",
-			windowKey: "seven_day",
-			generatedAt: at,
-			subscriptions,
+			body: {
+				schemaVersion: 1,
+				valueBasis: "api_equivalent_usd",
+				windowKey: "seven_day",
+				generatedAt: at,
+				subscriptions,
+			},
+			signature,
 		};
 	}
 
@@ -289,12 +320,35 @@ export function createPublicSubscriptionValueHandler(
 			const at = now();
 			if (!timestamp(at)) throw new FeedUnavailable("clock");
 			let entry = cache;
-			if (
+			let needsRefresh =
 				!entry ||
 				entry.raw !== key ||
 				at < entry.body.generatedAt ||
-				at >= entry.expiresAt
+				at >= entry.expiresAt;
+			if (
+				!needsRefresh &&
+				entry &&
+				config.status === "accounts" &&
+				entry.signature !== undefined &&
+				at - entry.rosterCheckedAt >= ROSTER_RECHECK_MS
 			) {
+				// One shared, cheap roster query per interval. An error propagates
+				// to the generic 503 path; the cached body is never served stale.
+				let pendingCheck = rosterRecheck;
+				if (!pendingCheck) {
+					pendingCheck = readRoster().then(rosterSignature);
+					rosterRecheck = pendingCheck;
+				}
+				let signature: string;
+				try {
+					signature = await pendingCheck;
+				} finally {
+					if (rosterRecheck === pendingCheck) rosterRecheck = undefined;
+				}
+				if (signature === entry.signature) entry.rosterCheckedAt = at;
+				else needsRefresh = true;
+			}
+			if (needsRefresh) {
 				let pending = refreshes.get(key);
 				if (!pending) {
 					pending = refresh(
@@ -303,18 +357,21 @@ export function createPublicSubscriptionValueHandler(
 					);
 					refreshes.set(key, pending);
 				}
-				let body: PublicSubscriptionValue;
+				let built: { body: PublicSubscriptionValue; signature?: string };
 				try {
-					body = await pending;
+					built = await pending;
 				} finally {
 					if (refreshes.get(key) === pending) refreshes.delete(key);
 				}
 				if (getConfig() !== raw) throw new FeedUnavailable("config_changed");
 				if (config.status === "accounts" && getGeneration() !== generation)
 					throw new FeedUnavailable("roster_changed");
+				const body = built.body;
 				entry = {
 					raw: key,
 					body,
+					signature: built.signature,
+					rosterCheckedAt: at,
 					expiresAt: Math.min(
 						body.generatedAt + CACHE_MS,
 						...body.subscriptions.flatMap((subscription) =>
@@ -323,6 +380,7 @@ export function createPublicSubscriptionValueHandler(
 					),
 				};
 			}
+			if (!entry) throw new FeedUnavailable("expired");
 			const responseAt = now();
 			if (!timestamp(responseAt)) throw new FeedUnavailable("clock");
 			if (responseAt < entry.body.generatedAt || responseAt >= entry.expiresAt)

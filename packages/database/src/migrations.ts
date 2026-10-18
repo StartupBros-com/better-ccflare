@@ -1570,6 +1570,44 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 	}
 }
 
+/**
+ * Case-insensitive uniqueness of published labels, enforced by the database.
+ * Idempotent; called after every accounts-table rebuild path. If duplicate
+ * published labels already exist the index cannot be built, so fail closed:
+ * unpublish every row in each duplicate group (never inherit or merge), then
+ * retry once.
+ */
+export function ensurePublicValueLabelUniqueIndex(db: Database): void {
+	const create = () =>
+		db
+			.prepare(
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_public_value_label_unique
+				 ON accounts(lower(public_value_label)) WHERE public_value_enabled = 1`,
+			)
+			.run();
+	try {
+		create();
+		return;
+	} catch (error) {
+		if (!/UNIQUE constraint|constraint failed/i.test((error as Error).message))
+			throw error;
+	}
+	const unpublished = db
+		.prepare(
+			`UPDATE accounts SET public_value_enabled = 0
+			 WHERE public_value_enabled = 1 AND lower(public_value_label) IN (
+			   SELECT lower(public_value_label) FROM accounts
+			   WHERE public_value_enabled = 1
+			   GROUP BY lower(public_value_label) HAVING COUNT(*) > 1
+			 )`,
+		)
+		.run().changes;
+	log.warn(
+		`Unpublished ${unpublished} accounts sharing a published public-value label`,
+	);
+	create();
+}
+
 export function runMigrations(db: Database, dbPath?: string): void {
 	ensureQualityRouteSchema(db);
 	// Ensure base schema exists first (outside transaction as it creates tables)
@@ -2874,6 +2912,10 @@ export function runMigrations(db: Database, dbPath?: string): void {
 				`Updated ${updateCount} accounts from 'muse-spark' to 'meta' provider`,
 			);
 		}
+
+		// Must follow every accounts-table rebuild above (they drop and recreate
+		// the table with a fixed index list), so it runs on every startup.
+		ensurePublicValueLabelUniqueIndex(db);
 	});
 
 	// Execute the migration transaction
