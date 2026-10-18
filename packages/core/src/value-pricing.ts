@@ -39,7 +39,7 @@ import type { TokenBreakdown } from "./pricing";
  * (UsageWindowLedger.revalueStaleClosedWindows), so history follows the
  * current rates instead of keeping the price it was closed at.
  */
-export const VALUE_PRICING_VERSION = "2026-10-15.1";
+export const VALUE_PRICING_VERSION = "2026-10-18.1";
 
 /**
  * Prompt-token threshold (input + cache read + cache creation, per request)
@@ -149,13 +149,91 @@ export const LIST_PRICE_ERAS: Record<string, ListPriceEra[]> = {
 			outputPerM: 30.0,
 			// source: models.dev 'openai' provider section, gpt-5.6-sol.cost
 			// (input=5, cache_read=0.5, output=30), cross-checked against
-			// /tmp/better-ccflare/models.dev.json on 2026-08-22. OpenAI
-			// announced a >20% Sol price drop on 2026-08-21
-			// (openai.com/index/gpt-5-6); the models.dev snapshot above still
-			// reflects the pre-drop rate as of this seeding, so this stays the
-			// single current era. Add a second era dated 2026-08-21 (not an
-			// edit to this one) once the canonical catalogue reflects the new
-			// rate.
+			// /tmp/better-ccflare/models.dev.json on 2026-08-22. This is the
+			// pre-2026-08-21 rate; the dated era below supersedes it from that day.
+		},
+		{
+			sinceMs: Date.parse("2026-08-21T00:00:00Z"),
+			inputPerM: 4.0,
+			cacheReadPerM: 0.4,
+			cacheCreationPerM: 5.0,
+			outputPerM: 20.0,
+			// source: https://developers.openai.com/api/docs/pricing
+			// "| gpt-5.6-sol | $4.00 | $0.40 | $5.00 | $20.00 | $8.00 | $0.80 | $10.00 | $30.00 |"
+			// and https://developers.openai.com/api/docs/models/gpt-5.6-sol (Input $4,
+			// Cached input $0.4, Output $20; "Cache writes are billed at 1.25x the
+			// uncached input token rate"); changelog 2026-08-21: "GPT-5.6 Sol now
+			// costs $4 per million input tokens and $20 per million output tokens".
+			// Promotional, available "at least through November 21, 2026".
+			// checked 2026-10-18. No longContext: see the OpenAI note below.
+		},
+	],
+
+	// OpenAI's >272K-prompt surcharge (2x input/cache, 1.5x output for the WHOLE
+	// request) is deliberately NOT modelled for any OpenAI entry. A stored
+	// model_breakdown keeps only the subset of tokens from requests over the
+	// global 100K LONG_CONTEXT_PROMPT_TOKENS split, so re-valuation cannot tell a
+	// 100K-272K request (standard rate) from a >272K one. Pricing everything at
+	// standard rates is a conservative lower bound: never overcharge.
+	// Terra/Luna: the pricing page and the 2026-07-30 changelog ("GPT-5.6 Luna
+	// costs 80% less, while GPT-5.6 Terra costs 20% less") agree with the current
+	// eras above; the pre-07-30 rates are not published as figures on the cited
+	// sources, so they are not guessed (the first eras may under-count
+	// 07-09..07-30, never over-count).
+	"gpt-6-astra": [
+		{
+			sinceMs: Date.parse("2026-09-03T00:00:00Z"),
+			inputPerM: 10.0,
+			cacheReadPerM: 1.0,
+			cacheCreationPerM: 12.5,
+			outputPerM: 50.0,
+			// source: https://developers.openai.com/api/docs/pricing
+			// "| gpt-6-astra | $10.00 | $1.00 | $12.50 | $50.00 | $20.00 | $2.00 | $25.00 | $75.00 |"
+			// and https://developers.openai.com/api/docs/models/gpt-6-astra (same base
+			// rates); launch 2026-09-03 per https://developers.openai.com/api/docs/changelog.
+			// checked 2026-10-18.
+		},
+	],
+	"gpt-6-sol": [
+		{
+			sinceMs: Date.parse("2026-09-22T00:00:00Z"),
+			inputPerM: 2.0,
+			cacheReadPerM: 0.2,
+			cacheCreationPerM: 2.5,
+			outputPerM: 10.0,
+			// source: https://developers.openai.com/api/docs/pricing
+			// "| gpt-6-sol | $2.00 | $0.20 | $2.50 | $10.00 | $4.00 | $0.40 | $5.00 | $15.00 |"
+			// and https://developers.openai.com/api/docs/models/gpt-6-sol (same base
+			// rates); launch 2026-09-22 per https://developers.openai.com/api/docs/changelog.
+			// checked 2026-10-18.
+		},
+	],
+	"gpt-6.1-sol": [
+		{
+			sinceMs: Date.parse("2026-09-29T00:00:00Z"),
+			inputPerM: 2.0,
+			cacheReadPerM: 0.1,
+			cacheCreationPerM: 2.5,
+			outputPerM: 10.0,
+			// source: https://developers.openai.com/api/docs/pricing
+			// "| gpt-6.1-sol | $2.00 | $0.10 | $2.50 | $10.00 | $4.00 | $0.20 | $5.00 | $15.00 |"
+			// and https://developers.openai.com/api/docs/models/gpt-6.1-sol (same base
+			// rates); launch 2026-09-29 per https://developers.openai.com/api/docs/changelog.
+			// checked 2026-10-18.
+		},
+	],
+	"gpt-6-luna": [
+		{
+			sinceMs: Date.parse("2026-09-22T00:00:00Z"),
+			inputPerM: 0.1,
+			cacheReadPerM: 0.01,
+			cacheCreationPerM: 0.125,
+			outputPerM: 0.5,
+			// source: https://developers.openai.com/api/docs/pricing
+			// "| gpt-6-luna | $0.10 | $0.01 | $0.125 | $0.50 | $0.20 | $0.02 | $0.25 | $0.75 |"
+			// and https://developers.openai.com/api/docs/models/gpt-6-luna (same base
+			// rates); launch 2026-09-22 per https://developers.openai.com/api/docs/changelog.
+			// checked 2026-10-18.
 		},
 	],
 
