@@ -36,6 +36,18 @@ function generatePublicId(accountId: string, taken: Set<string>): string {
 	throw new Error("Could not generate a public id");
 }
 
+/** True when a public label would reveal the account's name or id. */
+export function labelRevealsAccount(
+	label: string,
+	account: { id: string; name: string },
+): boolean {
+	const lower = label.toLowerCase();
+	return (
+		lower.includes(account.name.toLowerCase()) ||
+		lower.includes(account.id.toLowerCase())
+	);
+}
+
 /** Label rules that depend on the account; the shared validator covers the rest. */
 function labelProblem(
 	label: unknown,
@@ -43,11 +55,7 @@ function labelProblem(
 ): string | null {
 	if (!isValidPublicLabel(label))
 		return "Label must be 1-80 characters with no surrounding whitespace, '<', '>' or control characters";
-	const lower = label.toLowerCase();
-	if (
-		lower.includes(account.name.toLowerCase()) ||
-		lower.includes(account.id.toLowerCase())
-	)
+	if (labelRevealsAccount(label, account))
 		return "Label must not contain the account name or id";
 	return null;
 }

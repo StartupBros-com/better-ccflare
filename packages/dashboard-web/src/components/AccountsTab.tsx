@@ -39,6 +39,10 @@ import {
 	type AccountFamilyRoutingState,
 	getAccountFamilyRoutingStates,
 } from "./accounts/account-routing";
+import {
+	savePublicValue,
+	togglePublicValue,
+} from "./accounts/public-value-actions";
 import { Button } from "./ui/button";
 import {
 	Card,
@@ -660,13 +664,13 @@ export function AccountsTab() {
 	};
 
 	const handlePublicValueToggle = async (account: Account) => {
-		if (!account.publicValueEnabled) {
-			// Turning on needs a public label first.
-			setPublicValueDialog({ account, error: null, isSaving: false });
-			return;
-		}
 		try {
-			await api.setAccountPublicValue(account.id, false);
+			const outcome = await togglePublicValue(account, api);
+			if (outcome.kind === "open-dialog") {
+				// Turning on needs a public label first.
+				setPublicValueDialog({ account, error: null, isSaving: false });
+				return;
+			}
 			await loadAccounts();
 			setActionError(null);
 		} catch (err) {
@@ -682,17 +686,22 @@ export function AccountsTab() {
 		const account = publicValueDialog.account;
 		if (!account) return;
 		setPublicValueDialog((s) => ({ ...s, error: null, isSaving: true }));
-		try {
-			await api.setAccountPublicValue(account.id, true, label);
-			await loadAccounts();
-			setPublicValueDialog({ account: null, error: null, isSaving: false });
-			setActionError(null);
-		} catch (err) {
+		const outcome = await savePublicValue(account, label, api, formatError);
+		if (!outcome.ok) {
 			setPublicValueDialog((s) => ({
 				...s,
-				error: formatError(err),
+				error: outcome.error,
 				isSaving: false,
 			}));
+			return;
+		}
+		// The write succeeded; close the dialog even if the reload fails.
+		setPublicValueDialog({ account: null, error: null, isSaving: false });
+		try {
+			await loadAccounts();
+			setActionError(null);
+		} catch (err) {
+			setActionError(formatError(err));
 		}
 	};
 

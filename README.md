@@ -274,6 +274,9 @@ action next to a published account changes its label.
 - The public `id` is generated (`sub-` plus 16 hex characters), never derived
   from the account name or ID, and stays stable across relabels and
   unpublish/republish.
+- Renaming a published account to a name its public label contains is refused
+  (`400`); change the label or unpublish first. The feed also fails closed
+  (`503`) if a stored label ever contains the account name.
 - A replaced account (deleted and re-added, even under the same name) starts
   unpublished and must be published again.
 - Changes made in the dashboard reach the feed on the next request; deletes
@@ -283,7 +286,7 @@ action next to a published account changes its label.
 
 The JSON array form above remains supported and unchanged.
 
-A replacement account with the same ID is unavailable after the cached response
+In JSON array mode, a replacement account with the same ID is unavailable after the cached response
 expires until explicitly enrolled again with its new creation timestamp. Invalid,
 duplicate, or missing-generation mappings fail closed. Publication is
 all-or-nothing: any failing mapping makes the whole feed return a generic `503`,

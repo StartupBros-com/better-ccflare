@@ -31,6 +31,7 @@ const { isValidPublicId } = await import(
 	"../../services/public-subscriptions-config"
 );
 const { APIRouter } = await import("../../router");
+const { createAccountRenameHandler } = await import("../accounts");
 
 const db = new DatabaseOperations(":memory:");
 const context = { dbOps: db } as APIContext;
@@ -528,5 +529,62 @@ describe("public subscription value feed, accounts mode", () => {
 		} finally {
 			spyRead.mockRestore();
 		}
+	});
+});
+
+describe("renaming a published account", () => {
+	function rename(accountId: string, name: string) {
+		return createAccountRenameHandler(db)(
+			new Request(`http://localhost/api/accounts/${accountId}/rename`, {
+				method: "POST",
+				body: JSON.stringify({ name }),
+			}),
+			accountId,
+		);
+	}
+
+	it("refuses a rename into a name its public label contains, writing nothing", async () => {
+		await addAccount("rn-1", "work");
+		expect(
+			(await post("rn-1", { enabled: true, label: "Team Alpha" })).status,
+		).toBe(200);
+		const before = await snapshot();
+		const generation = getPublicRosterGeneration();
+		const response = await rename("rn-1", "alpha");
+		expect(response.status).toBe(400);
+		expect(await snapshot()).toBe(before);
+		const name = await db
+			.getAdapter()
+			.get<{ name: string }>("SELECT name FROM accounts WHERE id = ?", [
+				"rn-1",
+			]);
+		expect(name?.name).toBe("work");
+		expect(getPublicRosterGeneration()).toBe(generation);
+	});
+
+	it("allows a harmless rename of a published account and invalidates the feed", async () => {
+		await addAccount("rn-2", "work");
+		await post("rn-2", { enabled: true, label: "Team Alpha" });
+		const generation = getPublicRosterGeneration();
+		expect((await rename("rn-2", "other")).status).toBe(200);
+		expect(getPublicRosterGeneration()).toBeGreaterThan(generation);
+	});
+
+	it("allows any rename of an unpublished account", async () => {
+		await addAccount("rn-3", "work");
+		await post("rn-3", { enabled: true, label: "Team Alpha" });
+		await post("rn-3", { enabled: false });
+		expect((await rename("rn-3", "alpha")).status).toBe(200);
+	});
+
+	it("fails the feed closed when a stored label comes to contain the account name", async () => {
+		await addAccount("rn-4", "work");
+		await post("rn-4", { enabled: true, label: "Team Alpha" });
+		expect((await feedBody()).status).toBe(200);
+		await db
+			.getAdapter()
+			.run("UPDATE accounts SET name = 'alpha' WHERE id = 'rn-4'");
+		now += 10 * 60 * 1000;
+		expect((await feedBody()).status).toBe(503);
 	});
 });

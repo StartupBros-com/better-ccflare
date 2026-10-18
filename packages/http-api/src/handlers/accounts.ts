@@ -60,9 +60,13 @@ import type {
 	RateLimitReason,
 } from "@better-ccflare/types";
 import { requiresSessionDurationTracking } from "@better-ccflare/types";
-import { bumpPublicRosterGeneration } from "../services/public-subscription-roster";
+import {
+	bumpPublicRosterGeneration,
+	runExclusiveRosterWrite,
+} from "../services/public-subscription-roster";
 import type { AccountResponse } from "../types";
 import { accountCreatedResponse } from "../utils/account-created-response";
+import { labelRevealsAccount } from "./account-public-value";
 import {
 	computeRateLimitStatusDisplay,
 	getRepresentativeUsageResetMs,
@@ -1283,8 +1287,34 @@ export function createAccountRenameHandler(dbOps: DatabaseOperations) {
 				);
 			}
 
-			// Rename the account
-			dbOps.renameAccount(accountId, newName);
+			// Serialise with public-value writes: a rename must never leave a
+			// published account whose public label reveals its new name.
+			const refused = await runExclusiveRosterWrite(async () => {
+				const current = await dbOps.getAccount(accountId);
+				if (!current) return errorResponse(NotFound("Account not found"));
+				const published = current.public_value_enabled === true;
+				if (
+					published &&
+					(typeof current.public_value_label !== "string" ||
+						labelRevealsAccount(current.public_value_label, {
+							id: current.id,
+							name: newName,
+						}))
+				)
+					return errorResponse(
+						BadRequest(
+							"Cannot rename a published account to a name contained in its public label. Change or unpublish the label first.",
+						),
+					);
+				if (published) bumpPublicRosterGeneration();
+				try {
+					await dbOps.renameAccount(accountId, newName);
+				} finally {
+					if (published) bumpPublicRosterGeneration();
+				}
+				return null;
+			});
+			if (refused) return refused;
 
 			return jsonResponse({
 				success: true,

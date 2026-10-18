@@ -13,6 +13,7 @@ import {
 	valueOpenWindow,
 } from "../services/usage-window-read";
 import type { APIContext } from "../types";
+import { labelRevealsAccount } from "./account-public-value";
 
 interface PublicValueWindow {
 	startedAt: number;
@@ -225,7 +226,9 @@ export function createPublicSubscriptionValueHandler(
 					fromRoster &&
 					(account.public_value_enabled !== true ||
 						account.public_value_label !== mapping.label ||
-						account.public_value_id !== mapping.id)
+						account.public_value_id !== mapping.id ||
+						// A rename can make a stored label reveal the account name.
+						labelRevealsAccount(mapping.label, account))
 				)
 					throw new FeedUnavailable("roster_changed", mapping.id);
 				const observed = snapshot?.timestamp;
