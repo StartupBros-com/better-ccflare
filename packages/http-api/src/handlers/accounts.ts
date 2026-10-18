@@ -60,6 +60,7 @@ import type {
 	RateLimitReason,
 } from "@better-ccflare/types";
 import { requiresSessionDurationTracking } from "@better-ccflare/types";
+import { bumpPublicRosterGeneration } from "../services/public-subscription-roster";
 import type { AccountResponse } from "../types";
 import { accountCreatedResponse } from "../utils/account-created-response";
 import {
@@ -340,6 +341,8 @@ export function createAccountsListHandler(
 			auto_pause_on_overage_enabled: 0 | 1;
 			peak_hours_pause_enabled: 0 | 1;
 			codex_credit_drain_enabled: 0 | 1;
+			public_value_enabled: 0 | 1;
+			public_value_label: string | null;
 			custom_endpoint: string | null;
 			model_mappings: string | null;
 			cross_region_mode: string | null;
@@ -375,6 +378,8 @@ export function createAccountsListHandler(
 					COALESCE(auto_pause_on_overage_enabled, 0) as auto_pause_on_overage_enabled,
 					COALESCE(peak_hours_pause_enabled, 0) as peak_hours_pause_enabled,
 					COALESCE(codex_credit_drain_enabled, 0) as codex_credit_drain_enabled,
+					COALESCE(public_value_enabled, 0) as public_value_enabled,
+					public_value_label,
 
 					model_mappings,
 					cross_region_mode,
@@ -773,6 +778,8 @@ export function createAccountsListHandler(
 						account.auto_pause_on_overage_enabled === 1,
 					peakHoursPauseEnabled: account.peak_hours_pause_enabled === 1,
 					codexCreditDrainEnabled: account.codex_credit_drain_enabled === 1,
+					publicValueEnabled: Number(account.public_value_enabled) === 1,
+					publicValueLabel: account.public_value_label ?? null,
 					codexCreditDrainActive: creditDrainActive,
 					codexCreditDrainServing: creditDrainServing,
 					customEndpoint: account.custom_endpoint,
@@ -1110,6 +1117,10 @@ export function createAccountRemoveHandler(dbOps: DatabaseOperations) {
 			// entry — `stopPolling()` also clears the timer and tracking maps,
 			// otherwise the poll loop keeps rescheduling itself forever.
 			usageCache.stopPolling(accountId);
+
+			// A removed account must leave the public value feed immediately, not
+			// when its 60 s cache entry expires.
+			bumpPublicRosterGeneration();
 
 			// Also clear token-manager state (in-flight refresh, failure/backoff
 			// counters) for the removed account — otherwise it lingers until the
