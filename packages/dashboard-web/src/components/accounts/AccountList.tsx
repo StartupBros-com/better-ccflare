@@ -18,6 +18,8 @@ interface AccountListProps {
 	onBillingTypeToggle: (account: Account) => void;
 	onAutoPauseOnOverageToggle?: (account: Account) => void;
 	onCodexCreditDrainToggle?: (account: Account) => void;
+	onPublicValueToggle?: (account: Account) => void;
+	onPublicValueEditLabel?: (account: Account) => void;
 	onPeakHoursPauseToggle?: (account: Account) => void;
 	onCustomEndpointChange?: (account: Account) => void;
 	onModelMappingsChange?: (account: Account) => void;
@@ -40,6 +42,8 @@ export function AccountList({
 	onBillingTypeToggle,
 	onAutoPauseOnOverageToggle,
 	onCodexCreditDrainToggle,
+	onPublicValueToggle,
+	onPublicValueEditLabel,
 	onPeakHoursPauseToggle,
 	onCustomEndpointChange,
 	onModelMappingsChange,
@@ -70,6 +74,8 @@ export function AccountList({
 					onBillingTypeToggle={onBillingTypeToggle}
 					onAutoPauseOnOverageToggle={onAutoPauseOnOverageToggle}
 					onCodexCreditDrainToggle={onCodexCreditDrainToggle}
+					onPublicValueToggle={onPublicValueToggle}
+					onPublicValueEditLabel={onPublicValueEditLabel}
 					onPeakHoursPauseToggle={onPeakHoursPauseToggle}
 					onCustomEndpointChange={onCustomEndpointChange}
 					onModelMappingsChange={onModelMappingsChange}

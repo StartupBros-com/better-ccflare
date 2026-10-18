@@ -30,6 +30,7 @@ import {
 	AnthropicReauthDialog,
 	CodexReauthDialog,
 	DeleteConfirmationDialog,
+	PublicValueDialog,
 	QwenReauthDialog,
 	RenameAccountDialog,
 } from "./accounts";
@@ -270,6 +271,11 @@ export function AccountsTab() {
 		isOpen: false,
 		account: null,
 	});
+	const [publicValueDialog, setPublicValueDialog] = useState<{
+		account: Account | null;
+		error: string | null;
+		isSaving: boolean;
+	}>({ account: null, error: null, isSaving: false });
 	const [priorityDialog, setPriorityDialog] = useState<{
 		isOpen: boolean;
 		account: Account | null;
@@ -653,6 +659,43 @@ export function AccountsTab() {
 		}
 	};
 
+	const handlePublicValueToggle = async (account: Account) => {
+		if (!account.publicValueEnabled) {
+			// Turning on needs a public label first.
+			setPublicValueDialog({ account, error: null, isSaving: false });
+			return;
+		}
+		try {
+			await api.setAccountPublicValue(account.id, false);
+			await loadAccounts();
+			setActionError(null);
+		} catch (err) {
+			setActionError(formatError(err));
+		}
+	};
+
+	const handlePublicValueEditLabel = (account: Account) => {
+		setPublicValueDialog({ account, error: null, isSaving: false });
+	};
+
+	const handlePublicValueSave = async (label: string) => {
+		const account = publicValueDialog.account;
+		if (!account) return;
+		setPublicValueDialog((s) => ({ ...s, error: null, isSaving: true }));
+		try {
+			await api.setAccountPublicValue(account.id, true, label);
+			await loadAccounts();
+			setPublicValueDialog({ account: null, error: null, isSaving: false });
+			setActionError(null);
+		} catch (err) {
+			setPublicValueDialog((s) => ({
+				...s,
+				error: formatError(err),
+				isSaving: false,
+			}));
+		}
+	};
+
 	const handleCustomEndpointChange = (account: Account) => {
 		setCustomEndpointDialog({ isOpen: true, account });
 	};
@@ -809,6 +852,8 @@ export function AccountsTab() {
 						onBillingTypeToggle={handleBillingTypeToggle}
 						onAutoPauseOnOverageToggle={handleAutoPauseOnOverageToggle}
 						onCodexCreditDrainToggle={handleCodexCreditDrainToggle}
+						onPublicValueToggle={handlePublicValueToggle}
+						onPublicValueEditLabel={handlePublicValueEditLabel}
 						onPeakHoursPauseToggle={handlePeakHoursPauseToggle}
 						onCustomEndpointChange={handleCustomEndpointChange}
 						onModelMappingsChange={handleModelMappingsChange}
@@ -849,6 +894,24 @@ export function AccountsTab() {
 					onClose={() => setRenameDialog({ isOpen: false, account: null })}
 					onRename={handleConfirmRename}
 					isLoading={renameAccount.isPending}
+				/>
+			)}
+
+			{publicValueDialog.account && (
+				<PublicValueDialog
+					isOpen
+					accountName={publicValueDialog.account.name}
+					initialLabel={publicValueDialog.account.publicValueLabel ?? ""}
+					error={publicValueDialog.error}
+					isLoading={publicValueDialog.isSaving}
+					onClose={() =>
+						setPublicValueDialog({
+							account: null,
+							error: null,
+							isSaving: false,
+						})
+					}
+					onSave={handlePublicValueSave}
 				/>
 			)}
 

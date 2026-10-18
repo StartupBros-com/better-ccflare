@@ -15,7 +15,11 @@ import type { FullUsageData } from "@better-ccflare/types";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Account } from "../../api";
 import { AccountList } from "./AccountList";
-import { AccountListItem, CodexCreditDrainControl } from "./AccountListItem";
+import {
+	AccountListItem,
+	CodexCreditDrainControl,
+	PublicValueControl,
+} from "./AccountListItem";
 import { mergeAccountModelMappings } from "./AccountModelMappingsDialog";
 import type { AccountFamilyRoutingState } from "./account-routing";
 
@@ -681,4 +685,93 @@ function findSwitch(node: unknown): SwitchProps | null {
 		return props as SwitchProps;
 	}
 	return findSwitch(props.children);
+}
+
+describe("AccountListItem public value toggle", () => {
+	function render(
+		account: Account,
+		onPublicValueToggle?: (a: Account) => void,
+		onPublicValueEditLabel?: (a: Account) => void,
+	) {
+		return renderToStaticMarkup(
+			<AccountListItem
+				account={account}
+				{...requiredHandlers}
+				onPublicValueToggle={onPublicValueToggle}
+				onPublicValueEditLabel={onPublicValueEditLabel}
+			/>,
+		);
+	}
+
+	it("renders for every provider and not without a handler", () => {
+		for (const provider of ["anthropic", "codex", "zai"]) {
+			expect(render(makeAccount({ provider }), noop)).toContain(
+				"Public value:",
+			);
+		}
+		expect(render(makeAccount())).not.toContain("Public value:");
+	});
+
+	it("reflects publicValueEnabled", () => {
+		const on = render(makeAccount({ publicValueEnabled: true }), noop);
+		const off = render(makeAccount(), noop);
+		const sw = (html: string) => html.slice(html.indexOf("Public value:"));
+		expect(sw(on)).toContain('aria-checked="true"');
+		expect(sw(off)).not.toContain('aria-checked="true"');
+	});
+
+	it("shows the label and edit action only when published", () => {
+		const on = render(
+			makeAccount({ publicValueEnabled: true, publicValueLabel: "Max #1" }),
+			noop,
+			noop,
+		);
+		expect(on).toContain("Max #1");
+		expect(on).toContain("Edit public label");
+		// A kept label is not shown while unpublished.
+		const off = render(
+			makeAccount({ publicValueEnabled: false, publicValueLabel: "Max #1" }),
+			noop,
+			noop,
+		);
+		expect(off).not.toContain("Max #1");
+		expect(off).not.toContain("Edit public label");
+	});
+
+	it("calls the toggle handler with the account when switched", () => {
+		const account = makeAccount();
+		const calls: Account[] = [];
+		const el = PublicValueControl({
+			account,
+			onToggle: (a: Account) => calls.push(a),
+		});
+		const found = findSwitchByTitle(el, "House of Vibe");
+		expect(found).not.toBeNull();
+		found?.onCheckedChange?.(true);
+		expect(calls).toEqual([account]);
+	});
+});
+
+function findSwitchByTitle(
+	node: unknown,
+	titlePart: string,
+): SwitchProps | null {
+	if (!node || typeof node !== "object") return null;
+	if (Array.isArray(node)) {
+		for (const n of node) {
+			const r = findSwitchByTitle(n, titlePart);
+			if (r) return r;
+		}
+		return null;
+	}
+	const props = (node as { props?: Record<string, unknown> }).props;
+	if (!props) return null;
+	if (
+		typeof props.title === "string" &&
+		props.title.includes(titlePart) &&
+		typeof props.onCheckedChange === "function"
+	) {
+		return props as SwitchProps;
+	}
+	return findSwitchByTitle(props.children, titlePart);
 }

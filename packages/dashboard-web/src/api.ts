@@ -1578,6 +1578,32 @@ class API extends HttpClient {
 		}
 	}
 
+	async setAccountPublicValue(
+		accountId: string,
+		enabled: boolean,
+		label?: string,
+	): Promise<{ publicValueEnabled: boolean; publicValueLabel: string | null }> {
+		const url = `/api/accounts/${accountId}/public-value`;
+		this.logger.debug(`→ POST ${url}`, { enabled });
+		try {
+			const body: { enabled: boolean; label?: string } = { enabled };
+			if (label !== undefined) body.label = label;
+			return await this.post<{
+				success: boolean;
+				publicValueEnabled: boolean;
+				publicValueLabel: string | null;
+			}>(url, body);
+		} catch (error) {
+			this.logger.error(`✗ POST ${url} - ERROR`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			if (error instanceof HttpError) {
+				throw new Error(error.message, { cause: error });
+			}
+			throw error;
+		}
+	}
+
 	async updateAccountCustomEndpoint(
 		accountId: string,
 		customEndpoint: string | null,

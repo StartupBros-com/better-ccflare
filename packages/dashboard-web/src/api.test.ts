@@ -413,3 +413,48 @@ describe("dashboard error cause preservation", () => {
 		expect((caught as Error).cause).toBe(cause);
 	});
 });
+
+describe("setAccountPublicValue", () => {
+	it("posts enabled and the label to the public-value endpoint", async () => {
+		const request = mock(async () => ({
+			success: true,
+			publicValueEnabled: true,
+			publicValueLabel: "Max #1",
+		}));
+		api.request = request as typeof api.request;
+		const result = await api.setAccountPublicValue("acc-1", true, "Max #1");
+		const [url, options] = (request.mock.calls as unknown as RequestCall[])[0];
+		expect(url).toBe("/api/accounts/acc-1/public-value");
+		expect(options.method).toBe("POST");
+		expect(JSON.parse(String(options.body))).toEqual({
+			enabled: true,
+			label: "Max #1",
+		});
+		expect(result.publicValueLabel).toBe("Max #1");
+	});
+
+	it("omits the label when turning off and surfaces the server 400 message", async () => {
+		const request = mock(async () => ({
+			success: true,
+			publicValueEnabled: false,
+			publicValueLabel: null,
+		}));
+		api.request = request as typeof api.request;
+		await api.setAccountPublicValue("acc-1", false);
+		const [, options] = (request.mock.calls as unknown as RequestCall[])[0];
+		expect(JSON.parse(String(options.body))).toEqual({ enabled: false });
+
+		api.request = mock(async () => {
+			throw new HttpError(400, "label must not contain the account name");
+		}) as typeof api.request;
+		let caught: unknown;
+		try {
+			await api.setAccountPublicValue("acc-1", true, "my-account");
+		} catch (e) {
+			caught = e;
+		}
+		expect((caught as Error).message).toBe(
+			"label must not contain the account name",
+		);
+	});
+});
