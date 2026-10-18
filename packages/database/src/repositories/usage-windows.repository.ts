@@ -75,6 +75,10 @@ export interface ListWindowsOptions {
 	accountId?: string;
 	windowKey?: string;
 	sinceMs?: number;
+	/** Bounded read projections may select only settled rows. */
+	closedOnly?: boolean;
+	limit?: number;
+	startedAtOrAfter?: number;
 }
 
 interface UsageWindowRow {
@@ -434,6 +438,21 @@ export class UsageWindowsRepository extends BaseRepository<UsageWindow> {
 	async listWindows(options: ListWindowsOptions = {}): Promise<UsageWindow[]> {
 		const clauses: string[] = [];
 		const params: unknown[] = [];
+		if (
+			options.limit != null &&
+			(!Number.isSafeInteger(options.limit) ||
+				options.limit < 1 ||
+				options.limit > 200)
+		) {
+			throw new TypeError("limit must be an integer between 1 and 200");
+		}
+		if (options.closedOnly) clauses.push("closed_at IS NOT NULL");
+		if (options.startedAtOrAfter != null) {
+			clauses.push("started_at >= ?");
+			params.push(
+				requireTimestamp(options.startedAtOrAfter, "startedAtOrAfter"),
+			);
+		}
 		if (options.accountId != null) {
 			clauses.push("account_id = ?");
 			params.push(options.accountId);
@@ -450,8 +469,8 @@ export class UsageWindowsRepository extends BaseRepository<UsageWindow> {
 		const rows = await this.query<UsageWindowRow>(
 			`SELECT ${WINDOW_COLUMNS} FROM usage_windows
 			 ${where}
-			 ORDER BY resets_at DESC`,
-			params,
+			 ORDER BY resets_at DESC${options.limit == null ? "" : " LIMIT ?"}`,
+			options.limit == null ? params : [...params, options.limit],
 		);
 		return rows.map(toUsageWindow);
 	}

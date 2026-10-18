@@ -1,6 +1,4 @@
 // packages/http-api/src/handlers/usage-windows.ts
-import { valueWindowAggregates } from "@better-ccflare/core";
-import type { UsageWindow } from "@better-ccflare/database";
 import {
 	BadRequest,
 	errorResponse,
@@ -8,8 +6,17 @@ import {
 	NotFound,
 } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
-import type { Account } from "@better-ccflare/types";
+import {
+	type OpenUsageWindowRecord,
+	readUsageWindows,
+	type UsageWindowRecord,
+} from "../services/usage-window-read";
 import type { APIContext } from "../types";
+
+export type {
+	OpenUsageWindowRecord,
+	UsageWindowRecord,
+} from "../services/usage-window-read";
 
 const log = new Logger("UsageWindowsHandler");
 
@@ -18,38 +25,6 @@ const log = new Logger("UsageWindowsHandler");
 const DEFAULT_WINDOW_KEY = "seven_day";
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 200;
-const HOUR_MS = 60 * 60 * 1000;
-
-/** One closed-or-open `usage_windows` row, camelCased 1:1 — every ledger
- * column the issue asked for, including the parsed `modelBreakdown`. */
-export interface UsageWindowRecord {
-	id: string;
-	accountId: string;
-	windowKey: string;
-	startedAt: number;
-	resetsAt: number;
-	closedAt: number | null;
-	grantType: string;
-	peakUtilization: number;
-	first100At: number | null;
-	valueUsd: number | null;
-	inputTokens: number | null;
-	cacheReadInputTokens: number | null;
-	cacheCreationInputTokens: number | null;
-	outputTokens: number | null;
-	requestCount: number | null;
-	modelBreakdown: Record<string, unknown> | null;
-	unpricedTokens: number | null;
-	projectionVersion: string | null;
-}
-
-/** The still-open window, with its value computed live rather than read
- * from a (necessarily NULL, since it hasn't closed yet) `value_usd` column. */
-export interface OpenUsageWindowRecord extends UsageWindowRecord {
-	valueSoFarUsd: number;
-	utilization: number;
-	ageHours: number;
-}
 
 export interface AccountUsageWindowsResponse {
 	accountId: string;
@@ -61,29 +36,6 @@ export interface AccountUsageWindowsResponse {
 
 export interface FleetUsageWindowsResponse {
 	accounts: AccountUsageWindowsResponse[];
-}
-
-function toRecord(window: UsageWindow): UsageWindowRecord {
-	return {
-		id: window.id,
-		accountId: window.accountId,
-		windowKey: window.windowKey,
-		startedAt: window.startedAt,
-		resetsAt: window.resetsAt,
-		closedAt: window.closedAt,
-		grantType: window.grantType,
-		peakUtilization: window.peakUtilization,
-		first100At: window.first100At,
-		valueUsd: window.valueUsd,
-		inputTokens: window.inputTokens,
-		cacheReadInputTokens: window.cacheReadInputTokens,
-		cacheCreationInputTokens: window.cacheCreationInputTokens,
-		outputTokens: window.outputTokens,
-		requestCount: window.requestCount,
-		modelBreakdown: window.modelBreakdown,
-		unpricedTokens: window.unpricedTokens,
-		projectionVersion: window.projectionVersion,
-	};
 }
 
 /** Parses & validates the `limit` query param, throwing a `BadRequest`
@@ -100,60 +52,6 @@ function parseLimit(raw: string | null): number {
 		throw BadRequest(`limit must be between 1 and ${MAX_LIMIT}, got: ${n}`);
 	}
 	return n;
-}
-
-/**
- * Splits one account's ledger rows for `windowKey` into the most recent
- * `limit` CLOSED windows (already priced, ordered `resets_at` desc — the
- * repository's own order, preserved by this filter) and the single open
- * window (if any), then live-values that open window.
- *
- * The open window's value is computed with the exact same inputs and
- * era-keying as `UsageWindowLedger.closeAndValue` uses when it eventually
- * closes this same window: `aggregateTokensByModel(accountId, startedAt,
- * nowMs)` fed through `valueWindowAggregates(aggregates, startedAt)` —
- * priced at the window's grant time, not "now", so a mid-window price change
- * never retroactively re-prices usage that already happened under the old
- * rate.
- */
-async function buildAccountResponse(
-	context: APIContext,
-	account: Pick<Account, "id" | "name" | "provider">,
-	allWindows: readonly UsageWindow[],
-	limit: number,
-	nowMs: number,
-): Promise<AccountUsageWindowsResponse> {
-	const open = allWindows.find((w) => w.closedAt == null) ?? null;
-	const closed = allWindows.filter((w) => w.closedAt != null).slice(0, limit);
-
-	let openWindow: OpenUsageWindowRecord | null = null;
-	if (open) {
-		const aggregates = await context.dbOps.aggregateTokensByModel(
-			account.id,
-			open.startedAt,
-			nowMs,
-		);
-		const valuation = valueWindowAggregates(aggregates, open.startedAt);
-		openWindow = {
-			...toRecord(open),
-			valueSoFarUsd: valuation.valueUsd,
-			// The unclosed ledger row's own unpriced_tokens column is still null;
-			// the live valuation is the only source that can report unpriced usage
-			// inside an open window, so surface it (the dashboard's "unpriced"
-			// warning on live windows depends on this field).
-			unpricedTokens: valuation.unpricedTokens,
-			utilization: open.peakUtilization,
-			ageHours: (nowMs - open.startedAt) / HOUR_MS,
-		};
-	}
-
-	return {
-		accountId: account.id,
-		accountName: account.name,
-		provider: account.provider,
-		windows: closed.map(toRecord),
-		openWindow,
-	};
 }
 
 /**
@@ -194,15 +92,19 @@ export function createUsageWindowsHandler(context: APIContext) {
 						windowKey,
 					});
 					if (allWindows.length === 0) continue;
-					results.push(
-						await buildAccountResponse(
-							context,
-							account,
-							allWindows,
+					results.push({
+						accountId: account.id,
+						accountName: account.name,
+						provider: account.provider,
+						...(await readUsageWindows(
+							context.dbOps,
+							account.id,
+							windowKey,
 							limit,
 							nowMs,
-						),
-					);
+							allWindows,
+						)),
+					});
 				}
 				const response: FleetUsageWindowsResponse = { accounts: results };
 				return jsonResponse(response);
@@ -213,17 +115,18 @@ export function createUsageWindowsHandler(context: APIContext) {
 				return errorResponse(NotFound(`Account not found: ${accountParam}`));
 			}
 
-			const allWindows = await context.dbOps.listUsageWindows({
+			const response: AccountUsageWindowsResponse = {
 				accountId: account.id,
-				windowKey,
-			});
-			const response = await buildAccountResponse(
-				context,
-				account,
-				allWindows,
-				limit,
-				nowMs,
-			);
+				accountName: account.name,
+				provider: account.provider,
+				...(await readUsageWindows(
+					context.dbOps,
+					account.id,
+					windowKey,
+					limit,
+					nowMs,
+				)),
+			};
 			return jsonResponse(response);
 		} catch (error) {
 			log.error("Usage windows error:", error);
