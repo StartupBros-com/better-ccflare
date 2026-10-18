@@ -30,6 +30,7 @@ import {
 	AnthropicReauthDialog,
 	CodexReauthDialog,
 	DeleteConfirmationDialog,
+	PublicValueDialog,
 	QwenReauthDialog,
 	RenameAccountDialog,
 } from "./accounts";
@@ -38,6 +39,10 @@ import {
 	type AccountFamilyRoutingState,
 	getAccountFamilyRoutingStates,
 } from "./accounts/account-routing";
+import {
+	savePublicValue,
+	togglePublicValue,
+} from "./accounts/public-value-actions";
 import { Button } from "./ui/button";
 import {
 	Card,
@@ -270,6 +275,11 @@ export function AccountsTab() {
 		isOpen: false,
 		account: null,
 	});
+	const [publicValueDialog, setPublicValueDialog] = useState<{
+		account: Account | null;
+		error: string | null;
+		isSaving: boolean;
+	}>({ account: null, error: null, isSaving: false });
 	const [priorityDialog, setPriorityDialog] = useState<{
 		isOpen: boolean;
 		account: Account | null;
@@ -653,6 +663,48 @@ export function AccountsTab() {
 		}
 	};
 
+	const handlePublicValueToggle = async (account: Account) => {
+		try {
+			const outcome = await togglePublicValue(account, api);
+			if (outcome.kind === "open-dialog") {
+				// Turning on needs a public label first.
+				setPublicValueDialog({ account, error: null, isSaving: false });
+				return;
+			}
+			await loadAccounts();
+			setActionError(null);
+		} catch (err) {
+			setActionError(formatError(err));
+		}
+	};
+
+	const handlePublicValueEditLabel = (account: Account) => {
+		setPublicValueDialog({ account, error: null, isSaving: false });
+	};
+
+	const handlePublicValueSave = async (label: string) => {
+		const account = publicValueDialog.account;
+		if (!account) return;
+		setPublicValueDialog((s) => ({ ...s, error: null, isSaving: true }));
+		const outcome = await savePublicValue(account, label, api, formatError);
+		if (!outcome.ok) {
+			setPublicValueDialog((s) => ({
+				...s,
+				error: outcome.error,
+				isSaving: false,
+			}));
+			return;
+		}
+		// The write succeeded; close the dialog even if the reload fails.
+		setPublicValueDialog({ account: null, error: null, isSaving: false });
+		try {
+			await loadAccounts();
+			setActionError(null);
+		} catch (err) {
+			setActionError(formatError(err));
+		}
+	};
+
 	const handleCustomEndpointChange = (account: Account) => {
 		setCustomEndpointDialog({ isOpen: true, account });
 	};
@@ -809,6 +861,8 @@ export function AccountsTab() {
 						onBillingTypeToggle={handleBillingTypeToggle}
 						onAutoPauseOnOverageToggle={handleAutoPauseOnOverageToggle}
 						onCodexCreditDrainToggle={handleCodexCreditDrainToggle}
+						onPublicValueToggle={handlePublicValueToggle}
+						onPublicValueEditLabel={handlePublicValueEditLabel}
 						onPeakHoursPauseToggle={handlePeakHoursPauseToggle}
 						onCustomEndpointChange={handleCustomEndpointChange}
 						onModelMappingsChange={handleModelMappingsChange}
@@ -849,6 +903,24 @@ export function AccountsTab() {
 					onClose={() => setRenameDialog({ isOpen: false, account: null })}
 					onRename={handleConfirmRename}
 					isLoading={renameAccount.isPending}
+				/>
+			)}
+
+			{publicValueDialog.account && (
+				<PublicValueDialog
+					isOpen
+					accountName={publicValueDialog.account.name}
+					initialLabel={publicValueDialog.account.publicValueLabel ?? ""}
+					error={publicValueDialog.error}
+					isLoading={publicValueDialog.isSaving}
+					onClose={() =>
+						setPublicValueDialog({
+							account: null,
+							error: null,
+							isSaving: false,
+						})
+					}
+					onSave={handlePublicValueSave}
 				/>
 			)}
 

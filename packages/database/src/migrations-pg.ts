@@ -651,6 +651,9 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			auto_pause_on_overage_enabled INTEGER DEFAULT 0,
 			peak_hours_pause_enabled INTEGER NOT NULL DEFAULT 0,
 			codex_credit_drain_enabled INTEGER NOT NULL DEFAULT 0,
+			public_value_enabled INTEGER NOT NULL DEFAULT 0,
+			public_value_label TEXT,
+			public_value_id TEXT,
 			pause_reason TEXT,
 			requires_reauth INTEGER DEFAULT 0,
 			billing_type TEXT DEFAULT NULL,
@@ -1443,6 +1446,7 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 			   auto_pause_on_overage_enabled = (SELECT MAX(COALESCE(auto_pause_on_overage_enabled, 0)) FROM accounts ${PG_GROUP_SCOPE}),
 			   peak_hours_pause_enabled = (SELECT MAX(COALESCE(peak_hours_pause_enabled, 0)) FROM accounts ${PG_GROUP_SCOPE}),
 			   codex_credit_drain_enabled = (SELECT MAX(COALESCE(codex_credit_drain_enabled, 0)) FROM accounts ${PG_GROUP_SCOPE}),
+			   /* public_value_* is deliberately NOT merged (fail closed): the survivor keeps only its own values. */
 			   rate_limit_remaining = (SELECT MIN(rate_limit_remaining) FROM accounts ${PG_GROUP_SCOPE} AND rate_limit_remaining IS NOT NULL),
 			   rate_limit_status = COALESCE(rate_limit_status, ${pgFreshest("rate_limit_status")}),
 			   pause_reason = COALESCE(pause_reason, ${pgFreshest("pause_reason")}),
@@ -1749,6 +1753,22 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 		},
 		{
 			table: "accounts",
+			column: "public_value_enabled",
+			definition:
+				"ALTER TABLE accounts ADD COLUMN public_value_enabled INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			table: "accounts",
+			column: "public_value_label",
+			definition: "ALTER TABLE accounts ADD COLUMN public_value_label TEXT",
+		},
+		{
+			table: "accounts",
+			column: "public_value_id",
+			definition: "ALTER TABLE accounts ADD COLUMN public_value_id TEXT",
+		},
+		{
+			table: "accounts",
 			column: "pause_reason",
 			definition: "ALTER TABLE accounts ADD COLUMN pause_reason TEXT",
 		},
@@ -1886,6 +1906,39 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 		if (!exists) {
 			await addColumnTolerant(adapter, col);
 		}
+	}
+
+	// Mirrors ensurePublicValueLabelUniqueIndex() in migrations.ts: published
+	// labels are unique case-insensitively, enforced by the database. If
+	// duplicates already exist, fail closed (unpublish every row in each
+	// duplicate group, never inherit or merge) and retry once.
+	const createPublicValueLabelIndex = () =>
+		adapter.unsafe(
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_public_value_label_unique
+			 ON accounts (lower(public_value_label)) WHERE public_value_enabled = 1`,
+		);
+	try {
+		await createPublicValueLabelIndex();
+	} catch (error) {
+		const e = error as { code?: string; errno?: string; message?: string };
+		if (
+			e.code !== "23505" &&
+			e.errno !== "23505" &&
+			!/duplicate key|unique/i.test(e.message ?? "")
+		)
+			throw error;
+		const unpublished = await adapter.runWithChanges(
+			`UPDATE accounts SET public_value_enabled = 0
+			 WHERE public_value_enabled = 1 AND lower(public_value_label) IN (
+			   SELECT lower(public_value_label) FROM accounts
+			   WHERE public_value_enabled = 1
+			   GROUP BY lower(public_value_label) HAVING COUNT(*) > 1
+			 )`,
+		);
+		log.warn(
+			`Unpublished ${unpublished} accounts sharing a published public-value label`,
+		);
+		await createPublicValueLabelIndex();
 	}
 
 	// Adding this column with a volatile nextval() DEFAULT forces PostgreSQL to

@@ -1180,6 +1180,9 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 		   auto_pause_on_overage_enabled = ${agg("MAX", "auto_pause_on_overage_enabled")},
 		   peak_hours_pause_enabled = ${agg("MAX", "peak_hours_pause_enabled")},
 		   codex_credit_drain_enabled = ${agg("MAX", "codex_credit_drain_enabled")},
+		   -- public_value_* is deliberately NOT merged: published state is never
+		   -- inherited from a deleted duplicate (fail closed). The survivor keeps
+		   -- only its own values.
 		   rate_limit_remaining = (SELECT MIN(rate_limit_remaining) FROM accounts
 		                           ${groupScope} AND rate_limit_remaining IS NOT NULL),
 		   rate_limit_status = COALESCE(rate_limit_status, ${freshest("rate_limit_status")}),
@@ -1565,6 +1568,44 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 				`to the surviving account ids.`,
 		);
 	}
+}
+
+/**
+ * Case-insensitive uniqueness of published labels, enforced by the database.
+ * Idempotent; called after every accounts-table rebuild path. If duplicate
+ * published labels already exist the index cannot be built, so fail closed:
+ * unpublish every row in each duplicate group (never inherit or merge), then
+ * retry once.
+ */
+export function ensurePublicValueLabelUniqueIndex(db: Database): void {
+	const create = () =>
+		db
+			.prepare(
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_public_value_label_unique
+				 ON accounts(lower(public_value_label)) WHERE public_value_enabled = 1`,
+			)
+			.run();
+	try {
+		create();
+		return;
+	} catch (error) {
+		if (!/UNIQUE constraint|constraint failed/i.test((error as Error).message))
+			throw error;
+	}
+	const unpublished = db
+		.prepare(
+			`UPDATE accounts SET public_value_enabled = 0
+			 WHERE public_value_enabled = 1 AND lower(public_value_label) IN (
+			   SELECT lower(public_value_label) FROM accounts
+			   WHERE public_value_enabled = 1
+			   GROUP BY lower(public_value_label) HAVING COUNT(*) > 1
+			 )`,
+		)
+		.run().changes;
+	log.warn(
+		`Unpublished ${unpublished} accounts sharing a published public-value label`,
+	);
+	create();
 }
 
 export function runMigrations(db: Database, dbPath?: string): void {
@@ -2154,6 +2195,26 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			log.info("Added codex_credit_drain_enabled column to accounts table");
 		}
 
+		// Public subscription value feed roster (issue #536): per-account opt-in
+		// publication plus a server-generated opaque public id. Default 0 = not
+		// published; label and id stay NULL until set.
+		if (!initialAccountsColumnNames.includes("public_value_enabled")) {
+			db.prepare(
+				"ALTER TABLE accounts ADD COLUMN public_value_enabled INTEGER NOT NULL DEFAULT 0",
+			).run();
+			log.info("Added public_value_enabled column to accounts table");
+		}
+		if (!initialAccountsColumnNames.includes("public_value_label")) {
+			db.prepare(
+				"ALTER TABLE accounts ADD COLUMN public_value_label TEXT",
+			).run();
+			log.info("Added public_value_label column to accounts table");
+		}
+		if (!initialAccountsColumnNames.includes("public_value_id")) {
+			db.prepare("ALTER TABLE accounts ADD COLUMN public_value_id TEXT").run();
+			log.info("Added public_value_id column to accounts table");
+		}
+
 		// Add pause_reason column to track why an account is paused (issue #139)
 		// Possible values: null (not paused), 'manual' (user paused via CLI/API),
 		// 'failure_threshold' (auto-refresh failures), 'overage' (billing overage)
@@ -2236,7 +2297,10 @@ export function runMigrations(db: Database, dbPath?: string): void {
 					auto_pause_on_overage_enabled INTEGER DEFAULT 0,
 					pause_reason TEXT,
 					requires_reauth INTEGER DEFAULT 0,
-					codex_credit_drain_enabled INTEGER NOT NULL DEFAULT 0
+					codex_credit_drain_enabled INTEGER NOT NULL DEFAULT 0,
+					public_value_enabled INTEGER NOT NULL DEFAULT 0,
+					public_value_label TEXT,
+					public_value_id TEXT
 				)
 			`).run();
 
@@ -2253,7 +2317,8 @@ export function runMigrations(db: Database, dbPath?: string): void {
 					auto_fallback_enabled, custom_endpoint, auto_refresh_enabled,
 					model_mappings, cross_region_mode, model_fallbacks,
 					auto_pause_on_overage_enabled, pause_reason, requires_reauth,
-					codex_credit_drain_enabled
+					codex_credit_drain_enabled,
+					public_value_enabled, public_value_label, public_value_id
 				FROM accounts
 			`).run();
 
@@ -2591,7 +2656,8 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			       rate_limit_reset, rate_limit_reset_at, rate_limit_status, rate_limit_remaining,
 			       auto_fallback_enabled, custom_endpoint, auto_refresh_enabled, model_mappings,
 			       cross_region_mode, model_fallbacks, billing_type, auto_pause_on_overage_enabled,
-			       pause_reason, requires_reauth, codex_credit_drain_enabled
+			       pause_reason, requires_reauth, codex_credit_drain_enabled,
+			       public_value_enabled, public_value_label, public_value_id
 			FROM accounts
 		`).run();
 
@@ -2846,6 +2912,10 @@ export function runMigrations(db: Database, dbPath?: string): void {
 				`Updated ${updateCount} accounts from 'muse-spark' to 'meta' provider`,
 			);
 		}
+
+		// Must follow every accounts-table rebuild above (they drop and recreate
+		// the table with a fixed index list), so it runs on every startup.
+		ensurePublicValueLabelUniqueIndex(db);
 	});
 
 	// Execute the migration transaction

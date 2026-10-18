@@ -105,6 +105,8 @@ interface AccountListItemProps {
 	onBillingTypeToggle: (account: Account) => void;
 	onAutoPauseOnOverageToggle?: (account: Account) => void;
 	onCodexCreditDrainToggle?: (account: Account) => void;
+	onPublicValueToggle?: (account: Account) => void;
+	onPublicValueEditLabel?: (account: Account) => void;
 	onPeakHoursPauseToggle?: (account: Account) => void;
 	onCustomEndpointChange?: (account: Account) => void;
 	onModelMappingsChange?: (account: Account) => void;
@@ -144,6 +146,52 @@ export function CodexCreditDrainControl({
 	);
 }
 
+/**
+ * Per-account "Public value" switch: publishes the account's API-equivalent
+ * value on the public House of Vibe feed under a public label. Hook-free so
+ * tests can call it directly and inspect the Switch props.
+ */
+export function PublicValueControl({
+	account,
+	onToggle,
+	onEditLabel,
+}: {
+	account: Account;
+	onToggle: (account: Account) => void;
+	onEditLabel?: (account: Account) => void;
+}) {
+	const enabled = account.publicValueEnabled ?? false;
+	return (
+		<div className="flex items-center gap-2">
+			<span className="text-xs text-muted-foreground">Public value:</span>
+			<Switch
+				checked={enabled}
+				onCheckedChange={() => onToggle(account)}
+				title="Publishes this account's subscription value on the public House of Vibe site under a public label (never the account name)."
+			/>
+			{enabled && account.publicValueLabel && (
+				<span
+					className="text-xs font-medium"
+					title="Public label shown on the House of Vibe site"
+				>
+					{account.publicValueLabel}
+				</span>
+			)}
+			{enabled && onEditLabel && (
+				<Button
+					variant="ghost"
+					size="sm"
+					className="h-6 px-1"
+					onClick={() => onEditLabel(account)}
+					title="Edit public label"
+				>
+					<Edit2 className="h-3 w-3" />
+				</Button>
+			)}
+		</div>
+	);
+}
+
 export function AccountListItem({
 	account,
 	routingStates = [],
@@ -159,6 +207,8 @@ export function AccountListItem({
 	onBillingTypeToggle,
 	onAutoPauseOnOverageToggle,
 	onCodexCreditDrainToggle,
+	onPublicValueToggle,
+	onPublicValueEditLabel,
 	onPeakHoursPauseToggle,
 	onCustomEndpointChange,
 	onModelMappingsChange,
@@ -310,6 +360,13 @@ export function AccountListItem({
 								<CodexCreditDrainControl
 									account={account}
 									onToggle={onCodexCreditDrainToggle}
+								/>
+							)}
+							{onPublicValueToggle && (
+								<PublicValueControl
+									account={account}
+									onToggle={onPublicValueToggle}
+									onEditLabel={onPublicValueEditLabel}
 								/>
 							)}
 							{account.provider === "zai" && onPeakHoursPauseToggle && (

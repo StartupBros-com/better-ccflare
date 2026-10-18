@@ -287,6 +287,46 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 		).toBe(true);
 	});
 
+	it("ports public_value_* to CREATE TABLE and columnsToAdd, and never merges them in the dedup", () => {
+		const createBlock = pgSource.slice(
+			pgSource.indexOf("CREATE TABLE IF NOT EXISTS accounts"),
+		);
+		for (const definition of [
+			"public_value_enabled INTEGER NOT NULL DEFAULT 0",
+			"public_value_label TEXT",
+			"public_value_id TEXT",
+		]) {
+			expect(createBlock.slice(0, 4000)).toContain(definition);
+			expect(pgSource).toContain(
+				`ALTER TABLE accounts ADD COLUMN ${definition}`,
+			);
+		}
+		expect(pgSource).not.toContain("public_value_enabled = (SELECT");
+		expect(pgSource).not.toContain("public_value_label = (SELECT");
+		expect(pgSource).not.toContain("public_value_id = (SELECT");
+		for (const column of [
+			"public_value_enabled",
+			"public_value_label",
+			"public_value_id",
+		]) {
+			expect(sqliteInventory.tables.get("accounts")?.has(column)).toBe(true);
+			expect(pgInventory.tables.get("accounts")?.has(column)).toBe(true);
+		}
+	});
+
+	it("ports the published-label unique index with a fail-closed duplicate repair", () => {
+		expect(pgSource).toContain(
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_public_value_label_unique",
+		);
+		expect(pgSource).toContain(
+			"ON accounts (lower(public_value_label)) WHERE public_value_enabled = 1",
+		);
+		expect(pgSource).toContain("SET public_value_enabled = 0");
+		expect(
+			pgSource.indexOf("idx_accounts_public_value_label_unique"),
+		).toBeGreaterThan(pgSource.indexOf("for (const col of columnsToAdd)"));
+	});
+
 	it("includes the executed shared cache-health DDL and its real column names", () => {
 		const db = new Database(":memory:");
 		try {
@@ -942,6 +982,153 @@ describe.skipIf(!livePgAvailable)(
 				// against a real server.
 			} finally {
 				await adapter.close();
+			}
+		});
+
+		it("creates the published-label unique index and repairs duplicate published labels fail-closed", async () => {
+			const { SQL } = await import("bun");
+			const { BunSqlAdapter } = await import("./adapters/bun-sql-adapter");
+			const { ensureSchemaPg, runMigrationsPg } = await import(
+				"./migrations-pg"
+			);
+			// biome-ignore lint/style/noNonNullAssertion: guarded by describe.skipIf(!livePgAvailable)
+			const sqlClient = new SQL({ url: process.env.DATABASE_URL! });
+			const adapter = new BunSqlAdapter(sqlClient, false);
+			const indexCount = async () =>
+				Number(
+					(
+						await adapter.get<{ n: number | string }>(
+							`SELECT COUNT(*) AS n FROM pg_indexes WHERE indexname = 'idx_accounts_public_value_label_unique'`,
+						)
+					)?.n ?? 0,
+				);
+			try {
+				await ensureSchemaPg(adapter);
+				await runMigrationsPg(adapter);
+				expect(await indexCount()).toBe(1);
+				await adapter.unsafe(
+					`DROP INDEX IF EXISTS idx_accounts_public_value_label_unique`,
+				);
+				await adapter.run(
+					`DELETE FROM accounts WHERE id IN ('pvdup-1','pvdup-2','pvkeep')`,
+				);
+				for (const [id, label] of [
+					["pvdup-1", "Same Label"],
+					["pvdup-2", "same label"],
+					["pvkeep", "Unique Label"],
+				]) {
+					await adapter.run(
+						`INSERT INTO accounts (id, name, provider, created_at, public_value_enabled, public_value_label, public_value_id) VALUES (?, ?, 'anthropic', 1, 1, ?, ?)`,
+						[id, id, label, `sub-${id}`],
+					);
+				}
+				await runMigrationsPg(adapter);
+				expect(await indexCount()).toBe(1);
+				const rows = await adapter.query<{
+					id: string;
+					public_value_enabled: number;
+				}>(
+					`SELECT id, public_value_enabled FROM accounts WHERE id IN ('pvdup-1','pvdup-2','pvkeep') ORDER BY id`,
+				);
+				expect(rows.map((r) => [r.id, Number(r.public_value_enabled)])).toEqual(
+					[
+						["pvdup-1", 0],
+						["pvdup-2", 0],
+						["pvkeep", 1],
+					],
+				);
+			} finally {
+				await adapter.run(
+					`DELETE FROM accounts WHERE id IN ('pvdup-1','pvdup-2','pvkeep')`,
+				);
+				await adapter.close();
+			}
+		});
+
+		it("holds the published-account cap and label uniqueness across concurrent writers on separate pools", async () => {
+			const { SQL } = await import("bun");
+			const { BunSqlAdapter } = await import("./adapters/bun-sql-adapter");
+			const { ensureSchemaPg, runMigrationsPg } = await import(
+				"./migrations-pg"
+			);
+			const { AccountRepository } = await import(
+				"./repositories/account.repository"
+			);
+			// biome-ignore lint/style/noNonNullAssertion: guarded by describe.skipIf(!livePgAvailable)
+			const url = process.env.DATABASE_URL!;
+			// Each SQL client owns its own pool, standing in for a separate
+			// server process writing the same database.
+			const writers = Array.from({ length: 8 }, () => {
+				const adapter = new BunSqlAdapter(new SQL({ url }), false);
+				return { adapter, repo: new AccountRepository(adapter) };
+			});
+			const [{ adapter }] = writers;
+			const cleanup = () =>
+				adapter.run(`DELETE FROM accounts WHERE id LIKE 'pvrace-%'`);
+			const publishedCount = async () =>
+				Number(
+					(
+						await adapter.get<{ n: number | string }>(
+							`SELECT COUNT(*) AS n FROM accounts WHERE COALESCE(public_value_enabled, 0) = 1`,
+						)
+					)?.n ?? 0,
+				);
+			try {
+				await ensureSchemaPg(adapter);
+				await runMigrationsPg(adapter);
+				await cleanup();
+				const insert = (id: string, enabled: number, label: string | null) =>
+					adapter.run(
+						`INSERT INTO accounts (id, name, provider, created_at, public_value_enabled, public_value_label, public_value_id) VALUES (?, ?, 'anthropic', 1, ?, ?, ?)`,
+						[id, id, enabled, label, label ? `sub-${id}` : null],
+					);
+				const cap = (await publishedCount()) + 16;
+				for (let i = 0; i < 15; i++) {
+					await insert(`pvrace-seed-${i}`, 1, `Seed ${i}`);
+				}
+				for (let i = 0; i < writers.length; i++) {
+					await insert(`pvrace-cap-${i}`, 0, null);
+					await insert(`pvrace-label-${i}`, 0, null);
+				}
+				// Open every pool's connection first so the publishes overlap.
+				await Promise.all(writers.map((w) => w.adapter.get(`SELECT 1 AS ok`)));
+
+				const capResults = await Promise.all(
+					writers.map((w, i) =>
+						w.repo.setPublicValue(
+							`pvrace-cap-${i}`,
+							{ enabled: true, label: `Race ${i}`, publicId: `sub-cap-${i}` },
+							cap,
+						),
+					),
+				);
+				expect(capResults.filter(Boolean)).toHaveLength(1);
+				expect(await publishedCount()).toBe(cap);
+
+				await adapter.run(
+					`UPDATE accounts SET public_value_enabled = 0 WHERE id LIKE 'pvrace-cap-%'`,
+				);
+				const labelResults = await Promise.all(
+					writers.map((w, i) =>
+						w.repo.setPublicValue(
+							`pvrace-label-${i}`,
+							{
+								enabled: true,
+								label: "Shared Label",
+								publicId: `sub-label-${i}`,
+							},
+							cap,
+						),
+					),
+				);
+				expect(labelResults.filter(Boolean)).toHaveLength(1);
+				const shared = await adapter.get<{ n: number | string }>(
+					`SELECT COUNT(*) AS n FROM accounts WHERE public_value_enabled = 1 AND lower(public_value_label) = 'shared label'`,
+				);
+				expect(Number(shared?.n ?? 0)).toBe(1);
+			} finally {
+				await cleanup();
+				await Promise.all(writers.map((w) => w.adapter.close()));
 			}
 		});
 

@@ -60,8 +60,13 @@ import type {
 	RateLimitReason,
 } from "@better-ccflare/types";
 import { requiresSessionDurationTracking } from "@better-ccflare/types";
+import {
+	bumpPublicRosterGeneration,
+	runExclusiveRosterWrite,
+} from "../services/public-subscription-roster";
 import type { AccountResponse } from "../types";
 import { accountCreatedResponse } from "../utils/account-created-response";
+import { labelRevealsAccount } from "./account-public-value";
 import {
 	computeRateLimitStatusDisplay,
 	getRepresentativeUsageResetMs,
@@ -340,6 +345,8 @@ export function createAccountsListHandler(
 			auto_pause_on_overage_enabled: 0 | 1;
 			peak_hours_pause_enabled: 0 | 1;
 			codex_credit_drain_enabled: 0 | 1;
+			public_value_enabled: 0 | 1;
+			public_value_label: string | null;
 			custom_endpoint: string | null;
 			model_mappings: string | null;
 			cross_region_mode: string | null;
@@ -375,6 +382,8 @@ export function createAccountsListHandler(
 					COALESCE(auto_pause_on_overage_enabled, 0) as auto_pause_on_overage_enabled,
 					COALESCE(peak_hours_pause_enabled, 0) as peak_hours_pause_enabled,
 					COALESCE(codex_credit_drain_enabled, 0) as codex_credit_drain_enabled,
+					COALESCE(public_value_enabled, 0) as public_value_enabled,
+					public_value_label,
 
 					model_mappings,
 					cross_region_mode,
@@ -773,6 +782,8 @@ export function createAccountsListHandler(
 						account.auto_pause_on_overage_enabled === 1,
 					peakHoursPauseEnabled: account.peak_hours_pause_enabled === 1,
 					codexCreditDrainEnabled: account.codex_credit_drain_enabled === 1,
+					publicValueEnabled: Number(account.public_value_enabled) === 1,
+					publicValueLabel: account.public_value_label ?? null,
 					codexCreditDrainActive: creditDrainActive,
 					codexCreditDrainServing: creditDrainServing,
 					customEndpoint: account.custom_endpoint,
@@ -1111,6 +1122,10 @@ export function createAccountRemoveHandler(dbOps: DatabaseOperations) {
 			// otherwise the poll loop keeps rescheduling itself forever.
 			usageCache.stopPolling(accountId);
 
+			// A removed account must leave the public value feed immediately, not
+			// when its 60 s cache entry expires.
+			bumpPublicRosterGeneration();
+
 			// Also clear token-manager state (in-flight refresh, failure/backoff
 			// counters) for the removed account — otherwise it lingers until the
 			// 5-minute TTL sweep or the 1000-entry cap evicts it.
@@ -1272,8 +1287,34 @@ export function createAccountRenameHandler(dbOps: DatabaseOperations) {
 				);
 			}
 
-			// Rename the account
-			dbOps.renameAccount(accountId, newName);
+			// Serialise with public-value writes: a rename must never leave a
+			// published account whose public label reveals its new name.
+			const refused = await runExclusiveRosterWrite(async () => {
+				const current = await dbOps.getAccount(accountId);
+				if (!current) return errorResponse(NotFound("Account not found"));
+				const published = current.public_value_enabled === true;
+				if (
+					published &&
+					(typeof current.public_value_label !== "string" ||
+						labelRevealsAccount(current.public_value_label, {
+							id: current.id,
+							name: newName,
+						}))
+				)
+					return errorResponse(
+						BadRequest(
+							"Cannot rename a published account to a name contained in its public label. Change or unpublish the label first.",
+						),
+					);
+				if (published) bumpPublicRosterGeneration();
+				try {
+					await dbOps.renameAccount(accountId, newName);
+				} finally {
+					if (published) bumpPublicRosterGeneration();
+				}
+				return null;
+			});
+			if (refused) return refused;
 
 			return jsonResponse({
 				success: true,

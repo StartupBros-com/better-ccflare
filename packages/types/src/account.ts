@@ -228,6 +228,9 @@ export interface AccountRow {
 	auto_pause_on_overage_enabled?: boolean | number | null;
 	peak_hours_pause_enabled?: boolean | number | null;
 	codex_credit_drain_enabled?: boolean | number | null;
+	public_value_enabled?: boolean | number | null;
+	public_value_label?: string | null;
+	public_value_id?: string | null;
 	custom_endpoint?: string | null;
 	model_mappings?: string | null; // JSON string for OpenAI-compatible providers
 	cross_region_mode?: string | null; // Bedrock cross-region inference mode
@@ -271,6 +274,15 @@ export interface Account {
 	 * Account fixtures need no edit. toAccount always sets it.
 	 */
 	codex_credit_drain_enabled?: boolean;
+	/**
+	 * Public subscription value feed (#536). Optional like the drain flag so
+	 * existing fixtures need no edit: absent = not published. toAccount always
+	 * sets them. The id is server-generated and only ever leaves the process
+	 * through the public feed, never through the admin account payloads.
+	 */
+	public_value_enabled?: boolean;
+	public_value_label?: string | null;
+	public_value_id?: string | null;
 	custom_endpoint: string | null;
 	model_mappings: string | null; // JSON string for OpenAI-compatible providers
 	cross_region_mode: string | null; // Bedrock cross-region inference mode
@@ -345,6 +357,10 @@ export interface AccountResponse {
 	autoRefreshEnabled: boolean;
 	autoPauseOnOverageEnabled?: boolean;
 	codexCreditDrainEnabled?: boolean;
+	/** Published on the public subscription value feed (#536). */
+	publicValueEnabled?: boolean;
+	/** Public label; kept while unpublished so a re-publish reuses it. */
+	publicValueLabel?: string | null;
 	/** Enabled AND drain currently in effect (fresh credit evidence). */
 	codexCreditDrainActive?: boolean;
 	/**
@@ -506,6 +522,9 @@ export function toAccount(row: AccountRow): Account {
 		auto_pause_on_overage_enabled: !!row.auto_pause_on_overage_enabled,
 		peak_hours_pause_enabled: !!row.peak_hours_pause_enabled,
 		codex_credit_drain_enabled: !!row.codex_credit_drain_enabled,
+		public_value_enabled: !!row.public_value_enabled,
+		public_value_label: row.public_value_label ?? null,
+		public_value_id: row.public_value_id ?? null,
 		custom_endpoint: row.custom_endpoint || null,
 		model_mappings: row.model_mappings || null,
 		cross_region_mode: row.cross_region_mode || null,
@@ -599,6 +618,8 @@ export function toAccountResponse(account: Account): AccountResponse {
 		autoPauseOnOverageEnabled: account.auto_pause_on_overage_enabled,
 		peakHoursPauseEnabled: account.peak_hours_pause_enabled,
 		codexCreditDrainEnabled: !!account.codex_credit_drain_enabled,
+		publicValueEnabled: !!account.public_value_enabled,
+		publicValueLabel: account.public_value_label ?? null,
 		customEndpoint: account.custom_endpoint,
 		modelMappings,
 		usageUtilization: null, // Will be filled in by API handler from cache

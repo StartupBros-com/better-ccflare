@@ -7,6 +7,7 @@ export { AccountPriorityDialog } from "./AccountPriorityDialog";
 export { AnthropicReauthDialog } from "./AnthropicReauthDialog";
 export { CodexReauthDialog } from "./CodexReauthDialog";
 export { DeleteConfirmationDialog } from "./DeleteConfirmationDialog";
+export { PublicValueDialog } from "./PublicValueDialog";
 export { QwenReauthDialog } from "./QwenReauthDialog";
 export { RateLimitProgress } from "./RateLimitProgress";
 export { RenameAccountDialog } from "./RenameAccountDialog";

@@ -511,6 +511,29 @@ Routing honors the flag only while fresh, poll-verified credit evidence exists (
 
 `GET /api/accounts` returns `codexCreditDrainEnabled` (the setting) and `codexCreditDrainActive` (the setting AND fresh credit evidence, i.e. currently in effect). `codexCreditDrainServing` is true only while the account is active AND an account-wide plan window (`five_hour`/`seven_day`) is spent, i.e. requests are being served from purchased credits right now. While active, a spent window is not reported as `usage_exhausted` or throttled, and `/health` counts the account as routable.
 
+#### POST /api/accounts/:accountId/public-value
+
+Publish or unpublish an account on the public subscription value feed (`GET /api/public/subscription-value`) when the server runs with `BETTER_CCFLARE_PUBLIC_SUBSCRIPTIONS=accounts`. Requires admin authentication like other account routes (`401` while an API key is active and the caller is unauthenticated). The default is unpublished.
+
+**Request Body:**
+```json
+{ "enabled": true, "label": "Max #1" }
+```
+`enabled` must be a boolean. `label` is a string, required when publishing unless the account already has a stored label (it is reused). The label is public and must not contain the account name or ID (case-insensitive), must satisfy the feed label rules, and must be unique among other published accounts (case-insensitive). The label is kept when unpublishing.
+
+**Response:**
+```json
+{
+  "success": true,
+  "publicValueEnabled": true,
+  "publicValueLabel": "Max #1"
+}
+```
+
+Errors: `404` unknown account; `400` for malformed JSON or body, a non-boolean `enabled`, a non-string or invalid `label`, a label containing the account name or ID, a missing label on publish, a duplicate label, or a 17th published account (limit 16). A refused request changes nothing, including when a concurrent writer takes the last slot or the same label between the check and the write: the database write itself enforces the cap and label uniqueness and the request fails with `400`. An unpublish takes effect on the next feed request in the process that handled the write, and within 5 seconds in any other process sharing the database (which the single-instance-per-database deployment model does not support anyway). The public `id` is generated server-side and is never returned by admin routes.
+
+`GET /api/accounts` returns `publicValueEnabled` and `publicValueLabel` for every account.
+
 #### POST /api/accounts/:accountId/pause
 
 Pause an account temporarily.

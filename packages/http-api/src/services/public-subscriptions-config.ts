@@ -8,7 +8,31 @@ export interface PublicSubscriptionMapping {
 export type PublicSubscriptionsConfig =
 	| { status: "disabled" }
 	| { status: "invalid"; reason: string; index?: number }
-	| { status: "enabled"; mappings: PublicSubscriptionMapping[] };
+	| { status: "enabled"; mappings: PublicSubscriptionMapping[] }
+	/** DB-backed roster: published accounts are read on a feed cache miss. */
+	| { status: "accounts" };
+
+/** Maximum number of subscriptions the feed (either mode) may publish. */
+export const MAX_PUBLIC_SUBSCRIPTIONS = 16;
+
+/** Shared label rule: 1-80 code points, no surrounding whitespace, no markup or control/format/line separators. */
+export function isValidPublicLabel(label: unknown): label is string {
+	return (
+		typeof label === "string" &&
+		Array.from(label).length >= 1 &&
+		Array.from(label).length <= 80 &&
+		label.trim() === label &&
+		!/[<>\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(label)
+	);
+}
+
+/** Shared public-id rule: opaque slug, 1-64 chars, starts alphanumeric. */
+export function isValidPublicId(id: unknown): id is string {
+	return (
+		typeof id === "string" &&
+		/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}(?![\s\S])/.test(id)
+	);
+}
 
 const invalid = (
 	reason: string,
@@ -24,6 +48,7 @@ export function parsePublicSubscriptionsConfig(
 	raw: string | undefined,
 ): PublicSubscriptionsConfig {
 	if (raw === undefined || raw === "") return { status: "disabled" };
+	if (raw === "accounts") return { status: "accounts" };
 	if (new TextEncoder().encode(raw).byteLength > 16 * 1024)
 		return invalid("too_large");
 	let entries: unknown;
@@ -33,7 +58,7 @@ export function parsePublicSubscriptionsConfig(
 		return invalid("not_json");
 	}
 	if (!Array.isArray(entries)) return invalid("not_array");
-	if (entries.length > 16) return invalid("too_many");
+	if (entries.length > MAX_PUBLIC_SUBSCRIPTIONS) return invalid("too_many");
 	for (const [index, entry] of entries.entries()) {
 		if (
 			!entry ||
@@ -64,24 +89,13 @@ export function parsePublicSubscriptionsConfig(
 			return invalid("bad_account_id", index);
 		if (!Number.isSafeInteger(accountCreatedAt) || accountCreatedAt < 0)
 			return invalid("bad_account_created_at", index);
-		if (
-			typeof id !== "string" ||
-			!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}(?![\s\S])/.test(id)
-		)
-			return invalid("bad_id", index);
+		if (!isValidPublicId(id)) return invalid("bad_id", index);
 		if (
 			id.toLowerCase().includes(accountId.toLowerCase()) ||
 			accountId.toLowerCase().includes(id.toLowerCase())
 		)
 			return invalid("id_overlaps_account_id", index);
-		if (
-			typeof label !== "string" ||
-			Array.from(label).length < 1 ||
-			Array.from(label).length > 80 ||
-			label.trim() !== label ||
-			/[<>\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(label)
-		)
-			return invalid("bad_label", index);
+		if (!isValidPublicLabel(label)) return invalid("bad_label", index);
 		if (ids.has(id)) return invalid("duplicate_id", index);
 		if (accounts.has(accountId)) return invalid("duplicate_account_id", index);
 		ids.add(id);

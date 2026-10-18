@@ -12,6 +12,7 @@ import {
 	readCachePacingMs,
 	readCodexCachePacingSettleMs,
 } from "@better-ccflare/proxy";
+import { createAccountPublicValueHandler } from "./handlers/account-public-value";
 import {
 	createAccountAddHandler,
 	createAccountAutoFallbackHandler,
@@ -878,6 +879,16 @@ export class APIRouter {
 				);
 				return await this.wrapHandler((req) =>
 					codexCreditDrainHandler(req, accountId),
+				)(req, url);
+			}
+
+			// Account public-value feed publication (admin only; #536)
+			if (path.endsWith("/public-value") && method === "POST") {
+				const publicValueHandler = createAccountPublicValueHandler(
+					this.context.dbOps,
+				);
+				return await this.wrapHandler((req) =>
+					publicValueHandler(req, accountId),
 				)(req, url);
 			}
 

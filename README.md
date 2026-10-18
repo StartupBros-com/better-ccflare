@@ -258,7 +258,39 @@ For PostgreSQL, run the equivalent SQL against the configured database:
 SELECT id, created_at FROM accounts;
 ```
 
-A replacement account with the same ID is unavailable after the cached response
+##### Dashboard-managed roster
+
+Instead of a JSON array, set `BETTER_CCFLARE_PUBLIC_SUBSCRIPTIONS=accounts`
+once (exactly that string). That environment change needs a server restart.
+After it, manage the roster from the dashboard Accounts page with no further
+restarts: switch **Public value** on for an account, enter its public label,
+and save. Turning the switch off unpublishes it (the label is kept); the edit
+action next to a published account changes its label.
+
+- Labels are public and shown on the House of Vibe site. They must follow the
+  `label` rules above, must not contain the account name or ID, and must be
+  unique among published accounts (case-insensitive).
+- At most 16 accounts can be published; a 17th is refused.
+- The public `id` is generated (`sub-` plus 16 hex characters), never derived
+  from the account name or ID, and stays stable across relabels and
+  unpublish/republish.
+- Renaming a published account to a name its public label contains is refused
+  (`400`); change the label or unpublish first. The feed also fails closed
+  (`503`) if a stored label ever contains the account name.
+- A replaced account (deleted and re-added, even under the same name) starts
+  unpublished and must be published again.
+- Publishing and unpublishing take effect on the next request in the process
+  that handled the write, and within 5 seconds in any other process sharing the
+  database (which the single-instance-per-database deployment model does not
+  support anyway). The 16-account cap and label uniqueness are enforced by the
+  database write itself. A publish, unpublish, relabel or delete made directly
+  in the database is also picked up within 5 seconds.
+- Zero published accounts returns `200` with an empty list. The feed response
+  shape is unchanged.
+
+The JSON array form above remains supported and unchanged.
+
+In JSON array mode, a replacement account with the same ID is unavailable after the cached response
 expires until explicitly enrolled again with its new creation timestamp. Invalid,
 duplicate, or missing-generation mappings fail closed. Publication is
 all-or-nothing: any failing mapping makes the whole feed return a generic `503`,

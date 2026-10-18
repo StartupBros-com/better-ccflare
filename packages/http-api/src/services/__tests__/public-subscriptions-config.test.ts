@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { parsePublicSubscriptionsConfig } from "../public-subscriptions-config";
+import {
+	isValidPublicId,
+	isValidPublicLabel,
+	parsePublicSubscriptionsConfig,
+} from "../public-subscriptions-config";
 
 const mapping = {
 	accountId: "private",
@@ -177,5 +181,34 @@ describe("public subscription publication configuration", () => {
 			status: "enabled",
 			mappings: [{ ...mapping, label }],
 		});
+	});
+	it("selects the DB-backed roster only for the exact string accounts", () => {
+		expect(parsePublicSubscriptionsConfig("accounts")).toEqual({
+			status: "accounts",
+		});
+		for (const raw of ["Accounts", " accounts", "accounts ", "account"]) {
+			expect(parsePublicSubscriptionsConfig(raw).status).toBe("invalid");
+		}
+	});
+	it("exports the shared label and id validators used by both modes", () => {
+		expect(isValidPublicLabel("Weekly plan")).toBe(true);
+		expect(isValidPublicLabel("😀".repeat(80))).toBe(true);
+		for (const bad of [
+			"",
+			" x",
+			"x ",
+			"a<b",
+			"a>b",
+			"a\tb",
+			"a​b",
+			"a b",
+			"x".repeat(81),
+			5,
+			null,
+		])
+			expect(isValidPublicLabel(bad)).toBe(false);
+		expect(isValidPublicId("sub-0123456789abcdef")).toBe(true);
+		for (const bad of ["", "-x", "a b", "a".repeat(65), "a\n", 5, undefined])
+			expect(isValidPublicId(bad)).toBe(false);
 	});
 });

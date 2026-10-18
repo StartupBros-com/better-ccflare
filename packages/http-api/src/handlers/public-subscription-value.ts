@@ -1,5 +1,9 @@
 import { Logger } from "@better-ccflare/logger";
+import { getPublicRosterGeneration } from "../services/public-subscription-roster";
 import {
+	isValidPublicId,
+	isValidPublicLabel,
+	MAX_PUBLIC_SUBSCRIPTIONS,
 	type PublicSubscriptionMapping,
 	parsePublicSubscriptionsConfig,
 } from "../services/public-subscriptions-config";
@@ -9,6 +13,7 @@ import {
 	valueOpenWindow,
 } from "../services/usage-window-read";
 import type { APIContext } from "../types";
+import { labelRevealsAccount } from "./account-public-value";
 
 interface PublicValueWindow {
 	startedAt: number;
@@ -33,6 +38,12 @@ interface PublicSubscriptionValue {
 }
 
 const CACHE_MS = 60_000;
+/**
+ * In roster ("accounts") mode a still-valid cached body is revalidated against
+ * the database roster at most once per this interval per process, so a write
+ * made by another process sharing the database is picked up within this bound.
+ */
+export const ROSTER_RECHECK_MS = 5_000;
 /** Source clocks may lead this server by at most five seconds. */
 const CLOCK_SKEW_MS = 5_000;
 const timestamp = (value: number): boolean =>
@@ -90,23 +101,34 @@ const log = new Logger("PublicSubscriptionValueHandler");
 /** A read-only, explicitly enrolled projection. Public requests never select accounts or periods. */
 export function createPublicSubscriptionValueHandler(
 	context: APIContext,
-	options: { getConfig?: () => string | undefined; now?: () => number } = {},
+	options: {
+		getConfig?: () => string | undefined;
+		now?: () => number;
+		/** Roster generation for the DB-backed ("accounts") mode cache key. */
+		getRosterGeneration?: () => number;
+	} = {},
 ) {
 	const getConfig =
 		options.getConfig ??
 		(() => process.env.BETTER_CCFLARE_PUBLIC_SUBSCRIPTIONS);
 	const now = options.now ?? Date.now;
+	const getGeneration =
+		options.getRosterGeneration ?? getPublicRosterGeneration;
 	const loggedConfigs = new Set<string | undefined>();
 	const loggedFailures = new Map<string, number>();
 	const refreshes = new Map<
 		string | undefined,
-		Promise<PublicSubscriptionValue>
+		Promise<{ body: PublicSubscriptionValue; signature?: string }>
 	>();
+	let rosterRecheck: Promise<string> | undefined;
 	let cache:
 		| {
 				raw: string | undefined;
 				body: PublicSubscriptionValue;
 				expiresAt: number;
+				/** Roster mode only: identity of the roster this body was built from. */
+				signature?: string;
+				rosterCheckedAt: number;
 		  }
 		| undefined;
 
@@ -133,10 +155,75 @@ export function createPublicSubscriptionValueHandler(
 		else log.error("Public subscription value unavailable: unexpected", error);
 	}
 
+	/**
+	 * Reads the published roster. Called only from refresh (a cache miss), so the
+	 * database is never queried per public request. Anything malformed fails the
+	 * whole feed closed.
+	 */
+	async function readRoster(): Promise<PublicSubscriptionMapping[]> {
+		return validateRosterRows(
+			await context.dbOps.listPublishedPublicValue(
+				MAX_PUBLIC_SUBSCRIPTIONS + 1,
+			),
+		);
+	}
+
+	function validateRosterRows(
+		rows: Awaited<ReturnType<typeof context.dbOps.listPublishedPublicValue>>,
+	): PublicSubscriptionMapping[] {
+		if (rows.length > MAX_PUBLIC_SUBSCRIPTIONS)
+			throw new FeedUnavailable("too_many");
+		const ids = new Set<string>();
+		const labels = new Set<string>();
+		const mappings: PublicSubscriptionMapping[] = [];
+		for (const row of rows) {
+			const label = row.public_value_label;
+			const id = row.public_value_id;
+			const createdAt = Number(row.created_at);
+			if (!isValidPublicLabel(label)) throw new FeedUnavailable("bad_label");
+			if (!isValidPublicId(id)) throw new FeedUnavailable("bad_id");
+			if (!timestamp(createdAt))
+				throw new FeedUnavailable("bad_account_created_at", id);
+			const labelKey = label.toLowerCase();
+			if (ids.has(id)) throw new FeedUnavailable("duplicate_id", id);
+			if (labels.has(labelKey))
+				throw new FeedUnavailable("duplicate_label", id);
+			ids.add(id);
+			labels.add(labelKey);
+			mappings.push({
+				accountId: row.id,
+				accountCreatedAt: createdAt,
+				id,
+				label,
+			});
+		}
+		return mappings.sort(
+			(a, b) =>
+				(a.label.toLowerCase() < b.label.toLowerCase()
+					? -1
+					: a.label.toLowerCase() > b.label.toLowerCase()
+						? 1
+						: 0) || a.accountCreatedAt - b.accountCreatedAt,
+		);
+	}
+
+	/** Order-independent identity of a validated roster. */
+	function rosterSignature(mappings: PublicSubscriptionMapping[]): string {
+		return mappings
+			.map((m) =>
+				JSON.stringify([m.accountId, m.id, m.label, m.accountCreatedAt]),
+			)
+			.sort()
+			.join("\n");
+	}
+
 	async function refresh(
-		mappings: PublicSubscriptionMapping[],
+		source: PublicSubscriptionMapping[] | "accounts",
 		at: number,
-	): Promise<PublicSubscriptionValue> {
+	): Promise<{ body: PublicSubscriptionValue; signature?: string }> {
+		const fromRoster = source === "accounts";
+		const mappings = fromRoster ? await readRoster() : source;
+		const signature = fromRoster ? rosterSignature(mappings) : undefined;
 		const subscriptions = await Promise.all(
 			mappings.map(async (mapping) => {
 				const [snapshot, open, closed] = await Promise.all([
@@ -162,6 +249,16 @@ export function createPublicSubscriptionValueHandler(
 				const account = await context.dbOps.getAccount(mapping.accountId);
 				if (!account || account.created_at !== mapping.accountCreatedAt)
 					throw new FeedUnavailable("generation_mismatch", mapping.id);
+				// Roster mode: the row must still be published exactly as read.
+				if (
+					fromRoster &&
+					(account.public_value_enabled !== true ||
+						account.public_value_label !== mapping.label ||
+						account.public_value_id !== mapping.id ||
+						// A rename can make a stored label reveal the account name.
+						labelRevealsAccount(mapping.label, account))
+				)
+					throw new FeedUnavailable("roster_changed", mapping.id);
 				const observed = snapshot?.timestamp;
 				return {
 					id: mapping.id,
@@ -183,11 +280,14 @@ export function createPublicSubscriptionValueHandler(
 			}),
 		);
 		return {
-			schemaVersion: 1,
-			valueBasis: "api_equivalent_usd",
-			windowKey: "seven_day",
-			generatedAt: at,
-			subscriptions,
+			body: {
+				schemaVersion: 1,
+				valueBasis: "api_equivalent_usd",
+				windowKey: "seven_day",
+				generatedAt: at,
+				subscriptions,
+			},
+			signature,
 		};
 	}
 
@@ -204,6 +304,8 @@ export function createPublicSubscriptionValueHandler(
 						reason: config.reason,
 						...(config.index === undefined ? {} : { index: config.index }),
 					});
+				else if (config.status === "accounts")
+					log.info("Public subscriptions enabled from the account roster");
 				else
 					log.info("Public subscriptions enabled", {
 						subscriptions: config.mappings.length,
@@ -211,30 +313,65 @@ export function createPublicSubscriptionValueHandler(
 			}
 			if (config.status === "invalid")
 				return response({ error: "Unavailable" }, 503);
+			// Roster mode keys the cache on the write generation so an admin write
+			// is visible on the next request, and never shares a key with env JSON.
+			const generation = config.status === "accounts" ? getGeneration() : 0;
+			const key = config.status === "accounts" ? `accounts:${generation}` : raw;
 			const at = now();
 			if (!timestamp(at)) throw new FeedUnavailable("clock");
 			let entry = cache;
-			if (
+			let needsRefresh =
 				!entry ||
-				entry.raw !== raw ||
+				entry.raw !== key ||
 				at < entry.body.generatedAt ||
-				at >= entry.expiresAt
+				at >= entry.expiresAt;
+			if (
+				!needsRefresh &&
+				entry &&
+				config.status === "accounts" &&
+				entry.signature !== undefined &&
+				at - entry.rosterCheckedAt >= ROSTER_RECHECK_MS
 			) {
-				let pending = refreshes.get(raw);
-				if (!pending) {
-					pending = refresh(config.mappings, at);
-					refreshes.set(raw, pending);
+				// One shared, cheap roster query per interval. An error propagates
+				// to the generic 503 path; the cached body is never served stale.
+				let pendingCheck = rosterRecheck;
+				if (!pendingCheck) {
+					pendingCheck = readRoster().then(rosterSignature);
+					rosterRecheck = pendingCheck;
 				}
-				let body: PublicSubscriptionValue;
+				let signature: string;
 				try {
-					body = await pending;
+					signature = await pendingCheck;
 				} finally {
-					if (refreshes.get(raw) === pending) refreshes.delete(raw);
+					if (rosterRecheck === pendingCheck) rosterRecheck = undefined;
+				}
+				if (signature === entry.signature) entry.rosterCheckedAt = at;
+				else needsRefresh = true;
+			}
+			if (needsRefresh) {
+				let pending = refreshes.get(key);
+				if (!pending) {
+					pending = refresh(
+						config.status === "accounts" ? "accounts" : config.mappings,
+						at,
+					);
+					refreshes.set(key, pending);
+				}
+				let built: { body: PublicSubscriptionValue; signature?: string };
+				try {
+					built = await pending;
+				} finally {
+					if (refreshes.get(key) === pending) refreshes.delete(key);
 				}
 				if (getConfig() !== raw) throw new FeedUnavailable("config_changed");
+				if (config.status === "accounts" && getGeneration() !== generation)
+					throw new FeedUnavailable("roster_changed");
+				const body = built.body;
 				entry = {
-					raw,
+					raw: key,
 					body,
+					signature: built.signature,
+					rosterCheckedAt: at,
 					expiresAt: Math.min(
 						body.generatedAt + CACHE_MS,
 						...body.subscriptions.flatMap((subscription) =>
@@ -243,6 +380,7 @@ export function createPublicSubscriptionValueHandler(
 					),
 				};
 			}
+			if (!entry) throw new FeedUnavailable("expired");
 			const responseAt = now();
 			if (!timestamp(responseAt)) throw new FeedUnavailable("clock");
 			if (responseAt < entry.body.generatedAt || responseAt >= entry.expiresAt)

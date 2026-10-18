@@ -64,6 +64,7 @@ import {
 	AccountRepository,
 	type ClearedRateLimit,
 	type MarkAccountRateLimitedResult,
+	type PublishedPublicValueRow,
 } from "./repositories/account.repository";
 import { AgentPreferenceRepository } from "./repositories/agent-preference.repository";
 import { ApiKeyRepository } from "./repositories/api-key.repository";
@@ -1492,6 +1493,20 @@ OAuth tokens will need to be re-authenticated.
 		enabled: boolean,
 	): Promise<void> {
 		await this.accounts.setCodexCreditDrainEnabled(accountId, enabled);
+	}
+
+	async listPublishedPublicValue(
+		limit: number,
+	): Promise<PublishedPublicValueRow[]> {
+		return this.accounts.listPublishedPublicValue(limit);
+	}
+
+	async setPublicValue(
+		accountId: string,
+		value: { enabled: boolean; label: string | null; publicId: string | null },
+		maxPublished?: number,
+	): Promise<boolean> {
+		return this.accounts.setPublicValue(accountId, value, maxPublished);
 	}
 
 	async setPeakHoursPauseEnabled(
