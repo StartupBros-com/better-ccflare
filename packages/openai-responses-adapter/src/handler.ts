@@ -385,6 +385,9 @@ export async function handleResponsesRequest(
 	if (!body || (typeof body.input !== "string" && !Array.isArray(body.input))) {
 		return openAiRequestError(400, "input: Field required");
 	}
+	if (typeof body.model !== "string") {
+		return openAiRequestError(400, "model must be a string");
+	}
 	if (typeof body.input === "string") {
 		body = {
 			...body,
@@ -500,7 +503,13 @@ export async function handleResponsesRequest(
 			CODEX_CONTINUATION_STRATEGY_PREVIOUS_RESPONSE_ID;
 	}
 	const additionalToolsItems = Array.isArray(body.input)
-		? body.input.filter((item) => item.type === "additional_tools")
+		? body.input.filter(
+				(item) =>
+					item !== null &&
+					typeof item === "object" &&
+					!Array.isArray(item) &&
+					item.type === "additional_tools",
+			)
 		: [];
 	if (additionalToolsItems.length > 0) {
 		codexPassthrough.additional_tools = additionalToolsItems;
