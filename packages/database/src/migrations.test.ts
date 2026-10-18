@@ -2227,3 +2227,125 @@ describe("advisor usage column on requests", () => {
 		expect(row).toEqual({ advisor_usage: null });
 	});
 });
+
+describe("Database Migrations - public_value_* columns", () => {
+	type ColInfo = { name: string; notnull: number; dflt_value: string | null };
+	const cols = (db: Database) =>
+		db.prepare("PRAGMA table_info(accounts)").all() as ColInfo[];
+	const publicCols = (db: Database) =>
+		cols(db).filter((c) => c.name.startsWith("public_value_"));
+
+	it("adds the columns on a fresh DB with off/NULL defaults and is idempotent", () => {
+		const db = new Database(":memory:");
+		try {
+			ensureSchema(db);
+			expect(publicCols(db)).toHaveLength(0);
+			runMigrations(db);
+			const byName = new Map(publicCols(db).map((c) => [c.name, c]));
+			expect(byName.get("public_value_enabled")?.notnull).toBe(1);
+			expect(byName.get("public_value_enabled")?.dflt_value).toBe("0");
+			expect(byName.get("public_value_label")?.notnull).toBe(0);
+			expect(byName.get("public_value_id")?.notnull).toBe(0);
+			db.prepare(
+				"INSERT INTO accounts (id, name, provider, created_at) VALUES ('a1','a1','anthropic',1)",
+			).run();
+			expect(
+				db
+					.prepare(
+						"SELECT public_value_enabled e, public_value_label l, public_value_id i FROM accounts",
+					)
+					.get(),
+			).toEqual({ e: 0, l: null, i: null });
+			expect(() => runMigrations(db)).not.toThrow();
+			expect(publicCols(db)).toHaveLength(3);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("upgrades an existing DB and keeps rows unpublished", () => {
+		const db = new Database(":memory:");
+		try {
+			ensureSchema(db);
+			runMigrations(db);
+			db.exec(
+				"ALTER TABLE accounts DROP COLUMN public_value_enabled; ALTER TABLE accounts DROP COLUMN public_value_label; ALTER TABLE accounts DROP COLUMN public_value_id;",
+			);
+			db.prepare(
+				"INSERT INTO accounts (id, name, provider, created_at) VALUES ('old','old','anthropic',1)",
+			).run();
+			runMigrations(db);
+			expect(publicCols(db)).toHaveLength(3);
+			expect(
+				db.prepare("SELECT public_value_enabled e FROM accounts").get(),
+			).toEqual({ e: 0 });
+		} finally {
+			db.close();
+		}
+	});
+
+	it("keeps the columns through the legacy nullable-refresh_token rebuild", () => {
+		const db = new Database(":memory:");
+		try {
+			db.exec(`
+				CREATE TABLE accounts (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					provider TEXT DEFAULT 'anthropic',
+					api_key TEXT,
+					refresh_token TEXT NOT NULL,
+					access_token TEXT,
+					expires_at INTEGER,
+					created_at INTEGER NOT NULL,
+					last_used INTEGER,
+					request_count INTEGER DEFAULT 0,
+					total_requests INTEGER DEFAULT 0
+				)
+			`);
+			db.prepare(
+				"INSERT INTO accounts (id, name, provider, refresh_token, created_at) VALUES ('c1','c1','anthropic','rt',1)",
+			).run();
+			runMigrations(db);
+			expect(publicCols(db)).toHaveLength(3);
+			expect(
+				db.prepare("SELECT public_value_enabled e FROM accounts").get(),
+			).toEqual({ e: 0 });
+		} finally {
+			db.close();
+		}
+	});
+
+	it("keeps the columns through the legacy account_tier rebuild", () => {
+		const db = new Database(":memory:");
+		try {
+			db.exec(`
+				CREATE TABLE accounts (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					provider TEXT DEFAULT 'anthropic',
+					api_key TEXT,
+					refresh_token TEXT,
+					access_token TEXT,
+					expires_at INTEGER,
+					created_at INTEGER NOT NULL,
+					last_used INTEGER,
+					request_count INTEGER DEFAULT 0,
+					total_requests INTEGER DEFAULT 0,
+					priority INTEGER DEFAULT 0,
+					billing_type TEXT DEFAULT NULL,
+					account_tier TEXT DEFAULT 'free'
+				)
+			`);
+			db.prepare(
+				"INSERT INTO accounts (id, name, provider, refresh_token, created_at, account_tier) VALUES ('c1','c1','anthropic','',1,'pro')",
+			).run();
+			runMigrations(db);
+			expect(publicCols(db)).toHaveLength(3);
+			expect(
+				db.prepare("SELECT public_value_enabled e FROM accounts").get(),
+			).toEqual({ e: 0 });
+		} finally {
+			db.close();
+		}
+	});
+});

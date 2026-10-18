@@ -44,7 +44,10 @@ export {
 	isEncryptionEnabled,
 } from "./payload-encryption";
 export { analyzeIndexUsage } from "./performance-indexes";
-export type { MarkAccountRateLimitedResult } from "./repositories/account.repository";
+export type {
+	MarkAccountRateLimitedResult,
+	PublishedPublicValueRow,
+} from "./repositories/account.repository";
 export {
 	type CacheFlightRecorderCounts,
 	type CacheFlightRecorderLookup,

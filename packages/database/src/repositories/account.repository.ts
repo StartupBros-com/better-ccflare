@@ -32,6 +32,14 @@ export interface ClearedRateLimit {
 	provider: string;
 }
 
+export interface PublishedPublicValueRow {
+	id: string;
+	name: string;
+	created_at: number;
+	public_value_label: string | null;
+	public_value_id: string | null;
+}
+
 export class AccountRepository extends BaseRepository<Account> {
 	async findAll(): Promise<Account[]> {
 		const rows = await this.query<AccountRow>(`
@@ -48,6 +56,9 @@ export class AccountRepository extends BaseRepository<Account> {
 				COALESCE(auto_pause_on_overage_enabled, 0) as auto_pause_on_overage_enabled,
 				COALESCE(peak_hours_pause_enabled, 0) as peak_hours_pause_enabled,
 				COALESCE(codex_credit_drain_enabled, 0) as codex_credit_drain_enabled,
+				COALESCE(public_value_enabled, 0) as public_value_enabled,
+				public_value_label,
+				public_value_id,
 				custom_endpoint,
 				model_mappings,
 				cross_region_mode,
@@ -78,6 +89,9 @@ export class AccountRepository extends BaseRepository<Account> {
 				COALESCE(auto_pause_on_overage_enabled, 0) as auto_pause_on_overage_enabled,
 				COALESCE(peak_hours_pause_enabled, 0) as peak_hours_pause_enabled,
 				COALESCE(codex_credit_drain_enabled, 0) as codex_credit_drain_enabled,
+				COALESCE(public_value_enabled, 0) as public_value_enabled,
+				public_value_label,
+				public_value_id,
 				custom_endpoint,
 				model_mappings,
 				cross_region_mode,
@@ -602,6 +616,28 @@ export class AccountRepository extends BaseRepository<Account> {
 		await this.run(
 			`UPDATE accounts SET codex_credit_drain_enabled = ? WHERE id = ?`,
 			[enabled ? 1 : 0, accountId],
+		);
+	}
+
+	/** Published accounts for the public value feed (at most `limit`, unordered). */
+	async listPublishedPublicValue(
+		limit: number,
+	): Promise<PublishedPublicValueRow[]> {
+		return this.query<PublishedPublicValueRow>(
+			`SELECT id, name, created_at, public_value_label, public_value_id
+			 FROM accounts WHERE COALESCE(public_value_enabled, 0) = 1 LIMIT ?`,
+			[limit],
+		);
+	}
+
+	/** Writes the public-value columns together; the caller has validated them. */
+	async setPublicValue(
+		accountId: string,
+		value: { enabled: boolean; label: string | null; publicId: string | null },
+	): Promise<void> {
+		await this.run(
+			`UPDATE accounts SET public_value_enabled = ?, public_value_label = ?, public_value_id = ? WHERE id = ?`,
+			[value.enabled ? 1 : 0, value.label, value.publicId, accountId],
 		);
 	}
 

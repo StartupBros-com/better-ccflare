@@ -651,6 +651,9 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			auto_pause_on_overage_enabled INTEGER DEFAULT 0,
 			peak_hours_pause_enabled INTEGER NOT NULL DEFAULT 0,
 			codex_credit_drain_enabled INTEGER NOT NULL DEFAULT 0,
+			public_value_enabled INTEGER NOT NULL DEFAULT 0,
+			public_value_label TEXT,
+			public_value_id TEXT,
 			pause_reason TEXT,
 			requires_reauth INTEGER DEFAULT 0,
 			billing_type TEXT DEFAULT NULL,
@@ -1443,6 +1446,7 @@ export async function collapseAccountDuplicatesPreservingStatePg(
 			   auto_pause_on_overage_enabled = (SELECT MAX(COALESCE(auto_pause_on_overage_enabled, 0)) FROM accounts ${PG_GROUP_SCOPE}),
 			   peak_hours_pause_enabled = (SELECT MAX(COALESCE(peak_hours_pause_enabled, 0)) FROM accounts ${PG_GROUP_SCOPE}),
 			   codex_credit_drain_enabled = (SELECT MAX(COALESCE(codex_credit_drain_enabled, 0)) FROM accounts ${PG_GROUP_SCOPE}),
+			   /* public_value_* is deliberately NOT merged (fail closed): the survivor keeps only its own values. */
 			   rate_limit_remaining = (SELECT MIN(rate_limit_remaining) FROM accounts ${PG_GROUP_SCOPE} AND rate_limit_remaining IS NOT NULL),
 			   rate_limit_status = COALESCE(rate_limit_status, ${pgFreshest("rate_limit_status")}),
 			   pause_reason = COALESCE(pause_reason, ${pgFreshest("pause_reason")}),
@@ -1746,6 +1750,22 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			column: "codex_credit_drain_enabled",
 			definition:
 				"ALTER TABLE accounts ADD COLUMN codex_credit_drain_enabled INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			table: "accounts",
+			column: "public_value_enabled",
+			definition:
+				"ALTER TABLE accounts ADD COLUMN public_value_enabled INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			table: "accounts",
+			column: "public_value_label",
+			definition: "ALTER TABLE accounts ADD COLUMN public_value_label TEXT",
+		},
+		{
+			table: "accounts",
+			column: "public_value_id",
+			definition: "ALTER TABLE accounts ADD COLUMN public_value_id TEXT",
 		},
 		{
 			table: "accounts",

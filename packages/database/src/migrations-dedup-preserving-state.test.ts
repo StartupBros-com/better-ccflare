@@ -1119,6 +1119,76 @@ describe("Database Migrations — non-destructive account dedup", () => {
 		expect(survivors[0].v).toBe(1);
 	});
 
+	it("never inherits published public_value_* state from a deleted duplicate (fail closed)", () => {
+		setupFullSchemaForDedupTest(db);
+
+		const now = Date.now();
+		// The survivor (freshest credentials) is unpublished; the older duplicate
+		// that will be deleted is published with a label and id.
+		db.prepare(
+			`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint, public_value_enabled, public_value_label, public_value_id)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)`,
+		).run("pv-1", "pv", "anthropic", "r1", "a1", now - 5000, now, now, null);
+		db.prepare(
+			`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint, public_value_enabled, public_value_label, public_value_id)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'Published', 'sub-0123456789abcdef')`,
+		).run(
+			"pv-2",
+			"pv",
+			"anthropic",
+			"r2",
+			"a2",
+			now - 9000,
+			now - 90000,
+			now - 9000,
+			null,
+		);
+
+		runMigrations(db);
+
+		const survivors = db
+			.prepare(
+				`SELECT id, public_value_enabled AS e, public_value_label AS l, public_value_id AS i FROM accounts WHERE name = 'pv'`,
+			)
+			.all();
+		expect(survivors).toEqual([{ id: "pv-1", e: 0, l: null, i: null }]);
+	});
+
+	it("keeps a survivor's own published state and ignores the deleted duplicate's", () => {
+		setupFullSchemaForDedupTest(db);
+
+		const now = Date.now();
+		db.prepare(
+			`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint, public_value_enabled, public_value_label, public_value_id)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'Mine', 'sub-aaaaaaaaaaaaaaaa')`,
+		).run("pw-1", "pw", "anthropic", "r1", "a1", now - 5000, now, now, null);
+		db.prepare(
+			`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint, public_value_enabled, public_value_label, public_value_id)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'Theirs', 'sub-bbbbbbbbbbbbbbbb')`,
+		).run(
+			"pw-2",
+			"pw",
+			"anthropic",
+			"r2",
+			"a2",
+			now - 9000,
+			now - 90000,
+			now - 9000,
+			null,
+		);
+
+		runMigrations(db);
+
+		const survivors = db
+			.prepare(
+				`SELECT id, public_value_label AS l, public_value_id AS i FROM accounts WHERE name = 'pw'`,
+			)
+			.all();
+		expect(survivors).toEqual([
+			{ id: "pw-1", l: "Mine", i: "sub-aaaaaaaaaaaaaaaa" },
+		]);
+	});
+
 	// Regression tests for the code-review finding "dedup silently
 	// CASCADE-deletes combo_membership_exclusions" (and the companion
 	// device_setup_jobs gap). All tests above run with SQLite's default

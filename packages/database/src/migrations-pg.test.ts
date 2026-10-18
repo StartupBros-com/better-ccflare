@@ -287,6 +287,33 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 		).toBe(true);
 	});
 
+	it("ports public_value_* to CREATE TABLE and columnsToAdd, and never merges them in the dedup", () => {
+		const createBlock = pgSource.slice(
+			pgSource.indexOf("CREATE TABLE IF NOT EXISTS accounts"),
+		);
+		for (const definition of [
+			"public_value_enabled INTEGER NOT NULL DEFAULT 0",
+			"public_value_label TEXT",
+			"public_value_id TEXT",
+		]) {
+			expect(createBlock.slice(0, 4000)).toContain(definition);
+			expect(pgSource).toContain(
+				`ALTER TABLE accounts ADD COLUMN ${definition}`,
+			);
+		}
+		expect(pgSource).not.toContain("public_value_enabled = (SELECT");
+		expect(pgSource).not.toContain("public_value_label = (SELECT");
+		expect(pgSource).not.toContain("public_value_id = (SELECT");
+		for (const column of [
+			"public_value_enabled",
+			"public_value_label",
+			"public_value_id",
+		]) {
+			expect(sqliteInventory.tables.get("accounts")?.has(column)).toBe(true);
+			expect(pgInventory.tables.get("accounts")?.has(column)).toBe(true);
+		}
+	});
+
 	it("includes the executed shared cache-health DDL and its real column names", () => {
 		const db = new Database(":memory:");
 		try {
