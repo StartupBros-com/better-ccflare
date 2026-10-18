@@ -279,6 +279,25 @@ describe("public-value write authorization", () => {
 	});
 });
 
+describe("public-value route dispatch", () => {
+	it("routes an authorized POST to the handler instead of falling through", async () => {
+		const router = new APIRouter({
+			dbOps: {
+				getAdapter: () => ({}),
+				countActiveApiKeys: async () => 0,
+				getActiveApiKeys: async () => [],
+			},
+			config: {},
+		} as unknown as APIContext);
+		const url = new URL("http://localhost/api/accounts/acct-1/public-value");
+		const response = await router.handleRequest(
+			url,
+			new Request(url, { method: "POST", body: "{}" }),
+		);
+		expect(response?.status).toBe(400);
+	});
+});
+
 describe("public subscription value feed, accounts mode", () => {
 	it("serves an empty roster with 200 and exact schema keys", async () => {
 		const { status, body } = await feedBody();
