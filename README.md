@@ -199,6 +199,33 @@ STORE_PAYLOADS=false                   # Disable storing request/response bodies
 - Never commit `.env` files containing sensitive values to version control
 - Use environment-specific configuration for production deployments
 
+#### Optional private upstream trace context
+
+`PRIVATE_AI_TRACE_ROUTES_JSON` opts exact account UUIDs into correlation headers
+for exact initial HTTP origins, only for `openai-compatible` accounts:
+
+```bash
+PRIVATE_AI_TRACE_ROUTES_JSON='{"12345678-1234-4234-8234-123456789abc":"https://private.example:8443"}'
+```
+
+The example is a placeholder, not an enrolled account. Origins must use canonical
+HTTP(S) origin spelling, with no trailing slash, path, credentials, query, or
+fragment. Unset, empty, or invalid configuration disables this feature without
+logging its values. Other providers and unmatched routes are unchanged.
+
+Each physical HTTP attempt gets a fresh nonzero 16-hex `x-private-ai-attempt-id`,
+also used as the outgoing W3C `traceparent` span ID. `x-private-ai-request-id`
+retains ccflare's canonical logical request UUID across retries. A valid incoming
+`traceparent` supplies the trace ID and flags; its parent span ID is carried in
+`x-private-ai-parent-span-id`. Otherwise, the trace ID is the canonical UUID
+without hyphens, with flags `01`. Client-supplied `x-private-ai-*` values are
+replaced on opted-in routes. Internal guard IDs and secrets remain stripped.
+
+This propagates context only: ccflare does not export a span or inspect bodies for
+this feature. Matching gates the initial destination, not redirects; existing
+redirect behavior is unchanged, so these opaque IDs can follow an upstream
+redirect to another origin.
+
 #### Optional public subscription value feed
 
 `GET /api/public/subscription-value` is disabled (`404`) unless the server's

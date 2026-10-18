@@ -1108,6 +1108,39 @@ export function getChatTemplateReasoningAccountIds(): ReadonlySet<string> {
 	);
 }
 
+/** Exact account UUID -> initial HTTP origin. Invalid optional config is off. */
+export function getPrivateAiTraceRoutes(): ReadonlyMap<string, string> {
+	const raw = process.env.PRIVATE_AI_TRACE_ROUTES_JSON;
+	if (!raw) return new Map();
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			return new Map();
+		}
+		const routes = new Map<string, string>();
+		for (const [id, origin] of Object.entries(parsed)) {
+			if (
+				!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+					id,
+				) ||
+				typeof origin !== "string"
+			)
+				return new Map();
+			const url = new URL(origin);
+			if (
+				(url.protocol !== "http:" && url.protocol !== "https:") ||
+				url.origin !== origin
+			)
+				return new Map();
+			routes.set(id, origin);
+		}
+		return routes;
+	} catch {
+		// Never log the raw config or parser error (which can contain its values).
+		return new Map();
+	}
+}
+
 export function getCodexReasoningRetention(): boolean {
 	const fromEnv = process.env.CCFLARE_CODEX_REASONING_RETENTION;
 	if (fromEnv) {
