@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { chatGptCloudflareCookieJar } from "../../chatgpt-cloudflare-cookies";
+import { applyPrivateAiTraceContext } from "../private-ai-trace-context";
 import { makeProxyRequest } from "../request-handler";
 
 /**
@@ -81,6 +82,55 @@ describe("makeProxyRequest strips internal control headers before provider forwa
 		// unrelated headers still forwarded
 		expect(sentHeaders?.get("authorization")).toBe("Bearer token");
 		expect(sentHeaders?.get("content-type")).toBe("application/json");
+	});
+
+	it("private correlation survives final stripping without reading the body or replacing the response", async () => {
+		const previous = process.env.PRIVATE_AI_TRACE_ROUTES_JSON;
+		const accountId = "12345678-1234-4234-8234-123456789abc";
+		process.env.PRIVATE_AI_TRACE_ROUTES_JSON = JSON.stringify({
+			[accountId]: "https://private.example",
+		});
+		const response = new Response("upstream bytes", { status: 201 });
+		globalThis.fetch = mock(async (input: unknown) => {
+			if (!(input instanceof Request)) throw new Error("expected Request");
+			sentHeaders = input.headers;
+			expect(await input.text()).toBe("unchanged body");
+			return response;
+		}) as typeof fetch;
+		try {
+			const req = new Request("https://private.example/v1/chat/completions", {
+				method: "POST",
+				body: "unchanged body",
+				headers: {
+					"x-better-ccflare-guard-request-id": "signed-envelope",
+					"x-better-ccflare-guard-correlation-secret": "secret",
+					"x-better-ccflare-request-id": "internal",
+					"x-better-ccflare-internal-probe-secret": "secret",
+				},
+			});
+			applyPrivateAiTraceContext(
+				req.headers,
+				{ id: accountId, provider: "openai-compatible" },
+				req.url,
+				"abcdef01-2345-4678-9abc-def012345678",
+				new Headers(),
+			);
+			expect(req.bodyUsed).toBe(false);
+			expect(await makeProxyRequest(req)).toBe(response);
+			expect(response.bodyUsed).toBe(false);
+			expect(sentHeaders?.get("x-private-ai-request-id")).toBe(
+				"abcdef01-2345-4678-9abc-def012345678",
+			);
+			expect(sentHeaders?.get("traceparent")).toBe(
+				`00-abcdef01234546789abcdef012345678-${sentHeaders?.get("x-private-ai-attempt-id")}-01`,
+			);
+			for (const name of sentHeaders?.keys() ?? [])
+				expect(name.startsWith("x-better-ccflare-")).toBe(false);
+		} finally {
+			if (previous === undefined)
+				delete process.env.PRIVATE_AI_TRACE_ROUTES_JSON;
+			else process.env.PRIVATE_AI_TRACE_ROUTES_JSON = previous;
+		}
 	});
 
 	it("does not forward the probe secret on the Request-target path", async () => {

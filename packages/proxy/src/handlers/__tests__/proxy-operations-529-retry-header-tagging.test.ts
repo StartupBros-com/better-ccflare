@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { getProvider, registerProvider } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import { proxyWithAccount } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
@@ -147,6 +148,7 @@ describe("proxyWithAccount — 529 in-place retry response tagging", () => {
 	let originalFetch: typeof globalThis.fetch;
 	const savedEnv: Record<string, string | undefined> = {};
 	const ENV_KEYS = [
+		"PRIVATE_AI_TRACE_ROUTES_JSON",
 		"CCFLARE_OVERLOAD_RETRY_ENABLED",
 		"CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS",
 		"CCFLARE_OVERLOAD_RETRY_BASE_MS",
@@ -167,6 +169,74 @@ describe("proxyWithAccount — 529 in-place retry response tagging", () => {
 		for (const key of ENV_KEYS) {
 			if (savedEnv[key] === undefined) delete process.env[key];
 			else process.env[key] = savedEnv[key];
+		}
+	});
+
+	it("stamps fresh private spans at each actual HTTP retry with one logical UUID", async () => {
+		const accountId = "12345678-1234-4234-8234-123456789abc";
+		const requestId = "abcdef01-2345-4678-9abc-def012345678";
+		process.env.PRIVATE_AI_TRACE_ROUTES_JSON = JSON.stringify({
+			[accountId]: "https://upstream.local",
+		});
+		const ctx = makeProxyContext([]);
+		const previousProvider = getProvider("openai-compatible");
+		if (!previousProvider) throw new Error("missing compatible provider");
+		registerProvider(ctx.provider);
+		const sent: Headers[] = [];
+		globalThis.fetch = mock(async (input: unknown) => {
+			if (!(input instanceof Request)) throw new Error("expected Request");
+			sent.push(new Headers(input.headers));
+			return new Response("{}", {
+				status: sent.length === 1 ? 529 : 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		const body = makeRequestBody();
+		const req = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			body,
+			headers: {
+				traceparent: "00-11111111111111111111111111111111-2222222222222222-01",
+			},
+		});
+		try {
+			try {
+				await proxyWithAccount(
+					req,
+					new URL(req.url),
+					makeAccount({ id: accountId, provider: "openai-compatible" }),
+					makeRequestMeta({ id: requestId }),
+					body,
+					() => undefined,
+					0,
+					ctx,
+				);
+			} catch (error) {
+				if (
+					!(error instanceof Error) ||
+					!error.message.includes("UsageCollector not initialized")
+				)
+					throw error;
+			}
+			expect(sent).toHaveLength(2);
+			for (const headers of sent) {
+				expect(headers.get("x-private-ai-request-id")).toBe(requestId);
+				expect(headers.get("x-private-ai-attempt-id")).toMatch(
+					/^[0-9a-f]{16}$/,
+				);
+				expect(headers.get("traceparent")).toBe(
+					`00-11111111111111111111111111111111-${headers.get("x-private-ai-attempt-id")}-01`,
+				);
+				expect(headers.get("x-private-ai-parent-span-id")).toBe(
+					"2222222222222222",
+				);
+				expect(headers.has("x-better-ccflare-request-id")).toBe(false);
+			}
+			expect(sent[0].get("x-private-ai-attempt-id")).not.toBe(
+				sent[1].get("x-private-ai-attempt-id"),
+			);
+		} finally {
+			registerProvider(previousProvider);
 		}
 	});
 

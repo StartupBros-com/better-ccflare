@@ -169,6 +169,7 @@ import {
 } from "./account-selector";
 import { cancelDiscardedResponseBody } from "./discard-body-cancel";
 import { forwardObservedUpstream } from "./observed-upstream";
+import { applyPrivateAiTraceContext } from "./private-ai-trace-context";
 import {
 	ERROR_MESSAGES,
 	isInternalProbe,
@@ -2856,6 +2857,15 @@ export async function proxyWithAccount(
 						);
 						if (optionalResponse) return optionalResponse;
 						if (qualityPrepare) await qualityPrepare();
+						// This attempt owns disposable transport headers. Use the original
+						// client's parent, never a previous retry's stamped child span.
+						applyPrivateAiTraceContext(
+							request.headers,
+							account,
+							request.url,
+							requestMeta.id,
+							req.headers,
+						);
 						modelFallbackPolicy?.qualityAttempt?.assertDispatch();
 						// No await after the final authoritative gates. Observation is
 						// fail-open and cannot make an expired attempt dispatchable.
