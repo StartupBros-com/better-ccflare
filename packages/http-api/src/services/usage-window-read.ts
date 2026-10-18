@@ -33,7 +33,7 @@ export interface OpenUsageWindowRecord extends UsageWindowRecord {
 	ageHours: number;
 }
 
-function toRecord(window: UsageWindow): UsageWindowRecord {
+export function toUsageWindowRecord(window: UsageWindow): UsageWindowRecord {
 	return {
 		id: window.id,
 		accountId: window.accountId,
@@ -56,78 +56,52 @@ function toRecord(window: UsageWindow): UsageWindowRecord {
 	};
 }
 
-/** Shared read projection: open rows use canonical valuation at grant start;
- * completed rows retain their persisted ledger valuation. Reads never settle rows. */
+/** Value an open ledger row using the canonical prices at its grant start. */
+export async function valueOpenWindow(
+	dbOps: Pick<DatabaseOperations, "aggregateTokensByModel">,
+	open: UsageWindow,
+	nowMs: number,
+): Promise<OpenUsageWindowRecord> {
+	const aggregates = await dbOps.aggregateTokensByModel(
+		open.accountId,
+		open.startedAt,
+		nowMs,
+	);
+	const valuation = valueWindowAggregates(aggregates, open.startedAt);
+	return {
+		...toUsageWindowRecord(open),
+		valueSoFarUsd: valuation.valueUsd,
+		// An unclosed row has no persisted unpriced count; use the live valuation.
+		unpricedTokens: valuation.unpricedTokens,
+		utilization: open.peakUtilization,
+		ageHours: (nowMs - open.startedAt) / HOUR_MS,
+	};
+}
+
+/** Private read projection: preserve persisted closed values and value the first
+ * open row live, including overdue rows. Reads never settle or mutate rows. */
 export async function readUsageWindows(
 	dbOps: Pick<
 		DatabaseOperations,
-		"listUsageWindows" | "getOpenUsageWindow" | "aggregateTokensByModel"
+		"listUsageWindows" | "aggregateTokensByModel"
 	>,
 	accountId: string,
 	windowKey: string,
 	limit: number,
 	nowMs: number,
-	options: {
-		bounded?: boolean;
-		activeOnly?: boolean;
-		/** Ledger rows have no generation column and survive account deletion.
-		 * Conservatively omit windows starting before this account generation,
-		 * including an ambiguous backdated first_observed window. */
-		accountCreatedAt?: number;
-		existingWindows?: UsageWindow[];
-	} = {},
+	existingWindows?: UsageWindow[],
 ): Promise<{
 	windows: UsageWindowRecord[];
 	openWindow: OpenUsageWindowRecord | null;
 }> {
 	const allWindows =
-		options.existingWindows ??
-		(options.bounded
-			? [
-					...(await dbOps.listUsageWindows({
-						accountId,
-						windowKey,
-						closedOnly: true,
-						limit,
-						startedAtOrAfter: options.accountCreatedAt,
-					})),
-				]
-			: await dbOps.listUsageWindows({ accountId, windowKey }));
-	if (options.bounded) {
-		const open = await dbOps.getOpenUsageWindow(accountId, windowKey);
-		if (open) allWindows.push(open);
-	}
-	const candidate = allWindows.find((w) => w.closedAt == null) ?? null;
-	const open =
-		candidate &&
-		(!options.activeOnly ||
-			(candidate.startedAt <= nowMs && nowMs < candidate.resetsAt)) &&
-		(options.accountCreatedAt == null ||
-			candidate.startedAt >= options.accountCreatedAt)
-			? candidate
-			: null;
-	const closed = allWindows.filter((w) => w.closedAt != null).slice(0, limit);
-
-	let openWindow: OpenUsageWindowRecord | null = null;
-	if (open) {
-		const aggregates = await dbOps.aggregateTokensByModel(
-			accountId,
-			open.startedAt,
-			nowMs,
-		);
-		const valuation = valueWindowAggregates(aggregates, open.startedAt);
-		openWindow = {
-			...toRecord(open),
-			valueSoFarUsd: valuation.valueUsd,
-			// The unclosed ledger row's own unpriced_tokens column is still null;
-			// the live valuation is the only source that can report unpriced usage
-			// inside an open window, so surface it (the dashboard's "unpriced"
-			// warning on live windows depends on this field).
-			unpricedTokens: valuation.unpricedTokens,
-			utilization: open.peakUtilization,
-			ageHours: (nowMs - open.startedAt) / HOUR_MS,
-		};
-	}
-
-	return { windows: closed.map(toRecord), openWindow };
+		existingWindows ?? (await dbOps.listUsageWindows({ accountId, windowKey }));
+	const open = allWindows.find((window) => window.closedAt == null);
+	return {
+		windows: allWindows
+			.filter((window) => window.closedAt != null)
+			.slice(0, limit)
+			.map(toUsageWindowRecord),
+		openWindow: open ? await valueOpenWindow(dbOps, open, nowMs) : null,
+	};
 }

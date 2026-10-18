@@ -209,13 +209,40 @@ accounts. Its value is a JSON array of at most 16 mappings (16 KiB maximum):
 [{"accountId":"<internal-account-id>","accountCreatedAt":1234567890000,"id":"my-weekly-subscription","label":"My weekly subscription"}]
 ```
 
-These are placeholders, not enrolled accounts. Set `accountCreatedAt` to the
-account's exact creation timestamp in epoch milliseconds; a replacement account
-with the same ID is unavailable until explicitly enrolled again. Assign `id`
-independently of the internal account ID (never use its hash), and supply an
-explicit plain-text label rather than copying an account name or inferring a plan.
-Invalid, duplicate, or missing-generation mappings fail closed with a generic
-unavailable response. An empty array publishes an empty list.
+These are placeholders, not enrolled accounts. Each mapping must contain exactly
+these four fields; duplicate JSON keys are rejected:
+
+| Field | Constraints |
+| --- | --- |
+| `accountId` | Existing internal account ID; nonempty, no surrounding whitespace or Unicode control characters. Each account may appear once. |
+| `accountCreatedAt` | Exact `accounts.created_at` value: a nonnegative safe integer in epoch milliseconds. |
+| `id` | Unique public ID, 1–64 ASCII letters, digits, `_` or `-`, starting with a letter or digit. Neither it nor `accountId` may contain the other, ignoring case. Choose it independently; never use an account ID or its hash. |
+| `label` | Explicit plain text, 1–80 Unicode code points, no surrounding whitespace, `<`, `>`, Unicode controls, format characters, or line/paragraph separators. Do not copy an account name or infer a plan. |
+
+Read account creation timestamps from the default SQLite database:
+
+```bash
+sqlite3 ~/.config/better-ccflare/better-ccflare.db 'SELECT id, created_at FROM accounts;'
+```
+
+For PostgreSQL, run the equivalent SQL against the configured database:
+
+```sql
+SELECT id, created_at FROM accounts;
+```
+
+A replacement account with the same ID is unavailable after the cached response
+expires until explicitly enrolled again with its new creation timestamp. Invalid,
+duplicate, or missing-generation mappings fail closed. Publication is
+all-or-nothing: any failing mapping makes the whole feed return a generic `503`,
+with the reason in the server log. An empty array publishes an empty list.
+
+| Status | Meaning |
+| --- | --- |
+| `200` | Valid, available feed (including an explicitly configured empty list). |
+| `404` | Feed disabled, or any other `/api/public` path. |
+| `405` | A method other than `GET` on this endpoint; includes `Allow: GET`. |
+| `503` | Invalid configuration or unavailable data; the server log records the reason. |
 
 The fixed version-1 projection contains only `schemaVersion`, `valueBasis`,
 `windowKey`, `generatedAt`, and `subscriptions`. Each subscription exposes its
@@ -233,6 +260,8 @@ This is a counterfactual list-price value, not savings, ROI, subscription cost,
 actual bills, or plan capacity. Coverage includes only captured plan-billed
 `/v1/messages` traffic. First-observation windows and unpriced traffic make values
 partial or lower bounds; zero remains meaningful and missing valuation stays null.
+`pricingCoverage: "unknown"` with a numeric `valueUsd` identifies a legacy window
+whose unpriced usage was not recorded.
 Expired unclosed rows are omitted from `current`, never relabeled completed.
 Because historical ledger rows have no account-generation field, rows starting
 before the enrolled account's creation are conservatively omitted; this can also
@@ -243,11 +272,18 @@ omit a legitimate first-observation window that spans account creation.
 null; observations up to five seconds ahead of the server clock are tolerated.
 Codex observations can arrive through free `wham/usage` introspection polling
 (which consumes no model quota) as well as real traffic. An observation's age
-alone does not establish an ingestion outage. Responses use
-`Cache-Control: no-store`. The server coalesces concurrent reads and caches
-valuations for at most 60 seconds, stopping at the current reset boundary; config,
-generation, observation, and bounded ledger metadata checks invalidate stale
-entries. Revocation is checked on every request, and errors never serve stale data.
+alone does not establish an ingestion outage. The server coalesces concurrent
+reads and caches the response for up to 60 seconds or until a current window's
+reset, whichever is sooner. Within that interval, account, observation, and ledger
+changes may not be reflected. A failed refresh returns `503` and never falls back
+to an earlier response. Configuration is read from the server environment, so
+configuration changes apply on restart.
+
+At ingress, forward only the exact `GET /api/public/subscription-value` route and
+nothing else. Enable API-key authentication before exposing the server: with no
+active API key, every admin route is open to anything that reaches it. The server
+already serves a cached body for up to 60 seconds, so an edge cache adds nothing.
+All responses carry `Cache-Control: no-store`; forward them unchanged.
 
 #### Claude Code background merge policy
 

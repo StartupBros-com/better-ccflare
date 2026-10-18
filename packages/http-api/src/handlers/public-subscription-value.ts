@@ -1,10 +1,12 @@
+import { Logger } from "@better-ccflare/logger";
 import {
 	type PublicSubscriptionMapping,
 	parsePublicSubscriptionsConfig,
 } from "../services/public-subscriptions-config";
 import {
-	readUsageWindows,
+	toUsageWindowRecord,
 	type UsageWindowRecord,
+	valueOpenWindow,
 } from "../services/usage-window-read";
 import type { APIContext } from "../types";
 
@@ -48,10 +50,10 @@ function publicWindow(
 		(window.closedAt !== null &&
 			(!timestamp(window.closedAt) ||
 				window.closedAt < window.startedAt ||
-				window.closedAt > now)) ||
+				window.closedAt > now + CLOCK_SKEW_MS)) ||
 		(valueUsd !== null && (!Number.isFinite(valueUsd) || valueUsd < 0))
 	)
-		throw new Error("Unavailable");
+		throw new FeedUnavailable("invalid_window");
 	const unpriced = window.unpricedTokens;
 	return {
 		startedAt: window.startedAt,
@@ -75,6 +77,16 @@ function response(body: unknown, status = 200): Response {
 	});
 }
 
+class FeedUnavailable extends Error {
+	constructor(
+		readonly reason: string,
+		readonly publicId?: string,
+	) {
+		super(reason);
+	}
+}
+const log = new Logger("PublicSubscriptionValueHandler");
+
 /** A read-only, explicitly enrolled projection. Public requests never select accounts or periods. */
 export function createPublicSubscriptionValueHandler(
 	context: APIContext,
@@ -84,19 +96,48 @@ export function createPublicSubscriptionValueHandler(
 		options.getConfig ??
 		(() => process.env.BETTER_CCFLARE_PUBLIC_SUBSCRIPTIONS);
 	const now = options.now ?? Date.now;
-	let configKey: string | undefined;
+	const loggedConfigs = new Set<string | undefined>();
+	const loggedFailures = new Map<string, number>();
+	const refreshes = new Map<
+		string | undefined,
+		Promise<PublicSubscriptionValue>
+	>();
 	let cache:
-		| { fingerprint: string; expiresAt: number; body: PublicSubscriptionValue }
-		| undefined;
-	let flight:
-		| { fingerprint: string; promise: Promise<PublicSubscriptionValue> }
-		| undefined;
-	let requestFlight:
-		| { raw: string | undefined; promise: Promise<Response> }
+		| {
+				raw: string | undefined;
+				body: PublicSubscriptionValue;
+				expiresAt: number;
+		  }
 		| undefined;
 
-	async function inspect(mappings: PublicSubscriptionMapping[], at: number) {
-		const states = await Promise.all(
+	function logFailure(error: unknown) {
+		const reason =
+			error instanceof FeedUnavailable ? error.reason : "unexpected";
+		// A broken clock must not prevent diagnostics, or hide the original error.
+		let at = 0;
+		try {
+			const value = now();
+			if (timestamp(value)) at = value;
+		} catch {
+			/* log the original failure */
+		}
+		const previous = loggedFailures.get(reason);
+		if (previous !== undefined && at >= previous && at - previous < CACHE_MS)
+			return;
+		loggedFailures.set(reason, at);
+		if (error instanceof FeedUnavailable)
+			log.warn("Public subscription value unavailable", {
+				reason,
+				...(error.publicId ? { id: error.publicId } : {}),
+			});
+		else log.error("Public subscription value unavailable: unexpected", error);
+	}
+
+	async function refresh(
+		mappings: PublicSubscriptionMapping[],
+		at: number,
+	): Promise<PublicSubscriptionValue> {
+		const subscriptions = await Promise.all(
 			mappings.map(async (mapping) => {
 				const [snapshot, open, closed] = await Promise.all([
 					context.dbOps.getLatestUsageSnapshot(mapping.accountId, "seven_day"),
@@ -109,159 +150,107 @@ export function createPublicSubscriptionValueHandler(
 						startedAtOrAfter: mapping.accountCreatedAt,
 					}),
 				]);
-				// Check generation after the awaited reads as replacement may occur
-				// while the observation/history queries are in flight.
+				const current =
+					open &&
+					open.startedAt >= mapping.accountCreatedAt &&
+					open.startedAt <= at &&
+					at < open.resetsAt
+						? await valueOpenWindow(context.dbOps, open, at)
+						: null;
+				// Check generation after every read, including live valuation: replaced
+				// accounts must never publish rows belonging to their prior generation.
 				const account = await context.dbOps.getAccount(mapping.accountId);
 				if (!account || account.created_at !== mapping.accountCreatedAt)
-					throw new Error("Unavailable");
+					throw new FeedUnavailable("generation_mismatch", mapping.id);
 				const observed = snapshot?.timestamp;
-				const sourceObservedAt =
-					observed !== undefined &&
-					timestamp(observed) &&
-					observed >= mapping.accountCreatedAt &&
-					observed <= at + CLOCK_SKEW_MS
-						? observed
-						: null;
-				return { mapping, sourceObservedAt, open, closed };
+				return {
+					id: mapping.id,
+					label: mapping.label,
+					sourceObservedAt:
+						observed !== undefined &&
+						timestamp(observed) &&
+						observed >= mapping.accountCreatedAt &&
+						observed <= at + CLOCK_SKEW_MS
+							? observed
+							: null,
+					current: current
+						? publicWindow(current, current.valueSoFarUsd, at)
+						: null,
+					completed: closed.map((window) =>
+						publicWindow(toUsageWindowRecord(window), window.valueUsd, at),
+					),
+				};
 			}),
 		);
-		return { states, fingerprint: JSON.stringify(states) };
+		return {
+			schemaVersion: 1,
+			valueBasis: "api_equivalent_usd",
+			windowKey: "seven_day",
+			generatedAt: at,
+			subscriptions,
+		};
 	}
 
-	const handle = async (): Promise<Response> => {
-		const raw = getConfig();
-		if (raw !== configKey) {
-			configKey = raw;
-			cache = undefined;
-			flight = undefined;
-		}
-		const config = parsePublicSubscriptionsConfig(raw);
-		if (config.status === "disabled")
-			return response({ error: "Not found" }, 404);
-		if (config.status === "invalid")
-			return response({ error: "Unavailable" }, 503);
-		try {
-			const at = now();
-			if (!timestamp(at)) throw new Error("Unavailable");
-			const inspected = await inspect(config.mappings, at);
-			let body: PublicSubscriptionValue;
-			if (
-				cache &&
-				cache.fingerprint === inspected.fingerprint &&
-				at >= cache.body.generatedAt &&
-				at < cache.expiresAt
-			)
-				body = cache.body;
-			else {
-				if (!flight || flight.fingerprint !== inspected.fingerprint) {
-					const promise = (async (): Promise<PublicSubscriptionValue> => {
-						const subscriptions = await Promise.all(
-							inspected.states.map(async ({ mapping, sourceObservedAt }) => {
-								const windows = await readUsageWindows(
-									context.dbOps,
-									mapping.accountId,
-									"seven_day",
-									8,
-									at,
-									{
-										bounded: true,
-										activeOnly: true,
-										accountCreatedAt: mapping.accountCreatedAt,
-									},
-								);
-								return {
-									id: mapping.id,
-									label: mapping.label,
-									sourceObservedAt,
-									current: windows.openWindow
-										? publicWindow(
-												windows.openWindow,
-												windows.openWindow.valueSoFarUsd,
-												at,
-											)
-										: null,
-									completed: windows.windows.map((window) =>
-										publicWindow(window, window.valueUsd, at),
-									),
-								};
-							}),
-						);
-						return {
-							schemaVersion: 1,
-							valueBasis: "api_equivalent_usd",
-							windowKey: "seven_day",
-							generatedAt: at,
-							subscriptions,
-						};
-					})();
-					flight = { fingerprint: inspected.fingerprint, promise };
-				}
-				const pending = flight;
-				try {
-					body = await pending.promise;
-				} finally {
-					if (flight === pending) flight = undefined;
-				}
-			}
-			// Validate after every await: neither a revoked mapping nor a replaced/cleared
-			// generation can return a response assembled before the change.
-			if (getConfig() !== raw) throw new Error("Unavailable");
-			const finalAt = now();
-			if (!timestamp(finalAt)) throw new Error("Unavailable");
-			const verified = await inspect(config.mappings, finalAt);
-			const responseAt = now();
-			if (
-				getConfig() !== raw ||
-				!timestamp(responseAt) ||
-				verified.fingerprint !== inspected.fingerprint ||
-				responseAt < body.generatedAt ||
-				responseAt >= body.generatedAt + CACHE_MS ||
-				body.subscriptions.some(
-					(entry) => entry.current && responseAt >= entry.current.resetsAt,
-				)
-			)
-				throw new Error("Unavailable");
-			cache = {
-				fingerprint: inspected.fingerprint,
-				body,
-				expiresAt: Math.min(
-					body.generatedAt + CACHE_MS,
-					...body.subscriptions.flatMap((entry) =>
-						entry.current ? [entry.current.resetsAt] : [],
-					),
-				),
-			};
-			return response(body);
-		} catch {
-			cache = undefined;
-			return response({ error: "Unavailable" }, 503);
-		}
-	};
 	return async (): Promise<Response> => {
 		try {
 			const raw = getConfig();
-			if (!requestFlight || requestFlight.raw !== raw) {
-				requestFlight = { raw, promise: handle() };
+			const config = parsePublicSubscriptionsConfig(raw);
+			if (config.status === "disabled")
+				return response({ error: "Not found" }, 404);
+			if (!loggedConfigs.has(raw)) {
+				loggedConfigs.add(raw);
+				if (config.status === "invalid")
+					log.warn("Invalid public subscriptions config", {
+						reason: config.reason,
+						...(config.index === undefined ? {} : { index: config.index }),
+					});
+				else
+					log.info("Public subscriptions enabled", {
+						subscriptions: config.mappings.length,
+					});
 			}
-			const pending = requestFlight;
-			try {
-				const result = await pending.promise;
-				if (getConfig() !== raw) return response({ error: "Unavailable" }, 503);
-				const responseAt = now();
-				if (
-					result.status === 200 &&
-					(!timestamp(responseAt) ||
-						!cache ||
-						responseAt < cache.body.generatedAt ||
-						responseAt >= cache.expiresAt)
-				)
-					return response({ error: "Unavailable" }, 503);
-				return result.clone();
-			} finally {
-				if (requestFlight === pending) requestFlight = undefined;
+			if (config.status === "invalid")
+				return response({ error: "Unavailable" }, 503);
+			const at = now();
+			if (!timestamp(at)) throw new FeedUnavailable("clock");
+			let entry = cache;
+			if (
+				!entry ||
+				entry.raw !== raw ||
+				at < entry.body.generatedAt ||
+				at >= entry.expiresAt
+			) {
+				let pending = refreshes.get(raw);
+				if (!pending) {
+					pending = refresh(config.mappings, at);
+					refreshes.set(raw, pending);
+				}
+				let body: PublicSubscriptionValue;
+				try {
+					body = await pending;
+				} finally {
+					if (refreshes.get(raw) === pending) refreshes.delete(raw);
+				}
+				if (getConfig() !== raw) throw new FeedUnavailable("config_changed");
+				entry = {
+					raw,
+					body,
+					expiresAt: Math.min(
+						body.generatedAt + CACHE_MS,
+						...body.subscriptions.flatMap((subscription) =>
+							subscription.current ? [subscription.current.resetsAt] : [],
+						),
+					),
+				};
 			}
-		} catch {
-			cache = undefined;
+			const responseAt = now();
+			if (!timestamp(responseAt)) throw new FeedUnavailable("clock");
+			if (responseAt < entry.body.generatedAt || responseAt >= entry.expiresAt)
+				throw new FeedUnavailable("expired");
+			cache = entry;
+			return response(entry.body);
+		} catch (error) {
+			logFailure(error);
 			return response({ error: "Unavailable" }, 503);
 		}
 	};

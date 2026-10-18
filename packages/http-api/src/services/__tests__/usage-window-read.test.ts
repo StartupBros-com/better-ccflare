@@ -16,7 +16,9 @@ process.env.DATABASE_URL = "";
 process.env.BETTER_CCFLARE_DB_PATH = join(temp, "isolated.db");
 process.env.BETTER_CCFLARE_CONFIG_PATH = join(temp, "config.json");
 const { DatabaseOperations } = await import("@better-ccflare/database");
-const { readUsageWindows } = await import("../usage-window-read");
+const { readUsageWindows, valueOpenWindow, toUsageWindowRecord } = await import(
+	"../usage-window-read"
+);
 
 describe("shared usage window read", () => {
 	let db: DatabaseOperationsType;
@@ -36,58 +38,6 @@ describe("shared usage window read", () => {
 		rmSync(temp, { recursive: true, force: true });
 	});
 
-	it("bounds recent closed history in SQL and leaves an overdue open row unclosed", async () => {
-		for (let i = 0; i < 12; i++) {
-			const row = await db.openUsageWindow({
-				accountId: "fixture",
-				windowKey: "seven_day",
-				startedAt: 100 + i * 100,
-				resetsAt: 200 + i * 100,
-				grantType: "natural",
-			});
-			await db.closeUsageWindow(row.id, {
-				closedAt: row.resetsAt,
-				valueUsd: i,
-				inputTokens: 0,
-				cacheReadInputTokens: 0,
-				cacheCreationInputTokens: 0,
-				outputTokens: 0,
-				requestCount: 0,
-				modelBreakdown: null,
-				unpricedTokens: 0,
-				projectionVersion: "fixture",
-			});
-		}
-		await db.openUsageWindow({
-			accountId: "fixture",
-			windowKey: "seven_day",
-			startedAt: 1300,
-			resetsAt: 1400,
-			grantType: "first_observed",
-		});
-		const result = await readUsageWindows(db, "fixture", "seven_day", 8, 1500, {
-			bounded: true,
-			activeOnly: true,
-			accountCreatedAt: 100,
-		});
-		expect(result.windows).toHaveLength(8);
-		expect(
-			await db.listUsageWindows({
-				accountId: "fixture",
-				windowKey: "seven_day",
-				closedOnly: true,
-				limit: 2,
-			}),
-		).toHaveLength(2);
-		expect(result.windows.map((w) => w.valueUsd)).toEqual([
-			11, 10, 9, 8, 7, 6, 5, 4,
-		]);
-		expect(result.openWindow).toBeNull();
-		expect(
-			(await db.getOpenUsageWindow("fixture", "seven_day"))?.closedAt,
-		).toBeNull();
-	});
-
 	it("uses canonical live valuation and keeps private overdue-window behavior", async () => {
 		const startedAt = Date.parse("2026-09-01T00:00:00Z");
 		await db.openUsageWindow({
@@ -103,14 +53,11 @@ describe("shared usage window read", () => {
 				`INSERT INTO requests (id, timestamp, method, path, account_used, status_code, success, model, billing_type, input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_tokens) VALUES ('fixture-request', ?, 'POST', '/v1/messages', 'fixture', 200, 1, 'gpt-5.6-terra', 'plan', 1000000, 0, 0, 0)`,
 				[startedAt + 1000],
 			);
-		const live = await readUsageWindows(
-			db,
-			"fixture",
-			"seven_day",
-			8,
-			startedAt + 2000,
-			{ bounded: true, activeOnly: true, accountCreatedAt: 100 },
-		);
+		const open = await db.getOpenUsageWindow("fixture", "seven_day");
+		if (!open) throw new Error("missing fixture window");
+		const live = {
+			openWindow: await valueOpenWindow(db, open, startedAt + 2000),
+		};
 		expect(live.openWindow?.valueSoFarUsd).toBe(2);
 		expect(live.openWindow?.unpricedTokens).toBe(0);
 		const privateResult = await readUsageWindows(
@@ -121,32 +68,52 @@ describe("shared usage window read", () => {
 			startedAt + 8000,
 		);
 		expect(privateResult.openWindow?.valueSoFarUsd).toBe(2);
-		const publicResult = await readUsageWindows(
+		expect(privateResult.openWindow?.unpricedTokens).toBe(0);
+		expect(privateResult.openWindow?.utilization).toBe(0);
+		expect(privateResult.openWindow?.ageHours).toBe(8000 / 3_600_000);
+	});
+
+	it("keeps supplied private history unchanged and selects the first open row", async () => {
+		const open = await db.openUsageWindow({
+			accountId: "fixture",
+			windowKey: "seven_day",
+			startedAt: 200,
+			resetsAt: 2000,
+			grantType: "natural",
+		});
+		const closed = { ...open, id: "closed", closedAt: 900, valueUsd: 42 };
+		const supplied = [open, closed];
+		const result = await readUsageWindows(
 			db,
 			"fixture",
 			"seven_day",
-			8,
-			startedAt + 8000,
-			{ bounded: true, activeOnly: true },
+			1,
+			1000,
+			supplied,
 		);
-		expect(publicResult.openWindow).toBeNull();
+		expect(result.windows).toEqual([toUsageWindowRecord(closed)]);
+		expect(result.openWindow?.id).toBe(open.id);
+		expect(supplied).toEqual([open, closed]);
 	});
 
-	it("suppresses ambiguous backdated first observations across account generations", async () => {
+	it("keeps backdated first observations in private history and never settles reads", async () => {
+		// The public feed omits these (see public-subscription-value.test.ts); the
+		// private Window Value view must keep showing them.
 		const row = await db.openUsageWindow({
 			accountId: "fixture",
 			windowKey: "seven_day",
 			startedAt: 50,
-			resetsAt: 2000,
+			resetsAt: 900,
 			grantType: "first_observed",
 		});
-		const options = { bounded: true, activeOnly: true, accountCreatedAt: 100 };
+		const overdue = await readUsageWindows(db, "fixture", "seven_day", 8, 1000);
+		expect(overdue.openWindow?.id).toBe(row.id);
+		expect(overdue.openWindow?.grantType).toBe("first_observed");
 		expect(
-			(await readUsageWindows(db, "fixture", "seven_day", 8, 1000, options))
-				.openWindow,
+			(await db.getOpenUsageWindow("fixture", "seven_day"))?.closedAt,
 		).toBeNull();
 		await db.closeUsageWindow(row.id, {
-			closedAt: 1500,
+			closedAt: 900,
 			valueUsd: 1,
 			inputTokens: 0,
 			cacheReadInputTokens: 0,
@@ -157,38 +124,14 @@ describe("shared usage window read", () => {
 			unpricedTokens: 0,
 			projectionVersion: "fixture",
 		});
-		expect(
-			(await readUsageWindows(db, "fixture", "seven_day", 8, 1600, options))
-				.windows,
-		).toEqual([]);
-		expect(
-			(await readUsageWindows(db, "fixture", "seven_day", 8, 1600)).windows,
-		).toHaveLength(1);
+		const closed = await readUsageWindows(db, "fixture", "seven_day", 8, 1600);
+		expect(closed.openWindow).toBeNull();
+		expect(closed.windows.map((window) => window.id)).toEqual([row.id]);
 	});
 
-	it("suppresses future open rows and returns empty absent history", async () => {
-		expect(
-			await readUsageWindows(db, "fixture", "seven_day", 8, 1500, {
-				bounded: true,
-				activeOnly: true,
-			}),
-		).toEqual({ windows: [], openWindow: null });
-		await db.openUsageWindow({
-			accountId: "fixture",
-			windowKey: "seven_day",
-			startedAt: 2000,
-			resetsAt: 3000,
-			grantType: "natural",
-		});
-		expect(
-			(
-				await readUsageWindows(db, "fixture", "seven_day", 8, 1500, {
-					bounded: true,
-					activeOnly: true,
-				})
-			).openWindow,
-		).toBeNull();
-		await expect(db.listUsageWindows({ limit: 0 })).rejects.toThrow("limit");
-		await expect(db.listUsageWindows({ limit: 201 })).rejects.toThrow("limit");
+	it("returns empty private history", async () => {
+		expect(await readUsageWindows(db, "fixture", "seven_day", 8, 1000)).toEqual(
+			{ windows: [], openWindow: null },
+		);
 	});
 });

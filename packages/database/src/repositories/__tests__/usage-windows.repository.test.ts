@@ -16,6 +16,78 @@ function makeRepo(db: Database): UsageWindowsRepository {
 	return new UsageWindowsRepository(new BunSqlAdapter(db));
 }
 
+async function verifyBoundedListOptions(
+	repo: UsageWindowsRepository,
+	accountId: string,
+	otherAccountId: string,
+): Promise<void> {
+	for (const [owner, windowKey, startedAt, closed] of [
+		[accountId, "seven_day", 1_000, true],
+		[accountId, "seven_day", 11_000, true],
+		[accountId, "seven_day", 21_000, true],
+		[accountId, "seven_day", 31_000, false],
+		[otherAccountId, "seven_day", 41_000, true],
+		[accountId, "five_hour", 51_000, true],
+	] as const) {
+		const window = await repo.openWindow({
+			accountId: owner,
+			windowKey,
+			startedAt,
+			resetsAt: startedAt + 5_000,
+			grantType: "natural",
+		});
+		if (closed) {
+			await repo.closeWindow(window.id, {
+				closedAt: window.resetsAt,
+				valueUsd: 1,
+				inputTokens: null,
+				cacheReadInputTokens: null,
+				cacheCreationInputTokens: null,
+				outputTokens: null,
+				requestCount: null,
+				modelBreakdown: null,
+				unpricedTokens: null,
+				projectionVersion: null,
+			});
+		}
+	}
+	const filters = { accountId, windowKey: "seven_day" };
+	const closed = await repo.listWindows({ ...filters, closedOnly: true });
+	expect(closed.map((window) => window.startedAt)).toEqual([
+		21_000, 11_000, 1_000,
+	]);
+	expect(closed.every((window) => window.closedAt !== null)).toBe(true);
+
+	expect(
+		(await repo.listWindows({ ...filters, limit: 1 })).map(
+			(window) => window.startedAt,
+		),
+	).toEqual([31_000]);
+	expect(await repo.listWindows({ ...filters, limit: 200 })).toHaveLength(4);
+	for (const limit of [0, 201, 1.5]) {
+		await expect(repo.listWindows({ ...filters, limit })).rejects.toThrow(
+			"limit must be an integer between 1 and 200",
+		);
+	}
+
+	expect(
+		(await repo.listWindows({ ...filters, startedAtOrAfter: 11_000 })).map(
+			(window) => window.startedAt,
+		),
+	).toEqual([31_000, 21_000, 11_000]);
+	const combined = await repo.listWindows({
+		...filters,
+		closedOnly: true,
+		limit: 2,
+		startedAtOrAfter: 11_000,
+	});
+	expect(combined.map((window) => window.resetsAt)).toEqual([26_000, 16_000]);
+	expect(combined.every((window) => window.accountId === accountId)).toBe(true);
+	expect(combined.every((window) => window.windowKey === "seven_day")).toBe(
+		true,
+	);
+}
+
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
@@ -289,6 +361,19 @@ describe("UsageWindowsRepository", () => {
 	});
 
 	describe("listWindows", () => {
+		it("supports closedOnly, inclusive startedAtOrAfter, bounded limits, and combined filters", async () => {
+			const db = makeDb();
+			try {
+				await verifyBoundedListOptions(
+					makeRepo(db),
+					"bounded-acc",
+					"other-acc",
+				);
+			} finally {
+				db.close();
+			}
+		});
+
 		it("filters by accountId and windowKey, ordered by resets_at desc", async () => {
 			const db = makeDb();
 			const repo = makeRepo(db);
@@ -456,6 +541,37 @@ if (
 describe.skipIf(!livePgAvailable)(
 	"UsageWindowsRepository (live PostgreSQL, requires DATABASE_URL)",
 	() => {
+		it("supports closedOnly, inclusive startedAtOrAfter, bounded limits, and combined filters", async () => {
+			const { SQL } = await import("bun");
+			const { randomUUID } = await import("node:crypto");
+			const { ensureSchemaPg, runMigrationsPg } = await import(
+				"../../migrations-pg"
+			);
+			// biome-ignore lint/style/noNonNullAssertion: guarded by describe.skipIf(!livePgAvailable)
+			const databaseUrl = process.env.DATABASE_URL!;
+			const adapter = new BunSqlAdapter(new SQL({ url: databaseUrl }), false);
+			const accountId = `usage-windows-options-${randomUUID()}`;
+			const otherAccountId = `${accountId}-other`;
+			try {
+				await ensureSchemaPg(adapter);
+				await runMigrationsPg(adapter);
+				await verifyBoundedListOptions(
+					new UsageWindowsRepository(adapter),
+					accountId,
+					otherAccountId,
+				);
+			} finally {
+				try {
+					await adapter.run(
+						"DELETE FROM usage_windows WHERE account_id IN (?, ?)",
+						[accountId, otherAccountId],
+					);
+				} finally {
+					await adapter.close();
+				}
+			}
+		});
+
 		it("round-trips open / recordUtilization / close against a real PG server", async () => {
 			const { SQL } = await import("bun");
 			const { randomUUID } = await import("node:crypto");

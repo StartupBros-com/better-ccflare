@@ -102,7 +102,7 @@ export function createUsageWindowsHandler(context: APIContext) {
 							windowKey,
 							limit,
 							nowMs,
-							{ existingWindows: allWindows },
+							allWindows,
 						)),
 					});
 				}
