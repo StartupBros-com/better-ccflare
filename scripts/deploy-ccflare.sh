@@ -16,6 +16,10 @@
 #
 # USAGE
 #   scripts/deploy-ccflare.sh            Build, deploy, restart, verify.
+#   scripts/deploy-ccflare.sh --no-prune  Deploy normally, but preserve all old
+#                                        binaries, guards, runners and pin
+#                                        backups (including recovery backups).
+#                                        Skips only step 8; all gates still run.
 #   scripts/deploy-ccflare.sh --check    Run ONLY the main-source gate,
 #                                        print OK/refuse, and exit. Builds
 #                                        and deploys nothing. Safe to run
@@ -202,10 +206,12 @@ rollback_on_failure() {
 trap 'rollback_on_failure $?' EXIT
 
 CHECK_ONLY=0
+NO_PRUNE=0
 for arg in "$@"; do
 	case "$arg" in
 		--check) CHECK_ONLY=1 ;;
-		-h|--help) sed -n '2,43p' "$0"; exit 0 ;;
+		--no-prune) NO_PRUNE=1 ;;
+		-h|--help) sed -n '2,54p' "$0"; exit 0 ;;
 		*) echo "Unknown arg: $arg" >&2; exit 2 ;;
 	esac
 done
@@ -708,6 +714,9 @@ echo "==> Verified backend and ingress sources, timing/transaction artifacts, sc
 # 8) Prune old artifacts. Conservative: never touch the binary we just
 #    pinned, and only remove things strictly beyond the keep window.
 # ---------------------------------------------------------------------------
+if [[ "$NO_PRUNE" == "1" ]]; then
+	echo "==> Skipping artifact pruning (--no-prune): preserving all binaries, guards, runners and pin backups (including recovery backups)."
+else
 echo "==> Pruning old binaries, guard pairs, and pin backups…"
 
 PIN_DIR="$(dirname "$PIN")"
@@ -802,6 +811,8 @@ mapfile -t OLD_RECOVERY_BAKS < <(
 for f in "${OLD_RECOVERY_BAKS[@]:-}"; do
 	[[ -n "$f" ]] && sudo rm -f "$f" && echo "    removed $f"
 done
+
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

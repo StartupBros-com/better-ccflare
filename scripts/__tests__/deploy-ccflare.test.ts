@@ -2622,6 +2622,112 @@ describe("validate_main_deploy_source", () => {
 	});
 });
 
+describe("deploy --no-prune", () => {
+	test("documents preservation and still rejects unknown arguments", () => {
+		const help = bash("bash scripts/deploy-ccflare.sh --no-prune --help");
+		expectCommandOk(help);
+		expect(capturedOutput(help.stdout, "stdout")).toContain("--no-prune");
+		const unknown = bash("bash scripts/deploy-ccflare.sh --no-prune --unknown");
+		expect(unknown.exitCode).toBe(2);
+		expect(capturedOutput(unknown.stderr, "stderr")).toContain("Unknown arg: --unknown");
+	});
+
+	test("combines with --check without bypassing the main source gate", () => {
+		const { checkout } = createDisposableDeployRepo();
+		expectCommandOk(bashAt(checkout, "bash scripts/deploy-ccflare.sh --no-prune --check"));
+		expectCommandOk(gitAt(checkout, "switch", "-c", "feature"));
+		for (const flags of ["--no-prune --check", "--no-prune"]) {
+			const result = bashAt(checkout, `bash scripts/deploy-ccflare.sh ${flags}`);
+			expect(result.exitCode).toBe(1);
+			expect(capturedOutput(result.stderr, "stderr")).toContain("checkout must be refs/heads/main");
+		}
+	});
+
+	// Execute the actual parser and cleanup section, not a replica of its pruning
+	// algorithm. All filesystem effects (including sudo rm) stay in this fixture.
+	function runCleanup(flags: string, healthy = true) {
+		const root = tempDir();
+		const dest = join(root, "artifacts");
+		const pins = join(root, "pins");
+		mkdirSync(dest);
+		mkdirSync(pins);
+		const categories: string[][] = [[], [], [], [], []];
+		for (let i = 0; i < 8; i++) {
+			const paths = [
+				join(dest, `better-ccflare-v1.0.0-${i}`),
+				join(dest, "guards", `${i}`.repeat(40)),
+				join(dest, "runners", `${i}`.repeat(40)),
+				join(pins, `50-pinned-build.conf.bak-ordinary-${i}`),
+				join(pins, `50-pinned-build.conf.bak-recovery-${i}`),
+			];
+			paths.forEach((path, category) => {
+				if (category === 1 || category === 2) {
+					mkdirSync(path, { recursive: true });
+					const modules = category === 1
+						? ["ccflare-guard.mjs", "ccflare-guard-policy.mjs", "ccflare-managed-timing.mjs"]
+						: ["run-ccflare-stack.sh", "ccflare-deployment-transaction.mjs"];
+					for (const module of modules) writeFileSync(join(path, module), "fixture\n");
+				} else writeFileSync(path, "fixture\n");
+				utimesSync(path, 1000 + i, 1000 + i);
+				categories[category]?.push(path);
+			});
+		}
+		const pin = join(pins, "50-pinned-build.conf");
+		writeFileSync(pin, "[Service]\n");
+		const source = readFileSync(deployScript, "utf8");
+		const parser = source.slice(source.indexOf("CHECK_ONLY=0"), source.indexOf("# 1) Main source gate"));
+		const cleanup = source.slice(source.indexOf("# 8) Prune old artifacts"), source.indexOf("# Summary"));
+		const health = source.slice(source.indexOf('echo "==> Waiting for health'), source.indexOf("# 7) Verify exact binary"));
+		const result = bash([
+			"set -Eeuo pipefail",
+			`source ${shellQuote(helperScriptForShell)}`,
+			`set -- ${flags}`,
+			parser,
+			`DEST=${shellQuote(dest)}`,
+			`PIN=${shellQuote(pin)}`,
+			'GUARDS_ROOT="$DEST/guards"; RUNNERS_ROOT="$DEST/runners"',
+			// Protect an old artifact outside the retention window as the real
+			// deploy does; the other old artifacts must still prune by default.
+			`DEST_BIN="$DEST/better-ccflare-v1.0.0-0"; GUARD_DIR="$GUARDS_ROOT/${"0".repeat(40)}"; RUNNER_DIR="$RUNNERS_ROOT/${"0".repeat(40)}"`,
+			"KEEP_BINARIES=5; KEEP_GUARDS=5; KEEP_RUNNERS=5; KEEP_BACKUPS=3",
+			'sudo() { "$@"; }',
+			"HEALTH_URL=fixture; GUARD_HEALTH_URL=fixture; HEALTH_WAIT_SECS=0",
+			`poll_stack_health() { ${healthy ? "return 0" : "return 1"}; }`,
+			health,
+			cleanup,
+			// The real script continues with a successful summary after cleanup.
+			":",
+		].join("\n"));
+		return { result, categories };
+	}
+
+	test("preserves every binary, guard, runner, ordinary backup and recovery backup", () => {
+		const { result, categories } = runCleanup("--no-prune");
+		expectCommandOk(result);
+		for (const paths of categories) expect(paths.filter(existsSync)).toEqual(paths);
+		expect(capturedOutput(result.stdout, "stdout")).toContain("preserving all");
+		expect(capturedOutput(result.stdout, "stdout")).not.toContain("removed ");
+	});
+
+	test("default cleanup still removes old unprotected artifacts in every category", () => {
+		const { result, categories } = runCleanup("");
+		expectCommandOk(result);
+		for (const paths of categories) {
+			expect(existsSync(paths[1] as string)).toBe(false);
+			expect(existsSync(paths[7] as string)).toBe(true);
+		}
+		for (const paths of categories.slice(0, 3)) expect(existsSync(paths[0] as string)).toBe(true);
+	});
+
+	test("does not bypass failed health or reach cleanup after failure", () => {
+		const { result, categories } = runCleanup("--no-prune", false);
+		expect(result.exitCode).toBe(1);
+		expect(capturedOutput(result.stderr, "stderr")).toContain("did not both respond");
+		expect(capturedOutput(result.stdout, "stdout")).not.toContain("preserving all");
+		for (const paths of categories) expect(paths.filter(existsSync)).toEqual(paths);
+	});
+});
+
 describe("deploy source gate in disposable repositories", () => {
 	test("--check accepts only the checked-out refs/heads/main at the current origin tip", () => {
 		const accepted = createDisposableDeployRepo();
