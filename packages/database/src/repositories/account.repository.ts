@@ -668,8 +668,9 @@ export class AccountRepository extends BaseRepository<Account> {
 			],
 		};
 		if (this.adapter.isSQLite) {
-			// SQLite has one writer per database, and a write whose read snapshot
-			// went stale fails with SQLITE_BUSY_SNAPSHOT instead of committing.
+			// SQLite admits one writer at a time, and an autocommit UPDATE takes
+			// the write lock before its subqueries read, so they see every
+			// committed publish.
 			return (await this.runWithChanges(publish.sql, publish.params)) > 0;
 		}
 		// Under READ COMMITTED two publishes of different rows do not block each

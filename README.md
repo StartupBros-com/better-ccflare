@@ -283,8 +283,8 @@ action next to a published account changes its label.
   that handled the write, and within 5 seconds in any other process sharing the
   database (which the single-instance-per-database deployment model does not
   support anyway). The 16-account cap and label uniqueness are enforced by the
-  database write itself. Changes made directly in the database are also picked
-  up within 5 seconds.
+  database write itself. A publish, unpublish, relabel or delete made directly
+  in the database is also picked up within 5 seconds.
 - Zero published accounts returns `200` with an empty list. The feed response
   shape is unchanged.
 
