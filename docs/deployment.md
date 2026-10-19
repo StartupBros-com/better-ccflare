@@ -1174,8 +1174,19 @@ else
     CONFIG_DIR="$HOME/.config/better-ccflare"  # Default fallback
 fi
 
-# Backup database and config
-sqlite3 "$CONFIG_DIR/better-ccflare.db" ".backup $BACKUP_DIR/better-ccflare.db"
+# Back up the database with VACUUM INTO, not the sqlite3 `.backup` command.
+# The server writes continuously, and SQLite restarts an online `.backup`
+# whenever another connection writes to the source, so on a busy database it
+# may never finish. VACUUM INTO writes one consistent snapshot in a single
+# read transaction, including changes still in the -wal file. Its target must
+# not already exist, and an interrupted run can leave a partial file, so write
+# to a temporary name and rename only on success.
+SNAPSHOT="$BACKUP_DIR/better-ccflare.db"
+if ! sqlite3 "$CONFIG_DIR/better-ccflare.db" ".timeout 30000" "VACUUM INTO '$SNAPSHOT.partial'"; then
+    rm -f "$SNAPSHOT.partial"
+    exit 1
+fi
+mv "$SNAPSHOT.partial" "$SNAPSHOT"
 cp "$CONFIG_DIR/config.json" "$BACKUP_DIR/" 2>/dev/null || true
 
 # Compress
