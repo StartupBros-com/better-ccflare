@@ -647,20 +647,23 @@ These commands directly interact with the database through the `DatabaseOperatio
 
 ### Backup Strategies
 
-1. **File-based Backup**: Simple copy of the SQLite file when the application is stopped:
+1. **File-based Backup**: Copy the SQLite file only when the application is stopped. The database runs in WAL mode, so copy any `-wal` and `-shm` files alongside it; a `-wal` left by an unclean shutdown holds committed transactions the `.db` file alone does not:
 ```bash
 cp better-ccflare.db better-ccflare.db.backup
+[ -f better-ccflare.db-wal ] && cp better-ccflare.db-wal better-ccflare.db.backup-wal
+[ -f better-ccflare.db-shm ] && cp better-ccflare.db-shm better-ccflare.db.backup-shm
 ```
 
-2. **Online Backup**: Use SQLite's backup API for hot backups:
-```sql
-VACUUM INTO 'backup.db';
-```
-
-3. **Automated Backups**: Schedule regular backups using cron or system schedulers:
+2. **Online Backup**: While the server is running, use `VACUUM INTO`. It writes one consistent, compacted snapshot in a single read transaction, and the target file must not already exist:
 ```bash
-# Daily backup with rotation
-0 2 * * * cp /path/to/better-ccflare.db /backups/better-ccflare-$(date +\%Y\%m\%d).db
+sqlite3 better-ccflare.db ".timeout 30000" "VACUUM INTO 'better-ccflare-snapshot.db'"
+```
+Do not use the sqlite3 `.backup` command on a running server. SQLite restarts an online backup whenever another connection writes to the source, and the proxy writes continuously, so a large `.backup` can run for hours without finishing. The snapshot is written in rollback-journal mode; when the server opens a restored copy, `configureSqlite` switches it back to WAL unless `walMode` is disabled.
+
+3. **Automated Backups**: Schedule the same `VACUUM INTO` command with cron or a system scheduler, giving each run a new dated target:
+```bash
+# Daily snapshot (cron needs % escaped as \%)
+0 2 * * * sqlite3 /path/to/better-ccflare.db ".timeout 30000" "VACUUM INTO '/backups/better-ccflare-$(date +\%Y\%m\%d).db'"
 ```
 
 ### Maintenance Operations

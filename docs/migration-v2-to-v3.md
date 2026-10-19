@@ -88,10 +88,11 @@ No breaking changes to the public API. All endpoints continue to work as before.
 
 ### 1. Backup Your Database
 
-Before upgrading, create a backup of your database:
+Before upgrading, create a backup of your database. `VACUUM INTO` takes a consistent snapshot even while the server is running; a plain `cp` of a running WAL-mode database can miss committed changes still in the `-wal` file:
 
 ```bash
-cp ~/.config/better-ccflare/better-ccflare.db ~/.config/better-ccflare/better-ccflare.db.backup
+sqlite3 ~/.config/better-ccflare/better-ccflare.db ".timeout 30000" \
+  "VACUUM INTO '$HOME/.config/better-ccflare/better-ccflare.db.backup-$(date +%Y%m%d-%H%M%S)'"
 ```
 
 ### 2. Update to Version 3

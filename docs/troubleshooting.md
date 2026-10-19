@@ -379,8 +379,9 @@ Environment variables override config file settings:
 
 2. If repair succeeds but issues persist, backup and reset:
    ```bash
-   # Backup existing database
-   cp ~/.config/better-ccflare/better-ccflare.db ~/.config/better-ccflare/better-ccflare.db.backup
+   # Backup existing database (VACUUM INTO is safe while the server is running)
+   sqlite3 ~/.config/better-ccflare/better-ccflare.db ".timeout 30000" \
+     "VACUUM INTO '$HOME/.config/better-ccflare/better-ccflare.db.backup-$(date +%Y%m%d-%H%M%S)'"
 
    # Reset stats (preserves accounts)
    bun run cli --reset-stats
@@ -452,7 +453,8 @@ Environment variables override config file settings:
 2. If migrations fail repeatedly:
    ```bash
    # Backup existing database
-   cp ~/.config/better-ccflare/better-ccflare.db ~/.config/better-ccflare/better-ccflare.db.backup
+   sqlite3 ~/.config/better-ccflare/better-ccflare.db ".timeout 30000" \
+     "VACUUM INTO '$HOME/.config/better-ccflare/better-ccflare.db.backup-$(date +%Y%m%d-%H%M%S)'"
    
    # Remove and let it recreate
    rm ~/.config/better-ccflare/better-ccflare.db
