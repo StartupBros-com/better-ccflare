@@ -100,6 +100,64 @@ describe("local Linux artifact preparation", () => {
 			expect(readdirSync(temporary)).toEqual([]);
 		},
 	);
+	for (const hasPrevious of [true, false]) {
+		it.skipIf(process.platform !== "linux" || process.arch !== "x64")(
+			`rolls back a replacement after smoke validation fails ${hasPrevious ? "with" : "without"} a previous executable`,
+			() => {
+				const home = fixture();
+				const cli = join(home, "apps/cli");
+				const dashboard = join(home, "packages/dashboard-web");
+				mkdirSync(join(cli, "dist"), { recursive: true });
+				mkdirSync(dashboard, { recursive: true });
+				copyFileSync(entrypoint, join(cli, "prepare-router-artifacts.ts"));
+				writeFileSync(
+					join(dashboard, "build.ts"),
+					"// Synthetic successful build\n",
+				);
+				writeFileSync(join(cli, "package.json"), '{"version":"1.2.3"}');
+				writeFileSync(
+					join(cli, "build-multi-arch.ts"),
+					`import { writeFileSync } from "node:fs";
+writeFileSync("dist/better-ccflare-linux-amd64", "#!/bin/sh\\nprintf 'invalid smoke output\\\\n'\\n", { mode: 0o755 });`,
+				);
+				const built = join(cli, "dist/better-ccflare-linux-amd64");
+				const original = Buffer.from([0, 255, 1, 128, 10, 42]);
+				if (hasPrevious) writeFileSync(built, original);
+				const destination = join(home, "output");
+				const result = spawnSync(
+					process.execPath,
+					[
+						"--no-env-file",
+						"run",
+						join(cli, "prepare-router-artifacts.ts"),
+						destination,
+					],
+					{
+						cwd: home,
+						env: { PATH: "/usr/bin:/bin", HOME: home, TMPDIR: home },
+						encoding: "utf8",
+						timeout: 30000,
+					},
+				);
+				expect(result.status).not.toBe(0);
+				expect(result.stdout).toContain("better-ccflare-linux-amd64: OK");
+				expect(result.stderr).toContain(
+					"Unexpected wstack-router --help output",
+				);
+				expect(existsSync(destination)).toBe(false);
+				if (hasPrevious) expect(readFileSync(built)).toEqual(original);
+				else expect(existsSync(built)).toBe(false);
+				expect(readdirSync(join(cli, "dist"))).toEqual(
+					hasPrevious ? ["better-ccflare-linux-amd64"] : [],
+				);
+				expect(
+					readdirSync(home)
+						.filter((name) => name !== ".bun")
+						.sort(),
+				).toEqual(["apps", "packages"]);
+			},
+		);
+	}
 	it.skipIf(process.platform !== "linux" || process.arch !== "x64")(
 		"builds fresh Linux assets, verifies checksums and runs both aliases without configuration",
 		() => {

@@ -43,7 +43,9 @@ function prepare(): void {
 	let backupDir: string | undefined;
 	let previous = "";
 	let savedPrevious = false;
+	let ownsBuilt = false;
 	let ownsDestination = false;
+	let completed = false;
 	try {
 		const home = join(scratch, "home");
 		const cwd = join(scratch, "smoke", "cwd");
@@ -69,7 +71,7 @@ function prepare(): void {
 			});
 
 		// Preserve any old output, but make it impossible to package it after a
-		// failed or unexpectedly skipped build. Restore it only if no new file exists.
+		// failed or unexpectedly skipped build. Keep it until preparation succeeds.
 		if (lstatSync(built, { throwIfNoEntry: false })) {
 			backupDir = mkdtempSync(
 				join(dirname(built), ".router-prepare-previous-"),
@@ -78,6 +80,7 @@ function prepare(): void {
 			renameSync(built, previous);
 			savedPrevious = true;
 		}
+		ownsBuilt = true;
 		process.stdout.write(
 			run(
 				process.execPath,
@@ -149,12 +152,15 @@ function prepare(): void {
 			constants.COPYFILE_EXCL,
 		);
 		process.stdout.write(run("sha256sum", ["-c", "SHA256SUMS"], destination));
-		ownsDestination = false;
 		console.log(`Prepared local-only artifacts in ${destination}`);
+		completed = true;
+		ownsDestination = false;
 	} finally {
 		if (ownsDestination) rmSync(destination, { recursive: true, force: true });
-		if (savedPrevious && !lstatSync(built, { throwIfNoEntry: false })) {
-			renameSync(previous, built);
+		if (!completed && ownsBuilt) {
+			rmSync(built, { recursive: true, force: true });
+			// If removal or restoration fails, leave the backup intact for recovery.
+			if (savedPrevious) renameSync(previous, built);
 		}
 		if (backupDir) rmSync(backupDir, { recursive: true, force: true });
 		rmSync(scratch, { recursive: true, force: true });
