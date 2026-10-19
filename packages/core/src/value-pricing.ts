@@ -39,7 +39,7 @@ import type { TokenBreakdown } from "./pricing";
  * (UsageWindowLedger.revalueStaleClosedWindows), so history follows the
  * current rates instead of keeping the price it was closed at.
  */
-export const VALUE_PRICING_VERSION = "2026-10-18.1";
+export const VALUE_PRICING_VERSION = "2026-10-18.2";
 
 /**
  * Prompt-token threshold (input + cache read + cache creation, per request)
@@ -166,6 +166,34 @@ export const LIST_PRICE_ERAS: Record<string, ListPriceEra[]> = {
 			// costs $4 per million input tokens and $20 per million output tokens".
 			// Promotional, available "at least through November 21, 2026".
 			// checked 2026-10-18. No longContext: see the OpenAI note below.
+		},
+	],
+	"gpt-5.5": [
+		{
+			sinceMs: INITIAL_ERA_FLOOR_MS,
+			inputPerM: 5.0,
+			cacheReadPerM: 0.5,
+			outputPerM: 30.0,
+			// source: models.dev 'openai' provider section, gpt-5.5.cost
+			// (input=5, cache_read=0.5, output=30; release 2026-04-23) and LiteLLM
+			// model_prices_and_context_window.json gpt-5.5 (litellm_provider=openai,
+			// 5e-06 / 5e-07 / 3e-05 per token), both checked 2026-10-18. OpenAI's
+			// pricing page no longer lists gpt-5.5, so it was not cross-checked there.
+			// No cache-write rate is published; no longContext: see the OpenAI note.
+		},
+	],
+	"gpt-5.4": [
+		{
+			sinceMs: INITIAL_ERA_FLOOR_MS,
+			inputPerM: 2.5,
+			cacheReadPerM: 0.25,
+			outputPerM: 15.0,
+			// source: models.dev 'openai' provider section, gpt-5.4.cost
+			// (input=2.5, cache_read=0.25, output=15; release 2026-03-05) and LiteLLM
+			// model_prices_and_context_window.json gpt-5.4 (litellm_provider=openai,
+			// 2.5e-06 / 2.5e-07 / 1.5e-05 per token), both checked 2026-10-18. OpenAI's
+			// pricing page no longer lists gpt-5.4, so it was not cross-checked there.
+			// No cache-write rate is published; no longContext: see the OpenAI note.
 		},
 	],
 
@@ -481,7 +509,10 @@ export function priceTokensAtListPrice(
 	tokens: TokenBreakdown,
 	longContextTokens?: TokenBreakdown,
 ): number | null {
-	const eras = LIST_PRICE_ERAS[model];
+	// Operator decision for cloud exports lacking a physical model (2026-10-18).
+	const pricedModel =
+		model === "codex-cloud-unattributed" ? "gpt-6-astra" : model;
+	const eras = LIST_PRICE_ERAS[pricedModel];
 	if (!eras || eras.length === 0) return null;
 
 	const era = selectEra(eras, atMs);

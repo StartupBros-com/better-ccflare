@@ -13,6 +13,7 @@ export {
 	type DeviceSetupCoordinator,
 	type DeviceSetupCoordinatorDependencies,
 } from "./services/device-setup-jobs";
+export { ExternalCodexScanner } from "./services/external-codex-scanner";
 export { createServerDeviceSetupCoordinator } from "./services/server-device-setup";
 export { UsageWindowLedger } from "./services/usage-window-ledger";
 // Export types

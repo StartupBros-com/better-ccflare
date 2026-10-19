@@ -90,6 +90,7 @@ import type {
 } from "@better-ccflare/database";
 import { NO_ACCOUNT_ID } from "@better-ccflare/types";
 import { cacheHealthRepositoryContract } from "../../../database/src/repositories/__tests__/cache-health-contract";
+import type { ExternalUsageEvent } from "../../../database/src/repositories/external-usage.repository";
 import { createAnalyticsHandler } from "../handlers/analytics";
 import {
 	createCombosListHandler,
@@ -1790,6 +1791,261 @@ describe.skipIf(!livePgAvailable)(
 				expect(metrics.walBytes).toBe(0);
 				expect(metrics.orphanPages).toBe(0);
 			});
+		});
+
+		// -------------------------------------------------------------------
+		// 11b. External Codex usage: attribution, compare-and-set vote moves,
+		//      the fenced lease batch and the closed-window rebuild all run
+		//      through PG-specific SQL (IS NOT DISTINCT FROM, INSERT ... SELECT
+		//      with bind parameters, ON CONFLICT upserts) that SQLite cannot vet.
+		// -------------------------------------------------------------------
+
+		describe("external Codex usage", () => {
+			liveIt(
+				"ingest, vote moves and closed-window rebuilds execute on PostgreSQL",
+				async () => {
+					const { ExternalUsageRepository } = await import(
+						"../../../database/src/repositories/external-usage.repository"
+					);
+					const { UsageWindowLedger } = await import(
+						"../services/usage-window-ledger"
+					);
+					const event = (
+						timestamp: string,
+						eventTs: number,
+						overrides: Partial<ExternalUsageEvent> = {},
+					): ExternalUsageEvent => ({
+						sourceKind: "rollout",
+						eventTs,
+						timestamp,
+						model: "gpt-6-astra",
+						inputTokens: 100,
+						cacheReadInputTokens: 20,
+						outputTokens: 30,
+						reasoningOutputTokens: 10,
+						totalTokens: 150,
+						isFallbackModel: false,
+						rateLimitResetsAt: null,
+						planType: "pro",
+						limitId: "codex",
+						creditsHasCredits: true,
+						creditsBalance: "1.0",
+						primaryUsedPercent: 50,
+						sessionId: "s1",
+						...overrides,
+					});
+					try {
+						await seedAccount({
+							id: "cx-a",
+							name: "codex-a",
+							provider: "codex",
+						});
+						await seedAccount({
+							id: "cx-b",
+							name: "codex-b",
+							provider: "codex",
+						});
+						// Retained proxy history reaches the window start, so rebuilds are safe.
+						await seedRequest({
+							id: "cx-proxy",
+							timestamp: 1_000,
+							accountUsed: "cx-a",
+							success: true,
+							billingType: "plan",
+							model: "gpt-6-astra",
+							inputTokens: 7,
+							outputTokens: 0,
+						});
+						expect(await dbOps.getOldestRequestTimestamp()).toBe(1_000);
+						const windows = dbOps.getUsageWindowsRepository();
+						const ledger = new UsageWindowLedger(dbOps);
+						for (const [accountId, resetsAt] of [
+							["cx-a", 100_000],
+							["cx-b", 200_000],
+						] as const) {
+							const opened = await windows.openWindow({
+								accountId,
+								windowKey: "seven_day",
+								startedAt: 1_000,
+								resetsAt,
+								grantType: "natural",
+							});
+							expect(await ledger.closeAndValue(opened, resetsAt)).toBe(true);
+						}
+						const stored = async (accountId: string) =>
+							(
+								await dbOps.listUsageWindows({
+									accountId,
+									windowKey: "seven_day",
+								})
+							)[0];
+						expect((await stored("cx-a")).inputTokens).toBe(7);
+
+						const repo = new ExternalUsageRepository(adapter);
+						expect(await repo.acquireScanLease("pg-live")).toBe(true);
+						expect(
+							await new ExternalUsageRepository(adapter).acquireScanLease(
+								"pg-other",
+							),
+						).toBe(false);
+						const first = await repo.replaceSources([
+							{
+								path: "p1",
+								events: [
+									event("t-a1", 2_000, { rateLimitResetsAt: 100 }),
+									event("t-a2", 2_100, { rateLimitResetsAt: 101 }),
+									event("t-v", 2_200),
+									event("t-n", 2_300, {
+										rateLimitResetsAt: 999,
+										sessionId: "s2",
+									}),
+									event("t-c", 2_400, {
+										sourceKind: "cloud",
+										accountId: "cx-b",
+										sessionId: "c1",
+									}),
+								],
+							},
+						]);
+						expect(first.inserted).toBe(5);
+						const attribution = async () =>
+							(
+								await adapter.query<{
+									timestamp: string;
+									account_id: string | null;
+									attribution_basis: string | null;
+								}>(
+									"SELECT timestamp,account_id,attribution_basis FROM external_usage_events ORDER BY timestamp",
+								)
+							).map((row) => [
+								row.timestamp,
+								row.account_id,
+								row.attribution_basis,
+							]);
+						expect(await attribution()).toEqual([
+							["t-a1", "cx-a", "exact"],
+							["t-a2", "cx-a", "near"],
+							["t-c", "cx-b", "cloud"],
+							["t-n", null, null],
+							["t-v", "cx-a", "vote"],
+						]);
+						expect(
+							await ledger.reaggregateClosedWindows(first.affected),
+						).toEqual({ rewritten: 2, skippedRetention: 0, failed: 0 });
+						expect((await stored("cx-a")).inputTokens).toBe(307);
+						expect((await stored("cx-a")).requestCount).toBe(1);
+						expect((await stored("cx-b")).inputTokens).toBe(100);
+						const pending = async () =>
+							Number(
+								(
+									await adapter.get<{ n: number | string }>(
+										"SELECT COUNT(*) AS n FROM external_usage_pending_windows",
+									)
+								)?.n,
+							);
+						expect(await pending()).toBe(0);
+
+						// A duplicate journals nothing and inserts nothing.
+						const duplicate = await repo.ingest([
+							event("t-a1", 2_000, { rateLimitResetsAt: 100 }),
+						]);
+						expect(duplicate.inserted).toBe(0);
+						expect(await pending()).toBe(0);
+
+						// Three direct cx-b signals outvote cx-a's two: the vote moves and
+						// both accounts' closed windows are rebuilt.
+						const second = await repo.replaceSources([
+							{
+								path: "p2",
+								events: [
+									event("t-b1", 3_000, { rateLimitResetsAt: 200 }),
+									event("t-b2", 3_100, { rateLimitResetsAt: 200 }),
+									event("t-b3", 3_200, { rateLimitResetsAt: 200 }),
+								],
+							},
+						]);
+						expect(second.inserted).toBe(3);
+						expect(
+							(await attribution()).find((row) => row[0] === "t-v"),
+						).toEqual(["t-v", "cx-b", "vote"]);
+						expect(
+							await ledger.reaggregateClosedWindows(second.affected),
+						).toEqual({ rewritten: 2, skippedRetention: 0, failed: 0 });
+						expect((await stored("cx-a")).inputTokens).toBe(207);
+						expect((await stored("cx-b")).inputTokens).toBe(500);
+
+						// An explicit cloud mapping overrides inferred rollout attribution:
+						// t-a1 moves from cx-a (exact) to cx-b and both windows are rebuilt.
+						const third = await repo.replaceSources([
+							{
+								path: "p3",
+								events: [
+									event("t-a1", 2_000, {
+										sourceKind: "cloud",
+										accountId: "cx-b",
+										sessionId: "c2",
+									}),
+								],
+							},
+						]);
+						expect(third).toMatchObject({
+							inserted: 0,
+							reattributed: 1,
+							conflicts: 0,
+						});
+						expect(
+							(await attribution()).find((row) => row[0] === "t-a1"),
+						).toEqual(["t-a1", "cx-b", "cloud"]);
+						expect(
+							await ledger.reaggregateClosedWindows(third.affected),
+						).toEqual({ rewritten: 2, skippedRetention: 0, failed: 0 });
+						expect((await stored("cx-a")).inputTokens).toBe(107);
+						expect((await stored("cx-b")).inputTokens).toBe(600);
+
+						// A second cloud account claiming the same event is a conflict: it
+						// counts for neither, and cx-a's exact evidence never re-resolves it.
+						const fourth = await repo.replaceSources([
+							{
+								path: "p4",
+								events: [
+									event("t-a1", 2_000, {
+										sourceKind: "cloud",
+										accountId: "cx-a",
+										sessionId: "c3",
+									}),
+								],
+							},
+						]);
+						expect(fourth).toMatchObject({
+							inserted: 0,
+							reattributed: 0,
+							conflicts: 1,
+						});
+						expect(
+							(await attribution()).find((row) => row[0] === "t-a1"),
+						).toEqual(["t-a1", null, "conflict"]);
+						expect(
+							await ledger.reaggregateClosedWindows(fourth.affected),
+						).toEqual({ rewritten: 1, skippedRetention: 0, failed: 0 });
+						expect((await stored("cx-a")).inputTokens).toBe(107);
+						expect((await stored("cx-b")).inputTokens).toBe(500);
+						expect(await pending()).toBe(0);
+						await repo.releaseScanLease("pg-live");
+					} finally {
+						for (const table of [
+							"external_usage_event_sources",
+							"external_usage_pending_windows",
+							"external_usage_sources",
+							"external_usage_scan_lease",
+							"external_usage_events",
+						])
+							await adapter.unsafe(`DELETE FROM ${table}`);
+						await adapter.run(
+							"DELETE FROM usage_windows WHERE account_id IN ('cx-a','cx-b')",
+						);
+					}
+				},
+			);
 		});
 
 		// -------------------------------------------------------------------

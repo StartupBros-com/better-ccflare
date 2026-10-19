@@ -125,6 +125,7 @@ export {
 	DegradedOwnerOverlay,
 	type DegradedOwnerOverlayOptions,
 } from "./degraded-owner-overlay";
+export { startExternalCodexScheduler } from "./external-codex-scheduler";
 export {
 	type CodexUsageRefreshOutcome,
 	checkAllAccountsHealth,

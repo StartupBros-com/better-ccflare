@@ -1,10 +1,14 @@
 import { describe, expect, it, mock } from "bun:test";
+import { ExternalUsageRepository } from "../../../packages/database/src/repositories/external-usage.repository";
+import { ExternalCodexScanner } from "../../../packages/http-api/src/services/external-codex-scanner";
+import { startExternalCodexScheduler } from "../../../packages/proxy/src/external-codex-scheduler";
 
 // Server unit tests exercise exported pure lifecycle helpers without booting a
 // database. The production database barrel imports generated worker modules,
 // which intentionally do not exist until the build step runs.
 mock.module("@better-ccflare/database", () => ({
 	AsyncDbWriter: class {},
+	ExternalUsageRepository,
 	DatabaseFactory: {},
 	initPayloadEncryption: async () => {},
 }));
@@ -26,6 +30,7 @@ class MockUsageWindowLedger {
 const restorePendingRotations = mock(async () => 0);
 
 mock.module("@better-ccflare/http-api", () => ({
+	ExternalCodexScanner,
 	AlertService: MockHttpApiService,
 	APIRouter: MockHttpApiService,
 	AuthService: MockHttpApiService,
@@ -112,6 +117,7 @@ mock.module("@better-ccflare/proxy", () => {
 		registerRefreshClearer: () => {},
 		restorePendingRotations,
 		startGlobalTokenHealthChecks: () => {},
+		startExternalCodexScheduler,
 		startIntegrityScheduler: () => () => {},
 		stopGlobalTokenHealthChecks: () => {},
 		unregisterAutoRefreshTrackingClearer: () => {},

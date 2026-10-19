@@ -1,5 +1,5 @@
-import { valueWindowAggregates } from "@better-ccflare/core";
 import type { DatabaseOperations, UsageWindow } from "@better-ccflare/database";
+import { valueWindowAggregates } from "./usage-window-valuation";
 
 const HOUR_MS = 60 * 60 * 1000;
 /** One closed-or-open `usage_windows` row, camelCased 1:1 — every ledger

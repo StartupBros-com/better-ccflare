@@ -909,7 +909,14 @@ export function filterEnabledProviderModelDefaultOverrides(
 	return filtered;
 }
 
+export interface ExternalCodexCloudRoot {
+	accountName: string;
+	path: string;
+}
+
 export interface ConfigData {
+	external_codex_homes?: string;
+	external_codex_cloud_roots?: string;
 	quality_routing_policy?: QualityRoutingPolicyConfig | string;
 	lb_strategy?: StrategyName;
 	client_id?: string;
@@ -1390,6 +1397,58 @@ export class Config extends EventEmitter {
 		// Outside loadConfig's legacy parse-recovery catch: invalid policy must
 		// abort startup, never silently disable an explicitly enrolled route.
 		this.getQualityRoutingPolicy();
+	}
+
+	getExternalCodexHomes(): string[] {
+		return (
+			process.env.CCFLARE_EXTERNAL_CODEX_HOMES ??
+			this.data.external_codex_homes ??
+			""
+		)
+			.split(",")
+			.map((value) => value.trim())
+			.filter(Boolean);
+	}
+	setExternalCodexHomes(value: string[]): void {
+		this.set("external_codex_homes", value.join(","));
+	}
+	private getRawExternalCodexCloudRoots(): string {
+		return (
+			process.env.CCFLARE_EXTERNAL_CODEX_CLOUD_ROOTS ??
+			this.data.external_codex_cloud_roots ??
+			""
+		);
+	}
+	getExternalCodexCloudRoots(): ExternalCodexCloudRoot[] {
+		return this.getRawExternalCodexCloudRoots()
+			.split(",")
+			.flatMap((value) => {
+				const split = value.indexOf("=");
+				const accountName = value.slice(0, split).trim();
+				const path = value.slice(split + 1).trim();
+				return split < 1 || !accountName || !path
+					? []
+					: [{ accountName, path }];
+			});
+	}
+	getInvalidExternalCodexCloudRoots(): string[] {
+		return this.getRawExternalCodexCloudRoots()
+			.split(",")
+			.filter((value) => {
+				if (!value.trim()) return false;
+				const split = value.indexOf("=");
+				return (
+					split < 1 ||
+					!value.slice(0, split).trim() ||
+					!value.slice(split + 1).trim()
+				);
+			});
+	}
+	setExternalCodexCloudRoots(value: ExternalCodexCloudRoot[]): void {
+		this.set(
+			"external_codex_cloud_roots",
+			value.map((root) => `${root.accountName}=${root.path}`).join(","),
+		);
 	}
 
 	getQualityRoutingPolicy(): QualityRoutingPolicy | null {
@@ -2643,6 +2702,8 @@ export class Config extends EventEmitter {
 				this.getUsageThrottlingFiveHourEnabled(),
 			usage_throttling_weekly_enabled: this.getUsageThrottlingWeeklyEnabled(),
 			codex_five_hour_window_enabled: this.getCodexFiveHourWindowEnabled(),
+			external_codex_homes: this.getExternalCodexHomes().join(","),
+			external_codex_cloud_roots: this.getRawExternalCodexCloudRoots(),
 			model_scoped_capacity_routing: this.getModelScopedCapacityRouting(),
 			force_account_model: this.getForceAccountModel(),
 			combos_enabled: this.getCombosEnabled(),

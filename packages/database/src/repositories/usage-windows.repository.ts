@@ -435,6 +435,59 @@ export class UsageWindowsRepository extends BaseRepository<UsageWindow> {
 		return changes === 1;
 	}
 
+	/** CAS includes totals and breakdown: two scans can share a pricing version. */
+	async reaggregateClosedWindow(
+		id: string,
+		input: CloseWindowAggregates,
+		expected: UsageWindow,
+	): Promise<boolean> {
+		const changes = await this.runWithChanges(
+			`UPDATE usage_windows SET value_usd=?,input_tokens=?,cache_read_input_tokens=?,cache_creation_input_tokens=?,output_tokens=?,request_count=?,model_breakdown=?,unpriced_tokens=?,projection_version=?
+ WHERE id=? AND closed_at=? AND projection_version IS NOT DISTINCT FROM ?
+ AND input_tokens IS NOT DISTINCT FROM ? AND cache_read_input_tokens IS NOT DISTINCT FROM ? AND cache_creation_input_tokens IS NOT DISTINCT FROM ? AND output_tokens IS NOT DISTINCT FROM ? AND request_count IS NOT DISTINCT FROM ? AND model_breakdown IS NOT DISTINCT FROM ?`,
+			[
+				input.valueUsd,
+				input.inputTokens,
+				input.cacheReadInputTokens,
+				input.cacheCreationInputTokens,
+				input.outputTokens,
+				input.requestCount,
+				JSON.stringify(input.modelBreakdown),
+				input.unpricedTokens,
+				input.projectionVersion,
+				id,
+				expected.closedAt,
+				expected.projectionVersion,
+				expected.inputTokens,
+				expected.cacheReadInputTokens,
+				expected.cacheCreationInputTokens,
+				expected.outputTokens,
+				expected.requestCount,
+				expected.modelBreakdown === null
+					? null
+					: JSON.stringify(expected.modelBreakdown),
+			],
+		);
+		return changes === 1;
+	}
+
+	async pendingExternalRevision(id: string): Promise<string | null> {
+		return (
+			(
+				await this.get<{ revision: string }>(
+					"SELECT revision FROM external_usage_pending_windows WHERE window_id=?",
+					[id],
+				)
+			)?.revision ?? null
+		);
+	}
+	async clearPendingExternal(id: string, revision: string): Promise<void> {
+		await this.run(
+			"DELETE FROM external_usage_pending_windows WHERE window_id=? AND revision=?",
+			[id, revision],
+		);
+	}
+
 	async listWindows(options: ListWindowsOptions = {}): Promise<UsageWindow[]> {
 		const clauses: string[] = [];
 		const params: unknown[] = [];

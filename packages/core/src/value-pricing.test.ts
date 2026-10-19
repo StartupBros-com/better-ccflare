@@ -38,6 +38,16 @@ const LC_AT_MS = Date.parse("2026-10-10T00:00:00Z");
 const LC_NO_TIER_MODEL = "test-no-longcontext-model";
 const LC_TIER_MODEL = "test-longcontext-no-write-rate-model";
 
+it("prices exported unattributed cloud usage at Astra list price", () => {
+	expect(
+		priceTokensAtListPrice("codex-cloud-unattributed", LC_AT_MS, {
+			inputTokens: 1_000_000,
+			cacheReadInputTokens: 1_000_000,
+			outputTokens: 1_000_000,
+		}),
+	).toBe(61);
+});
+
 describe("priceTokensAtListPrice long-context tier", () => {
 	afterEach(() => {
 		delete LIST_PRICE_ERAS[LC_NO_TIER_MODEL];
@@ -147,7 +157,7 @@ describe("priceTokensAtListPrice long-context tier", () => {
 
 describe("priceTokensAtListPrice", () => {
 	it("advances VALUE_PRICING_VERSION for the GPT-6 price table", () => {
-		expect(VALUE_PRICING_VERSION).toBe("2026-10-18.1");
+		expect(VALUE_PRICING_VERSION).toBe("2026-10-18.2");
 	});
 
 	describe("OpenAI GPT-6 and GPT-5.6 Sol eras", () => {
@@ -206,8 +216,34 @@ describe("priceTokensAtListPrice", () => {
 			).toBeCloseTo((300_000 * 10) / 1e6 + 50, 10);
 		});
 
+		it("gpt-5.5 and gpt-5.4: standard rates from the era floor, cache writes unpriced", () => {
+			const floor = D("2026-06-01T00:00:00Z");
+			const t = {
+				inputTokens: 1_000_000,
+				cacheReadInputTokens: 1_000_000,
+				outputTokens: 1_000_000,
+			};
+			expect(priceTokensAtListPrice("gpt-5.5", floor - 1, t)).toBeNull();
+			expect(priceTokensAtListPrice("gpt-5.5", floor, t)).toBeCloseTo(
+				5 + 0.5 + 30,
+				10,
+			);
+			expect(priceTokensAtListPrice("gpt-5.4", floor, t)).toBeCloseTo(
+				2.5 + 0.25 + 15,
+				10,
+			);
+			// No published cache-write rate: cache-creation tokens stay loudly unpriced.
+			expect(priceTokensAtListPrice("gpt-5.5", floor, M)).toBeNull();
+			expect(priceTokensAtListPrice("gpt-5.4", floor, M)).toBeNull();
+		});
+
 		it("OpenAI entries carry no longContext tier", () => {
-			for (const model of [...Object.keys(LAUNCH), "gpt-5.6-sol"]) {
+			for (const model of [
+				...Object.keys(LAUNCH),
+				"gpt-5.6-sol",
+				"gpt-5.5",
+				"gpt-5.4",
+			]) {
 				for (const era of LIST_PRICE_ERAS[model]) {
 					expect(era.longContext).toBeUndefined();
 				}

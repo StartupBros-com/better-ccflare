@@ -811,24 +811,26 @@ export class RequestRepository extends BaseRepository<RequestData> {
 			`
 			SELECT
 				COALESCE(model, '') as model,
-				COUNT(*) as request_count,
+				SUM(is_request) as request_count,
 				SUM(COALESCE(input_tokens, 0)) as input_tokens,
 				SUM(COALESCE(cache_read_input_tokens, 0)) as cache_read_input_tokens,
 				SUM(COALESCE(cache_creation_input_tokens, 0)) as cache_creation_input_tokens,
 				SUM(COALESCE(output_tokens, 0)) as output_tokens,
-				SUM(CASE WHEN ${overThreshold} THEN 1 ELSE 0 END) as long_context_request_count,
+				SUM(CASE WHEN ${overThreshold} THEN is_request ELSE 0 END) as long_context_request_count,
 				SUM(CASE WHEN ${overThreshold} THEN COALESCE(input_tokens, 0) ELSE 0 END) as long_context_input_tokens,
 				SUM(CASE WHEN ${overThreshold} THEN COALESCE(cache_read_input_tokens, 0) ELSE 0 END) as long_context_cache_read_input_tokens,
 				SUM(CASE WHEN ${overThreshold} THEN COALESCE(cache_creation_input_tokens, 0) ELSE 0 END) as long_context_cache_creation_input_tokens,
 				SUM(CASE WHEN ${overThreshold} THEN COALESCE(output_tokens, 0) ELSE 0 END) as long_context_output_tokens
-			FROM requests
-			WHERE account_used = ?
-			  AND path = '/v1/messages'
-			  AND billing_type = 'plan'
-			  AND timestamp >= ? AND timestamp < ?
+			FROM (
+ SELECT model,input_tokens,cache_read_input_tokens,cache_creation_input_tokens,output_tokens,1 AS is_request FROM requests
+ WHERE account_used=? AND path='/v1/messages' AND billing_type='plan' AND timestamp>=? AND timestamp<?
+ UNION ALL
+ SELECT model,input_tokens,cache_read_input_tokens,0 AS cache_creation_input_tokens,output_tokens,0 AS is_request FROM external_usage_events
+ WHERE account_id=? AND event_ts>=? AND event_ts<?
+ ) usage_rows
 			GROUP BY model
 		`,
-			[accountId, fromMs, toMs],
+			[accountId, fromMs, toMs, accountId, fromMs, toMs],
 		);
 		// Advisor iterations (R14): advisor_usage holds per-model token totals
 		// as JSON. Each entry joins its own model's line and adds no request

@@ -9,6 +9,7 @@ This guide covers all configuration options for better-ccflare, including file-b
 - [Configuration File Format](#configuration-file-format)
 - [Configuration Options](#configuration-options)
 - [Environment Variables](#environment-variables)
+- [External Codex Usage](#external-codex-usage)
 - [Service-Lifetime Cohort Seal](#service-lifetime-cohort-seal)
 - [Claude Code Model Route Profiles](#claude-code-model-route-profiles)
 - [Anthropic Degraded Mode](#anthropic-degraded-mode)
@@ -83,6 +84,8 @@ The configuration file is stored at:
 | `session_duration_ms` | number | `18000000` (5 hours) | Session persistence duration in milliseconds |
 | `port` | number | `8080` | HTTP server port |
 | `model_scoped_capacity_routing` | `"off"` \| `"exhausted"` | `"off"` | Per-model-family capacity exclusion mode. `"off"` leaves account selection unchanged; `"exhausted"` enables fail-open exclusion for exhausted model-family capacity. `MODEL_SCOPED_CAPACITY_ROUTING` takes precedence when it contains a valid value. |
+| `external_codex_homes` | string | unset | Comma-separated Codex home directories whose CLI/Desktop rollouts count toward Codex Window Value. See [External Codex Usage](#external-codex-usage) |
+| `external_codex_cloud_roots` | string | unset | Comma-separated `account-name=path` pairs mapping a Codex account to a cloud usage collector directory. See [External Codex Usage](#external-codex-usage) |
 
 ### Load Balancing Strategy
 
@@ -118,6 +121,8 @@ The configuration file is stored at:
 | `PORT` | `port` | number | `PORT=3000` |
 | `DATA_RETENTION_DAYS` | `data_retention_days` | number | `DATA_RETENTION_DAYS=3` (payloads) |
 | `REQUEST_RETENTION_DAYS` | `request_retention_days` | number | `REQUEST_RETENTION_DAYS=90` (metadata) |
+| `CCFLARE_EXTERNAL_CODEX_HOMES` | `external_codex_homes` | string (comma-separated paths) | `CCFLARE_EXTERNAL_CODEX_HOMES=/home/me/.codex` |
+| `CCFLARE_EXTERNAL_CODEX_CLOUD_ROOTS` | `external_codex_cloud_roots` | string (comma-separated `account=path`) | `CCFLARE_EXTERNAL_CODEX_CLOUD_ROOTS=codex-main=/srv/codex-cloud/codex` |
 | `better-ccflare_CONFIG_PATH` | - | string | `better-ccflare_CONFIG_PATH=/etc/better-ccflare.json` |
 
 ### Additional Environment Variables
@@ -270,6 +275,56 @@ If this compatibility path needs diagnosis, use only naturally initiated authori
 | `CCFLARE_CODEX_VERIFIED_VERSION_FILE` | Absolute path to a verified Codex CLI version record that a managed updater writes after each verified CLI promotion. The record is a regular file of at most 4 KiB: `{"schemaVersion":1,"packageName":"@openai/codex","version":"X.Y.Z","verifiedAt":"<UTC>Z"}`. It is only read: the proxy never runs the CLI, and a symlink is rejected. It is re-read at most once per second, so a promotion applies without a restart. A record that goes missing or invalid after a valid read keeps the last valid version within the same process. After a restart with the record still missing or invalid, it falls back to the compiled version. One older than 30 days is still used but reported as not fresh. While set, a stale or unreadable record raises `codex_identity_record_stale` (see [Codex catalog alerts](#codex-catalog-alerts)). Ignored when a valid `CCFLARE_CODEX_CLIENT_VERSION` is set; see [systemd](systemd.md#codex-client-identity-drop-in) for the production drop-in | unset | `CCFLARE_CODEX_VERIFIED_VERSION_FILE=/home/<user>/.local/state/codex-update/verified-version.json` |
 | `CCFLARE_XAI_CACHE_NATIVE` | Opt-in: derive a privacy-safe conversation id from the client's Claude session id and attach it as `x-grok-conv-id` on requests to `api.x.ai`, with sticky account affinity so a conversation stays on the account owning its upstream cache partition. Byte-for-byte no-op when unset | unset (off) | `CCFLARE_XAI_CACHE_NATIVE=1` |
 | `CODEX_FIVE_HOUR_WINDOW_ENABLED` | Whether Codex accounts on this install still report a 5-hour usage window alongside the weekly one. Defaults to `false`: OpenAI removed the 5-hour limit for Plus, Business and Pro on 2026-07-12 ([announcement](https://x.com/thsottiaux/status/2076365965915467978), never added to the Codex changelog; user-visible report in [openai/codex#32791](https://github.com/openai/codex/issues/32791)), so the `x-codex-*` response headers carry the weekly window alone. With the flag off, Codex session expiry follows whichever usage window the account actually reports; set it to `true` to restore the earlier behaviour, which tracks the 5-hour window specifically and treats a weekly rollover as no rollover at all. The removal was announced as temporary, which is why this is a switch rather than a new built-in assumption. Scope: the flag selects the window the rollover detector watches in the proxy; it does not reach the load-balancer's session expiry, which reads the single `rate_limit_reset` column and cannot tell which window wrote it — so with the flag on and no 5-hour window reported, a session still ends at the weekly boundary. Same as the `codex_five_hour_window_enabled` config file field; env var takes precedence | `false` | `CODEX_FIVE_HOUR_WINDOW_ENABLED=true` |
+
+## External Codex Usage
+
+Codex subscription usage that never passes through the proxy (Codex CLI, Codex Desktop,
+and Codex cloud tasks) can be counted in each Codex account's seven-day Window Value.
+Both settings are unset by default, which leaves scanning off.
+
+- `external_codex_homes` lists Codex home directories. Each home's `sessions/` and
+  `archived_sessions/` trees (or the home itself when neither exists) are scanned for
+  `.jsonl` and `.jsonl.zst` rollouts. A file whose name starts with `auth`,
+  `credential(s)` or `secret(s)` followed by `.`, `-`, `_` or nothing (for example
+  `auth.jsonl`) is never read. Parsing and replay suppression mirror ccusage v20.0.19.
+- `external_codex_cloud_roots` maps a Codex account name to a cloud usage collector
+  directory. Rows from that directory belong to that account. An entry whose account
+  name is missing or matches more than one Codex account is skipped, and so is a
+  malformed entry; each is reported in the scan summary's `skippedCloudRoots`.
+
+When either setting is present, the server scans 30 seconds after startup and every
+5 minutes afterwards. `better-ccflare --scan-external-codex [--json]` runs one scan
+and prints the summary plus a per-model, per-account report. A database lease keeps
+the server and the CLI from scanning at the same time. Unchanged files are skipped
+on later scans.
+
+Rollout rows are attributed by the primary rate-limit reset recorded with each event:
+
+1. **exact**: exactly one Codex account has a seven-day window resetting at that second.
+   Two or more exact matches leave the row unattributed.
+2. **near**: when no account resets at exactly that second, exactly one account resets
+   within two seconds of it.
+3. **vote**: an event without a usable reset takes the strict-majority account of
+   its session's exact and near rows. A tie leaves a new row unattributed and keeps
+   an earlier vote unchanged.
+
+A cloud root's account mapping is explicit, so it outranks all three: when a cloud
+event matches a row already attributed by exact, near or vote, the row moves to the
+mapped account and both accounts' closed windows are rebuilt. If two cloud roots
+mapped to different accounts claim the same event, the row is left unattributed
+for good (basis `conflict`), no later claim or vote re-attributes it, and the scan
+summary counts it in `rowsCloudConflict`.
+
+Rows that match no account, or more than one, are stored and reported but excluded
+from Window Value. So is usage from before the first tracked window. Usage paid with
+credits is not separated from subscription usage.
+
+When attributed rows land in an already-closed window, that window is re-aggregated.
+A window keeps its stored value instead when its proxy half can no longer be
+recomputed: it starts before the oldest retained proxy request (see
+`request_retention_days`), or fewer of that account's proxy requests are retained
+for its range than the close counted. The scan summary counts these as
+`windowsSkippedRetention`. A window's `requestCount` counts proxy requests only.
 
 ## Service-Lifetime Cohort Seal
 

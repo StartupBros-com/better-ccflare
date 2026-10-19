@@ -1,13 +1,13 @@
 import {
 	type LongContextTokenSubset,
 	VALUE_PRICING_VERSION,
-	valueWindowAggregates,
 	type WindowTokenAggregate,
 } from "@better-ccflare/core";
 import type { DatabaseOperations, UsageWindow } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import type { CanonicalUsageWindow } from "@better-ccflare/types";
 import type { AlertService } from "./alerts";
+import { valueWindowAggregates } from "./usage-window-valuation";
 
 const log = new Logger("UsageWindowLedger");
 
@@ -142,6 +142,106 @@ export class UsageWindowLedger {
 		private readonly dbOps: DatabaseOperations,
 		private readonly alertService?: AlertService,
 	) {}
+
+	/** Rebuild affected closed windows only while request history covers their start
+	 * and every proxy request the close counted for that account is still retained. */
+	async reaggregateClosedWindows(
+		affected: ReadonlyArray<{ accountId: string; eventTs: number }>,
+	): Promise<{ rewritten: number; skippedRetention: number; failed: number }> {
+		const summary = { rewritten: 0, skippedRetention: 0, failed: 0 };
+		const byAccount = new Map<string, number[]>();
+		for (const row of affected) {
+			const timestamps = byAccount.get(row.accountId) ?? [];
+			timestamps.push(row.eventTs);
+			byAccount.set(row.accountId, timestamps);
+		}
+		for (const [accountId, timestamps] of byAccount) {
+			timestamps.sort((a, b) => a - b);
+			try {
+				const windows = (
+					await this.dbOps.listUsageWindows({
+						accountId,
+						windowKey: LEDGER_WINDOW_KEY,
+					})
+				).sort((a, b) => a.startedAt - b.startedAt);
+				const oldest = await this.dbOps.getOldestRequestTimestamp();
+				for (let i = 0; i < windows.length; i++) {
+					const window = windows[i];
+					try {
+						if (window.closedAt === null) continue;
+						const successor = windows
+							.slice(i + 1)
+							.find((w) => w.startedAt > window.startedAt);
+						const end = successor
+							? Math.min(successor.startedAt, window.closedAt)
+							: window.closedAt;
+						let low = 0,
+							high = timestamps.length;
+						while (low < high) {
+							const mid = (low + high) >>> 1;
+							if (timestamps[mid] < window.startedAt) low = mid + 1;
+							else high = mid;
+						}
+						if (low === timestamps.length || timestamps[low] >= end) continue;
+						const repo = this.dbOps.getUsageWindowsRepository();
+						const revision = await repo.pendingExternalRevision(window.id);
+						const skipRetentionUnsafe = async () => {
+							if (revision !== null)
+								await repo.clearPendingExternal(window.id, revision);
+							log.warn(
+								`Skipping retention-unsafe external usage rebuild for window ${window.id}, account ${accountId}`,
+							);
+							summary.skippedRetention++;
+						};
+						if (oldest === null || oldest > window.startedAt) {
+							// New installs may have an observed window older than their first request;
+							// refuse those too, since completeness cannot be proved from retained data.
+							await skipRetentionUnsafe();
+							continue;
+						}
+						const aggregates = await this.dbOps.aggregateTokensByModel(
+							accountId,
+							window.startedAt,
+							end,
+						);
+						const value = valueWindowAggregates(aggregates, window.startedAt);
+						// The global oldest request proves nothing about this account's own rows. The
+						// close counted its proxy requests over this same range, so fewer retained now
+						// (or an unknown stored count) means the proxy half can no longer be rebuilt.
+						if (
+							window.requestCount === null ||
+							value.requestCount < window.requestCount
+						) {
+							await skipRetentionUnsafe();
+							continue;
+						}
+						if (
+							await repo.reaggregateClosedWindow(
+								window.id,
+								{ ...value, projectionVersion: VALUE_PRICING_VERSION },
+								window,
+							)
+						) {
+							summary.rewritten++;
+							if (revision !== null)
+								await repo.clearPendingExternal(window.id, revision);
+						}
+					} catch (error) {
+						summary.failed++;
+						log.warn(
+							`External usage rebuild failed for window ${window.id}, account ${accountId}: ${String(error)}`,
+						);
+					}
+				}
+			} catch (error) {
+				summary.failed++;
+				log.warn(
+					`External usage rebuild failed for account ${accountId}: ${String(error)}`,
+				);
+			}
+		}
+		return summary;
+	}
 
 	/**
 	 * Processes one poll's worth of canonical usage windows for `accountId`.

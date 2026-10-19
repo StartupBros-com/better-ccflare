@@ -614,10 +614,58 @@ async function ensureRoutingAttemptsReasonConstraintPg(
 	);
 }
 
+async function ensureExternalUsageSchemaPg(
+	adapter: BunSqlAdapter,
+): Promise<void> {
+	// attribution_basis needs no ALTER: external_usage_events has never shipped to a database.
+	await adapter.unsafe(`CREATE TABLE IF NOT EXISTS external_usage_events (id TEXT PRIMARY KEY,
+ account_id TEXT,
+ attribution_basis TEXT CHECK (attribution_basis IN ('exact', 'near', 'vote', 'cloud', 'conflict')),
+ source_kind TEXT NOT NULL CHECK (source_kind IN ('rollout', 'cloud')),
+ event_ts BIGINT NOT NULL,
+ timestamp TEXT NOT NULL,
+ model TEXT NOT NULL,
+ input_tokens BIGINT NOT NULL,
+ cache_read_input_tokens BIGINT NOT NULL,
+ output_tokens BIGINT NOT NULL,
+ reasoning_output_tokens BIGINT NOT NULL,
+ total_tokens BIGINT NOT NULL,
+ is_fallback_model BIGINT NOT NULL,
+ rate_limit_resets_at BIGINT,
+ plan_type TEXT,
+ limit_id TEXT,
+ credits_has_credits BIGINT,
+ credits_balance TEXT,
+ primary_used_percent DOUBLE PRECISION,
+ session_id TEXT NOT NULL,
+ ingested_at BIGINT NOT NULL)`);
+	await adapter.unsafe(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_external_usage_dedupe ON external_usage_events(timestamp, model, input_tokens, cache_read_input_tokens, output_tokens, reasoning_output_tokens, total_tokens)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_external_usage_account_time ON external_usage_events(account_id, event_ts)`,
+	);
+	await adapter.unsafe(
+		`CREATE TABLE IF NOT EXISTS external_usage_scan_lease (id TEXT PRIMARY KEY,owner TEXT NOT NULL,expires_at BIGINT NOT NULL)`,
+	);
+	await adapter.unsafe(`CREATE TABLE IF NOT EXISTS external_usage_sources (path TEXT PRIMARY KEY, size BIGINT NOT NULL, mtime_ns TEXT NOT NULL,
+ session_id TEXT, parent_id TEXT, session_timestamp TEXT, last_scanned_at BIGINT NOT NULL)`);
+	await adapter.unsafe(`CREATE TABLE IF NOT EXISTS external_usage_pending_windows (
+ window_id TEXT PRIMARY KEY, revision TEXT NOT NULL
+ )`);
+	await adapter.unsafe(`CREATE TABLE IF NOT EXISTS external_usage_event_sources (
+ path TEXT NOT NULL,event_id TEXT NOT NULL,generation TEXT NOT NULL,PRIMARY KEY(path,event_id)
+ )`);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_external_usage_source_event ON external_usage_event_sources(event_id)`,
+	);
+}
+
 /**
  * Ensure the full schema exists for PostgreSQL
  */
 export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
+	await ensureExternalUsageSchemaPg(adapter);
 	await adapter.unsafe(CACHE_HEALTH_STATE_SCHEMA);
 	// Create accounts table
 	await adapter.unsafe(`
@@ -1597,6 +1645,7 @@ export async function collapseAccountDuplicatesPreservingStatePg(
  * Run PostgreSQL-specific migrations
  */
 export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
+	await ensureExternalUsageSchemaPg(adapter);
 	await adapter.unsafe(CACHE_HEALTH_STATE_SCHEMA);
 	// Repair an interrupted additive routing-attempt migration independently.
 	await ensureRoutingAttemptsSchemaPg(adapter);
