@@ -12,6 +12,7 @@ import {
 	type ReleaseTransport,
 	reconcileDraft,
 	reconcilePullRequests,
+	validateDraft,
 } from "../router-release";
 
 const root = new URL("../../", import.meta.url);
@@ -152,6 +153,26 @@ test("transport fixture: merged engine PR creates one forced-tag draft; rerun re
 	expect(writes[0]).toMatchObject({
 		options: { draft: true, forceTag: true, prerelease: false },
 	});
+});
+
+test("read-only draft validation requires existing exact draft and never labels or creates", async () => {
+	const f = await draftFixture();
+	await expect(validateDraft(f.transport, expected)).rejects.toThrow();
+	expect(f.writes).toEqual([]);
+	await reconcileDraft(f.transport, expected);
+	f.transport.scm.addIssueLabels = async () => {
+		throw new Error("unexpected label write");
+	};
+	f.transport.scm.removeIssueLabels = async () => {
+		throw new Error("unexpected label write");
+	};
+	expect(await validateDraft(f.transport, expected)).toMatchObject({
+		...expected,
+		releaseId: 17,
+	});
+	f.setTag("b".repeat(40));
+	await expect(validateDraft(f.transport, expected)).rejects.toThrow();
+	expect(f.writes).toHaveLength(1);
 });
 
 test("pending A is discovered at main B; only A's CI authorizes its draft and tagged retry", async () => {

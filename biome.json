@@ -7,7 +7,14 @@
 	},
 	"files": {
 		"ignoreUnknown": false,
-		"includes": ["apps/**", "packages/**"]
+		"includes": [
+			"apps/**",
+			"packages/**",
+			"scripts/router-release.ts",
+			"scripts/router-release-assets.ts",
+			"scripts/__tests__/router-release.test.ts",
+			"scripts/__tests__/router-release-workflow.test.ts"
+		]
 	},
 	"formatter": {
 		"enabled": true,

@@ -1,0 +1,159 @@
+name: wstack Router Release Artifacts
+
+# Dispatched only by the coordinator, at refs/tags/vX.Y.Z. Stages a verified
+# DRAFT release; it never publishes, deletes, clobbers, or installs anything.
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      release_id:
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: wstack-router-release-artifacts-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ROUTER_REPOSITORY: ${{ github.repository }}
+  ROUTER_SHA: ${{ inputs.source_sha }}
+  ROUTER_VERSION: ${{ inputs.version }}
+  ROUTER_REF: refs/tags/v${{ inputs.version }}
+  ROUTER_RELEASE_ID: ${{ inputs.release_id }}
+
+jobs:
+  validate:
+    if: github.repository == 'StartupBros/wstack-router'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+          no-cache: true
+          token: ''
+      - name: Verify the installed Bun matches .bun-version
+        run: test "$(bun --version)" = "$(tr -d '[:space:]' < .bun-version)"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Require tag run identity
+        run: bun --no-env-file run scripts/router-release-assets.ts artifact-event
+      - name: Revalidate eligibility, source CI, merged PR, tag and draft (read-only)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun --no-env-file run scripts/router-release.ts validate-draft "$ROUTER_REPOSITORY" "$ROUTER_SHA" "$ROUTER_VERSION" "$ROUTER_REF"
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+          no-cache: true
+          token: ''
+      - name: Verify the installed Bun matches .bun-version
+        run: test "$(bun --version)" = "$(tr -d '[:space:]' < .bun-version)"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build fixed release inventory (credential-free)
+        run: |
+          mkdir -p "$RUNNER_TEMP/router-release"
+          bun --no-env-file run apps/cli/prepare-router-release.ts prepare "$RUNNER_TEMP/router-release/assets" "$ROUTER_REPOSITORY" "$ROUTER_VERSION" "$ROUTER_REF" "$ROUTER_SHA"
+      - name: Store build outputs for attestation and staging
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: router-release-assets
+          path: ${{ runner.temp }}/router-release/assets
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download build outputs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: router-release-assets
+          path: ${{ runner.temp }}/router-release/assets
+      - name: Attest binary and manifest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: |
+            ${{ runner.temp }}/router-release/assets/better-ccflare-linux-amd64
+            ${{ runner.temp }}/router-release/assets/release-manifest.json
+
+  stage:
+    needs: [build, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: read
+      actions: read
+      attestations: read
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+          no-cache: true
+          token: ''
+      - name: Verify the installed Bun matches .bun-version
+        run: test "$(bun --version)" = "$(tr -d '[:space:]' < .bun-version)"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Download same-run build outputs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: router-release-assets
+          path: ${{ runner.temp }}/router-release/assets
+      - name: Require attestation verifier flags
+        run: |
+          set -euo pipefail
+          help="$(gh attestation verify --help)"
+          for flag in --repo --source-digest --source-ref --cert-identity --signer-digest --deny-self-hosted-runners; do
+            grep -F -- "$flag" <<<"$help" > /dev/null
+          done
+      - name: Stage missing assets, verify downloads and attestations, then smoke
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          result="$(bun --no-env-file run scripts/router-release-assets.ts stage "$RUNNER_TEMP/router-release/assets")"
+          jq -r '"Verified draft (not published): \(.draftUrl)\nSource: \(.repository)@\(.sha) \(.ref)"' <<<"$result" | tee -a "$GITHUB_STEP_SUMMARY"

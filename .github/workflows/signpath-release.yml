@@ -9,6 +9,8 @@ on:
 jobs:
   sign-and-upload:
     name: Sign Windows Binary and Upload to Release
+    # Router publishes only through the draft-only wstack release workflows.
+    if: github.repository != 'StartupBros/wstack-router'
     permissions:
       contents: write
     runs-on: ubuntu-latest

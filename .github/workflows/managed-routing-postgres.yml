@@ -142,6 +142,14 @@ jobs:
       - name: Run typecheck
         run: bun run typecheck
 
+      - name: Strictly typecheck release scripts (root typecheck excludes scripts and tests)
+        run: >-
+          bun x tsc --noEmit --ignoreConfig --strict --skipLibCheck
+          --target esnext --module esnext --moduleResolution bundler --types bun
+          scripts/router-release.ts scripts/router-release-assets.ts
+          scripts/__tests__/router-release.test.ts
+          scripts/__tests__/router-release-workflow.test.ts
+
       - name: Run format
         run: bun run format
 

@@ -173,7 +173,7 @@ Existing `--version` and `--git-sha` verify the actual binary's public identity.
 
 **Requirements:** R1–R6; KTD3, KTD5–KTD7. **Dependencies:** U1 and U2.
 
-**Files:** `.github/workflows/router-release.yml`, `.github/workflows/router-release-artifacts.yml`, `.github/workflows/release-dispatch.yml`, `.github/workflows/release.yml`, `.github/workflows/signpath-release.yml`, `.github/workflows/signpath-test.yml`, `.github/workflows/docker-publish.yml`, `.github/workflows/auto-rerun-failed.yml`, `scripts/__tests__/router-release-workflow.test.ts`, `tests/bun-toolchain-pin.test.ts` when the workflow inventory changes, and `docs/wstack-router-releases.md`.
+**Files:** `.github/workflows/router-release.yml`, `.github/workflows/router-release-artifacts.yml`, `.github/workflows/release-dispatch.yml`, `.github/workflows/release.yml`, `.github/workflows/signpath-release.yml`, `.github/workflows/signpath-test.yml`, `.github/workflows/docker-publish.yml`, `.github/workflows/auto-rerun-failed.yml`, `scripts/router-release-assets.ts` (testable remote asset reconciliation), `scripts/__tests__/router-release-workflow.test.ts`, `.github/workflows/managed-routing-postgres.yml` (static check of release scripts), a read-only draft validation in `scripts/router-release.ts` with its test, `tests/bun-toolchain-pin.test.ts` when the workflow inventory changes, and `docs/wstack-router-releases.md`.
 
 **Approach:**
 1. Add trusted main-push foundation completion and bounded explicit retry handling, with exact-source checks and serialized publication effects.

@@ -19,6 +19,8 @@ permissions:
 
 jobs:
   release:
+    # Router publishes only through the draft-only wstack release workflows.
+    if: github.repository != 'StartupBros/wstack-router'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main

@@ -1,0 +1,144 @@
+name: wstack Router Release Coordinator
+
+# Draft-only coordinator. It never publishes a release, package or image.
+# PR creation is blocked when a release PR is needed until repository policy
+# allows it (can_approve_pull_request_reviews); this file changes no settings.
+on:
+  workflow_run:
+    workflows: ["Managed Routing Foundation Gate"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Merged release PR source SHA for an explicit draft retry"
+        required: true
+        type: string
+      version:
+        description: "Stable version without v prefix for the draft retry"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: wstack-router-release-coordinator
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    if: github.repository == 'StartupBros/wstack-router'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.event.outputs.sha }}
+      version: ${{ steps.event.outputs.version }}
+    steps:
+      - name: Checkout trusted main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+          no-cache: true
+          token: ''
+      - name: Verify the installed Bun matches .bun-version
+        run: test "$(bun --version)" = "$(tr -d '[:space:]' < .bun-version)"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Validate exact trigger
+        id: event
+        run: |
+          result="$(bun --no-env-file run scripts/router-release-assets.ts coordinator-event)"
+          printf 'sha=%s\n' "$(jq -r .sha <<<"$result")" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$(jq -r '.version // ""' <<<"$result")" >> "$GITHUB_OUTPUT"
+
+  pull-requests:
+    # Exact current main only; an explicit draft retry never touches release PRs.
+    needs: guard
+    if: github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    steps:
+      - name: Checkout trusted main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+          no-cache: true
+          token: ''
+      - name: Verify the installed Bun matches .bun-version
+        run: test "$(bun --version)" = "$(tr -d '[:space:]' < .bun-version)"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Reconcile release pull requests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ROUTER_REPOSITORY: ${{ github.repository }}
+          ROUTER_SHA: ${{ needs.guard.outputs.sha }}
+        run: bun --no-env-file run scripts/router-release.ts reconcile-pr "$ROUTER_REPOSITORY" "$ROUTER_SHA"
+
+  drafts:
+    # A failed PR step (for example the PR-creation policy) must not hide an already merged release.
+    needs: [guard, pull-requests]
+    if: ${{ !cancelled() && needs.guard.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Checkout trusted main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+          no-cache: true
+          token: ''
+      - name: Verify the installed Bun matches .bun-version
+        run: test "$(bun --version)" = "$(tr -d '[:space:]' < .bun-version)"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Reconcile drafts and dispatch tag-bound artifact runs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          ROUTER_REPOSITORY: ${{ github.repository }}
+          ROUTER_SHA: ${{ needs.guard.outputs.sha }}
+          ROUTER_VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ROUTER_VERSION" ]; then
+            selection="$(jq -nc --arg v "$ROUTER_VERSION" --arg s "$ROUTER_SHA" '[{version:$v,sha:$s}]')"
+          else
+            candidates="$(bun --no-env-file run scripts/router-release.ts candidates "$ROUTER_REPOSITORY" "$ROUTER_SHA")"
+            selection="$(jq -c '[.releases[] | {version, sha}]' <<<"$candidates")"
+          fi
+          while IFS= read -r release; do
+            version="$(jq -r .version <<<"$release")"
+            source="$(jq -r .sha <<<"$release")"
+            draft="$(bun --no-env-file run scripts/router-release.ts draft "$ROUTER_REPOSITORY" "$source" "$version" "refs/tags/v$version")"
+            release_id="$(jq -r .releaseId <<<"$draft")"
+            # Dispatch at the tag so the OIDC commit/ref are the release identity, never main.
+            gh workflow run router-release-artifacts.yml --repo "$ROUTER_REPOSITORY" --ref "v$version" \
+              -f source_sha="$source" -f version="$version" -f release_id="$release_id"
+          done < <(jq -c '.[]' <<<"$selection")

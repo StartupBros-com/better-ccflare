@@ -7,8 +7,20 @@ import {
 import type { ConventionalCommit } from "release-please/build/src/commit";
 import type { Scm, ScmRelease } from "release-please/build/src/scm";
 import type { BuildUpdatesOptions } from "release-please/build/src/strategies/base";
-import { Node } from "release-please/build/src/strategies/node";
+
+// Finish the public entry point before traversing its circular internal strategies.
+const { Node } = await import("release-please/build/src/strategies/node");
+
 import ts from "typescript";
+
+// Both CLI entry points reserve stdout for their machine-readable result.
+setLogger({
+	error: console.error,
+	warn: console.error,
+	info: console.error,
+	debug: console.error,
+	trace: console.error,
+});
 
 export const ROUTER_REPOSITORY = "StartupBros/wstack-router";
 const aliases: Record<string, string> = {
@@ -157,9 +169,21 @@ export async function reconcilePullRequests(
 	return manifest.createPullRequests();
 }
 
-export async function reconcileDraft(
+export const reconcileDraft = (
 	transport: ReleaseTransport,
 	expected: DraftIdentity,
+) => draftFlow(transport, expected, true);
+
+/** Read-only revalidation for build/stage runs: never creates tags/releases or edits labels. */
+export const validateDraft = (
+	transport: ReleaseTransport,
+	expected: DraftIdentity,
+) => draftFlow(transport, expected, false);
+
+async function draftFlow(
+	transport: ReleaseTransport,
+	expected: DraftIdentity,
+	write: boolean,
 ) {
 	if (
 		!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(expected.version) ||
@@ -227,6 +251,7 @@ export async function reconcileDraft(
 	)
 		throw new Error(`Published or mismatched release ${release.id}`);
 	await assertSource(transport, expected, true);
+	if (!release && !write) throw new Error(`Missing draft release ${tag}`);
 	if (!release)
 		release = await transport.scm.createRelease(candidate, {
 			draft: true,
@@ -244,12 +269,12 @@ export async function reconcileDraft(
 		(await transport.getTagSha(tag)) !== expected.sha
 	)
 		throw new Error("Draft/tag verification failed");
-	if (!candidate.pullRequest.labels.includes("autorelease: tagged"))
+	if (write && !candidate.pullRequest.labels.includes("autorelease: tagged"))
 		await transport.scm.addIssueLabels(
 			["autorelease: tagged"],
 			candidate.pullRequest.number,
 		);
-	if (candidate.pullRequest.labels.includes("autorelease: pending"))
+	if (write && candidate.pullRequest.labels.includes("autorelease: pending"))
 		await transport.scm.removeIssueLabels(
 			["autorelease: pending"],
 			candidate.pullRequest.number,
@@ -386,22 +411,17 @@ export async function githubTransport(
 }
 
 if (import.meta.main) {
-	setLogger({
-		error: console.error,
-		warn: console.error,
-		info: console.error,
-		debug: console.error,
-		trace: console.error,
-	});
 	const [command, repository, sha, version, ref] = process.argv.slice(2);
 	if (
-		!["candidates", "reconcile-pr", "draft"].includes(command) ||
+		!["candidates", "reconcile-pr", "draft", "validate-draft"].includes(
+			command,
+		) ||
 		!repository ||
 		!sha ||
-		(command === "draft" && (!version || !ref))
+		(command.endsWith("draft") && (!version || !ref))
 	)
 		throw new Error(
-			"Usage: router-release.ts candidates|reconcile-pr REPOSITORY SHA; draft REPOSITORY SHA VERSION REF",
+			"Usage: router-release.ts candidates|reconcile-pr REPOSITORY SHA; draft|validate-draft REPOSITORY SHA VERSION REF",
 		);
 	const token = process.env.GITHUB_TOKEN;
 	if (!token)
@@ -413,20 +433,22 @@ if (import.meta.main) {
 	const output =
 		command === "draft"
 			? await reconcileDraft(transport, { ...expected, version, ref })
-			: command === "reconcile-pr"
-				? await reconcilePullRequests(transport, expected)
-				: await buildCandidates(transport, expected).then(
-						({ pullRequests, releases }) => ({
-							pullRequests: pullRequests.map((pr) => ({
-								title: pr.title.toString(),
-								version: pr.version?.toString(),
-							})),
-							releases: releases.map((release) => ({
-								version: release.tag.version.toString(),
-								sha: release.sha,
-								ref: `refs/tags/${release.tag}`,
-							})),
-						}),
-					);
+			: command === "validate-draft"
+				? await validateDraft(transport, { ...expected, version, ref })
+				: command === "reconcile-pr"
+					? await reconcilePullRequests(transport, expected)
+					: await buildCandidates(transport, expected).then(
+							({ pullRequests, releases }) => ({
+								pullRequests: pullRequests.map((pr) => ({
+									title: pr.title.toString(),
+									version: pr.version?.toString(),
+								})),
+								releases: releases.map((release) => ({
+									version: release.tag.version.toString(),
+									sha: release.sha,
+									ref: `refs/tags/${release.tag}`,
+								})),
+							}),
+						);
 	console.log(JSON.stringify(output));
 }
