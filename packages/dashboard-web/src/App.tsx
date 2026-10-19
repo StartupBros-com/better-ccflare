@@ -78,7 +78,7 @@ export function App() {
 				path: "/",
 				element: <OverviewTab />,
 				title: "Dashboard Overview",
-				subtitle: "Monitor your ccflare performance and usage",
+				subtitle: "Monitor your wstack Router performance and usage",
 			},
 			{
 				path: "/analytics",

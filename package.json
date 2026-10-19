@@ -1,13 +1,14 @@
 {
 	"private": true,
 	"name": "better-ccflare",
-	"description": "A load balancer proxy for Claude Code with intelligent load balancing across multiple accounts",
+	"description": "wstack Router - a load balancer proxy for Claude Code across multiple account providers",
 	"workspaces": [
 		"apps/*",
 		"packages/*"
 	],
 	"scripts": {
 		"better-ccflare": "bun run build && bun run cli",
+		"wstack-router": "bun run build && bun run cli",
 		"cli": "bun run apps/cli/src/main.ts",
 		"dev": "bun run cli",
 		"start": "bun run apps/server/src/server.ts",

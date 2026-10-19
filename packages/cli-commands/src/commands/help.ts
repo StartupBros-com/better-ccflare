@@ -1,3 +1,9 @@
+import {
+	COMMAND_NAME,
+	LEGACY_COMMAND_NAME,
+	PRODUCT_NAME,
+} from "@better-ccflare/core/product-identity";
+
 /**
  * Exact managed-routing surface shared with the packaged CLI help.
  */
@@ -23,7 +29,9 @@ export function getManagedRoutingHelpText(): string {
  */
 export function getHelpText(): string {
 	return `
-Usage: better-ccflare <command> [options]
+${PRODUCT_NAME}
+Usage: ${COMMAND_NAME} <command> [options]
+${LEGACY_COMMAND_NAME} remains a supported alias.
 
 Commands:
   add <name> [--mode <claude-oauth|console|codex|qwen|xai|zai|minimax|anthropic-compatible|openai-compatible|nanogpt|kilo|openrouter|ollama|ollama-cloud|meta>] [--priority <number>] [--modelMappings <JSON>] [--api-url <loopback-url>]
@@ -94,17 +102,17 @@ ${getManagedRoutingHelpText()}
     Show this help message
 
 Examples:
-  better-ccflare add myaccount --mode claude-oauth --priority 10
-  better-ccflare add grok --mode xai --priority 50
-  better-ccflare add anthropic-account --mode anthropic-compatible --priority 5 --modelMappings '{"opus":"claude-3-opus","sonnet":"claude-3-sonnet"}'
-  better-ccflare add "My Account" --mode claude-oauth --priority 10  # Account names with spaces must be quoted
-  better-ccflare list
-  better-ccflare remove myaccount
-  better-ccflare pause "My Account"  # Use quotes for names with spaces
-  better-ccflare resume myaccount
-  better-ccflare set-priority myaccount 20
-  better-ccflare token-health
-  better-ccflare reauth-needed
+  ${COMMAND_NAME} add myaccount --mode claude-oauth --priority 10
+  ${COMMAND_NAME} add grok --mode xai --priority 50
+  ${COMMAND_NAME} add anthropic-account --mode anthropic-compatible --priority 5 --modelMappings '{"opus":"claude-3-opus","sonnet":"claude-3-sonnet"}'
+  ${COMMAND_NAME} add "My Account" --mode claude-oauth --priority 10  # Account names with spaces must be quoted
+  ${COMMAND_NAME} list
+  ${COMMAND_NAME} remove myaccount
+  ${COMMAND_NAME} pause "My Account"  # Use quotes for names with spaces
+  ${COMMAND_NAME} resume myaccount
+  ${COMMAND_NAME} set-priority myaccount 20
+  ${COMMAND_NAME} token-health
+  ${COMMAND_NAME} reauth-needed
 
 Note: Account names can contain letters, numbers, spaces, hyphens, and underscores.
       When using names with spaces, wrap them in quotes (e.g., "My Account").

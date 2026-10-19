@@ -27,6 +27,11 @@ import {
 	resolveFamilyAliasModel,
 	shutdown,
 } from "@better-ccflare/core";
+import {
+	COMMAND_NAME,
+	LEGACY_COMMAND_NAME,
+	PRODUCT_NAME,
+} from "@better-ccflare/core/product-identity";
 import { container, SERVICE_KEYS } from "@better-ccflare/core-di";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
@@ -128,9 +133,10 @@ function formatModeUsageLines(): string[] {
  */
 export function renderHelpText(version: string): string {
 	return `
-🎯 better-ccflare v${version} - Load Balancer for Claude
+🎯 ${PRODUCT_NAME} v${version} - Load Balancer for Claude
 
-Usage: better-ccflare [options]
+Usage: ${COMMAND_NAME} [options]
+${LEGACY_COMMAND_NAME} remains a supported alias.
 
 Options:
   --version, -v       Show version number
@@ -198,21 +204,21 @@ Debugging:
   --help, -h                 Show this help message
 
 Examples:
-  better-ccflare --serve                # Start server
-  better-ccflare --serve --ssl-key /path/to/key.pem --ssl-cert /path/to/cert.pem  # Start server with HTTPS
-  better-ccflare --add-account work --mode claude-oauth --priority 0  # Add account
-  better-ccflare --add-account my-bedrock --mode bedrock --profile default  # Add Bedrock account
-  better-ccflare --reauthenticate work  # Re-authenticate account (preserves metadata)
-  better-ccflare --force-reset-rate-limit work  # Force-clear stale rate-limit lock
-  better-ccflare --pause work           # Pause account
-  better-ccflare --analyze              # Run performance analysis
-  better-ccflare --rebuild-windows --dry-run  # Preview rebuilt usage windows without writing
-  better-ccflare --rebuild-windows --since 2026-08-01  # Rebuild windows from a start date
-  better-ccflare --stats                # View stats
-  better-ccflare --generate-api-key "My App"  # Generate API-only key
-  better-ccflare --generate-api-key "Admin Key" --admin  # Generate admin key
-  better-ccflare --list-api-keys               # List all API keys
-  better-ccflare --disable-api-key "My App"    # Disable an API key
+  ${COMMAND_NAME} --serve                # Start server
+  ${COMMAND_NAME} --serve --ssl-key /path/to/key.pem --ssl-cert /path/to/cert.pem  # Start server with HTTPS
+  ${COMMAND_NAME} --add-account work --mode claude-oauth --priority 0  # Add account
+  ${COMMAND_NAME} --add-account my-bedrock --mode bedrock --profile default  # Add Bedrock account
+  ${COMMAND_NAME} --reauthenticate work  # Re-authenticate account (preserves metadata)
+  ${COMMAND_NAME} --force-reset-rate-limit work  # Force-clear stale rate-limit lock
+  ${COMMAND_NAME} --pause work           # Pause account
+  ${COMMAND_NAME} --analyze              # Run performance analysis
+  ${COMMAND_NAME} --rebuild-windows --dry-run  # Preview rebuilt usage windows without writing
+  ${COMMAND_NAME} --rebuild-windows --since 2026-08-01  # Rebuild windows from a start date
+  ${COMMAND_NAME} --stats                # View stats
+  ${COMMAND_NAME} --generate-api-key "My App"  # Generate API-only key
+  ${COMMAND_NAME} --generate-api-key "Admin Key" --admin  # Generate admin key
+  ${COMMAND_NAME} --list-api-keys               # List all API keys
+  ${COMMAND_NAME} --disable-api-key "My App"    # Disable an API key
 `;
 }
 
@@ -227,7 +233,7 @@ export function renderAddAccountModeUsageError(): string {
 		...formatModeUsageLines(),
 		"",
 		"Example:",
-		"  better-ccflare --add-account work --mode claude-oauth --priority 0",
+		`  ${COMMAND_NAME} --add-account work --mode claude-oauth --priority 0`,
 	].join("\n");
 }
 
@@ -569,7 +575,7 @@ function displayConfigInfo(parsed: ParsedArgs, config: Config): void {
 	// Print configuration
 	const version = getVersionSync();
 	console.log(`
-⚙️  better-ccflare v${version} - Configuration
+⚙️  ${PRODUCT_NAME} v${version} - Configuration
 
 Configuration Precedence: CLI arguments > Environment variables > Config file > Defaults
 
@@ -1368,7 +1374,7 @@ async function main() {
 	if (parsed.version) {
 		// Use sync version to avoid async overhead
 		const version = getVersionSync();
-		console.log(`better-ccflare v${version}`);
+		console.log(`${PRODUCT_NAME} v${version}`);
 		fastExit(0);
 		return;
 	}
@@ -2010,7 +2016,7 @@ async function main() {
 	}
 
 	// Default: Start server if no command specified
-	console.log("Starting better-ccflare server...");
+	console.log(`Starting ${PRODUCT_NAME} server...`);
 	const config = new Config();
 	await startServerWithConfig(parsed, config);
 
