@@ -30,6 +30,57 @@ function provenance(
 }
 
 describe("update status service", () => {
+	it("never looks up branded releases or leaks a warmed upstream action", async () => {
+		let current = provenance();
+		let calls = 0;
+		const adapter = async () => {
+			calls += 1;
+			return "1.1.0";
+		};
+		const service = createUpdateStatusService({
+			currentVersion: () => "1.0.0",
+			readProvenance: () => current,
+			adapters: { npm: adapter, ghcr: adapter, "github-releases": adapter },
+		});
+		expect((await service.check()).action?.value).toBe(
+			"npm install -g better-ccflare@latest",
+		);
+		expect((await service.check()).cache).toBe("hit");
+		for (const [token, mode] of [
+			["v1:startupbros-wstack-router-binary", "binary"],
+			["v1:startupbros-wstack-router-package", "package"],
+		] as const) {
+			const branded = resolveBuildProvenance({
+				CCFLARE_DISTRIBUTION: token,
+				CCFLARE_VERSION: "1.0.0",
+				CCFLARE_GIT_SHA: sha,
+				CCFLARE_SOURCE_SHA: sha,
+				CCFLARE_GIT_REF: "refs/tags/v1.0.0",
+				CCFLARE_SOURCE_REF: "refs/tags/v1.0.0",
+				CCFLARE_PRODUCER: "startupbros",
+				CCFLARE_ARTIFACT_MODE: mode,
+			});
+			expect(branded.proven).toBe(true);
+			for (const patch of [
+				{},
+				{ actionable: true },
+				{ updateChannel: "npm" as const },
+				{ reason: "proven_actionable" },
+				{
+					actionable: true,
+					updateChannel: "npm" as const,
+					reason: "proven_actionable",
+				},
+			]) {
+				current = { ...branded, ...patch };
+				const result = await service.check();
+				expect(result.availability).toBe("unavailable");
+				expect(result.latestVersion).toBeNull();
+				expect(result.action).toBeNull();
+				expect(calls).toBe(1);
+			}
+		}
+	});
 	it("does not call an adapter or expose an action for managed and unproven provenance", async () => {
 		let calls = 0;
 		const service = createUpdateStatusService({

@@ -117,6 +117,22 @@ export interface DistributionIdentity {
 }
 
 const DISTRIBUTION_CATALOGUE = Object.freeze({
+	"v1:startupbros-wstack-router-binary": {
+		schemaVersion: "v1",
+		token: "v1:startupbros-wstack-router-binary",
+		producer: "startupbros",
+		artifactMode: "binary",
+		updateChannel: null,
+		actionable: false,
+	},
+	"v1:startupbros-wstack-router-package": {
+		schemaVersion: "v1",
+		token: "v1:startupbros-wstack-router-package",
+		producer: "startupbros",
+		artifactMode: "package",
+		updateChannel: null,
+		actionable: false,
+	},
 	"v1:startupbros-managed-source": {
 		schemaVersion: "v1",
 		token: "v1:startupbros-managed-source",
@@ -205,10 +221,17 @@ function rawOrUnknown(value: string | undefined): string {
 	return value ?? "unknown";
 }
 
+function requiresReleaseTag(identity: DistributionIdentity): boolean {
+	return (
+		identity.token !== "v1:startupbros-managed-source" &&
+		identity.token !== "v1:startupbros-docker-image"
+	);
+}
+
 function sourceRefFor(identity: DistributionIdentity, version: string): string {
-	return identity.producer === "startupbros"
-		? "refs/heads/main"
-		: `refs/tags/v${version}`;
+	return requiresReleaseTag(identity)
+		? `refs/tags/v${version}`
+		: "refs/heads/main";
 }
 
 /**
@@ -223,7 +246,7 @@ export function isTrustedDistributionProvenance(
 	const identity = parseDistributionIdentity(provenance.raw ?? undefined);
 	return (
 		identity !== null &&
-		(!identity.actionable || STABLE_RELEASE_VERSION.test(version)) &&
+		(!requiresReleaseTag(identity) || STABLE_RELEASE_VERSION.test(version)) &&
 		provenance.proven === true &&
 		provenance.identity === identity.token &&
 		provenance.schemaVersion === identity.schemaVersion &&
@@ -286,7 +309,7 @@ export function resolveBuildProvenance(
 	}
 	if (sourceRef === undefined)
 		return invalid(raw, "missing_source_ref", identity);
-	if (identity.producer === "tombii" && !STABLE_RELEASE_VERSION.test(version)) {
+	if (requiresReleaseTag(identity) && !STABLE_RELEASE_VERSION.test(version)) {
 		return invalid(raw, "invalid_release_version", identity);
 	}
 	if (sourceEvidenceSha === undefined) {

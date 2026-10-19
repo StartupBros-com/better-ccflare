@@ -155,6 +155,96 @@ describe("trackClientVersion and getClientVersion", () => {
 	});
 });
 
+describe("wstack Router distribution identity", () => {
+	const sha = "abcdef1234567890abcdef1234567890abcdef12";
+	for (const [token, mode] of [
+		["v1:startupbros-wstack-router-binary", "binary"],
+		["v1:startupbros-wstack-router-package", "package"],
+	] as const) {
+		it(`validates tagged ${mode} evidence consistently without making it actionable`, () => {
+			const env = {
+				CCFLARE_DISTRIBUTION: token,
+				CCFLARE_VERSION: "1.2.3",
+				CCFLARE_GIT_SHA: sha,
+				CCFLARE_SOURCE_SHA: sha,
+				CCFLARE_GIT_REF: "refs/tags/v1.2.3",
+				CCFLARE_SOURCE_REF: "refs/tags/v1.2.3",
+				CCFLARE_PRODUCER: "startupbros",
+				CCFLARE_ARTIFACT_MODE: mode,
+			};
+			const valid = resolveBuildProvenance(env);
+			expect(valid).toMatchObject({
+				identity: token,
+				proven: true,
+				actionable: false,
+				updateChannel: null,
+				reason: "proven_non_actionable",
+			});
+			expect(isTrustedDistributionProvenance(valid, "1.2.3")).toBe(true);
+			for (const version of [
+				"unknown",
+				"01.2.3",
+				"1.2",
+				"1.2.3-rc.1",
+				"1.2.3+local",
+				" 1.2.3",
+			]) {
+				expect(
+					resolveBuildProvenance({
+						...env,
+						CCFLARE_VERSION: version,
+						CCFLARE_GIT_REF: `refs/tags/v${version}`,
+						CCFLARE_SOURCE_REF: `refs/tags/v${version}`,
+					}).reason,
+				).toBe("invalid_release_version");
+				expect(
+					isTrustedDistributionProvenance(
+						{ ...valid, source_ref: `refs/tags/v${version}` },
+						version,
+					),
+				).toBe(false);
+			}
+			for (const patch of [
+				{ CCFLARE_DISTRIBUTION: ` ${token}` },
+				{ CCFLARE_DISTRIBUTION: token.toUpperCase() },
+				{ CCFLARE_DISTRIBUTION: `${token}:extra` },
+				{ CCFLARE_GIT_SHA: sha.toUpperCase() },
+				{ CCFLARE_GIT_SHA: "short" },
+				{ CCFLARE_SOURCE_SHA: "forged" },
+				{ CCFLARE_SOURCE_REF: "refs/heads/main" },
+				{
+					CCFLARE_GIT_REF: "refs/heads/main",
+					CCFLARE_SOURCE_REF: "refs/heads/main",
+				},
+				{
+					CCFLARE_GIT_REF: "refs/tags/v1.2.4",
+					CCFLARE_SOURCE_REF: "refs/tags/v1.2.4",
+				},
+				{ CCFLARE_PRODUCER: "tombii" },
+				{ CCFLARE_ARTIFACT_MODE: "docker" },
+				{ CCFLARE_UPDATE_CHANNEL: "npm" },
+				{ CCFLARE_UPDATE_CHANNEL: "" },
+			])
+				expect(resolveBuildProvenance({ ...env, ...patch }).proven).toBe(false);
+			for (const key of Object.keys(env)) {
+				const partial: Record<string, string> = { ...env };
+				delete partial[key];
+				expect(resolveBuildProvenance(partial).proven).toBe(false);
+			}
+			for (const patch of [
+				{ actionable: true },
+				{ updateChannel: "npm" as const },
+				{ reason: "proven_actionable" },
+				{ source_ref: "refs/heads/main" },
+			]) {
+				expect(
+					isTrustedDistributionProvenance({ ...valid, ...patch }, "1.2.3"),
+				).toBe(false);
+			}
+		});
+	}
+});
+
 describe("distribution identity", () => {
 	const sourceSha = "abcdef1234567890abcdef1234567890abcdef12";
 
