@@ -21,13 +21,13 @@ describe("public product identity", () => {
 			"bun run build && bun run cli",
 		);
 		expect(cliPackage.repository.url).toBe(
-			"git+https://github.com/StartupBros-com/better-ccflare.git",
+			"git+https://github.com/StartupBros/wstack-router.git",
 		);
 		expect(cliPackage.homepage).toBe(
-			"https://github.com/StartupBros-com/better-ccflare#readme",
+			"https://github.com/StartupBros/wstack-router#readme",
 		);
 		expect(cliPackage.bugs.url).toBe(
-			"https://github.com/StartupBros-com/better-ccflare/issues",
+			"https://github.com/StartupBros/wstack-router/issues",
 		);
 		expect(rootPackage.description).toContain("wstack Router");
 		expect(cliPackage.description).toContain("wstack Router");

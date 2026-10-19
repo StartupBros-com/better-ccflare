@@ -27,10 +27,10 @@ describe("documented source install", () => {
 		const readme = readFileSync(join(root, "README.md"), "utf8");
 		expect(readme.startsWith("# wstack Router\n")).toBe(true);
 		expect(readme).toContain(
-			"https://github.com/StartupBros-com/better-ccflare.git",
+			"git clone https://github.com/StartupBros/wstack-router.git better-ccflare\ncd better-ccflare\n",
 		);
 		expect(readme).toContain(
-			"https://github.com/StartupBros-com/better-ccflare/issues",
+			"https://github.com/StartupBros/wstack-router/issues",
 		);
 		expect(readme).toContain("https://github.com/tombii/better-ccflare");
 		expect(readme).toContain("https://github.com/snipeship/ccflare");

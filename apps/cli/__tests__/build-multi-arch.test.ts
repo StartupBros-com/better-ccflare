@@ -111,10 +111,10 @@ describe("wstack Router build provenance", () => {
 			"package",
 		],
 	] as const) {
-		it(`requires exact current-origin clean tagged evidence for ${context}`, () => {
+		it(`requires exact current or legacy origin clean tagged evidence for ${context}`, () => {
 			const probe =
 				(
-					origin = "https://github.com/StartupBros-com/better-ccflare",
+					origin = "https://github.com/StartupBros/wstack-router",
 					status: string | null = "",
 					head = sha,
 					tag: string | null = sha,
@@ -129,6 +129,10 @@ describe("wstack Router build provenance", () => {
 				"https://github.com/StartupBros-com/better-ccflare.git",
 				"git@github.com:StartupBros-com/better-ccflare.git",
 				"ssh://git@github.com/StartupBros-com/better-ccflare.git",
+				"https://github.com/StartupBros/wstack-router",
+				"https://github.com/StartupBros/wstack-router.git",
+				"git@github.com:StartupBros/wstack-router.git",
+				"ssh://git@github.com/StartupBros/wstack-router.git",
 			]) {
 				expect(
 					readTombiiTaggedBuildEvidence("1.2.3", context, probe(origin)),
@@ -144,6 +148,11 @@ describe("wstack Router build provenance", () => {
 				"https://github.com/startupbros-com/better-ccflare",
 				" https://github.com/StartupBros-com/better-ccflare",
 				"https://github.com/StartupBros-com/better-ccflare/extra",
+				"https://github.com/startupbros/wstack-router",
+				" https://github.com/StartupBros/wstack-router",
+				"https://github.com/StartupBros/wstack-router ",
+				"https://github.com/StartupBros/wstack-router/extra",
+				"https:/github.com/StartupBros/wstack-router",
 			])
 				expect(
 					readTombiiTaggedBuildEvidence("1.2.3", context, probe(origin)),
