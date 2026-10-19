@@ -8,6 +8,7 @@ const workflowsDir = join(repositoryRoot, ".github/workflows");
 // Every workflow that installs Bun. A new one must be added here deliberately (#321).
 const PINNED_WORKFLOWS = [
 	"managed-routing-postgres.yml",
+	"prepare-router-artifacts.yml",
 	"release.yml",
 	"release-dispatch.yml",
 	"signpath-release.yml",
