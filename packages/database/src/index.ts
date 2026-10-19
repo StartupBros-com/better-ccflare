@@ -75,6 +75,12 @@ export {
 	type DeviceSetupSafeErrorCode,
 	type DeviceSetupTerminalStatus,
 } from "./repositories/device-setup-job.repository";
+export {
+	type ExternalUsageAffected,
+	type ExternalUsageEvent,
+	ExternalUsageRepository,
+	type ExternalUsageSource,
+} from "./repositories/external-usage.repository";
 export type {
 	ModelTranslation,
 	SimilarModel,

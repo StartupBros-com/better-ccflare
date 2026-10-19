@@ -338,6 +338,11 @@ changes may not be reflected. A failed refresh returns `503` and never falls bac
 to an earlier response. Configuration is read from the server environment, so
 configuration changes apply on restart.
 
+Codex window values also count Codex CLI, Desktop, and cloud usage that bypasses
+the proxy once external Codex sources are configured; see
+[External Codex Usage](docs/configuration.md#external-codex-usage) for attribution
+rules and exclusions.
+
 At ingress, forward only the exact `GET /api/public/subscription-value` route and
 nothing else. Enable API-key authentication before exposing the server: with no
 active API key, every admin route is open to anything that reaches it. The server

@@ -107,6 +107,7 @@ function emptyEntry(): ModelValueBreakdownEntry {
 export function valueWindowAggregates(
 	aggregates: readonly WindowTokenAggregate[],
 	atMs: number,
+	resolveModel: (model: string) => string = (model) => model,
 ): WindowValuation {
 	let valueUsd = 0;
 	let inputTokens = 0;
@@ -125,7 +126,7 @@ export function valueWindowAggregates(
 		requestCount += item.requestCount;
 
 		const price = priceTokensAtListPrice(
-			item.model,
+			resolveModel(item.model),
 			atMs,
 			{
 				inputTokens: item.inputTokens,

@@ -31,6 +31,7 @@ import type { DatabaseOperations } from "@better-ccflare/database";
 import {
 	AsyncDbWriter,
 	DatabaseFactory,
+	ExternalUsageRepository,
 	initPayloadEncryption,
 } from "@better-ccflare/database";
 import {
@@ -39,6 +40,7 @@ import {
 	AuthService,
 	classifyAuthPath,
 	createServerDeviceSetupCoordinator,
+	ExternalCodexScanner,
 	UsageWindowLedger,
 } from "@better-ccflare/http-api";
 import {
@@ -109,6 +111,7 @@ import {
 	registerPollingRestarter,
 	registerRefreshClearer,
 	restorePendingRotations,
+	startExternalCodexScheduler,
 	startGlobalTokenHealthChecks,
 	startIntegrityScheduler,
 	stopGlobalTokenHealthChecks,
@@ -1607,6 +1610,29 @@ export default async function startServer(options?: {
 	// otherwise never reach the ledger. Internally resilient: see
 	// UsageWindowLedger.observeSnapshot's per-window try/catch.
 	const usageWindowLedger = new UsageWindowLedger(dbOps, alertService);
+	const externalScanner = new ExternalCodexScanner(
+		new ExternalUsageRepository(dbOps.getAdapter()),
+		(affected) => usageWindowLedger.reaggregateClosedWindows(affected),
+	);
+	const externalSources = () => ({
+		homes: config.getExternalCodexHomes(),
+		cloudRoots: config.getExternalCodexCloudRoots(),
+		invalidCloudRoots: config.getInvalidExternalCodexCloudRoots(),
+	});
+	const stopExternalScanner = startExternalCodexScheduler(
+		() => {
+			const sources = externalSources();
+			return (
+				sources.homes.length > 0 ||
+				sources.cloudRoots.length > 0 ||
+				sources.invalidCloudRoots.length > 0
+			);
+		},
+		async () =>
+			externalScanner.scan(externalSources(), await dbOps.getAllAccounts()),
+	);
+	registerDisposable({ dispose: stopExternalScanner });
+
 	// Re-price closed windows stamped with an older VALUE_PRICING_VERSION. Done
 	// here, at construction, because the ledger has no init lifecycle and this
 	// runs exactly once per process. Not awaited so startup isn't blocked; the

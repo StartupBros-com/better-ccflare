@@ -158,6 +158,7 @@ ${getManagedRoutingHelpText()}
     --origin <loopback-origin> --credential-env <ENV_NAME>  Required; existing inference key only
                        Ambient HTTP(S)_PROXY / ALL_PROXY must be unset; redirects are refused
 
+  --scan-external-codex Scan configured Codex rollout/cloud sources once (--json supported)
   --analyze            Analyze database performance
   --repair-db          Check and repair database integrity
   --doctor             Run database integrity check and storage diagnostics
@@ -250,6 +251,7 @@ interface ParsedArgs {
 	setPriority: [string, number] | null;
 	reauthenticate: string | null;
 	analyze: boolean;
+	scanExternalCodex: boolean;
 	repairDb: boolean;
 	doctor: boolean;
 	doctorFull: boolean;
@@ -627,6 +629,7 @@ function parseArgs(args: string[]): ParsedArgs {
 		setPriority: null,
 		reauthenticate: null,
 		analyze: false,
+		scanExternalCodex: false,
 		repairDb: false,
 		doctor: false,
 		doctorFull: false,
@@ -848,6 +851,9 @@ function parseArgs(args: string[]): ParsedArgs {
 				parsed.setPriority = [name, priority];
 				break;
 			}
+			case "--scan-external-codex":
+				parsed.scanExternalCodex = true;
+				break;
 			case "--analyze":
 				parsed.analyze = true;
 				break;
@@ -1299,6 +1305,10 @@ async function main() {
 		}
 	}
 	const parsed = parseArgs(args);
+	if (parsed.scanExternalCodex && parsed.json) {
+		const { setConsoleLogging } = await import("@better-ccflare/logger");
+		setConsoleLogging(false);
+	}
 	const recorderRequested =
 		args.includes("--cache-flight-recorder-report") ||
 		parsed.cacheFlightRecorderHealth;
@@ -1553,6 +1563,34 @@ async function main() {
 	container.registerInstance(SERVICE_KEYS.Database, dbOps);
 
 	// Handle non-interactive commands
+
+	if (parsed.scanExternalCodex) {
+		const { ExternalUsageRepository } = await import(
+			"@better-ccflare/database"
+		);
+		const { ExternalCodexScanner, UsageWindowLedger } = await import(
+			"@better-ccflare/http-api"
+		);
+		const repository = new ExternalUsageRepository(dbOps.getAdapter());
+		const ledger = new UsageWindowLedger(dbOps);
+		const scanner = new ExternalCodexScanner(repository, (affected) =>
+			ledger.reaggregateClosedWindows(affected),
+		);
+		const summary = await scanner.scan(
+			{
+				homes: cliConfig.getExternalCodexHomes(),
+				cloudRoots: cliConfig.getExternalCodexCloudRoots(),
+				invalidCloudRoots: cliConfig.getInvalidExternalCodexCloudRoots(),
+			},
+			await dbOps.getAllAccounts(),
+		);
+		const rows = await repository.report();
+		process.stdout.write(
+			`${JSON.stringify({ summary, models: rows, exclusions: ["Pre-tracking usage has no subscription window", "Unattributed rows are reported but excluded from Window Value", "Credit-paid usage is not separated"] }, null, parsed.json ? undefined : 2)}\n`,
+		);
+		await exitGracefully(0);
+		return;
+	}
 	if (parsed.serve) {
 		const config = new Config();
 		await startServerWithConfig(parsed, config);

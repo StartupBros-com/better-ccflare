@@ -1826,6 +1826,14 @@ OAuth tokens will need to be re-authenticated.
 		return this.requests.getRequestsByAccount(since);
 	}
 
+	/** Global retention boundary, shared by SQLite and PostgreSQL adapters. */
+	async getOldestRequestTimestamp(): Promise<number | null> {
+		const row = await this.adapter.get<{ oldest: number | string | null }>(
+			"SELECT MIN(timestamp) AS oldest FROM requests",
+		);
+		return row?.oldest == null ? null : Number(row.oldest);
+	}
+
 	/** See RequestRepository.aggregateTokensByModel — the Window Value
 	 * Ledger's per-model token/request source for one window's life. */
 	async aggregateTokensByModel(
