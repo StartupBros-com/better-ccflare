@@ -799,6 +799,10 @@ async function handleProxyImpl(
 	}
 }
 
+interface RoutingCancellationHistory {
+	record?: () => Promise<void>;
+}
+
 async function handleProxyCore(
 	req: Request,
 	url: URL,
@@ -810,6 +814,7 @@ async function handleProxyCore(
 	degradedTelemetry?: DegradedTelemetryHolder,
 	observation?: RequestObservation,
 ): Promise<Response> {
+	const cancellationHistory: RoutingCancellationHistory = {};
 	try {
 		return await handleProxyCoreImpl(
 			req,
@@ -821,6 +826,7 @@ async function handleProxyCore(
 			anthropicPreCommitRescue,
 			degradedTelemetry,
 			observation,
+			cancellationHistory,
 		);
 	} catch (error) {
 		if (!(error instanceof PhysicalAttemptBudgetExceededError)) throw error;
@@ -835,6 +841,20 @@ async function handleProxyCore(
 			nextLanePresent: error.nextLaneKey !== null,
 		});
 		return error.terminalize();
+	} finally {
+		// Routing may finish without forwardToClient ever claiming analytics (a
+		// rejected fetch or discarded prepared candidate). Only the caller signal
+		// owns this fallback, never an internal rescue/hedge cancellation.
+		if (req.signal.aborted) {
+			try {
+				// Claim synchronously, but never hold the response for telemetry I/O.
+				void cancellationHistory.record?.().catch((error) => {
+					log.error("Failed to record pre-forward caller cancellation", error);
+				});
+			} catch (error) {
+				log.error("Failed to record pre-forward caller cancellation", error);
+			}
+		}
 	}
 }
 
@@ -848,6 +868,7 @@ async function handleProxyCoreImpl(
 	anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext,
 	degradedTelemetry?: DegradedTelemetryHolder,
 	observation?: RequestObservation,
+	cancellationHistory?: RoutingCancellationHistory,
 ): Promise<Response> {
 	// Consume the private scheduler credential before any request inspection,
 	// metadata construction, logging, cache staging, or upstream forwarding.
@@ -1022,6 +1043,29 @@ async function handleProxyCoreImpl(
 		});
 		return response;
 	};
+	if (cancellationHistory) {
+		cancellationHistory.record = () => {
+			// A started (including asynchronously finalizing) response owns its
+			// existing chunks, usage, and terminal. Never replace that lifecycle.
+			if (getRequestLifecycleCoordinator(requestMeta).state !== "unclaimed")
+				return Promise.resolve();
+			return recordRoutingTerminalRequest({
+				collector: tryGetUsageCollector(),
+				requestMeta,
+				requestHeaders: req.headers,
+				response: new Response(null, { status: 499 }),
+				providerName: ctx.provider.name,
+				terminalKind: "client_cancelled",
+				upstreamAttempts: routingAttemptLedger.attemptedCount,
+				apiKeyId,
+				apiKeyName,
+				skip: trustedInternalAutoRefresh,
+				onError: (error) => {
+					log.error(`Cancellation history failed for ${requestMeta.id}`, error);
+				},
+			});
+		};
+	}
 	registerManagedTerminal(req, (cause) => {
 		routingAttemptLedger.recordPhysicalOutcome(cause);
 		recordLocalRoutingTerminal(
