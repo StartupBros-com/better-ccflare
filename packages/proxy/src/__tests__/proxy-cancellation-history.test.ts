@@ -202,6 +202,57 @@ describe("canonical history for caller cancellation before forwarding", () => {
 		expect(endSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("returns 499 before pending cancellation telemetry settles", async () => {
+		const controller = new AbortController();
+		const request = makeRequest(controller);
+		const end = collector.handleEnd.bind(collector);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let pendingEnd: Promise<void> | undefined;
+		const endSpy = spyOn(collector, "handleEnd").mockImplementation(
+			(message) => {
+				pendingEnd = gate.then(() => end(message));
+				return pendingEnd;
+			},
+		);
+		restores.push(() => endSpy.mockRestore());
+		const fetch = mock(async () => {
+			controller.abort();
+			throw new DOMException("synthetic disconnect", "AbortError");
+		});
+		globalThis.fetch = fetch as unknown as typeof globalThis.fetch;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const response = handleProxy(request, new URL(request.url), ctx);
+		try {
+			const result = await Promise.race([
+				response,
+				new Promise<null>((resolve) => {
+					timeout = setTimeout(() => resolve(null), 250);
+				}),
+			]);
+			expect(result?.status).toBe(499);
+			expect(endSpy).toHaveBeenCalledTimes(1);
+			expect(fetch).toHaveBeenCalledTimes(1);
+			expect(await db.getRecentRequests()).toEqual([]);
+		} finally {
+			clearTimeout(timeout);
+			release();
+			await response;
+			await pendingEnd;
+			await collector.drain();
+		}
+		const rows = await db.getRecentRequests();
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({
+			status_code: 499,
+			success: false,
+			account_used: "cancel-account",
+		});
+		expect(await db.getRequestPayload(rows[0].id)).toBeNull();
+	});
+
 	it("does not log an internally discarded candidate as caller cancellation", async () => {
 		const controller = new AbortController();
 		globalThis.fetch = mock(async () =>

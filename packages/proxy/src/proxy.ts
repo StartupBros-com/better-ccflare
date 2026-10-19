@@ -847,7 +847,10 @@ async function handleProxyCore(
 		// owns this fallback, never an internal rescue/hedge cancellation.
 		if (req.signal.aborted) {
 			try {
-				await cancellationHistory.record?.();
+				// Claim synchronously, but never hold the response for telemetry I/O.
+				void cancellationHistory.record?.().catch((error) => {
+					log.error("Failed to record pre-forward caller cancellation", error);
+				});
 			} catch (error) {
 				log.error("Failed to record pre-forward caller cancellation", error);
 			}
