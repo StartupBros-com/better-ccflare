@@ -135,6 +135,59 @@ for (const oldest of [null, 1001]) {
 		sql.close();
 	});
 }
+test("another account's retained request does not authorize rebuilding a window that lost its own requests", async () => {
+	const sql = new Database(":memory:");
+	runMigrations(sql);
+	const adapter = new BunSqlAdapter(sql);
+	const windows = new UsageWindowsRepository(adapter);
+	const requests = new RequestRepository(adapter);
+	const facade = {
+		closeUsageWindow: windows.closeWindow.bind(windows),
+		listUsageWindows: windows.listWindows.bind(windows),
+		aggregateTokensByModel: requests.aggregateTokensByModel.bind(requests),
+		getUsageWindowsRepository: () => windows,
+		getOldestRequestTimestamp:
+			DatabaseOperations.prototype.getOldestRequestTimestamp.bind({
+				adapter,
+			} as unknown as DatabaseOperations),
+	} as unknown as DatabaseOperations;
+	sql.run(
+		"INSERT INTO requests(id,timestamp,method,path,account_used,model,input_tokens,billing_type) VALUES ('a-old',0,'POST','/v1/messages','a','unknown',7,'plan'),('b-own',1500,'POST','/v1/messages','b','unknown',9,'plan'),('c-own',1500,'POST','/v1/messages','c','unknown',11,'plan')",
+	);
+	const ledger = new UsageWindowLedger(facade);
+	for (const accountId of ["a", "b", "c"]) {
+		const w = await windows.openWindow({
+			accountId,
+			windowKey: "seven_day",
+			startedAt: accountId === "a" ? 0 : 1000,
+			resetsAt: 2000,
+			grantType: "natural",
+		});
+		await ledger.closeAndValue(w, 2000);
+		sql.run(
+			`INSERT INTO external_usage_events(id,account_id,source_kind,event_ts,timestamp,model,input_tokens,cache_read_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,is_fallback_model,session_id,ingested_at) VALUES (?,?,'cloud',1600,?,'unknown',100,20,30,10,150,0,'s',0)`,
+			[`e-${accountId}`, accountId, `t-${accountId}`],
+		);
+	}
+	// a's request at 0 keeps the global oldest ahead of every window start, but b has
+	// lost the request its closed window counted and c's stored count is unknown.
+	sql.run("DELETE FROM requests WHERE account_used='b'");
+	sql.run("UPDATE usage_windows SET request_count=NULL WHERE account_id='c'");
+	const byAccount = async () =>
+		new Map((await windows.listWindows()).map((w) => [w.accountId, w]));
+	const before = await byAccount();
+	expect(
+		await ledger.reaggregateClosedWindows(
+			["a", "b", "c"].map((accountId) => ({ accountId, eventTs: 1600 })),
+		),
+	).toEqual({ rewritten: 1, skippedRetention: 2, failed: 0 });
+	const after = await byAccount();
+	expect(after.get("a")?.inputTokens).toBe(107);
+	expect(after.get("a")?.requestCount).toBe(1);
+	expect(after.get("b")).toEqual(before.get("b"));
+	expect(after.get("c")).toEqual(before.get("c"));
+	sql.close();
+});
 test("a failed aggregate leaves pending and continues to the next account", async () => {
 	const sql = new Database(":memory:");
 	runMigrations(sql);

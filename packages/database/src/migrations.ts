@@ -970,7 +970,7 @@ export function ensureSchema(db: Database): void {
 	// attribution_basis needs no ALTER: external_usage_events has never shipped to a database.
 	db.run(`CREATE TABLE IF NOT EXISTS external_usage_events (id TEXT PRIMARY KEY,
  account_id TEXT,
- attribution_basis TEXT CHECK (attribution_basis IN ('exact', 'near', 'vote', 'cloud')),
+ attribution_basis TEXT CHECK (attribution_basis IN ('exact', 'near', 'vote', 'cloud', 'conflict')),
  source_kind TEXT NOT NULL CHECK (source_kind IN ('rollout', 'cloud')),
  event_ts INTEGER NOT NULL,
  timestamp TEXT NOT NULL,

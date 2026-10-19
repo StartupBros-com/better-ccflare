@@ -308,15 +308,23 @@ Rollout rows are attributed by the primary rate-limit reset recorded with each e
    its session's exact and near rows. A tie leaves a new row unattributed and keeps
    an earlier vote unchanged.
 
+A cloud root's account mapping is explicit, so it outranks all three: when a cloud
+event matches a row already attributed by exact, near or vote, the row moves to the
+mapped account and both accounts' closed windows are rebuilt. If two cloud roots
+mapped to different accounts claim the same event, the row is left unattributed
+for good (basis `conflict`), no later claim or vote re-attributes it, and the scan
+summary counts it in `rowsCloudConflict`.
+
 Rows that match no account, or more than one, are stored and reported but excluded
 from Window Value. So is usage from before the first tracked window. Usage paid with
 credits is not separated from subscription usage.
 
 When attributed rows land in an already-closed window, that window is re-aggregated.
-A window that starts before the oldest retained proxy request (see
-`request_retention_days`) keeps its stored value instead, because its proxy half can
-no longer be recomputed; the scan summary counts these as `windowsSkippedRetention`.
-A window's `requestCount` counts proxy requests only.
+A window keeps its stored value instead when its proxy half can no longer be
+recomputed: it starts before the oldest retained proxy request (see
+`request_retention_days`), or fewer of that account's proxy requests are retained
+for its range than the close counted. The scan summary counts these as
+`windowsSkippedRetention`. A window's `requestCount` counts proxy requests only.
 
 ## Service-Lifetime Cohort Seal
 

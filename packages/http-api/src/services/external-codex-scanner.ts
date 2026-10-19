@@ -46,6 +46,8 @@ export interface ExternalCodexScanSummary {
 	rowsInserted: number;
 	rowsReattributed: number;
 	rowsUnattributed: number;
+	/** Rows two cloud accounts claimed during this scan; they stay unattributed. */
+	rowsCloudConflict: number;
 	malformedLines: number;
 }
 /** Retains metadata only. Files are reparsed whole when changed; SQL is the global dedupe authority. */
@@ -76,6 +78,7 @@ export class ExternalCodexScanner {
 			rowsInserted: 0,
 			rowsReattributed: 0,
 			rowsUnattributed: 0,
+			rowsCloudConflict: 0,
 			malformedLines: 0,
 		};
 
@@ -336,6 +339,11 @@ export class ExternalCodexScanner {
 			const result = await this.repository.replaceSources(replacements);
 			summary.rowsInserted = result.inserted;
 			summary.rowsReattributed = result.reattributed;
+			summary.rowsCloudConflict = result.conflicts;
+			if (result.conflicts)
+				log.warn(
+					`External Codex scan: ${result.conflicts} events claimed by two cloud accounts were left unattributed`,
+				);
 			if (this.onAffected) {
 				const windows = await this.onAffected(result.affected);
 				summary.windowsRewritten = windows.rewritten;

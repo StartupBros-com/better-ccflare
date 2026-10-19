@@ -143,7 +143,8 @@ export class UsageWindowLedger {
 		private readonly alertService?: AlertService,
 	) {}
 
-	/** Rebuild affected closed windows only while request history covers their start. */
+	/** Rebuild affected closed windows only while request history covers their start
+	 * and every proxy request the close counted for that account is still retained. */
 	async reaggregateClosedWindows(
 		affected: ReadonlyArray<{ accountId: string; eventTs: number }>,
 	): Promise<{ rewritten: number; skippedRetention: number; failed: number }> {
@@ -184,15 +185,18 @@ export class UsageWindowLedger {
 						if (low === timestamps.length || timestamps[low] >= end) continue;
 						const repo = this.dbOps.getUsageWindowsRepository();
 						const revision = await repo.pendingExternalRevision(window.id);
-						if (oldest === null || oldest > window.startedAt) {
-							// New installs may have an observed window older than their first request;
-							// refuse those too, since completeness cannot be proved from retained data.
+						const skipRetentionUnsafe = async () => {
 							if (revision !== null)
 								await repo.clearPendingExternal(window.id, revision);
 							log.warn(
 								`Skipping retention-unsafe external usage rebuild for window ${window.id}, account ${accountId}`,
 							);
 							summary.skippedRetention++;
+						};
+						if (oldest === null || oldest > window.startedAt) {
+							// New installs may have an observed window older than their first request;
+							// refuse those too, since completeness cannot be proved from retained data.
+							await skipRetentionUnsafe();
 							continue;
 						}
 						const aggregates = await this.dbOps.aggregateTokensByModel(
@@ -201,6 +205,16 @@ export class UsageWindowLedger {
 							end,
 						);
 						const value = valueWindowAggregates(aggregates, window.startedAt);
+						// The global oldest request proves nothing about this account's own rows. The
+						// close counted its proxy requests over this same range, so fewer retained now
+						// (or an unknown stored count) means the proxy half can no longer be rebuilt.
+						if (
+							window.requestCount === null ||
+							value.requestCount < window.requestCount
+						) {
+							await skipRetentionUnsafe();
+							continue;
+						}
 						if (
 							await repo.reaggregateClosedWindow(
 								window.id,

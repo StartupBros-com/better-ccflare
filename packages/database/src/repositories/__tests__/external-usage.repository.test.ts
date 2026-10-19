@@ -478,3 +478,75 @@ test("deleting direct evidence triggers a new vote without inserted rows", async
 			.get(),
 	).toEqual({ account_id: "b" });
 });
+
+test("explicit cloud mapping overrides inferred rollout attribution and journals both accounts", async () => {
+	window("a", 100);
+	window("b", 200);
+	db.run("UPDATE usage_windows SET closed_at=resets_at");
+	await repo.ingest([event()]);
+	db.run("DELETE FROM external_usage_pending_windows");
+	const result = await repo.ingest([
+		event({ sourceKind: "cloud", accountId: "b" }),
+	]);
+	expect(result).toMatchObject({ inserted: 0, reattributed: 1, conflicts: 0 });
+	expect(
+		db
+			.query("SELECT account_id,attribution_basis FROM external_usage_events")
+			.all(),
+	).toEqual([{ account_id: "b", attribution_basis: "cloud" }]);
+	expect(
+		db
+			.query(
+				"SELECT window_id FROM external_usage_pending_windows ORDER BY window_id",
+			)
+			.all(),
+	).toEqual([{ window_id: "a100" }, { window_id: "b200" }]);
+	expect(
+		[...new Set(result.affected.map((row) => row.accountId))].sort(),
+	).toEqual(["a", "b"]);
+	const requests = new RequestRepository(new BunSqlAdapter(db));
+	const input = async (account: string) =>
+		(await requests.aggregateTokensByModel(account, 0, 300_000)).reduce(
+			(sum, row) => sum + row.inputTokens,
+			0,
+		);
+	expect(await input("a")).toBe(0);
+	expect(await input("b")).toBe(100);
+});
+
+test("conflicting cloud claims leave an event unattributed and no later claim or vote re-promotes it", async () => {
+	window("a", 100);
+	window("b", 200);
+	db.run("UPDATE usage_windows SET closed_at=resets_at");
+	await repo.ingest([event(), event({ sourceKind: "cloud", accountId: "b" })]);
+	db.run("DELETE FROM external_usage_pending_windows");
+	const attribution = () =>
+		db
+			.query("SELECT account_id,attribution_basis FROM external_usage_events")
+			.all();
+	// The row still carries exact rate-limit evidence for a; resolution must not use it.
+	const conflict = await repo.ingest([
+		event({ sourceKind: "cloud", accountId: "a" }),
+	]);
+	expect(conflict).toMatchObject({
+		inserted: 0,
+		reattributed: 0,
+		conflicts: 1,
+	});
+	expect(attribution()).toEqual([
+		{ account_id: null, attribution_basis: "conflict" },
+	]);
+	expect(
+		db.query("SELECT window_id FROM external_usage_pending_windows").all(),
+	).toEqual([{ window_id: "b200" }]);
+	expect(conflict.affected.map((row) => row.accountId)).toEqual(["b"]);
+	for (const accountId of ["a", "b"])
+		expect(
+			await repo.ingest([event({ sourceKind: "cloud", accountId })]),
+		).toMatchObject({ inserted: 0, reattributed: 0, conflicts: 0 });
+	window("c", 300);
+	await repo.ingest([]);
+	expect(attribution()).toEqual([
+		{ account_id: null, attribution_basis: "conflict" },
+	]);
+});

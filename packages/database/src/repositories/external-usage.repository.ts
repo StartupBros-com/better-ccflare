@@ -41,7 +41,8 @@ interface Candidate {
 	resets_at: number;
 	started_at: number;
 }
-type AttributionBasis = "exact" | "near" | "vote" | "cloud";
+/** `conflict` marks a row two cloud accounts claimed; it stays unattributed. */
+type AttributionBasis = "exact" | "near" | "vote" | "cloud" | "conflict";
 interface Unresolved {
 	account_id: string | null;
 	attribution_basis: AttributionBasis | null;
@@ -201,6 +202,7 @@ export class ExternalUsageRepository extends BaseRepository<ExternalUsageEvent> 
 	): Promise<{
 		inserted: number;
 		reattributed: number;
+		conflicts: number;
 		affected: ExternalUsageAffected[];
 	}> {
 		const windows = await this.query<Candidate>(
@@ -209,6 +211,7 @@ export class ExternalUsageRepository extends BaseRepository<ExternalUsageEvent> 
 		const affected: ExternalUsageAffected[] = [];
 		let inserted = 0;
 		let reattributed = 0;
+		let conflicts = 0;
 
 		// A bounded SQL transaction amortizes fsync during a cold scan without holding
 		// the proxy event loop for an entire corpus. The lease fences each batch.
@@ -219,6 +222,7 @@ export class ExternalUsageRepository extends BaseRepository<ExternalUsageEvent> 
 				account: string | null;
 				insert: number;
 				cloudUpdate?: number;
+				cloudConflict?: number;
 			}> = [];
 			for (const e of events.slice(offset, offset + 256)) {
 				const resolution =
@@ -239,11 +243,17 @@ export class ExternalUsageRepository extends BaseRepository<ExternalUsageEvent> 
 					e.reasoningOutputTokens,
 					e.totalTokens,
 				];
+				// An explicit cloud mapping outranks rate-limit inference: it claims a matching
+				// row that is unattributed or inferred for another account. A row another cloud
+				// account already claimed becomes a conflict instead and counts for neither.
+				const claimable =
+					"attribution_basis IS DISTINCT FROM 'cloud' AND attribution_basis IS DISTINCT FROM 'conflict' AND account_id IS DISTINCT FROM ?";
+				const cloudClaim = account !== null && e.sourceKind === "cloud";
 				if (account)
 					statements.push({
 						sql: `INSERT INTO external_usage_pending_windows(window_id,revision)
  SELECT id,? FROM usage_windows WHERE account_id=? AND window_key='seven_day' AND started_at<=? AND COALESCE(closed_at,resets_at)>?
- AND (NOT EXISTS(SELECT 1 FROM external_usage_events WHERE ${dedupe})${e.sourceKind === "cloud" ? ` OR EXISTS(SELECT 1 FROM external_usage_events WHERE ${dedupe} AND account_id IS NULL)` : ""})
+ AND (NOT EXISTS(SELECT 1 FROM external_usage_events WHERE ${dedupe})${cloudClaim ? ` OR EXISTS(SELECT 1 FROM external_usage_events WHERE ${dedupe} AND ${claimable})` : ""})
  ON CONFLICT(window_id) DO UPDATE SET revision=excluded.revision`,
 						params: [
 							randomUUID(),
@@ -251,8 +261,18 @@ export class ExternalUsageRepository extends BaseRepository<ExternalUsageEvent> 
 							e.eventTs,
 							e.eventTs,
 							...dedupeParams,
-							...(e.sourceKind === "cloud" ? dedupeParams : []),
+							...(cloudClaim ? [...dedupeParams, account] : []),
 						],
+					});
+				if (cloudClaim)
+					// The account a claimed or conflicted row leaves loses it from its windows.
+					statements.push({
+						sql: `INSERT INTO external_usage_pending_windows(window_id,revision)
+ SELECT w.id,? FROM usage_windows w JOIN external_usage_events ev ON ev.account_id=w.account_id
+ WHERE ev.timestamp=? AND ev.model=? AND ev.input_tokens=? AND ev.cache_read_input_tokens=? AND ev.output_tokens=? AND ev.reasoning_output_tokens=? AND ev.total_tokens=? AND ev.account_id<>?
+ AND w.window_key='seven_day' AND w.started_at<=ev.event_ts AND COALESCE(w.closed_at,w.resets_at)>ev.event_ts
+ ON CONFLICT(window_id) DO UPDATE SET revision=excluded.revision`,
+						params: [randomUUID(), ...dedupeParams, account],
 					});
 				const insert = statements.length;
 				statements.push({
@@ -282,23 +302,26 @@ export class ExternalUsageRepository extends BaseRepository<ExternalUsageEvent> 
 					],
 				});
 				let cloudUpdate: number | undefined;
-				if (account && e.sourceKind === "cloud") {
+				let cloudConflict: number | undefined;
+				if (cloudClaim) {
 					cloudUpdate = statements.length;
 					statements.push({
-						sql: `UPDATE external_usage_events SET account_id=?,attribution_basis='cloud' WHERE timestamp=? AND model=? AND input_tokens=? AND cache_read_input_tokens=? AND output_tokens=? AND reasoning_output_tokens=? AND total_tokens=? AND account_id IS NULL`,
-						params: [
-							account,
-							e.timestamp,
-							e.model,
-							e.inputTokens,
-							e.cacheReadInputTokens,
-							e.outputTokens,
-							e.reasoningOutputTokens,
-							e.totalTokens,
-						],
+						sql: `UPDATE external_usage_events SET account_id=?,attribution_basis='cloud' WHERE ${dedupe} AND ${claimable}`,
+						params: [account, ...dedupeParams, account],
+					});
+					cloudConflict = statements.length;
+					statements.push({
+						sql: `UPDATE external_usage_events SET account_id=NULL,attribution_basis='conflict' WHERE ${dedupe} AND attribution_basis='cloud' AND account_id<>?`,
+						params: [...dedupeParams, account],
 					});
 				}
-				outcomes.push({ event: e, account, insert, cloudUpdate });
+				outcomes.push({
+					event: e,
+					account,
+					insert,
+					cloudUpdate,
+					cloudConflict,
+				});
 			}
 			const changes = await this.mutationBatch(statements);
 			for (const outcome of outcomes) {
@@ -307,6 +330,8 @@ export class ExternalUsageRepository extends BaseRepository<ExternalUsageEvent> 
 					outcome.cloudUpdate === undefined ? 0 : changes[outcome.cloudUpdate];
 				inserted += n;
 				reattributed += updated;
+				if (outcome.cloudConflict !== undefined)
+					conflicts += changes[outcome.cloudConflict];
 				if (outcome.account && (n || updated))
 					affected.push({
 						accountId: outcome.account,
@@ -316,7 +341,7 @@ export class ExternalUsageRepository extends BaseRepository<ExternalUsageEvent> 
 			await setImmediate();
 		}
 
-		this.evidenceChanged ||= inserted > 0 || reattributed > 0;
+		this.evidenceChanged ||= inserted > 0 || reattributed > 0 || conflicts > 0;
 		if (options.resolve !== false) {
 			const fingerprint = JSON.stringify(
 				windows
@@ -327,7 +352,7 @@ export class ExternalUsageRepository extends BaseRepository<ExternalUsageEvent> 
 				if (windows.length) {
 					const bound = Math.min(...windows.map((w) => Number(w.started_at)));
 					const pending = await this.query<Unresolved>(
-						"SELECT id,session_id,event_ts,rate_limit_resets_at,account_id,attribution_basis FROM external_usage_events WHERE source_kind='rollout' AND (account_id IS NULL OR attribution_basis='vote') AND event_ts>=?",
+						"SELECT id,session_id,event_ts,rate_limit_resets_at,account_id,attribution_basis FROM external_usage_events WHERE source_kind='rollout' AND (account_id IS NULL OR attribution_basis='vote') AND attribution_basis IS DISTINCT FROM 'conflict' AND event_ts>=?",
 						[bound],
 					);
 					const tallies = new Map<string, Map<string, number>>();
@@ -440,7 +465,12 @@ export class ExternalUsageRepository extends BaseRepository<ExternalUsageEvent> 
 			}
 			affected.push(...(await this.pendingAffected()));
 		}
-		return { inserted, reattributed, affected: this.dedupeAffected(affected) };
+		return {
+			inserted,
+			reattributed,
+			conflicts,
+			affected: this.dedupeAffected(affected),
+		};
 	}
 	private dedupeAffected(
 		affected: ExternalUsageAffected[],
@@ -524,6 +554,7 @@ export class ExternalUsageRepository extends BaseRepository<ExternalUsageEvent> 
 		}
 		const resolved = await this.ingest([]);
 		result.reattributed += resolved.reattributed;
+		result.conflicts += resolved.conflicts;
 		result.affected.push(...resolved.affected);
 		result.affected = this.dedupeAffected(result.affected);
 		return result;

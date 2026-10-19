@@ -1973,6 +1973,63 @@ describe.skipIf(!livePgAvailable)(
 						).toEqual({ rewritten: 2, skippedRetention: 0, failed: 0 });
 						expect((await stored("cx-a")).inputTokens).toBe(207);
 						expect((await stored("cx-b")).inputTokens).toBe(500);
+
+						// An explicit cloud mapping overrides inferred rollout attribution:
+						// t-a1 moves from cx-a (exact) to cx-b and both windows are rebuilt.
+						const third = await repo.replaceSources([
+							{
+								path: "p3",
+								events: [
+									event("t-a1", 2_000, {
+										sourceKind: "cloud",
+										accountId: "cx-b",
+										sessionId: "c2",
+									}),
+								],
+							},
+						]);
+						expect(third).toMatchObject({
+							inserted: 0,
+							reattributed: 1,
+							conflicts: 0,
+						});
+						expect(
+							(await attribution()).find((row) => row[0] === "t-a1"),
+						).toEqual(["t-a1", "cx-b", "cloud"]);
+						expect(
+							await ledger.reaggregateClosedWindows(third.affected),
+						).toEqual({ rewritten: 2, skippedRetention: 0, failed: 0 });
+						expect((await stored("cx-a")).inputTokens).toBe(107);
+						expect((await stored("cx-b")).inputTokens).toBe(600);
+
+						// A second cloud account claiming the same event is a conflict: it
+						// counts for neither, and cx-a's exact evidence never re-resolves it.
+						const fourth = await repo.replaceSources([
+							{
+								path: "p4",
+								events: [
+									event("t-a1", 2_000, {
+										sourceKind: "cloud",
+										accountId: "cx-a",
+										sessionId: "c3",
+									}),
+								],
+							},
+						]);
+						expect(fourth).toMatchObject({
+							inserted: 0,
+							reattributed: 0,
+							conflicts: 1,
+						});
+						expect(
+							(await attribution()).find((row) => row[0] === "t-a1"),
+						).toEqual(["t-a1", null, "conflict"]);
+						expect(
+							await ledger.reaggregateClosedWindows(fourth.affected),
+						).toEqual({ rewritten: 1, skippedRetention: 0, failed: 0 });
+						expect((await stored("cx-a")).inputTokens).toBe(107);
+						expect((await stored("cx-b")).inputTokens).toBe(500);
+						expect(await pending()).toBe(0);
 						await repo.releaseScanLease("pg-live");
 					} finally {
 						for (const table of [

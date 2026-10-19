@@ -57,9 +57,19 @@ test("scan skips unchanged sources, retries recent corrupt zstd, and reports met
 		) => {
 			const events = replacements.flatMap((source) => source.events);
 			batches.push(events);
-			return { inserted: events.length, reattributed: 0, affected: [] };
+			return {
+				inserted: events.length,
+				reattributed: 0,
+				conflicts: 0,
+				affected: [],
+			};
 		},
-		ingest: async () => ({ inserted: 0, reattributed: 0, affected: [] }),
+		ingest: async () => ({
+			inserted: 0,
+			reattributed: 0,
+			conflicts: 0,
+			affected: [],
+		}),
 		report: async () => [],
 	};
 	const scanner = new ExternalCodexScanner(repository);
@@ -162,9 +172,14 @@ test("file changed during ingest is retried and scan remains responsive", async 
 				first = false;
 				await writeFile(path, "{}\n".repeat(50_001));
 			}
-			return { inserted: 0, reattributed: 0, affected: [] };
+			return { inserted: 0, reattributed: 0, conflicts: 0, affected: [] };
 		},
-		ingest: async () => ({ inserted: 0, reattributed: 0, affected: [] }),
+		ingest: async () => ({
+			inserted: 0,
+			reattributed: 0,
+			conflicts: 0,
+			affected: [],
+		}),
 		report: async () => [],
 	};
 	const scanner = new ExternalCodexScanner(repo);
@@ -193,9 +208,15 @@ test("cloud root requires a configured Codex subscription account", async () => 
 		replaceSources: async () => ({
 			inserted: 0,
 			reattributed: 0,
+			conflicts: 0,
 			affected: [],
 		}),
-		ingest: async () => ({ inserted: 0, reattributed: 0, affected: [] }),
+		ingest: async () => ({
+			inserted: 0,
+			reattributed: 0,
+			conflicts: 0,
+			affected: [],
+		}),
 		report: async () => [],
 	};
 	const scanner = new ExternalCodexScanner(repo);
@@ -225,9 +246,15 @@ test("database scan lease rejects concurrent operator scan and can retry", async
 		replaceSources: async () => ({
 			inserted: 0,
 			reattributed: 0,
+			conflicts: 0,
 			affected: [],
 		}),
-		ingest: async () => ({ inserted: 0, reattributed: 0, affected: [] }),
+		ingest: async () => ({
+			inserted: 0,
+			reattributed: 0,
+			conflicts: 0,
+			affected: [],
+		}),
 		report: async () => [],
 	};
 	const scanner = new ExternalCodexScanner(repo);
