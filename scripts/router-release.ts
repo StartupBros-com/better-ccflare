@@ -426,7 +426,7 @@ if (import.meta.main) {
 	const token = process.env.GITHUB_TOKEN;
 	if (!token)
 		throw new Error(
-			"GITHUB_TOKEN required; repository policy must permit PR creation (can_approve_pull_request_reviews)",
+			"GITHUB_TOKEN required; supply a token with permissions for the requested release operation",
 		);
 	const transport = await githubTransport(token);
 	const expected = { repository, sha };

@@ -341,8 +341,12 @@ for (const failure of [
 const workflows = join(import.meta.dir, "../../.github/workflows");
 type Job = {
 	if?: string;
+	"continue-on-error"?: boolean;
 	permissions?: Record<string, string>;
 	steps: {
+		id?: string;
+		if?: string;
+		"continue-on-error"?: boolean;
 		uses?: string;
 		run?: string;
 		env?: Record<string, string>;
@@ -352,6 +356,7 @@ type Job = {
 function workflow(file: string) {
 	return Bun.YAML.parse(readFileSync(join(workflows, file), "utf8")) as {
 		name: string;
+		permissions: Record<string, string>;
 		jobs: Record<string, Job>;
 		concurrency: { group: string; "cancel-in-progress": boolean };
 	};
@@ -462,11 +467,9 @@ test("workflow jobs isolate build credentials and permissions; dispatch and atte
 		attestations: "read",
 		actions: "read",
 	});
+	expect(coordinator.permissions).toEqual({});
 	expect(coordinator.jobs["pull-requests"].permissions).toEqual({
-		contents: "write",
-		"pull-requests": "write",
-		issues: "write",
-		actions: "read",
+		contents: "read",
 	});
 	expect(coordinator.jobs.drafts.permissions).toEqual({
 		contents: "write",
@@ -490,6 +493,103 @@ test("workflow jobs isolate build credentials and permissions; dispatch and atte
 	);
 	expect(exclusions).toContain(`"${coordinator.name}"`);
 	expect(exclusions).toContain(`"${artifacts.name}"`);
+});
+// Static wiring proof only: these assertions do not mint a token or run Actions.
+test("release App is pinned, repo-scoped and minted only immediately before PR reconciliation", () => {
+	const coordinator = workflow("router-release.yml");
+	const job = coordinator.jobs["pull-requests"];
+	expect(job["continue-on-error"]).toBeUndefined();
+	const index = job.steps.findIndex((step) => step.id === "release-app");
+	expect(index).toBeGreaterThan(0);
+	const mint = job.steps[index];
+	expect(mint.uses).toBe(
+		"actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
+	);
+	expect(mint.with).toEqual({
+		"client-id": `\${{ vars.ROUTER_RELEASE_APP_CLIENT_ID }}`,
+		"private-key": `\${{ secrets.ROUTER_RELEASE_APP_PRIVATE_KEY }}`,
+		owner: "StartupBros",
+		repositories: "wstack-router",
+		"permission-contents": "write",
+		"permission-pull-requests": "write",
+		"permission-issues": "write",
+		"permission-actions": "read",
+	});
+	expect(job.steps[index - 1].run).toBe("bun install --frozen-lockfile");
+	const reconcile = job.steps[index + 1];
+	expect(reconcile.run).toBe(
+		'bun --no-env-file run scripts/router-release.ts reconcile-pr "$ROUTER_REPOSITORY" "$ROUTER_SHA"',
+	);
+	expect(reconcile.env?.GITHUB_TOKEN).toBe(
+		`\${{ steps.release-app.outputs.token }}`,
+	);
+	// Missing config and mint failures must fail the job, not skip or fall back.
+	for (const step of [mint, reconcile]) {
+		expect(step.if).toBeUndefined();
+		expect(step["continue-on-error"]).toBeUndefined();
+	}
+	for (const file of ["router-release.yml", "router-release-artifacts.yml"]) {
+		const w = workflow(file);
+		for (const candidate of Object.values(w.jobs)) {
+			for (const step of candidate.steps) {
+				if (step.uses?.startsWith("actions/checkout@"))
+					expect(step.with?.["persist-credentials"]).toBe(false);
+			}
+		}
+		const text = JSON.stringify(w);
+		for (const config of [
+			"ROUTER_RELEASE_APP_CLIENT_ID",
+			"ROUTER_RELEASE_APP_PRIVATE_KEY",
+		])
+			expect(text.split(config).length - 1).toBe(
+				file === "router-release.yml" ? 1 : 0,
+			);
+		expect(text.split("steps.release-app.outputs.token").length - 1).toBe(
+			file === "router-release.yml" ? 1 : 0,
+		);
+		expect(text.split("actions/create-github-app-token@").length - 1).toBe(
+			file === "router-release.yml" ? 1 : 0,
+		);
+	}
+});
+test("manual draft retry skips minting and retains independent built-in credentials", () => {
+	const coordinator = workflow("router-release.yml");
+	const job = coordinator.jobs["pull-requests"];
+	expect(evaluate(job.if ?? "true", { event_name: "workflow_dispatch" })).toBe(
+		false,
+	);
+	expect(evaluate(job.if ?? "true", { event_name: "workflow_run" })).toBe(true);
+	const drafts = coordinator.jobs.drafts;
+	expect(drafts.if).toBe(
+		`\${{ !cancelled() && needs.guard.result == 'success' }}`,
+	);
+	const dispatch = drafts.steps.find((step) =>
+		step.run?.includes("selection="),
+	);
+	expect(dispatch?.env?.GITHUB_TOKEN).toBe(`\${{ github.token }}`);
+	expect(dispatch?.env?.GH_TOKEN).toBe(`\${{ github.token }}`);
+	expect(JSON.stringify(drafts)).not.toMatch(/release-app|ROUTER_RELEASE_APP/);
+});
+test("release CLI without a token fails with an authentication-neutral diagnostic", () => {
+	const result = Bun.spawnSync(
+		[
+			process.execPath,
+			"--no-env-file",
+			join(import.meta.dir, "../router-release.ts"),
+			"reconcile-pr",
+			repository,
+			sha,
+		],
+		{ env: { GITHUB_TOKEN: "" } },
+	);
+	expect(result.exitCode).not.toBe(0);
+	expect(result.stderr.toString()).toContain(
+		"GITHUB_TOKEN required; supply a token with permissions for the requested release operation",
+	);
+	expect(result.stderr.toString()).not.toContain(
+		"can_approve_pull_request_reviews",
+	);
+	expect(result.stdout.toString()).toBe("");
 });
 test("verifier help preflight consumes long output and requires every used flag", () => {
 	const root = mkdtempSync(join(tmpdir(), "router-help-"));

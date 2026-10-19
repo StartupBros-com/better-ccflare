@@ -1,8 +1,8 @@
 name: wstack Router Release Coordinator
 
 # Draft-only coordinator. It never publishes a release, package or image.
-# PR creation is blocked when a release PR is needed until repository policy
-# allows it (can_approve_pull_request_reviews); this file changes no settings.
+# Release PRs use a repository-scoped App token; missing App configuration fails
+# that job without changing repository policy or blocking independent draft retries.
 on:
   workflow_run:
     workflows: ["Managed Routing Foundation Gate"]
@@ -65,10 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      actions: read
+      contents: read
     steps:
       - name: Checkout trusted main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -85,15 +82,27 @@ jobs:
         run: test "$(bun --version)" = "$(tr -d '[:space:]' < .bun-version)"
       - name: Install dependencies
         run: bun install --frozen-lockfile
+      - name: Mint repository-scoped release App token
+        id: release-app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.ROUTER_RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.ROUTER_RELEASE_APP_PRIVATE_KEY }}
+          owner: StartupBros
+          repositories: wstack-router
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-actions: read
       - name: Reconcile release pull requests
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ steps.release-app.outputs.token }}
           ROUTER_REPOSITORY: ${{ github.repository }}
           ROUTER_SHA: ${{ needs.guard.outputs.sha }}
         run: bun --no-env-file run scripts/router-release.ts reconcile-pr "$ROUTER_REPOSITORY" "$ROUTER_SHA"
 
   drafts:
-    # A failed PR step (for example the PR-creation policy) must not hide an already merged release.
+    # A failed PR step (for example missing App configuration) must not hide an already merged release.
     needs: [guard, pull-requests]
     if: ${{ !cancelled() && needs.guard.result == 'success' }}
     runs-on: ubuntu-latest
