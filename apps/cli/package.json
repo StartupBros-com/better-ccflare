@@ -5,11 +5,11 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/StartupBros-com/better-ccflare.git"
+		"url": "git+https://github.com/StartupBros/wstack-router.git"
 	},
-	"homepage": "https://github.com/StartupBros-com/better-ccflare#readme",
+	"homepage": "https://github.com/StartupBros/wstack-router#readme",
 	"bugs": {
-		"url": "https://github.com/StartupBros-com/better-ccflare/issues"
+		"url": "https://github.com/StartupBros/wstack-router/issues"
 	},
 	"bin": {
 		"better-ccflare": "dist/better-ccflare",

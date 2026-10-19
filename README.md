@@ -4,7 +4,7 @@ Route Claude Code requests across multiple account providers, with request loggi
 
 A House of Vibe project, continuing [tombii/better-ccflare](https://github.com/tombii/better-ccflare) and its ancestor [snipeship/ccflare](https://github.com/snipeship/ccflare). The MIT license and contributor credits remain intact.
 
-**Install from the [current fork's source](#install-from-source)**. The public source repository and support home remain [StartupBros-com/better-ccflare](https://github.com/StartupBros-com/better-ccflare). No wstack Router registry package, release download, or container image is published by this change.
+**Install from the [current fork's source](#install-from-source)**. The public source repository and support home are now [StartupBros/wstack-router](https://github.com/StartupBros/wstack-router). No wstack Router registry package, release download, or container image is published by this change.
 
 Existing users: read the [migration and rollback guide](docs/wstack-router-migration.md). The command name changes; existing storage and integration names do not.
 
@@ -71,7 +71,7 @@ This project builds upon the excellent foundation of [snipeship/ccflare](https:/
 Requires Git, Node.js (used by the build), and Bun (this checkout pins Bun 1.4.2). These commands use a POSIX shell on Linux/macOS; on Windows use WSL. The public HTTPS clone below does not require a GitHub login.
 
 ```bash
-git clone https://github.com/StartupBros-com/better-ccflare.git
+git clone https://github.com/StartupBros/wstack-router.git better-ccflare
 cd better-ccflare
 bun install --frozen-lockfile
 bun run build
@@ -103,7 +103,7 @@ BETTER_CCFLARE_HOST=127.0.0.1 wstack-router --serve --port 8080
 
 Open `http://localhost:8080` and continue to [Configure Claude SDK](#configure-claude-sdk). If that port is occupied, choose an unused port and use it in your client configuration. `better-ccflare` remains an equivalent command. This guide does not change a running service or move existing accounts.
 
-See [manual updates, unchanged paths, and rollback](docs/wstack-router-migration.md). Report fork issues at [StartupBros-com/better-ccflare/issues](https://github.com/StartupBros-com/better-ccflare/issues).
+See [manual updates, unchanged paths, and rollback](docs/wstack-router-migration.md). Report fork issues at [StartupBros/wstack-router/issues](https://github.com/StartupBros/wstack-router/issues).
 
 ### Legacy upstream distributions (not wstack Router)
 

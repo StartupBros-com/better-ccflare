@@ -16,6 +16,10 @@ const STARTUPBROS_REPOSITORY_URLS = new Set([
 	"https://github.com/StartupBros-com/better-ccflare.git",
 	"git@github.com:StartupBros-com/better-ccflare.git",
 	"ssh://git@github.com/StartupBros-com/better-ccflare.git",
+	"https://github.com/StartupBros/wstack-router",
+	"https://github.com/StartupBros/wstack-router.git",
+	"git@github.com:StartupBros/wstack-router.git",
+	"ssh://git@github.com/StartupBros/wstack-router.git",
 ]);
 
 export type ReleaseBuildContext =
