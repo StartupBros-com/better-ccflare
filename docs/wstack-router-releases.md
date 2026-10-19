@@ -5,19 +5,56 @@ This is the operator guide for `StartupBros/wstack-router`. It stages a verified
 images, announces, installs, restarts services, or deploys. Public publication is
 a separate decision that is not part of this increment.
 
-## Status: not active until a repository policy blocker is resolved
+## Status: App provisioning and live activation not yet verified
 
-The repository reports `default_workflow_permissions: read` and
-`can_approve_pull_request_reviews: false`. The second setting stops the built-in
-`GITHUB_TOKEN` from creating release pull requests, so a
-`router-release.yml` run fails at its `pull-requests` job when a release PR is needed.
-A chore-only implementation run can no-op without creating a PR, tag or release. This implementation
-changes no repository setting and uses no personal access token. Whoever owns the
-repository settings must decide how to unblock PR creation. Until then, describe the
-automation as installed but not operating.
+Release PR reconciliation uses a dedicated GitHub App installation token, not the
+built-in Actions token. Keep `default_workflow_permissions: read` and the combined
+“Allow GitHub Actions to create and approve pull requests” setting
+(`can_approve_pull_request_reviews`) **off**. Neither policy needs relaxing.
+The `pull-requests` job's built-in token has only `contents: read`; top-level workflow
+permissions remain empty. This change does not grant the App a ruleset bypass or
+authorize unattended release-PR merges, and it uses no personal access token.
+
+The dedicated Router App, its installation, repository variable and secret are not
+yet verified as provisioned. Until the live path succeeds, describe this as installed
+wiring, not operating release automation. Missing configuration fails the mint step;
+it never silently skips reconciliation or falls back to the built-in token, even on
+a chore-only run that would otherwise need no release PR.
 
 The `drafts` job still runs when `pull-requests` fails, so an already merged release
-is not hidden by the policy blocker. The overall workflow run stays red.
+is not hidden by an App failure. The overall workflow run stays red. Manual draft
+retries skip the entire PR job and never mint an App token.
+
+## Dedicated Router App configuration
+
+1. Register a dedicated App that can be installed on the personal-owned
+   `StartupBros/wstack-router` repository. Existing private, organization-owned HoV
+   Apps cannot serve this installation; do not broaden their visibility to reuse them.
+   Grant repository permissions **Contents: read/write**, **Pull requests: read/write**,
+   **Issues: read/write** (release labels), and **Actions: read-only** (source CI).
+   GitHub's implicit **Metadata: read-only** permission remains. No administration,
+   workflow-write, organization permissions, or ruleset bypass is needed.
+2. Install it on `StartupBros`, selecting **only `wstack-router`**. Preserve all other
+   repository protection and Actions policies. The token request also restricts
+   `owner: StartupBros` and `repositories: wstack-router` with the four explicit
+   permissions above; neither installation nor request should include other repos.
+3. Set repository Actions variable `ROUTER_RELEASE_APP_CLIENT_ID` to the App's
+   **Client ID**, not its numeric App ID. Generate its private key and set repository
+   Actions secret `ROUTER_RELEASE_APP_PRIVATE_KEY` through the approved secure
+   provisioning path. Never paste the PEM into chat, command arguments, source, or
+   logs; never echo it or invent another credential store. App registration,
+   installation and key handling require the operator's provisioning decision.
+4. Verify the real coordinator can mint the token, create or update a genuinely
+   needed release PR, and trigger its required checks. Do not fake a version bump
+   to exercise this. Local tests cannot verify installation access or live CI events.
+
+The pinned `actions/create-github-app-token` v3.3.0 action
+(`64ab729a6294000f5aa4a4bc0b73d1f32bc45510`, Node 24) mints after dependency installation,
+only immediately before reconciliation. Only that step receives the output through
+the existing `GITHUB_TOKEN` interface. Checkout does not persist credentials. The
+App token is not passed to dependency installation, build, smoke, draft or artifact
+jobs, and the action's default post-job revocation remains enabled. Draft and
+artifact jobs retain their separate built-in tokens and existing permissions.
 
 ## Version policy
 
@@ -102,10 +139,17 @@ behavior is enforced by this pipeline only; do not describe it as platform immut
 
 ## Pull request CI approval
 
-`GITHUB_TOKEN`-created release PRs may have their `pull_request` runs held at "Approve
-workflows to run" until a user with write access approves them. Required PR CI is not
-bypassed or automatically dispatched. When runs are suppressed or unavailable, a
-maintainer must start CI manually before the PR can merge.
+PRs created or updated with the built-in `GITHUB_TOKEN` produce approval-required
+`pull_request` runs for `opened`, `synchronize`, and `reopened` events. App-authored
+PRs avoid that token-specific manual approval gate. This wiring does not prove
+that the live installation will trigger CI: verify the actual release PR and its checks.
+
+The strict required checks have been verified live as `managed-routing-foundation`
+and `prepare`, both bound to the GitHub Actions integration **15368**. Preserve that
+binding and all other policies. The App receives no bypass; required PR CI is neither
+waived nor automatically dispatched by this change. If checks are held for approval,
+suppressed or unavailable, the PR remains blocked until normal approval and CI
+requirements are satisfied. Unattended release-PR merging is outside this increment.
 
 ## Containment
 
@@ -116,7 +160,11 @@ condition. Their triggers and other repositories' behavior are unchanged.
 
 ## Unexercised remote behavior
 
-No live draft, tag, attestation, upload or dispatch has been run. The action pins
+No live App token mint, App-authored release PR, draft, tag, attestation, upload or
+dispatch has been verified for this implementation. The App action's pinned
+`action.yml` and `main.js` confirm the inputs, Node 24 runtime and failure on missing
+Client ID or private key. Static YAML assertions prove wiring, not live credential
+availability, revocation or GitHub event behavior. The other action pins
 (`actions/checkout` 7.0.1, `setup-bun` 2.2.0, `upload-artifact` 6.0.0,
 `download-artifact` 7.0.0, `actions/attest` 4.2.1) and the `gh attestation verify`
 flags are checked against official sources and local tests only. The `stage` job
