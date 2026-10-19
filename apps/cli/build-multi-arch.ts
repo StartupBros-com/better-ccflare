@@ -207,8 +207,9 @@ async function buildPlatform(platform: Platform) {
 		: packageJson.version;
 
 	const releaseContext =
-		process.env.CCFLARE_BUILD_PRODUCER === "github-release-binary"
-			? "github-release-binary"
+		process.env.CCFLARE_BUILD_PRODUCER === "github-release-binary" ||
+		process.env.CCFLARE_BUILD_PRODUCER === "wstack-router-binary"
+			? process.env.CCFLARE_BUILD_PRODUCER
 			: undefined;
 	const evidence = readTombiiTaggedBuildEvidence(version, releaseContext);
 	const buildArgs = [
@@ -222,7 +223,7 @@ async function buildPlatform(platform: Platform) {
 		"--minify",
 		"--define",
 		`__BETTER_CCFLARE_VERSION__=${JSON.stringify(version)}`,
-		...releaseBuildDefines(evidence, "github-release-binary"),
+		...releaseBuildDefines(evidence, releaseContext ?? null),
 	];
 	if (!evidence) {
 		console.warn(

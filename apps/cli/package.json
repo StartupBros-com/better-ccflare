@@ -1,18 +1,19 @@
 {
 	"name": "better-ccflare",
 	"version": "3.5.78",
-	"description": "Load balancer proxy for Claude API with intelligent distribution across multiple OAuth accounts to avoid rate limiting",
+	"description": "wstack Router - a load balancer proxy for Claude Code across multiple account providers",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/tombii/better-ccflare.git"
+		"url": "git+https://github.com/StartupBros-com/better-ccflare.git"
 	},
-	"homepage": "https://github.com/tombii/better-ccflare#readme",
+	"homepage": "https://github.com/StartupBros-com/better-ccflare#readme",
 	"bugs": {
-		"url": "https://github.com/tombii/better-ccflare/issues"
+		"url": "https://github.com/StartupBros-com/better-ccflare/issues"
 	},
 	"bin": {
-		"better-ccflare": "dist/better-ccflare"
+		"better-ccflare": "dist/better-ccflare",
+		"wstack-router": "dist/better-ccflare"
 	},
 	"type": "module",
 	"scripts": {

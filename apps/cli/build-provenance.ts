@@ -11,7 +11,18 @@ const TOMBI_REPOSITORY_URLS = new Set([
 	"ssh://git@github.com/tombii/better-ccflare.git",
 ]);
 
-export type ReleaseBuildContext = "github-release-binary" | "npm-package";
+const STARTUPBROS_REPOSITORY_URLS = new Set([
+	"https://github.com/StartupBros-com/better-ccflare",
+	"https://github.com/StartupBros-com/better-ccflare.git",
+	"git@github.com:StartupBros-com/better-ccflare.git",
+	"ssh://git@github.com/StartupBros-com/better-ccflare.git",
+]);
+
+export type ReleaseBuildContext =
+	| "github-release-binary"
+	| "npm-package"
+	| "wstack-router-binary"
+	| "wstack-router-package";
 
 export interface ReleaseBuildEvidence {
 	readonly version: string;
@@ -23,22 +34,56 @@ function define(name: string, value: string): string[] {
 	return ["--define", `${name}=${JSON.stringify(value)}`];
 }
 
-function distributionFor(context: ReleaseBuildContext): {
-	token: string;
-	artifactMode: string;
-	updateChannel: string;
-} {
-	return context === "github-release-binary"
-		? {
-				token: "v1:tombii-github-release-binary",
-				artifactMode: "binary",
-				updateChannel: "github-releases",
-			}
-		: {
-				token: "v1:tombii-npm-package",
-				artifactMode: "package",
-				updateChannel: "npm",
-			};
+const RELEASE_CONTEXTS = {
+	"github-release-binary": {
+		token: "v1:tombii-github-release-binary",
+		producer: "tombii",
+		artifactMode: "binary",
+		updateChannel: "github-releases",
+		origins: TOMBI_REPOSITORY_URLS,
+	},
+	"npm-package": {
+		token: "v1:tombii-npm-package",
+		producer: "tombii",
+		artifactMode: "package",
+		updateChannel: "npm",
+		origins: TOMBI_REPOSITORY_URLS,
+	},
+	"wstack-router-binary": {
+		token: "v1:startupbros-wstack-router-binary",
+		producer: "startupbros",
+		artifactMode: "binary",
+		updateChannel: null,
+		origins: STARTUPBROS_REPOSITORY_URLS,
+	},
+	"wstack-router-package": {
+		token: "v1:startupbros-wstack-router-package",
+		producer: "startupbros",
+		artifactMode: "package",
+		updateChannel: null,
+		origins: STARTUPBROS_REPOSITORY_URLS,
+	},
+} as const satisfies Record<
+	ReleaseBuildContext,
+	{
+		token: string;
+		producer: string;
+		artifactMode: string;
+		updateChannel: string | null;
+		origins: ReadonlySet<string>;
+	}
+>;
+
+export function parseReleaseBuildContext(
+	context: string | undefined,
+): ReleaseBuildContext | null {
+	return context !== undefined && Object.hasOwn(RELEASE_CONTEXTS, context)
+		? (context as ReleaseBuildContext)
+		: null;
+}
+
+function distributionFor(context: ReleaseBuildContext) {
+	return RELEASE_CONTEXTS[context];
 }
 
 function validEvidence(
@@ -67,15 +112,17 @@ export function releaseBuildDefines(
 		...define("__BETTER_CCFLARE_GIT_SHA__", evidence.sourceSha),
 		...define("__CCFLARE_BUILD_PROVENANCE_VERSION__", evidence.version),
 		...define("__CCFLARE_BUILD_PROVENANCE_DISTRIBUTION__", distribution.token),
-		...define("__CCFLARE_BUILD_PROVENANCE_PRODUCER__", "tombii"),
+		...define("__CCFLARE_BUILD_PROVENANCE_PRODUCER__", distribution.producer),
 		...define(
 			"__CCFLARE_BUILD_PROVENANCE_ARTIFACT_MODE__",
 			distribution.artifactMode,
 		),
-		...define(
-			"__CCFLARE_BUILD_PROVENANCE_UPDATE_CHANNEL__",
-			distribution.updateChannel,
-		),
+		...(distribution.updateChannel === null
+			? []
+			: define(
+					"__CCFLARE_BUILD_PROVENANCE_UPDATE_CHANNEL__",
+					distribution.updateChannel,
+				)),
 		...define("__CCFLARE_BUILD_PROVENANCE_GIT_SHA__", evidence.sourceSha),
 		...define("__CCFLARE_BUILD_PROVENANCE_GIT_REF__", evidence.sourceRef),
 		...define("__CCFLARE_BUILD_PROVENANCE_SOURCE_SHA__", evidence.sourceSha),
@@ -97,8 +144,9 @@ function git(args: string[]): string | null {
 
 /**
  * A release marker alone is insufficient: only an explicit producer context,
- * the tombii origin, a clean worktree, a plain version, and an exact HEAD/tag
- * equality can emit actionable provenance. Git-ignored generated workers and
+ * the context's exact origin, a clean worktree, a plain version, and an exact
+ * HEAD/tag equality can emit provenance. The historical function name is kept
+ * for existing callers; branded contexts never emit an update channel. Git-ignored generated workers and
  * build outputs remain outside the cleanliness check.
  */
 export function readTombiiTaggedBuildEvidence(
@@ -106,13 +154,10 @@ export function readTombiiTaggedBuildEvidence(
 	context: string | undefined,
 	runGit: (args: string[]) => string | null = git,
 ): ReleaseBuildEvidence | null {
+	const releaseContext = parseReleaseBuildContext(context);
+	if (!RELEASE_VERSION.test(version) || releaseContext === null) return null;
 	if (
-		!RELEASE_VERSION.test(version) ||
-		(context !== "github-release-binary" && context !== "npm-package")
-	)
-		return null;
-	if (
-		!TOMBI_REPOSITORY_URLS.has(
+		!distributionFor(releaseContext).origins.has(
 			runGit(["config", "--get", "remote.origin.url"]) ?? "",
 		)
 	)
@@ -139,9 +184,7 @@ async function main(): Promise<void> {
 	const evidence = readTombiiTaggedBuildEvidence(version, context);
 	const defines = releaseBuildDefines(
 		evidence,
-		context === "github-release-binary" || context === "npm-package"
-			? context
-			: null,
+		parseReleaseBuildContext(context),
 	);
 	if (defines.length > 0) process.stdout.write(defines.join(" "));
 }

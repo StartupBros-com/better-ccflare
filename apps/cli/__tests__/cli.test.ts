@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -266,11 +266,28 @@ describe("CLI Integration Tests", () => {
 	});
 
 	describe("Version Command", () => {
+		it("keeps identity flags free of config and database initialization", async () => {
+			for (const flag of ["--help", "-h", "--version", "-v", "--git-sha"]) {
+				const home = join(tempDir, flag);
+				const result = await runCLI([flag], {
+					HOME: home,
+					XDG_CONFIG_HOME: join(home, "config"),
+					BETTER_CCFLARE_DB_PATH:
+						"/proc/better-ccflare-must-not-open/identity.db",
+					BETTER_CCFLARE_GIT_SHA: "abcdef1234567890abcdef1234567890abcdef12",
+				});
+				expect(result.exitCode).toBe(0);
+				expect(result.stderr).toBe("");
+				// Bun's own runtime cache (.bun) may appear; no CLI config namespace may.
+				expect(existsSync(join(home, "config"))).toBe(false);
+				expect(existsSync(join(home, ".config"))).toBe(false);
+			}
+		});
 		it("should display version with --version flag", async () => {
 			const result = await runCLI(["--version"]);
 
 			expect(result.exitCode).toBe(0);
-			expect(result.stdout).toContain("better-ccflare v");
+			expect(result.stdout).toContain("wstack Router v");
 			expect(result.stdout).toMatch(/v\d+\.\d+\.\d+/);
 		});
 
@@ -278,7 +295,7 @@ describe("CLI Integration Tests", () => {
 			const result = await runCLI(["-v"]);
 
 			expect(result.exitCode).toBe(0);
-			expect(result.stdout).toContain("better-ccflare v");
+			expect(result.stdout).toContain("wstack Router v");
 		});
 
 		it("should exit quickly for version command", async () => {
@@ -319,7 +336,12 @@ describe("CLI Integration Tests", () => {
 			const result = await runCLI(["--help"]);
 
 			expect(result.exitCode).toBe(0);
-			expect(result.stdout).toContain("better-ccflare");
+			expect(result.stdout).toContain("wstack Router");
+			expect(result.stdout).toContain("Usage: wstack-router [options]");
+			expect(result.stdout).toContain(
+				"better-ccflare remains a supported alias",
+			);
+			expect(result.stdout).toContain("wstack-router --serve");
 			expect(result.stdout).toContain("Usage:");
 			expect(result.stdout).toContain("Options:");
 			expect(result.stdout).toContain("--serve");
@@ -518,7 +540,7 @@ describe("CLI Integration Tests", () => {
 			]) {
 				const result = await runCLI(args);
 				expect(result.exitCode).toBe(2);
-				expect(result.stdout).not.toContain("Starting better-ccflare server");
+				expect(result.stdout).not.toContain("Starting wstack Router server");
 			}
 		});
 
@@ -642,7 +664,7 @@ describe("CLI Integration Tests", () => {
 			const output = result.stdout + result.stderr;
 			expect(output).toContain("Example:");
 			expect(output).toMatch(
-				/better-ccflare.*--add-account.*--mode.*--priority/,
+				/wstack-router.*--add-account.*--mode.*--priority/,
 			);
 		});
 
@@ -706,7 +728,7 @@ describe("CLI Integration Tests", () => {
 
 			// Version should take precedence and exit early
 			expect(result.exitCode).toBe(0);
-			expect(result.stdout).toContain("better-ccflare v");
+			expect(result.stdout).toContain("wstack Router v");
 		});
 	});
 

@@ -1,16 +1,19 @@
-# better-ccflare 🛡️
-[![Mentioned in Awesome Claude Code](https://awesome.re/mentioned-badge.svg)](https://github.com/hesreallyhim/awesome-claude-code)
+# wstack Router
 
-**Track Every Request. Go Low-Level. Never Hit Rate Limits Again.**
+Route Claude Code requests across multiple account providers, with request logging, usage tracking, and a local dashboard.
 
-The ultimate Claude API proxy with intelligent load balancing across multiple accounts. Full visibility into every request, response, and rate limit.
+A House of Vibe project, continuing [tombii/better-ccflare](https://github.com/tombii/better-ccflare) and its ancestor [snipeship/ccflare](https://github.com/snipeship/ccflare). The MIT license and contributor credits remain intact.
+
+**Install from the [current fork's source](#install-from-source)**. The public source repository and support home remain [StartupBros-com/better-ccflare](https://github.com/StartupBros-com/better-ccflare). No wstack Router registry package, release download, or container image is published by this change.
+
+Existing users: read the [migration and rollback guide](docs/wstack-router-migration.md). The command name changes; existing storage and integration names do not.
 
 https://github.com/user-attachments/assets/c859872f-ca5e-4f8b-b6a0-7cc7461fe62a
 
 
 ![better-ccflare Dashboard](apps/lander/src/screenshot-dashboard.png)
 
-## Why better-ccflare?
+## Why wstack Router?
 
 - **🚀 Zero Rate Limit Errors** - Automatically distribute requests across multiple accounts
 - **🤖 Multi-Provider Support** - Claude OAuth, Claude API console, Vertex AI, AWS Bedrock, NanoGPT, z.ai, Minimax, DeepSeek, OpenRouter, Kilo, Codex (OpenAI OAuth), xAI/Grok, Meta Model API (`meta`; legacy `muse-spark` HTTP ingress compatibility), Anthropic-compatible, and OpenAI-compatible providers
@@ -37,7 +40,7 @@ This project builds upon the excellent foundation of [snipeship/ccflare](https:/
 - **Extended Provider Support** - AWS Bedrock, NanoGPT (with dynamic pricing), Minimax, DeepSeek, OpenRouter, Kilo, Codex (OpenAI OAuth), xAI/Grok, Meta Model API (`meta`; legacy `muse-spark` HTTP ingress compatibility), Anthropic-compatible, and OpenAI-compatible providers
 - **Simplified Load Balancing** - Removed tier system for O(1) priority-based selection
 - **Real-time Analytics Dashboard** - Beautiful web UI with fixed request history (no disappearing requests)
-- **Package Distribution** - Available via npm and bun for easy installation
+- **Source Installation** - Build the current fork locally; upstream distribution recipes below install upstream, not wstack Router
 
 **🛠️ Developer Experience:**
 - **Powerful CLI** - Complete command-line interface for account management and configuration
@@ -48,11 +51,10 @@ This project builds upon the excellent foundation of [snipeship/ccflare](https:/
 - **Alert Webhooks** - With an empty `ALERT_WEBHOOK_TYPES` list, Discord keeps cache-efficiency observations (including recovery) and unknown-model catalog observations in alert history and the dashboard stream without sending a notification. Authentication failures, capacity warnings, actual stale-policy model rewrites, and cache telemetry gaps (including recovery) remain eligible. A nonempty list admits exactly the named types, including these observations. Generic webhooks retain their legacy admission and `{type, alert}` body. Discord presents the affected thing, observation, impact, action, and where to find evidence; raw messages remain in history. Persistence is not a delivery receipt: failed sends are logged, and the existing engine can record an opening that never arrived and later send its recovery.
 - **Database Integration** - SQLite (default) or PostgreSQL for persistent storage and analytics, supporting Kubernetes multi-pod deployments
 
-**📦 Distribution & Updates:**
-- **npm/bun Registry** - Install with `npm install -g better-ccflare` or `bun install -g better-ccflare`
-- **npx/bunx Support** - Run without installation: `npx better-ccflare` or `bunx better-ccflare`
-- **Smart Update Detection** - Web UI detects package manager and shows appropriate update commands
-- **Version Management** - Semantic versioning with automatic update notifications
+**Distribution & Updates:**
+- **Local Source Build** - Install the built artifact as both `wstack-router` and `better-ccflare`
+- **Manual Updates** - Fetch the current fork and rebuild; branded builds do not offer upstream auto-updates
+- **Compatibility** - Package names, build filenames, environment variables, paths, ports, and headers retain their existing names
 
 **🏢 Production Ready:**
 - **Enterprise Features** - Custom API endpoints, session management, advanced analytics
@@ -63,6 +65,52 @@ This project builds upon the excellent foundation of [snipeship/ccflare](https:/
 - **PostgreSQL Support** - Set `DATABASE_URL=postgresql://...` to use PostgreSQL for Kubernetes multi-pod deployments where SQLite file-sharing is not feasible
 
 ## Quick Start
+
+### Install from source
+
+Requires Git, Node.js (used by the build), and Bun (this checkout pins Bun 1.4.2). These commands use a POSIX shell on Linux/macOS; on Windows use WSL. The public HTTPS clone below does not require a GitHub login.
+
+```bash
+git clone https://github.com/StartupBros-com/better-ccflare.git
+cd better-ccflare
+bun install --frozen-lockfile
+bun run build
+```
+
+The build produces `apps/cli/dist/better-ccflare`. It does not install a command on your PATH. From the checkout root, copy that same artifact under both names into a fresh user-owned directory. This deliberately leaves any previous installation untouched.
+
+<!-- source-install-local -->
+```bash
+mkdir -p "$HOME/.local"
+install_dir=$(mktemp -d "$HOME/.local/wstack-router.XXXXXX")
+install -m 755 apps/cli/dist/better-ccflare "$install_dir/wstack-router"
+install -m 755 apps/cli/dist/better-ccflare "$install_dir/better-ccflare"
+export PATH="$install_dir:$PATH"
+wstack-router --version
+better-ccflare --version
+wstack-router --help
+printf 'Installed commands in %s\n' "$install_dir"
+```
+<!-- /source-install-local -->
+
+The PATH change applies to this shell only. To keep it, add the printed directory (its literal path, not `$install_dir`) to your shell's PATH configuration, ahead of older installations. Use `command -v wstack-router` and `command -v better-ccflare` to confirm which commands will run. Keep the prior executable and its location for rollback; do not overwrite a global install or change an existing service as part of this quickstart.
+
+For a new local setup, run `wstack-router --help` for account options, then start the server and dashboard with:
+
+```bash
+BETTER_CCFLARE_HOST=127.0.0.1 wstack-router --serve --port 8080
+```
+
+Open `http://localhost:8080` and continue to [Configure Claude SDK](#configure-claude-sdk). If that port is occupied, choose an unused port and use it in your client configuration. `better-ccflare` remains an equivalent command. This guide does not change a running service or move existing accounts.
+
+See [manual updates, unchanged paths, and rollback](docs/wstack-router-migration.md). Report fork issues at [StartupBros-com/better-ccflare/issues](https://github.com/StartupBros-com/better-ccflare/issues).
+
+### Legacy upstream distributions (not wstack Router)
+
+The recipes below are retained for upstream users. The `better-ccflare` registry package, `tombii` release downloads, and `ghcr.io/tombii` images install **upstream better-ccflare**, not this branded fork. Their availability and platform coverage are upstream's responsibility. Do not use them to install or update wstack Router.
+
+<details>
+<summary>Upstream npm, Bun, and release download recipes</summary>
 
 ### Install via npm (Linux x86_64)
 
@@ -140,23 +188,9 @@ npx better-ccflare@latest
 bunx better-ccflare@latest
 ```
 Continue to [Configure Claude SDK](https://github.com/tombii/better-ccflare#configure-claude-sdk).
-### Install from source
+</details>
 
-```bash
-# Clone and install
-git clone https://github.com/tombii/better-ccflare
-cd better-ccflare
-bun install
-
-# Build dashboard (required before first run)
-bun run build
-
-# Start better-ccflare (TUI + Server)
-bun run better-ccflare
-```
-Continue to [Configure Claude SDK](https://github.com/tombii/better-ccflare#configure-claude-sdk).
-
-**Note**: You must run `bun run build` at least once to build the dashboard files before starting the server. This can also be done by running `bun run better-ccflare` which includes the build step.
+The configuration reference below also applies to wstack Router. Legacy `better-ccflare` command examples work with the source-installed compatibility command.
 
 ### Environment Variables
 
@@ -519,7 +553,9 @@ docker-compose up
 docker run -v $(pwd)/.env:/app/.env:ro -p 8080:8080 ghcr.io/tombii/better-ccflare:latest
 ```
 
-### Docker (Multi-Platform: linux/amd64, linux/arm64)
+### Docker (legacy upstream images, not wstack Router)
+
+All `ghcr.io/tombii/better-ccflare` recipes here, including the `.env` and Traefik examples, run upstream images. The checked-in Docker Compose behavior is unchanged; no branded image is available from this change.
 
 ```bash
 # Quick start with docker-compose
@@ -843,6 +879,8 @@ No `NODE_OPTIONS` needed - Traefik provides trusted certificates automatically!
 
 ## Windows Troubleshooting
 
+These workarounds concern the legacy upstream npm package and release binaries, not a wstack Router distribution. For this fork, use the source quickstart in WSL; native Windows installation has not been verified here.
+
 ### Issue: "Command is misspelled or could not be found" after npm install
 
 If you installed better-ccflare via npm on Windows and encounter an error like:
@@ -1070,6 +1108,8 @@ Full documentation available in [`docs/`](docs/):
 
 ## Platform Support
 
+The table below describes the retained **upstream distribution** recipes, not published wstack Router artifacts. The source-install acceptance check for this fork runs on Linux x86_64; macOS and native Windows installation have not been verified for this identity change.
+
 | Platform | Architecture | Status |
 |----------|-------------|--------|
 | Linux | x86_64 | ✅ Supported (npm + binary) |
@@ -1087,7 +1127,9 @@ Full documentation available in [`docs/`](docs/):
 **Not supported:**
 - ARM32 devices (Raspberry Pi Zero, Pi 1, Pi 2, or 32-bit OS)
 
-## Sponsors
+## Upstream Sponsors
+
+Credit retained from upstream; this does not claim signing or sponsorship for wstack Router builds.
 
 | | |
 |---|---|

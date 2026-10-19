@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { resolveBuildProvenance } from "@better-ccflare/core";
 import { renderToStaticMarkup } from "react-dom/server";
+import { createUpdateStatusService } from "../../../http-api/src/handlers/version";
 import {
 	requestUpdateStatus,
 	scheduleUpdateChecks,
@@ -28,6 +30,72 @@ function status(
 		...overrides,
 	};
 }
+
+describe("navigation identity", () => {
+	it("uses the safe identity subpath for desktop, mobile, and static title labels", () => {
+		const source = readFileSync(
+			join(import.meta.dir, "navigation.tsx"),
+			"utf8",
+		);
+		const app = readFileSync(join(import.meta.dir, "../App.tsx"), "utf8");
+		const html = readFileSync(join(import.meta.dir, "../index.html"), "utf8");
+
+		expect(source).toContain('from "@better-ccflare/core/product-identity"');
+		expect(source).not.toContain('from "@better-ccflare/core"');
+		expect(source.match(/\{PRODUCT_NAME\}/g)?.length).toBe(2);
+		expect(source).not.toContain(">better-ccflare<");
+		expect(html).toContain("<title>wstack Router Dashboard</title>");
+		expect(app).toContain("Monitor your wstack Router performance and usage");
+	});
+
+	it("renders no action for genuinely resolved branded U1 provenance", async () => {
+		const sha = "0123456789abcdef0123456789abcdef01234567";
+		let lookups = 0;
+		for (const [token, mode] of [
+			["v1:startupbros-wstack-router-binary", "binary"],
+			["v1:startupbros-wstack-router-package", "package"],
+		] as const) {
+			const provenance = resolveBuildProvenance({
+				CCFLARE_DISTRIBUTION: token,
+				CCFLARE_VERSION: "1.0.0",
+				CCFLARE_GIT_SHA: sha,
+				CCFLARE_SOURCE_SHA: sha,
+				CCFLARE_GIT_REF: "refs/tags/v1.0.0",
+				CCFLARE_SOURCE_REF: "refs/tags/v1.0.0",
+				CCFLARE_PRODUCER: "startupbros",
+				CCFLARE_ARTIFACT_MODE: mode,
+			});
+			expect(provenance.proven).toBe(true);
+			const adapter = async () => {
+				lookups += 1;
+				return "9.9.9";
+			};
+			const served = await createUpdateStatusService({
+				currentVersion: () => "1.0.0",
+				readProvenance: () => provenance,
+				adapters: { npm: adapter, ghcr: adapter, "github-releases": adapter },
+			}).check();
+			const html = renderToStaticMarkup(
+				<UpdateStatusDetails
+					status={served.availability}
+					result={{
+						currentVersion: served.currentVersion,
+						availability: served.availability,
+						latestVersion: served.latestVersion,
+						action: served.action,
+						reason: served.reason,
+					}}
+				/>,
+			);
+			expect(served.action).toBeNull();
+			expect(html).not.toContain("<code");
+			expect(html).not.toContain("href=");
+			for (const guidance of DEFAULT_GUIDANCE)
+				expect(html).not.toContain(guidance);
+		}
+		expect(lookups).toBe(0);
+	});
+});
 
 describe("navigation", () => {
 	it("keeps navigation items in the dynamic feature-flagged list only", () => {

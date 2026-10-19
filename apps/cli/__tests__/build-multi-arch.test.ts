@@ -102,6 +102,142 @@ function releaseFixtureDefines() {
 	];
 }
 
+describe("wstack Router build provenance", () => {
+	for (const [context, token, mode] of [
+		["wstack-router-binary", "v1:startupbros-wstack-router-binary", "binary"],
+		[
+			"wstack-router-package",
+			"v1:startupbros-wstack-router-package",
+			"package",
+		],
+	] as const) {
+		it(`requires exact current-origin clean tagged evidence for ${context}`, () => {
+			const probe =
+				(
+					origin = "https://github.com/StartupBros-com/better-ccflare",
+					status: string | null = "",
+					head = sha,
+					tag: string | null = sha,
+				) =>
+				(args: string[]) => {
+					if (args[0] === "config") return origin;
+					if (args[0] === "status") return status;
+					return args[1] === "HEAD" ? head : tag;
+				};
+			for (const origin of [
+				"https://github.com/StartupBros-com/better-ccflare",
+				"https://github.com/StartupBros-com/better-ccflare.git",
+				"git@github.com:StartupBros-com/better-ccflare.git",
+				"ssh://git@github.com/StartupBros-com/better-ccflare.git",
+			]) {
+				expect(
+					readTombiiTaggedBuildEvidence("1.2.3", context, probe(origin)),
+				).toEqual({
+					version: "1.2.3",
+					sourceSha: sha,
+					sourceRef: "refs/tags/v1.2.3",
+				});
+			}
+			for (const origin of [
+				"https://github.com/tombii/better-ccflare",
+				"https://github.com/StartupBros-com/wstack-router",
+				"https://github.com/startupbros-com/better-ccflare",
+				" https://github.com/StartupBros-com/better-ccflare",
+				"https://github.com/StartupBros-com/better-ccflare/extra",
+			])
+				expect(
+					readTombiiTaggedBuildEvidence("1.2.3", context, probe(origin)),
+				).toBeNull();
+			for (const version of [
+				"01.2.3",
+				"1.2.3+local",
+				"1.2.3-rc.1",
+				"1.2",
+				" 1.2.3",
+			])
+				expect(
+					readTombiiTaggedBuildEvidence(version, context, probe()),
+				).toBeNull();
+			for (const invalidContext of [
+				undefined,
+				"",
+				` ${context}`,
+				context.toUpperCase(),
+				"unknown",
+			])
+				expect(
+					readTombiiTaggedBuildEvidence("1.2.3", invalidContext, probe()),
+				).toBeNull();
+			for (const badProbe of [
+				probe(undefined, " M tracked.ts"),
+				probe(undefined, "?? untracked.ts"),
+				probe(undefined, null),
+				probe(undefined, "", "short"),
+				probe(undefined, "", sha.toUpperCase()),
+				probe(undefined, "", sha, runtimeSha),
+				probe(undefined, "", sha, null),
+			])
+				expect(
+					readTombiiTaggedBuildEvidence("1.2.3", context, badProbe),
+				).toBeNull();
+		});
+		it(`compiles non-actionable ${mode} evidence and binds runtime overrides`, () => {
+			const evidence = {
+				version: "1.2.3",
+				sourceSha: sha,
+				sourceRef: "refs/tags/v1.2.3",
+			};
+			const defines = releaseBuildDefines(evidence, context);
+			expect(defines).toContain(
+				`__CCFLARE_BUILD_PROVENANCE_DISTRIBUTION__="${token}"`,
+			);
+			expect(
+				defines.some((value) =>
+					value.startsWith("__CCFLARE_BUILD_PROVENANCE_UPDATE_CHANNEL__="),
+				),
+			).toBe(false);
+			const embedded = runCompiledFixture(defines);
+			expect(embedded.provenance).toMatchObject({
+				identity: token,
+				producer: "startupbros",
+				artifactMode: mode,
+				source_sha: sha,
+				source_ref: "refs/tags/v1.2.3",
+				proven: true,
+				actionable: false,
+				updateChannel: null,
+			});
+			expect(
+				runCompiledFixture(defines, {
+					CCFLARE_VERSION: "9.9.9",
+					CCFLARE_GIT_SHA: runtimeSha,
+					CCFLARE_UPDATE_CHANNEL: "npm",
+				}),
+			).toEqual(embedded);
+			expect(
+				runCompiledFixture(defines, { CCFLARE_DISTRIBUTION: token }).provenance,
+			).toMatchObject({ proven: false, reason: "missing_source_sha" });
+			expect(
+				runCompiledFixture(defines, {
+					CCFLARE_DISTRIBUTION: token,
+					CCFLARE_VERSION: "2.0.0",
+					CCFLARE_GIT_SHA: runtimeSha,
+					CCFLARE_SOURCE_SHA: runtimeSha,
+					CCFLARE_GIT_REF: "refs/tags/v2.0.0",
+					CCFLARE_SOURCE_REF: "refs/tags/v2.0.0",
+					CCFLARE_PRODUCER: "startupbros",
+					CCFLARE_ARTIFACT_MODE: mode,
+				}).provenance,
+			).toMatchObject({
+				proven: true,
+				actionable: false,
+				source_sha: runtimeSha,
+				source_ref: "refs/tags/v2.0.0",
+			});
+		});
+	}
+});
+
 describe("release binary provenance", () => {
 	it("emits shell-safe immutable constants only for an explicit release producer", () => {
 		const evidence = {
