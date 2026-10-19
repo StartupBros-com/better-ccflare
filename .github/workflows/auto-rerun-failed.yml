@@ -25,6 +25,8 @@ jobs:
           # or re-run untrusted signing steps without human review.
           EXCLUDED_WORKFLOWS=(
             "Build and Publish Docker Images"
+            "wstack Router Release Coordinator"
+            "wstack Router Release Artifacts"
             "Manual Release"
             "Release Multi-Architecture Binaries"
             "SignPath Test Signing"

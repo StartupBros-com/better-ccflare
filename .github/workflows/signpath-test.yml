@@ -6,6 +6,8 @@ on:
 jobs:
   sign:
     name: Test-sign Windows binary
+    # Router never uses inherited signing jobs.
+    if: github.repository != 'StartupBros/wstack-router'
     runs-on: ubuntu-latest
     permissions:
       contents: write

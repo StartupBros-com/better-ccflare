@@ -67,6 +67,10 @@ describe("local Linux artifact preparation", () => {
 			mkdirSync(join(cli, "dist"), { recursive: true });
 			mkdirSync(dashboard, { recursive: true });
 			copyFileSync(entrypoint, join(cli, "prepare-router-artifacts.ts"));
+			copyFileSync(
+				join(root, "apps/cli/router-artifacts.ts"),
+				join(cli, "router-artifacts.ts"),
+			);
 			writeFileSync(
 				join(dashboard, "build.ts"),
 				'throw new Error("cross-device build reached");',
@@ -110,6 +114,10 @@ describe("local Linux artifact preparation", () => {
 				mkdirSync(join(cli, "dist"), { recursive: true });
 				mkdirSync(dashboard, { recursive: true });
 				copyFileSync(entrypoint, join(cli, "prepare-router-artifacts.ts"));
+				copyFileSync(
+					join(root, "apps/cli/router-artifacts.ts"),
+					join(cli, "router-artifacts.ts"),
+				);
 				writeFileSync(
 					join(dashboard, "build.ts"),
 					"// Synthetic successful build\n",
@@ -241,6 +249,10 @@ writeFileSync("dist/better-ccflare-linux-amd64", "#!/bin/sh\\nprintf 'invalid sm
 			mkdirSync(join(cli, "dist"), { recursive: true });
 			mkdirSync(dashboard, { recursive: true });
 			copyFileSync(entrypoint, join(cli, "prepare-router-artifacts.ts"));
+			copyFileSync(
+				join(root, "apps/cli/router-artifacts.ts"),
+				join(cli, "router-artifacts.ts"),
+			);
 			writeFileSync(
 				join(dashboard, "build.ts"),
 				'console.error("dashboard-warning-visible");',
@@ -309,6 +321,10 @@ writeFileSync("dist/better-ccflare-linux-amd64", "#!/bin/sh\\nprintf 'invalid sm
 			mkdirSync(join(cli, "dist"), { recursive: true });
 			mkdirSync(dashboard, { recursive: true });
 			copyFileSync(entrypoint, join(cli, "prepare-router-artifacts.ts"));
+			copyFileSync(
+				join(root, "apps/cli/router-artifacts.ts"),
+				join(cli, "router-artifacts.ts"),
+			);
 			writeFileSync(
 				join(dashboard, "build.ts"),
 				'throw new Error("deliberate dashboard build failure");',

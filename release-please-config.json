@@ -1,0 +1,26 @@
+{
+	"bootstrap-sha": "d981843f014e76d8d1743410010d3628bbdc3962",
+	"packages": {
+		".": {
+			"release-type": "router-node",
+			"include-component-in-tag": false,
+			"include-v-in-tag": true,
+			"changelog-sections": [
+				{ "type": "feat", "section": "Features" },
+				{ "type": "fix", "section": "Bug Fixes" },
+				{ "type": "security", "section": "Security" },
+				{ "type": "refactor", "section": "Improvements" },
+				{ "type": "perf", "section": "Performance Improvements" }
+			],
+			"draft": true,
+			"force-tag-creation": true,
+			"extra-files": [
+				{
+					"type": "json",
+					"path": "apps/cli/package.json",
+					"jsonpath": "$.version"
+				}
+			]
+		}
+	}
+}
