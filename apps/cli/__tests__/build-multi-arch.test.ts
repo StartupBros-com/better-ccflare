@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { platformsForBuild, releaseBuildDefines } from "../build-multi-arch";
 import { readTombiiTaggedBuildEvidence } from "../build-provenance";
+import { expectedManifest } from "../prepare-router-release";
 
 const sha = "abcdef1234567890abcdef1234567890abcdef12";
 const runtimeSha = "1234567890abcdef1234567890abcdef12345678";
@@ -196,7 +197,10 @@ describe("wstack Router build provenance", () => {
 				sourceSha: sha,
 				sourceRef: "refs/tags/v1.2.3",
 			};
-			const defines = releaseBuildDefines(evidence, context);
+			const defines = [
+				...define("__BETTER_CCFLARE_VERSION__", evidence.version),
+				...releaseBuildDefines(evidence, context),
+			];
 			expect(defines).toContain(
 				`__CCFLARE_BUILD_PROVENANCE_DISTRIBUTION__="${token}"`,
 			);
@@ -206,6 +210,21 @@ describe("wstack Router build provenance", () => {
 				),
 			).toBe(false);
 			const embedded = runCompiledFixture(defines);
+			if (mode === "binary") {
+				expect(embedded.provenance).toEqual(
+					expectedManifest(
+						{
+							repository: "StartupBros/wstack-router",
+							version: "1.2.3",
+							ref: "refs/tags/v1.2.3",
+							sha,
+						},
+						1,
+						"0".repeat(64),
+					).provenance,
+				);
+				expect(embedded.version).toBe("1.2.3");
+			}
 			expect(embedded.provenance).toMatchObject({
 				identity: token,
 				producer: "startupbros",
