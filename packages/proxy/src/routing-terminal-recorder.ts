@@ -196,7 +196,8 @@ function reportRecorderFailure(
 
 /**
  * Complete the normal request-history lifecycle for a locally generated
- * routing terminal that has no serving account.
+ * routing terminal that has no serving account. Pre-forward caller cancellation
+ * retains the last observed attempt's account, without claiming a serving winner.
  *
  * This intentionally records the native terminal response before any outer
  * transport adapter (notably Anthropic pre-commit rescue) can translate a
@@ -251,7 +252,10 @@ export function recordRoutingTerminalRequest(
 					type: "start",
 					messageId: randomUUID(),
 					requestId: requestMeta.id,
-					accountId: null,
+					accountId:
+						options.terminalKind === "client_cancelled"
+							? (attemptedIdentity?.accountId ?? null)
+							: null,
 					method: requestMeta.method,
 					path: requestMeta.path,
 					timestamp: requestMeta.timestamp,
@@ -289,9 +293,9 @@ export function recordRoutingTerminalRequest(
 						? (requestMeta.appliedModel as string)
 						: null,
 					comboName: requestMeta.comboName ?? null,
-					// No serving account/attempt exists on this locally generated
-					// terminal path (see file doc comment), so there is never a
-					// combo-slot override to attribute here.
+					// No serving winner exists on this locally generated terminal
+					// path, so do not infer a successful combo-slot override from
+					// an earlier attempted account.
 					comboModelOverrideFrom: null,
 					comboModelOverrideTo: null,
 					apiKeyId: options.apiKeyId ?? null,
@@ -310,6 +314,9 @@ export function recordRoutingTerminalRequest(
 			requestId: requestMeta.id,
 			success: false,
 			error: options.terminalKind,
+			...(options.terminalKind === "client_cancelled"
+				? { streamTerminalState: "client_cancelled" as const }
+				: {}),
 		});
 	} catch (error) {
 		reportRecorderFailure(options.onError, error);
