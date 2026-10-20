@@ -4,7 +4,7 @@ Route Claude Code requests across multiple account providers, with request loggi
 
 A House of Vibe project, continuing [tombii/better-ccflare](https://github.com/tombii/better-ccflare) and its ancestor [snipeship/ccflare](https://github.com/snipeship/ccflare). The MIT license and contributor credits remain intact.
 
-**Install from the [current fork's source](#install-from-source)**. The public source repository and support home are now [StartupBros/wstack-router](https://github.com/StartupBros/wstack-router). No wstack Router registry package, release download, or container image is published by this change.
+**Install [wstack Router 3.6.2 for Linux x86_64](#install-the-linux-x86_64-release)** from the [public release](https://github.com/StartupBros/wstack-router/releases/tag/v3.6.2), or [build from source](#install-from-source). The source repository and support home are [StartupBros/wstack-router](https://github.com/StartupBros/wstack-router). Router npm packages, container images, and binaries for other platforms are not published.
 
 Existing users: read the [migration and rollback guide](docs/wstack-router-migration.md). The command name changes; existing storage and integration names do not.
 
@@ -46,7 +46,7 @@ This project builds upon the excellent foundation of [snipeship/ccflare](https:/
 - **Powerful CLI** - Complete command-line interface for account management and configuration
 - **REST API** - Complete API for automation and integration
 - **Claude Code `/model` Route Profiles** - Discover operator-defined exact-account or capability-pool routes in Claude Code's native picker and pin one authenticated session tree when caller/session identity is available, without changing other sessions. See [configuration](docs/configuration.md#claude-code-model-route-profiles) and [routing semantics](docs/routing-architecture.md#claude-code-model-route-profiles)
-- **Cross-Platform Binary** - Pre-compiled binary works with Node.js or Bun
+- **Standalone Linux x86_64 Binary** - Router 3.6.2 runs without Node.js or Bun; other platforms use the source-build path
 - **Comprehensive Logging** - Request/response tracking with searchable history
 - **Alert Webhooks** - With an empty `ALERT_WEBHOOK_TYPES` list, Discord keeps cache-efficiency observations (including recovery) and unknown-model catalog observations in alert history and the dashboard stream without sending a notification. Authentication failures, capacity warnings, actual stale-policy model rewrites, and cache telemetry gaps (including recovery) remain eligible. A nonempty list admits exactly the named types, including these observations. Generic webhooks retain their legacy admission and `{type, alert}` body. Discord presents the affected thing, observation, impact, action, and where to find evidence; raw messages remain in history. Persistence is not a delivery receipt: failed sends are logged, and the existing engine can record an opening that never arrived and later send its recovery.
 - **Database Integration** - SQLite (default) or PostgreSQL for persistent storage and analytics, supporting Kubernetes multi-pod deployments
@@ -65,6 +65,81 @@ This project builds upon the excellent foundation of [snipeship/ccflare](https:/
 - **PostgreSQL Support** - Set `DATABASE_URL=postgresql://...` to use PostgreSQL for Kubernetes multi-pod deployments where SQLite file-sharing is not feasible
 
 ## Quick Start
+
+### Install the Linux x86_64 release
+
+[Release 3.6.2](https://github.com/StartupBros/wstack-router/releases/tag/v3.6.2) contains one standalone Linux x86_64 binary; Node.js and Bun are not required to run it. For other platforms or a local build, use [Install from source](#install-from-source).
+
+Requires Bash on Linux x86_64, `curl`, GNU coreutils (`sha256sum`, `cmp`, `wc`, `install`, `mktemp`), and a current [GitHub CLI](https://cli.github.com/) supporting the attestation flags below. Downloads use public HTTPS URLs without credentials. Attestation lookup may require your existing GitHub CLI authentication. If a tool, flag, authentication, or verification step fails, stop and resolve it; do not skip verification or run the download manually.
+
+Paste the whole block into Bash. It downloads exactly three assets into a fresh directory, checks the pinned size and checksum, and verifies GitHub attestations for both the binary and manifest **before installing or executing either command**. The expected source is `5d7b2a888a9b61d87916332b414e46606498d896` at `refs/tags/v3.6.2`; these expectations come from this guide, not from the downloaded manifest.
+
+<!-- router-release-install -->
+```bash
+(
+  set -eu
+  umask 077
+  test "$(uname -s)" = Linux
+  test "$(uname -m)" = x86_64
+  command -v curl
+  command -v sha256sum
+  command -v gh
+
+  version_dir="$HOME/.local/lib/wstack-router/3.6.2"
+  bin_dir="$HOME/.local/bin"
+  for name in wstack-router better-ccflare; do
+    if [ -e "$bin_dir/$name" ] || [ -L "$bin_dir/$name" ]; then
+      printf 'Refusing existing command: %s\n' "$bin_dir/$name" >&2
+      exit 1
+    fi
+  done
+  if [ -e "$version_dir" ] || [ -L "$version_dir" ]; then
+    printf 'Refusing existing version directory: %s\n' "$version_dir" >&2
+    exit 1
+  fi
+
+  download_dir=$(mktemp -d)
+  printf 'Downloads: %s\n' "$download_dir"
+  cd "$download_dir"
+  base=https://github.com/StartupBros/wstack-router/releases/download/v3.6.2
+  curl -q --fail --location --proto '=https' --proto-redir '=https' --output better-ccflare-linux-amd64 "$base/better-ccflare-linux-amd64"
+  curl -q --fail --location --proto '=https' --proto-redir '=https' --output SHA256SUMS "$base/SHA256SUMS"
+  curl -q --fail --location --proto '=https' --proto-redir '=https' --output release-manifest.json "$base/release-manifest.json"
+
+  digest=b01a4989323ecf4e2d0a68394b45828741430d89eb35288f7318a28c45b4c9d7
+  test "$(wc -c < better-ccflare-linux-amd64)" -eq 97965536
+  printf '%s  better-ccflare-linux-amd64\n' "$digest" | cmp - SHA256SUMS
+  sha256sum --check --strict SHA256SUMS
+  source_sha=5d7b2a888a9b61d87916332b414e46606498d896
+  for asset in better-ccflare-linux-amd64 release-manifest.json; do
+    gh attestation verify "$asset" \
+      --repo StartupBros/wstack-router \
+      --source-digest "$source_sha" \
+      --source-ref refs/tags/v3.6.2 \
+      --cert-identity https://github.com/StartupBros/wstack-router/.github/workflows/router-release-artifacts.yml@refs/tags/v3.6.2 \
+      --signer-digest "$source_sha" \
+      --deny-self-hosted-runners
+  done
+
+  mkdir -p "$HOME/.local/lib/wstack-router" "$bin_dir"
+  mkdir "$version_dir"
+  install -m 755 better-ccflare-linux-amd64 "$version_dir/wstack-router"
+  cd "$version_dir"
+  test "$(./wstack-router --version)" = 'wstack Router v3.6.2'
+  test "$(./wstack-router --git-sha)" = "$source_sha"
+  ./wstack-router --help
+  ln -s "$version_dir/wstack-router" "$bin_dir/wstack-router"
+  ln -s "$version_dir/wstack-router" "$bin_dir/better-ccflare"
+  test "$("$bin_dir/better-ccflare" --version)" = 'wstack Router v3.6.2'
+  test "$("$bin_dir/better-ccflare" --git-sha)" = "$source_sha"
+  printf 'Installed wstack Router 3.6.2 (%s)\nAdd %s to PATH in your shell.\n' "$source_sha" "$bin_dir"
+)
+```
+<!-- /router-release-install -->
+
+The subshell stops on any failed check and leaves the download directory for inspection. It uses no `sudo`, does not overwrite commands (including broken symlinks), and refuses an existing version directory. If a later step fails, inspect the printed error and any files already created before retrying; do not force replacement.
+
+After success, add `$HOME/.local/bin` to your shell's PATH configuration. Check `command -v wstack-router` and `command -v better-ccflare` in each terminal; both should resolve there. Existing commands elsewhere remain untouched, but PATH order determines which runs. Continue at [Start the local server](#start-the-local-server). Existing service users should follow the [migration and rollback guide](docs/wstack-router-migration.md) rather than changing a running service with this quickstart.
 
 ### Install from source
 
@@ -94,6 +169,8 @@ printf 'Installed commands in %s\n' "$install_dir"
 <!-- /source-install-local -->
 
 The PATH change applies to this shell only. To keep it, add the printed directory (its literal path, not `$install_dir`) to your shell's PATH configuration, ahead of older installations. Use `command -v wstack-router` and `command -v better-ccflare` to confirm which commands will run. Keep the prior executable and its location for rollback; do not overwrite a global install or change an existing service as part of this quickstart.
+
+### Start the local server
 
 For a new local setup, start the server and dashboard with:
 
@@ -1103,7 +1180,9 @@ Full documentation available in [`docs/`](docs/):
 
 ## Requirements
 
-**For installation:**
+**For wstack Router installation:** use the [Linux x86_64 release prerequisites](#install-the-linux-x86_64-release) or the [source-build requirements](#install-from-source). No Router npm package or container image is published.
+
+**For the retained legacy upstream installation recipes:**
 - **npm** or **bun** package manager (for npm/bun installation)
 - **Node.js** >= 18.0.0 (when installed via npm)
 - **Bun** >= 1.2.8 (when installed via bun or running from source)
@@ -1114,7 +1193,9 @@ Full documentation available in [`docs/`](docs/):
 
 ## Platform Support
 
-The table below describes the retained **upstream distribution** recipes, not published wstack Router artifacts. The source-install acceptance check for this fork runs on Linux x86_64; macOS and native Windows installation have not been verified for this identity change.
+wstack Router 3.6.2 publishes a **Linux x86_64 binary only**. No Router Linux ARM64, macOS, or native Windows binary is published. The [source-build path](#install-from-source) remains available; its acceptance check runs on Linux x86_64, not macOS or native Windows.
+
+The table and device list below describe the retained **upstream distribution** recipes, not wstack Router artifacts.
 
 | Platform | Architecture | Status |
 |----------|-------------|--------|

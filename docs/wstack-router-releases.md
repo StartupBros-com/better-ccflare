@@ -1,9 +1,13 @@
 # wstack Router release automation (draft-only)
 
-This is the operator guide for `StartupBros/wstack-router`. It stages a verified
-**draft** GitHub release. It never publishes a release, publishes npm packages or
-images, announces, installs, restarts services, or deploys. Public publication is
-a separate decision that is not part of this increment.
+For the published 3.6.2 Linux x86_64 binary, follow the README's
+[consumer installation and verification instructions](../README.md#install-the-linux-x86_64-release).
+
+This is the operator guide for `StartupBros/wstack-router` release automation.
+The automation stages a verified **draft** GitHub release. It never publishes a
+release, publishes npm packages or images, announces, installs, restarts services,
+or deploys. Public publication is a separate operator decision; the consumer
+instructions above do not use the draft-only automation helpers.
 
 ## App authentication and verification boundaries
 
