@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { GitHub, Manifest } from "release-please";
@@ -455,7 +461,7 @@ test.each([
 	await expect(reconcileDraft(f.transport, input)).rejects.toThrow();
 	expect(f.writes).toEqual([]);
 });
-function fixture(message: string) {
+function fixture(message: string, baseline = "3.5.78") {
 	const files: Record<string, string> = Object.fromEntries(
 		[
 			"package.json",
@@ -465,6 +471,21 @@ function fixture(message: string) {
 			".release-please-manifest.json",
 		].map((path) => [path, readFileSync(new URL(path, root), "utf8")]),
 	);
+	// Keep historical expectations independent of the checkout's release version.
+	for (const path of ["package.json", "apps/cli/package.json"]) {
+		const manifest = JSON.parse(files[path]);
+		manifest.version = baseline;
+		files[path] = JSON.stringify(manifest);
+	}
+	const manifest = JSON.parse(files[".release-please-manifest.json"]);
+	manifest["."] = baseline;
+	files[".release-please-manifest.json"] = JSON.stringify(manifest);
+	const lock = ts.parseConfigFileTextToJson(
+		"bun.lock",
+		files["bun.lock"],
+	).config;
+	lock.workspaces["apps/cli"].version = baseline;
+	files["bun.lock"] = JSON.stringify(lock);
 	const scm = {
 		repository: {
 			owner: "StartupBros",
@@ -537,47 +558,94 @@ test.each([
 	expect(await engine.buildPullRequests()).toEqual([]);
 	expect(await engine.buildReleases()).toEqual([]);
 });
-test("candidate updates synchronize product without changing dependency resolution", async () => {
-	const { scm, files } = fixture("fix: repair routing");
-	const [pr] = await (await createRouterManifest(scm)).buildPullRequests();
-	const updated: Record<string, string> = {};
-	for (const update of pr.updates) {
-		if (files[update.path] !== undefined || update.createIfMissing)
-			updated[update.path] = update.updater.updateContent(files[update.path]);
-	}
-	expect(JSON.parse(updated["package.json"]).version).toBe("3.5.79");
-	expect(JSON.parse(updated["apps/cli/package.json"]).version).toBe("3.5.79");
-	expect(JSON.parse(updated[".release-please-manifest.json"])["."]).toBe(
-		"3.5.79",
-	);
-	const before = ts.parseConfigFileTextToJson(
-		"bun.lock",
-		files["bun.lock"],
-	).config;
-	const after = JSON.parse(updated["bun.lock"]);
-	expect(after.workspaces["apps/cli"].version).toBe("3.5.79");
-	before.workspaces["apps/cli"].version = "3.5.79";
-	expect(after).toEqual(before);
-	const directory = mkdtempSync(join(tmpdir(), "router-candidate-"));
-	const paths = ["package.json", "bun.lock"];
-	for (const pattern of ["apps/*/package.json", "packages/*/package.json"]) {
-		for await (const path of new Bun.Glob(pattern).scan({ cwd: root.pathname }))
-			paths.push(path);
-	}
-	for (const path of paths) {
-		mkdirSync(dirname(join(directory, path)), { recursive: true });
-		writeFileSync(
-			join(directory, path),
-			updated[path] ?? readFileSync(new URL(path, root), "utf8"),
+test.each([
+	["fix: repair routing", "3.5.79", "repair routing"],
+	[
+		"chore: prepare the first wstack Router release\n\nRelease-As:3.6.0",
+		"3.6.0",
+		"prepare the first wstack Router release",
+	],
+])(
+	"candidate %s synchronizes product without changing dependency resolution",
+	async (message, version, subject) => {
+		const { scm, files } = fixture(message);
+		const engine = await createRouterManifest(scm);
+		const prs = await engine.buildPullRequests();
+		expect(prs).toHaveLength(1);
+		const [pr] = prs;
+		expect(pr.version?.toString()).toBe(version);
+		expect(pr.body.toString()).toContain(subject);
+		// A request commit is not a merged engine release PR.
+		expect(await engine.buildReleases()).toEqual([]);
+		const updated: Record<string, string> = {};
+		for (const update of pr.updates) {
+			if (files[update.path] !== undefined || update.createIfMissing)
+				updated[update.path] = update.updater.updateContent(files[update.path]);
+		}
+		expect(updated["CHANGELOG.md"]).toContain(subject);
+		expect(JSON.parse(updated["package.json"]).version).toBe(version);
+		expect(JSON.parse(updated["apps/cli/package.json"]).version).toBe(version);
+		expect(JSON.parse(updated[".release-please-manifest.json"])["."]).toBe(
+			version,
 		);
+		const before = ts.parseConfigFileTextToJson(
+			"bun.lock",
+			files["bun.lock"],
+		).config;
+		const after = JSON.parse(updated["bun.lock"]);
+		expect(after.workspaces["apps/cli"].version).toBe(version);
+		before.workspaces["apps/cli"].version = version;
+		expect(after).toEqual(before);
+		const directory = mkdtempSync(join(tmpdir(), "router-candidate-"));
+		try {
+			const paths = ["package.json", "bun.lock"];
+			for (const pattern of [
+				"apps/*/package.json",
+				"packages/*/package.json",
+			]) {
+				for await (const path of new Bun.Glob(pattern).scan({
+					cwd: root.pathname,
+				}))
+					paths.push(path);
+			}
+			for (const path of paths) {
+				mkdirSync(dirname(join(directory, path)), { recursive: true });
+				writeFileSync(
+					join(directory, path),
+					updated[path] ?? readFileSync(new URL(path, root), "utf8"),
+				);
+			}
+			const result = Bun.spawnSync(
+				[process.execPath, "install", "--frozen-lockfile", "--ignore-scripts"],
+				{ cwd: directory, env: process.env },
+			);
+			expect(result.stderr.toString()).not.toContain("lockfile had changes");
+			expect(result.exitCode).toBe(0);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	},
+	60_000,
+);
+
+test("explicit fixture baseline computes the next patch without leaking to the default", async () => {
+	for (const [baseline, version] of [
+		["3.6.0", "3.6.1"],
+		[undefined, "3.5.79"],
+	]) {
+		const { scm, files } = fixture("fix: repair routing", baseline);
+		const base = baseline ?? "3.5.78";
+		expect(JSON.parse(files["package.json"]).version).toBe(base);
+		expect(JSON.parse(files["apps/cli/package.json"]).version).toBe(base);
+		expect(JSON.parse(files[".release-please-manifest.json"])["."]).toBe(base);
+		expect(JSON.parse(files["bun.lock"]).workspaces["apps/cli"].version).toBe(
+			base,
+		);
+		const prs = await (await createRouterManifest(scm)).buildPullRequests();
+		expect(prs).toHaveLength(1);
+		expect(prs[0].version?.toString()).toBe(version);
 	}
-	const result = Bun.spawnSync(
-		[process.execPath, "install", "--frozen-lockfile", "--ignore-scripts"],
-		{ cwd: directory, env: process.env },
-	);
-	expect(result.stderr.toString()).not.toContain("lockfile had changes");
-	expect(result.exitCode).toBe(0);
-}, 60_000);
+});
 
 test("real manifest engine computes patch after exclusive bootstrap", async () => {
 	const { scm } = fixture("fix: repair routing");

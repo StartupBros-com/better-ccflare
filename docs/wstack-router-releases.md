@@ -5,7 +5,7 @@ This is the operator guide for `StartupBros/wstack-router`. It stages a verified
 images, announces, installs, restarts services, or deploys. Public publication is
 a separate decision that is not part of this increment.
 
-## Status: App provisioning and live activation not yet verified
+## App authentication and verification boundaries
 
 Release PR reconciliation uses a dedicated GitHub App installation token, not the
 built-in Actions token. Keep `default_workflow_permissions: read` and the combined
@@ -15,11 +15,14 @@ The `pull-requests` job's built-in token has only `contents: read`; top-level wo
 permissions remain empty. This change does not grant the App a ruleset bypass or
 authorize unattended release-PR merges, and it uses no personal access token.
 
-The dedicated Router App, its installation, repository variable and secret are not
-yet verified as provisioned. Until the live path succeeds, describe this as installed
-wiring, not operating release automation. Missing configuration fails the mint step;
-it never silently skips reconciliation or falls back to the built-in token, even on
-a chore-only run that would otherwise need no release PR.
+PR #556 activated the scoped App/token wiring with the required checks preserved.
+Its coordinator passed App token minting, release-PR reconciliation and post-job
+token revocation. That no-op reconciliation did not create a release PR and is not
+proof of the release PR, its checks, or the draft/artifact path. Verify those steps
+for each actual release; the release's Actions runs are the evidence, not this
+setup guide. Missing configuration fails the mint step; it never silently skips
+reconciliation or falls back to the built-in token, even on a chore-only run that
+would otherwise need no release PR.
 
 The `drafts` job still runs when `pull-requests` fails, so an already merged release
 is not hidden by an App failure. The overall workflow run stays red. Manual draft
@@ -72,6 +75,45 @@ artifact jobs retain their separate built-in tokens and existing permissions.
   and `style` alone produce no release pull request.
 - Tags are `vX.Y.Z` with no component. The change that merges this automation uses
   `chore` commits and creates no tag or release.
+
+## Intentional first release or explicit version request
+
+An intentional release request can use the engine's `Release-As` commit-body
+trailer without inventing a feature or editing version files. For the first Router
+release, preserve this complete message on the request PR's squash commit:
+
+```text
+chore: prepare the first wstack Router release
+
+Release-As:3.6.0
+```
+
+1. Open a normal request PR and let its required checks pass. Ordinary unmarked
+   `docs`, `chore`, `test` and `style` commits remain no-ops; the trailer is a
+   deliberate release request, not a new rule that releases every chore.
+2. When merging the request PR, put `Release-As:3.6.0` in a local body file and use
+   `gh pr merge <request-pr> --squash --subject "chore: prepare the first wstack Router release" --body-file <body-file>`.
+   Do not rely on the PR description or GitHub's default squash body to retain it.
+   Use the normal checked merge path, never a direct-main push, force push or bypass.
+3. Read back the **actual main commit message** using the merged PR's
+   `mergeCommit.oid` and `gh api repos/StartupBros/wstack-router/commits/<sha> --jq .commit.message`.
+   Confirm the honest subject, blank line and exact `Release-As:3.6.0` trailer before
+   treating the request as delivered. A local message or PR description is not proof.
+4. After that commit's foundation gate passes, observe the coordinator's generated
+   release PR. The pinned engine selects 3.6.0 and synchronizes root/CLI packages,
+   release manifest and Bun workspace version without changing dependency resolution.
+   The request subject appears in generated PR notes and `CHANGELOG.md`; arbitrary
+   body prose is not a supported way to enrich those notes. Leave version-file edits
+   to the engine and verify the actual App-authored PR's required checks.
+5. Merge that genuine engine release PR only through the normal required-check path.
+   The request commit alone cannot authorize a draft. Its release PR's exact merged
+   commit needs its own successful foundation gate before the coordinator can create
+   the draft/tag and stage verified artifacts. After observing draft creation, richer
+   release notes can be supplied through supported release-note editing; do not
+   publish the draft as part of this procedure.
+
+This procedure does not enable auto-merge or change the publication boundary.
+Local characterization verifies engine behavior, not completion of these live steps.
 
 ## What authorizes a draft
 
@@ -158,16 +200,19 @@ Docker publishing have a job-level `github.repository != 'StartupBros/wstack-rou
 condition. Their triggers and other repositories' behavior are unchanged.
 `prepare-router-artifacts.yml` stays a local, non-publishing preparation check.
 
-## Unexercised remote behavior
+## Evidence required for each release
 
-No live App token mint, App-authored release PR, draft, tag, attestation, upload or
-dispatch has been verified for this implementation. The App action's pinned
-`action.yml` and `main.js` confirm the inputs, Node 24 runtime and failure on missing
-Client ID or private key. Static YAML assertions prove wiring, not live credential
-availability, revocation or GitHub event behavior. The other action pins
-(`actions/checkout` 7.0.1, `setup-bun` 2.2.0, `upload-artifact` 6.0.0,
-`download-artifact` 7.0.0, `actions/attest` 4.2.1) and the `gh attestation verify`
-flags are checked against official sources and local tests only. The `stage` job
+Verify the actual App-authored release PR and its CI events, draft, tag,
+attestation, upload and dispatch at the release's immutable source SHA. PR #556's
+successful token mint, no-op reconciliation and revocation prove the App wiring,
+not that later releases completed those steps.
+
+The App action's pinned `action.yml` and `main.js` confirm the inputs, Node 24
+runtime and failure on missing Client ID or private key. Static YAML assertions
+alone prove wiring, not live credential availability, revocation or GitHub event
+behavior. The other action pins (`actions/checkout` 7.0.1, `setup-bun` 2.2.0,
+`upload-artifact` 6.0.0, `download-artifact` 7.0.0, `actions/attest` 4.2.1) and the
+`gh attestation verify` flags have source and local-test coverage. The `stage` job
 checks the runner's `gh` supports every verifier flag used by the helper before
 using it. Local executable fixtures exercise CLI output and the coordinator's shell
 with synthetic API responses and command stand-ins; they do not prove live GitHub
