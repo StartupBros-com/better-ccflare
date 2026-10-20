@@ -1,7 +1,7 @@
 # wstack Router release automation (draft-only)
 
-For the published 3.6.2 Linux x86_64 binary, follow the README's
-[consumer installation and verification instructions](../README.md#install-the-linux-x86_64-release).
+For the published 3.6.2 Linux x86_64 binary, follow the technical reference's
+[consumer installation and verification instructions](reference.md#install-the-linux-x86_64-release).
 
 This is the operator guide for `StartupBros/wstack-router` release automation.
 The automation stages a verified **draft** GitHub release. It never publishes a
@@ -11,8 +11,8 @@ instructions above do not use the draft-only automation helpers.
 
 ## Optional consumer provenance verification
 
-The README's [binary install](../README.md#install-the-linux-x86_64-release)
-checks the download against a SHA-256 pinned in that README. If you also want
+The technical reference's [binary install](reference.md#install-the-linux-x86_64-release)
+checks the download against a SHA-256 pinned in that reference. If you also want
 signed evidence of its origin, run the following block **after the checksum check
 and before running the binary**. It verifies the binary already downloaded; no
 manifest or additional release asset is needed.
@@ -43,7 +43,7 @@ This independently checks GitHub's signed build provenance against the expected
 repository, source commit, tag, workflow identity, signer commit, and hosted-runner
 policy. Those expectations are pinned here, not read from a downloaded manifest.
 Neither a checksum nor provenance proves the program is free of bugs or malicious
-behavior. After verification succeeds, return to the README's separate run step.
+behavior. After verification succeeds, return to the technical reference's separate run step.
 
 The release also publishes `SHA256SUMS` and an attested `release-manifest.json` for
 release auditing; neither is required by the consumer install above. The operator

@@ -22,9 +22,9 @@ The wstack Router CLI provides a command-line interface for managing accounts, m
 
 ### Installation
 
-Follow the root [Linux x86_64 release installation](../README.md#install-the-linux-x86_64-release) for Router 3.6.2: download, verify the pinned SHA-256, then run. [Signed provenance verification](./wstack-router-releases.md#optional-consumer-provenance-verification) is optional and available before the first run. You can also [build from source](../README.md#install-from-source). Router npm packages, container images, and other-platform binaries are not published. Upstream registry packages and releases are not Router distributions.
+For agent-assisted setup, use the [agent setup guide](agent-setup.md). For manual installation, follow the [Linux x86_64 release installation](reference.md#install-the-linux-x86_64-release) for Router 3.6.2: download, verify the pinned SHA-256, then run. [Signed provenance verification](./wstack-router-releases.md#optional-consumer-provenance-verification) is optional and available before the first run. You can also [build from source](reference.md#install-from-source). Router npm packages, container images, and other-platform binaries are not published. Upstream registry packages and releases are not Router distributions.
 
-The examples below assume you completed the optional [PATH setup](../README.md#optional-add-commands-to-path) or the source install, which provide both `wstack-router` and `better-ccflare`. Without PATH setup, replace either command with `"$HOME/.local/lib/wstack-router/3.6.2/wstack-router"`. After building, source-checkout commands such as `bun run cli [command]` remain supported. In a second terminal, use the same installation directory on PATH or the same explicit binary path.
+The examples below assume you completed the optional [PATH setup](reference.md#optional-add-commands-to-path) or the source install, which provide both `wstack-router` and `better-ccflare`. Without PATH setup, replace either command with `"$HOME/.local/lib/wstack-router/3.6.2/wstack-router"`. After building, source-checkout commands such as `bun run cli [command]` remain supported. In a second terminal, use the same installation directory on PATH or the same explicit binary path.
 
 ### First-time Setup
 
@@ -54,7 +54,7 @@ wstack-router routing detail <account-id> --api-url http://127.0.0.1:8080
 
 Review failures also do not roll back any family changes already applied; see [Post-create routing review](#post-create-routing-review) for partial-result behavior.
 
-4. Open [the dashboard](http://127.0.0.1:8080/dashboard) and follow the root [Configure Claude SDK](../README.md#configure-claude-sdk) instructions for client setup and authentication.
+4. Open [the dashboard](http://127.0.0.1:8080/dashboard) and follow [Configure Claude SDK](reference.md#configure-claude-sdk) instructions for client setup and authentication.
 
 ## Global Options and Help
 

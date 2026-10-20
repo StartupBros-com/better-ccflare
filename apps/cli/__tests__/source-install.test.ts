@@ -10,7 +10,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "../../..");
 const homes: string[] = [];
@@ -23,12 +23,9 @@ afterEach(() => {
 // An allowlisted environment prevents developer credentials, live-test opt-ins,
 // DATABASE_URL, or build/provenance overrides from reaching child processes.
 describe("documented source install", () => {
-	it("installs the built fork under both names and preserves legacy storage", () => {
+	it("keeps product identity, support, lineage, and license in the README", () => {
 		const readme = readFileSync(join(root, "README.md"), "utf8");
 		expect(readme.startsWith("# wstack Router\n")).toBe(true);
-		expect(readme).toContain(
-			"git clone https://github.com/StartupBros/wstack-router.git better-ccflare\ncd better-ccflare\n",
-		);
 		expect(readme).toContain(
 			"https://github.com/StartupBros/wstack-router/issues",
 		);
@@ -36,7 +33,65 @@ describe("documented source install", () => {
 		expect(readme).toContain("https://github.com/snipeship/ccflare");
 		expect(readme).toContain("## Acknowledgements");
 		expect(readme).toContain("MIT - See [LICENSE](LICENSE)");
-		const section = readme.split("<!-- source-install-local -->")[1];
+	});
+
+	it("connects the README agent prompt to setup and working local references", () => {
+		const readme = readFileSync(join(root, "README.md"), "utf8");
+		const prompt = readme.match(/```text\n([\s\S]*?)```/)?.[1];
+		expect(prompt).toBeDefined();
+		expect(prompt).toContain(
+			"https://github.com/StartupBros/wstack-router/blob/main/docs/agent-setup.md",
+		);
+		const guide = readFileSync(join(root, "docs/agent-setup.md"), "utf8");
+		for (const anchor of [
+			"install-the-linux-x86_64-release",
+			"install-from-source",
+			"configure-claude-sdk",
+		])
+			expect(guide).toContain(`reference.md#${anchor}`);
+		// A moved heading or an unrebased image must not strand the setup path.
+		for (const file of [
+			"README.md",
+			"docs/agent-setup.md",
+			"docs/reference.md",
+			"docs/index.md",
+		]) {
+			const path = join(root, file);
+			const text = readFileSync(path, "utf8").replace(/```[\s\S]*?```/g, "");
+			const links = [
+				...Array.from(text.matchAll(/\]\(([^\s)]+)\)/g), (match) => match[1]),
+				...Array.from(
+					text.matchAll(/(?:src|href)="([^"]+)"/g),
+					(match) => match[1],
+				),
+			];
+			for (const link of links) {
+				if (/^[a-z][a-z\d+.-]*:/i.test(link)) continue;
+				const [relative, anchor] = link.split("#");
+				const target = relative ? resolve(dirname(path), relative) : path;
+				expect(existsSync(target), `${file}: ${link}`).toBe(true);
+				if (!anchor || !target.endsWith(".md")) continue;
+				const headings = Array.from(
+					readFileSync(target, "utf8")
+						.replace(/```[\s\S]*?```/g, "")
+						.matchAll(/^#{1,6} (.+)$/gm),
+					(match) =>
+						match[1]
+							.toLowerCase()
+							.replace(/[^\p{L}\p{N}_ -]/gu, "")
+							.replace(/ /g, "-"),
+				);
+				expect(headings, `${file}: ${link}`).toContain(anchor);
+			}
+		}
+	});
+
+	it("installs the built fork under both names and preserves legacy storage", () => {
+		const reference = readFileSync(join(root, "docs/reference.md"), "utf8");
+		expect(reference).toContain(
+			"git clone https://github.com/StartupBros/wstack-router.git better-ccflare\ncd better-ccflare\n",
+		);
+		const section = reference.split("<!-- source-install-local -->")[1];
 		expect(section).toBeDefined();
 		const commands = section.split("```bash\n")[1].split("```")[0];
 		expect(existsSync(join(root, "apps/cli/dist/better-ccflare"))).toBe(true);

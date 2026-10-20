@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "../../..");
-const readme = readFileSync(join(root, "README.md"), "utf8");
+const reference = readFileSync(join(root, "docs/reference.md"), "utf8");
 const releaseDigest =
 	"b01a4989323ecf4e2d0a68394b45828741430d89eb35288f7318a28c45b4c9d7";
 const releaseUrl =
@@ -33,8 +33,8 @@ afterEach(() => {
 });
 
 function block(marker: string) {
-	const section = readme.split(`<!-- ${marker} -->`)[1];
-	expect(section, `README block ${marker}`).toBeDefined();
+	const section = reference.split(`<!-- ${marker} -->`)[1];
+	expect(section, `reference block ${marker}`).toBeDefined();
 	return section
 		.split(`<!-- /${marker} -->`)[0]
 		.split("```bash\n")[1]
@@ -93,10 +93,10 @@ esac
 describe("documented binary install (synthetic downloads)", () => {
 	it("offers the full pinned provenance policy before the first run", () => {
 		const link =
-			"docs/wstack-router-releases.md#optional-consumer-provenance-verification";
-		expect(readme.indexOf(link)).toBeGreaterThan(0);
-		expect(readme.indexOf(link)).toBeLessThan(
-			readme.indexOf("<!-- router-release-run -->"),
+			"wstack-router-releases.md#optional-consumer-provenance-verification";
+		expect(reference.indexOf(link)).toBeGreaterThan(0);
+		expect(reference.indexOf(link)).toBeLessThan(
+			reference.indexOf("<!-- router-release-run -->"),
 		);
 		const guide = readFileSync(
 			join(root, "docs/wstack-router-releases.md"),
