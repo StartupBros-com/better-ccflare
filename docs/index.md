@@ -4,6 +4,7 @@ New here? [Send the setup prompt to your coding agent](../README.md#send-this-to
 
 ## Install or connect
 
+- [Connect to a shared Router](agent-setup.md#shared-client-only): client-only setup over Tailscale or another approved private connection; no local Router install.
 - [Manual installation](reference.md#install-the-linux-x86_64-release): verified Linux x86_64 binary, with optional [signed provenance](wstack-router-releases.md#optional-consumer-provenance-verification).
 - [Source build](reference.md#install-from-source): requirements and installation without overwriting an existing command.
 - [Local server and account setup](reference.md#start-the-local-server): dashboard workflow and request verification.

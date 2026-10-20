@@ -58,6 +58,8 @@ This project builds upon the foundation of [snipeship/ccflare](https://github.co
 
 ## Quick Start
 
+**Choose before installing:** if a Router already serves your computers, follow [shared-client setup](agent-setup.md#shared-client-only). Use its owner-confirmed origin and authentication; do not install a local Router or repeat server/account setup. The installation sections below are for a **new host**, not each client. Client OS support does not depend on a matching Router server binary; private native test builds are not public releases.
+
 ### Install the Linux x86_64 release
 
 [Release 3.6.2](https://github.com/StartupBros/wstack-router/releases/tag/v3.6.2) contains one standalone Linux x86_64 binary; Node.js and Bun are not required to run it. For other platforms or a local build, use [Install from source](#install-from-source).
@@ -668,15 +670,17 @@ For running better-ccflare as a native systemd service on Linux (without Docker)
 
 ## Configure Claude SDK
 
+**Connecting to an existing Router?** Begin with [shared-client setup](agent-setup.md#shared-client-only), including the owner-confirmed origin, private reachability, and authentication requirements. Substitute that origin for localhost in the examples below. Shared clients do not install Router, create accounts, log in to providers, or change routing/server lifecycle. Tailnet membership is not Router authentication. Keep saved settings and the current Claude Code login intact unless the human explicitly chooses an authentication change; prefer session-scoped configuration. If dashboard access requires admin privileges, ask the owner to verify the request rather than distribute an admin key to an inference client.
+
 ### Option 1: Using Claude CLI with OAuth (Recommended if you have Claude Pro/Team)
 
-If you have a Claude Pro or Team subscription and are logged into Claude CLI:
+If you have a Claude Pro or Team subscription and are logged into Claude CLI, this preserves that login for a Router without API-key authentication. It does **not** bypass a protected Router's key requirement; use Option 2 only after agreeing on any client authentication change.
 
 ```bash
 # Set only the base URL - no API key needed!
 export ANTHROPIC_BASE_URL=http://localhost:8080
 
-# Make sure to configure your accounts in the better-ccflare dashboard
+# New hosts: configure accounts in the dashboard; shared clients reuse existing routing
 
 # Start Claude CLI (uses your existing login)
 claude
@@ -686,10 +690,12 @@ claude
 
 ### Option 2: Using API Key Authentication
 
-If you're NOT using Claude CLI's OAuth login, or prefer API key authentication:
+If you're NOT using Claude CLI's OAuth login, or explicitly choose API key authentication:
+
+**Before logout:** this changes a working login. Agree with the human on the switch and restoration first; do not run the logout step blindly. For a shared Router, obtain an inference-scoped Router key privately from its owner; do not generate one in a local database. Provider credentials are not Router keys. Never paste actual keys into chat or captured logs; the token below is a placeholder, not an invitation to record a real secret in shell history. Unprotected access is for an isolated local setup, not a shared-server recommendation.
 
 ```bash
-# First, logout from Claude CLI if you're currently logged in
+# Only after agreeing to switch; skip if already logged out
 claude /logout
 
 # Then set both the base URL and API key
@@ -699,10 +705,11 @@ export ANTHROPIC_BASE_URL=http://localhost:8080
 export ANTHROPIC_AUTH_TOKEN=dummy-key
 
 # If better-ccflare HAS API keys configured (protected):
-# Generate a key first: better-ccflare --generate-api-key "My VPS"
+# New-host owner only: better-ccflare --generate-api-key "My VPS"
+# Shared clients: obtain an inference key privately from the existing owner
 export ANTHROPIC_AUTH_TOKEN=btr-abcdef1234567890...  # Use your real better-ccflare API key
 
-# Make sure to configure your accounts in the better-ccflare dashboard
+# New hosts: configure accounts in the dashboard; shared clients reuse existing routing
 
 # Start Claude CLI
 claude
@@ -710,22 +717,25 @@ claude
 
 ### Option 3: Remote/Headless VPS Setup (Secure Proxy)
 
-Use better-ccflare on a trusted server to avoid storing OAuth credentials on untrusted/temporary machines:
+Use better-ccflare on a trusted server to keep provider OAuth credentials off temporary clients. If that server already exists, follow [shared-client setup](agent-setup.md#shared-client-only) and **skip the server commands below**. Use the owner-approved Tailscale origin or other private endpoint; do not discover servers by scanning or change their exposure. The client still holds a sensitive Router credential, so untrusted machines can steal it.
 
-**On your trusted server (running better-ccflare):**
+**On a new trusted host only, by its owner:** use isolated state and the same paths for all commands as described in [agent setup](agent-setup.md#3-open-the-right-dashboard). Before remote exposure, establish Router authentication and approved private network access. The first active key is admin: keep it with the owner and create a separate inference-scoped key for clients using the dashboard's API Keys controls. Do not share the first admin key as a client credential.
+
+The following are server-owner operations, not instructions to run on each client:
+
 ```bash
 # Add your Claude account with OAuth
 better-ccflare --add-account myaccount --mode claude-oauth --priority 0
 
-# Generate an API key for remote access
-better-ccflare --generate-api-key "Remote VPS"
-# Save the generated key: btr-abcdef1234567890...
+# Bootstrap authentication privately; the first key is admin and stays with the owner
+better-ccflare --generate-api-key "Server owner"
 
-# Start the server (ensure it's accessible remotely)
-better-ccflare --serve
+# Start privately; remote binding/exposure is a separate owner-approved step
+BETTER_CCFLARE_HOST=127.0.0.1 better-ccflare --serve
 ```
 
-**On your untrusted/temporary VPS:**
+**On the client/VPS:** first apply Option 2's authentication-conflict and secret-handling precautions. Preserve any existing login until the human chooses the change. Replace the sample origin with the owner's confirmed origin and supply the inference key privately; do not run account or server commands here.
+
 ```bash
 # Set the remote better-ccflare URL and API key
 export ANTHROPIC_BASE_URL=https://your-server.com:8080
@@ -739,13 +749,16 @@ claude
 - Claude Code CLI sends requests with your better-ccflare API key
 - better-ccflare validates the API key and proxies requests using its stored OAuth credentials
 - Your OAuth credentials stay secure on your trusted server
-- You can use Claude Code on any machine without storing sensitive credentials
+- Clients hold a Router key, not the server's provider OAuth credentials; protect that key too
+
+Verify with a real interactive Claude Code request and a matching **Requests** entry, following [request verification](agent-setup.md#5-connect-claude-code-and-prove-the-route). If dashboard access is restricted, get owner-assisted evidence; until then route verification is pending. Do not issue admin keys merely for this check or use raw scripted Anthropic inference.
 
 ### Which method should I use?
 
-- **Have Claude Pro/Team and working locally?** Use Option 1 (OAuth only) - simpler and no API key needed
-- **Working on untrusted/temporary machines?** Use Option 3 (Remote VPS setup) - keeps credentials secure
-- **Using only API keys in better-ccflare?** Use Option 2 (logout + API key)
+- **Already have a shared Router?** Use [shared-client setup](agent-setup.md#shared-client-only) before choosing client authentication; skip server setup
+- **Have Claude Pro/Team and an isolated local Router without API-key authentication?** Use Option 1 to preserve OAuth login
+- **Working on a temporary client?** Use Option 3, keeping the Router key private and provider credentials on the server
+- **Router requires a key, or choosing API-key authentication?** Use Option 2 after agreeing on any login change
 - **Getting auth conflict warnings?** You have both methods active - choose one and follow its steps above
 
 ### Codex CLI as a Client
