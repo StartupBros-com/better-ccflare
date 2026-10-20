@@ -15,7 +15,7 @@
     },
     "apps/cli": {
       "name": "better-ccflare",
-      "version": "3.6.0",
+      "version": "3.6.1",
       "bin": {
         "better-ccflare": "dist/better-ccflare"
       },

@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.6.1](https://github.com/StartupBros/wstack-router/compare/v3.6.0...v3.6.1) (2026-10-20)
+
+
+### Bug Fixes
+
+* **ci:** allow validation to see unpublished release drafts ([bc74514](https://github.com/StartupBros/wstack-router/commit/bc74514166c53a92e32106517a13f6e91862ad61))
+
 ## [3.6.0](https://github.com/StartupBros/wstack-router/compare/v3.5.78...v3.6.0) (2026-10-20)
 
 
