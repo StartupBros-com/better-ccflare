@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import ts from "typescript";
 import {
 	isTrustedDistributionProvenance,
 	parseDistributionIdentity,
@@ -15,7 +16,7 @@ import {
 } from "./version";
 
 describe("release lineage", () => {
-	it("keeps root and CLI package lineage at exact v3.5.78 parity", () => {
+	it("keeps all release versions at exact stable SemVer parity", () => {
 		const repositoryRoot = resolve(import.meta.dir, "../../..");
 		const rootPackage = JSON.parse(
 			readFileSync(resolve(repositoryRoot, "package.json"), "utf8"),
@@ -23,10 +24,27 @@ describe("release lineage", () => {
 		const cliPackage = JSON.parse(
 			readFileSync(resolve(repositoryRoot, "apps/cli/package.json"), "utf8"),
 		) as { version?: unknown };
+		const releaseManifest = JSON.parse(
+			readFileSync(
+				resolve(repositoryRoot, ".release-please-manifest.json"),
+				"utf8",
+			),
+		) as { "."?: unknown };
+		const lock = ts.parseConfigFileTextToJson(
+			"bun.lock",
+			readFileSync(resolve(repositoryRoot, "bun.lock"), "utf8"),
+		);
 
-		expect(rootPackage.version).toBe("3.5.78");
-		expect(cliPackage.version).toBe("3.5.78");
-		expect(rootPackage.version).toBe(cliPackage.version);
+		// 3.5.78 is the historical seed; the release engine owns subsequent versions.
+		expect(rootPackage.version).toMatch(
+			/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/,
+		);
+		expect(cliPackage.version).toBe(rootPackage.version);
+		expect(releaseManifest["."]).toBe(rootPackage.version);
+		expect(lock.error).toBeUndefined();
+		expect(lock.config.workspaces["apps/cli"].version).toBe(
+			rootPackage.version,
+		);
 	});
 
 	it("uses the exact upstream Claude CLI fallback version", () => {
