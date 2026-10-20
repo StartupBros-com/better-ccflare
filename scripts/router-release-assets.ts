@@ -213,16 +213,45 @@ async function ghFetch(token: string, url: string, init: RequestInit = {}) {
 	return response;
 }
 
+const cleanEnv = (home: string) => ({
+	PATH: process.env.PATH ?? "",
+	HOME: home,
+});
+
+export function smokeDownloadedAssets(
+	files: Map<string, Uint8Array>,
+	identity: ArtifactIdentity,
+	root: string,
+) {
+	const directory = mkdtempSync(join(root, "download-"));
+	for (const [name, bytes] of files)
+		writeFileSync(join(directory, name), bytes);
+	// Keep runtime caches outside the exact three-file download inventory.
+	const home = mkdtempSync(join(root, "smoke-home-"));
+	// No token in the executable verification environment.
+	execFileSync(
+		"bun",
+		[
+			"--no-env-file",
+			"run",
+			"apps/cli/prepare-router-release.ts",
+			"verify",
+			directory,
+			identity.repository,
+			identity.version,
+			identity.ref,
+			identity.sha,
+		],
+		{ env: cleanEnv(home), stdio: ["ignore", 2, 2] },
+	);
+}
+
 async function githubAssets(
 	token: string,
 	identity: ArtifactIdentity,
 	root: string,
 ): Promise<AssetTransport & { url(): Promise<string> }> {
 	const release = await githubTransport(token);
-	const cleanEnv = (home: string) => ({
-		PATH: process.env.PATH ?? "",
-		HOME: home,
-	});
 	return {
 		validate: async () => {
 			const result = await validateDraft(release, identity);
@@ -279,27 +308,7 @@ async function githubAssets(
 				},
 			);
 		},
-		smoke: async (files) => {
-			const directory = mkdtempSync(join(root, "download-"));
-			for (const [name, bytes] of files)
-				writeFileSync(join(directory, name), bytes);
-			// No token in the executable verification environment.
-			execFileSync(
-				"bun",
-				[
-					"--no-env-file",
-					"run",
-					"apps/cli/prepare-router-release.ts",
-					"verify",
-					directory,
-					identity.repository,
-					identity.version,
-					identity.ref,
-					identity.sha,
-				],
-				{ env: cleanEnv(directory), stdio: ["ignore", 2, 2] },
-			);
-		},
+		smoke: async (files) => smokeDownloadedAssets(files, identity, root),
 		url: async () =>
 			(
 				(await (
