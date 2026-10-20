@@ -133,7 +133,7 @@ Proxy requests to Claude API. All requests to paths starting with `/v1/` are for
 - Any other Claude API v1 endpoint
 
 **Codex CLI as a Client:**
-Codex CLI (and other OpenAI Responses API clients) can target better-ccflare directly. Requests to `/v1/responses` and `/v1/responses/compact` are intercepted before the normal proxy and translated to Anthropic `/v1/messages` internally, then routed through the account pool like any other request. See the [README](../README.md#codex-cli-as-a-client) for configuration details.
+Codex CLI (and other OpenAI Responses API clients) can target better-ccflare directly. Requests to `/v1/responses` and `/v1/responses/compact` are intercepted before the normal proxy and translated to Anthropic `/v1/messages` internally, then routed through the account pool like any other request. See the [client reference](reference.md#codex-cli-as-a-client) for configuration details.
 
 Note: this is distinct from the `codex` *provider*, which routes requests outbound to OpenAI's Codex endpoint.
 

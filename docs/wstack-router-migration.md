@@ -2,11 +2,11 @@
 
 wstack Router is the independent product identity of the [StartupBros/wstack-router fork](https://github.com/StartupBros/wstack-router), presented as a House of Vibe project. It continues tombii/better-ccflare and snipeship/ccflare under the existing MIT license. Git history, contributor acknowledgements, and license terms remain intact.
 
-The source repository is public and was moved from `StartupBros-com/better-ccflare` to `StartupBros/wstack-router` on 2026-10-19 (see [the repository move](#repository-move)). It remains a fork of tombii/better-ccflare. No release has been published. [Fork support](https://github.com/StartupBros/wstack-router/issues) is in the new repository.
+The source repository is public and was moved from `StartupBros-com/better-ccflare` to `StartupBros/wstack-router` on 2026-10-19 (see [the repository move](#repository-move)). It remains a fork of tombii/better-ccflare. [Router 3.6.2 for Linux x86_64](reference.md#install-the-linux-x86_64-release) is now published; npm packages, container images, and other-platform Router binaries are not. [Fork support](https://github.com/StartupBros/wstack-router/issues) is in the new repository.
 
 ## Install without replacing your current executable
 
-Follow the [source quickstart](../README.md#install-from-source). It builds the current fork with `bun install --frozen-lockfile` and `bun run build`, then installs the unchanged `apps/cli/dist/better-ccflare` artifact under **both** executable names in a fresh directory:
+Follow the [source quickstart](reference.md#install-from-source). It builds the current fork with `bun install --frozen-lockfile` and `bun run build`, then installs the unchanged `apps/cli/dist/better-ccflare` artifact under **both** executable names in a fresh directory:
 
 - `wstack-router` is the preferred command.
 - `better-ccflare` is the compatibility command, not a second server.
@@ -46,7 +46,7 @@ Branded builds do not offer an actionable upstream update. Do not install a regi
    ```
 
    If you have local changes or a diverged branch, stop and resolve them; do not reset or overwrite your work. These are manual maintainer commands, not an auto-updater.
-3. Repeat the README's local installation block. It creates another fresh directory instead of overwriting the previous executable. Verify both commands' `--version` and `--git-sha` output before choosing that directory in PATH. Repointing or restarting an existing service is a separate deployment operation, not part of this installation guide.
+3. Repeat the [source installation](reference.md#install-from-source) local installation block. It creates another fresh directory instead of overwriting the previous executable. Verify both commands' `--version` and `--git-sha` output before choosing that directory in PATH. Repointing or restarting an existing service is a separate deployment operation, not part of this installation guide.
 
 ## Roll back the command choice
 
@@ -85,11 +85,11 @@ The CI counterpart is the separate [Prepare wstack Router Artifacts](../.github/
 - `signpath-release.yml` and `signpath-test.yml` submit signing requests; they are not local smoke checks.
 - `docker-publish.yml` can publish images on manual dispatch or after the release workflow completes successfully.
 
-Do not invoke those workflows for preparation, change versions manually, or push a tag to test this path. Actual publication requires separate approval and validation of release wiring, version/tag agreement, provenance, and intended destinations **before** creating a release tag. These local files are not a published downloadable release, and there is no new live download URL.
+Do not invoke those workflows for preparation, change versions manually, or push a tag to test this path. Actual publication requires separate approval and validation of release wiring, version/tag agreement, provenance, and intended destinations **before** creating a release tag. These locally prepared files are not a published downloadable release. For the separately published 3.6.2 artifact, use the [consumer installation](reference.md#install-the-linux-x86_64-release).
 
 ## Repository move
 
-On 2026-10-19 the source repository was transferred from `StartupBros-com/better-ccflare` to [`StartupBros/wstack-router`](https://github.com/StartupBros/wstack-router). It remains a public fork of tombii/better-ccflare, and the transfer retains the fork relationship, Git history, and the MIT license. Contributor credits are unchanged. The post-transfer check confirmed the same repository ID, default-branch commit, branches/tags, issue and pull-request identities, and active workflows. The old repository URL redirects to the new home. There were no releases or assets before or after the move; this is not a published binary release.
+On 2026-10-19 the source repository was transferred from `StartupBros-com/better-ccflare` to [`StartupBros/wstack-router`](https://github.com/StartupBros/wstack-router). It remains a public fork of tombii/better-ccflare, and the transfer retains the fork relationship, Git history, and the MIT license. Contributor credits are unchanged. The post-transfer check confirmed the same repository ID, default-branch commit, branches/tags, issue and pull-request identities, and active workflows. The old repository URL redirects to the new home. At the time of the transfer check, there were no releases or assets before or immediately after the move; the move itself was not a binary release. Router 3.6.2 was published separately afterward.
 
 Existing checkouts keep working under their current directory name; do not rename it. To point an existing checkout at the new location, inspect first, then update the remote:
 
@@ -99,15 +99,15 @@ git remote set-url origin https://github.com/StartupBros/wstack-router.git
 git remote -v
 ```
 
-The old repository URLs are kept in historical documentation and were verified to redirect after the move, but update your remote rather than depending on that indefinitely. A fresh clone uses the README's `git clone ... better-ccflare` form, which keeps the local directory name compatible.
+The old repository URLs are kept in historical documentation and were verified to redirect after the move, but update your remote rather than depending on that indefinitely. A fresh clone uses the [source guide's](reference.md#install-from-source) `git clone ... better-ccflare` form, which keeps the local directory name compatible.
 
-Still pending separate approval and validation: npm publication, GHCR images, signing, and any release workflow. The repository move does not validate any of them, and the existing publishing workflows listed above must not be invoked for it. In `.github/workflows/managed-routing-postgres.yml`, the exact repository match selects the self-hosted runner, so the moved repository uses the hosted runner fallback until runner access is verified and that match is updated. The exact-origin allowlist in `apps/cli/build-provenance.ts` accepts the verified new origin forms while retaining the old ones. Its clean-tree, explicit-context, version, and exact-tag checks remain unchanged; untagged builds still have no proven release identity and branded builds have no actionable update channel.
+At transfer time, npm publication, GHCR images, signing, and release workflows still required separate approval and validation. The move did not validate any of them; subsequent Router release automation is documented in the [release guide](wstack-router-releases.md). The existing publishing workflows listed above must not be invoked merely to move the repository. The transfer-time check also found that `.github/workflows/managed-routing-postgres.yml` used an exact repository match for its self-hosted runner, with the moved repository taking the hosted fallback; inspect current workflow configuration before making runner assumptions. The exact-origin allowlist in `apps/cli/build-provenance.ts` accepts the verified new origin forms while retaining the old ones. Its clean-tree, explicit-context, version, and exact-tag checks remain unchanged; untagged builds still have no proven release identity and branded builds have no actionable update channel.
 
 GitHub redirects can be broken by reuse of the old repository path. [Detaching a fork](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/detaching-a-fork) is a separate irreversible decision and has not been made.
 
 ## Not included
 
-No detaching of the fork or visibility change; registry/package, image or release publication; tag push; production deployment; provider inference; new installer; config migration; update adapter; or external harness/wstack integration is part of this handoff. Upstream Docker Compose recipes retain their existing behavior and images. A new product name does not change the provider usage rules.
+No detaching of the fork or visibility change; registry/package, image or release publication; tag push; production deployment; provider inference; new installer; config migration; update adapter; or external harness/wstack integration was part of the identity-change and repository-transfer handoff. Upstream Docker Compose recipes retain their existing behavior and images. A new product name does not change the provider usage rules.
 
 ## If installation fails
 
