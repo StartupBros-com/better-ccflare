@@ -70,76 +70,67 @@ This project builds upon the excellent foundation of [snipeship/ccflare](https:/
 
 [Release 3.6.2](https://github.com/StartupBros/wstack-router/releases/tag/v3.6.2) contains one standalone Linux x86_64 binary; Node.js and Bun are not required to run it. For other platforms or a local build, use [Install from source](#install-from-source).
 
-Requires Bash on Linux x86_64, `curl`, GNU coreutils (`sha256sum`, `cmp`, `wc`, `install`, `mktemp`), and a current [GitHub CLI](https://cli.github.com/) supporting the attestation flags below. Downloads use public HTTPS URLs without credentials. Attestation lookup may require your existing GitHub CLI authentication. If a tool, flag, authentication, or verification step fails, stop and resolve it; do not skip verification or run the download manually.
+Requires Bash on Linux x86_64, `curl`, and GNU coreutils (`sha256sum`, `mkdir`, `chmod`). No GitHub CLI, Node.js, or Bun is needed.
 
-Paste the whole block into Bash. It downloads exactly three assets into a fresh directory, checks the pinned size and checksum, and verifies GitHub attestations for both the binary and manifest **before installing or executing either command**. The expected source is `5d7b2a888a9b61d87916332b414e46606498d896` at `refs/tags/v3.6.2`; these expectations come from this guide, not from the downloaded manifest.
+**1. Download and check.** Paste the whole block into Bash. It downloads one binary into a new version directory, checks its SHA-256, and only then makes it executable. It does not run it.
 
 <!-- router-release-install -->
 ```bash
 (
   set -eu
   umask 077
-  test "$(uname -s)" = Linux
-  test "$(uname -m)" = x86_64
-  command -v curl
-  command -v sha256sum
-  command -v gh
-
   version_dir="$HOME/.local/lib/wstack-router/3.6.2"
+  mkdir -p "$HOME/.local/lib/wstack-router"
+  mkdir "$version_dir"
+  cd "$version_dir"
+  curl -q --fail --location --proto '=https' --proto-redir '=https' \
+    --output wstack-router https://github.com/StartupBros/wstack-router/releases/download/v3.6.2/better-ccflare-linux-amd64
+  digest=b01a4989323ecf4e2d0a68394b45828741430d89eb35288f7318a28c45b4c9d7
+  printf '%s  wstack-router\n' "$digest" | sha256sum --check --strict -
+  chmod 755 wstack-router
+)
+```
+<!-- /router-release-install -->
+
+The checksum verifies the bytes against this trusted README; it does not independently prove who built them. Before the first run, you can also [verify signed build provenance](docs/wstack-router-releases.md#optional-consumer-provenance-verification). That optional check uses GitHub CLI to verify the repository, source commit, tag, workflow identity, signer commit, and hosted runner.
+
+If any command fails, stop: do not run the binary. The block refuses any existing `3.6.2` path, including a symlink, and leaves partial downloads for inspection rather than deleting or overwriting them. Inspect the error and existing files before retrying.
+
+**2. Run.** After the checksum (and optional provenance check) succeeds:
+
+<!-- router-release-run -->
+```bash
+"$HOME/.local/lib/wstack-router/3.6.2/wstack-router" --help
+```
+<!-- /router-release-run -->
+
+Continue at [Start the local server](#start-the-local-server), or add the optional aliases below. Existing service users should follow the [migration and rollback guide](docs/wstack-router-migration.md) instead; this quickstart does not change running services.
+
+#### Optional: add commands to PATH
+
+After verification succeeds, create `wstack-router` and the compatible `better-ccflare` command in `$HOME/.local/bin`. This checks both names before creating either and refuses existing files, directories, or symlinks, including broken ones.
+
+<!-- router-release-path -->
+```bash
+(
+  set -eu
+  binary="$HOME/.local/lib/wstack-router/3.6.2/wstack-router"
   bin_dir="$HOME/.local/bin"
+  test -x "$binary"
+  mkdir -p "$bin_dir"
   for name in wstack-router better-ccflare; do
     if [ -e "$bin_dir/$name" ] || [ -L "$bin_dir/$name" ]; then
       printf 'Refusing existing command: %s\n' "$bin_dir/$name" >&2
       exit 1
     fi
   done
-  if [ -e "$version_dir" ] || [ -L "$version_dir" ]; then
-    printf 'Refusing existing version directory: %s\n' "$version_dir" >&2
-    exit 1
-  fi
-
-  download_dir=$(mktemp -d)
-  printf 'Downloads: %s\n' "$download_dir"
-  cd "$download_dir"
-  base=https://github.com/StartupBros/wstack-router/releases/download/v3.6.2
-  curl -q --fail --location --proto '=https' --proto-redir '=https' --output better-ccflare-linux-amd64 "$base/better-ccflare-linux-amd64"
-  curl -q --fail --location --proto '=https' --proto-redir '=https' --output SHA256SUMS "$base/SHA256SUMS"
-  curl -q --fail --location --proto '=https' --proto-redir '=https' --output release-manifest.json "$base/release-manifest.json"
-
-  digest=b01a4989323ecf4e2d0a68394b45828741430d89eb35288f7318a28c45b4c9d7
-  test "$(wc -c < better-ccflare-linux-amd64)" -eq 97965536
-  printf '%s  better-ccflare-linux-amd64\n' "$digest" | cmp - SHA256SUMS
-  sha256sum --check --strict SHA256SUMS
-  source_sha=5d7b2a888a9b61d87916332b414e46606498d896
-  for asset in better-ccflare-linux-amd64 release-manifest.json; do
-    gh attestation verify "$asset" \
-      --repo StartupBros/wstack-router \
-      --source-digest "$source_sha" \
-      --source-ref refs/tags/v3.6.2 \
-      --cert-identity https://github.com/StartupBros/wstack-router/.github/workflows/router-release-artifacts.yml@refs/tags/v3.6.2 \
-      --signer-digest "$source_sha" \
-      --deny-self-hosted-runners
-  done
-
-  mkdir -p "$HOME/.local/lib/wstack-router" "$bin_dir"
-  mkdir "$version_dir"
-  install -m 755 better-ccflare-linux-amd64 "$version_dir/wstack-router"
-  cd "$version_dir"
-  test "$(./wstack-router --version)" = 'wstack Router v3.6.2'
-  test "$(./wstack-router --git-sha)" = "$source_sha"
-  ./wstack-router --help
-  ln -s "$version_dir/wstack-router" "$bin_dir/wstack-router"
-  ln -s "$version_dir/wstack-router" "$bin_dir/better-ccflare"
-  test "$("$bin_dir/better-ccflare" --version)" = 'wstack Router v3.6.2'
-  test "$("$bin_dir/better-ccflare" --git-sha)" = "$source_sha"
-  printf 'Installed wstack Router 3.6.2 (%s)\nAdd %s to PATH in your shell.\n' "$source_sha" "$bin_dir"
+  ln -sT "$binary" "$bin_dir/wstack-router"
+  ln -sT "$binary" "$bin_dir/better-ccflare"
 )
 ```
-<!-- /router-release-install -->
+<!-- /router-release-path -->
 
-The subshell stops on any failed check and leaves the download directory for inspection. It uses no `sudo`, does not overwrite commands (including broken symlinks), and refuses an existing version directory. If a later step fails, inspect the printed error and any files already created before retrying; do not force replacement.
-
-After success, add `$HOME/.local/bin` to your shell's PATH configuration. Check `command -v wstack-router` and `command -v better-ccflare` in each terminal; both should resolve there. Existing commands elsewhere remain untouched, but PATH order determines which runs. Continue at [Start the local server](#start-the-local-server). Existing service users should follow the [migration and rollback guide](docs/wstack-router-migration.md) rather than changing a running service with this quickstart.
+After success, use `export PATH="$HOME/.local/bin:$PATH"` in each terminal where you want the short commands. Check `command -v wstack-router` and `command -v better-ccflare`; both should resolve there. To keep this PATH setting, add it to your shell configuration yourself. Nothing here edits shell profiles or uses `sudo`. Existing commands elsewhere remain untouched; PATH order determines which runs. If alias creation fails, inspect the error and any link already created rather than forcing replacement.
 
 ### Install from source
 
@@ -171,6 +162,8 @@ printf 'Installed commands in %s\n' "$install_dir"
 The PATH change applies to this shell only. To keep it, add the printed directory (its literal path, not `$install_dir`) to your shell's PATH configuration, ahead of older installations. Use `command -v wstack-router` and `command -v better-ccflare` to confirm which commands will run. Keep the prior executable and its location for rollback; do not overwrite a global install or change an existing service as part of this quickstart.
 
 ### Start the local server
+
+The commands below assume you completed the optional [PATH setup](#optional-add-commands-to-path) or the source install. If you skipped PATH setup, replace `wstack-router` (or `better-ccflare`) in these examples with `"$HOME/.local/lib/wstack-router/3.6.2/wstack-router"`.
 
 For a new local setup, start the server and dashboard with:
 
@@ -273,7 +266,7 @@ bunx better-ccflare@latest
 Continue to [Configure Claude SDK](https://github.com/tombii/better-ccflare#configure-claude-sdk).
 </details>
 
-The configuration reference below also applies to wstack Router. Legacy `better-ccflare` command examples work with the source-installed compatibility command.
+The configuration reference below also applies to wstack Router. Legacy `better-ccflare` command examples work with the optional release alias or the source-installed compatibility command.
 
 ### Environment Variables
 
