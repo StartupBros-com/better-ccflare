@@ -2,12 +2,13 @@ import { expect, test } from "bun:test";
 import {
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	type AssetTransport,
 	assertArtifactEvent,
@@ -219,6 +220,49 @@ globalThis.fetch = async (input) => {
 			"bun stderr diagnostic",
 		])
 			expect(result.stderr.toString()).toContain(diagnostic);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("production smoke launcher keeps runtime HOME out of downloaded inventory", () => {
+	const root = mkdtempSync(join(tmpdir(), "router-smoke-"));
+	try {
+		const names = [
+			"SHA256SUMS",
+			"better-ccflare-linux-amd64",
+			"release-manifest.json",
+		];
+		// Run the real launcher and verifier, not a replacement bun executable.
+		// Invalid JSON stops verification before any inert executable bytes can run.
+		const result = Bun.spawnSync(
+			[
+				process.execPath,
+				"--no-env-file",
+				"-e",
+				`import { smokeDownloadedAssets } from ${JSON.stringify(join(import.meta.dir, "../router-release-assets.ts"))};
+smokeDownloadedAssets(new Map(${JSON.stringify(names)}.map(name => [name, new TextEncoder().encode("inert text")])), ${JSON.stringify(identity)}, ${JSON.stringify(root)});`,
+			],
+			{
+				cwd: join(import.meta.dir, "../.."),
+				env: {
+					PATH: `${dirname(process.execPath)}:${process.env.PATH}`,
+					HOME: root,
+				},
+			},
+		);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr.toString()).toContain("Malformed release manifest");
+		expect(result.stderr.toString()).not.toContain("Invalid release inventory");
+		const downloads = readdirSync(root).filter((name) =>
+			name.startsWith("download-"),
+		);
+		expect(downloads).toHaveLength(1);
+		expect(readdirSync(join(root, downloads[0])).sort()).toEqual(names);
+		for (const name of names)
+			expect(readFileSync(join(root, downloads[0], name), "utf8")).toBe(
+				"inert text",
+			);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
