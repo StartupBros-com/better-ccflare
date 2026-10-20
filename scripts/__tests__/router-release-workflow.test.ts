@@ -456,8 +456,10 @@ test("workflow jobs isolate build credentials and permissions; dispatch and atte
 		"id-token": "write",
 		attestations: "write",
 	});
+	// Listing drafts requires push access even though validate-draft is read-only.
+	expect(artifacts.permissions).toEqual({});
 	expect(artifacts.jobs.validate.permissions).toEqual({
-		contents: "read",
+		contents: "write",
 		"pull-requests": "read",
 		actions: "read",
 	});

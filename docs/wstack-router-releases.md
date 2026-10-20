@@ -134,9 +134,12 @@ current `main` head.
    release commit and tag ref. The workflow file must exist on `main` and in the tag.
 3. The tag run requires `github.sha` and `github.ref` to equal the release identity,
    then revalidates eligibility, source CI, merged PR, tag and draft read-only.
+   The `validate` job needs `contents: write` because GitHub's
+   [release listing](https://docs.github.com/en/rest/releases/releases#list-releases)
+   only exposes drafts to callers with push access; validation does not mutate them.
 4. A credential-free `build` job runs `apps/cli/prepare-router-release.ts prepare`.
    A separate `attest` job (`id-token: write`, `attestations: write`) attests the
-   binary and manifest. A separate `stage` job holds the write token.
+   binary and manifest. A separate `stage` job holds its own write token for uploads.
 5. `stage` uploads only missing assets, re-reads the inventory, downloads fresh bytes,
    authenticates attestations and then runs smoke checks. It revalidates release
    eligibility, source CI, merged PR, tag and draft again after those checks, before

@@ -34,7 +34,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: read
+      # Draft listing requires push access even though validate-draft is read-only.
+      # https://docs.github.com/en/rest/releases/releases#list-releases
+      contents: write
       pull-requests: read
       actions: read
     steps:
