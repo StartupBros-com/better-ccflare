@@ -1,6 +1,6 @@
 {
 	"name": "better-ccflare",
-	"version": "3.6.1",
+	"version": "3.6.2",
 	"description": "wstack Router - a load balancer proxy for Claude Code across multiple account providers",
 	"license": "MIT",
 	"repository": {
