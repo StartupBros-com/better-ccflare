@@ -84,7 +84,9 @@ jobs:
 
 		// The self-hosted main-branch lane (linux-x64-bccf-main) was retired with
 		// the move out of StartupBros-com; no job here may route to LAN hardware.
-		expect(workflow.jobs["managed-routing-foundation"]["runs-on"]).toBe("ubuntu-latest");
+		expect(workflow.jobs["managed-routing-foundation"]["runs-on"]).toBe(
+			"ubuntu-latest",
+		);
 	});
 
 	test("preserves the managed-routing PostgreSQL gate and exact Bun pin", async () => {
