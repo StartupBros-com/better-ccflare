@@ -1,11 +1,11 @@
-# better-ccflare Documentation
+# wstack Router Documentation
+
+wstack Router is the maintained fork at [StartupBros/wstack-router](https://github.com/StartupBros/wstack-router), built on upstream better-ccflare. The `better-ccflare` command and `BETTER_CCFLARE_*` configuration names remain supported.
 
 ## Track Every Request. Go Low-Level. Never Hit Rate Limits Again.
 
-![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
-![Version](https://img.shields.io/badge/version-2.0.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Bun](https://img.shields.io/badge/bun-%3E%3D1.2.8-f472b6)
+[Bun requirements](../README.md#install-from-source)
 
 ## Overview
 
@@ -78,66 +78,38 @@ When working with Claude API at scale, rate limits can become a significant bott
 
 ## Quick Start
 
-### 1. Install better-ccflare
+### 1. Install wstack Router
+
+Follow the root [Install from source](../README.md#install-from-source) instructions for the canonical repository, runtime requirements, frozen dependency install, build, and both command aliases. The build alone does not install a command on your PATH. Upstream better-ccflare distributions are not Router builds.
+
+### 2. Start the Server
 
 ```bash
-# Clone the repository
-git clone https://github.com/snipeship/better-ccflare.git
-cd better-ccflare
-
-# Install dependencies
-bun install
+BETTER_CCFLARE_HOST=127.0.0.1 wstack-router --serve --port 8080
 ```
 
-### 2. Start better-ccflare (CLI + Server)
-
-```bash
-# Start better-ccflare with CLI (automatically starts server if no command specified)
-bun run cli
-
-# Or start just the server
-bun run server
-
-# Start server on specific port
-bun run server --port 8081
-
-# Specify session duration for session-based strategies (default: 5 hours)
-SESSION_DURATION_MS=21600000 bun run server  # 6 hours
-
-# Run CLI directly with Bun (if not using npm scripts)
-bun run apps/cli/src/main.ts
-```
+Leave the server running. `better-ccflare` remains an equivalent command; source-checkout commands are listed below. If you choose a different port, use it consistently in the following commands and client configuration.
 
 ### 3. Add Your Claude Accounts
 
+In another terminal with the same installed command on PATH and the same local user/database configuration:
+
 ```bash
-# In another terminal, add your accounts
-# Add a work account
-bun run apps/cli/src/main.ts --add-account work-account --mode max --priority 0
-
-# Add a personal account
-bun run apps/cli/src/main.ts --add-account personal-account --mode max --priority 10
-
-# Add accounts with specific priorities
-bun run apps/cli/src/main.ts --add-account pro-account --mode max --priority 0
-bun run apps/cli/src/main.ts --add-account max-account --mode max --priority 10
-
-# Or if you have better-ccflare command available globally
-better-ccflare --add-account work-account --mode max --priority 0
+wstack-router --add-account work-account --mode claude-oauth --priority 0 --api-url http://127.0.0.1:8080
+wstack-router routing list --api-url http://127.0.0.1:8080
 ```
+
+Use `claude-oauth` for Claude OAuth. `max` remains a deprecated compatibility alias: the CLI warns and normalizes it to `claude-oauth`. Account creation persists locally before reviewing routing on the live server. Pass the explicit origin because the routing client otherwise defaults to port 8788 unless `BETTER_CCFLARE_API_URL` is set. If review fails after a created account ID is printed, do not recreate the account: follow [First-time Setup](./cli.md#first-time-setup) to inspect that ID and configure management API authentication when needed.
 
 ### 4. Configure Your Claude Client
 
-```bash
-# Set the base URL to use better-ccflare
-export ANTHROPIC_BASE_URL=http://localhost:8080
-```
+Follow [Configure Claude SDK](../README.md#configure-claude-sdk) for client setup and authentication, using the same server port.
 
 ### 5. Monitor Your Usage
 
-- **Web Dashboard**: Open [http://localhost:8080/dashboard](http://localhost:8080/dashboard) for real-time analytics
-- **CLI**: Check status with `bun run apps/cli/src/main.ts --list`
-- **Stats**: View detailed statistics with `bun run apps/cli/src/main.ts --stats`
+- **Web Dashboard**: Open [http://127.0.0.1:8080/dashboard](http://127.0.0.1:8080/dashboard) for real-time analytics
+- **CLI**: Check status with `wstack-router --list`
+- **Stats**: View detailed statistics with `wstack-router --stats`
 
 ## Project Structure
 
@@ -193,7 +165,7 @@ The better-ccflare CLI provides comprehensive command-line interface for managem
 bun run apps/cli/src/main.ts [command]
 
 # Account management
-bun run apps/cli/src/main.ts --add-account <name> --mode <max|console|zai|openai-compatible> --priority <number>  # Add account
+bun run apps/cli/src/main.ts --add-account <name> --mode <ACCOUNT_MODE> --priority <number> --api-url http://127.0.0.1:8080  # Add account; modes: see CLI Commands
 bun run apps/cli/src/main.ts --list                   # List accounts
 bun run apps/cli/src/main.ts --remove <name>          # Remove account
 bun run apps/cli/src/main.ts --pause <name>           # Pause account
@@ -248,7 +220,7 @@ NODE_ENV=production            # Environment mode
 - [SQLite Documentation](https://www.sqlite.org/docs.html) - SQLite database docs
 
 ### Support
-- [GitHub Repository](https://github.com/snipeship/better-ccflare) - Source code and issues
+- [GitHub Repository](https://github.com/StartupBros/wstack-router) - Router source code and issues
 - [Contributing](./contributing.md) - How to contribute to better-ccflare
 
 ## License
