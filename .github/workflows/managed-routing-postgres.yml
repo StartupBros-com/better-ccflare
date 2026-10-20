@@ -12,8 +12,7 @@ permissions:
 
 jobs:
   managed-routing-foundation:
-    # Runner-group workflow restrictions must independently block edited PR workflows.
-    runs-on: ${{ github.repository == 'StartupBros-com/better-ccflare' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'linux-x64-bccf-main' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
       postgres:
