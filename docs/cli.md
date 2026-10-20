@@ -22,7 +22,7 @@ The wstack Router CLI provides a command-line interface for managing accounts, m
 
 ### Installation
 
-Follow the root [Install from source](../README.md#install-from-source) instructions for the canonical `StartupBros/wstack-router` repository, required runtimes, frozen dependency install, build, and installation of both command names. The build alone does not put either command on your PATH. Upstream registry packages and releases are not Router distributions.
+Follow the root [Linux x86_64 release installation](../README.md#install-the-linux-x86_64-release) for Router 3.6.2, including checksum and attestation verification before installation, or [build from source](../README.md#install-from-source). Both paths provide `wstack-router` and `better-ccflare`. Router npm packages, container images, and other-platform binaries are not published. Upstream registry packages and releases are not Router distributions.
 
 The examples below use the installed `wstack-router` command. `better-ccflare` is equivalent; after building, source-checkout commands such as `bun run cli [command]` remain supported. In a second terminal, make sure the same installation directory is on PATH.
 
