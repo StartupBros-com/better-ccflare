@@ -80,7 +80,7 @@ When working with Claude API at scale, rate limits can become a significant bott
 
 ### 1. Install wstack Router
 
-Follow the root [Install from source](../README.md#install-from-source) instructions for the canonical repository, runtime requirements, frozen dependency install, build, and both command aliases. The build alone does not install a command on your PATH. Upstream better-ccflare distributions are not Router builds.
+Use the root [Linux x86_64 release installation](../README.md#install-the-linux-x86_64-release) for Router 3.6.2: prerequisites, pinned downloads, checksum and attestation verification, and both command aliases. For other platforms or local builds, use [Install from source](../README.md#install-from-source). Router npm packages, container images, and other-platform binaries are not published; upstream better-ccflare distributions are not Router builds.
 
 ### 2. Start the Server
 
