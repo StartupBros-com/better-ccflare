@@ -95,13 +95,19 @@ printf 'Installed commands in %s\n' "$install_dir"
 
 The PATH change applies to this shell only. To keep it, add the printed directory (its literal path, not `$install_dir`) to your shell's PATH configuration, ahead of older installations. Use `command -v wstack-router` and `command -v better-ccflare` to confirm which commands will run. Keep the prior executable and its location for rollback; do not overwrite a global install or change an existing service as part of this quickstart.
 
-For a new local setup, run `wstack-router --help` for account options, then start the server and dashboard with:
+For a new local setup, start the server and dashboard with:
 
 ```bash
 BETTER_CCFLARE_HOST=127.0.0.1 wstack-router --serve --port 8080
 ```
 
-Open `http://localhost:8080` and continue to [Configure Claude SDK](#configure-claude-sdk). If that port is occupied, choose an unused port and use it in your client configuration. `better-ccflare` remains an equivalent command. This guide does not change a running service or move existing accounts.
+Leave the server running, then:
+
+1. Open [the dashboard](http://127.0.0.1:8080/dashboard), select **Accounts > Add Account**, and choose your provider. Complete its credential setup and routing review before configuring a client. For **OpenAI-Compatible**, enter your provider endpoint and credential, select **Discover models**, set the **Sonnet Model** mapping, select **Review routing**, check **I reviewed these routing changes**, then select **Create account**. Other providers have their own authentication steps. For the CLI alternative and live routing verification against this same `http://127.0.0.1:8080` server, see [First-time Setup](docs/cli.md#first-time-setup).
+2. Follow [Configure Claude SDK](#configure-claude-sdk), using this server's origin. A provider credential belongs to the account you just added; a proxy API key, when required, authenticates your client to Router.
+3. After your first client request, open the dashboard's **Requests** tab. Find that request and check its account and status to confirm which account handled it and whether it succeeded. An account appearing in **Accounts** alone does not prove a request routed successfully.
+
+If port 8080 is occupied, choose an unused port and use it consistently for the server, dashboard, CLI routing commands, and client configuration. `better-ccflare` remains an equivalent command. This guide does not change a running service or move existing accounts.
 
 See [manual updates, unchanged paths, and rollback](docs/wstack-router-migration.md). Report fork issues at [StartupBros/wstack-router/issues](https://github.com/StartupBros/wstack-router/issues).
 

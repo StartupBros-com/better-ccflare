@@ -1,6 +1,6 @@
-# better-ccflare CLI Documentation
+# wstack Router CLI Documentation
 
-The better-ccflare CLI provides a command-line interface for managing OAuth accounts, monitoring usage statistics, and controlling the load balancer.
+The wstack Router CLI provides a command-line interface for managing accounts, monitoring usage statistics, and controlling the load balancer. Router builds on upstream better-ccflare; `better-ccflare` remains an equivalent command, and existing `BETTER_CCFLARE_*` configuration names remain unchanged.
 
 ## Table of Contents
 
@@ -20,49 +20,41 @@ The better-ccflare CLI provides a command-line interface for managing OAuth acco
 
 ## Installation and Setup
 
-### Prerequisites
-
-- Bun runtime (>= 1.2.8)
-- Node.js compatible system
-
 ### Installation
 
-1. Clone the repository:
-```bash
-git clone https://github.com/tombii/better-ccflare.git
-cd better-ccflare
-```
+Follow the root [Install from source](../README.md#install-from-source) instructions for the canonical `StartupBros/wstack-router` repository, required runtimes, frozen dependency install, build, and installation of both command names. The build alone does not put either command on your PATH. Upstream registry packages and releases are not Router distributions.
 
-2. Install dependencies:
-```bash
-bun install
-```
-
-3. Build the CLI:
-```bash
-bun run build
-```
-
-4. Run the CLI:
-```bash
-bun run cli [command]
-# or if globally installed:
-better-ccflare [command]
-```
+The examples below use the installed `wstack-router` command. `better-ccflare` is equivalent; after building, source-checkout commands such as `bun run cli [command]` remain supported. In a second terminal, make sure the same installation directory is on PATH.
 
 ### First-time Setup
 
-1. Add your first OAuth account:
+1. Start the server before adding an account, and leave it running:
 ```bash
-bun run cli --add-account myaccount --mode claude-oauth --priority 0
+BETTER_CCFLARE_HOST=127.0.0.1 wstack-router --serve --port 8080
 ```
 
-2. Start the load balancer server:
+2. In another terminal, add your first OAuth account against that server:
 ```bash
-bun run cli --serve
-# or just:
-bun start
+wstack-router --add-account myaccount --mode claude-oauth --priority 0 --api-url http://127.0.0.1:8080
 ```
+
+Use the same local user and database configuration in both terminals. Account creation writes to the local database, then reviews routing through the live server. Use `claude-oauth` for Claude OAuth. `max` remains a deprecated compatibility alias: the CLI warns and normalizes it to `claude-oauth`.
+
+3. Inspect live routing without changing policy:
+```bash
+wstack-router routing list --api-url http://127.0.0.1:8080
+```
+
+The explicit `--api-url` matters: managed-routing commands otherwise default to `http://127.0.0.1:8788` unless `BETTER_CCFLARE_API_URL` is set. If port 8080 is occupied, choose an unused port and use it consistently for the server, account review, routing commands, dashboard, and client. If API authentication is enabled, see [Managed Routing](#managed-routing-live-server) for `BETTER_CCFLARE_ADMIN_API_KEY` setup.
+
+A failed post-create routing review does **not** undo account creation. If the CLI printed a created account ID before reporting failure or incomplete routing, keep that ID rather than adding the account again. Once the server is reachable and authentication is configured, inspect it with:
+```bash
+wstack-router routing detail <account-id> --api-url http://127.0.0.1:8080
+```
+
+Review failures also do not roll back any family changes already applied; see [Post-create routing review](#post-create-routing-review) for partial-result behavior.
+
+4. Open [the dashboard](http://127.0.0.1:8080/dashboard) and follow the root [Configure Claude SDK](../README.md#configure-claude-sdk) instructions for client setup and authentication.
 
 ## Global Options and Help
 
