@@ -22,9 +22,9 @@ The wstack Router CLI provides a command-line interface for managing accounts, m
 
 ### Installation
 
-Follow the root [Linux x86_64 release installation](../README.md#install-the-linux-x86_64-release) for Router 3.6.2, including checksum and attestation verification before installation, or [build from source](../README.md#install-from-source). Both paths provide `wstack-router` and `better-ccflare`. Router npm packages, container images, and other-platform binaries are not published. Upstream registry packages and releases are not Router distributions.
+Follow the root [Linux x86_64 release installation](../README.md#install-the-linux-x86_64-release) for Router 3.6.2: download, verify the pinned SHA-256, then run. [Signed provenance verification](./wstack-router-releases.md#optional-consumer-provenance-verification) is optional and available before the first run. You can also [build from source](../README.md#install-from-source). Router npm packages, container images, and other-platform binaries are not published. Upstream registry packages and releases are not Router distributions.
 
-The examples below use the installed `wstack-router` command. `better-ccflare` is equivalent; after building, source-checkout commands such as `bun run cli [command]` remain supported. In a second terminal, make sure the same installation directory is on PATH.
+The examples below assume you completed the optional [PATH setup](../README.md#optional-add-commands-to-path) or the source install, which provide both `wstack-router` and `better-ccflare`. Without PATH setup, replace either command with `"$HOME/.local/lib/wstack-router/3.6.2/wstack-router"`. After building, source-checkout commands such as `bun run cli [command]` remain supported. In a second terminal, use the same installation directory on PATH or the same explicit binary path.
 
 ### First-time Setup
 

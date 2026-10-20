@@ -9,6 +9,47 @@ release, publishes npm packages or images, announces, installs, restarts service
 or deploys. Public publication is a separate operator decision; the consumer
 instructions above do not use the draft-only automation helpers.
 
+## Optional consumer provenance verification
+
+The README's [binary install](../README.md#install-the-linux-x86_64-release)
+checks the download against a SHA-256 pinned in that README. If you also want
+signed evidence of its origin, run the following block **after the checksum check
+and before running the binary**. It verifies the binary already downloaded; no
+manifest or additional release asset is needed.
+
+Requires a current [GitHub CLI](https://cli.github.com/) supporting every flag below.
+Attestation lookup may require your existing GitHub CLI authentication. If a tool,
+flag, authentication, or verification step fails, stop and resolve it; do not treat
+an incomplete provenance check as successful.
+
+<!-- router-release-provenance -->
+```bash
+(
+  set -eu
+  binary="$HOME/.local/lib/wstack-router/3.6.2/wstack-router"
+  source_sha=5d7b2a888a9b61d87916332b414e46606498d896
+  gh attestation verify "$binary" \
+    --repo StartupBros/wstack-router \
+    --source-digest "$source_sha" \
+    --source-ref refs/tags/v3.6.2 \
+    --cert-identity https://github.com/StartupBros/wstack-router/.github/workflows/router-release-artifacts.yml@refs/tags/v3.6.2 \
+    --signer-digest "$source_sha" \
+    --deny-self-hosted-runners
+)
+```
+<!-- /router-release-provenance -->
+
+This independently checks GitHub's signed build provenance against the expected
+repository, source commit, tag, workflow identity, signer commit, and hosted-runner
+policy. Those expectations are pinned here, not read from a downloaded manifest.
+Neither a checksum nor provenance proves the program is free of bugs or malicious
+behavior. After verification succeeds, return to the README's separate run step.
+
+The release also publishes `SHA256SUMS` and an attested `release-manifest.json` for
+release auditing; neither is required by the consumer install above. The operator
+pipeline below still verifies the complete inventory and both attestations before
+executing release smoke checks. Its strict verification policy is unchanged.
+
 ## App authentication and verification boundaries
 
 Release PR reconciliation uses a dedicated GitHub App installation token, not the
