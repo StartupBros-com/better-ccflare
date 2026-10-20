@@ -49,6 +49,21 @@ describe("documented source install", () => {
 			"configure-claude-sdk",
 		])
 			expect(guide).toContain(`reference.md#${anchor}`);
+		// Client-only readers need a route that does not start with installation.
+		const sharedClient = "agent-setup.md#shared-client-only";
+		expect(readme).toContain(`docs/${sharedClient}`);
+		expect(readFileSync(join(root, "docs/index.md"), "utf8")).toContain(
+			sharedClient,
+		);
+		const reference = readFileSync(join(root, "docs/reference.md"), "utf8");
+		for (const section of [
+			"## Quick Start",
+			"## Configure Claude SDK",
+			"### Option 3: Remote/Headless VPS Setup (Secure Proxy)",
+		]) {
+			const body = reference.split(`${section}\n`)[1]?.split(/\n#{1,3} /)[0];
+			expect(body, section).toContain(sharedClient);
+		}
 		// A moved heading or an unrebased image must not strand the setup path.
 		for (const file of [
 			"README.md",
