@@ -14,6 +14,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import {
+	COMMAND_NAMES,
+	PRODUCT_NAME,
+} from "../../packages/core/src/product-identity";
 
 export const artifactRoot = resolve(import.meta.dir, "../..");
 export const executableFilename = "better-ccflare-linux-amd64";
@@ -32,9 +36,25 @@ export function digestFile(path: string): string {
 /** Shared isolation for local builds and already-authenticated downloaded releases. */
 export function smokeExecutable(
 	binary: string,
-	version: string,
-	sha?: string,
+	expected: {
+		readonly version: string;
+		readonly sha?: string;
+		readonly repository?: string;
+		readonly ref?: string;
+	},
 ): void {
+	const { version, sha } = expected;
+	// Only downloaded, independently identified historical bytes use the old display.
+	// New builds pass version/SHA alone, even while the checkout is still v3.6.2.
+	const historical =
+		expected.repository === "StartupBros/wstack-router" &&
+		version === "3.6.2" &&
+		expected.ref === "refs/tags/v3.6.2" &&
+		sha === "5d7b2a888a9b61d87916332b414e46606498d896";
+	const product = historical ? "wstack Router" : PRODUCT_NAME;
+	const commands = historical
+		? (["wstack-router", "better-ccflare"] as const)
+		: COMMAND_NAMES;
 	const scratch = mkdtempSync(join(tmpdir(), "router-smoke-"));
 	try {
 		const home = join(scratch, "home");
@@ -42,7 +62,7 @@ export function smokeExecutable(
 		mkdirSync(home);
 		mkdirSync(cwd, { recursive: true });
 		const env = isolatedEnvironment(home, scratch);
-		for (const alias of ["wstack-router", "better-ccflare"]) {
+		for (const alias of commands) {
 			const executable = join(scratch, alias);
 			copyFileSync(binary, executable, constants.COPYFILE_EXCL);
 			for (const flag of [
@@ -57,9 +77,9 @@ export function smokeExecutable(
 					timeout: 10_000,
 				});
 				if (
-					(flag === "--help" && !output.includes("wstack Router")) ||
+					(flag === "--help" && !output.includes(product)) ||
 					(flag === "--version" &&
-						output.trim() !== `wstack Router v${version}`) ||
+						output.trim() !== `${product} v${version}`) ||
 					(flag === "--git-sha" && output.trim() !== sha)
 				)
 					throw new Error(`Unexpected ${alias} ${flag} output`);
@@ -169,7 +189,7 @@ export function prepareArtifacts(
 			JSON.parse(
 				readFileSync(join(artifactRoot, "apps/cli/package.json"), "utf8"),
 			).version;
-		smokeExecutable(staged, version, release?.sha);
+		smokeExecutable(staged, { version, sha: release?.sha });
 		const inventory = [executableFilename, "SHA256SUMS"];
 		if (release) {
 			writeFileSync(

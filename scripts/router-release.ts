@@ -7,6 +7,11 @@ import {
 import type { ConventionalCommit } from "release-please/build/src/commit";
 import type { Scm, ScmRelease } from "release-please/build/src/scm";
 import type { BuildUpdatesOptions } from "release-please/build/src/strategies/base";
+import {
+	isRouterRepository,
+	type RouterRepository,
+	validateRouterRepository,
+} from "../packages/core/src/router-repository";
 
 // Finish the public entry point before traversing its circular internal strategies.
 const { Node } = await import("release-please/build/src/strategies/node");
@@ -22,7 +27,6 @@ setLogger({
 	trace: console.error,
 });
 
-export const ROUTER_REPOSITORY = "StartupBros/wstack-router";
 const aliases: Record<string, string> = {
 	feature: "feat",
 	add: "feat",
@@ -70,7 +74,7 @@ class RouterNode extends Node {
 registerReleaseType("router-node", (options) => new RouterNode(options));
 
 export function createRouterManifest(scm: Scm) {
-	if (`${scm.repository.owner}/${scm.repository.repo}` !== ROUTER_REPOSITORY)
+	if (!isRouterRepository(`${scm.repository.owner}/${scm.repository.repo}`))
 		throw new Error("Wrong release repository");
 	return Manifest.fromManifest(scm, "main");
 }
@@ -85,6 +89,8 @@ export interface DraftIdentity extends SourceIdentity {
 }
 export interface ReleaseTransport {
 	scm: Scm;
+	/** Re-read API identity before release operations; fixtures supply full metadata too. */
+	getRepository(): Promise<unknown>;
 	getHeadSha(): Promise<string>;
 	isAncestor(sourceSha: string, mainSha: string): Promise<boolean>;
 	checkFoundation(sha: string): Promise<boolean>;
@@ -96,10 +102,11 @@ async function assertSource(
 	expected: SourceIdentity,
 	allowAncestor = false,
 ) {
+	const repository = validateRouterRepository(await transport.getRepository());
 	if (
-		expected.repository !== ROUTER_REPOSITORY ||
+		!isRouterRepository(expected.repository) ||
 		`${transport.scm.repository.owner}/${transport.scm.repository.repo}` !==
-			expected.repository
+			repository.full_name
 	)
 		throw new Error("Wrong release repository");
 	if (!/^[a-f0-9]{40}$/.test(expected.sha))
@@ -281,6 +288,7 @@ async function draftFlow(
 		);
 	return {
 		...expected,
+		repository: `${transport.scm.repository.owner}/${transport.scm.repository.repo}`,
 		releaseId: verified.id,
 		tag,
 		pullRequest: candidate.pullRequest.number,
@@ -288,24 +296,48 @@ async function draftFlow(
 }
 
 /** Production transport. Tests use fixtures, not authenticated GitHub acceptance probes. */
+export async function resolveRouterRepository(
+	token: string,
+	repository: string,
+): Promise<RouterRepository> {
+	if (!isRouterRepository(repository))
+		throw new Error("Wrong release repository");
+	// A stale admitted alias may redirect, but only returned metadata proves authority.
+	const response = await fetch(`https://api.github.com/repos/${repository}`, {
+		headers: {
+			Authorization: `Bearer ${token}`,
+			Accept: "application/vnd.github+json",
+			"X-GitHub-Api-Version": "2022-11-28",
+		},
+		redirect: "follow",
+	});
+	if (!response.ok)
+		throw new Error(`GitHub repository metadata: HTTP ${response.status}`);
+	return validateRouterRepository(await response.json());
+}
+
 export async function githubTransport(
 	token: string,
+	repository: string,
 ): Promise<ReleaseTransport> {
-	const owner = "StartupBros";
-	const repo = "wstack-router";
+	const current = await resolveRouterRepository(token, repository);
 	const scm = await GitHub.create({
-		owner,
-		repo,
+		owner: current.owner.login,
+		repo: current.name,
 		token,
 		defaultBranch: "main",
+		// Mutations must never follow a later rename or an unrelated redirect.
+		fetch: (url: string, init?: RequestInit) =>
+			fetch(url, { ...init, redirect: "error" }),
 	});
 	async function read<T>(
 		path: string,
 		optional = false,
 	): Promise<T | undefined> {
 		const response = await fetch(
-			`https://api.github.com/repos/${ROUTER_REPOSITORY}/${path}`,
+			`https://api.github.com/repos/${current.full_name}${path ? `/${path}` : ""}`,
 			{
+				redirect: "error",
 				headers: {
 					Authorization: `Bearer ${token}`,
 					Accept: "application/vnd.github+json",
@@ -325,6 +357,8 @@ export async function githubTransport(
 	}
 	return {
 		scm,
+		getRepository: async () =>
+			validateRouterRepository(await need<unknown>("")),
 		getHeadSha: async () =>
 			(await need<{ object: { sha: string } }>("git/ref/heads/main")).object
 				.sha,
@@ -344,27 +378,38 @@ export async function githubTransport(
 		checkFoundation: async (sha) => {
 			const data = await need<{
 				workflow_runs: {
+					name: string;
 					head_sha: string;
 					head_branch: string;
 					event: string;
 					conclusion: string;
 					status: string;
 					path: string;
-					repository: { full_name: string };
+					repository: unknown;
+					head_repository: unknown;
 				}[];
 			}>(
 				`actions/workflows/managed-routing-postgres.yml/runs?head_sha=${sha}&event=push&branch=main&per_page=100`,
 			);
-			return data.workflow_runs.some(
-				(run) =>
-					run.head_sha === sha &&
-					run.head_branch === "main" &&
-					run.event === "push" &&
-					run.status === "completed" &&
-					run.conclusion === "success" &&
-					run.path === ".github/workflows/managed-routing-postgres.yml" &&
-					run.repository.full_name === ROUTER_REPOSITORY,
-			);
+			return data.workflow_runs.some((run) => {
+				try {
+					return (
+						run.name === "Managed Routing Foundation Gate" &&
+						run.head_sha === sha &&
+						run.head_branch === "main" &&
+						run.event === "push" &&
+						run.status === "completed" &&
+						run.conclusion === "success" &&
+						run.path === ".github/workflows/managed-routing-postgres.yml" &&
+						validateRouterRepository(run.repository).full_name ===
+							current.full_name &&
+						validateRouterRepository(run.head_repository).full_name ===
+							current.full_name
+					);
+				} catch {
+					return false;
+				}
+			});
 		},
 		getTagSha: async (tag) => {
 			let object = (
@@ -428,7 +473,7 @@ if (import.meta.main) {
 		throw new Error(
 			"GITHUB_TOKEN required; supply a token with permissions for the requested release operation",
 		);
-	const transport = await githubTransport(token);
+	const transport = await githubTransport(token, repository);
 	const expected = { repository, sha };
 	const output =
 		command === "draft"

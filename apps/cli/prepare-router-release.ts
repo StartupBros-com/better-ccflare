@@ -13,6 +13,10 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import {
+	isRouterRepository,
+	routerRepositoryOrigins,
+} from "../../packages/core/src/router-repository";
 import { readTombiiTaggedBuildEvidence } from "./build-provenance";
 import {
 	artifactRoot,
@@ -29,7 +33,6 @@ export interface ReleaseIdentity {
 	readonly ref: string;
 	readonly sha: string;
 }
-const repository = "StartupBros/wstack-router";
 const bunPin = readFileSync(join(artifactRoot, ".bun-version"), "utf8").trim();
 const target = "bun-linux-amd64";
 const inventory = [
@@ -39,7 +42,7 @@ const inventory = [
 ].sort();
 function validateIdentity(expected: ReleaseIdentity): void {
 	if (
-		expected.repository !== repository ||
+		!isRouterRepository(expected.repository) ||
 		!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(expected.version) ||
 		expected.ref !== `refs/tags/v${expected.version}` ||
 		!/^[a-f0-9]{40}$/.test(expected.sha)
@@ -90,15 +93,8 @@ export function validateReleaseSource(
 		throw new Error("Release package version mismatch");
 	if (bun !== bunPin || platform !== "linux" || arch !== "x64")
 		throw new Error(`Release requires native Linux x64 Bun ${bunPin}`);
-	const origin = git(["config", "--get", "remote.origin.url"]);
-	if (
-		![
-			"https://github.com/StartupBros/wstack-router",
-			"https://github.com/StartupBros/wstack-router.git",
-			"git@github.com:StartupBros/wstack-router.git",
-			"ssh://git@github.com/StartupBros/wstack-router.git",
-		].includes(origin ?? "")
-	)
+	const origin = git(["config", "--null", "--get", "remote.origin.url"]);
+	if (!routerRepositoryOrigins(expected.repository).includes(origin ?? ""))
 		throw new Error("Release origin does not match expected repository");
 	const evidence = readTombiiTaggedBuildEvidence(
 		version,
@@ -122,12 +118,15 @@ export function prepareRelease(
 	try {
 		const git = (args: string[]): string | null => {
 			try {
-				return execFileSync("git", args, {
+				const output = execFileSync("git", args, {
 					cwd: artifactRoot,
 					env: isolatedEnvironment(scratch, scratch),
 					encoding: "utf8",
 					stdio: ["ignore", "pipe", "inherit"],
-				}).trim();
+				});
+				return args[0] === "config"
+					? output.replace(/\0$/, "")
+					: output.replace(/\r?\n$/, "");
 			} catch {
 				return null;
 			}
@@ -208,7 +207,7 @@ export function verifyReleaseDirectory(
 			throw new Error("Malformed or mismatched release checksums");
 		// Download transports need not preserve mode. Never chmod untrusted input in place.
 		chmodSync(binary, 0o755);
-		smokeExecutable(binary, expected.version, expected.sha);
+		smokeExecutable(binary, expected);
 		return manifest;
 	} finally {
 		rmSync(scratch, { recursive: true, force: true });

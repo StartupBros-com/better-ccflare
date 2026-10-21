@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { COMMAND_NAMES } from "../../../packages/core/src/product-identity";
 import {
 	expectedManifest,
 	validateReleaseSource,
@@ -32,12 +33,17 @@ const bunPin = readFileSync(
 	"utf8",
 ).trim();
 // Independent schema example: never construct verifier input with the producer.
-function schemaExample(sha: string, size: number, sha256: string) {
+function schemaExample(
+	sha: string,
+	size: number,
+	sha256: string,
+	identity = expected,
+) {
 	return {
 		schema: 1,
-		repository: "StartupBros/wstack-router",
-		version: "1.2.3",
-		ref: "refs/tags/v1.2.3",
+		repository: identity.repository,
+		version: identity.version,
+		ref: identity.ref,
 		sha,
 		bun: bunPin,
 		target: "bun-linux-amd64",
@@ -50,7 +56,7 @@ function schemaExample(sha: string, size: number, sha256: string) {
 			artifactMode: "binary",
 			updateChannel: null,
 			source_sha: sha,
-			source_ref: "refs/tags/v1.2.3",
+			source_ref: identity.ref,
 			proven: true,
 			actionable: false,
 			reason: "proven_non_actionable",
@@ -62,15 +68,15 @@ afterEach(() => {
 	for (const dir of dirs.splice(0))
 		rmSync(dir, { recursive: true, force: true });
 });
-function fixture(body?: string) {
+function fixture(body?: string, identity = expected, product = "HoV Router") {
 	const dir = mkdtempSync(join(tmpdir(), "release-verify-test-"));
 	dirs.push(dir);
 	const binary = Buffer.from(
 		body ??
-			`#!/bin/sh\ncase "$1" in\n--help) printf 'wstack Router\\n';;\n--version) printf 'wstack Router v1.2.3\\n';;\n--git-sha) printf '${expected.sha}\\n';;\nesac\n`,
+			`#!/bin/sh\ncase "$1" in\n--help) printf '${product}\\n';;\n--version) printf '${product} v${identity.version}\\n';;\n--git-sha) printf '${identity.sha}\\n';;\nesac\n`,
 	);
 	const digest = createHash("sha256").update(binary).digest("hex");
-	const manifest = schemaExample(expected.sha, binary.length, digest);
+	const manifest = schemaExample(identity.sha, binary.length, digest, identity);
 	writeFileSync(join(dir, filename), binary, { mode: 0o755 });
 	writeFileSync(join(dir, "SHA256SUMS"), `${digest}  ${filename}\n`);
 	writeFileSync(join(dir, "release-manifest.json"), JSON.stringify(manifest));
@@ -107,6 +113,13 @@ function syntheticRelease(mode = "clean", hasPrevious = false) {
 		"build-provenance.ts",
 	])
 		copyFileSync(join(import.meta.dir, "..", name), join(cli, name));
+	const core = join(repo, "packages/core/src");
+	mkdirSync(core, { recursive: true });
+	for (const name of ["router-repository.ts", "product-identity.ts"])
+		copyFileSync(
+			join(import.meta.dir, "../../../packages/core/src", name),
+			join(core, name),
+		);
 	writeFileSync(join(repo, ".bun-version"), "1.4.2\n");
 	writeFileSync(join(repo, ".gitignore"), "apps/cli/dist/\n");
 	for (const dir of [repo, cli])
@@ -168,7 +181,7 @@ import { execFileSync } from "node:child_process";
 if (process.env.CCFLARE_BUILD_PRODUCER !== "wstack-router-binary" || process.env.CCFLARE_ONLY_PLATFORMS !== "bun-linux-amd64") throw new Error("wrong explicit release producer/platform");
 appendFileSync(${JSON.stringify(calls)}, "cli\\n");
 const sha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-const body = '#!/bin/sh\\ntest -z "${shellGuard}" || exit 94\\nprintf "%s %s\\\\n" "' + '$' + '{0##*/}" "$1" >> ${calls}\\ncase "$1" in\\n--help) printf "wstack Router\\\\n";;\\n--version) printf "wstack Router v1.2.3\\\\n";;\\n--git-sha) printf "' + ${mode === "smoke" ? '"wrong-sha"' : "sha"} + '\\\\n";;\\nesac\\n';
+const body = '#!/bin/sh\\ntest -z "${shellGuard}" || exit 94\\nprintf "%s %s\\\\n" "' + '$' + '{0##*/}" "$1" >> ${calls}\\ncase "$1" in\\n--help) printf "HoV Router\\\\n";;\\n--version) printf "HoV Router v1.2.3\\\\n";;\\n--git-sha) printf "' + ${mode === "smoke" ? '"wrong-sha"' : "sha"} + '\\\\n";;\\nesac\\n';
 writeFileSync("dist/${filename}", body, { mode: 0o755 });
 ${mode === "dirty" ? 'appendFileSync("package.json", "\\n");' : ""}
 `,
@@ -238,12 +251,9 @@ describe("synthetic release preparation", () => {
 		expect(readFileSync(f.calls, "utf8").trim().split("\n")).toEqual([
 			"dashboard",
 			"cli",
-			"wstack-router --help",
-			"wstack-router --version",
-			"wstack-router --git-sha",
-			"better-ccflare --help",
-			"better-ccflare --version",
-			"better-ccflare --git-sha",
+			...COMMAND_NAMES.flatMap((alias) =>
+				["--help", "--version", "--git-sha"].map((flag) => `${alias} ${flag}`),
+			),
 		]);
 		expect(
 			verifyReleaseDirectory(f.output, { ...expected, sha: f.sha }),
@@ -256,7 +266,7 @@ describe("synthetic release preparation", () => {
 				expect(f.result.status, f.result.stderr).not.toBe(0);
 				expect(f.result.stderr).toContain(
 					mode === "smoke"
-						? "Unexpected wstack-router --git-sha output"
+						? "Unexpected hov-router --git-sha output"
 						: "Release requires clean exact HEAD/tag/source evidence",
 				);
 				expect(existsSync(f.output)).toBe(false);
@@ -356,6 +366,8 @@ describe("native tagged release rehearsal", () => {
 				"scripts/ccflare-managed-timing.mjs",
 				"apps/cli/router-artifacts.ts",
 				"apps/cli/prepare-router-release.ts",
+				"packages/core/src/router-repository.ts",
+				"packages/core/src/product-identity.ts",
 			);
 			for (const path of new Set(files)) {
 				const destination = join(repo, path);
@@ -440,6 +452,52 @@ describe("native tagged release rehearsal", () => {
 });
 
 describe("release source evidence", () => {
+	it("binds each producing name to its exact offline origin forms", () => {
+		for (const repository of [
+			"StartupBros/wstack-router",
+			"StartupBros/hov-router",
+		]) {
+			const identity = { ...expected, repository };
+			for (const origin of [
+				`https://github.com/${repository}`,
+				`https://github.com/${repository}.git`,
+				`git@github.com:${repository}.git`,
+				`ssh://git@github.com/${repository}.git`,
+			])
+				expect(() =>
+					validateReleaseSource(
+						identity,
+						"1.2.3",
+						bunPin,
+						"linux",
+						"x64",
+						(args) => (args[0] === "config" ? origin : probe(args)),
+					),
+				).not.toThrow();
+			for (const origin of [
+				`https://github.com/${repository}-extra`,
+				`https://github.com/${repository}/extra`,
+				`https://github.com/${repository} `,
+				"https://github.com/StartupBros-com/better-ccflare",
+				`https://github.com/${repository === expected.repository ? "StartupBros/hov-router" : expected.repository}`,
+			])
+				expect(() =>
+					validateReleaseSource(
+						identity,
+						"1.2.3",
+						bunPin,
+						"linux",
+						"x64",
+						(args) => (args[0] === "config" ? origin : probe(args)),
+					),
+				).toThrow(/origin/);
+			const manifest = expectedManifest(identity, 123, "d".repeat(64));
+			expect(manifest.repository).toBe(repository);
+			expect(manifest.provenance).toEqual(
+				schemaExample(expected.sha, 123, "d".repeat(64)).provenance,
+			);
+		}
+	});
 	it("uses the checkout Bun pin and the literal manifest schema", () => {
 		expect(expectedManifest(expected, 123, "d".repeat(64))).toEqual(
 			schemaExample(expected.sha, 123, "d".repeat(64)),
@@ -475,8 +533,10 @@ describe("release source evidence", () => {
 		for (const change of [
 			{ repository: "tombii/better-ccflare" },
 			{ version: "1.2.3-rc.1" },
+			{ version: "1.2.3\n", ref: "refs/tags/v1.2.3\n" },
 			{ ref: "refs/heads/main" },
 			{ sha: "abc" },
+			{ sha: `${expected.sha}\n` },
 			{ sha: "b".repeat(40) },
 		])
 			expect(() =>
@@ -512,13 +572,57 @@ describe("release source evidence", () => {
 	});
 });
 describe("downloaded release verification (not publisher authentication)", () => {
-	it("validates the fixed inventory and smokes both aliases under an isolated environment", () => {
+	it("preserves old output only for the independently pinned historical v3.6.2 identity (fixture)", () => {
+		const historical = {
+			repository: "StartupBros/wstack-router",
+			version: "3.6.2",
+			ref: "refs/tags/v3.6.2",
+			sha: "5d7b2a888a9b61d87916332b414e46606498d896",
+		};
+		const old = fixture(undefined, historical, "wstack Router");
+		expect(verifyReleaseDirectory(old.dir, historical)).toEqual(old.manifest);
+		const renamed = fixture(undefined, historical);
+		expect(() => verifyReleaseDirectory(renamed.dir, historical)).toThrow(
+			/Unexpected/,
+		);
+		for (const identity of [
+			{ ...historical, sha: expected.sha },
+			{ ...historical, repository: "StartupBros/hov-router" },
+			{ ...historical, version: "3.6.3", ref: "refs/tags/v3.6.3" },
+		]) {
+			const current = fixture(undefined, identity);
+			expect(verifyReleaseDirectory(current.dir, identity)).toEqual(
+				current.manifest,
+			);
+			const stale = fixture(undefined, identity, "wstack Router");
+			expect(() => verifyReleaseDirectory(stale.dir, identity)).toThrow(
+				/Unexpected/,
+			);
+		}
+	});
+	it("requires current branding under both producing names for future releases (fixture)", () => {
+		for (const repository of [
+			"StartupBros/wstack-router",
+			"StartupBros/hov-router",
+		]) {
+			const identity = { ...expected, repository };
+			const current = fixture(undefined, identity);
+			expect(verifyReleaseDirectory(current.dir, identity)).toEqual(
+				current.manifest,
+			);
+			const stale = fixture(undefined, identity, "wstack Router");
+			expect(() => verifyReleaseDirectory(stale.dir, identity)).toThrow(
+				/Unexpected/,
+			);
+		}
+	});
+	it("validates the fixed inventory and smokes all three aliases under an isolated environment", () => {
 		const { dir } = fixture();
 		expect(verifyReleaseDirectory(dir, expected).version).toBe(
 			expected.version,
 		);
 	});
-	it("runs all three exits for both aliases without inherited secrets or ancestor dotenv", () => {
+	it("runs all three exits for all three aliases without inherited secrets or ancestor dotenv", () => {
 		const home = mkdtempSync(join(tmpdir(), "release-hostile-"));
 		dirs.push(home);
 		const marker = join(home, "calls");
@@ -563,12 +667,9 @@ describe("downloaded release verification (not publisher authentication)", () =>
 		);
 		expect(result.status, result.stderr).toBe(0);
 		expect(readFileSync(marker, "utf8").trim().split("\n")).toEqual([
-			"wstack-router --help",
-			"wstack-router --version",
-			"wstack-router --git-sha",
-			"better-ccflare --help",
-			"better-ccflare --version",
-			"better-ccflare --git-sha",
+			...COMMAND_NAMES.flatMap((alias) =>
+				["--help", "--version", "--git-sha"].map((flag) => `${alias} ${flag}`),
+			),
 		]);
 	});
 	for (const name of [filename, "SHA256SUMS", "release-manifest.json"]) {
@@ -659,7 +760,7 @@ describe("downloaded release verification (not publisher authentication)", () =>
 		}
 	});
 	for (const [flag, output] of [
-		["--version", "wstack Router v9.9.9"],
+		["--version", "HoV Router v9.9.9"],
 		["--git-sha", "b".repeat(40)],
 	] as const) {
 		it(`rejects actual executable ${flag} mismatch despite consistent claims`, () => {
@@ -667,7 +768,7 @@ describe("downloaded release verification (not publisher authentication)", () =>
 			const source = readFileSync(join(original.dir, filename), "utf8");
 			const { dir } = fixture(
 				source.replace(
-					flag === "--version" ? "wstack Router v1.2.3" : expected.sha,
+					flag === "--version" ? "HoV Router v1.2.3" : expected.sha,
 					output,
 				),
 			);

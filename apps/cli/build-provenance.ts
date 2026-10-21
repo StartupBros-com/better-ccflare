@@ -1,5 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
+import {
+	ROUTER_REPOSITORIES,
+	routerRepositoryOrigins,
+} from "../../packages/core/src/router-repository";
 
 const projectRoot = join(import.meta.dir, "../..");
 const FULL_LOWERCASE_SHA = /^[0-9a-f]{40}$/;
@@ -16,10 +20,7 @@ const STARTUPBROS_REPOSITORY_URLS = new Set([
 	"https://github.com/StartupBros-com/better-ccflare.git",
 	"git@github.com:StartupBros-com/better-ccflare.git",
 	"ssh://git@github.com/StartupBros-com/better-ccflare.git",
-	"https://github.com/StartupBros/wstack-router",
-	"https://github.com/StartupBros/wstack-router.git",
-	"git@github.com:StartupBros/wstack-router.git",
-	"ssh://git@github.com/StartupBros/wstack-router.git",
+	...ROUTER_REPOSITORIES.flatMap(routerRepositoryOrigins),
 ]);
 
 export type ReleaseBuildContext =
@@ -136,11 +137,15 @@ export function releaseBuildDefines(
 
 function git(args: string[]): string | null {
 	try {
-		return execFileSync("git", args, {
+		const output = execFileSync("git", args, {
 			cwd: projectRoot,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
-		}).trim();
+		});
+		// NUL termination preserves whitespace in the configured origin exactly.
+		return args[0] === "config"
+			? output.replace(/\0$/, "")
+			: output.replace(/\r?\n$/, "");
 	} catch {
 		return null;
 	}
@@ -162,7 +167,7 @@ export function readTombiiTaggedBuildEvidence(
 	if (!RELEASE_VERSION.test(version) || releaseContext === null) return null;
 	if (
 		!distributionFor(releaseContext).origins.has(
-			runGit(["config", "--get", "remote.origin.url"]) ?? "",
+			runGit(["config", "--null", "--get", "remote.origin.url"]) ?? "",
 		)
 	)
 		return null;
