@@ -187,6 +187,25 @@ export const validateDraft = (
 	expected: DraftIdentity,
 ) => draftFlow(transport, expected, false);
 
+function diagnosticValue(value: unknown): string {
+	if (typeof value === "string") {
+		const bounded = value.length > 120 ? `${value.slice(0, 120)}...` : value;
+		return JSON.stringify(bounded).replace(
+			/[^\x20-\x7e]/g,
+			(character) =>
+				`\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+		);
+	}
+	if (
+		value === null ||
+		value === undefined ||
+		typeof value === "number" ||
+		typeof value === "boolean"
+	)
+		return String(value);
+	return "[invalid type]";
+}
+
 async function draftFlow(
 	transport: ReleaseTransport,
 	expected: DraftIdentity,
@@ -267,15 +286,31 @@ async function draftFlow(
 		});
 	// Verify the effect rather than treating an API response as proof of the tag.
 	const verified = await transport.getRelease(tag);
-	if (
-		!verified ||
-		verified.id !== release.id ||
-		!verified.draft ||
-		verified.tagName !== tag ||
-		verified.sha !== expected.sha ||
-		(await transport.getTagSha(tag)) !== expected.sha
-	)
-		throw new Error("Draft/tag verification failed");
+	if (!verified)
+		throw new Error(
+			`Draft/tag verification failed: release missing; expected tag=${diagnosticValue(tag)}; observed=${diagnosticValue(verified)}`,
+		);
+	if (verified.id !== release.id)
+		throw new Error(
+			`Draft/tag verification failed: release ID mismatch; expected=${diagnosticValue(release.id)}; observed=${diagnosticValue(verified.id)}`,
+		);
+	if (!verified.draft)
+		throw new Error(
+			`Draft/tag verification failed: release is not draft; expected=true; observed=${diagnosticValue(verified.draft)}`,
+		);
+	if (verified.tagName !== tag)
+		throw new Error(
+			`Draft/tag verification failed: release tag mismatch; expected=${diagnosticValue(tag)}; observed=${diagnosticValue(verified.tagName)}`,
+		);
+	if (verified.sha !== expected.sha)
+		throw new Error(
+			`Draft/tag verification failed: release source SHA mismatch; expected=${diagnosticValue(expected.sha)}; observed=${diagnosticValue(verified.sha)}`,
+		);
+	const verifiedTagSha = await transport.getTagSha(tag);
+	if (verifiedTagSha !== expected.sha)
+		throw new Error(
+			`Draft/tag verification failed: resolved tag SHA mismatch; expected=${diagnosticValue(expected.sha)}; observed=${diagnosticValue(verifiedTagSha)}`,
+		);
 	if (write && !candidate.pullRequest.labels.includes("autorelease: tagged"))
 		await transport.scm.addIssueLabels(
 			["autorelease: tagged"],

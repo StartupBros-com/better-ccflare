@@ -188,6 +188,138 @@ test("read-only draft validation requires existing exact draft and never labels 
 	expect(f.writes).toHaveLength(1);
 });
 
+const readbackFailures = [
+	["missing", 'release missing; expected tag="v3.5.79"; observed=undefined'],
+	["id", "release ID mismatch; expected=17; observed=18"],
+	["draft", "release is not draft; expected=true; observed=false"],
+	["tag", 'release tag mismatch; expected="v3.5.79"; observed="v3.5.80"'],
+	[
+		"source",
+		`release source SHA mismatch; expected="${sha}"; observed="${"b".repeat(40)}"`,
+	],
+	[
+		"resolved",
+		`resolved tag SHA mismatch; expected="${sha}"; observed="${"b".repeat(40)}"`,
+	],
+	[
+		"missing-tag",
+		`resolved tag SHA mismatch; expected="${sha}"; observed=undefined`,
+	],
+] as const;
+
+for (const mode of ["create", "validate"] as const) {
+	test.each(
+		readbackFailures,
+	)(`${mode} readback diagnoses %s without advancing labels or retrying creation`, async (failure, detail) => {
+		const f = await draftFixture();
+		if (mode === "validate") {
+			f.setTag(sha);
+			f.setDraft({
+				id: 17,
+				tagName: "v3.5.79",
+				sha,
+				draft: true,
+				url: "fixture",
+			});
+		}
+		const readRelease = f.transport.getRelease;
+		let releaseReads = 0;
+		f.transport.getRelease = async (tag) => {
+			const release = await readRelease(tag);
+			if (++releaseReads === 1) return release;
+			if (failure === "missing") return undefined;
+			if (!release)
+				throw new Error(
+					"fixture requires a successful creation or existing draft",
+				);
+			return {
+				...release,
+				...(failure === "id" ? { id: 18 } : {}),
+				...(failure === "draft" ? { draft: false } : {}),
+				...(failure === "tag" ? { tagName: "v3.5.80" } : {}),
+				...(failure === "source" ? { sha: "b".repeat(40) } : {}),
+			};
+		};
+		const readTag = f.transport.getTagSha;
+		let tagReads = 0;
+		f.transport.getTagSha = async (tag) => {
+			if (++tagReads === 1) return readTag(tag);
+			return failure === "missing-tag" ? undefined : "b".repeat(40);
+		};
+		const labelWrites: string[] = [];
+		f.transport.scm.addIssueLabels = async () => {
+			labelWrites.push("add");
+		};
+		f.transport.scm.removeIssueLabels = async () => {
+			labelWrites.push("remove");
+		};
+		const operation = mode === "create" ? reconcileDraft : validateDraft;
+		await expect(operation(f.transport, expected)).rejects.toThrow(
+			`Draft/tag verification failed: ${detail}`,
+		);
+		expect(releaseReads).toBe(2);
+		expect(tagReads).toBe(
+			failure === "resolved" || failure === "missing-tag" ? 2 : 1,
+		);
+		expect(f.writes).toHaveLength(mode === "create" ? 1 : 0);
+		expect(labelWrites).toEqual([]);
+		expect(f.getLabels()).toEqual(["autorelease: pending"]);
+	});
+}
+
+test.each([
+	"release",
+	"tag",
+])("readback propagates %s HTTP errors unchanged", async (failure) => {
+	const f = await draftFixture();
+	const error = new Error("GitHub read fixture: HTTP 503");
+	const readRelease = f.transport.getRelease;
+	const readTag = f.transport.getTagSha;
+	let releaseReads = 0;
+	let tagReads = 0;
+	f.transport.getRelease = async (tag) => {
+		if (++releaseReads === 2 && failure === "release") throw error;
+		return readRelease(tag);
+	};
+	f.transport.getTagSha = async (tag) => {
+		if (++tagReads === 2) throw error;
+		return readTag(tag);
+	};
+	await expect(reconcileDraft(f.transport, expected)).rejects.toBe(error);
+	expect(tagReads).toBe(failure === "release" ? 1 : 2);
+	expect(f.writes).toHaveLength(1);
+	expect(f.getLabels()).toEqual(["autorelease: pending"]);
+});
+
+test("readback bounds and escapes external metadata without serializing objects", async () => {
+	for (const value of [
+		`bad\n\r\t\u001b\u007f${String.fromCharCode(0x202e)}"\\${"x".repeat(500)}`,
+		{ private: "do-not-log" },
+	]) {
+		const f = await draftFixture();
+		const read = f.transport.getRelease;
+		f.transport.getRelease = async (tag) => {
+			const release = await read(tag);
+			return release ? { ...release, tagName: value as string } : release;
+		};
+		const error = await reconcileDraft(f.transport, expected).catch(
+			(error: unknown) => error,
+		);
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain(
+			"Draft/tag verification failed: release tag mismatch;",
+		);
+		expect(message).not.toMatch(/[^\x20-\x7e]/);
+		expect(message.length).toBeLessThan(900);
+		expect(message).not.toContain("do-not-log");
+		if (typeof value === "string") {
+			expect(message).toContain('bad\\n\\r\\t\\u001b\\u007f\\u202e\\"\\\\');
+			expect(message).toContain("...");
+		} else expect(message).toContain("[invalid type]");
+	}
+});
+
 test("pending A is discovered at main B; only A's CI authorizes its draft and tagged retry", async () => {
 	const f = await draftFixture();
 	const main = "b".repeat(40);
