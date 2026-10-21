@@ -287,7 +287,7 @@ describe("CLI Integration Tests", () => {
 			const result = await runCLI(["--version"]);
 
 			expect(result.exitCode).toBe(0);
-			expect(result.stdout).toContain("wstack Router v");
+			expect(result.stdout).toContain("HoV Router v");
 			expect(result.stdout).toMatch(/v\d+\.\d+\.\d+/);
 		});
 
@@ -295,7 +295,7 @@ describe("CLI Integration Tests", () => {
 			const result = await runCLI(["-v"]);
 
 			expect(result.exitCode).toBe(0);
-			expect(result.stdout).toContain("wstack Router v");
+			expect(result.stdout).toContain("HoV Router v");
 		});
 
 		it("should exit quickly for version command", async () => {
@@ -336,12 +336,14 @@ describe("CLI Integration Tests", () => {
 			const result = await runCLI(["--help"]);
 
 			expect(result.exitCode).toBe(0);
-			expect(result.stdout).toContain("wstack Router");
-			expect(result.stdout).toContain("Usage: wstack-router [options]");
+			expect(result.stdout).toContain("HoV Router");
+			expect(result.stdout).toContain("Usage: hov-router [options]");
 			expect(result.stdout).toContain(
-				"better-ccflare remains a supported alias",
+				"wstack-router and better-ccflare remain supported aliases",
 			);
-			expect(result.stdout).toContain("wstack-router --serve");
+			expect(result.stdout).toContain("hov-router --serve");
+			expect(result.stdout).not.toContain("  wstack-router ");
+			expect(result.stdout).not.toContain("  better-ccflare ");
 			expect(result.stdout).toContain("Usage:");
 			expect(result.stdout).toContain("Options:");
 			expect(result.stdout).toContain("--serve");
@@ -540,7 +542,7 @@ describe("CLI Integration Tests", () => {
 			]) {
 				const result = await runCLI(args);
 				expect(result.exitCode).toBe(2);
-				expect(result.stdout).not.toContain("Starting wstack Router server");
+				expect(result.stdout).not.toContain("Starting HoV Router server");
 			}
 		});
 
@@ -663,9 +665,7 @@ describe("CLI Integration Tests", () => {
 
 			const output = result.stdout + result.stderr;
 			expect(output).toContain("Example:");
-			expect(output).toMatch(
-				/wstack-router.*--add-account.*--mode.*--priority/,
-			);
+			expect(output).toMatch(/hov-router.*--add-account.*--mode.*--priority/);
 		});
 
 		// Note: "max" mode is remapped to "claude-oauth" with a deprecation warning,
@@ -728,7 +728,7 @@ describe("CLI Integration Tests", () => {
 
 			// Version should take precedence and exit early
 			expect(result.exitCode).toBe(0);
-			expect(result.stdout).toContain("wstack Router v");
+			expect(result.stdout).toContain("HoV Router v");
 		});
 	});
 

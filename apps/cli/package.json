@@ -1,17 +1,18 @@
 {
 	"name": "better-ccflare",
 	"version": "3.6.2",
-	"description": "wstack Router - a load balancer proxy for Claude Code across multiple account providers",
+	"description": "HoV Router - a load balancer proxy for Claude Code across multiple account providers",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/StartupBros/wstack-router.git"
+		"url": "git+https://github.com/StartupBros/hov-router.git"
 	},
-	"homepage": "https://github.com/StartupBros/wstack-router#readme",
+	"homepage": "https://github.com/StartupBros/hov-router#readme",
 	"bugs": {
-		"url": "https://github.com/StartupBros/wstack-router/issues"
+		"url": "https://github.com/StartupBros/hov-router/issues"
 	},
 	"bin": {
+		"hov-router": "dist/better-ccflare",
 		"better-ccflare": "dist/better-ccflare",
 		"wstack-router": "dist/better-ccflare"
 	},
