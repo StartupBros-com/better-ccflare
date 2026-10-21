@@ -30,7 +30,7 @@ function provenance(
 }
 
 describe("update status service", () => {
-	it("never looks up branded releases or leaks a warmed upstream action", async () => {
+	it("never looks up HoV Router releases or leaks a warmed upstream action", async () => {
 		let current = provenance();
 		let calls = 0;
 		const adapter = async () => {
@@ -60,7 +60,14 @@ describe("update status service", () => {
 				CCFLARE_PRODUCER: "startupbros",
 				CCFLARE_ARTIFACT_MODE: mode,
 			});
-			expect(branded.proven).toBe(true);
+			expect(branded).toMatchObject({
+				identity: token,
+				producer: "startupbros",
+				artifactMode: mode,
+				proven: true,
+				actionable: false,
+				updateChannel: null,
+			});
 			for (const patch of [
 				{},
 				{ actionable: true },
@@ -71,12 +78,23 @@ describe("update status service", () => {
 					updateChannel: "npm" as const,
 					reason: "proven_actionable",
 				},
+				{
+					actionable: true,
+					updateChannel: "ghcr" as const,
+					reason: "proven_actionable",
+				},
+				{
+					actionable: true,
+					updateChannel: "github-releases" as const,
+					reason: "proven_actionable",
+				},
 			]) {
 				current = { ...branded, ...patch };
 				const result = await service.check();
 				expect(result.availability).toBe("unavailable");
 				expect(result.latestVersion).toBeNull();
 				expect(result.action).toBeNull();
+				expect(result.cache).toBe("not-applicable");
 				expect(calls).toBe(1);
 			}
 		}

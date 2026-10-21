@@ -8,6 +8,7 @@ import {
 	readDockerBuildProvenance,
 	resolveBuildProvenance,
 } from "./build-provenance";
+import { PRODUCT_NAME } from "./product-identity";
 import {
 	CLAUDE_CLI_VERSION,
 	extractClaudeVersion,
@@ -173,8 +174,12 @@ describe("trackClientVersion and getClientVersion", () => {
 	});
 });
 
-describe("wstack Router distribution identity", () => {
+describe("HoV Router distribution identity", () => {
 	const sha = "abcdef1234567890abcdef1234567890abcdef12";
+	it("uses the current public display name", () => {
+		expect(PRODUCT_NAME).toBe("HoV Router");
+	});
+
 	for (const [token, mode] of [
 		["v1:startupbros-wstack-router-binary", "binary"],
 		["v1:startupbros-wstack-router-package", "package"],
@@ -193,6 +198,8 @@ describe("wstack Router distribution identity", () => {
 			const valid = resolveBuildProvenance(env);
 			expect(valid).toMatchObject({
 				identity: token,
+				producer: "startupbros",
+				artifactMode: mode,
 				proven: true,
 				actionable: false,
 				updateChannel: null,
