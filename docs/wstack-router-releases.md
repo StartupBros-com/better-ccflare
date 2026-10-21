@@ -1,9 +1,16 @@
-# wstack Router release automation (draft-only)
+# HoV Router release automation (draft-only)
+
+<a id="wstack-router-release-automation-draft-only"></a>
 
 For the published 3.6.2 Linux x86_64 binary, follow the technical reference's
 [consumer installation and verification instructions](reference.md#install-the-linux-x86_64-release).
 
-This is the operator guide for `StartupBros/wstack-router` release automation.
+This is the operator guide for HoV Router release automation, targeting
+`StartupBros/hov-router`. Before the repository rename, the live home remains
+`StartupBros/wstack-router`; source must merge before cutover. Current automation
+accepts either exact name only with repository ID `1278801682` and derives the
+current repository name from validated metadata. Historical release evidence
+below intentionally keeps the old repository and signer identity.
 The automation stages a verified **draft** GitHub release. It never publishes a
 release, publishes npm packages or images, announces, installs, restarts services,
 or deploys. Public publication is a separate operator decision; the consumer
@@ -22,19 +29,35 @@ Attestation lookup may require your existing GitHub CLI authentication. If a too
 flag, authentication, or verification step fails, stop and resolve it; do not treat
 an incomplete provenance check as successful.
 
+Retrieval and signing identities are separate. The intended public home is
+`StartupBros/hov-router`. **Before the repository rename**, the live location is
+still `StartupBros/wstack-router`: change only `retrieval_repo` below to that name.
+After the rename, retrieve from `StartupBros/hov-router` while retaining every old
+verification expectation. GitHub CLI 2.97 binds `--repo` during verification to
+`SourceRepositoryURI`, so replacing it with the new repository or an owner-only
+policy would change the historical trust policy. Download the bundle first, then
+verify that same local bundle with the exact old repository and certificate.
+
 <!-- router-release-provenance -->
 ```bash
 (
   set -eu
   binary="$HOME/.local/lib/wstack-router/3.6.2/wstack-router"
   source_sha=5d7b2a888a9b61d87916332b414e46606498d896
+  digest=b01a4989323ecf4e2d0a68394b45828741430d89eb35288f7318a28c45b4c9d7
+  printf '%s  %s\n' "$digest" "$binary" | sha256sum --check --strict -
+  retrieval_repo=StartupBros/hov-router
+  bundle_dir=$(mktemp -d "${TMPDIR:-/tmp}/wstack-router-provenance.XXXXXX")
+  cd "$bundle_dir"
+  gh attestation download "$binary" --repo "$retrieval_repo"
   gh attestation verify "$binary" \
     --repo StartupBros/wstack-router \
     --source-digest "$source_sha" \
     --source-ref refs/tags/v3.6.2 \
     --cert-identity https://github.com/StartupBros/wstack-router/.github/workflows/router-release-artifacts.yml@refs/tags/v3.6.2 \
     --signer-digest "$source_sha" \
-    --deny-self-hosted-runners
+    --deny-self-hosted-runners \
+    --bundle "$bundle_dir/sha256:$digest.jsonl"
 )
 ```
 <!-- /router-release-provenance -->
@@ -44,11 +67,37 @@ repository, source commit, tag, workflow identity, signer commit, and hosted-run
 policy. Those expectations are pinned here, not read from a downloaded manifest.
 Neither a checksum nor provenance proves the program is free of bugs or malicious
 behavior. After verification succeeds, return to the technical reference's separate run step.
+The temporary bundle directory is left for inspection; this procedure does not
+execute the binary or change its installed aliases.
 
 The release also publishes `SHA256SUMS` and an attested `release-manifest.json` for
 release auditing; neither is required by the consumer install above. The operator
 pipeline below still verifies the complete inventory and both attestations before
 executing release smoke checks. Its strict verification policy is unchanged.
+
+The published v3.6.2 evidence remains historical, even when retrieved through the
+new public home. Release ID **418096444** and tag `refs/tags/v3.6.2` identify source
+commit `5d7b2a888a9b61d87916332b414e46606498d896`. The exact certificate remains
+`https://github.com/StartupBros/wstack-router/.github/workflows/router-release-artifacts.yml@refs/tags/v3.6.2`.
+
+| Historical asset | Asset ID | Size (bytes) | SHA-256 |
+| --- | --- | --- | --- |
+| `better-ccflare-linux-amd64` | 658578101 | 97965536 | `b01a4989323ecf4e2d0a68394b45828741430d89eb35288f7318a28c45b4c9d7` |
+| `release-manifest.json` | 658578455 | — | `a90aa5f71ba5ae9f4b255e487c2afc80f39d44bc70a6193da43d83f4b05dc60b` |
+| `SHA256SUMS` | 658577847 | — | `dee851d757ec92a28946c838a11919d34bf2fc4755613e67b34bd1e3cdf70b29` |
+
+For a manifest audit, download `release-manifest.json` from the current repository's
+v3.6.2 release, check the independent digest above, then use the same download and
+verify commands with `binary` set to that local manifest and `digest` set to its
+pinned SHA-256. Keep the full old source SHA, tag ref, certificate, signer SHA,
+`--repo StartupBros/wstack-router`, `--deny-self-hosted-runners`, and the matching
+local `--bundle`; authenticate both assets before any release smoke execution.
+The signed manifest's repository remains `StartupBros/wstack-router` and its
+distribution token remains `v1:startupbros-wstack-router-binary`, with
+`actionable: false` and `updateChannel: null`. Do not rewrite the public bytes,
+manifest, tag, or certificate for the new display name. The historical binary
+still reports `wstack Router v3.6.2` through `hov-router`; newly built artifacts
+report `HoV Router`. Only Linux x86_64 was publicly released for v3.6.2.
 
 ## App authentication and verification boundaries
 
@@ -75,17 +124,21 @@ retries skip the entire PR job and never mint an App token.
 
 ## Dedicated Router App configuration
 
-1. Register a dedicated App that can be installed on the personal-owned
-   `StartupBros/wstack-router` repository. Existing private, organization-owned HoV
+1. Use a dedicated App that can be installed on the personal-owned
+   `StartupBros/hov-router` repository (`StartupBros/wstack-router` before cutover).
+   Retain the existing scoped installation across the rename and verify its access.
+   Existing private, organization-owned HoV
    Apps cannot serve this installation; do not broaden their visibility to reuse them.
    Grant repository permissions **Contents: read/write**, **Pull requests: read/write**,
    **Issues: read/write** (release labels), and **Actions: read-only** (source CI).
    GitHub's implicit **Metadata: read-only** permission remains. No administration,
    workflow-write, organization permissions, or ruleset bypass is needed.
-2. Install it on `StartupBros`, selecting **only `wstack-router`**. Preserve all other
-   repository protection and Actions policies. The token request also restricts
-   `owner: StartupBros` and `repositories: wstack-router` with the four explicit
-   permissions above; neither installation nor request should include other repos.
+2. Scope it on `StartupBros` to **only this Router repository**: `hov-router` after
+   cutover, `wstack-router` before it. Preserve all other repository protection and
+   Actions policies. The token request restricts `owner: StartupBros` and
+   `repositories` to the current name from validated repository metadata, with the
+   four explicit permissions above; neither installation nor request should include
+   other repos.
 3. Set repository Actions variable `ROUTER_RELEASE_APP_CLIENT_ID` to the App's
    **Client ID**, not its numeric App ID. Generate its private key and set repository
    Actions secret `ROUTER_RELEASE_APP_PRIVATE_KEY` through the approved secure
@@ -124,8 +177,11 @@ artifact jobs retain their separate built-in tokens and existing permissions.
 ## Intentional first release or explicit version request
 
 An intentional release request can use the engine's `Release-As` commit-body
-trailer without inventing a feature or editing version files. For the first Router
-release, preserve this complete message on the request PR's squash commit:
+trailer without inventing a feature or editing version files. The following is the
+historical first-release recipe, preserving its wstack Router subject, repository,
+and requested 3.6.0 version. It is not a current request to release 3.6.0 again;
+future requests use their approved version and the current repository name.
+For that first-release recipe, preserve this complete request PR squash message:
 
 ```text
 chore: prepare the first wstack Router release
@@ -244,8 +300,9 @@ requirements are satisfied. Unattended release-PR merging is outside this increm
 ## Containment
 
 The inherited npm release, multi-architecture release, both SignPath workflows and
-Docker publishing have a job-level `github.repository != 'StartupBros/wstack-router'`
-condition. Their triggers and other repositories' behavior are unchanged.
+Docker publishing exclude both `StartupBros/wstack-router` and
+`StartupBros/hov-router`, plus repository ID `1278801682`, at the job level.
+Their triggers and other repositories' behavior are unchanged.
 `prepare-router-artifacts.yml` stays a local, non-publishing preparation check.
 
 ## Evidence required for each release

@@ -23,14 +23,20 @@ import {
 
 const root = new URL("../../", import.meta.url);
 const sha = "a".repeat(40);
+const repositoryMetadata = (full_name = "StartupBros/wstack-router") => ({
+	id: 1278801682,
+	full_name,
+	name: full_name.split("/")[1],
+	owner: { login: "StartupBros" },
+});
 const expected = {
 	repository: "StartupBros/wstack-router",
 	sha,
 	version: "3.5.79",
 	ref: "refs/tags/v3.5.79",
 };
-async function draftFixture() {
-	const { scm, files } = fixture("fix: repair routing");
+async function draftFixture(repo = "wstack-router") {
+	const { scm, files } = fixture("fix: repair routing", undefined, repo);
 	const [pr] = await (await createRouterManifest(scm)).buildPullRequests();
 	for (const update of pr.updates)
 		if (files[update.path] !== undefined)
@@ -71,6 +77,7 @@ async function draftFixture() {
 	};
 	const transport: ReleaseTransport = {
 		scm,
+		getRepository: async () => repositoryMetadata(),
 		getHeadSha: async () => sha,
 		isAncestor: async () => false,
 		checkFoundation: async () => true,
@@ -294,7 +301,7 @@ test.each([
 	expect(f.getLabels()).toEqual(["autorelease: pending"]);
 });
 
-test("githubTransport validates compare direction and exact foundation push evidence", async () => {
+test("transport fixture: githubTransport validates compare direction and exact foundation push evidence", async () => {
 	const original = globalThis.fetch;
 	const main = "b".repeat(40);
 	let comparison = {
@@ -303,21 +310,25 @@ test("githubTransport validates compare direction and exact foundation push evid
 		base_commit: { sha },
 	};
 	const validRun = {
+		name: "Managed Routing Foundation Gate",
 		head_sha: sha,
 		head_branch: "main",
 		event: "push",
 		conclusion: "success",
 		status: "completed",
 		path: ".github/workflows/managed-routing-postgres.yml",
-		repository: { full_name: expected.repository },
+		repository: repositoryMetadata(),
+		head_repository: repositoryMetadata(),
 	};
-	let runs = [validRun];
+	let runs: unknown[] = [validRun];
 	const requests: string[] = [];
 	globalThis.fetch = (async (input: string | URL | Request) => {
 		const url = new URL(
 			typeof input === "string" || input instanceof URL ? input : input.url,
 		);
 		requests.push(url.pathname + url.search);
+		if (url.pathname === `/repos/${expected.repository}`)
+			return Response.json(repositoryMetadata());
 		if (url.pathname.endsWith(`/compare/${sha}...${main}`))
 			return Response.json(comparison);
 		if (url.pathname.endsWith("/managed-routing-postgres.yml/runs")) {
@@ -329,7 +340,10 @@ test("githubTransport validates compare direction and exact foundation push evid
 		throw new Error(`Unexpected fixture request ${url}`);
 	}) as typeof fetch;
 	try {
-		const transport = await githubTransport("fixture-not-a-credential");
+		const transport = await githubTransport(
+			"fixture-not-a-credential",
+			expected.repository,
+		);
 		expect(await transport.isAncestor(sha, main)).toBe(true);
 		for (const status of ["behind", "diverged"]) {
 			comparison = { ...comparison, status };
@@ -355,12 +369,17 @@ test("githubTransport validates compare direction and exact foundation push evid
 			{ conclusion: "failure" },
 			{ status: "in_progress" },
 			{ path: "other.yml" },
-			{ repository: { full_name: "other/repo" } },
+			{ name: "Other" },
+			{ repository: { ...repositoryMetadata(), full_name: "other/repo" } },
+			{ repository: { ...repositoryMetadata(), id: 1 } },
+			{ repository: { ...repositoryMetadata(), id: undefined } },
+			{ head_repository: { ...repositoryMetadata(), id: 1 } },
+			{ head_repository: repositoryMetadata("StartupBros/hov-router") },
 		]) {
 			runs = [{ ...validRun, ...patch }];
 			expect(await transport.checkFoundation(sha)).toBe(false);
 		}
-		expect(requests[0]).toBe(
+		expect(requests[1]).toBe(
 			`/repos/${expected.repository}/compare/${sha}...${main}`,
 		);
 	} finally {
@@ -368,7 +387,7 @@ test("githubTransport validates compare direction and exact foundation push evid
 	}
 });
 
-test("githubTransport reads draft listing and dereferences tags without writes", async () => {
+test("transport fixture: githubTransport reads draft listing and dereferences tags without writes", async () => {
 	const original = globalThis.fetch;
 	const requests: string[] = [];
 	globalThis.fetch = (async (
@@ -380,6 +399,8 @@ test("githubTransport reads draft listing and dereferences tags without writes",
 			typeof input === "string" || input instanceof URL ? input : input.url,
 		);
 		requests.push(url.pathname + url.search);
+		if (url.pathname === `/repos/${expected.repository}`)
+			return Response.json(repositoryMetadata());
 		if (url.pathname.endsWith("/git/ref/heads/main"))
 			return Response.json({ object: { sha } });
 		if (url.pathname.endsWith("/git/ref/tags/v3.5.79"))
@@ -410,7 +431,10 @@ test("githubTransport reads draft listing and dereferences tags without writes",
 		throw new Error(`Unexpected fixture request ${url}`);
 	}) as typeof fetch;
 	try {
-		const transport = await githubTransport("fixture-not-a-credential");
+		const transport = await githubTransport(
+			"fixture-not-a-credential",
+			expected.repository,
+		);
 		expect(await transport.getHeadSha()).toBe(sha);
 		expect(await transport.getTagSha("v3.5.79")).toBe(sha);
 		expect(await transport.getTagSha("v0.0.0")).toBeUndefined();
@@ -427,6 +451,117 @@ test("githubTransport reads draft listing and dereferences tags without writes",
 		);
 	} finally {
 		globalThis.fetch = original;
+	}
+});
+
+test("transport fixture: metadata authority precedes SCM creation and stale aliases use only the validated current destination", async () => {
+	const originalFetch = globalThis.fetch;
+	const originalCreate = GitHub.create;
+	let metadata: unknown;
+	const creates: string[] = [];
+	const requests: string[] = [];
+	GitHub.create = async (options) => {
+		creates.push(`${options.owner}/${options.repo}`);
+		const { scm } = fixture("fix: fixture", undefined, options.repo);
+		return scm as GitHub;
+	};
+	globalThis.fetch = (async (input, init) => {
+		const url = String(input);
+		requests.push(url);
+		if (url.endsWith("/git/ref/heads/main")) {
+			expect(init?.redirect).toBe("error");
+			return Response.json({ object: { sha } });
+		}
+		return Response.json(metadata);
+	}) as typeof fetch;
+	try {
+		for (const repository of [expected.repository, "StartupBros/hov-router"]) {
+			for (const invalid of [
+				{ ...repositoryMetadata(repository), id: undefined },
+				{ ...repositoryMetadata(repository), id: 1 },
+				{ ...repositoryMetadata(repository), owner: { login: "other" } },
+				repositoryMetadata("other/redirect-target"),
+				{ ...repositoryMetadata(repository), name: "mismatch" },
+			]) {
+				metadata = invalid;
+				await expect(
+					githubTransport("fixture-not-a-credential", repository),
+				).rejects.toThrow();
+				expect(creates).toEqual([]);
+			}
+		}
+		metadata = repositoryMetadata("StartupBros/hov-router");
+		const transport = await githubTransport(
+			"fixture-not-a-credential",
+			expected.repository,
+		);
+		expect(creates).toEqual(["StartupBros/hov-router"]);
+		requests.length = 0;
+		expect(await transport.getHeadSha()).toBe(sha);
+		await transport.getRepository();
+		expect(
+			requests.every((url) =>
+				url.startsWith("https://api.github.com/repos/StartupBros/hov-router"),
+			),
+		).toBe(true);
+		requests.length = 0;
+		await expect(
+			githubTransport("fixture-not-a-credential", "other/hov-router"),
+		).rejects.toThrow();
+		expect(requests).toEqual([]);
+	} finally {
+		globalThis.fetch = originalFetch;
+		GitHub.create = originalCreate;
+	}
+});
+
+test("transport fixtures reject reused names, changed authority and mixed SCM identities before writes", async () => {
+	for (const repository of [expected.repository, "StartupBros/hov-router"]) {
+		for (const failure of [
+			"missing-id",
+			"wrong-id",
+			"owner",
+			"name",
+			"mixed-scm",
+			"lost-id",
+		]) {
+			const f = await draftFixture(repository.split("/")[1]);
+			let checks = 0;
+			f.transport.getRepository = async () => {
+				checks++;
+				const valid = repositoryMetadata(repository);
+				if (failure === "missing-id") return { ...valid, id: undefined };
+				if (failure === "wrong-id" || (failure === "lost-id" && checks > 1))
+					return { ...valid, id: 1 };
+				if (failure === "owner") return { ...valid, owner: { login: "other" } };
+				if (failure === "name")
+					return { ...valid, full_name: `${repository}-extra` };
+				return valid;
+			};
+			if (failure === "mixed-scm")
+				f.transport.scm = {
+					...f.transport.scm,
+					repository: { ...f.transport.scm.repository, repo: "unrelated" },
+				};
+			await expect(
+				reconcileDraft(f.transport, { ...expected, repository }),
+			).rejects.toThrow();
+			expect(f.writes).toEqual([]);
+			expect(f.getLabels()).toEqual(["autorelease: pending"]);
+		}
+	}
+});
+
+test("transport fixtures reconcile draft-only releases under either exact current name", async () => {
+	for (const repository of [expected.repository, "StartupBros/hov-router"]) {
+		const f = await draftFixture(repository.split("/")[1]);
+		f.transport.getRepository = async () => repositoryMetadata(repository);
+		expect(
+			await reconcileDraft(f.transport, { ...expected, repository }),
+		).toMatchObject({ repository, releaseId: 17 });
+		expect(f.writes).toMatchObject([
+			{ options: { draft: true, forceTag: true, prerelease: false } },
+		]);
 	}
 });
 
@@ -461,7 +596,7 @@ test.each([
 	await expect(reconcileDraft(f.transport, input)).rejects.toThrow();
 	expect(f.writes).toEqual([]);
 });
-function fixture(message: string, baseline = "3.5.78") {
+function fixture(message: string, baseline = "3.5.78", repo = "wstack-router") {
 	const files: Record<string, string> = Object.fromEntries(
 		[
 			"package.json",
@@ -489,7 +624,7 @@ function fixture(message: string, baseline = "3.5.78") {
 	const scm = {
 		repository: {
 			owner: "StartupBros",
-			repo: "wstack-router",
+			repo,
 			defaultBranch: "main",
 		},
 		getFileContentsOnBranch: async (path: string) => ({

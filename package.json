@@ -1,12 +1,13 @@
 {
 	"private": true,
 	"name": "better-ccflare",
-	"description": "wstack Router - a load balancer proxy for Claude Code across multiple account providers",
+	"description": "HoV Router - a load balancer proxy for Claude Code across multiple account providers",
 	"workspaces": [
 		"apps/*",
 		"packages/*"
 	],
 	"scripts": {
+		"hov-router": "bun run build && bun run cli",
 		"better-ccflare": "bun run build && bun run cli",
 		"wstack-router": "bun run build && bun run cli",
 		"cli": "bun run apps/cli/src/main.ts",

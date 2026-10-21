@@ -1,6 +1,6 @@
 # Technical reference
 
-Manual installation, client configuration, and operating details for wstack Router. For agent-assisted setup, start with the [agent setup guide](agent-setup.md).
+Manual installation, client configuration, and operating details for HoV Router. For agent-assisted setup, start with the [agent setup guide](agent-setup.md). Use `hov-router`; `wstack-router` and `better-ccflare` remain compatible commands.
 
 - [Linux x86_64 release](#install-the-linux-x86_64-release) or [source build](#install-from-source)
 - [Local server and account setup](#start-the-local-server)
@@ -34,7 +34,7 @@ This project builds upon the foundation of [snipeship/ccflare](https://github.co
 - **Extended Provider Support** - AWS Bedrock, NanoGPT (with dynamic pricing), Minimax, DeepSeek, OpenRouter, Kilo, Codex (OpenAI OAuth), xAI/Grok, Meta Model API (`meta`; legacy `muse-spark` HTTP ingress compatibility), Anthropic-compatible, and OpenAI-compatible providers
 - **Simplified Load Balancing** - Removed tier system for O(1) priority-based selection
 - **Real-time Analytics Dashboard** - Web UI with fixed request history (no disappearing requests)
-- **Source Installation** - Build the current fork locally; upstream distribution recipes below install upstream, not wstack Router
+- **Source Installation** - Build the current fork locally; upstream distribution recipes below install upstream, not HoV Router
 
 **🛠️ Developer Experience:**
 - **Powerful CLI** - Complete command-line interface for account management and configuration
@@ -46,7 +46,7 @@ This project builds upon the foundation of [snipeship/ccflare](https://github.co
 - **Database Integration** - SQLite (default) or PostgreSQL for persistent storage and analytics, supporting Kubernetes multi-pod deployments
 
 **Distribution & Updates:**
-- **Local Source Build** - Install the built artifact as both `wstack-router` and `better-ccflare`
+- **Local Source Build** - Install the built artifact as `hov-router`, `wstack-router`, and `better-ccflare`
 - **Manual Updates** - Fetch the current fork and rebuild; branded builds do not offer upstream auto-updates
 - **Compatibility** - Package names, build filenames, environment variables, paths, ports, and headers retain their existing names
 
@@ -62,7 +62,9 @@ This project builds upon the foundation of [snipeship/ccflare](https://github.co
 
 ### Install the Linux x86_64 release
 
-[Release 3.6.2](https://github.com/StartupBros/wstack-router/releases/tag/v3.6.2) contains one standalone Linux x86_64 binary; Node.js and Bun are not required to run it. For other platforms or a local build, use [Install from source](#install-from-source).
+[Release 3.6.2](https://github.com/StartupBros/hov-router/releases/tag/v3.6.2) contains one standalone Linux x86_64 binary; Node.js and Bun are not required to run it. For other platforms or a local build, use [Install from source](#install-from-source).
+
+The public home below targets `StartupBros/hov-router`. **Before the repository rename**, `StartupBros/wstack-router` is still live: use that repository name in download and clone URLs until the rename is complete. This guide does not claim the move has happened. The historical 3.6.2 binary, manifest, tag, and signing identity stay unchanged; its version output is exactly `wstack Router v3.6.2`, including when invoked through `hov-router`. New source builds display `HoV Router` through all three command names.
 
 Requires Bash on Linux x86_64, `curl`, and GNU coreutils (`sha256sum`, `mkdir`, `chmod`). No GitHub CLI, Node.js, or Bun is needed.
 
@@ -78,7 +80,7 @@ Requires Bash on Linux x86_64, `curl`, and GNU coreutils (`sha256sum`, `mkdir`, 
   mkdir "$version_dir"
   cd "$version_dir"
   curl -q --fail --location --proto '=https' --proto-redir '=https' \
-    --output wstack-router https://github.com/StartupBros/wstack-router/releases/download/v3.6.2/better-ccflare-linux-amd64
+    --output wstack-router https://github.com/StartupBros/hov-router/releases/download/v3.6.2/better-ccflare-linux-amd64
   digest=b01a4989323ecf4e2d0a68394b45828741430d89eb35288f7318a28c45b4c9d7
   printf '%s  wstack-router\n' "$digest" | sha256sum --check --strict -
   chmod 755 wstack-router
@@ -86,7 +88,7 @@ Requires Bash on Linux x86_64, `curl`, and GNU coreutils (`sha256sum`, `mkdir`, 
 ```
 <!-- /router-release-install -->
 
-The checksum verifies the bytes against this trusted reference; it does not independently prove who built them. Before the first run, you can also [verify signed build provenance](wstack-router-releases.md#optional-consumer-provenance-verification). That optional check uses GitHub CLI to verify the repository, source commit, tag, workflow identity, signer commit, and hosted runner.
+The checksum verifies the bytes against this trusted reference; it does not independently prove who built them. Before the first run, you can also [verify signed build provenance](wstack-router-releases.md#optional-consumer-provenance-verification). That optional check retrieves a bundle from the current repository location and verifies it against the exact historical repository, source commit, tag, workflow identity, signer commit, and hosted runner.
 
 If any command fails, stop: do not run the binary. The block refuses any existing `3.6.2` path, including a symlink, and leaves partial downloads for inspection rather than deleting or overwriting them. Inspect the error and existing files before retrying.
 
@@ -102,7 +104,7 @@ Continue at [Start the local server](#start-the-local-server), or add the option
 
 #### Optional: add commands to PATH
 
-After verification succeeds, create `wstack-router` and the compatible `better-ccflare` command in `$HOME/.local/bin`. This checks both names before creating either and refuses existing files, directories, or symlinks, including broken ones.
+After verification succeeds, create `hov-router`, `wstack-router`, and `better-ccflare` in `$HOME/.local/bin`, all pointing to the same verified binary. This checks all three names before creating any and refuses existing files, directories, or symlinks, including broken ones.
 
 <!-- router-release-path -->
 ```bash
@@ -112,57 +114,60 @@ After verification succeeds, create `wstack-router` and the compatible `better-c
   bin_dir="$HOME/.local/bin"
   test -x "$binary"
   mkdir -p "$bin_dir"
-  for name in wstack-router better-ccflare; do
+  for name in hov-router wstack-router better-ccflare; do
     if [ -e "$bin_dir/$name" ] || [ -L "$bin_dir/$name" ]; then
       printf 'Refusing existing command: %s\n' "$bin_dir/$name" >&2
       exit 1
     fi
   done
-  ln -sT "$binary" "$bin_dir/wstack-router"
-  ln -sT "$binary" "$bin_dir/better-ccflare"
+  for name in hov-router wstack-router better-ccflare; do
+    ln -sT "$binary" "$bin_dir/$name"
+  done
 )
 ```
 <!-- /router-release-path -->
 
-After success, use `export PATH="$HOME/.local/bin:$PATH"` in each terminal where you want the short commands. Check `command -v wstack-router` and `command -v better-ccflare`; both should resolve there. To keep this PATH setting, add it to your shell configuration yourself. Nothing here edits shell profiles or uses `sudo`. Existing commands elsewhere remain untouched; PATH order determines which runs. If alias creation fails, inspect the error and any link already created rather than forcing replacement.
+After success, use `export PATH="$HOME/.local/bin:$PATH"` in each terminal where you want the short commands. Check `command -v hov-router`, `command -v wstack-router`, and `command -v better-ccflare`; all three should resolve there. To keep this PATH setting, add it to your shell configuration yourself. Nothing here edits shell profiles or uses `sudo`. Existing commands elsewhere remain untouched; PATH order determines which runs. If alias creation fails, inspect the error and any link already created rather than forcing replacement.
 
 ### Install from source
 
 Requires Git, Node.js (used by the build), and Bun (this checkout pins Bun 1.4.2). These commands use a POSIX shell on Linux/macOS; on Windows use WSL. The public HTTPS clone below does not require a GitHub login.
 
 ```bash
-git clone https://github.com/StartupBros/wstack-router.git better-ccflare
+git clone https://github.com/StartupBros/hov-router.git better-ccflare
 cd better-ccflare
 bun install --frozen-lockfile
 bun run build
 ```
 
-The build produces `apps/cli/dist/better-ccflare`. It does not install a command on your PATH. From the checkout root, copy that same artifact under both names into a fresh user-owned directory. This deliberately leaves any previous installation untouched.
+The build produces `apps/cli/dist/better-ccflare`. It does not install a command on your PATH. From the checkout root, copy that same artifact under all three names into a fresh user-owned directory. Each name runs the same version with the same provenance and configuration. The clone directory, build filename, `better-ccflare` configuration/database paths, and environment variables retain their existing names. This deliberately leaves any previous installation untouched.
 
 <!-- source-install-local -->
 ```bash
 mkdir -p "$HOME/.local"
 install_dir=$(mktemp -d "$HOME/.local/wstack-router.XXXXXX")
-install -m 755 apps/cli/dist/better-ccflare "$install_dir/wstack-router"
-install -m 755 apps/cli/dist/better-ccflare "$install_dir/better-ccflare"
+for name in hov-router wstack-router better-ccflare; do
+  install -m 755 apps/cli/dist/better-ccflare "$install_dir/$name"
+done
 export PATH="$install_dir:$PATH"
+hov-router --version
 wstack-router --version
 better-ccflare --version
-wstack-router --help
+hov-router --help
 printf 'Installed commands in %s\n' "$install_dir"
 ```
 <!-- /source-install-local -->
 
-The PATH change applies to this shell only. To keep it, add the printed directory (its literal path, not `$install_dir`) to your shell's PATH configuration, ahead of older installations. Use `command -v wstack-router` and `command -v better-ccflare` to confirm which commands will run. Keep the prior executable and its location for rollback; do not overwrite a global install or change an existing service as part of this quickstart.
+The PATH change applies to this shell only. To keep it, add the printed directory (its literal path, not `$install_dir`) to your shell's PATH configuration, ahead of older installations. Use `command -v hov-router`, `command -v wstack-router`, and `command -v better-ccflare` to confirm which commands will run. Keep the prior executable and its location for rollback; do not overwrite a global install or change an existing service as part of this quickstart.
 
 ### Start the local server
 
-The commands below assume you completed the optional [PATH setup](#optional-add-commands-to-path) or the source install. If you skipped PATH setup, replace `wstack-router` (or `better-ccflare`) in these examples with `"$HOME/.local/lib/wstack-router/3.6.2/wstack-router"`.
+The commands below assume you completed the optional [PATH setup](#optional-add-commands-to-path) or the source install. If you skipped PATH setup, replace `hov-router` (or either compatibility command) in these examples with `"$HOME/.local/lib/wstack-router/3.6.2/wstack-router"`.
 
 For a new local setup, start the server and dashboard with:
 
 ```bash
-BETTER_CCFLARE_HOST=127.0.0.1 wstack-router --serve --port 8080
+BETTER_CCFLARE_HOST=127.0.0.1 hov-router --serve --port 8080
 ```
 
 Leave the server running, then:
@@ -171,13 +176,15 @@ Leave the server running, then:
 2. Follow [Configure Claude SDK](#configure-claude-sdk), using this server's origin. A provider credential belongs to the account you just added; a proxy API key, when required, authenticates your client to Router.
 3. After your first client request, open the dashboard's **Requests** tab. Find that request and check its account and status to confirm which account handled it and whether it succeeded. An account appearing in **Accounts** alone does not prove a request routed successfully.
 
-If port 8080 is occupied, choose an unused port and use it consistently for the server, dashboard, CLI routing commands, and client configuration. `better-ccflare` remains an equivalent command. This guide does not change a running service or move existing accounts.
+If port 8080 is occupied, choose an unused port and use it consistently for the server, dashboard, CLI routing commands, and client configuration. `wstack-router` and `better-ccflare` remain equivalent commands. This guide does not change a running service or move existing accounts.
 
-See [manual updates, unchanged paths, and rollback](wstack-router-migration.md). Report fork issues at [StartupBros/wstack-router/issues](https://github.com/StartupBros/wstack-router/issues).
+See [manual updates, unchanged paths, and rollback](wstack-router-migration.md). Report fork issues at [StartupBros/hov-router/issues](https://github.com/StartupBros/hov-router/issues), using the pre-cutover repository name until the rename completes.
 
-### Legacy upstream distributions (not wstack Router)
+<a id="legacy-upstream-distributions-not-wstack-router"></a>
 
-The recipes below are retained for upstream users. The `better-ccflare` registry package, `tombii` release downloads, and `ghcr.io/tombii` images install **upstream better-ccflare**, not this branded fork. Their availability and platform coverage are upstream's responsibility. Do not use them to install or update wstack Router.
+### Legacy upstream distributions (not HoV Router)
+
+The recipes below are retained for upstream users. The `better-ccflare` registry package, `tombii` release downloads, and `ghcr.io/tombii` images install **upstream better-ccflare**, not this branded fork. Their availability and platform coverage are upstream's responsibility. Do not use them to install or update HoV Router.
 
 <details>
 <summary>Upstream npm, Bun, and release download recipes</summary>
@@ -260,11 +267,11 @@ bunx better-ccflare@latest
 Continue to [Configure Claude SDK](https://github.com/tombii/better-ccflare#configure-claude-sdk).
 </details>
 
-The configuration reference below also applies to wstack Router. Legacy `better-ccflare` command examples work with the optional release alias or the source-installed compatibility command.
+The configuration reference below applies to HoV Router. Both compatibility commands work with the optional release aliases or the source installation.
 
 ### Environment Variables
 
-better-ccflare supports several environment variables for configuration. The most commonly used ones:
+HoV Router supports several environment variables for configuration. The most commonly used ones:
 
 ```bash
 # Server Configuration
@@ -319,13 +326,13 @@ logging its values. Other providers and unmatched routes are unchanged.
 
 Each physical HTTP attempt gets a fresh nonzero 16-hex `x-private-ai-attempt-id`,
 also used as the outgoing W3C `traceparent` span ID. `x-private-ai-request-id`
-retains ccflare's canonical logical request UUID across retries. A valid incoming
+retains HoV Router's canonical logical request UUID across retries. A valid incoming
 `traceparent` supplies the trace ID and flags; its parent span ID is carried in
 `x-private-ai-parent-span-id`. Otherwise, the trace ID is the canonical UUID
 without hyphens, with flags `01`. Client-supplied `x-private-ai-*` values are
 replaced on opted-in routes. Internal guard IDs and secrets remain stripped.
 
-This propagates context only: ccflare does not export a span or inspect bodies for
+This propagates context only: HoV Router does not export a span or inspect bodies for
 this feature. Matching gates the initial destination, not redirects; existing
 redirect behavior is unchanged, so these opaque IDs can follow an upstream
 redirect to another origin.
@@ -573,7 +580,7 @@ Writers remain unavailable without trustworthy aggregate, per-key-material fleet
 
 ### Using .env Files
 
-better-ccflare automatically supports `.env` files for easy configuration management. You can create a `.env` file in your project directory:
+HoV Router automatically supports `.env` files for easy configuration management. You can create a `.env` file in your project directory:
 
 ```bash
 # Copy the example .env file
@@ -614,7 +621,7 @@ STORE_PAYLOADS=true
 **Usage with different deployment methods**:
 ```bash
 # CLI (binary or local development)
-better-ccflare --serve
+hov-router --serve
 
 # Docker Compose (place .env alongside docker-compose.yml)
 docker-compose up
@@ -623,7 +630,9 @@ docker-compose up
 docker run -v $(pwd)/.env:/app/.env:ro -p 8080:8080 ghcr.io/tombii/better-ccflare:latest
 ```
 
-### Docker (legacy upstream images, not wstack Router)
+<a id="docker-legacy-upstream-images-not-wstack-router"></a>
+
+### Docker (legacy upstream images, not HoV Router)
 
 All `ghcr.io/tombii/better-ccflare` recipes here, including the `.env` and Traefik examples, run upstream images. The checked-in Docker Compose behavior is unchanged; no branded image is available from this change.
 
@@ -666,7 +675,7 @@ See [DOCKER.md](../DOCKER.md) for detailed Docker documentation.
 
 ### Systemd Deployment
 
-For running better-ccflare as a native systemd service on Linux (without Docker), see the [Systemd Deployment Guide](systemd.md). It covers unit file configuration, memory management with `--smol`, restart policies, and a preflight script that prevents `BUN_JSC_*` environment variable crashes.
+For running HoV Router as a native systemd service on Linux (without Docker), see the [Systemd Deployment Guide](systemd.md). It covers unit file configuration, memory management with `--smol`, restart policies, and a preflight script that prevents `BUN_JSC_*` environment variable crashes. Existing service and executable paths keep their names.
 
 ## Configure Claude SDK
 
@@ -701,13 +710,13 @@ claude /logout
 # Then set both the base URL and API key
 export ANTHROPIC_BASE_URL=http://localhost:8080
 
-# If better-ccflare has NO API keys configured (open access):
+# If Router has NO API keys configured (open access):
 export ANTHROPIC_AUTH_TOKEN=dummy-key
 
-# If better-ccflare HAS API keys configured (protected):
-# New-host owner only: better-ccflare --generate-api-key "My VPS"
+# If Router HAS API keys configured (protected):
+# New-host owner only: hov-router --generate-api-key "My VPS"
 # Shared clients: obtain an inference key privately from the existing owner
-export ANTHROPIC_AUTH_TOKEN=btr-abcdef1234567890...  # Use your real better-ccflare API key
+export ANTHROPIC_AUTH_TOKEN=btr-abcdef1234567890...  # Use your real Router API key
 
 # New hosts: configure accounts in the dashboard; shared clients reuse existing routing
 
@@ -717,7 +726,7 @@ claude
 
 ### Option 3: Remote/Headless VPS Setup (Secure Proxy)
 
-Use better-ccflare on a trusted server to keep provider OAuth credentials off temporary clients. If that server already exists, follow [shared-client setup](agent-setup.md#shared-client-only) and **skip the server commands below**. Use the owner-approved Tailscale origin or other private endpoint; do not discover servers by scanning or change their exposure. The client still holds a sensitive Router credential, so untrusted machines can steal it.
+Use HoV Router on a trusted server to keep provider OAuth credentials off temporary clients. If that server already exists, follow [shared-client setup](agent-setup.md#shared-client-only) and **skip the server commands below**. Use the owner-approved Tailscale origin or other private endpoint; do not discover servers by scanning or change their exposure. The client still holds a sensitive Router credential, so untrusted machines can steal it.
 
 **On a new trusted host only, by its owner:** use isolated state and the same paths for all commands as described in [agent setup](agent-setup.md#3-open-the-right-dashboard). Before remote exposure, establish Router authentication and approved private network access. The first active key is admin: keep it with the owner and create a separate inference-scoped key for clients using the dashboard's API Keys controls. Do not share the first admin key as a client credential.
 
@@ -725,29 +734,29 @@ The following are server-owner operations, not instructions to run on each clien
 
 ```bash
 # Add your Claude account with OAuth
-better-ccflare --add-account myaccount --mode claude-oauth --priority 0
+hov-router --add-account myaccount --mode claude-oauth --priority 0
 
 # Bootstrap authentication privately; the first key is admin and stays with the owner
-better-ccflare --generate-api-key "Server owner"
+hov-router --generate-api-key "Server owner"
 
 # Start privately; remote binding/exposure is a separate owner-approved step
-BETTER_CCFLARE_HOST=127.0.0.1 better-ccflare --serve
+BETTER_CCFLARE_HOST=127.0.0.1 hov-router --serve
 ```
 
 **On the client/VPS:** first apply Option 2's authentication-conflict and secret-handling precautions. Preserve any existing login until the human chooses the change. Replace the sample origin with the owner's confirmed origin and supply the inference key privately; do not run account or server commands here.
 
 ```bash
-# Set the remote better-ccflare URL and API key
+# Set the confirmed Router URL and API key
 export ANTHROPIC_BASE_URL=https://your-server.com:8080
-export ANTHROPIC_AUTH_TOKEN=btr-abcdef1234567890...  # Your better-ccflare API key
+export ANTHROPIC_AUTH_TOKEN=btr-abcdef1234567890...  # Your Router API key
 
-# Start Claude CLI (no need to login - better-ccflare handles auth)
+# Start Claude CLI with the agreed Router authentication
 claude
 ```
 
 **How it works:**
-- Claude Code CLI sends requests with your better-ccflare API key
-- better-ccflare validates the API key and proxies requests using its stored OAuth credentials
+- Claude Code CLI sends requests with your Router API key
+- HoV Router validates the API key and proxies requests using its stored OAuth credentials
 - Your OAuth credentials stay secure on your trusted server
 - Clients hold a Router key, not the server's provider OAuth credentials; protect that key too
 
@@ -763,9 +772,9 @@ Verify with a real interactive Claude Code request and a matching **Requests** e
 
 ### Codex CLI as a Client
 
-better-ccflare supports [Codex CLI](https://github.com/openai/codex) as a client. Codex speaks the OpenAI Responses API; better-ccflare intercepts requests to `/v1/responses` and `/v1/responses/compact` and translates them to Anthropic `POST /v1/messages` internally, routing through your configured account pool.
+HoV Router supports [Codex CLI](https://github.com/openai/codex) as a client. Codex speaks the OpenAI Responses API; HoV Router intercepts requests to `/v1/responses` and `/v1/responses/compact` and translates them to Anthropic `POST /v1/messages` internally, routing through your configured account pool.
 
-Configure Codex CLI to point at better-ccflare in `~/.codex/config.toml`:
+Configure Codex CLI to point at HoV Router in `~/.codex/config.toml`:
 
 ```toml
 openai_base_url = "http://127.0.0.1:8080/v1"
@@ -780,7 +789,7 @@ export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
 export OPENAI_API_KEY=dummy-key
 ```
 
-Codex CLI requires an API key to start — use `dummy-key` if better-ccflare API key authentication is not enabled, or your real better-ccflare API key if it is.
+Codex CLI requires an API key to start — use `dummy-key` if Router API key authentication is not enabled, or your real Router API key if it is.
 
 Known limitations:
 
@@ -790,22 +799,22 @@ Known limitations:
 
 ### SSL/HTTPS Configuration
 
-To enable HTTPS with better-ccflare, you'll need SSL certificates. Here are your options:
+To enable HTTPS with HoV Router, you'll need SSL certificates. Here are your options:
 
 #### Option 1: Generate Self-Signed Certificates (Development/Local Use)
 
 ```bash
-# Generate a self-signed certificate on the better-ccflare host
+# Generate a self-signed certificate on the Router host
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes \
   -subj "/C=US/ST=State/L=City/O=Organization/CN=yourhostname"
 
-# Start better-ccflare with SSL
+# Start HoV Router with SSL
 export SSL_KEY_PATH=/path/to/key.pem
 export SSL_CERT_PATH=/path/to/cert.pem
-better-ccflare
+hov-router
 
 # Or use command line flags
-better-ccflare --ssl-key /path/to/key.pem --ssl-cert /path/to/cert.pem
+hov-router --ssl-key /path/to/key.pem --ssl-cert /path/to/cert.pem
 ```
 
 **Trust the self-signed certificate on client machines:**
@@ -814,27 +823,27 @@ For self-signed certificates, you need to add the certificate to your system's t
 
 - **Linux (Ubuntu/Debian):**
   ```bash
-  # Copy cert.pem from the better-ccflare host to your client machine
+  # Copy cert.pem from the Router host to your client machine
   sudo cp cert.pem /usr/local/share/ca-certificates/better-ccflare.crt
   sudo update-ca-certificates
   ```
 
 - **Linux (Arch/Manjaro):**
   ```bash
-  # Copy cert.pem from the better-ccflare host to your client machine
+  # Copy cert.pem from the Router host to your client machine
   sudo cp cert.pem /etc/ca-certificates/trust-source/anchors/better-ccflare.crt
   sudo trust extract-compat
   ```
 
 - **macOS:**
   ```bash
-  # Copy cert.pem from the better-ccflare host to your client machine
+  # Copy cert.pem from the Router host to your client machine
   sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain cert.pem
   ```
 
 - **Windows (PowerShell as Administrator):**
   ```powershell
-  # Copy cert.pem from the better-ccflare host to your client machine
+  # Copy cert.pem from the Router host to your client machine
   Import-Certificate -FilePath cert.pem -CertStoreLocation Cert:\LocalMachine\Root
   ```
 
@@ -852,13 +861,13 @@ The `NODE_OPTIONS="--use-system-ca"` is **required** for Claude Code and other N
 
 #### Option 2: Use Production Certificates (Production/Remote Access)
 
-If you're running better-ccflare on a server with a domain name, use Let's Encrypt or your certificate provider:
+If you're running HoV Router on a server with a domain name, use Let's Encrypt or your certificate provider:
 
 ```bash
 # Using Let's Encrypt certificates
 export SSL_KEY_PATH=/etc/letsencrypt/live/yourdomain.com/privkey.pem
 export SSL_CERT_PATH=/etc/letsencrypt/live/yourdomain.com/fullchain.pem
-better-ccflare
+hov-router
 
 # Set the base URL to use HTTPS
 export ANTHROPIC_BASE_URL=https://yourdomain.com:8080
@@ -960,7 +969,7 @@ No `NODE_OPTIONS` needed - Traefik provides trusted certificates automatically!
 
 ## Windows Troubleshooting
 
-These workarounds concern the legacy upstream npm package and release binaries, not a wstack Router distribution. For this fork, use the source quickstart in WSL; native Windows installation has not been verified here.
+These workarounds concern the legacy upstream npm package and release binaries, not a HoV Router distribution. For this fork, use the source quickstart in WSL; native Windows installation has not been verified here.
 
 ### Issue: "Command is misspelled or could not be found" after npm install
 
@@ -1054,11 +1063,11 @@ See [Combos and Managed Family Routing](combos.md) for routing semantics and rol
 The shipped live-server CLI surface is:
 
 ```bash
-better-ccflare routing list [--api-url <loopback-url>] [--json]
-better-ccflare routing detail <account-id> [--api-url <loopback-url>] [--json]
-better-ccflare routing preview <family> [--managed-model <model>] [--api-url <loopback-url>] [--json]
-better-ccflare routing apply <family> --preview-id <id> --proposal-id <id> --managed-model <model> --yes [--api-url <loopback-url>] [--json]
-better-ccflare routing manual <family> --yes [--api-url <loopback-url>] [--json]
+hov-router routing list [--api-url <loopback-url>] [--json]
+hov-router routing detail <account-id> [--api-url <loopback-url>] [--json]
+hov-router routing preview <family> [--managed-model <model>] [--api-url <loopback-url>] [--json]
+hov-router routing apply <family> --preview-id <id> --proposal-id <id> --managed-model <model> --yes [--api-url <loopback-url>] [--json]
+hov-router routing manual <family> --yes [--api-url <loopback-url>] [--json]
 ```
 
 Interactive apply can preview, show exact deltas, require an explicit proposal selection, and confirm before writing. Unattended or JSON apply requires the complete displayed tuple plus `--yes`; Manual rollback requires `--yes`. The admin key is accepted only through `BETTER_CCFLARE_ADMIN_API_KEY`. Interactive account creation reviews routing by the persisted immutable account ID, then freshly previews, displays, confirms, and applies each selected family in sequence. Missing or materially changed proposals fail closed, and any already-applied family results are reported as partial rather than hidden or rolled back. `--add-account --json` is rejected before creation; non-TTY text creation prints the immutable ID and follow-up commands without previewing or changing routing. Routing commands continue to support `--json`.
@@ -1081,7 +1090,7 @@ Interactive apply can preview, show exact deltas, require an explicit proposal s
 See [Service-Lifetime Cohort Seal configuration and operator guidance](configuration.md#service-lifetime-cohort-seal) for activation, report and health commands, retention, privacy, and the mandatory pre-transport runtime-safety gate.
 
 ### Developer Tools
-- Powerful CLI (`better-ccflare`)
+- CLI (`hov-router`, with `wstack-router` and `better-ccflare` compatibility)
 - Web dashboard (`http://localhost:8080/dashboard`)
 - CLI for account management
 - REST API for automation
@@ -1178,7 +1187,7 @@ Full documentation available in [the documentation index](index.md):
 
 ## Requirements
 
-**For wstack Router installation:** use the [Linux x86_64 release prerequisites](#install-the-linux-x86_64-release) or the [source-build requirements](#install-from-source). No Router npm package or container image is published.
+**For HoV Router installation:** use the [Linux x86_64 release prerequisites](#install-the-linux-x86_64-release) or the [source-build requirements](#install-from-source). No Router npm package or container image is published.
 
 **For the retained legacy upstream installation recipes:**
 - **npm** or **bun** package manager (for npm/bun installation)
@@ -1191,9 +1200,9 @@ Full documentation available in [the documentation index](index.md):
 
 ## Platform Support
 
-wstack Router 3.6.2 publishes a **Linux x86_64 binary only**. No Router Linux ARM64, macOS, or native Windows binary is published. The [source-build path](#install-from-source) remains available; its acceptance check runs on Linux x86_64, not macOS or native Windows.
+The historical wstack Router 3.6.2 release provides a **Linux x86_64 binary only**. No Router Linux ARM64, macOS, or native Windows binary is published. The [source-build path](#install-from-source) remains available; its acceptance check runs on Linux x86_64, not macOS or native Windows.
 
-The table and device list below describe the retained **upstream distribution** recipes, not wstack Router artifacts.
+The table and device list below describe the retained **upstream distribution** recipes, not HoV Router artifacts.
 
 | Platform | Architecture | Status |
 |----------|-------------|--------|
@@ -1264,7 +1273,7 @@ bun run format         # Format code
 
 ## CLI Commands
 
-The better-ccflare CLI provides comprehensive command-line interface for management and monitoring:
+The HoV Router CLI provides a command-line interface for management and monitoring:
 
 ```bash
 # If running without global install, use the full path:

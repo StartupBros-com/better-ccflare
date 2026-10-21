@@ -1,10 +1,14 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveBuildProvenance } from "@better-ccflare/core";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
+import { MemoryRouter } from "react-router-dom";
 import { createUpdateStatusService } from "../../../http-api/src/handlers/version";
+import * as themeContext from "../contexts/theme-context";
 import {
+	Navigation,
 	requestUpdateStatus,
 	scheduleUpdateChecks,
 	UPDATE_CHECK_INTERVAL_MS,
@@ -32,20 +36,56 @@ function status(
 }
 
 describe("navigation identity", () => {
-	it("uses the safe identity subpath for desktop, mobile, and static title labels", () => {
-		const source = readFileSync(
-			join(import.meta.dir, "navigation.tsx"),
-			"utf8",
-		);
-		const app = readFileSync(join(import.meta.dir, "../App.tsx"), "utf8");
-		const html = readFileSync(join(import.meta.dir, "../index.html"), "utf8");
+	it("loads display identity directly without the runtime core barrel", () => {
+		for (const path of ["navigation.tsx", "../App.tsx"]) {
+			const source = readFileSync(join(import.meta.dir, path), "utf8");
+			expect(source).toContain(
+				'import { PRODUCT_NAME } from "@better-ccflare/core/product-identity"',
+			);
+			expect(source).not.toContain('from "@better-ccflare/core"');
+		}
+	});
 
-		expect(source).toContain('from "@better-ccflare/core/product-identity"');
-		expect(source).not.toContain('from "@better-ccflare/core"');
-		expect(source.match(/\{PRODUCT_NAME\}/g)?.length).toBe(2);
-		expect(source).not.toContain(">better-ccflare<");
-		expect(html).toContain("<title>wstack Router Dashboard</title>");
-		expect(app).toContain("Monitor your wstack Router performance and usage");
+	it("renders HoV Router in both the mobile header and desktop sidebar", () => {
+		const queryClient = new QueryClient();
+		const theme = spyOn(themeContext, "useTheme").mockReturnValue({
+			theme: "light",
+			setTheme: () => {},
+		});
+		try {
+			const html = renderToStaticMarkup(
+				<QueryClientProvider client={queryClient}>
+					<MemoryRouter>
+						<Navigation />
+					</MemoryRouter>
+				</QueryClientProvider>,
+			);
+			const [mobileHeader, sidebar] = html.split("<aside");
+			expect(mobileHeader).toContain('class="lg:hidden ');
+			expect(mobileHeader).toMatch(/<span\b[^>]*>HoV Router<\/span>/);
+			expect(sidebar).toContain("lg:translate-x-0");
+			expect(sidebar).toMatch(/<h1\b[^>]*>HoV Router<\/h1>/);
+			expect(html).not.toContain(">wstack Router<");
+			expect(html).not.toContain(">better-ccflare<");
+		} finally {
+			theme.mockRestore();
+			queryClient.clear();
+		}
+	});
+
+	it("uses shared display identity for the overview subtitle", () => {
+		const app = readFileSync(join(import.meta.dir, "../App.tsx"), "utf8");
+		expect(app).toContain(
+			"subtitle: `Monitor your ${PRODUCT_NAME} performance and usage`",
+		);
+		expect(app).not.toContain("Monitor your wstack Router");
+	});
+
+	it("sets the static browser title to HoV Router Dashboard", () => {
+		const html = readFileSync(join(import.meta.dir, "../index.html"), "utf8");
+		expect(html.match(/<title>([^<]*)<\/title>/)?.[1]).toBe(
+			"HoV Router Dashboard",
+		);
 	});
 
 	it("renders no action for genuinely resolved branded U1 provenance", async () => {
@@ -65,7 +105,12 @@ describe("navigation identity", () => {
 				CCFLARE_PRODUCER: "startupbros",
 				CCFLARE_ARTIFACT_MODE: mode,
 			});
-			expect(provenance.proven).toBe(true);
+			expect(provenance).toMatchObject({
+				identity: token,
+				proven: true,
+				actionable: false,
+				updateChannel: null,
+			});
 			const adapter = async () => {
 				lookups += 1;
 				return "9.9.9";
@@ -87,7 +132,13 @@ describe("navigation identity", () => {
 					}}
 				/>,
 			);
-			expect(served.action).toBeNull();
+			expect(served).toMatchObject({
+				availability: "unavailable",
+				latestVersion: null,
+				action: null,
+				cache: "not-applicable",
+				reason: "proven_non_actionable",
+			});
 			expect(html).not.toContain("<code");
 			expect(html).not.toContain("href=");
 			for (const guidance of DEFAULT_GUIDANCE)

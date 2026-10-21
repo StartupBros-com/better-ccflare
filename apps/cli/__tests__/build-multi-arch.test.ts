@@ -134,6 +134,10 @@ describe("wstack Router build provenance", () => {
 				"https://github.com/StartupBros/wstack-router.git",
 				"git@github.com:StartupBros/wstack-router.git",
 				"ssh://git@github.com/StartupBros/wstack-router.git",
+				"https://github.com/StartupBros/hov-router",
+				"https://github.com/StartupBros/hov-router.git",
+				"git@github.com:StartupBros/hov-router.git",
+				"ssh://git@github.com/StartupBros/hov-router.git",
 			]) {
 				expect(
 					readTombiiTaggedBuildEvidence("1.2.3", context, probe(origin)),
@@ -154,6 +158,13 @@ describe("wstack Router build provenance", () => {
 				"https://github.com/StartupBros/wstack-router ",
 				"https://github.com/StartupBros/wstack-router/extra",
 				"https:/github.com/StartupBros/wstack-router",
+				"https://github.com/StartupBros/hov-router-extra",
+				"https://github.com/StartupBros/hov-router/extra",
+				"https://github.com/StartupBros/hov-router.git?x=1",
+				"https://github.com/StartupBros/hov-router#main",
+				"https://github.com/StartupBros/hov-router\n",
+				"https://github.com/startupbros/hov-router",
+				"https://github.com/StartupBros-com/hov-router",
 			])
 				expect(
 					readTombiiTaggedBuildEvidence("1.2.3", context, probe(origin)),
@@ -164,6 +175,7 @@ describe("wstack Router build provenance", () => {
 				"1.2.3-rc.1",
 				"1.2",
 				" 1.2.3",
+				"1.2.3\n",
 			])
 				expect(
 					readTombiiTaggedBuildEvidence(version, context, probe()),
@@ -186,6 +198,7 @@ describe("wstack Router build provenance", () => {
 				probe(undefined, "", sha.toUpperCase()),
 				probe(undefined, "", sha, runtimeSha),
 				probe(undefined, "", sha, null),
+				probe(undefined, "", `${sha}\n`, `${sha}\n`),
 			])
 				expect(
 					readTombiiTaggedBuildEvidence("1.2.3", context, badProbe),
@@ -428,6 +441,12 @@ describe("release binary provenance", () => {
 			sourceRef: "refs/tags/v1.2.3",
 		});
 		expect(cleanProbeCalls).toContainEqual(["status", "--porcelain"]);
+		expect(cleanProbeCalls).toContainEqual([
+			"config",
+			"--null",
+			"--get",
+			"remote.origin.url",
+		]);
 
 		for (const status of [
 			" M apps/cli/build-provenance.ts",

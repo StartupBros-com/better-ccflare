@@ -1,3 +1,4 @@
+import { PRODUCT_NAME } from "@better-ccflare/core/product-identity";
 import { HttpError } from "@better-ccflare/http-common";
 import {
 	MutationCache,
@@ -78,7 +79,7 @@ export function App() {
 				path: "/",
 				element: <OverviewTab />,
 				title: "Dashboard Overview",
-				subtitle: "Monitor your wstack Router performance and usage",
+				subtitle: `Monitor your ${PRODUCT_NAME} performance and usage`,
 			},
 			{
 				path: "/analytics",

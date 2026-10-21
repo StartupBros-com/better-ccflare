@@ -7,7 +7,7 @@ jobs:
   sign:
     name: Test-sign Windows binary
     # Router never uses inherited signing jobs.
-    if: github.repository != 'StartupBros/wstack-router'
+    if: github.repository != 'StartupBros/wstack-router' && github.repository != 'StartupBros/hov-router' && github.repository_id != '1278801682'
     runs-on: ubuntu-latest
     permissions:
       contents: write

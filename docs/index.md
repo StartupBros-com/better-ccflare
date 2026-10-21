@@ -1,4 +1,6 @@
-# wstack Router Documentation
+# HoV Router Documentation
+
+<a id="wstack-router-documentation"></a>
 
 New here? [Send the setup prompt to your coding agent](../README.md#send-this-to-your-ai-agent). The [agent setup guide](agent-setup.md) takes it from inspecting your computer to verifying a client request, with sign-in left to you.
 
@@ -9,7 +11,7 @@ New here? [Send the setup prompt to your coding agent](../README.md#send-this-to
 - [Source build](reference.md#install-from-source): requirements and installation without overwriting an existing command.
 - [Local server and account setup](reference.md#start-the-local-server): dashboard workflow and request verification.
 - [Claude Code authentication](reference.md#configure-claude-sdk) or [Codex client configuration](reference.md#codex-cli-as-a-client).
-- [Migration and rollback](wstack-router-migration.md): existing better-ccflare users, unchanged storage names, and manual updates.
+- [Migration and rollback](wstack-router-migration.md): existing wstack-router/better-ccflare users, unchanged storage names, and manual updates.
 
 Router 3.6.2 publishes a Linux x86_64 binary only. The [platform notes](reference.md#platform-support) distinguish source-build coverage from upstream packages and downloads, which do not install Router.
 
@@ -32,6 +34,8 @@ Router 3.6.2 publishes a Linux x86_64 binary only. The [platform notes](referenc
 - [Release automation](wstack-router-releases.md): maintainer draft-release workflow, separate from consumer installation.
 - [Anthropic usage API changelog](anthropic-api-changelog.md).
 
-[Router source and issues](https://github.com/StartupBros/wstack-router) · [MIT license](../LICENSE)
+[Router source and issues](https://github.com/StartupBros/hov-router) · [MIT license](../LICENSE)
+
+Use `hov-router`; `wstack-router` and `better-ccflare` remain compatible commands. Before the repository rename, the live home is [StartupBros/wstack-router](https://github.com/StartupBros/wstack-router); use it in GitHub URLs until cutover. Existing documentation filenames remain unchanged.
 
 External references: [Anthropic API](https://docs.anthropic.com/claude/docs), [Bun](https://bun.sh/docs), [SQLite](https://www.sqlite.org/docs.html).

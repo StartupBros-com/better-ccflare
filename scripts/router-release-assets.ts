@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
 	mkdirSync,
 	mkdtempSync,
@@ -11,8 +12,12 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
+	ROUTER_REPOSITORY_ID,
+	validateRouterRepository,
+} from "../packages/core/src/router-repository";
+import {
 	githubTransport,
-	ROUTER_REPOSITORY,
+	resolveRouterRepository,
 	validateDraft,
 } from "./router-release";
 
@@ -31,10 +36,12 @@ const STABLE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 export interface EventContext {
 	repository: string;
+	repositoryId: number;
 	eventName: string;
 	ref: string;
 	sha: string;
 	event: {
+		repository?: unknown;
 		workflow_run?: {
 			name?: string;
 			path?: string;
@@ -43,11 +50,20 @@ export interface EventContext {
 			conclusion?: string;
 			head_branch?: string;
 			head_sha?: string;
-			repository?: { full_name?: string };
-			head_repository?: { full_name?: string };
+			repository?: unknown;
+			head_repository?: unknown;
 		};
-		inputs?: { source_sha?: string; version?: string };
+		inputs?: { source_sha?: string; version?: string; release_id?: string };
 	};
+}
+
+function assertEventRepository(ctx: EventContext) {
+	const repository = validateRouterRepository(ctx.event?.repository);
+	if (
+		ctx.repositoryId !== ROUTER_REPOSITORY_ID ||
+		ctx.repository !== repository.full_name
+	)
+		throw new Error("Wrong repository for Router release");
 }
 export interface ArtifactIdentity {
 	repository: string;
@@ -59,8 +75,7 @@ export interface ArtifactIdentity {
 
 /** Coordinator trigger gate: only exact-repo foundation push success on main, or an explicit bounded retry. */
 export function assertCoordinatorEvent(ctx: EventContext) {
-	if (ctx.repository !== ROUTER_REPOSITORY)
-		throw new Error("Wrong repository for Router release");
+	assertEventRepository(ctx);
 	if (ctx.ref !== "refs/heads/main")
 		throw new Error("Router release coordinator runs only from main");
 	if (ctx.eventName === "workflow_run") {
@@ -72,8 +87,9 @@ export function assertCoordinatorEvent(ctx: EventContext) {
 			run.status !== "completed" ||
 			run.conclusion !== "success" ||
 			run.head_branch !== "main" ||
-			run.repository?.full_name !== ROUTER_REPOSITORY ||
-			run.head_repository?.full_name !== ROUTER_REPOSITORY ||
+			validateRouterRepository(run.repository).full_name !== ctx.repository ||
+			validateRouterRepository(run.head_repository).full_name !==
+				ctx.repository ||
 			!SHA.test(run.head_sha ?? "")
 		)
 			throw new Error("Foundation run is not exact-repo successful main push");
@@ -99,14 +115,18 @@ export function assertArtifactEvent(
 	ctx: EventContext,
 	identity: ArtifactIdentity,
 ) {
+	assertEventRepository(ctx);
 	if (
-		ctx.repository !== ROUTER_REPOSITORY ||
-		identity.repository !== ROUTER_REPOSITORY ||
+		identity.repository !== ctx.repository ||
 		ctx.eventName !== "workflow_dispatch" ||
 		!SHA.test(identity.sha) ||
 		!STABLE.test(identity.version) ||
 		identity.ref !== `refs/tags/v${identity.version}` ||
 		!Number.isSafeInteger(identity.releaseId) ||
+		identity.releaseId <= 0 ||
+		ctx.event.inputs?.source_sha !== identity.sha ||
+		ctx.event.inputs?.version !== identity.version ||
+		ctx.event.inputs?.release_id !== String(identity.releaseId) ||
 		ctx.sha !== identity.sha ||
 		ctx.ref !== identity.ref
 	)
@@ -116,6 +136,7 @@ export function assertArtifactEvent(
 export function attestationArguments(
 	subject: string,
 	identity: ArtifactIdentity,
+	bundle?: string,
 ) {
 	return [
 		"attestation",
@@ -132,6 +153,7 @@ export function attestationArguments(
 		"--signer-digest",
 		identity.sha,
 		"--deny-self-hosted-runners",
+		...(bundle ? ["--bundle", bundle] : []),
 	];
 }
 
@@ -194,10 +216,9 @@ export async function reconcileAssets(
 	return ASSET_NAMES;
 }
 
-const api = (path: string) =>
-	`https://api.github.com/repos/${ROUTER_REPOSITORY}/${path}`;
 async function ghFetch(token: string, url: string, init: RequestInit = {}) {
 	const response = await fetch(url, {
+		redirect: "error",
 		...init,
 		headers: {
 			Authorization: `Bearer ${token}`,
@@ -251,7 +272,10 @@ async function githubAssets(
 	identity: ArtifactIdentity,
 	root: string,
 ): Promise<AssetTransport & { url(): Promise<string> }> {
-	const release = await githubTransport(token);
+	const release = await githubTransport(token, identity.repository);
+	const repository = `${release.scm.repository.owner}/${release.scm.repository.repo}`;
+	const api = (path: string) =>
+		`https://api.github.com/repos/${repository}/${path}`;
 	return {
 		validate: async () => {
 			const result = await validateDraft(release, identity);
@@ -281,6 +305,8 @@ async function githubAssets(
 			new Uint8Array(
 				await (
 					await ghFetch(token, api(`releases/assets/${asset.id}`), {
+						// GitHub's asset endpoint redirects to object storage after repository validation.
+						redirect: "follow",
 						headers: { Accept: "application/octet-stream" },
 					})
 				).arrayBuffer(),
@@ -288,7 +314,7 @@ async function githubAssets(
 		upload: async (name, bytes) => {
 			await ghFetch(
 				token,
-				`https://uploads.github.com/repos/${ROUTER_REPOSITORY}/releases/${identity.releaseId}/assets?name=${encodeURIComponent(name)}`,
+				`https://uploads.github.com/repos/${repository}/releases/${identity.releaseId}/assets?name=${encodeURIComponent(name)}`,
 				{
 					method: "POST",
 					headers: { "Content-Type": "application/octet-stream" },
@@ -298,10 +324,26 @@ async function githubAssets(
 		},
 		authenticate: async (name, bytes) => {
 			const directory = mkdtempSync(join(root, "attest-"));
-			writeFileSync(join(directory, name), bytes);
+			const subject = join(directory, name);
+			writeFileSync(subject, bytes);
+			// Retrieval follows validated current metadata; verification retains the producing identity.
 			execFileSync(
 				"gh",
-				attestationArguments(join(directory, name), identity),
+				["attestation", "download", subject, "--repo", repository],
+				{
+					cwd: directory,
+					env: { ...cleanEnv(directory), GH_TOKEN: token },
+					stdio: ["ignore", 2, 2],
+				},
+			);
+			const digest = createHash("sha256").update(bytes).digest("hex");
+			execFileSync(
+				"gh",
+				attestationArguments(
+					subject,
+					identity,
+					join(directory, `sha256:${digest}.jsonl`),
+				),
 				{
 					env: { ...cleanEnv(directory), GH_TOKEN: token },
 					stdio: ["ignore", 2, 2],
@@ -323,6 +365,10 @@ async function githubAssets(
 function eventContext(): EventContext {
 	return {
 		repository: process.env.GITHUB_REPOSITORY ?? "",
+		repositoryId:
+			process.env.GITHUB_REPOSITORY_ID === String(ROUTER_REPOSITORY_ID)
+				? ROUTER_REPOSITORY_ID
+				: NaN,
 		eventName: process.env.GITHUB_EVENT_NAME ?? "",
 		ref: process.env.GITHUB_REF ?? "",
 		sha: process.env.GITHUB_SHA ?? "",
@@ -343,9 +389,20 @@ function identityFromEnvironment(): ArtifactIdentity {
 
 if (import.meta.main) {
 	const [command, directory] = process.argv.slice(2);
-	if (command === "coordinator-event")
-		console.log(JSON.stringify(assertCoordinatorEvent(eventContext())));
-	else if (command === "artifact-event")
+	if (command === "coordinator-event") {
+		const context = eventContext();
+		const source = assertCoordinatorEvent(context);
+		const token = process.env.GITHUB_TOKEN;
+		if (!token) throw new Error("GITHUB_TOKEN required");
+		const current = await resolveRouterRepository(token, context.repository);
+		console.log(
+			JSON.stringify({
+				...source,
+				repository: current.full_name,
+				repositoryName: current.name,
+			}),
+		);
+	} else if (command === "artifact-event")
 		assertArtifactEvent(eventContext(), identityFromEnvironment());
 	else if (command === "stage" && directory) {
 		const identity = identityFromEnvironment();

@@ -1,6 +1,8 @@
 # Set up Router with an agent
 
-For a coding agent with computer and terminal access, helping a human connect Claude Code to wstack Router. Choose client-only or new-host setup **before installing anything**. Installation commands live in the [technical reference](reference.md), not here. Finish with a working client request and matching dashboard evidence, directly or with the owner's help; otherwise name the evidence or human step still needed.
+For a coding agent with computer and terminal access, helping a human connect Claude Code to HoV Router. Choose client-only or new-host setup **before installing anything**. Installation commands live in the [technical reference](reference.md), not here. Finish with a working client request and matching dashboard evidence, directly or with the owner's help; otherwise name the evidence or human step still needed.
+
+Use `hov-router` for current builds; `wstack-router` and `better-ccflare` remain compatible commands. The target public home is `StartupBros/hov-router`. Before the repository rename, use the live `StartupBros/wstack-router` in guide, clone, download, and support URLs. Keep the local clone directory `better-ccflare`. Published 3.6.2 still reports `wstack Router v3.6.2` through every alias; preserve its historical verification pins. HoV Router and hovstack are independent House of Vibe projects; no hovstack installation is needed.
 
 ## 1. Choose the setup path
 

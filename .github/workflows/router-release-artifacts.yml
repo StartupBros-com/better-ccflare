@@ -30,7 +30,8 @@ env:
 
 jobs:
   validate:
-    if: github.repository == 'StartupBros/wstack-router'
+    # Mirror packages/core/src/router-repository.ts; fixture tests enforce parity.
+    if: (github.repository == 'StartupBros/wstack-router' || github.repository == 'StartupBros/hov-router') && github.repository_id == '1278801682'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -63,6 +64,7 @@ jobs:
 
   build:
     needs: validate
+    if: (github.repository == 'StartupBros/wstack-router' || github.repository == 'StartupBros/hov-router') && github.repository_id == '1278801682'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -97,6 +99,7 @@ jobs:
 
   attest:
     needs: build
+    if: (github.repository == 'StartupBros/wstack-router' || github.repository == 'StartupBros/hov-router') && github.repository_id == '1278801682'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -118,6 +121,7 @@ jobs:
 
   stage:
     needs: [build, attest]
+    if: (github.repository == 'StartupBros/wstack-router' || github.repository == 'StartupBros/hov-router') && github.repository_id == '1278801682'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -149,7 +153,7 @@ jobs:
         run: |
           set -euo pipefail
           help="$(gh attestation verify --help)"
-          for flag in --repo --source-digest --source-ref --cert-identity --signer-digest --deny-self-hosted-runners; do
+          for flag in --repo --source-digest --source-ref --cert-identity --signer-digest --deny-self-hosted-runners --bundle; do
             grep -F -- "$flag" <<<"$help" > /dev/null
           done
       - name: Stage missing assets, verify downloads and attestations, then smoke

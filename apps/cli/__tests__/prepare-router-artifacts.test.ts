@@ -14,6 +14,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+	COMMAND_NAMES,
+	PRODUCT_NAME,
+} from "../../../packages/core/src/product-identity";
+import { smokeExecutable } from "../router-artifacts";
 
 const root = resolve(import.meta.dir, "../../..");
 const entrypoint = join(root, "apps/cli/prepare-router-artifacts.ts");
@@ -22,6 +27,14 @@ function fixture() {
 	const dir = mkdtempSync(join(tmpdir(), "router-prepare-test-"));
 	fixtures.push(dir);
 	return dir;
+}
+function copyProductIdentity(repo: string) {
+	const core = join(repo, "packages/core/src");
+	mkdirSync(core, { recursive: true });
+	copyFileSync(
+		join(root, "packages/core/src/product-identity.ts"),
+		join(core, "product-identity.ts"),
+	);
 }
 afterEach(() => {
 	for (const dir of fixtures.splice(0))
@@ -49,6 +62,72 @@ function prepare(
 	);
 }
 
+describe("current executable smoke fixtures (not native build proof)", () => {
+	function executable(body: string) {
+		const dir = fixture();
+		const binary = join(dir, "binary");
+		writeFileSync(binary, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+		return { dir, binary };
+	}
+	const sha = "a".repeat(40);
+	const body = `case "$1" in
+--help) printf 'HoV Router\\n';;
+--version) printf 'HoV Router v1.2.3\\n';;
+--git-sha) printf '${sha}\\n';;
+esac`;
+	it("checks exact current output and SHA for all three command aliases", () => {
+		const { dir, binary } = executable(body);
+		const calls = join(dir, "calls");
+		writeFileSync(
+			binary,
+			`#!/bin/sh\nprintf '%s %s\\n' "\${0##*/}" "$1" >> '${calls}'\n${body}\n`,
+		);
+		expect(() =>
+			smokeExecutable(binary, { version: "1.2.3", sha }),
+		).not.toThrow();
+		expect(readFileSync(calls, "utf8").trim().split("\n")).toEqual(
+			COMMAND_NAMES.flatMap((alias) =>
+				["--help", "--version", "--git-sha"].map((flag) => `${alias} ${flag}`),
+			),
+		);
+	});
+	it("requires current output for a new build even with the historical version and SHA", () => {
+		const identity = {
+			version: "3.6.2",
+			sha: "5d7b2a888a9b61d87916332b414e46606498d896",
+		};
+		const current = body.replace("v1.2.3", "v3.6.2").replace(sha, identity.sha);
+		expect(() =>
+			smokeExecutable(executable(current).binary, identity),
+		).not.toThrow();
+		expect(() =>
+			smokeExecutable(
+				executable(current.replaceAll("HoV Router", "wstack Router")).binary,
+				identity,
+			),
+		).toThrow(/Unexpected/);
+	});
+	for (const [label, source] of [
+		["old branding", body.replaceAll("HoV Router", "wstack Router")],
+		["wrong version", body.replace("v1.2.3", "v9.9.9")],
+		["extra version output", body.replace("v1.2.3", "v1.2.3 extra")],
+		["wrong SHA", body.replace(sha, "b".repeat(40))],
+		["configuration creation", `mkdir "$HOME/.config"\n${body}`],
+		["working directory writes", `touch initialized\n${body}`],
+		[
+			"broken hov-router alias",
+			`test "\${0##*/}" != hov-router || exit 93\n${body}`,
+		],
+	] as const) {
+		it(`rejects ${label}`, () => {
+			const { binary } = executable(source);
+			expect(() =>
+				smokeExecutable(binary, { version: "1.2.3", sha }),
+			).toThrow();
+		});
+	}
+});
+
 describe("local Linux artifact preparation", () => {
 	it.skipIf(
 		process.platform !== "linux" ||
@@ -67,6 +146,7 @@ describe("local Linux artifact preparation", () => {
 			mkdirSync(join(cli, "dist"), { recursive: true });
 			mkdirSync(dashboard, { recursive: true });
 			copyFileSync(entrypoint, join(cli, "prepare-router-artifacts.ts"));
+			copyProductIdentity(home);
 			copyFileSync(
 				join(root, "apps/cli/router-artifacts.ts"),
 				join(cli, "router-artifacts.ts"),
@@ -114,6 +194,7 @@ describe("local Linux artifact preparation", () => {
 				mkdirSync(join(cli, "dist"), { recursive: true });
 				mkdirSync(dashboard, { recursive: true });
 				copyFileSync(entrypoint, join(cli, "prepare-router-artifacts.ts"));
+				copyProductIdentity(home);
 				copyFileSync(
 					join(root, "apps/cli/router-artifacts.ts"),
 					join(cli, "router-artifacts.ts"),
@@ -149,9 +230,7 @@ writeFileSync("dist/better-ccflare-linux-amd64", "#!/bin/sh\\nprintf 'invalid sm
 				);
 				expect(result.status).not.toBe(0);
 				expect(result.stdout).toContain("better-ccflare-linux-amd64: OK");
-				expect(result.stderr).toContain(
-					"Unexpected wstack-router --help output",
-				);
+				expect(result.stderr).toContain("Unexpected hov-router --help output");
 				expect(existsSync(destination)).toBe(false);
 				if (hasPrevious) expect(readFileSync(built)).toEqual(original);
 				else expect(existsSync(built)).toBe(false);
@@ -167,7 +246,7 @@ writeFileSync("dist/better-ccflare-linux-amd64", "#!/bin/sh\\nprintf 'invalid sm
 		);
 	}
 	it.skipIf(process.platform !== "linux" || process.arch !== "x64")(
-		"builds fresh Linux assets, verifies checksums and runs both aliases without configuration",
+		"builds fresh Linux assets, verifies checksums and runs all three aliases without configuration",
 		() => {
 			const home = fixture();
 			const destination = join(home, "output");
@@ -202,7 +281,7 @@ writeFileSync("dist/better-ccflare-linux-amd64", "#!/bin/sh\\nprintf 'invalid sm
 			const version = JSON.parse(
 				readFileSync(join(root, "apps/cli/package.json"), "utf8"),
 			).version;
-			for (const alias of ["wstack-router", "better-ccflare"]) {
+			for (const alias of COMMAND_NAMES) {
 				const executable = join(home, "smoke", alias);
 				copyFileSync(
 					join(destination, "better-ccflare-linux-amd64"),
@@ -216,9 +295,9 @@ writeFileSync("dist/better-ccflare-linux-amd64", "#!/bin/sh\\nprintf 'invalid sm
 						timeout: 10000,
 					});
 					expect(smoke.status, smoke.stderr).toBe(0);
-					expect(smoke.stdout).toContain("wstack Router");
+					expect(smoke.stdout).toContain(PRODUCT_NAME);
 					if (flag === "--version")
-						expect(smoke.stdout.trim()).toBe(`wstack Router v${version}`);
+						expect(smoke.stdout.trim()).toBe(`${PRODUCT_NAME} v${version}`);
 				}
 			}
 			expect(readdirSync(emptyHome).filter((name) => name !== ".bun")).toEqual(
@@ -249,6 +328,7 @@ writeFileSync("dist/better-ccflare-linux-amd64", "#!/bin/sh\\nprintf 'invalid sm
 			mkdirSync(join(cli, "dist"), { recursive: true });
 			mkdirSync(dashboard, { recursive: true });
 			copyFileSync(entrypoint, join(cli, "prepare-router-artifacts.ts"));
+			copyProductIdentity(home);
 			copyFileSync(
 				join(root, "apps/cli/router-artifacts.ts"),
 				join(cli, "router-artifacts.ts"),
@@ -321,6 +401,7 @@ writeFileSync("dist/better-ccflare-linux-amd64", "#!/bin/sh\\nprintf 'invalid sm
 			mkdirSync(join(cli, "dist"), { recursive: true });
 			mkdirSync(dashboard, { recursive: true });
 			copyFileSync(entrypoint, join(cli, "prepare-router-artifacts.ts"));
+			copyProductIdentity(home);
 			copyFileSync(
 				join(root, "apps/cli/router-artifacts.ts"),
 				join(cli, "router-artifacts.ts"),

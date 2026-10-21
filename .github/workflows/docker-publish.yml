@@ -15,7 +15,7 @@ jobs:
   build-and-push:
     # workflow_run fires for failed workflows too; never publish their artifacts.
     # Router never publishes inherited images.
-    if: github.repository != 'StartupBros/wstack-router' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    if: github.repository != 'StartupBros/wstack-router' && github.repository != 'StartupBros/hov-router' && github.repository_id != '1278801682' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: read
