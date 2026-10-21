@@ -178,8 +178,12 @@ describe("documented binary install (synthetic downloads)", () => {
 		])
 			expect(policy).toContain(pin);
 		for (const document of [reference, releaseGuide]) {
-			expect(document).toContain("Before the repository rename");
-			expect(document).toContain("StartupBros/wstack-router");
+			expect(document.replace(/\s+/g, " ")).toContain(
+				"renamed from `StartupBros/wstack-router` on 2026-10-21",
+			);
+			expect(document).toContain("`StartupBros/hov-router`");
+			expect(document).toContain("1278801682");
+			expect(document).not.toContain("Before the repository rename");
 		}
 	});
 

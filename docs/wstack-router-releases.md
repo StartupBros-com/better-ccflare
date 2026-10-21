@@ -5,11 +5,11 @@
 For the published 3.6.2 Linux x86_64 binary, follow the technical reference's
 [consumer installation and verification instructions](reference.md#install-the-linux-x86_64-release).
 
-This is the operator guide for HoV Router release automation, targeting
-`StartupBros/hov-router`. Before the repository rename, the live home remains
-`StartupBros/wstack-router`; source must merge before cutover. Current automation
-accepts either exact name only with repository ID `1278801682` and derives the
-current repository name from validated metadata. Historical release evidence
+This is the operator guide for HoV Router release automation at
+`StartupBros/hov-router`. The repository was renamed from
+`StartupBros/wstack-router` on 2026-10-21, retaining repository ID `1278801682`.
+Current automation accepts either exact name only with that repository ID and
+derives the current repository name from validated metadata. Historical release evidence
 below intentionally keeps the old repository and signer identity.
 The automation stages a verified **draft** GitHub release. It never publishes a
 release, publishes npm packages or images, announces, installs, restarts services,
@@ -29,11 +29,9 @@ Attestation lookup may require your existing GitHub CLI authentication. If a too
 flag, authentication, or verification step fails, stop and resolve it; do not treat
 an incomplete provenance check as successful.
 
-Retrieval and signing identities are separate. The intended public home is
-`StartupBros/hov-router`. **Before the repository rename**, the live location is
-still `StartupBros/wstack-router`: change only `retrieval_repo` below to that name.
-After the rename, retrieve from `StartupBros/hov-router` while retaining every old
-verification expectation. GitHub CLI 2.97 binds `--repo` during verification to
+Retrieval and signing identities are separate. Retrieve from the current public
+home, `StartupBros/hov-router`, while retaining every historical verification
+expectation. GitHub CLI 2.97 binds `--repo` during verification to
 `SourceRepositoryURI`, so replacing it with the new repository or an owner-only
 policy would change the historical trust policy. Download the bundle first, then
 verify that same local bundle with the exact old repository and certificate.
@@ -125,16 +123,16 @@ retries skip the entire PR job and never mint an App token.
 ## Dedicated Router App configuration
 
 1. Use a dedicated App that can be installed on the personal-owned
-   `StartupBros/hov-router` repository (`StartupBros/wstack-router` before cutover).
-   Retain the existing scoped installation across the rename and verify its access.
+   `StartupBros/hov-router` repository.
+   Retain the existing scoped installation and verify its access.
    Existing private, organization-owned HoV
    Apps cannot serve this installation; do not broaden their visibility to reuse them.
    Grant repository permissions **Contents: read/write**, **Pull requests: read/write**,
    **Issues: read/write** (release labels), and **Actions: read-only** (source CI).
    GitHub's implicit **Metadata: read-only** permission remains. No administration,
    workflow-write, organization permissions, or ruleset bypass is needed.
-2. Scope it on `StartupBros` to **only this Router repository**: `hov-router` after
-   cutover, `wstack-router` before it. Preserve all other repository protection and
+2. Scope it on `StartupBros` to **only this Router repository**, `hov-router`.
+   Preserve all other repository protection and
    Actions policies. The token request restricts `owner: StartupBros` and
    `repositories` to the current name from validated repository metadata, with the
    four explicit permissions above; neither installation nor request should include
