@@ -11,12 +11,83 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import {
+	COMMAND_NAMES,
+	PRODUCT_NAME,
+} from "../../../packages/core/src/product-identity";
 
 const root = resolve(import.meta.dir, "../../..");
 const homes: string[] = [];
 afterEach(() => {
 	for (const home of homes.splice(0))
 		rmSync(home, { recursive: true, force: true });
+});
+
+describe("documented source installer shell (synthetic artifact, not native build proof)", () => {
+	it("installs all three names from the unchanged build filename into a fresh legacy directory without overwriting commands or profiles", () => {
+		const reference = readFileSync(join(root, "docs/reference.md"), "utf8");
+		expect(reference).toContain(
+			"git clone https://github.com/StartupBros/hov-router.git better-ccflare\ncd better-ccflare\n",
+		);
+		const commands = reference
+			.split("<!-- source-install-local -->")[1]
+			?.split("```bash\n")[1]
+			?.split("```")[0];
+		expect(commands).toBeDefined();
+		const home = mkdtempSync(join(tmpdir(), "wstack-source-install-"));
+		homes.push(home);
+		const checkout = join(home, "better-ccflare");
+		const built = join(checkout, "apps/cli/dist/better-ccflare");
+		mkdirSync(dirname(built), { recursive: true });
+		const payload = `#!/bin/sh\ncase "$1" in\n--version) printf '${PRODUCT_NAME} v1.2.3\\n';;\n--help) printf '${PRODUCT_NAME}\\n';;\n*) exit 94;;\nesac\n`;
+		writeFileSync(built, payload, { mode: 0o755 });
+		const previous = join(home, ".local/bin");
+		mkdirSync(previous, { recursive: true });
+		for (const name of COMMAND_NAMES)
+			writeFileSync(join(previous, name), "keep existing command\n");
+		for (const profile of [".profile", ".bashrc", ".zshrc"])
+			writeFileSync(join(home, profile), "keep profile\n");
+		const config = join(home, ".config/better-ccflare");
+		mkdirSync(config, { recursive: true });
+		writeFileSync(join(config, "better-ccflare.json"), "keep config\n");
+		writeFileSync(join(config, "better-ccflare.db"), "keep database\n");
+		const installed = spawnSync(
+			"/bin/bash",
+			[
+				"--noprofile",
+				"--norc",
+				"-eu",
+				"-c",
+				`${commands}\nprintf '\\nINSTALL_DIR=%s\\n' "$install_dir"`,
+			],
+			{
+				cwd: checkout,
+				env: { HOME: home, PATH: `${previous}:/usr/bin:/bin` },
+				encoding: "utf8",
+				timeout: 10000,
+			},
+		);
+		expect(installed.status, installed.stderr).toBe(0);
+		const bin = installed.stdout.trim().split("INSTALL_DIR=")[1];
+		expect(bin).toStartWith(join(home, ".local/wstack-router."));
+		expect(readdirSync(bin).sort()).toEqual([...COMMAND_NAMES].sort());
+		for (const name of COMMAND_NAMES) {
+			expect(readFileSync(join(bin, name), "utf8")).toBe(payload);
+			expect(readFileSync(join(previous, name), "utf8")).toBe(
+				"keep existing command\n",
+			);
+		}
+		for (const profile of [".profile", ".bashrc", ".zshrc"])
+			expect(readFileSync(join(home, profile), "utf8")).toBe("keep profile\n");
+		expect(readFileSync(built, "utf8")).toBe(payload);
+		expect(readFileSync(join(config, "better-ccflare.json"), "utf8")).toBe(
+			"keep config\n",
+		);
+		expect(readFileSync(join(config, "better-ccflare.db"), "utf8")).toBe(
+			"keep database\n",
+		);
+		expect(readdirSync(join(home, ".config"))).toEqual(["better-ccflare"]);
+	});
 });
 
 // This is an artifact acceptance test: run `bun run build` first, not prepublish.
@@ -101,10 +172,10 @@ describe("documented source install", () => {
 		}
 	});
 
-	it("installs the built fork under both names and preserves legacy storage", () => {
+	it("installs the built fork under all three names with identical version/source evidence and config behavior while preserving legacy storage", () => {
 		const reference = readFileSync(join(root, "docs/reference.md"), "utf8");
 		expect(reference).toContain(
-			"git clone https://github.com/StartupBros/wstack-router.git better-ccflare\ncd better-ccflare\n",
+			"git clone https://github.com/StartupBros/hov-router.git better-ccflare\ncd better-ccflare\n",
 		);
 		const section = reference.split("<!-- source-install-local -->")[1];
 		expect(section).toBeDefined();
@@ -121,6 +192,8 @@ describe("documented source install", () => {
 		const installed = spawnSync(
 			"/bin/bash",
 			[
+				"--noprofile",
+				"--norc",
 				"-eu",
 				"-c",
 				`${commands}\nprintf '\\nINSTALL_DIR=%s\\n' "$install_dir"`,
@@ -147,7 +220,19 @@ describe("documented source install", () => {
 			override,
 			'{"default_agent_model":"synthetic-override-model"}\n',
 		);
-		for (const name of ["wstack-router", "better-ccflare"]) {
+		const version = JSON.parse(
+			readFileSync(join(root, "apps/cli/package.json"), "utf8"),
+		).version;
+		const sourceEvidence = spawnSync(
+			join(root, "apps/cli/dist/better-ccflare"),
+			["--git-sha"],
+			{ cwd: home, env, encoding: "utf8", timeout: 10000 },
+		);
+		expect(sourceEvidence.error).toBeUndefined();
+		expect(sourceEvidence.status).not.toBeNull();
+		expect(readdirSync(bin).sort()).toEqual([...COMMAND_NAMES].sort());
+		const configOutputs = new Map<boolean, string>();
+		for (const name of COMMAND_NAMES) {
 			const executable = join(bin, name);
 			expect(
 				readFileSync(executable).equals(
@@ -162,8 +247,22 @@ describe("documented source install", () => {
 					timeout: 10000,
 				});
 				expect(result.status).toBe(0);
-				expect(result.stdout).toContain("wstack Router");
+				expect(result.stdout).toContain(PRODUCT_NAME);
+				if (flag === "--version")
+					expect(result.stdout.trim()).toBe(`${PRODUCT_NAME} v${version}`);
 			}
+			const evidence = spawnSync(executable, ["--git-sha"], {
+				cwd: home,
+				env,
+				encoding: "utf8",
+				timeout: 10000,
+			});
+			expect(evidence.error).toBeUndefined();
+			expect([evidence.status, evidence.stdout, evidence.stderr]).toEqual([
+				sourceEvidence.status,
+				sourceEvidence.stdout,
+				sourceEvidence.stderr,
+			]);
 			for (const custom of [false, true]) {
 				const result = spawnSync(executable, ["--get-model"], {
 					cwd: home,
@@ -179,6 +278,10 @@ describe("documented source install", () => {
 					custom ? "synthetic-override-model" : "synthetic-legacy-model",
 				);
 				expect(result.stderr).toBe("");
+				const previousOutput = configOutputs.get(custom);
+				if (previousOutput === undefined)
+					configOutputs.set(custom, result.stdout);
+				else expect(result.stdout).toBe(previousOutput);
 			}
 		}
 		for (const [name, bytes] of Object.entries(fixtures))

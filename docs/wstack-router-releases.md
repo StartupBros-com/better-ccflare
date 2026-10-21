@@ -22,19 +22,35 @@ Attestation lookup may require your existing GitHub CLI authentication. If a too
 flag, authentication, or verification step fails, stop and resolve it; do not treat
 an incomplete provenance check as successful.
 
+Retrieval and signing identities are separate. The intended public home is
+`StartupBros/hov-router`. **Before the repository rename**, the live location is
+still `StartupBros/wstack-router`: change only `retrieval_repo` below to that name.
+After the rename, retrieve from `StartupBros/hov-router` while retaining every old
+verification expectation. GitHub CLI 2.97 binds `--repo` during verification to
+`SourceRepositoryURI`, so replacing it with the new repository or an owner-only
+policy would change the historical trust policy. Download the bundle first, then
+verify that same local bundle with the exact old repository and certificate.
+
 <!-- router-release-provenance -->
 ```bash
 (
   set -eu
   binary="$HOME/.local/lib/wstack-router/3.6.2/wstack-router"
   source_sha=5d7b2a888a9b61d87916332b414e46606498d896
+  digest=b01a4989323ecf4e2d0a68394b45828741430d89eb35288f7318a28c45b4c9d7
+  printf '%s  %s\n' "$digest" "$binary" | sha256sum --check --strict -
+  retrieval_repo=StartupBros/hov-router
+  bundle_dir=$(mktemp -d "${TMPDIR:-/tmp}/wstack-router-provenance.XXXXXX")
+  cd "$bundle_dir"
+  gh attestation download "$binary" --repo "$retrieval_repo"
   gh attestation verify "$binary" \
     --repo StartupBros/wstack-router \
     --source-digest "$source_sha" \
     --source-ref refs/tags/v3.6.2 \
     --cert-identity https://github.com/StartupBros/wstack-router/.github/workflows/router-release-artifacts.yml@refs/tags/v3.6.2 \
     --signer-digest "$source_sha" \
-    --deny-self-hosted-runners
+    --deny-self-hosted-runners \
+    --bundle "$bundle_dir/sha256:$digest.jsonl"
 )
 ```
 <!-- /router-release-provenance -->
@@ -44,11 +60,37 @@ repository, source commit, tag, workflow identity, signer commit, and hosted-run
 policy. Those expectations are pinned here, not read from a downloaded manifest.
 Neither a checksum nor provenance proves the program is free of bugs or malicious
 behavior. After verification succeeds, return to the technical reference's separate run step.
+The temporary bundle directory is left for inspection; this procedure does not
+execute the binary or change its installed aliases.
 
 The release also publishes `SHA256SUMS` and an attested `release-manifest.json` for
 release auditing; neither is required by the consumer install above. The operator
 pipeline below still verifies the complete inventory and both attestations before
 executing release smoke checks. Its strict verification policy is unchanged.
+
+The published v3.6.2 evidence remains historical, even when retrieved through the
+new public home. Release ID **418096444** and tag `refs/tags/v3.6.2` identify source
+commit `5d7b2a888a9b61d87916332b414e46606498d896`. The exact certificate remains
+`https://github.com/StartupBros/wstack-router/.github/workflows/router-release-artifacts.yml@refs/tags/v3.6.2`.
+
+| Historical asset | Asset ID | Size (bytes) | SHA-256 |
+| --- | --- | --- | --- |
+| `better-ccflare-linux-amd64` | 658578101 | 97965536 | `b01a4989323ecf4e2d0a68394b45828741430d89eb35288f7318a28c45b4c9d7` |
+| `release-manifest.json` | 658578455 | — | `a90aa5f71ba5ae9f4b255e487c2afc80f39d44bc70a6193da43d83f4b05dc60b` |
+| `SHA256SUMS` | 658577847 | — | `dee851d757ec92a28946c838a11919d34bf2fc4755613e67b34bd1e3cdf70b29` |
+
+For a manifest audit, download `release-manifest.json` from the current repository's
+v3.6.2 release, check the independent digest above, then use the same download and
+verify commands with `binary` set to that local manifest and `digest` set to its
+pinned SHA-256. Keep the full old source SHA, tag ref, certificate, signer SHA,
+`--repo StartupBros/wstack-router`, `--deny-self-hosted-runners`, and the matching
+local `--bundle`; authenticate both assets before any release smoke execution.
+The signed manifest's repository remains `StartupBros/wstack-router` and its
+distribution token remains `v1:startupbros-wstack-router-binary`, with
+`actionable: false` and `updateChannel: null`. Do not rewrite the public bytes,
+manifest, tag, or certificate for the new display name. The historical binary
+still reports `wstack Router v3.6.2` through `hov-router`; newly built artifacts
+report `HoV Router`. Only Linux x86_64 was publicly released for v3.6.2.
 
 ## App authentication and verification boundaries
 

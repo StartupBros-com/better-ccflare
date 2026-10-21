@@ -62,7 +62,9 @@ This project builds upon the foundation of [snipeship/ccflare](https://github.co
 
 ### Install the Linux x86_64 release
 
-[Release 3.6.2](https://github.com/StartupBros/wstack-router/releases/tag/v3.6.2) contains one standalone Linux x86_64 binary; Node.js and Bun are not required to run it. For other platforms or a local build, use [Install from source](#install-from-source).
+[Release 3.6.2](https://github.com/StartupBros/hov-router/releases/tag/v3.6.2) contains one standalone Linux x86_64 binary; Node.js and Bun are not required to run it. For other platforms or a local build, use [Install from source](#install-from-source).
+
+The public home below targets `StartupBros/hov-router`. **Before the repository rename**, `StartupBros/wstack-router` is still live: use that repository name in download and clone URLs until the rename is complete. This guide does not claim the move has happened. The historical 3.6.2 binary, manifest, tag, and signing identity stay unchanged; its version output is exactly `wstack Router v3.6.2`, including when invoked through `hov-router`. New source builds display `HoV Router` through all three command names.
 
 Requires Bash on Linux x86_64, `curl`, and GNU coreutils (`sha256sum`, `mkdir`, `chmod`). No GitHub CLI, Node.js, or Bun is needed.
 
@@ -78,7 +80,7 @@ Requires Bash on Linux x86_64, `curl`, and GNU coreutils (`sha256sum`, `mkdir`, 
   mkdir "$version_dir"
   cd "$version_dir"
   curl -q --fail --location --proto '=https' --proto-redir '=https' \
-    --output wstack-router https://github.com/StartupBros/wstack-router/releases/download/v3.6.2/better-ccflare-linux-amd64
+    --output wstack-router https://github.com/StartupBros/hov-router/releases/download/v3.6.2/better-ccflare-linux-amd64
   digest=b01a4989323ecf4e2d0a68394b45828741430d89eb35288f7318a28c45b4c9d7
   printf '%s  wstack-router\n' "$digest" | sha256sum --check --strict -
   chmod 755 wstack-router
@@ -86,7 +88,7 @@ Requires Bash on Linux x86_64, `curl`, and GNU coreutils (`sha256sum`, `mkdir`, 
 ```
 <!-- /router-release-install -->
 
-The checksum verifies the bytes against this trusted reference; it does not independently prove who built them. Before the first run, you can also [verify signed build provenance](wstack-router-releases.md#optional-consumer-provenance-verification). That optional check uses GitHub CLI to verify the repository, source commit, tag, workflow identity, signer commit, and hosted runner.
+The checksum verifies the bytes against this trusted reference; it does not independently prove who built them. Before the first run, you can also [verify signed build provenance](wstack-router-releases.md#optional-consumer-provenance-verification). That optional check retrieves a bundle from the current repository location and verifies it against the exact historical repository, source commit, tag, workflow identity, signer commit, and hosted runner.
 
 If any command fails, stop: do not run the binary. The block refuses any existing `3.6.2` path, including a symlink, and leaves partial downloads for inspection rather than deleting or overwriting them. Inspect the error and existing files before retrying.
 
@@ -102,7 +104,7 @@ Continue at [Start the local server](#start-the-local-server), or add the option
 
 #### Optional: add commands to PATH
 
-After verification succeeds, create `wstack-router` and the compatible `better-ccflare` command in `$HOME/.local/bin`. This checks both names before creating either and refuses existing files, directories, or symlinks, including broken ones.
+After verification succeeds, create `hov-router`, `wstack-router`, and `better-ccflare` in `$HOME/.local/bin`, all pointing to the same verified binary. This checks all three names before creating any and refuses existing files, directories, or symlinks, including broken ones.
 
 <!-- router-release-path -->
 ```bash
@@ -112,57 +114,60 @@ After verification succeeds, create `wstack-router` and the compatible `better-c
   bin_dir="$HOME/.local/bin"
   test -x "$binary"
   mkdir -p "$bin_dir"
-  for name in wstack-router better-ccflare; do
+  for name in hov-router wstack-router better-ccflare; do
     if [ -e "$bin_dir/$name" ] || [ -L "$bin_dir/$name" ]; then
       printf 'Refusing existing command: %s\n' "$bin_dir/$name" >&2
       exit 1
     fi
   done
-  ln -sT "$binary" "$bin_dir/wstack-router"
-  ln -sT "$binary" "$bin_dir/better-ccflare"
+  for name in hov-router wstack-router better-ccflare; do
+    ln -sT "$binary" "$bin_dir/$name"
+  done
 )
 ```
 <!-- /router-release-path -->
 
-After success, use `export PATH="$HOME/.local/bin:$PATH"` in each terminal where you want the short commands. Check `command -v wstack-router` and `command -v better-ccflare`; both should resolve there. To keep this PATH setting, add it to your shell configuration yourself. Nothing here edits shell profiles or uses `sudo`. Existing commands elsewhere remain untouched; PATH order determines which runs. If alias creation fails, inspect the error and any link already created rather than forcing replacement.
+After success, use `export PATH="$HOME/.local/bin:$PATH"` in each terminal where you want the short commands. Check `command -v hov-router`, `command -v wstack-router`, and `command -v better-ccflare`; all three should resolve there. To keep this PATH setting, add it to your shell configuration yourself. Nothing here edits shell profiles or uses `sudo`. Existing commands elsewhere remain untouched; PATH order determines which runs. If alias creation fails, inspect the error and any link already created rather than forcing replacement.
 
 ### Install from source
 
 Requires Git, Node.js (used by the build), and Bun (this checkout pins Bun 1.4.2). These commands use a POSIX shell on Linux/macOS; on Windows use WSL. The public HTTPS clone below does not require a GitHub login.
 
 ```bash
-git clone https://github.com/StartupBros/wstack-router.git better-ccflare
+git clone https://github.com/StartupBros/hov-router.git better-ccflare
 cd better-ccflare
 bun install --frozen-lockfile
 bun run build
 ```
 
-The build produces `apps/cli/dist/better-ccflare`. It does not install a command on your PATH. From the checkout root, copy that same artifact under both names into a fresh user-owned directory. This deliberately leaves any previous installation untouched.
+The build produces `apps/cli/dist/better-ccflare`. It does not install a command on your PATH. From the checkout root, copy that same artifact under all three names into a fresh user-owned directory. Each name runs the same version with the same provenance and configuration. The clone directory, build filename, `better-ccflare` configuration/database paths, and environment variables retain their existing names. This deliberately leaves any previous installation untouched.
 
 <!-- source-install-local -->
 ```bash
 mkdir -p "$HOME/.local"
 install_dir=$(mktemp -d "$HOME/.local/wstack-router.XXXXXX")
-install -m 755 apps/cli/dist/better-ccflare "$install_dir/wstack-router"
-install -m 755 apps/cli/dist/better-ccflare "$install_dir/better-ccflare"
+for name in hov-router wstack-router better-ccflare; do
+  install -m 755 apps/cli/dist/better-ccflare "$install_dir/$name"
+done
 export PATH="$install_dir:$PATH"
+hov-router --version
 wstack-router --version
 better-ccflare --version
-wstack-router --help
+hov-router --help
 printf 'Installed commands in %s\n' "$install_dir"
 ```
 <!-- /source-install-local -->
 
-The PATH change applies to this shell only. To keep it, add the printed directory (its literal path, not `$install_dir`) to your shell's PATH configuration, ahead of older installations. Use `command -v wstack-router` and `command -v better-ccflare` to confirm which commands will run. Keep the prior executable and its location for rollback; do not overwrite a global install or change an existing service as part of this quickstart.
+The PATH change applies to this shell only. To keep it, add the printed directory (its literal path, not `$install_dir`) to your shell's PATH configuration, ahead of older installations. Use `command -v hov-router`, `command -v wstack-router`, and `command -v better-ccflare` to confirm which commands will run. Keep the prior executable and its location for rollback; do not overwrite a global install or change an existing service as part of this quickstart.
 
 ### Start the local server
 
-The commands below assume you completed the optional [PATH setup](#optional-add-commands-to-path) or the source install. If you skipped PATH setup, replace `wstack-router` (or `better-ccflare`) in these examples with `"$HOME/.local/lib/wstack-router/3.6.2/wstack-router"`.
+The commands below assume you completed the optional [PATH setup](#optional-add-commands-to-path) or the source install. If you skipped PATH setup, replace `hov-router` (or either compatibility command) in these examples with `"$HOME/.local/lib/wstack-router/3.6.2/wstack-router"`.
 
 For a new local setup, start the server and dashboard with:
 
 ```bash
-BETTER_CCFLARE_HOST=127.0.0.1 wstack-router --serve --port 8080
+BETTER_CCFLARE_HOST=127.0.0.1 hov-router --serve --port 8080
 ```
 
 Leave the server running, then:
@@ -171,9 +176,9 @@ Leave the server running, then:
 2. Follow [Configure Claude SDK](#configure-claude-sdk), using this server's origin. A provider credential belongs to the account you just added; a proxy API key, when required, authenticates your client to Router.
 3. After your first client request, open the dashboard's **Requests** tab. Find that request and check its account and status to confirm which account handled it and whether it succeeded. An account appearing in **Accounts** alone does not prove a request routed successfully.
 
-If port 8080 is occupied, choose an unused port and use it consistently for the server, dashboard, CLI routing commands, and client configuration. `better-ccflare` remains an equivalent command. This guide does not change a running service or move existing accounts.
+If port 8080 is occupied, choose an unused port and use it consistently for the server, dashboard, CLI routing commands, and client configuration. `wstack-router` and `better-ccflare` remain equivalent commands. This guide does not change a running service or move existing accounts.
 
-See [manual updates, unchanged paths, and rollback](wstack-router-migration.md). Report fork issues at [StartupBros/wstack-router/issues](https://github.com/StartupBros/wstack-router/issues).
+See [manual updates, unchanged paths, and rollback](wstack-router-migration.md). Report fork issues at [StartupBros/hov-router/issues](https://github.com/StartupBros/hov-router/issues), using the pre-cutover repository name until the rename completes.
 
 ### Legacy upstream distributions (not wstack Router)
 
