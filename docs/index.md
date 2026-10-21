@@ -36,6 +36,6 @@ Router 3.6.2 publishes a Linux x86_64 binary only. The [platform notes](referenc
 
 [Router source and issues](https://github.com/StartupBros/hov-router) · [MIT license](../LICENSE)
 
-Use `hov-router`; `wstack-router` and `better-ccflare` remain compatible commands. Before the repository rename, the live home is [StartupBros/wstack-router](https://github.com/StartupBros/wstack-router); use it in GitHub URLs until cutover. Existing documentation filenames remain unchanged.
+Use `hov-router`; `wstack-router` and `better-ccflare` remain compatible commands. The same repository was renamed to [StartupBros/hov-router](https://github.com/StartupBros/hov-router) on 2026-10-21; see [the repository move](wstack-router-migration.md#repository-move) for verification and the known old-issue URL exception. Existing documentation filenames remain unchanged.
 
 External references: [Anthropic API](https://docs.anthropic.com/claude/docs), [Bun](https://bun.sh/docs), [SQLite](https://www.sqlite.org/docs.html).

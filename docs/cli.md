@@ -807,7 +807,7 @@ Auto was separately authorized and enabled at **2026-10-03 04:42:21Z**, with zer
 1. Check existing documentation in `/docs`
 2. Review debug logs for detailed error messages
 3. Ensure all dependencies are up to date
-4. File an issue with reproduction steps at [StartupBros/hov-router/issues](https://github.com/StartupBros/hov-router/issues). Before the repository rename, use the live [StartupBros/wstack-router/issues](https://github.com/StartupBros/wstack-router/issues).
+4. File an issue with reproduction steps at [StartupBros/hov-router/issues](https://github.com/StartupBros/hov-router/issues).
 
 ### Best Practices
 

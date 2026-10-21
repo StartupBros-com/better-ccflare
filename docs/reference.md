@@ -64,7 +64,7 @@ This project builds upon the foundation of [snipeship/ccflare](https://github.co
 
 [Release 3.6.2](https://github.com/StartupBros/hov-router/releases/tag/v3.6.2) contains one standalone Linux x86_64 binary; Node.js and Bun are not required to run it. For other platforms or a local build, use [Install from source](#install-from-source).
 
-The public home below targets `StartupBros/hov-router`. **Before the repository rename**, `StartupBros/wstack-router` is still live: use that repository name in download and clone URLs until the rename is complete. This guide does not claim the move has happened. The historical 3.6.2 binary, manifest, tag, and signing identity stay unchanged; its version output is exactly `wstack Router v3.6.2`, including when invoked through `hov-router`. New source builds display `HoV Router` through all three command names.
+The public home is `StartupBros/hov-router`, renamed from `StartupBros/wstack-router` on 2026-10-21 with the same repository ID `1278801682`. Use the current download and clone URLs below. The historical 3.6.2 binary, manifest, tag, and signing identity stay unchanged; its version output is exactly `wstack Router v3.6.2`, including when invoked through `hov-router`. New source builds display `HoV Router` through all three command names.
 
 Requires Bash on Linux x86_64, `curl`, and GNU coreutils (`sha256sum`, `mkdir`, `chmod`). No GitHub CLI, Node.js, or Bun is needed.
 
@@ -178,7 +178,7 @@ Leave the server running, then:
 
 If port 8080 is occupied, choose an unused port and use it consistently for the server, dashboard, CLI routing commands, and client configuration. `wstack-router` and `better-ccflare` remain equivalent commands. This guide does not change a running service or move existing accounts.
 
-See [manual updates, unchanged paths, and rollback](wstack-router-migration.md). Report fork issues at [StartupBros/hov-router/issues](https://github.com/StartupBros/hov-router/issues), using the pre-cutover repository name until the rename completes.
+See [manual updates, unchanged paths, and rollback](wstack-router-migration.md). Report fork issues at [StartupBros/hov-router/issues](https://github.com/StartupBros/hov-router/issues).
 
 <a id="legacy-upstream-distributions-not-wstack-router"></a>
 

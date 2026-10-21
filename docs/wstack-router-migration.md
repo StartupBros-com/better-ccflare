@@ -2,9 +2,9 @@
 
 <a id="moving-to-wstack-router"></a>
 
-HoV Router is a House of Vibe project targeting [StartupBros/hov-router](https://github.com/StartupBros/hov-router). HoV Router and hovstack are independent sibling products; neither requires the other. Router continues tombii/better-ccflare and snipeship/ccflare under the existing MIT license. Git history, contributor acknowledgements, and license terms remain intact.
+HoV Router is a House of Vibe project at [StartupBros/hov-router](https://github.com/StartupBros/hov-router). HoV Router and hovstack are independent sibling products; neither requires the other. Router continues tombii/better-ccflare and snipeship/ccflare under the existing MIT license. Git history, contributor acknowledgements, and license terms remain intact.
 
-The public repository moved from `StartupBros-com/better-ccflare` to `StartupBros/wstack-router` on 2026-10-19 (see [the repository move](#repository-move)). **Before the HoV rename:** use the live [StartupBros/wstack-router](https://github.com/StartupBros/wstack-router) in clone, download, and support URLs until cutover. [Fork support targets StartupBros/hov-router/issues](https://github.com/StartupBros/hov-router/issues). Source must merge before the repository rename; this guide performs neither operation.
+The public repository moved from `StartupBros-com/better-ccflare` to `StartupBros/wstack-router` on 2026-10-19 and was renamed to `StartupBros/hov-router` on 2026-10-21. It is the same repository, ID `1278801682` (see [the repository move](#repository-move)). Use `StartupBros/hov-router` in clone, download, and support URLs. [Report Router issues here](https://github.com/StartupBros/hov-router/issues).
 
 The published [3.6.2 Linux x86_64 binary](reference.md#install-the-linux-x86_64-release) remains historical wstack Router, including its exact bytes, source SHA, tag, and signing identity. It still prints `wstack Router v3.6.2` through `hov-router`; a filesystem alias cannot relabel its embedded output. New source builds display HoV Router. Router npm packages, container images, and other-platform binaries are not published.
 
@@ -40,7 +40,7 @@ There is no new HoV configuration namespace and no config or credential migratio
 Branded builds do not offer an actionable upstream update. Do not install a registry package or a tombii release to update this fork: those are upstream distributions, not HoV Router.
 
 1. Keep the prior installed directory and record its `--version` and `--git-sha` output. Back up configuration and database using your existing backup procedure before running a newer server; an identity change is not a promise that future schema changes can be downgraded.
-2. In the clean source checkout created by the quickstart, inspect `git remote -v` and confirm `origin` points to `StartupBros/hov-router` after cutover, or the live `StartupBros/wstack-router` before it (see [the repository move](#repository-move)). Confirm `git symbolic-ref HEAD` reports `refs/heads/main` before updating; use a separate fresh checkout if you are working on another branch. Fetch and fast-forward from the unambiguous remote reference (the repository also has a `main` tag):
+2. In the clean source checkout created by the quickstart, inspect `git remote -v` and confirm `origin` points to `StartupBros/hov-router` (see [the repository move](#repository-move)). Confirm `git symbolic-ref HEAD` reports `refs/heads/main` before updating; use a separate fresh checkout if you are working on another branch. Fetch and fast-forward from the unambiguous remote reference (the repository also has a `main` tag):
 
    ```bash
    git fetch origin refs/heads/main
@@ -95,7 +95,9 @@ Do not invoke those workflows for preparation, change versions manually, or push
 
 On 2026-10-19 the source repository was transferred from `StartupBros-com/better-ccflare` to [`StartupBros/wstack-router`](https://github.com/StartupBros/wstack-router). It remains a public fork of tombii/better-ccflare, and the transfer retains the fork relationship, Git history, and the MIT license. Contributor credits are unchanged. The post-transfer check confirmed the same repository ID, default-branch commit, branches/tags, issue and pull-request identities, and active workflows. The old repository URL redirects to the new home. At the time of the transfer check, there were no releases or assets before or immediately after the move; the move itself was not a binary release. Router 3.6.2 was published separately afterward.
 
-Existing checkouts keep working under their current directory name; do not rename it. For the HoV rename, the target is `StartupBros/hov-router`. Before that rename, keep the live `StartupBros/wstack-router` remote. Only after cutover is confirmed, inspect and update an existing checkout's remote:
+On 2026-10-21, after [PR #579](https://github.com/StartupBros/hov-router/pull/579) merged, the same repository was renamed to `StartupBros/hov-router`, retaining ID `1278801682`. The [verified cutover record](https://github.com/StartupBros/hov-router/issues/578#issuecomment-6308306333) records the checks, including successful old repository-root, PR #579, release 3.6.2, and agent-setup document URL checks. This rename did not publish a new binary or change the historical release evidence.
+
+Existing checkouts keep working under their current directory name; do not rename it. Inspect and update an existing checkout's remote to the current home:
 
 ```bash
 git remote -v
@@ -103,7 +105,7 @@ git remote set-url origin https://github.com/StartupBros/hov-router.git
 git remote -v
 ```
 
-The old repository URLs are kept in historical documentation and were verified to redirect after the 2026-10-19 move. Verify redirects during the HoV cutover rather than assuming the earlier transfer proves them. A fresh clone uses the [source guide's](reference.md#install-from-source) `git clone https://github.com/StartupBros/hov-router.git better-ccflare` form after cutover, keeping the local directory name compatible.
+Old repository URLs remain in historical documentation, but not every old URL works anonymously. The cutover check observed HTTP 404 for `https://github.com/StartupBros/wstack-router/issues/578` without authentication, while the canonical [issue #578](https://github.com/StartupBros/hov-router/issues/578) returned HTTP 200 publicly. An authenticated browser opened the old URL as the renamed repository's issue; the cause of the anonymous failure is unknown. Use the canonical issue URL rather than relying on that redirect. A fresh clone uses the [source guide's](reference.md#install-from-source) `git clone https://github.com/StartupBros/hov-router.git better-ccflare` form, keeping the local directory name compatible.
 
 At transfer time, npm publication, GHCR images, signing, and release workflows still required separate approval and validation. The move did not validate any of them; subsequent Router release automation is documented in the [release guide](wstack-router-releases.md). The existing publishing workflows listed above must not be invoked merely to move the repository. The transfer-time check also found that `.github/workflows/managed-routing-postgres.yml` used an exact repository match for its self-hosted runner, with the moved repository taking the hosted fallback; inspect current workflow configuration before making runner assumptions. The exact-origin allowlist in `apps/cli/build-provenance.ts` accepts the verified new origin forms while retaining the old ones. Its clean-tree, explicit-context, version, and exact-tag checks remain unchanged; untagged builds still have no proven release identity and branded builds have no actionable update channel.
 
@@ -115,7 +117,7 @@ No detaching of the fork or visibility change; registry/package, image or releas
 
 ## If installation fails
 
-- **Repository not found:** before cutover use `https://github.com/StartupBros/wstack-router`; after the confirmed rename use `https://github.com/StartupBros/hov-router`. Check your network/Git configuration; hovstack is a separate product, not an alternate Router repository.
+- **Repository not found:** use the current home, `https://github.com/StartupBros/hov-router`, and canonical issue links rather than old redirects. Check your network/Git configuration; hovstack is a separate product, not an alternate Router repository.
 - **Missing build artifact:** run `bun run build` from the checkout root before copying. The build includes the dashboard and compiled CLI; do not invoke `prepublish`.
 - **Command not found or old branding:** check PATH order and the printed installation directory with `command -v`; an older global command may still be selected.
 - **Missing accounts/config:** check the existing HOME/XDG and config/database overrides. Do not create a replacement namespace or move credentials to fix a command-name change.
