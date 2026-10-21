@@ -96,9 +96,9 @@ describe("documented source installer shell (synthetic artifact, not native buil
 describe("documented source install", () => {
 	it("keeps product identity, support, lineage, and license in the README", () => {
 		const readme = readFileSync(join(root, "README.md"), "utf8");
-		expect(readme.startsWith("# wstack Router\n")).toBe(true);
+		expect(readme.startsWith(`# ${PRODUCT_NAME}\n`)).toBe(true);
 		expect(readme).toContain(
-			"https://github.com/StartupBros/wstack-router/issues",
+			"https://github.com/StartupBros/hov-router/issues",
 		);
 		expect(readme).toContain("https://github.com/tombii/better-ccflare");
 		expect(readme).toContain("https://github.com/snipeship/ccflare");
@@ -111,7 +111,7 @@ describe("documented source install", () => {
 		const prompt = readme.match(/```text\n([\s\S]*?)```/)?.[1];
 		expect(prompt).toBeDefined();
 		expect(prompt).toContain(
-			"https://github.com/StartupBros/wstack-router/blob/main/docs/agent-setup.md",
+			"https://github.com/StartupBros/hov-router/blob/main/docs/agent-setup.md",
 		);
 		const guide = readFileSync(join(root, "docs/agent-setup.md"), "utf8");
 		for (const anchor of [

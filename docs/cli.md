@@ -1,6 +1,8 @@
-# wstack Router CLI Documentation
+# HoV Router CLI Documentation
 
-The wstack Router CLI provides a command-line interface for managing accounts, monitoring usage statistics, and controlling the load balancer. Router builds on upstream better-ccflare; `better-ccflare` remains an equivalent command, and existing `BETTER_CCFLARE_*` configuration names remain unchanged.
+<a id="wstack-router-cli-documentation"></a>
+
+The HoV Router CLI provides a command-line interface for managing accounts, monitoring usage statistics, and controlling the load balancer. Use `hov-router`; `wstack-router` and `better-ccflare` remain equivalent commands, and existing `BETTER_CCFLARE_*` configuration names remain unchanged.
 
 ## Table of Contents
 
@@ -20,36 +22,38 @@ The wstack Router CLI provides a command-line interface for managing accounts, m
 
 ## Installation and Setup
 
+**New hosts only.** If a Router already exists, use [shared-client setup](agent-setup.md#shared-client-only) with its owner-confirmed origin and authentication. Skip installation, provider setup, and server commands.
+
 ### Installation
 
 For agent-assisted setup, use the [agent setup guide](agent-setup.md). For manual installation, follow the [Linux x86_64 release installation](reference.md#install-the-linux-x86_64-release) for Router 3.6.2: download, verify the pinned SHA-256, then run. [Signed provenance verification](./wstack-router-releases.md#optional-consumer-provenance-verification) is optional and available before the first run. You can also [build from source](reference.md#install-from-source). Router npm packages, container images, and other-platform binaries are not published. Upstream registry packages and releases are not Router distributions.
 
-The examples below assume you completed the optional [PATH setup](reference.md#optional-add-commands-to-path) or the source install, which provide both `wstack-router` and `better-ccflare`. Without PATH setup, replace either command with `"$HOME/.local/lib/wstack-router/3.6.2/wstack-router"`. After building, source-checkout commands such as `bun run cli [command]` remain supported. In a second terminal, use the same installation directory on PATH or the same explicit binary path.
+The examples below assume you completed the optional [PATH setup](reference.md#optional-add-commands-to-path) or the source install, which provide all three command names. Without PATH setup, replace `hov-router` with `"$HOME/.local/lib/wstack-router/3.6.2/wstack-router"`. The published binary still prints `wstack Router v3.6.2` through every alias; new source builds display HoV Router. After building, source-checkout commands such as `bun run cli [command]` remain supported. In a second terminal, use the same installation directory on PATH or the same explicit binary path.
 
 ### First-time Setup
 
 1. Start the server before adding an account, and leave it running:
 ```bash
-BETTER_CCFLARE_HOST=127.0.0.1 wstack-router --serve --port 8080
+BETTER_CCFLARE_HOST=127.0.0.1 hov-router --serve --port 8080
 ```
 
 2. In another terminal, add your first OAuth account against that server:
 ```bash
-wstack-router --add-account myaccount --mode claude-oauth --priority 0 --api-url http://127.0.0.1:8080
+hov-router --add-account myaccount --mode claude-oauth --priority 0 --api-url http://127.0.0.1:8080
 ```
 
 Use the same local user and database configuration in both terminals. Account creation writes to the local database, then reviews routing through the live server. Use `claude-oauth` for Claude OAuth. `max` remains a deprecated compatibility alias: the CLI warns and normalizes it to `claude-oauth`.
 
 3. Inspect live routing without changing policy:
 ```bash
-wstack-router routing list --api-url http://127.0.0.1:8080
+hov-router routing list --api-url http://127.0.0.1:8080
 ```
 
 The explicit `--api-url` matters: managed-routing commands otherwise default to `http://127.0.0.1:8788` unless `BETTER_CCFLARE_API_URL` is set. If port 8080 is occupied, choose an unused port and use it consistently for the server, account review, routing commands, dashboard, and client. If API authentication is enabled, see [Managed Routing](#managed-routing-live-server) for `BETTER_CCFLARE_ADMIN_API_KEY` setup.
 
 A failed post-create routing review does **not** undo account creation. If the CLI printed a created account ID before reporting failure or incomplete routing, keep that ID rather than adding the account again. Once the server is reachable and authentication is configured, inspect it with:
 ```bash
-wstack-router routing detail <account-id> --api-url http://127.0.0.1:8080
+hov-router routing detail <account-id> --api-url http://127.0.0.1:8080
 ```
 
 Review failures also do not roll back any family changes already applied; see [Post-create routing review](#post-create-routing-review) for partial-result behavior.
@@ -74,10 +78,13 @@ bun run cli -h
 
 ### Help Output Format
 
-```
-🎯 better-ccflare - Load Balancer for Claude
+Current source builds use this format, with the installed version in the heading:
 
-Usage: better-ccflare [options]
+```
+🎯 HoV Router v<version> - Load Balancer for Claude
+
+Usage: hov-router [options]
+wstack-router and better-ccflare remain supported aliases.
 
 Options:
   --serve              Start API server with dashboard
@@ -258,11 +265,11 @@ The managed-routing CLI controls the same authoritative live-server policy used 
 #### Exact command surface
 
 ```bash
-better-ccflare routing list [--api-url <loopback-url>] [--json]
-better-ccflare routing detail <account-id> [--api-url <loopback-url>] [--json]
-better-ccflare routing preview <family> [--managed-model <model>] [--api-url <loopback-url>] [--json]
-better-ccflare routing apply <family> --preview-id <id> --proposal-id <id> --managed-model <model> --yes [--api-url <loopback-url>] [--json]
-better-ccflare routing manual <family> --yes [--api-url <loopback-url>] [--json]
+hov-router routing list [--api-url <loopback-url>] [--json]
+hov-router routing detail <account-id> [--api-url <loopback-url>] [--json]
+hov-router routing preview <family> [--managed-model <model>] [--api-url <loopback-url>] [--json]
+hov-router routing apply <family> --preview-id <id> --proposal-id <id> --managed-model <model> --yes [--api-url <loopback-url>] [--json]
+hov-router routing manual <family> --yes [--api-url <loopback-url>] [--json]
 ```
 
 `<family>` must be `fable`, `opus`, `sonnet`, or `haiku`. Unattended or JSON apply requires the complete displayed tuple plus `--yes`; unattended or JSON Manual rollback requires `--yes`. In an interactive TTY, `routing apply` may omit the tuple and `--yes`, and `routing manual` may omit `--yes`; the CLI then performs the review and confirmation flow described below.
@@ -275,7 +282,7 @@ The CLI calls the running management API instead of opening the local database o
 
 Only an HTTP or HTTPS loopback origin is accepted. A URL with a non-loopback host, credentials, path, query, or fragment is rejected. `--api-url` is valid only with a `routing` command or the packaged `--add-account` post-create workflow.
 
-If API authentication is configured, set `BETTER_CCFLARE_ADMIN_API_KEY` in the process environment. There is deliberately no admin-key CLI flag. Use a better-ccflare admin key, not a provider credential or API-only key. The client sends it as `x-api-key`, redacts it from text/JSON/errors, and rejects redirects instead of forwarding a credentialed request.
+If API authentication is configured, set `BETTER_CCFLARE_ADMIN_API_KEY` in the process environment. There is deliberately no admin-key CLI flag. Use a Router admin key, not a provider credential or API-only key. The client sends it as `x-api-key`, redacts it from text/JSON/errors, and rejects redirects instead of forwarding a credentialed request.
 
 #### Read and preview commands
 
@@ -617,7 +624,7 @@ bun run cli --set-priority primary-account 10  # Restore normal priority
 
 ### Configuration File Location
 
-better-ccflare stores its configuration in platform-specific directories:
+HoV Router stores its configuration in the existing platform-specific directories:
 
 #### macOS/Linux
 ```
@@ -745,7 +752,7 @@ The SQLite database follows the same directory structure:
 **Problem**: "Database is locked" or corruption errors
 
 **Solutions**:
-1. Stop all better-ccflare processes
+1. Stop the Router processes using the affected database, regardless of command alias
 2. Check file permissions on database
 3. Backup and recreate if corrupted:
    ```bash
@@ -776,9 +783,9 @@ These commands operate on an already enrolled durable session; they do not creat
 The following commands are examples for a separately authorized **local test instance**, not production activation. `EXISTING_INFERENCE_KEY` denotes an existing process environment variable; these commands do not set it:
 
 ```bash
-better-ccflare --quality-routing-status session-example \
+hov-router --quality-routing-status session-example \
   --origin http://127.0.0.1:8081 --credential-env EXISTING_INFERENCE_KEY
-better-ccflare --quality-routing-retry-preferred session-example \
+hov-router --quality-routing-retry-preferred session-example \
   --origin http://127.0.0.1:8081 --credential-env EXISTING_INFERENCE_KEY
 ```
 
@@ -800,7 +807,7 @@ Auto was separately authorized and enabled at **2026-10-03 04:42:21Z**, with zer
 1. Check existing documentation in `/docs`
 2. Review debug logs for detailed error messages
 3. Ensure all dependencies are up to date
-4. File an issue with reproduction steps
+4. File an issue with reproduction steps at [StartupBros/hov-router/issues](https://github.com/StartupBros/hov-router/issues). Before the repository rename, use the live [StartupBros/wstack-router/issues](https://github.com/StartupBros/wstack-router/issues).
 
 ### Best Practices
 
