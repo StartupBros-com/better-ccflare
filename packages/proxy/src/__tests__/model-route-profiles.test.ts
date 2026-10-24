@@ -1820,3 +1820,36 @@ describe("describeModelRouteProfileFlow", () => {
 		}
 	});
 });
+
+describe("parseModelRouteProfiles advisorEmulation", () => {
+	const base = {
+		id: "adv",
+		displayName: "Adv",
+		accountId: "acct",
+		logicalModel: "claude-opus-5",
+		expectedProvider: "codex",
+	};
+	const parse = (extra: Record<string, unknown>, over = {}) =>
+		parseModelRouteProfiles(
+			JSON.stringify([{ ...base, ...over, ...extra }]),
+		)[0];
+
+	it("parses true and false, and omits the key when absent", () => {
+		expect(parse({ advisorEmulation: true })?.advisorEmulation).toBe(true);
+		expect(parse({ advisorEmulation: false })?.advisorEmulation).toBe(false);
+		const absent = parse({});
+		expect("advisorEmulation" in (absent ?? {})).toBe(false);
+		expect(JSON.stringify(absent)).not.toContain("advisorEmulation");
+	});
+	it("rejects true without a codex expectedProvider", () => {
+		expect(() =>
+			parse({ advisorEmulation: true }, { expectedProvider: "anthropic" }),
+		).toThrow(/advisorEmulation requires expectedProvider codex/);
+		expect(() =>
+			parse({ advisorEmulation: true }, { expectedProvider: undefined }),
+		).toThrow(/advisorEmulation/);
+	});
+	it("rejects non-boolean values", () => {
+		expect(() => parse({ advisorEmulation: "yes" })).toThrow(/boolean/);
+	});
+});

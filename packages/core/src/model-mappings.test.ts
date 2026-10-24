@@ -13,6 +13,7 @@ import {
 	getModelShortName,
 	getStrictClaudeModelFamily,
 	hasForcedToolChoice,
+	isCodexOAuthAccount,
 	isFamilyAliasModel,
 	isFirstPartyAnthropicAccount,
 	isValidClaudeModel,
@@ -1223,5 +1224,28 @@ describe("isFirstPartyAnthropicAccount", () => {
 				),
 			).toBe(false);
 		}
+	});
+});
+
+describe("isCodexOAuthAccount", () => {
+	const make = (over: Partial<Account>): Account =>
+		({
+			provider: "codex",
+			api_key: null,
+			custom_endpoint: null,
+			access_token: "tok",
+			...over,
+		}) as Account;
+	test("codex OAuth with token qualifies", () => {
+		expect(isCodexOAuthAccount(make({}))).toBe(true);
+	});
+	test("api key, custom endpoint, missing token, other provider do not", () => {
+		expect(isCodexOAuthAccount(make({ api_key: "sk" }))).toBe(false);
+		expect(isCodexOAuthAccount(make({ custom_endpoint: "https://x.y" }))).toBe(
+			false,
+		);
+		expect(isCodexOAuthAccount(make({ access_token: null }))).toBe(false);
+		expect(isCodexOAuthAccount(make({ access_token: "  " }))).toBe(false);
+		expect(isCodexOAuthAccount(make({ provider: "anthropic" }))).toBe(false);
 	});
 });

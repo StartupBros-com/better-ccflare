@@ -214,12 +214,21 @@ describe("discarded response drain deadline", () => {
 		expect(source).toContain(
 			"transferResponseDrainTransport(rawResponse, rescueTaggedRaw);",
 		);
+		// Advisor emulation: the tagged internal sub-call response reuses the raw
+		// body, and the spliced client response is the sole reader of the worker
+		// body (a sole-owner wrapper, not a tee).
+		expect(source).toContain(
+			"transferResponseDrainTransport(rawInternal, taggedInternal);",
+		);
+		expect(source).toContain(
+			"transferResponseDrainTransport(response, splicedResponse);",
+		);
 		expect(
 			source.match(
 				/wrapAnthropicPrecommitGatedResponse\(response, gatedBody\)/g,
 			),
 		).toHaveLength(2);
-		expect(source.match(/transferResponseDrainTransport\(/g)).toHaveLength(4);
+		expect(source.match(/transferResponseDrainTransport\(/g)).toHaveLength(6);
 		expect(source).not.toMatch(
 			/transferResponseDrainTransport\([^,\n]*\.clone\(\)/,
 		);

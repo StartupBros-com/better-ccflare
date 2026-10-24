@@ -2,6 +2,7 @@ import { isFirstPartyAnthropicAccount } from "@better-ccflare/core";
 import type {
 	Account,
 	RateLimitReason,
+	RequestMeta,
 	RouteCircuitRecoveryHint,
 	RoutingSelectionDiagnostics,
 } from "@better-ccflare/types";
@@ -10,6 +11,7 @@ import {
 	RECOVERY_STATUS_EXHAUSTED,
 	RECOVERY_STATUS_HEADER,
 } from "@better-ccflare/types/routing-recovery";
+import { isAdvisorEmulationAdmitted } from "../advisor-emulation/eligibility";
 import { sanitizeAnthropicRetryAfterSeconds } from "../anthropic-degraded-mode";
 import type { RoutingCapacityContext } from "./account-selector";
 import type { NativeQuotaTerminalPresentation } from "./native-quota-policy";
@@ -964,12 +966,14 @@ export function mergeTerminalAccountState(
  * Mirror selector request exclusions while retaining dynamic cross-provider
  * routing. `nativeAnthropicOnly` mirrors the advisor constraint: terminal
  * bodies and the `pool_exhausted` classification must ignore accounts that
- * could never have served the request.
+ * could never have served the request. A request admitted for advisor
+ * emulation (`meta.advisorEmulation`) also keeps Codex OAuth accounts.
  */
 export function filterRequestCompatibleAccounts(
 	accounts: readonly Account[],
 	headers: Headers,
 	nativeAnthropicOnly = false,
+	meta?: Pick<RequestMeta, "advisorEmulation">,
 ): Account[] {
 	const excluded =
 		headers
@@ -978,7 +982,11 @@ export function filterRequestCompatibleAccounts(
 			.map((provider) => provider.trim())
 			.filter(Boolean) ?? [];
 	const candidates = nativeAnthropicOnly
-		? accounts.filter((account) => isFirstPartyAnthropicAccount(account))
+		? accounts.filter(
+				(account) =>
+					isFirstPartyAnthropicAccount(account) ||
+					isAdvisorEmulationAdmitted(meta, account),
+			)
 		: accounts;
 	if (excluded.length === 0) return [...candidates];
 	return candidates.filter((account) =>

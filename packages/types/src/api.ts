@@ -265,6 +265,8 @@ export interface RequestMeta {
 	 * "no constraint"; null where no body context exists (count helpers, probes).
 	 */
 	nativeAnthropicToolRequirement: NativeAnthropicToolRequirement | null;
+	/** Set when the request qualifies for advisor emulation on a Codex OAuth route. */
+	advisorEmulation?: { advisorModel: string; declarationModel: string };
 	/**
 	 * Whether the endpoint carries a semantically significant server-tool query.
 	 * Raw query text is never copied into routing metadata; the exact Claude SDK

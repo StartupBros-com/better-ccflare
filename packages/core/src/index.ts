@@ -81,6 +81,7 @@ export {
 	getModelList,
 	getModelMappings,
 	getStrictClaudeModelFamily,
+	isCodexOAuthAccount,
 	isFamilyAliasModel,
 	isFirstPartyAnthropicAccount,
 	isValidClaudeModel,

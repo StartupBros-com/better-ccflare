@@ -7,6 +7,7 @@ import {
 	getModelFamily,
 	getModelList,
 	isAccountAvailable,
+	isCodexOAuthAccount,
 	isFirstPartyAnthropicAccount,
 	isOfficialXaiEndpoint,
 	providerAcceptsClientModel,
@@ -45,6 +46,7 @@ import type {
 	ServerToolCapabilityTuple,
 	ServerToolRoutingCapabilitySummary,
 } from "@better-ccflare/types";
+import { isAdvisorEmulationAdmitted } from "../advisor-emulation/eligibility";
 import { isNativeAnthropicOAuthDegradedModeEligible } from "../anthropic-degraded-eligibility";
 import type {
 	AnthropicDegradedRouteInspection,
@@ -2116,6 +2118,30 @@ function applyXaiCacheAffinity(
  */
 const NATIVE_ANTHROPIC_ONLY_EXCLUSION = "\u0000native-anthropic-only";
 
+/**
+ * Variant carried instead of the token above when the request is admitted for
+ * advisor emulation: first-party Anthropic accounts and Codex OAuth accounts
+ * may serve it, everything else stays excluded.
+ */
+const NATIVE_ANTHROPIC_OR_EMULATION_EXCLUSION =
+	"\u0000native-anthropic-or-advisor-emulation";
+
+/**
+ * The one predicate every native-constraint removal and refusal site shares: an
+ * account satisfies the constraint when it is first-party Anthropic, or when
+ * the request carries an advisor-emulation decision and the account is Codex
+ * OAuth (KTD1).
+ */
+function isNativeConstraintSatisfiedBy(
+	meta: RequestMeta,
+	account: Account,
+): boolean {
+	return (
+		isFirstPartyAnthropicAccount(account) ||
+		isAdvisorEmulationAdmitted(meta, account)
+	);
+}
+
 function hasNativeAnthropicConstraint(meta: RequestMeta): boolean {
 	return meta.nativeAnthropicToolRequirement != null;
 }
@@ -2130,9 +2156,15 @@ function getExcludedProviders(
 			?.split(",")
 			.map((provider) => provider.trim())
 			.filter(Boolean) ?? [];
-	return includeNativeConstraint && hasNativeAnthropicConstraint(meta)
-		? [...excluded, NATIVE_ANTHROPIC_ONLY_EXCLUSION]
-		: excluded;
+	if (!includeNativeConstraint || !hasNativeAnthropicConstraint(meta)) {
+		return excluded;
+	}
+	return [
+		...excluded,
+		meta.advisorEmulation
+			? NATIVE_ANTHROPIC_OR_EMULATION_EXCLUSION
+			: NATIVE_ANTHROPIC_ONLY_EXCLUSION,
+	];
 }
 
 function isProviderExcludedForRequest(
@@ -2142,6 +2174,13 @@ function isProviderExcludedForRequest(
 	for (const excluded of excludeProviders) {
 		if (excluded === NATIVE_ANTHROPIC_ONLY_EXCLUSION) {
 			if (!isFirstPartyAnthropicAccount(account)) return true;
+		} else if (excluded === NATIVE_ANTHROPIC_OR_EMULATION_EXCLUSION) {
+			if (
+				!isFirstPartyAnthropicAccount(account) &&
+				!isCodexOAuthAccount(account)
+			) {
+				return true;
+			}
 		} else if (excluded === "anthropic-oauth") {
 			if (account.provider === "anthropic" && account.refresh_token != null) {
 				return true;
@@ -2264,7 +2303,7 @@ function isServableNativeRemoval(
 	options: Omit<CandidateCapacityEvaluationOptions, "observationMeta">,
 ): boolean {
 	if (!hasNativeAnthropicConstraint(meta)) return false;
-	if (isFirstPartyAnthropicAccount(account)) return false;
+	if (isNativeConstraintSatisfiedBy(meta, account)) return false;
 	if (!isAccountAvailable(account)) return false;
 	if (
 		model !== null &&
@@ -2306,7 +2345,7 @@ function applyNativeConstraint(
 	if (!hasNativeAnthropicConstraint(meta)) return accounts;
 	const kept: Account[] = [];
 	for (const account of accounts) {
-		if (isFirstPartyAnthropicAccount(account)) {
+		if (isNativeConstraintSatisfiedBy(meta, account)) {
 			kept.push(account);
 		} else if (isServableNativeRemoval(meta, account, model, options)) {
 			recordNativeConstraintRemoval(meta, account.id);
@@ -3312,7 +3351,7 @@ async function selectAccountsForRequestInternal(
 			// non-first-party account, and the refusal names no account.
 			if (
 				hasNativeAnthropicConstraint(meta) &&
-				!isFirstPartyAnthropicAccount(forcedAccount)
+				!isNativeConstraintSatisfiedBy(meta, forcedAccount)
 			) {
 				// A forced non-advisor request still reaches the usage-throttle
 				// stage, so a throttled pin keeps that terminal (R7).
@@ -3965,7 +4004,9 @@ async function selectAccountsForRequestInternal(
 					const nativeRemovedComboAccountIds = new Set(
 						hasNativeAnthropicConstraint(meta)
 							? implicitComboPool
-									.filter((account) => !isFirstPartyAnthropicAccount(account))
+									.filter(
+										(account) => !isNativeConstraintSatisfiedBy(meta, account),
+									)
 									.map((account) => account.id)
 							: [],
 					);

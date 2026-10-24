@@ -39,6 +39,7 @@ import type {
 	ServerToolRequirements,
 } from "@better-ccflare/types";
 import { registerManagedTerminal } from "../../../scripts/ccflare-managed-timing.mjs";
+import { deriveAdvisorEmulation } from "./advisor-emulation/eligibility";
 import {
 	type AnthropicDegradedCohortFacts,
 	type AnthropicDegradedRouteInspection,
@@ -1787,6 +1788,22 @@ async function handleProxyCoreImpl(
 		: finalRequestBodyContext.finalizeNativeAnthropicToolRequirement();
 	requestMeta.nativeAnthropicToolRequirement =
 		nativeAnthropicToolRequirement ?? null;
+	const advisorEmulation = deriveAdvisorEmulation({
+		body: finalRequestBodyContext.getParsedJson(),
+		requirement: nativeAnthropicToolRequirement,
+		hasServerToolRequirements: serverToolRequirements !== undefined,
+		profile:
+			modelRouteResolution?.kind === "route"
+				? modelRouteResolution.profile
+				: undefined,
+	});
+	if ("ineligible" in advisorEmulation) {
+		if (nativeAnthropicToolRequirement) {
+			log.debug(`Advisor emulation ineligible: ${advisorEmulation.ineligible}`);
+		}
+	} else {
+		requestMeta.advisorEmulation = advisorEmulation;
+	}
 	// Advisor beside a proxy-hosted tool, or an advisor_* type this proxy does not
 	// know, cannot be served by any single route. Refuse before replay binding.
 	// A request that is already invalid or unsupported keeps that error: dropping
@@ -2994,6 +3011,7 @@ async function handleProxyCoreImpl(
 				),
 				req.headers,
 				requestMeta.nativeAnthropicToolRequirement != null,
+				requestMeta,
 			);
 		} catch (error) {
 			log.error("Failed to load terminal account state", error);
@@ -5133,6 +5151,7 @@ async function handleProxyCoreImpl(
 			await loadRoutingInventory(requestMeta, () => ctx.dbOps.getAllAccounts()),
 			req.headers,
 			requestMeta.nativeAnthropicToolRequirement != null,
+			requestMeta,
 		);
 		terminalAccounts = mergeTerminalAccountState(
 			refreshedTerminalAccounts,

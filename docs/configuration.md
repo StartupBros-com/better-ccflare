@@ -569,6 +569,7 @@ routing, error reasons, and saved picker IDs are unchanged.
 | `contextWindow` | no | Exact-account profiles only; required with `maxOutputTokens`. Positive integer total context bound |
 | `maxOutputTokens` | no | Exact-account profiles only; required with `contextWindow`. Positive integer less than `contextWindow`; caps request output |
 | `clientContextWindowHint` | no | Only `"1m"` is accepted. It is a Claude Code context-classification hint and is invalid with bounded `contextWindow` or `maxOutputTokens` |
+| `advisorEmulation` | no | Boolean; requires `expectedProvider: "codex"` (any other provider is a parse error). When `true`, a request on this profile that declares Claude Code's advisor tool may be served by a Codex OAuth account, with the advisor emulated by the proxy (Fable-family advisors run on `gpt-6-astra`, Opus-family on `gpt-6.1-sol`). Set `BCCF_ADVISOR_EMULATION=off` to disable emulation on every profile. Without it, advisor requests keep requiring a first-party Anthropic account; see the "Codex advisor emulation" paragraph in `docs/routing-architecture.md` |
 
 At startup, better-ccflare logs only the configured profile count, never the JSON, account IDs, logical models, or physical models. Legacy profiles name exact account IDs, so keep those values in a protected environment file or service-manager credential rather than committing a real deployment value. Capability profiles contain no account IDs, but their provider/model constraints are still operational configuration and should be protected accordingly.
 

@@ -7418,6 +7418,294 @@ describe("selectAccountsForRequest — native Anthropic advisor constraint", () 
 		).toEqual(["first-party-oauth", "first-party-api-key"]);
 		expect(filterRequestCompatibleAccounts(pool, headers)).toHaveLength(6);
 	});
+
+	describe("advisor emulation admission (U5)", () => {
+		const EMULATION = {
+			advisorModel: "gpt-6.1-sol",
+			declarationModel: "claude-opus-5",
+		} as const;
+
+		function codexOAuth(id: string, model = MODEL_ID): Account {
+			return serving(
+				{
+					id,
+					provider: "codex",
+					api_key: null,
+					custom_endpoint: null,
+					access_token: "codex-access",
+				},
+				model,
+			);
+		}
+
+		function emulationPool(model = MODEL_ID): Account[] {
+			return [
+				codexOAuth("codex-oauth", model),
+				serving(
+					{
+						id: "codex-api-key",
+						provider: "codex",
+						api_key: "sk-codex",
+						refresh_token: null,
+						access_token: null,
+					},
+					model,
+				),
+				serving(
+					{
+						id: "codex-custom-endpoint",
+						provider: "codex",
+						custom_endpoint: "https://codex-proxy.example/v1",
+					},
+					model,
+				),
+				serving({ id: "xai", provider: "xai" }, model),
+				serving(
+					{
+						id: "openai-compatible",
+						provider: "openai-compatible",
+						custom_endpoint: "https://compat.example/v1",
+					},
+					model,
+				),
+				serving({ id: "first-party-oauth", provider: "anthropic" }, model),
+			];
+		}
+
+		function admittedMeta(overrides: Partial<RequestMeta> = {}): RequestMeta {
+			return advisorMeta(DECLARED, {
+				advisorEmulation: EMULATION,
+				...overrides,
+			});
+		}
+
+		it("offers the strategy first-party plus Codex OAuth only, never other providers", async () => {
+			const ctx = makeCtx({ accounts: emulationPool() });
+			const meta = admittedMeta();
+
+			const result = await selectAccountsForRequest(meta, ctx, MODEL_ID);
+
+			expect(selectedBy(ctx)).toEqual([["codex-oauth", "first-party-oauth"]]);
+			expect(result.map(({ id }) => id)).toEqual([
+				"codex-oauth",
+				"first-party-oauth",
+			]);
+			expect([...getNativeConstraintRemovedAccountIds(meta)].sort()).toEqual([
+				"codex-api-key",
+				"codex-custom-endpoint",
+				"openai-compatible",
+				"xai",
+			]);
+		});
+
+		it("refuses the identical pool exactly as before when meta carries no emulation", async () => {
+			const pool = [
+				codexOAuth("codex-oauth"),
+				serving({ id: "xai", provider: "xai" }),
+			];
+			const ctx = makeCtx({ accounts: pool });
+			const meta = advisorMeta();
+
+			expect(
+				await selectAccountsForRequest(
+					advisorMeta(),
+					makeCtx({ accounts: [pool[0] as Account, pool[1] as Account] }),
+					MODEL_ID,
+				).then(
+					(accounts) => accounts.map(({ id }) => id),
+					(error) => error,
+				),
+			).toMatchObject({
+				name: "ServerToolRoutingError",
+				reason: "advisor_declaration_unavailable",
+			});
+			expect(selectedBy(ctx)).toEqual([]);
+			expect(getNativeConstraintRemovedAccountIds(meta).size).toBe(0);
+		});
+
+		it("selects the Codex OAuth account on an opted-in capability profile", async () => {
+			const codex = makeAccount({
+				id: "codex-sol",
+				provider: "codex",
+				model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+			});
+			const profileMeta = (overrides: Partial<RequestMeta> = {}) =>
+				makeRequestMeta({
+					routeProfileId: "sol-capability",
+					routeProfileSelection: "capability",
+					routeProfileLogicalModel: "claude-opus-5",
+					routeProfileExpectedPhysicalModel: "gpt-5.6-sol",
+					routeExpectedProvider: "codex",
+					nativeAnthropicToolRequirement: DECLARED,
+					...overrides,
+				});
+
+			const admitted = await selectAccountsForRequest(
+				profileMeta({ advisorEmulation: EMULATION }),
+				makeCtx({ accounts: [codex] }),
+				"claude-opus-5",
+			);
+			expect(admitted.map(({ id }) => id)).toEqual(["codex-sol"]);
+
+			expectRefusal(
+				await rejection(
+					selectAccountsForRequest(
+						profileMeta(),
+						makeCtx({ accounts: [codex] }),
+						"claude-opus-5",
+					),
+				),
+			);
+		});
+
+		it("keeps a Codex api_key and a Codex custom_endpoint account excluded even when admitted", async () => {
+			const apiKey = serving({
+				id: "codex-api-key",
+				provider: "codex",
+				api_key: "sk-codex",
+				refresh_token: null,
+				access_token: null,
+			});
+			const custom = serving({
+				id: "codex-custom-endpoint",
+				provider: "codex",
+				custom_endpoint: "https://codex-proxy.example/v1",
+			});
+			for (const account of [apiKey, custom]) {
+				expectRefusal(
+					await rejection(
+						selectAccountsForRequest(
+							admittedMeta(),
+							makeCtx({ accounts: [account] }),
+							MODEL_ID,
+						),
+					),
+				);
+			}
+		});
+
+		it("admits a header-forced Codex OAuth pin only with emulation meta", async () => {
+			const headers = new Headers({
+				"x-better-ccflare-account-id": "codex-oauth",
+			});
+			const served = await selectAccountsForRequest(
+				admittedMeta({ headers }),
+				makeCtx({ accounts: emulationPool() }),
+				MODEL_ID,
+			);
+			expect(served.map(({ id }) => id)).toEqual(["codex-oauth"]);
+
+			expectRefusal(
+				await rejection(
+					selectAccountsForRequest(
+						advisorMeta(DECLARED, { headers }),
+						makeCtx({ accounts: emulationPool() }),
+						MODEL_ID,
+					),
+				),
+			);
+		});
+
+		it("keeps forced pins to Codex api_key, xAI and openai-compatible refused when admitted", async () => {
+			for (const id of ["codex-api-key", "xai", "openai-compatible"]) {
+				const ctx = makeCtx({ accounts: emulationPool() });
+				expectRefusal(
+					await rejection(
+						selectAccountsForRequest(
+							admittedMeta({
+								headers: new Headers({ "x-better-ccflare-account-id": id }),
+							}),
+							ctx,
+							MODEL_ID,
+						),
+					),
+				);
+				expect(ctx.strategy.select).not.toHaveBeenCalled();
+			}
+		});
+
+		it("admits a profile-pinned Codex OAuth account only with emulation meta", async () => {
+			const pinned = (overrides: Partial<RequestMeta> = {}) =>
+				advisorMeta(DECLARED, {
+					routeProfileId: "pinned-profile",
+					forcedAccountId: "codex-oauth",
+					...overrides,
+				});
+			const served = await selectAccountsForRequest(
+				pinned({ advisorEmulation: EMULATION }),
+				makeCtx({ accounts: emulationPool() }),
+				MODEL_ID,
+			);
+			expect(served.map(({ id }) => id)).toEqual(["codex-oauth"]);
+
+			expectRefusal(
+				await rejection(
+					selectAccountsForRequest(
+						pinned(),
+						makeCtx({ accounts: emulationPool() }),
+						MODEL_ID,
+					),
+				),
+			);
+		});
+
+		it("admits a Codex OAuth combo member only with emulation meta, and still refuses xAI-only combos", async () => {
+			const pool = [
+				codexOAuth("codex-oauth", OPUS_ID),
+				serving({ id: "xai", provider: "xai" }, OPUS_ID),
+			];
+			const combo = makeCombo(opusSlots(["codex-oauth", 1], ["xai", 2]));
+			const ctx = makeCtx({ accounts: pool, activeCombo: combo });
+			ctx.strategy.select = mock((all: Account[]) => availableOnly(all));
+
+			const served = await selectAccountsForRequest(
+				admittedMeta(),
+				ctx,
+				OPUS_ID,
+			);
+			expect(served.map(({ id }) => id)).toEqual(["codex-oauth"]);
+
+			const noMeta = makeCtx({ accounts: pool, activeCombo: combo });
+			noMeta.strategy.select = mock((all: Account[]) => availableOnly(all));
+			expectRefusal(
+				await rejection(
+					selectAccountsForRequest(advisorMeta(), noMeta, OPUS_ID),
+				),
+			);
+
+			const xaiOnly = makeCtx({
+				accounts: [pool[1] as Account],
+				activeCombo: makeCombo(opusSlots(["xai", 1])),
+			});
+			xaiOnly.strategy.select = mock((all: Account[]) => availableOnly(all));
+			expectRefusal(
+				await rejection(
+					selectAccountsForRequest(admittedMeta(), xaiOnly, OPUS_ID),
+				),
+			);
+		});
+
+		it("widens the terminal account filter to Codex OAuth only when admitted", () => {
+			const pool = emulationPool();
+			const headers = new Headers();
+
+			expect(
+				filterRequestCompatibleAccounts(pool, headers, true, {
+					advisorEmulation: EMULATION,
+				}).map(({ id }) => id),
+			).toEqual(["codex-oauth", "first-party-oauth"]);
+			expect(
+				filterRequestCompatibleAccounts(pool, headers, true, {}).map(
+					({ id }) => id,
+				),
+			).toEqual(["first-party-oauth"]);
+			expect(
+				filterRequestCompatibleAccounts(pool, headers, true).map(
+					({ id }) => id,
+				),
+			).toEqual(["first-party-oauth"]);
+		});
+	});
 });
 
 describe("selectAccountsForRequest — native web_search passthrough lane", () => {
